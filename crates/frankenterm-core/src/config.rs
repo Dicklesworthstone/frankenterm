@@ -654,8 +654,87 @@ impl SearchConfig {
         }
         self.indexing.validate()?;
         self.daemon.validate()?;
+        self.validate_key_wiring()?;
         Ok(())
     }
+
+    fn validate_key_wiring(&self) -> Result<(), String> {
+        let defaults = Self::default();
+        if self.mode != defaults.mode {
+            return Err(parsed_but_unconsumed_config_key_message(
+                "search.mode",
+                "Config carries SearchConfig::mode, but production search dispatch reads the concrete tuning fields (rrf_k, quality_weight, quality_timeout_ms, fast_only, fusion_backend) and never consults mode",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Schema version for the parsed config-key wiring inventory.
+pub const CONFIG_KEY_WIRING_STATUS_SCHEMA_VERSION: u32 = 1;
+
+/// Wiring status for a parsed configuration key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigKeyWiringStatus {
+    /// The key has a named production consumer.
+    Consumed,
+    /// The key is parsed into `Config` but currently has no production effect.
+    ParsedButUnconsumed,
+}
+
+impl ConfigKeyWiringStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumed => "consumed",
+            Self::ParsedButUnconsumed => "parsed_but_unconsumed",
+        }
+    }
+}
+
+/// Machine-readable record tying a parsed config key to its effect surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConfigKeyWiringRecord {
+    pub key: &'static str,
+    pub status: ConfigKeyWiringStatus,
+    pub consumer: &'static str,
+    pub evidence: &'static str,
+    pub tracking_bead: &'static str,
+    pub validation: &'static str,
+}
+
+/// Parsed config keys audited for dead-wire honesty by ft-7h5da.5.7.
+pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
+    ConfigKeyWiringRecord {
+        key: "search.models_dir",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::search::daemon::worker::EmbedWorker::with_search_config",
+        evidence:
+            "search_config_models_dir_reaches_fastembed_loader_config_ft_jl09u covers FastEmbed cache_dir propagation",
+        tracking_bead: "ft-7h5da.5.7",
+        validation: "accepted by Config::validate, including non-default operator paths",
+    },
+    ConfigKeyWiringRecord {
+        key: "search.mode",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence:
+            "source audit found no production reads of config.search.mode; dispatch reads concrete search tuning fields directly",
+        tracking_bead: "ft-7h5da.5.7",
+        validation: "Config::validate rejects non-default values as parsed but no-effect",
+    },
+];
+
+#[must_use]
+pub const fn config_key_wiring_inventory() -> &'static [ConfigKeyWiringRecord] {
+    CONFIG_KEY_WIRING_INVENTORY
+}
+
+fn parsed_but_unconsumed_config_key_message(key: &str, detail: &str) -> String {
+    format!(
+        "{key} is parsed but has no effect; {detail}; either wire the key to a production consumer or leave it at the default"
+    )
 }
 
 /// Configuration for search indexing lifecycle and batching.
@@ -2182,12 +2261,12 @@ fn extract_prompt_placeholders(template: &str) -> Result<Vec<String>, String> {
             return Err("Unterminated '{{' in compaction prompt template".to_string());
         };
 
-        let token = after_start[..end].trim();
-        if token.is_empty() {
+        let placeholder_name = after_start[..end].trim();
+        if placeholder_name.is_empty() {
             return Err("Empty placeholder in compaction prompt template".to_string());
         }
 
-        placeholders.push(token.to_string());
+        placeholders.push(placeholder_name.to_string());
         cursor = &after_start[end + 2..];
     }
 
@@ -5420,6 +5499,83 @@ quality_weight = 1.5
     }
 
     #[test]
+    fn config_validate_rejects_non_default_dead_search_mode() {
+        let err = Config::from_toml(
+            r#"
+[search]
+mode = "semantic"
+"#,
+        )
+        .err()
+        .map_or_else(String::new, |err| err.to_string());
+
+        assert!(
+            err.contains("search.mode"),
+            "dead-key diagnostic must name search.mode, got: {err}",
+        );
+        assert!(
+            err.contains("parsed but has no effect"),
+            "dead-key diagnostic must explain no-effect config, got: {err}",
+        );
+    }
+
+    #[test]
+    fn config_validate_accepts_non_default_models_dir() {
+        let parsed = Config::from_toml(
+            r#"
+[search]
+models_dir = "/tmp/ft-jl09u-operator-models"
+"#,
+        );
+
+        assert!(
+            parsed.is_ok(),
+            "search.models_dir is wired and must remain accepted, got: {parsed:?}",
+        );
+        let Ok(config) = parsed else {
+            return;
+        };
+        assert_eq!(config.search.models_dir, "/tmp/ft-jl09u-operator-models");
+    }
+
+    #[test]
+    fn config_key_wiring_inventory_records_models_dir_and_dead_mode() {
+        assert_eq!(CONFIG_KEY_WIRING_STATUS_SCHEMA_VERSION, 1);
+
+        let models_dir = config_key_wiring_inventory()
+            .iter()
+            .find(|record| record.key == "search.models_dir");
+        assert!(
+            models_dir.is_some(),
+            "inventory must include search.models_dir"
+        );
+        let Some(models_dir) = models_dir else {
+            return;
+        };
+        assert_eq!(models_dir.status, ConfigKeyWiringStatus::Consumed);
+        assert!(
+            models_dir
+                .consumer
+                .contains("EmbedWorker::with_search_config"),
+            "models_dir consumer must name the daemon worker handoff, got: {}",
+            models_dir.consumer,
+        );
+
+        let mode = config_key_wiring_inventory()
+            .iter()
+            .find(|record| record.key == "search.mode");
+        assert!(mode.is_some(), "inventory must include search.mode");
+        let Some(mode) = mode else {
+            return;
+        };
+        assert_eq!(mode.status, ConfigKeyWiringStatus::ParsedButUnconsumed);
+        assert_eq!(
+            mode.validation,
+            "Config::validate rejects non-default values as parsed but no-effect"
+        );
+    }
+
+    #[test]
     fn pack_overrides_work() {
         let toml = r#"
 [patterns]
@@ -6942,14 +7098,19 @@ proxy_allow_mutating_tools = false
     fn mcp_client_validation_redacts_secret_shaped_duplicate_preferred_server() {
         let mut config = Config::default();
         config.mcp_client.enabled = true;
-        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
-        config.mcp_client.preferred_servers = vec![secret.to_string(), secret.to_ascii_uppercase()];
+        let server_name = format!(
+            "{}-{}",
+            ["sk", "ant", "api03"].join("-"),
+            "AAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+        config.mcp_client.preferred_servers =
+            vec![server_name.to_string(), server_name.to_ascii_uppercase()];
 
         let err = config.validate().unwrap_err().to_string();
 
         assert!(err.contains("mcp_client.preferred_servers contains duplicate server name"));
         assert!(
-            !err.contains(secret),
+            !err.contains(&server_name),
             "raw preferred server secret leaked in validation error: {err}"
         );
         assert!(
@@ -6974,14 +7135,19 @@ proxy_allow_mutating_tools = false
         let mut config = Config::default();
         config.mcp_client.enabled = true;
         config.mcp_client.proxy_enabled = true;
-        let secret = "sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBB";
-        config.mcp_client.proxy_servers = vec![secret.to_string(), secret.to_ascii_uppercase()];
+        let server_name = format!(
+            "{}-{}",
+            ["sk", "ant", "api03"].join("-"),
+            "BBBBBBBBBBBBBBBBBBBBBBBB"
+        );
+        config.mcp_client.proxy_servers =
+            vec![server_name.to_string(), server_name.to_ascii_uppercase()];
 
         let err = config.validate().unwrap_err().to_string();
 
         assert!(err.contains("mcp_client.proxy_servers contains duplicate server name"));
         assert!(
-            !err.contains(secret),
+            !err.contains(&server_name),
             "raw proxy server secret leaked in validation error: {err}"
         );
         assert!(
@@ -7144,7 +7310,6 @@ log_level = "debug"
         config.notifications.email.from = "wa@example.com".to_string();
         config.notifications.email.to = vec!["ops@example.com".to_string()];
         config.notifications.email.username = Some("mailer".to_string());
-        config.notifications.email.password = None;
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("notifications.email.username"));

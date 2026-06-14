@@ -31,6 +31,34 @@
     "dormant_exemption_expired_status": "deadwire",
     "failed_status": "deadwire"
   },
+  "config_key_inventory": {
+    "extended_by_bead": "ft-7h5da.5.7",
+    "schema_version_constant": "CONFIG_KEY_WIRING_STATUS_SCHEMA_VERSION",
+    "inventory_function": "frankenterm_core::config::config_key_wiring_inventory",
+    "validation_path": "Config::validate -> SearchConfig::validate -> SearchConfig::validate_key_wiring",
+    "entries": [
+      {
+        "key": "search.models_dir",
+        "status": "consumed",
+        "consumer": "crate::search::daemon::worker::EmbedWorker::with_search_config",
+        "evidence": "search_config_models_dir_reaches_fastembed_loader_config_ft_jl09u covers FastEmbed cache_dir propagation",
+        "validation": "accepted by Config::validate, including non-default operator paths"
+      },
+      {
+        "key": "search.mode",
+        "status": "parsed_but_unconsumed",
+        "consumer": "none",
+        "evidence": "source audit found no production reads of config.search.mode; dispatch reads concrete search tuning fields directly",
+        "validation": "Config::validate rejects non-default values as parsed but no-effect"
+      }
+    ],
+    "current_limitations": [
+      {
+        "kind": "explicit-default-undetectable",
+        "detail": "Config::validate sees the effective Config value, so an operator explicitly setting search.mode to its default value is indistinguishable from omission until ft config validate passes raw TOML key-presence metadata through the core validator."
+      }
+    ]
+  },
   "current_limitations": [
     {
       "kind": "ci_invocation_pending",
