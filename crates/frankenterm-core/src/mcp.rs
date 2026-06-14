@@ -123,7 +123,7 @@ use mcp_resources::{
     WaRendererInputToPhotonResource, WaRendererSsimParityResource,
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaRulesByAgentTemplateResource,
     WaRulesResource, WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource,
-    WaWorkflowsResource,
+    WaSwarmScentResource, WaWorkflowsResource,
 };
 use mcp_tools::{
     WaAccountsRefreshTool, WaAccountsTool, WaAttentionTool, WaAwaitEventTool, WaCassSearchTool,
@@ -1389,10 +1389,12 @@ mod tests {
             let mut config = Config::default();
             config.ingest.panes = panes;
 
-            let Err(err) = build_server_with_db(&config, None) else {
-                panic!("None db_path must stay on the strict error path");
-            };
-            let msg = err.to_string();
+            let result = build_server_with_db(&config, None);
+            prop_assert!(
+                result.is_err(),
+                "None db_path must stay on the strict error path"
+            );
+            let msg = result.err().map_or_else(String::new, |err| err.to_string());
             prop_assert!(
                 msg.contains("build_server_degraded"),
                 "strict no-db error must name the public degraded constructor: {msg}"
@@ -1531,6 +1533,7 @@ mod tests {
                 "wa://agent-mail/outbox".to_string(),
                 "wa://attention-router/current".to_string(),
                 "wa://herd-wave".to_string(),
+                "wa://swarm/scent".to_string(),
                 "wa://swarm-capacity/current".to_string(),
                 "wa://operating-envelope/current".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
@@ -1582,6 +1585,7 @@ mod tests {
                 "wa://agent-mail/outbox".to_string(),
                 "wa://attention-router/current".to_string(),
                 "wa://herd-wave".to_string(),
+                "wa://swarm/scent".to_string(),
                 "wa://swarm-capacity/current".to_string(),
                 "wa://operating-envelope/current".to_string(),
                 "wa://perf/renderer-slo/input_to_photon".to_string(),
@@ -2094,7 +2098,10 @@ mod tests {
         (dir, db_path)
     }
 
-    fn latest_audit_action(db_path: &Path, action_kind: &str) -> crate::storage::AuditActionRecord {
+    fn latest_audit_action(
+        db_path: &Path,
+        action_kind: &str,
+    ) -> Option<crate::storage::AuditActionRecord> {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
@@ -2108,9 +2115,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            rows.into_iter()
-                .next()
-                .unwrap_or_else(|| panic!("missing audit row for {action_kind}"))
+            rows.into_iter().next()
         })
     }
 
@@ -2195,6 +2200,10 @@ mod tests {
         });
 
         let audit = latest_audit_action(&db_path, "mcp.wa.rules_list");
+        assert!(audit.is_some(), "missing audit row for mcp.wa.rules_list");
+        let Some(audit) = audit else {
+            return;
+        };
         assert_eq!(audit.actor_kind, "mcp");
         let context: DecisionContext = serde_json::from_str(
             audit

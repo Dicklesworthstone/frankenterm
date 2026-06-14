@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -16,6 +16,10 @@ use crate::mcp_framework::{
     FrameworkResourceTemplate as ResourceTemplate, FrameworkToolHandler as ToolHandler,
 };
 
+use crate::agent_correlator::{
+    AgentCorrelator, DEFAULT_SWARM_SCENT_TTL_MS, SwarmScentReport, SwarmScentReservation,
+    SwarmScentSourceStatus, SwarmScentTxIntent, SwarmScentWorkClaim,
+};
 use crate::agent_mail_outbox::{DEFAULT_OUTBOX_MANIFEST_PATH, load_agent_mail_outbox_surface};
 use crate::attention_router::{
     ATTENTION_ROUTER_MCP_CURRENT_URI, ATTENTION_ROUTER_MCP_ITEM_URI_TEMPLATE,
@@ -23,7 +27,7 @@ use crate::attention_router::{
     build_attention_router_surface_payload,
 };
 use crate::context_horizon::predict_context_horizon_from_sqlite;
-use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_STORAGE};
+use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_STORAGE, MCP_ERR_WEZTERM};
 use crate::operating_envelope::{
     OPERATING_ENVELOPE_MCP_CURRENT_URI, OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
 };
@@ -38,6 +42,7 @@ use crate::render_quality::{
     RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_MCP_RESOURCE_URI,
     renderer_slos_doctor_report,
 };
+use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::runtime_telemetry::{
     ROBOT_SWARM_CAPACITY_OPERATOR_CONTRACT_ID, SWARM_CAPACITY_OPERATOR_MCP_CURRENT_URI,
     SWARM_CAPACITY_OPERATOR_MCP_RUN_URI_TEMPLATE, SwarmCapacityOperatorSummary,
@@ -45,7 +50,11 @@ use crate::runtime_telemetry::{
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
 };
+use crate::wezterm::default_wezterm_handle;
 
+use super::mcp_missions::{
+    mcp_load_mission_tx_contract_from_path, mcp_resolve_mission_tx_file_path,
+};
 use super::mcp_tools::{
     WaAccountsTool, WaEventsTool, WaMissionObjectivePlanTool, WaOperatingEnvelopeTool,
     WaRehearsalScoreTool, WaReservationsTool, WaRulesListTool, WaStateTool,
@@ -55,6 +64,7 @@ use crate::config::{Config, PaneFilterConfig};
 
 const PROOF_HISTORY_RESOURCE_URI: &str = "wa://proof-history";
 const PROOF_HISTORY_RELEASE_BLOCKING_URI: &str = "wa://proof-history/release-blocking";
+const SWARM_SCENT_RESOURCE_URI: &str = "wa://swarm/scent";
 pub(super) const AGENT_MAIL_OUTBOX_RESOURCE_URI: &str = "wa://agent-mail/outbox";
 
 fn tool_output_as_resource(uri: &str, contents: Vec<Content>) -> McpResult<Vec<ResourceContent>> {
@@ -1016,6 +1026,452 @@ impl ResourceHandler for WaAgentMailOutboxResource {
     }
 }
 
+#[derive(Debug)]
+enum SwarmScentLoadError {
+    Runtime(String),
+    PaneDiscovery(String),
+}
+
+impl SwarmScentLoadError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Runtime(_) => MCP_ERR_INTERNAL,
+            Self::PaneDiscovery(_) => MCP_ERR_WEZTERM,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Runtime(message) | Self::PaneDiscovery(message) => message,
+        }
+    }
+
+    fn hint(&self) -> &'static str {
+        match self {
+            Self::Runtime(_) => "Could not initialize the runtime for swarm scent generation.",
+            Self::PaneDiscovery(_) => {
+                "Check that the live mux is reachable; stale swarm scent is not emitted."
+            }
+        }
+    }
+}
+
+pub(super) struct WaSwarmScentResource {
+    config: Arc<Config>,
+    db_path: Option<Arc<PathBuf>>,
+}
+
+impl WaSwarmScentResource {
+    pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
+        Self { config, db_path }
+    }
+}
+
+impl ResourceHandler for WaSwarmScentResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: SWARM_SCENT_RESOURCE_URI.to_string(),
+            name: "ft swarm scent".to_string(),
+            description: Some(
+                "Read-only sibling-agent scent with live CWDs, reservations, and TTL freshness"
+                    .to_string(),
+            ),
+            mime_type: Some("application/json".to_string()),
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "swarm".to_string(),
+                "scent".to_string(),
+                "attention".to_string(),
+            ],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        let start = Instant::now();
+        let generated_at_ms = attention_router_resource_now_ms();
+        match load_swarm_scent_report(
+            Arc::clone(&self.config),
+            self.db_path.as_ref().map(Arc::clone),
+            generated_at_ms,
+        ) {
+            Ok(report) => envelope_as_resource(
+                SWARM_SCENT_RESOURCE_URI,
+                McpEnvelope::success(report, elapsed_ms(start)),
+            ),
+            Err(error) => envelope_as_resource(
+                SWARM_SCENT_RESOURCE_URI,
+                McpEnvelope::<serde_json::Value>::error(
+                    error.code(),
+                    error.message().to_string(),
+                    Some(error.hint().to_string()),
+                    elapsed_ms(start),
+                ),
+            ),
+        }
+    }
+}
+
+fn load_swarm_scent_report(
+    config: Arc<Config>,
+    db_path: Option<Arc<PathBuf>>,
+    generated_at_ms: u64,
+) -> Result<SwarmScentReport, SwarmScentLoadError> {
+    let runtime = CompatRuntimeBuilder::current_thread()
+        .build()
+        .map_err(|err| SwarmScentLoadError::Runtime(format!("Runtime init failed: {err}")))?;
+
+    runtime.block_on(async move {
+        let panes = default_wezterm_handle()
+            .list_panes()
+            .await
+            .map_err(|err| SwarmScentLoadError::PaneDiscovery(format!("List live panes: {err}")))?;
+        let mut correlator = AgentCorrelator::new();
+        for pane in &panes {
+            correlator.update_from_pane_info(pane);
+        }
+
+        let (reservations, reservation_source) = load_swarm_scent_reservations(
+            db_path.as_ref().map(|path| path.as_path()),
+            generated_at_ms,
+        );
+        let (work_claims, work_claim_source) =
+            load_swarm_scent_work_claims(db_path.as_ref().map(|path| path.as_path()));
+        let (tx_intents, tx_intent_source) = load_swarm_scent_tx_intents(config.as_ref());
+        Ok(correlator.swarm_scent_report_with_sources(
+            generated_at_ms,
+            DEFAULT_SWARM_SCENT_TTL_MS,
+            reservations,
+            reservation_source,
+            work_claims,
+            work_claim_source,
+            tx_intents,
+            tx_intent_source,
+        ))
+    })
+}
+
+fn load_swarm_scent_reservations(
+    db_path: Option<&Path>,
+    generated_at_ms: u64,
+) -> (Vec<SwarmScentReservation>, SwarmScentSourceStatus) {
+    let Some(db_path) = db_path else {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "reservations",
+                "No storage path was available for active pane reservations.",
+            ),
+        );
+    };
+    if !db_path.exists() {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "reservations",
+                format!("Reservation storage does not exist: {}", db_path.display()),
+            ),
+        );
+    }
+
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "reservations",
+                    format!("Open reservation storage read-only: {err}"),
+                ),
+            );
+        }
+    };
+    if let Err(err) = conn.busy_timeout(Duration::from_secs(2)) {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "reservations",
+                format!("Configure reservation storage busy timeout: {err}"),
+            ),
+        );
+    }
+
+    let now_ms = match i64::try_from(generated_at_ms) {
+        Ok(ms) => ms,
+        Err(_) => i64::MAX,
+    };
+    let mut stmt = match conn.prepare(
+        r"
+        SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at
+        FROM pane_reservations
+        WHERE status = 'active' AND expires_at > ?1
+        ORDER BY created_at ASC, id ASC
+        LIMIT 200
+        ",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "reservations",
+                    format!("Prepare active-reservation query: {err}"),
+                ),
+            );
+        }
+    };
+
+    let rows = match stmt.query_map([now_ms], |row| {
+        swarm_scent_reservation_from_row(row, now_ms)
+    }) {
+        Ok(rows) => rows,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "reservations",
+                    format!("Read active reservation rows: {err}"),
+                ),
+            );
+        }
+    };
+
+    let mut reservations = Vec::new();
+    for row in rows {
+        match row {
+            Ok(reservation) => reservations.push(reservation),
+            Err(err) => {
+                return (
+                    Vec::new(),
+                    SwarmScentSourceStatus::unavailable(
+                        "reservations",
+                        format!("Decode active reservation row: {err}"),
+                    ),
+                );
+            }
+        }
+    }
+
+    (
+        reservations,
+        SwarmScentSourceStatus::live(
+            "reservations",
+            "Active pane reservations were read from storage.",
+        ),
+    )
+}
+
+fn swarm_scent_reservation_from_row(
+    row: &rusqlite::Row<'_>,
+    now_ms: i64,
+) -> rusqlite::Result<SwarmScentReservation> {
+    let pane_id_i64: i64 = row.get(1)?;
+    let pane_id = u64::try_from(pane_id_i64).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Integer, Box::new(err))
+    })?;
+    let expires_at_ms: i64 = row.get(6)?;
+    let remaining_ms = expires_at_ms.saturating_sub(now_ms);
+    let ttl_remaining_ms: u64 = u64::try_from(remaining_ms).unwrap_or_default();
+    Ok(SwarmScentReservation {
+        id: row.get(0)?,
+        pane_id,
+        owner_kind: row.get(2)?,
+        owner_id: row.get(3)?,
+        reason: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        expires_at_ms,
+        ttl_remaining_ms,
+    })
+}
+
+fn load_swarm_scent_work_claims(
+    db_path: Option<&Path>,
+) -> (Vec<SwarmScentWorkClaim>, SwarmScentSourceStatus) {
+    let Some(db_path) = db_path else {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "work_claims",
+                "No storage path was available for native work claims.",
+            ),
+        );
+    };
+    if !db_path.exists() {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "work_claims",
+                format!("Work-claim storage does not exist: {}", db_path.display()),
+            ),
+        );
+    }
+
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(conn) => conn,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "work_claims",
+                    format!("Open work-claim storage read-only: {err}"),
+                ),
+            );
+        }
+    };
+    if let Err(err) = conn.busy_timeout(Duration::from_secs(2)) {
+        return (
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "work_claims",
+                format!("Configure work-claim storage busy timeout: {err}"),
+            ),
+        );
+    }
+
+    let mut stmt = match conn.prepare(
+        r"
+        SELECT claim_id, owner, priority, labels_json, claimed_at_ms, updated_at_ms, summary
+        FROM work_claims
+        WHERE state = 'claimed' AND owner IS NOT NULL
+        ORDER BY priority ASC, updated_at_ms DESC, claim_id ASC
+        LIMIT 200
+        ",
+    ) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "work_claims",
+                    format!("Prepare claimed-work query: {err}"),
+                ),
+            );
+        }
+    };
+
+    let rows = match stmt.query_map([], swarm_scent_work_claim_from_row) {
+        Ok(rows) => rows,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "work_claims",
+                    format!("Read claimed work rows: {err}"),
+                ),
+            );
+        }
+    };
+
+    let mut claims = Vec::new();
+    for row in rows {
+        match row {
+            Ok(claim) => claims.push(claim),
+            Err(err) => {
+                return (
+                    Vec::new(),
+                    SwarmScentSourceStatus::unavailable(
+                        "work_claims",
+                        format!("Decode claimed work row: {err}"),
+                    ),
+                );
+            }
+        }
+    }
+
+    (
+        claims,
+        SwarmScentSourceStatus::live(
+            "work_claims",
+            "Currently claimed native work-queue rows were read from storage.",
+        ),
+    )
+}
+
+fn swarm_scent_work_claim_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SwarmScentWorkClaim> {
+    let priority: i64 = row.get(2)?;
+    let labels_json: String = row.get(3)?;
+    Ok(SwarmScentWorkClaim {
+        claim_id: row.get(0)?,
+        owner: row.get(1)?,
+        priority: u32::try_from(priority).unwrap_or(3),
+        labels: serde_json::from_str::<Vec<String>>(&labels_json).unwrap_or_default(),
+        claimed_at_ms: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+        summary: row.get(6)?,
+    })
+}
+
+fn load_swarm_scent_tx_intents(
+    config: &Config,
+) -> (Vec<SwarmScentTxIntent>, SwarmScentSourceStatus) {
+    let contract_path = match mcp_resolve_mission_tx_file_path(config, None) {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "tx_intents",
+                    format!("Resolve active mission tx path: {}", err.message),
+                ),
+            );
+        }
+    };
+
+    let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+        Ok(contract) => contract,
+        Err(err) if err.code == "robot.tx_not_found" => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::live(
+                    "tx_intents",
+                    format!(
+                        "No active mission tx contract exists at {}.",
+                        contract_path.display()
+                    ),
+                ),
+            );
+        }
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "tx_intents",
+                    format!("Read active mission tx contract: {}", err.message),
+                ),
+            );
+        }
+    };
+
+    let intent = SwarmScentTxIntent {
+        tx_id: contract.intent.tx_id.0.clone(),
+        plan_id: contract.plan.plan_id.0.clone(),
+        requested_by: format!("{:?}", contract.intent.requested_by),
+        lifecycle_state: format!("{:?}", contract.lifecycle_state),
+        outcome: format!("{:?}", contract.outcome),
+        summary: contract.intent.summary.clone(),
+        correlation_id: contract.intent.correlation_id.clone(),
+        created_at_ms: contract.intent.created_at_ms,
+        contract_file: contract_path.display().to_string(),
+    };
+
+    (
+        vec![intent],
+        SwarmScentSourceStatus::live(
+            "tx_intents",
+            "Active mission transaction intent was read from the configured tx contract file.",
+        ),
+    )
+}
+
 pub(super) struct WaHerdWaveResource;
 
 impl ResourceHandler for WaHerdWaveResource {
@@ -1923,8 +2379,8 @@ mod tests {
         WaRehearsalScoreSurfaceTemplateResource, WaRendererInputToPhotonResource,
         WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
         WaRulesByAgentTemplateResource, WaRulesResource, WaSwarmCapacityCurrentResource,
-        WaSwarmCapacityRunTemplateResource, WaWorkflowsResource, envelope_as_resource,
-        load_proof_history_query_from_roots, tool_output_as_resource,
+        WaSwarmCapacityRunTemplateResource, WaSwarmScentResource, WaWorkflowsResource,
+        envelope_as_resource, load_proof_history_query_from_roots, tool_output_as_resource,
     };
     use crate::config::{Config, PaneFilterConfig};
     use crate::mcp_framework::{
@@ -2218,6 +2674,16 @@ mod tests {
         assert_eq!(def.uri, "wa://attestation/retractions");
         assert!(def.tags.contains(&"attestation".to_string()));
         assert!(def.tags.contains(&"retractions".to_string()));
+    }
+
+    #[test]
+    fn swarm_scent_resource_definition_uri() {
+        let def = WaSwarmScentResource::new(Arc::new(Config::default()), None).definition();
+        assert_eq!(def.uri, "wa://swarm/scent");
+        assert_eq!(def.mime_type.as_deref(), Some("application/json"));
+        assert!(def.tags.contains(&"swarm".to_string()));
+        assert!(def.tags.contains(&"scent".to_string()));
+        assert!(def.tags.contains(&"attention".to_string()));
     }
 
     #[test]
@@ -2604,6 +3070,9 @@ mod tests {
             WaAgentMailOutboxResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
+            WaSwarmScentResource::new(Arc::new(Config::default()), None)
+                .definition()
+                .uri,
             WaSwarmCapacityCurrentResource.definition().uri,
             WaSwarmCapacityRunTemplateResource.definition().uri,
             WaOperatingEnvelopeCurrentResource.definition().uri,
@@ -2664,6 +3133,9 @@ mod tests {
             WaAgentMailOutboxResource::new(Arc::clone(&config))
                 .definition()
                 .uri,
+            WaSwarmScentResource::new(Arc::new(Config::default()), None)
+                .definition()
+                .uri,
             WaSwarmCapacityCurrentResource.definition().uri,
             WaSwarmCapacityRunTemplateResource.definition().uri,
             WaOperatingEnvelopeCurrentResource.definition().uri,
@@ -2713,6 +3185,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaSwarmScentResource::new(Arc::new(Config::default()), None).definition(),
             WaSwarmCapacityCurrentResource.definition(),
             WaSwarmCapacityRunTemplateResource.definition(),
             WaOperatingEnvelopeCurrentResource.definition(),
@@ -2752,6 +3225,7 @@ mod tests {
             WaEventsResource::new(Arc::clone(&db)).definition(),
             WaRulesResource.definition(),
             WaWorkflowsResource::new(Arc::new(Config::default())).definition(),
+            WaSwarmScentResource::new(Arc::new(Config::default()), None).definition(),
             WaSwarmCapacityCurrentResource.definition(),
             WaSwarmCapacityRunTemplateResource.definition(),
             WaOperatingEnvelopeCurrentResource.definition(),

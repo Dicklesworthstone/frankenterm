@@ -39,6 +39,12 @@ use crate::wezterm::PaneInfo;
 const STATE_DETECTION_MAX_AGE: Duration =
     Duration::from_secs(crate::tuning_config::RuntimeTuning::DEFAULT_STATE_DETECTION_MAX_AGE_SECS);
 
+/// Freshness window for entries returned from `wa://swarm/scent`.
+///
+/// The scent surface is coordination input for sibling agents. A short TTL is
+/// intentional: stale ownership hints are more dangerous than missing hints.
+pub const DEFAULT_SWARM_SCENT_TTL_MS: u64 = 60_000;
+
 /// Agent installation inventory entry for robot/API consumers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstalledAgentInventoryEntry {
@@ -65,6 +71,117 @@ pub struct RunningAgentInventoryEntry {
 pub struct AgentInventory {
     pub installed: Vec<InstalledAgentInventoryEntry>,
     pub running: BTreeMap<u64, RunningAgentInventoryEntry>,
+}
+
+/// Read-only swarm scent payload for MCP coordination consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmScentReport {
+    pub schema_version: u16,
+    pub generated_at_ms: u64,
+    pub ttl_ms: u64,
+    pub agents: Vec<SwarmScentAgent>,
+    pub reservations: Vec<SwarmScentReservation>,
+    pub work_claims: Vec<SwarmScentWorkClaim>,
+    pub tx_intents: Vec<SwarmScentTxIntent>,
+    pub sources: Vec<SwarmScentSourceStatus>,
+    pub summary: SwarmScentSummary,
+}
+
+/// A fresh live-agent scent entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmScentAgent {
+    pub pane_id: u64,
+    pub slug: String,
+    pub agent_type: String,
+    pub state: String,
+    pub source: DetectionSource,
+    pub cwd: Option<String>,
+    pub session_id: Option<String>,
+    pub last_rule_id: Option<String>,
+    pub state_age_ms: u64,
+    pub ttl_remaining_ms: u64,
+}
+
+/// A live reservation scent entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmScentReservation {
+    pub id: i64,
+    pub pane_id: u64,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub reason: Option<String>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub ttl_remaining_ms: u64,
+}
+
+/// A currently claimed native work-queue item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmScentWorkClaim {
+    pub claim_id: String,
+    pub owner: String,
+    pub priority: u32,
+    pub labels: Vec<String>,
+    pub claimed_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
+    pub summary: Option<String>,
+}
+
+/// Active mission transaction intent scent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmScentTxIntent {
+    pub tx_id: String,
+    pub plan_id: String,
+    pub requested_by: String,
+    pub lifecycle_state: String,
+    pub outcome: String,
+    pub summary: String,
+    pub correlation_id: String,
+    pub created_at_ms: i64,
+    pub contract_file: String,
+}
+
+/// Freshness state for an input family folded into swarm scent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmScentSourceStatus {
+    pub source: String,
+    pub status: String,
+    pub fresh: bool,
+    pub detail: String,
+}
+
+impl SwarmScentSourceStatus {
+    #[must_use]
+    pub fn live(source: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            status: "live".to_string(),
+            fresh: true,
+            detail: detail.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn unavailable(source: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            status: "unavailable".to_string(),
+            fresh: false,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Summary counts for the scent payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmScentSummary {
+    pub tracked_agents: usize,
+    pub fresh_agents: usize,
+    pub expired_agents: usize,
+    pub active_reservations: usize,
+    pub active_work_claims: usize,
+    pub active_tx_intents: usize,
+    pub unavailable_sources: usize,
 }
 
 #[cfg(feature = "agent-detection")]
@@ -96,6 +213,8 @@ struct PaneAgentState {
     source: DetectionSource,
     /// Agent session ID if extracted from patterns.
     session_id: Option<String>,
+    /// Last observed current working directory for the pane.
+    cwd: Option<String>,
     /// Last inferred state (e.g., "working", "idle").
     last_state: String,
     /// When the state was last updated.
@@ -154,6 +273,7 @@ impl AgentCorrelator {
                     provider: provider.clone(),
                     source: DetectionSource::PatternEngine,
                     session_id: None,
+                    cwd: None,
                     last_state: "active".to_string(),
                     last_state_at: Instant::now(),
                     last_rule_id: None,
@@ -194,7 +314,10 @@ impl AgentCorrelator {
     /// Called during checkpoint to ensure all panes have agent detection
     /// even without pattern matches (e.g., new panes not yet processed).
     pub fn update_from_pane_info(&mut self, pane: &PaneInfo) {
-        if self.pane_agents.contains_key(&pane.pane_id) {
+        if let Some(state) = self.pane_agents.get_mut(&pane.pane_id) {
+            if pane.cwd.is_some() {
+                state.cwd = pane.cwd.clone();
+            }
             return; // Already detected via patterns — don't downgrade
         }
 
@@ -207,6 +330,7 @@ impl AgentCorrelator {
                     provider: AgentProvider::from_agent_type(&agent_type),
                     source: DetectionSource::PaneTitle,
                     session_id: None,
+                    cwd: pane.cwd.clone(),
                     last_state: "active".to_string(),
                     last_state_at: Instant::now(),
                     last_rule_id: None,
@@ -234,6 +358,7 @@ impl AgentCorrelator {
                         provider: AgentProvider::from_agent_type(&agent_type),
                         source: DetectionSource::ProcessName,
                         session_id: None,
+                        cwd: pane.cwd.clone(),
                         last_state: "active".to_string(),
                         last_state_at: Instant::now(),
                         last_rule_id: None,
@@ -317,6 +442,141 @@ impl AgentCorrelator {
             installed: installed_inventory_cached().unwrap_or_default(),
             running,
         }
+    }
+
+    /// Build a read-only scent report for sibling-agent coordination.
+    ///
+    /// Entries older than `ttl_ms` are counted as expired but omitted from
+    /// `agents`, so stale state is never presented as actionable ownership.
+    #[must_use]
+    pub fn swarm_scent_report_with_reservations(
+        &self,
+        generated_at_ms: u64,
+        ttl_ms: u64,
+        reservations: Vec<SwarmScentReservation>,
+        reservation_source: SwarmScentSourceStatus,
+    ) -> SwarmScentReport {
+        self.swarm_scent_report_with_sources(
+            generated_at_ms,
+            ttl_ms,
+            reservations,
+            reservation_source,
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "work_claims",
+                "Native work-claim state was not provided to this scent builder.",
+            ),
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "tx_intents",
+                "Mission transaction intent state was not provided to this scent builder.",
+            ),
+        )
+    }
+
+    /// Build a read-only scent report with all currently known source families.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn swarm_scent_report_with_sources(
+        &self,
+        generated_at_ms: u64,
+        ttl_ms: u64,
+        mut reservations: Vec<SwarmScentReservation>,
+        reservation_source: SwarmScentSourceStatus,
+        mut work_claims: Vec<SwarmScentWorkClaim>,
+        work_claim_source: SwarmScentSourceStatus,
+        mut tx_intents: Vec<SwarmScentTxIntent>,
+        tx_intent_source: SwarmScentSourceStatus,
+    ) -> SwarmScentReport {
+        let mut expired_agents = 0usize;
+        let mut agents: Vec<SwarmScentAgent> = self
+            .pane_agents
+            .iter()
+            .filter_map(|(pane_id, state)| {
+                let state_age_ms = duration_ms_saturating(state.last_state_at.elapsed());
+                if state_age_ms > ttl_ms {
+                    expired_agents = expired_agents.saturating_add(1);
+                    return None;
+                }
+
+                Some(SwarmScentAgent {
+                    pane_id: *pane_id,
+                    slug: state.provider.canonical_name().to_string(),
+                    agent_type: if state.agent_type != AgentType::Unknown {
+                        state.agent_type.to_string()
+                    } else {
+                        metadata_agent_type_for_provider(&state.provider)
+                    },
+                    state: state.last_state.clone(),
+                    source: state.source,
+                    cwd: state.cwd.clone(),
+                    session_id: state.session_id.clone(),
+                    last_rule_id: state.last_rule_id.clone(),
+                    state_age_ms,
+                    ttl_remaining_ms: ttl_ms.saturating_sub(state_age_ms),
+                })
+            })
+            .collect();
+        agents.sort_by_key(|agent| agent.pane_id);
+        reservations.sort_by_key(|reservation| (reservation.pane_id, reservation.id));
+        work_claims.sort_by(|left, right| {
+            left.owner
+                .cmp(&right.owner)
+                .then_with(|| left.priority.cmp(&right.priority))
+                .then_with(|| left.claim_id.cmp(&right.claim_id))
+        });
+        tx_intents.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.tx_id.cmp(&right.tx_id))
+        });
+
+        let sources = vec![
+            SwarmScentSourceStatus::live(
+                "agent_correlator",
+                "Live pane-agent correlation with TTL-filtered freshness.",
+            ),
+            SwarmScentSourceStatus::live("pane_cwd", "Last observed pane current directories."),
+            reservation_source,
+            work_claim_source,
+            tx_intent_source,
+        ];
+        let unavailable_sources = sources.iter().filter(|source| !source.fresh).count();
+        let summary = SwarmScentSummary {
+            tracked_agents: self.pane_agents.len(),
+            fresh_agents: agents.len(),
+            expired_agents,
+            active_reservations: reservations.len(),
+            active_work_claims: work_claims.len(),
+            active_tx_intents: tx_intents.len(),
+            unavailable_sources,
+        };
+
+        SwarmScentReport {
+            schema_version: 1,
+            generated_at_ms,
+            ttl_ms,
+            agents,
+            reservations,
+            work_claims,
+            tx_intents,
+            sources,
+            summary,
+        }
+    }
+
+    /// Build a scent report when reservation state is unavailable.
+    #[must_use]
+    pub fn swarm_scent_report(&self, generated_at_ms: u64, ttl_ms: u64) -> SwarmScentReport {
+        self.swarm_scent_report_with_reservations(
+            generated_at_ms,
+            ttl_ms,
+            Vec::new(),
+            SwarmScentSourceStatus::unavailable(
+                "reservations",
+                "No storage handle was available for active pane reservations.",
+            ),
+        )
     }
 }
 
@@ -412,6 +672,13 @@ fn metadata_agent_type_for_provider(provider: &AgentProvider) -> String {
         legacy.to_string()
     } else {
         provider.canonical_name().to_string()
+    }
+}
+
+fn duration_ms_saturating(duration: Duration) -> u64 {
+    match u64::try_from(duration.as_millis()) {
+        Ok(ms) => ms,
+        Err(_) => u64::MAX,
     }
 }
 
@@ -678,6 +945,31 @@ mod tests {
         }
     }
 
+    fn test_pane(pane_id: u64, title: &str, cwd: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            pane_id,
+            tab_id: 0,
+            window_id: 0,
+            domain_id: None,
+            domain_name: None,
+            workspace: None,
+            size: None,
+            rows: None,
+            cols: None,
+            title: Some(title.to_string()),
+            cwd: cwd.map(str::to_string),
+            tty_name: None,
+            cursor_x: None,
+            cursor_y: None,
+            cursor_visibility: None,
+            left_col: None,
+            top_row: None,
+            is_active: true,
+            is_zoomed: false,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
     // ---- Agent detection from detections ----
 
     #[test]
@@ -818,6 +1110,94 @@ mod tests {
         let meta = correlator.get_metadata(5).unwrap();
         assert_eq!(meta.agent_type, "claude_code");
         assert_eq!(meta.state.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn update_from_pane_info_refreshes_cwd_without_downgrading_detection() {
+        let mut correlator = AgentCorrelator::new();
+        correlator.ingest_detections(
+            5,
+            &[make_detection(
+                "core.claude_code:tool_use",
+                AgentType::ClaudeCode,
+            )],
+        );
+
+        correlator.update_from_pane_info(&test_pane(5, "gemini-cli", Some("file:///repo")));
+
+        let report = correlator.swarm_scent_report(1_700_000_000_000, DEFAULT_SWARM_SCENT_TTL_MS);
+        assert_eq!(report.summary.tracked_agents, 1);
+        assert_eq!(
+            report.agents.first().map(|agent| agent.agent_type.as_str()),
+            Some("claude_code")
+        );
+        assert_eq!(
+            report.agents.first().and_then(|agent| agent.cwd.as_deref()),
+            Some("file:///repo")
+        );
+    }
+
+    #[test]
+    fn swarm_scent_report_includes_live_reservations() {
+        let mut correlator = AgentCorrelator::new();
+        correlator.update_from_pane_info(&test_pane(7, "codex", Some("file:///worktree")));
+
+        let reservation = SwarmScentReservation {
+            id: 42,
+            pane_id: 7,
+            owner_kind: "agent".to_string(),
+            owner_id: "cod_10".to_string(),
+            reason: Some("ft-7h5da.7.5".to_string()),
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_700_000_060_000,
+            ttl_remaining_ms: 60_000,
+        };
+
+        let report = correlator.swarm_scent_report_with_reservations(
+            1_700_000_000_000,
+            DEFAULT_SWARM_SCENT_TTL_MS,
+            vec![reservation],
+            SwarmScentSourceStatus::live("reservations", "Active reservation reader succeeded."),
+        );
+
+        assert_eq!(report.summary.fresh_agents, 1);
+        assert_eq!(report.summary.active_reservations, 1);
+        assert_eq!(
+            report
+                .reservations
+                .first()
+                .map(|reservation| reservation.owner_id.as_str()),
+            Some("cod_10")
+        );
+        assert!(
+            report
+                .sources
+                .iter()
+                .any(|source| source.source == "reservations" && source.fresh)
+        );
+    }
+
+    #[test]
+    fn swarm_scent_report_expires_stale_agents() {
+        let mut correlator = AgentCorrelator::new();
+        correlator.update_from_pane_info(&test_pane(9, "codex", Some("file:///old")));
+        assert!(correlator.pane_agents.contains_key(&9));
+        if let Some(state) = correlator.pane_agents.get_mut(&9) {
+            state.last_state_at =
+                Instant::now() - Duration::from_millis(DEFAULT_SWARM_SCENT_TTL_MS + 1);
+        }
+
+        let report = correlator.swarm_scent_report(1_700_000_000_000, DEFAULT_SWARM_SCENT_TTL_MS);
+
+        assert!(report.agents.is_empty());
+        assert_eq!(report.summary.tracked_agents, 1);
+        assert_eq!(report.summary.expired_agents, 1);
+        assert!(
+            report
+                .sources
+                .iter()
+                .any(|source| source.source == "reservations" && !source.fresh)
+        );
     }
 
     #[test]

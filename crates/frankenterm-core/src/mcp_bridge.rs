@@ -21,8 +21,8 @@ use super::{
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaSteerPlanTool,
-    WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource, WaTxPlanTool,
-    WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+    WaSwarmCapacityCurrentResource, WaSwarmCapacityRunTemplateResource, WaSwarmScentResource,
+    WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
     WaWorkflowStatusTool, WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
@@ -300,6 +300,10 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .resource(WaOperatingEnvelopeRunTemplateResource)
         .resource(WaAttentionCurrentResource)
         .resource(WaAttentionItemTemplateResource)
+        .resource(WaSwarmScentResource::new(
+            Arc::clone(&config),
+            db_path.clone(),
+        ))
         .resource(WaRehearsalScoreCurrentResource::new(Arc::clone(&config)))
         .resource(WaRehearsalScoreSurfaceTemplateResource::new(Arc::clone(
             &config,
@@ -599,10 +603,12 @@ mod tests {
     #[test]
     fn build_server_with_db_rejects_none_db_path() {
         let config = Config::default();
-        let Err(err) = build_server_with_db(&config, None) else {
-            panic!("None db_path must produce explicit error after ft-647cj");
-        };
-        let msg = err.to_string();
+        let result = build_server_with_db(&config, None);
+        assert!(
+            result.is_err(),
+            "None db_path must produce explicit error after ft-647cj"
+        );
+        let msg = result.err().map_or_else(String::new, |err| err.to_string());
         assert!(
             msg.contains("br-ft-647cj"),
             "error must reference the bead: {msg}"
@@ -631,11 +637,9 @@ mod tests {
     #[test]
     fn build_server_with_db_none_error_contract_is_stable_ft_p0ni1() {
         let config = Config::default();
-        let err = match build_server_with_db(&config, None) {
-            Ok(_) => panic!("ft-p0ni1: None db_path must error"),
-            Err(err) => err,
-        };
-        let msg = err.to_string();
+        let result = build_server_with_db(&config, None);
+        assert!(result.is_err(), "ft-p0ni1: None db_path must error");
+        let msg = result.err().map_or_else(String::new, |err| err.to_string());
 
         // Invariant 1: bead breadcrumb present (existing smoke test
         // pins this; re-asserted here for the contract bundle).
