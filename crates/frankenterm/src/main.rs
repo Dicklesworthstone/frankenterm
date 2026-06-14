@@ -5115,6 +5115,10 @@ enum RobotWorkCommands {
         /// Agent slot ID claiming the work
         #[arg(long)]
         agent_id: String,
+
+        /// Pane associated with this work item for pane-limit decline checks
+        #[arg(long)]
+        pane_id: Option<u64>,
     },
     /// Release a claimed work item back to the queue
     Release {
@@ -5174,6 +5178,10 @@ enum RobotWorkCommands {
         /// Agent to assign to
         #[arg(long)]
         agent_id: String,
+
+        /// Pane associated with this assignment for pane-limit decline checks
+        #[arg(long)]
+        pane_id: Option<u64>,
 
         /// Assignment strategy override
         #[arg(long)]
@@ -6556,6 +6564,7 @@ const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
 const ROBOT_ERR_CHECKPOINT_NOT_FOUND: &str = "robot.checkpoint_not_found";
 const ROBOT_ERR_WORK_ITEM_NOT_FOUND: &str = "robot.work_item_not_found";
 const ROBOT_ERR_WORK_ITEM_CONFLICT: &str = "robot.work_item_conflict";
+const ROBOT_ERR_PANE_RATE_LIMITED: &str = "robot.pane_rate_limited";
 const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
 const ROBOT_ERR_RESOURCE_WHAT_IF: &str = "robot.resource.what_if_error";
 const ROBOT_ERR_COORDINATION_RISK: &str = "robot.coordination_risk_unavailable";
@@ -12801,10 +12810,13 @@ fn robot_fleet_claimed_work_counts(
     let mut counts = BTreeMap::new();
     for (pane_id, entry) in running_agents {
         let agent_id = robot_fleet_agent_id(*pane_id, entry);
+        let pane_id_i64 = robot_work_pane_id_to_i64(*pane_id).unwrap_or(i64::MAX);
         let count = conn
             .query_row(
-                "SELECT COUNT(*) FROM work_claims WHERE state = 'claimed' AND owner = ?1",
-                [agent_id],
+                "SELECT COUNT(*) FROM work_claims
+                 WHERE state = 'claimed'
+                   AND (pane_id = ?1 OR (pane_id IS NULL AND owner = ?2))",
+                rusqlite::params![pane_id_i64, agent_id],
                 |row| row.get::<_, i64>(0),
             )
             .map(robot_work_count)
@@ -13289,7 +13301,7 @@ fn robot_fleet_rebalance_work_rows(db_path: &str) -> (Vec<RobotWorkRow>, Option<
 
     let mut stmt = match conn.prepare(
         r"
-        SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
+        SELECT claim_id, state, owner, pane_id, priority, labels_json, created_at_ms, updated_at_ms,
                claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
                unblocks_count, last_reason
         FROM work_claims
@@ -13350,13 +13362,24 @@ fn robot_fleet_rebalance_agents(
         .enumerate()
         .map(|(index, agent)| (agent.agent_id.clone(), index))
         .collect::<BTreeMap<_, _>>();
+    let index_by_pane = agents
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| (agent.pane_id, index))
+        .collect::<BTreeMap<_, _>>();
     for row in rows {
-        if row.state == "claimed"
-            && let Some(owner) = row.owner.as_deref()
-            && let Some(index) = index_by_agent.get(owner).copied()
-            && let Some(agent) = agents.get_mut(index)
-        {
-            agent.load = agent.load.saturating_add(1);
+        if row.state == "claimed" {
+            let index = row
+                .pane_id
+                .and_then(|pane_id| index_by_pane.get(&pane_id).copied())
+                .or_else(|| {
+                    row.owner
+                        .as_deref()
+                        .and_then(|owner| index_by_agent.get(owner).copied())
+                });
+            if let Some(agent) = index.and_then(|index| agents.get_mut(index)) {
+                agent.load = agent.load.saturating_add(1);
+            }
         }
     }
 
@@ -14280,12 +14303,42 @@ fn robot_fleet_reassign_work(
     }
 
     let now_ms = now_ms_i64();
+    let target_pane_id = robot_work_effective_pane_id(None, row.pane_id, to_agent);
+    if let Some(pane_id) = target_pane_id {
+        if let Some(limit) =
+            robot_work_active_limit_for_pane_tx(&tx, pane_id, now_ms).map_err(|err| {
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    "robot.fleet.work_queue_unavailable",
+                    format!("failed to consult pane limit windows: {err}"),
+                )
+            })?
+        {
+            return Err(
+                frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                    ROBOT_ERR_PANE_RATE_LIMITED,
+                    format!(
+                        "work item `{work_item_id}` cannot be reassigned to pane {pane_id}: active limit window resets at {}",
+                        limit.reset_at_ms
+                    ),
+                ),
+            );
+        }
+    }
+    let target_pane_id_sql = target_pane_id
+        .map(robot_work_pane_id_to_i64)
+        .transpose()
+        .map_err(|err| {
+            frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                "robot.fleet.work_queue_unavailable",
+                format!("failed to encode target pane id: {err}"),
+            )
+        })?;
     tx.execute(
         "UPDATE work_claims
          SET state = 'claimed', owner = ?2, claimed_at_ms = COALESCE(claimed_at_ms, ?3),
-             updated_at_ms = ?3, assign_strategy = 'fleet_rebalance', last_reason = ?4
+             updated_at_ms = ?3, pane_id = ?4, assign_strategy = 'fleet_rebalance', last_reason = ?5
          WHERE claim_id = ?1",
-        rusqlite::params![work_item_id, to_agent, now_ms, reason],
+        rusqlite::params![work_item_id, to_agent, now_ms, target_pane_id_sql, reason],
     )
     .map_err(|err| {
         frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
@@ -14312,6 +14365,11 @@ fn robot_fleet_reassign_work(
     output
         .details
         .insert("to_agent".to_string(), to_agent.to_string());
+    if let Some(target_pane_id) = target_pane_id {
+        output
+            .details
+            .insert("pane_id".to_string(), target_pane_id.to_string());
+    }
     output
         .details
         .insert("reason".to_string(), reason.to_string());
@@ -16661,6 +16719,7 @@ struct RobotWorkRow {
     claim_id: String,
     state: String,
     owner: Option<String>,
+    pane_id: Option<u64>,
     priority: i64,
     labels_json: String,
     created_at_ms: i64,
@@ -16725,6 +16784,34 @@ fn robot_work_conflict(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RobotWorkPaneLimit {
+    reset_at_ms: i64,
+    reset_known: bool,
+}
+
+fn robot_work_pane_rate_limited(
+    item_id: &str,
+    pane_id: u64,
+    limit: RobotWorkPaneLimit,
+    elapsed_ms: u64,
+) -> RobotJsonResponse {
+    let reset_state = if limit.reset_known {
+        "known reset"
+    } else {
+        "conservative reset estimate"
+    };
+    robot_work_error_response(
+        ROBOT_ERR_PANE_RATE_LIMITED,
+        format!(
+            "Work item `{item_id}` cannot be assigned to pane {pane_id}: pane has an active limit window ({reset_state} at {}).",
+            limit.reset_at_ms
+        ),
+        Some("Wait for the reset time or assign the work to an unlimited pane.".to_string()),
+        elapsed_ms,
+    )
+}
+
 fn robot_work_validate_id(kind: &str, value: &str, elapsed_ms: u64) -> RobotJsonResult<()> {
     if value.trim().is_empty() {
         return Err(Box::new(robot_work_error_response(
@@ -16745,11 +16832,91 @@ fn robot_work_validate_id(kind: &str, value: &str, elapsed_ms: u64) -> RobotJson
     Ok(())
 }
 
+fn robot_work_limit_windows_table_exists(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'limit_windows'
+        )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(Into::into)
+}
+
+fn robot_work_active_limit_for_pane_tx(
+    tx: &rusqlite::Transaction<'_>,
+    pane_id: u64,
+    now_ms: i64,
+) -> anyhow::Result<Option<RobotWorkPaneLimit>> {
+    use rusqlite::OptionalExtension as _;
+
+    if !robot_work_limit_windows_table_exists(tx)? {
+        return Ok(None);
+    }
+
+    let pane_id = robot_work_pane_id_to_i64(pane_id)?;
+    tx.query_row(
+        "SELECT COALESCE(reset_at, last_seen_at + conservative_ttl_ms) AS effective_reset_at,
+                CASE WHEN reset_at IS NULL THEN 0 ELSE 1 END AS reset_known
+         FROM limit_windows
+         WHERE pane_id = ?1
+           AND COALESCE(reset_at, last_seen_at + conservative_ttl_ms) > ?2
+         ORDER BY effective_reset_at DESC, last_seen_at DESC
+         LIMIT 1",
+        rusqlite::params![pane_id, now_ms],
+        |row| {
+            Ok(RobotWorkPaneLimit {
+                reset_at_ms: row.get(0)?,
+                reset_known: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn robot_work_pane_id_to_i64(pane_id: u64) -> anyhow::Result<i64> {
+    i64::try_from(pane_id).map_err(|_| anyhow::anyhow!("pane_id {pane_id} exceeds i64::MAX"))
+}
+
+fn robot_work_pane_id_from_agent_id(agent_id: &str) -> Option<u64> {
+    agent_id
+        .rsplit_once(':')
+        .and_then(|(_, pane)| pane.parse::<u64>().ok())
+}
+
+fn robot_work_effective_pane_id(
+    requested_pane_id: Option<u64>,
+    stored_pane_id: Option<u64>,
+    agent_id: &str,
+) -> Option<u64> {
+    requested_pane_id
+        .or_else(|| robot_work_pane_id_from_agent_id(agent_id))
+        .or(stored_pane_id)
+}
+
 fn robot_work_open_conn(db_path: &str) -> anyhow::Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(db_path)?;
     conn.busy_timeout(Duration::from_secs(2))?;
     robot_work_ensure_schema(&conn)?;
     Ok(conn)
+}
+
+fn robot_work_column_exists(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn robot_work_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
@@ -16759,6 +16926,7 @@ fn robot_work_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
             claim_id TEXT PRIMARY KEY NOT NULL,
             state TEXT NOT NULL CHECK (state IN ('unclaimed', 'claimed', 'completed')),
             owner TEXT,
+            pane_id INTEGER,
             priority INTEGER NOT NULL DEFAULT 3,
             labels_json TEXT NOT NULL DEFAULT '[]',
             created_at_ms INTEGER NOT NULL,
@@ -16777,30 +16945,40 @@ fn robot_work_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_work_claims_owner ON work_claims(owner);
         ",
     )?;
+    if !robot_work_column_exists(conn, "work_claims", "pane_id")? {
+        conn.execute_batch("ALTER TABLE work_claims ADD COLUMN pane_id INTEGER;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_work_claims_pane_id ON work_claims(pane_id);",
+    )?;
     Ok(())
 }
 
 fn robot_work_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<RobotWorkRow> {
+    let pane_id = row
+        .get::<_, Option<i64>>(3)?
+        .and_then(|value| u64::try_from(value).ok());
     Ok(RobotWorkRow {
         claim_id: row.get(0)?,
         state: row.get(1)?,
         owner: row.get(2)?,
-        priority: row.get(3)?,
-        labels_json: row.get(4)?,
-        created_at_ms: row.get(5)?,
-        updated_at_ms: row.get(6)?,
-        claimed_at_ms: row.get(7)?,
-        completed_at_ms: row.get(8)?,
-        summary: row.get(9)?,
-        evidence_json: row.get(10)?,
-        blocked_by_count: row.get(11)?,
-        unblocks_count: row.get(12)?,
-        last_reason: row.get(13)?,
+        pane_id,
+        priority: row.get(4)?,
+        labels_json: row.get(5)?,
+        created_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+        claimed_at_ms: row.get(8)?,
+        completed_at_ms: row.get(9)?,
+        summary: row.get(10)?,
+        evidence_json: row.get(11)?,
+        blocked_by_count: row.get(12)?,
+        unblocks_count: row.get(13)?,
+        last_reason: row.get(14)?,
     })
 }
 
 const ROBOT_WORK_SELECT_ROW: &str = r"
-    SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
+    SELECT claim_id, state, owner, pane_id, priority, labels_json, created_at_ms, updated_at_ms,
            claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
            unblocks_count, last_reason
     FROM work_claims
@@ -16839,6 +17017,7 @@ fn robot_work_summary(row: &RobotWorkRow) -> serde_json::Value {
         "status": row.state,
         "state": row.state,
         "assigned_to": row.owner,
+        "pane_id": row.pane_id,
         "labels": robot_work_parse_string_array(&row.labels_json),
         "blocked_by_count": robot_work_count(row.blocked_by_count),
         "unblocks_count": robot_work_count(row.unblocks_count),
@@ -16885,6 +17064,7 @@ fn robot_work_claim_data(
     db_path: &str,
     item_id: &str,
     agent_id: &str,
+    pane_id: Option<u64>,
     elapsed_ms: u64,
 ) -> RobotJsonResult<serde_json::Value> {
     robot_work_validate_id("item_id", item_id, elapsed_ms)?;
@@ -16902,19 +17082,41 @@ fn robot_work_claim_data(
     let row = robot_work_fetch_row_tx(&tx, item_id)
         .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
         .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+    let effective_pane_id = robot_work_effective_pane_id(pane_id, row.pane_id, agent_id);
+    if let Some(pane_id) = effective_pane_id {
+        if let Some(limit) = robot_work_active_limit_for_pane_tx(&tx, pane_id, now_ms)
+            .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        {
+            return Err(Box::new(robot_work_pane_rate_limited(
+                item_id, pane_id, limit, elapsed_ms,
+            )));
+        }
+    }
+    let effective_pane_id_sql = effective_pane_id
+        .map(robot_work_pane_id_to_i64)
+        .transpose()
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
 
     match (row.state.as_str(), row.owner.as_deref()) {
         ("unclaimed", _) => {
             tx.execute(
                 "UPDATE work_claims
                  SET state = 'claimed', owner = ?2, claimed_at_ms = ?3, updated_at_ms = ?3,
-                     last_reason = NULL
+                     pane_id = ?4, last_reason = NULL
                  WHERE claim_id = ?1",
-                rusqlite::params![item_id, agent_id, now_ms],
+                rusqlite::params![item_id, agent_id, now_ms, effective_pane_id_sql],
             )
             .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
         }
-        ("claimed", Some(owner)) if owner == agent_id => {}
+        ("claimed", Some(owner)) if owner == agent_id => {
+            tx.execute(
+                "UPDATE work_claims
+                 SET pane_id = COALESCE(pane_id, ?2), updated_at_ms = ?3
+                 WHERE claim_id = ?1",
+                rusqlite::params![item_id, effective_pane_id_sql, now_ms],
+            )
+            .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+        }
         ("claimed", owner) => {
             return Err(Box::new(robot_work_conflict(
                 item_id,
@@ -16955,6 +17157,7 @@ fn robot_work_claim_data(
         "item_id": row.claim_id,
         "claim_id": row.claim_id,
         "agent_id": agent_id,
+        "pane_id": row.pane_id,
         "state": row.state,
         "title": row.claim_id,
         "priority": robot_work_priority(row.priority),
@@ -17081,6 +17284,7 @@ fn robot_work_assign_data(
     db_path: &str,
     item_id: &str,
     agent_id: &str,
+    pane_id: Option<u64>,
     strategy: Option<&str>,
     elapsed_ms: u64,
 ) -> RobotJsonResult<serde_json::Value> {
@@ -17101,6 +17305,20 @@ fn robot_work_assign_data(
     let row = robot_work_fetch_row_tx(&tx, item_id)
         .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
         .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+    let effective_pane_id = robot_work_effective_pane_id(pane_id, row.pane_id, agent_id);
+    if let Some(pane_id) = effective_pane_id {
+        if let Some(limit) = robot_work_active_limit_for_pane_tx(&tx, pane_id, now_ms)
+            .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        {
+            return Err(Box::new(robot_work_pane_rate_limited(
+                item_id, pane_id, limit, elapsed_ms,
+            )));
+        }
+    }
+    let effective_pane_id_sql = effective_pane_id
+        .map(robot_work_pane_id_to_i64)
+        .transpose()
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
 
     if row.state == "completed" {
         return Err(Box::new(robot_work_conflict(
@@ -17122,9 +17340,15 @@ fn robot_work_assign_data(
     tx.execute(
         "UPDATE work_claims
          SET state = 'claimed', owner = ?2, claimed_at_ms = COALESCE(claimed_at_ms, ?3),
-             updated_at_ms = ?3, assign_strategy = ?4, last_reason = NULL
+             updated_at_ms = ?3, pane_id = ?4, assign_strategy = ?5, last_reason = NULL
          WHERE claim_id = ?1",
-        rusqlite::params![item_id, agent_id, now_ms, strategy_used],
+        rusqlite::params![
+            item_id,
+            agent_id,
+            now_ms,
+            effective_pane_id_sql,
+            strategy_used
+        ],
     )
     .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
     tx.commit()
@@ -17138,6 +17362,7 @@ fn robot_work_assign_data(
         "item_id": item_id,
         "claim_id": item_id,
         "agent_id": agent_id,
+        "pane_id": effective_pane_id,
         "strategy_used": strategy_used,
         "audit": {
             "event": "work.assigned",
@@ -17158,7 +17383,7 @@ fn robot_work_list_rows(
     let limit = robot_work_limit(limit);
     let mut stmt = conn.prepare(
         r"
-        SELECT claim_id, state, owner, priority, labels_json, created_at_ms, updated_at_ms,
+        SELECT claim_id, state, owner, pane_id, priority, labels_json, created_at_ms, updated_at_ms,
                claimed_at_ms, completed_at_ms, summary, evidence_json, blocked_by_count,
                unblocks_count, last_reason
         FROM work_claims
@@ -17273,9 +17498,11 @@ fn robot_work_command_response(
     elapsed_ms: u64,
 ) -> RobotResponse<serde_json::Value> {
     let result = match command {
-        RobotWorkCommands::Claim { item_id, agent_id } => {
-            robot_work_claim_data(db_path, item_id, agent_id, elapsed_ms)
-        }
+        RobotWorkCommands::Claim {
+            item_id,
+            agent_id,
+            pane_id,
+        } => robot_work_claim_data(db_path, item_id, agent_id, *pane_id, elapsed_ms),
         RobotWorkCommands::Release { item_id, reason } => {
             robot_work_release_data(db_path, item_id, reason.as_deref(), elapsed_ms)
         }
@@ -17309,8 +17536,16 @@ fn robot_work_command_response(
         RobotWorkCommands::Assign {
             item_id,
             agent_id,
+            pane_id,
             strategy,
-        } => robot_work_assign_data(db_path, item_id, agent_id, strategy.as_deref(), elapsed_ms),
+        } => robot_work_assign_data(
+            db_path,
+            item_id,
+            agent_id,
+            *pane_id,
+            strategy.as_deref(),
+            elapsed_ms,
+        ),
     };
 
     match result {
@@ -18310,16 +18545,47 @@ mod robot_work_backend_tests {
         }
     }
 
+    fn seed_active_limit_window(db_path: &str, pane_id: u64, reset_at_ms: i64) {
+        let conn = rusqlite::Connection::open(db_path).expect("open test db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS limit_windows (
+                pane_id INTEGER NOT NULL,
+                reset_at INTEGER,
+                last_seen_at INTEGER NOT NULL,
+                conservative_ttl_ms INTEGER NOT NULL
+            );",
+        )
+        .expect("create limit_windows fixture");
+        conn.execute(
+            "INSERT INTO limit_windows
+             (pane_id, reset_at, last_seen_at, conservative_ttl_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                robot_work_pane_id_to_i64(pane_id).expect("pane id fits"),
+                reset_at_ms,
+                reset_at_ms - 1_000,
+                300_000_i64
+            ],
+        )
+        .expect("insert limit window fixture");
+    }
+
     #[test]
     fn work_claim_rejects_competing_owner_and_preserves_original_claim() {
         let (_dir, db_path) = temp_work_db();
 
-        let first = expect_ok(robot_work_claim_data(&db_path, "ft-work-a", "agent-a", 0));
+        let first = expect_ok(robot_work_claim_data(
+            &db_path,
+            "ft-work-a",
+            "agent-a",
+            None,
+            0,
+        ));
         assert_eq!(first["state"], "claimed");
         assert_eq!(first["agent_id"], "agent-a");
 
         expect_error_code(
-            robot_work_claim_data(&db_path, "ft-work-a", "agent-b", 0),
+            robot_work_claim_data(&db_path, "ft-work-a", "agent-b", None, 0),
             ROBOT_ERR_WORK_ITEM_CONFLICT,
         );
 
@@ -18337,6 +18603,53 @@ mod robot_work_backend_tests {
     }
 
     #[test]
+    fn work_claim_infers_and_lists_pane_id_from_agent_owner() {
+        let (_dir, db_path) = temp_work_db();
+
+        let claimed = expect_ok(robot_work_claim_data(
+            &db_path,
+            "ft-pane-a",
+            "codex:42",
+            None,
+            0,
+        ));
+        assert_eq!(claimed["pane_id"].as_u64(), Some(42));
+
+        let list = expect_ok(robot_work_list_data(
+            &db_path,
+            Some("claimed"),
+            Some("codex:42"),
+            None,
+            10,
+            0,
+        ));
+        assert_eq!(list["items"][0]["pane_id"].as_u64(), Some(42));
+    }
+
+    #[test]
+    fn work_assign_declines_active_pane_limit_before_claiming() {
+        let (_dir, db_path) = temp_work_db();
+        seed_active_limit_window(&db_path, 7, now_ms_i64() + 60_000);
+
+        expect_error_code(
+            robot_work_assign_data(
+                &db_path,
+                "ft-limited-pane",
+                "codex:7",
+                Some(7),
+                Some("direct"),
+                0,
+            ),
+            ROBOT_ERR_PANE_RATE_LIMITED,
+        );
+
+        let ready = expect_ok(robot_work_ready_data(&db_path, Some("codex:7"), 10, 0));
+        assert_eq!(ready["total_ready"], 1);
+        assert_eq!(ready["items"][0]["state"], "unclaimed");
+        assert!(ready["items"][0]["pane_id"].is_null());
+    }
+
+    #[test]
     fn work_release_complete_and_ready_use_durable_states() {
         let (_dir, db_path) = temp_work_db();
 
@@ -18344,6 +18657,7 @@ mod robot_work_backend_tests {
             &db_path,
             "ft-ready-a",
             "agent-a",
+            None,
             Some("direct"),
             0,
         ));
@@ -18357,7 +18671,13 @@ mod robot_work_backend_tests {
         assert_eq!(ready["total_ready"], 1);
         assert_eq!(ready["items"][0]["state"], "unclaimed");
 
-        expect_ok(robot_work_claim_data(&db_path, "ft-ready-a", "agent-b", 0));
+        expect_ok(robot_work_claim_data(
+            &db_path,
+            "ft-ready-a",
+            "agent-b",
+            None,
+            0,
+        ));
         let completed = expect_ok(robot_work_complete_data(
             &db_path,
             "ft-ready-a",
@@ -18389,6 +18709,7 @@ mod robot_work_backend_tests {
             &db_path,
             "ft-rebalance-a",
             "codex:1",
+            None,
             Some("seed"),
             0,
         ));
@@ -18455,7 +18776,7 @@ mod robot_work_backend_tests {
             let agent = agent.to_string();
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                robot_work_claim_data(db_path.as_str(), "ft-race", &agent, 0).is_ok()
+                robot_work_claim_data(db_path.as_str(), "ft-race", &agent, None, 0).is_ok()
             }));
         }
 
@@ -75334,6 +75655,7 @@ log_level = "debug"
             claim_id: claim_id.to_string(),
             state: state.to_string(),
             owner: owner.map(str::to_string),
+            pane_id: owner.and_then(robot_work_pane_id_from_agent_id),
             priority,
             labels_json: serde_json::to_string(labels).expect("labels json"),
             created_at_ms: 1,
