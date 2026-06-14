@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "subprocess-bridge")]
 use crate::beads_types::{BeadReadinessReport, BeadResolverReasonCode, BeadStatusCounts};
+use crate::capacity_governor::GovernorDecision;
 
 pub const OPERATING_ENVELOPE_CONTRACT_ID: &str = "ft.operating_envelope.v1";
 pub const OPERATING_ENVELOPE_SCHEMA_VERSION: u16 = 1;
@@ -179,6 +180,7 @@ pub enum OperatingEnvelopeRedactionState {
 #[serde(rename_all = "snake_case")]
 pub enum OperatingEnvelopeEvidenceCategory {
     CapacityPressure,
+    CapacityGovernor,
     TargetHardware,
     RchWorkerSelection,
     RchActiveProjectExclusion,
@@ -1249,6 +1251,7 @@ pub struct OperatingEnvelopeCapacitySourceInput {
     pub provenance: OperatingEnvelopeSourceProvenance,
     pub pressure_tier: OperatingEnvelopeCapacityPressureTier,
     pub target_class_proof_state: OperatingEnvelopeProofState,
+    pub heavy_workload_governor_decision: Option<GovernorDecision>,
     pub kill_switch_active: bool,
     pub unavailable_reason: Option<String>,
 }
@@ -1260,6 +1263,7 @@ impl OperatingEnvelopeCapacitySourceInput {
             provenance,
             pressure_tier: OperatingEnvelopeCapacityPressureTier::Unknown,
             target_class_proof_state: OperatingEnvelopeProofState::Unavailable,
+            heavy_workload_governor_decision: None,
             kill_switch_active: false,
             unavailable_reason: None,
         }
@@ -1313,6 +1317,47 @@ impl OperatingEnvelopeCapacitySourceInput {
             pressure_reason,
         ));
 
+        match &self.heavy_workload_governor_decision {
+            Some(decision) => {
+                let reason_code = capacity_governor_heavy_reason_code(decision);
+                match decision {
+                    GovernorDecision::Block { .. } => {
+                        snapshot = snapshot.blocked(reason_code);
+                    }
+                    GovernorDecision::Throttle { .. } => {
+                        snapshot = snapshot.degraded(reason_code);
+                    }
+                    GovernorDecision::Allow { .. }
+                    | GovernorDecision::Offload { .. }
+                    | GovernorDecision::Override { .. } => {
+                        push_unique(&mut snapshot.reason_codes, reason_code.to_string());
+                    }
+                }
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::CapacityGovernor,
+                    capacity_governor_heavy_evidence_state(decision),
+                    format!(
+                        "heavy_workload_governor={}",
+                        capacity_governor_heavy_action(decision)
+                    ),
+                    reason_code,
+                ));
+            }
+            None => {
+                snapshot = snapshot.degraded("capacity.governor.missing_heavy");
+                push_unique(
+                    &mut snapshot.reason_codes,
+                    "telemetry.required_source_missing".to_string(),
+                );
+                snapshot.evidence.push(evidence(
+                    OperatingEnvelopeEvidenceCategory::CapacityGovernor,
+                    OperatingEnvelopeEvidenceState::Unknown,
+                    "heavy workload governor telemetry missing",
+                    "capacity.governor.missing_heavy",
+                ));
+            }
+        }
+
         if self.kill_switch_active {
             snapshot = snapshot.blocked("capacity.kill_switch_active");
             push_unique(
@@ -1364,6 +1409,38 @@ impl OperatingEnvelopeCapacitySourceInput {
         }
 
         snapshot
+    }
+}
+
+fn capacity_governor_heavy_reason_code(decision: &GovernorDecision) -> &'static str {
+    match decision {
+        GovernorDecision::Allow { .. } => "capacity.governor.allow_heavy",
+        GovernorDecision::Throttle { .. } => "capacity.governor.throttle_heavy",
+        GovernorDecision::Offload { .. } => "capacity.governor.offload_heavy",
+        GovernorDecision::Block { .. } => "capacity.governor.block_heavy",
+        GovernorDecision::Override { .. } => "capacity.governor.override_heavy",
+    }
+}
+
+fn capacity_governor_heavy_action(decision: &GovernorDecision) -> &'static str {
+    match decision {
+        GovernorDecision::Allow { .. } => "allow",
+        GovernorDecision::Throttle { .. } => "throttle",
+        GovernorDecision::Offload { .. } => "offload",
+        GovernorDecision::Block { .. } => "block",
+        GovernorDecision::Override { .. } => "override",
+    }
+}
+
+fn capacity_governor_heavy_evidence_state(
+    decision: &GovernorDecision,
+) -> OperatingEnvelopeEvidenceState {
+    match decision {
+        GovernorDecision::Allow { .. } => OperatingEnvelopeEvidenceState::Pass,
+        GovernorDecision::Throttle { .. }
+        | GovernorDecision::Offload { .. }
+        | GovernorDecision::Override { .. } => OperatingEnvelopeEvidenceState::Warn,
+        GovernorDecision::Block { .. } => OperatingEnvelopeEvidenceState::Blocked,
     }
 }
 
@@ -1813,6 +1890,9 @@ fn scenario_domains(
     ));
     capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
     capacity.target_class_proof_state = OperatingEnvelopeProofState::NotRequired;
+    capacity.heavy_workload_governor_decision = Some(GovernorDecision::Allow {
+        reason: "within capacity".to_string(),
+    });
 
     let mut rch = OperatingEnvelopeRchSourceInput::new(fixture_provenance(
         "fixture.rch",
@@ -2108,6 +2188,11 @@ struct EnvelopeFacts {
     privacy_violation: bool,
     capacity_black: bool,
     capacity_red: bool,
+    capacity_governor_allow_heavy: bool,
+    capacity_governor_throttle_heavy: bool,
+    capacity_governor_offload_heavy: bool,
+    capacity_governor_block_heavy: bool,
+    capacity_governor_missing_heavy: bool,
     rch_no_worker: bool,
     rch_topology_failure: bool,
     rch_active_project_exclusion: bool,
@@ -2141,6 +2226,20 @@ impl EnvelopeFacts {
                 .any(|source| !source.redacted || source.raw_pane_content_stored),
             capacity_black: any_reason(&sources, &["capacity.black", "pressure.black"]),
             capacity_red: any_reason(&sources, &["capacity.red", "pressure.red"]),
+            capacity_governor_allow_heavy: any_reason(&sources, &["capacity.governor.allow_heavy"]),
+            capacity_governor_throttle_heavy: any_reason(
+                &sources,
+                &["capacity.governor.throttle_heavy"],
+            ),
+            capacity_governor_offload_heavy: any_reason(
+                &sources,
+                &["capacity.governor.offload_heavy"],
+            ),
+            capacity_governor_block_heavy: any_reason(&sources, &["capacity.governor.block_heavy"]),
+            capacity_governor_missing_heavy: any_reason(
+                &sources,
+                &["capacity.governor.missing_heavy"],
+            ),
             rch_no_worker: any_reason(
                 &sources,
                 &[
@@ -2328,6 +2427,16 @@ fn decision_for(
                 0,
                 0,
             )
+        } else if facts.capacity_governor_block_heavy {
+            push_unique(&mut reason_codes, "capacity.governor.block_heavy");
+            (
+                OperatingEnvelopeOutcome::Block,
+                OperatingEnvelopeTier::Black,
+                OperatingEnvelopeConfidence::Measured,
+                dirty_tree_state(facts),
+                0,
+                0,
+            )
         } else if facts.rch_contradiction() {
             push_unique(&mut reason_codes, "fail_closed.block_contradiction");
             push_unique(&mut reason_codes, "rch.evidence_contradictory");
@@ -2357,6 +2466,28 @@ fn decision_for(
                 OperatingEnvelopeConfidence::Measured,
                 dirty_tree_state(facts),
                 0,
+                0,
+            )
+        } else if facts.capacity_governor_missing_heavy {
+            push_unique(&mut reason_codes, "capacity.governor.missing_heavy");
+            push_unique(&mut reason_codes, "fail_closed.lower_missing");
+            push_unique(&mut reason_codes, "telemetry.required_source_missing");
+            (
+                OperatingEnvelopeOutcome::Defer,
+                OperatingEnvelopeTier::Orange,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
+                0,
+            )
+        } else if facts.capacity_governor_throttle_heavy {
+            push_unique(&mut reason_codes, "capacity.governor.throttle_heavy");
+            (
+                OperatingEnvelopeOutcome::Degrade,
+                OperatingEnvelopeTier::Yellow,
+                OperatingEnvelopeConfidence::Mixed,
+                dirty_tree_state(facts),
+                input.budgets.docs_static_checks,
                 0,
             )
         } else if facts.dirty_overlap || facts.active_owner {
@@ -2479,6 +2610,12 @@ fn decision_for(
 
     push_unique(&mut reason_codes, "policy.no_local_cargo_proof");
     push_unique(&mut reason_codes, "source.redacted_summary_only");
+    if facts.capacity_governor_allow_heavy {
+        push_unique(&mut reason_codes, "capacity.governor.allow_heavy");
+    }
+    if facts.capacity_governor_offload_heavy {
+        push_unique(&mut reason_codes, "capacity.governor.offload_heavy");
+    }
 
     OperatingEnvelopeDecision {
         decision_id: format!("decision-{}", slug(&input.envelope_id)),
@@ -2948,6 +3085,12 @@ mod tests {
             )
     }
 
+    fn heavy_governor_allow() -> GovernorDecision {
+        GovernorDecision::Allow {
+            reason: "within capacity".to_string(),
+        }
+    }
+
     fn adapter_domains() -> OperatingEnvelopeInputDomains {
         let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
             "capacity-resource-retained",
@@ -2955,6 +3098,7 @@ mod tests {
         ));
         capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
         capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(heavy_governor_allow());
 
         let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
             "rch-status-retained",
@@ -3416,6 +3560,114 @@ mod tests {
     }
 
     #[test]
+    fn capacity_governor_block_blocks_heavy_admission() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-block-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(GovernorDecision::Block {
+            reason: "heavy workload over capacity".to_string(),
+        });
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Block);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Black);
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.block_heavy".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_governor_throttle_degrades_heavy_admission() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-throttle-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(GovernorDecision::Throttle {
+            delay_ms: 2_000,
+            reason: "heavy concurrency limit".to_string(),
+        });
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Yellow);
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert_eq!(window_ids(&plan), vec!["docs_only"]);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.throttle_heavy".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_governor_offload_keeps_remote_proof_window() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-offload-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(GovernorDecision::Offload {
+            reason: "heavy concurrency limit, rch available".to_string(),
+        });
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Admit);
+        assert_eq!(plan.decision.max_parallel_proofs, 8);
+        assert!(window_ids(&plan).contains(&"proof_only"));
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.offload_heavy".to_string())
+        );
+    }
+
+    #[test]
+    fn capacity_governor_missing_heavy_telemetry_fails_closed() {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-governor-missing-retained",
+            "capacity governor evaluate heavy",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        domains.capacity_resource = capacity.to_source_snapshot();
+
+        let plan = plan_with(domains);
+
+        assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Defer);
+        assert_eq!(plan.decision.envelope_tier, OperatingEnvelopeTier::Orange);
+        assert_eq!(plan.decision.max_parallel_proofs, 0);
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"capacity.governor.missing_heavy".to_string())
+        );
+        assert!(
+            plan.decision
+                .reason_codes
+                .contains(&"telemetry.required_source_missing".to_string())
+        );
+    }
+
+    #[test]
     fn source_adapters_fail_closed_on_unknown_required_evidence() {
         let mut domains = adapter_domains();
         let mut capacity =
@@ -3550,17 +3802,13 @@ mod tests {
         )
         .unavailable("agent_mail.unavailable_after_retry");
 
-        let input = OperatingEnvelopePlannerInput::new(
-            NOW_MS,
-            "test-envelope",
-            "test-objective",
-            domains,
-        )
-        .target_class(
-            OperatingEnvelopeTargetClass::target_64_core_256g()
-                .proof_state(OperatingEnvelopeProofState::Measured),
-        )
-        .budgets(OperatingEnvelopeBudgets::conservative());
+        let input =
+            OperatingEnvelopePlannerInput::new(NOW_MS, "test-envelope", "test-objective", domains)
+                .target_class(
+                    OperatingEnvelopeTargetClass::target_64_core_256g()
+                        .proof_state(OperatingEnvelopeProofState::Measured),
+                )
+                .budgets(OperatingEnvelopeBudgets::conservative());
 
         let plan = plan_operating_envelope(input);
         assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
