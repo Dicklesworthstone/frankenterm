@@ -308,6 +308,18 @@ impl AccessibilityPlatform {
         }
     }
 
+    /// Native assistive-technology framework name, when this is a
+    /// real OS-backed platform. `Synthetic` has no native framework.
+    #[must_use]
+    pub const fn native_screen_reader_framework(self) -> Option<&'static str> {
+        match self {
+            Self::MacosNsAccessibility => Some("NSAccessibility"),
+            Self::LinuxAtSpi => Some("AT-SPI"),
+            Self::WindowsUiAutomation => Some("UIAutomation"),
+            Self::Synthetic => None,
+        }
+    }
+
     /// Whether a real AT-framework adapter is wired today.
     ///
     /// All real platforms currently return `false` — the fixture
@@ -616,10 +628,9 @@ mod tests {
     #[test]
     fn empty_stream_is_a_violation() {
         let v = check_invariants(AccessibilityScenario::SteadyTyping, &[]);
-        assert!(
-            v.iter()
-                .any(|x| matches!(x, InvariantViolation::EmptyStream))
-        );
+        assert!(v
+            .iter()
+            .any(|x| matches!(x, InvariantViolation::EmptyStream)));
     }
 
     #[test]

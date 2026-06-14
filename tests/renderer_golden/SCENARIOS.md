@@ -38,7 +38,7 @@ under this catalog must conform to the same fixture format
 | 15 | `wide-gamut` | — | gap | ft-ruona | — |
 | 16 | `rtl-script` | `text-rtl-arabic-hebrew` | shipped | — | — |
 | 17 | `cjk-mixed` | `text-cjk-mixed` | shipped | — | — |
-| 18 | `screen-reader-active` | a11y event-stream contract (`gpu_regression_fuzz_report.rs`) | headless-shipped | ft-5pk4h (native) | — |
+| 18 | `screen-reader-active` | a11y event-stream + native comparator contract (`gpu_regression_fuzz_report.rs`) | headless-shipped | — | — |
 
 Status legend:
 
@@ -52,8 +52,10 @@ Status legend:
 - **headless-shipped** — a platform-agnostic headless contract ships and
   runs in CI (here, the `screen-reader-active` accessibility event-stream
   comparator in `crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`,
-  built on the `a11y_tree` contract); the native per-platform comparator
-  (AT-SPI / NSAccessibility / UIAutomation) is the named follow-up `ft-5pk4h`
+  built on the `a11y_tree` contract). The native per-platform comparator
+  contract (AT-SPI / NSAccessibility / UIAutomation) is also present there;
+  live OS recorder availability is reported as `skipped`, not green, when a
+  worker lacks the native AT service.
 
 ## Existing fixtures not in the bead's 18
 
@@ -93,8 +95,8 @@ Cross-references:
   `tests/golden/gpu/` inventory; the non-a11y **gap** and **partial**
   rows above flow into `ft-ruona`, and `screen-reader-active` ships its
   headless a11y event-stream contract under `ft-0q5zm` (see
-  `gpu_regression_fuzz_report.rs`), with the native per-platform
-  comparator tracked by `ft-5pk4h`
+  `gpu_regression_fuzz_report.rs`) plus the native per-platform comparator
+  result contract from `ft-5pk4h`
 - RQ-S4 (24h fuzz, 0 critical artifacts) in the SLO catalog now has a
   concrete seed-generator owner — the comparator already exists
   (`compare_images`), so the integration bead is just plumbing
@@ -149,9 +151,10 @@ the contract module agree on `tests/golden/gpu/`.
   `screen_reader_active_golden`, `screen_reader_active_violations` in
   `crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`, built on
   the `a11y_tree` contract) ships under `ft-0q5zm` and runs in CI. The
-  native per-platform comparator (AT-SPI / NSAccessibility /
-  UIAutomation) that records against a real assistive-tech client is
-  tracked by the follow-up `ft-5pk4h`.
+  native per-platform comparator result contract
+  (`compare_native_screen_reader_events`) records AT-SPI /
+  NSAccessibility / UIAutomation proof as pass/fail/skipped, so missing
+  OS assistive-tech services remain explicit instead of green.
 - Per-release attestation entry at
   `docs/attestations/render-parity-<version>.json` (depends on
   `BR-RC-FOUNDATION.G3.1` / `ft-syqcz.1` attestation graph schema).

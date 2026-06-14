@@ -46,8 +46,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::a11y_tree::{
-    AccessibilityEvent, AccessibilityPlatform, AccessibilityScenario, AnnouncePriority,
-    InvariantViolation, check_invariants,
+    check_invariants, AccessibilityEvent, AccessibilityPlatform, AccessibilityScenario,
+    AnnouncePriority, InvariantViolation,
 };
 
 // ============================================================================
@@ -333,10 +333,10 @@ pub enum ScenarioStatus {
     BlockedOnSubBead,
     /// A platform-agnostic, headless contract scenario ships and
     /// runs in CI (e.g. `screen-reader-active` via the
-    /// [`crate::a11y_tree`] event-stream comparator). The native
-    /// per-platform comparator (AT-SPI / `NSAccessibility` /
-    /// UIAutomation) is still a tracked follow-up, named in
-    /// `blocked_on`.
+    /// [`crate::a11y_tree`] event-stream comparator). Native
+    /// per-platform recorder proof is represented by an explicit
+    /// pass/fail/skipped comparison result so unavailable OS AT
+    /// services cannot be mistaken for green proof.
     HeadlessShipped,
 }
 
@@ -396,14 +396,9 @@ pub fn scenario_manifest() -> Vec<ScenarioRecord> {
         row("cjk-mixed", &[], Shipped, None),
         // The headless a11y event-stream contract for this scenario
         // ships here (see `screen_reader_active_golden` /
-        // `screen_reader_active_violations`); the native per-platform
-        // comparator is tracked by ft-5pk4h.
-        row(
-            "screen-reader-active",
-            &[],
-            HeadlessShipped,
-            Some("ft-5pk4h"),
-        ),
+        // `screen_reader_active_violations`) alongside the native
+        // per-platform comparator result contract.
+        row("screen-reader-active", &[], HeadlessShipped, None),
     ]
 }
 
@@ -599,6 +594,133 @@ pub fn screen_reader_active_violations(
     }
 
     violations
+}
+
+/// Availability of the native OS recorder that supplied an event
+/// stream for [`compare_native_screen_reader_events`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NativeScreenReaderRecorderState {
+    /// The platform recorder ran and produced an event stream.
+    Available,
+    /// The platform recorder could not run; the comparison is
+    /// retained as an explicit skip instead of silently passing.
+    Unavailable { reason: String },
+}
+
+impl NativeScreenReaderRecorderState {
+    /// Convenience constructor for available recorder state.
+    #[must_use]
+    pub const fn available() -> Self {
+        Self::Available
+    }
+
+    /// Convenience constructor for skipped recorder state.
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+/// Verdict for the native screen-reader comparator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeScreenReaderComparisonStatus {
+    /// Native recorder output satisfied the screen-reader contract.
+    Pass,
+    /// Native recorder output ran and violated the contract.
+    Fail,
+    /// Native recorder did not run; the missing platform proof is
+    /// represented explicitly and must not be counted as green.
+    Skipped,
+}
+
+/// Retained comparison result for `screen-reader-active` against a
+/// native platform recorder (AT-SPI / `NSAccessibility` / UIAutomation).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeScreenReaderComparison {
+    pub scenario_slug: String,
+    pub platform: AccessibilityPlatform,
+    pub framework: String,
+    pub screen_reader_active: bool,
+    pub recorder_state: NativeScreenReaderRecorderState,
+    pub status: NativeScreenReaderComparisonStatus,
+    pub violations: Vec<ScreenReaderContractViolation>,
+}
+
+impl NativeScreenReaderComparison {
+    #[must_use]
+    pub const fn passed(&self) -> bool {
+        matches!(self.status, NativeScreenReaderComparisonStatus::Pass)
+    }
+
+    #[must_use]
+    pub const fn skipped(&self) -> bool {
+        matches!(self.status, NativeScreenReaderComparisonStatus::Skipped)
+    }
+}
+
+/// Compare a native screen-reader recorder stream against the
+/// `screen-reader-active` contract.
+///
+/// This is intentionally split from live OS probing: macOS VoiceOver,
+/// Linux Orca/AT-SPI, and Windows Narrator/UIA availability varies by
+/// worker. Callers pass the recorder availability they observed, and
+/// this function records `skipped` when native proof was unavailable.
+#[must_use]
+pub fn compare_native_screen_reader_events(
+    session: ScreenReaderSession,
+    recorder_state: NativeScreenReaderRecorderState,
+    events: &[AccessibilityEvent],
+) -> NativeScreenReaderComparison {
+    let Some(framework) = session.platform.native_screen_reader_framework() else {
+        return NativeScreenReaderComparison {
+            scenario_slug: SCREEN_READER_ACTIVE_SLUG.to_string(),
+            platform: session.platform,
+            framework: "synthetic".to_string(),
+            screen_reader_active: session.active,
+            recorder_state: NativeScreenReaderRecorderState::unavailable(
+                "synthetic platform is covered by the headless contract, not the native comparator",
+            ),
+            status: NativeScreenReaderComparisonStatus::Skipped,
+            violations: Vec::new(),
+        };
+    };
+
+    if !recorder_state.is_available() {
+        return NativeScreenReaderComparison {
+            scenario_slug: SCREEN_READER_ACTIVE_SLUG.to_string(),
+            platform: session.platform,
+            framework: framework.to_string(),
+            screen_reader_active: session.active,
+            recorder_state,
+            status: NativeScreenReaderComparisonStatus::Skipped,
+            violations: Vec::new(),
+        };
+    }
+
+    let violations = screen_reader_active_violations(session, events);
+    let status = if violations.is_empty() {
+        NativeScreenReaderComparisonStatus::Pass
+    } else {
+        NativeScreenReaderComparisonStatus::Fail
+    };
+    NativeScreenReaderComparison {
+        scenario_slug: SCREEN_READER_ACTIVE_SLUG.to_string(),
+        platform: session.platform,
+        framework: framework.to_string(),
+        screen_reader_active: session.active,
+        recorder_state,
+        status,
+        violations,
+    }
 }
 
 // ============================================================================
@@ -898,8 +1020,8 @@ mod tests {
                 ScenarioStatus::HeadlessShipped => {
                     assert_eq!(
                         scenario.blocked_on.as_deref(),
-                        Some("ft-5pk4h"),
-                        "headless scenario {} should point at its per-platform follow-up",
+                        None,
+                        "headless scenario {} has its native comparator contract",
                         scenario.slug
                     );
                 }
@@ -990,15 +1112,104 @@ mod tests {
         assert_eq!(row.status, ScenarioStatus::HeadlessShipped);
         assert_eq!(
             row.blocked_on.as_deref(),
-            Some("ft-5pk4h"),
-            "headless contract must track its per-platform follow-up"
+            None,
+            "native comparator contract has landed; live recorder availability is explicit"
         );
-        // No native AT framework is wired yet; the headless
-        // Synthetic contract stands in until ft-5pk4h lands.
+        // No live native AT recorder is wired yet; the comparator
+        // reports skipped when the platform recorder is unavailable.
         assert!(!AccessibilityPlatform::MacosNsAccessibility.is_wired());
         assert!(!AccessibilityPlatform::LinuxAtSpi.is_wired());
         assert!(!AccessibilityPlatform::WindowsUiAutomation.is_wired());
         assert!(AccessibilityPlatform::Synthetic.is_wired());
+    }
+
+    #[test]
+    fn native_screen_reader_frameworks_are_named() {
+        assert_eq!(
+            AccessibilityPlatform::MacosNsAccessibility.native_screen_reader_framework(),
+            Some("NSAccessibility")
+        );
+        assert_eq!(
+            AccessibilityPlatform::LinuxAtSpi.native_screen_reader_framework(),
+            Some("AT-SPI")
+        );
+        assert_eq!(
+            AccessibilityPlatform::WindowsUiAutomation.native_screen_reader_framework(),
+            Some("UIAutomation")
+        );
+        assert_eq!(
+            AccessibilityPlatform::Synthetic.native_screen_reader_framework(),
+            None
+        );
+    }
+
+    #[test]
+    fn native_screen_reader_comparator_passes_platform_golden() {
+        let session = ScreenReaderSession::active(AccessibilityPlatform::MacosNsAccessibility);
+        let events = screen_reader_active_golden(session);
+
+        let comparison = compare_native_screen_reader_events(
+            session,
+            NativeScreenReaderRecorderState::available(),
+            &events,
+        );
+
+        assert!(comparison.passed(), "{comparison:?}");
+        assert_eq!(comparison.framework, "NSAccessibility");
+        assert!(comparison.violations.is_empty());
+    }
+
+    #[test]
+    fn native_screen_reader_comparator_fails_missing_announcement() {
+        let session = ScreenReaderSession::active(AccessibilityPlatform::LinuxAtSpi);
+        let events = vec![AccessibilityEvent::FocusChanged {
+            ts_ms: 0,
+            role: "Terminal".to_string(),
+            name: "pane:1".to_string(),
+        }];
+
+        let comparison = compare_native_screen_reader_events(
+            session,
+            NativeScreenReaderRecorderState::available(),
+            &events,
+        );
+
+        assert_eq!(comparison.status, NativeScreenReaderComparisonStatus::Fail);
+        assert_eq!(comparison.framework, "AT-SPI");
+        assert!(comparison
+            .violations
+            .contains(&ScreenReaderContractViolation::ActiveSessionMissingAnnouncement));
+    }
+
+    #[test]
+    fn native_screen_reader_comparator_skips_unavailable_recorder() {
+        let session = ScreenReaderSession::active(AccessibilityPlatform::WindowsUiAutomation);
+        let events = screen_reader_active_golden(session);
+
+        let comparison = compare_native_screen_reader_events(
+            session,
+            NativeScreenReaderRecorderState::unavailable("Narrator is not running on this worker"),
+            &events,
+        );
+
+        assert!(comparison.skipped(), "{comparison:?}");
+        assert_eq!(comparison.framework, "UIAutomation");
+        assert!(comparison.violations.is_empty());
+    }
+
+    #[test]
+    fn native_screen_reader_comparator_rejects_synthetic_platform() {
+        let session = ScreenReaderSession::active(AccessibilityPlatform::Synthetic);
+        let events = screen_reader_active_golden(session);
+
+        let comparison = compare_native_screen_reader_events(
+            session,
+            NativeScreenReaderRecorderState::available(),
+            &events,
+        );
+
+        assert!(comparison.skipped(), "{comparison:?}");
+        assert_eq!(comparison.framework, "synthetic");
     }
 
     #[test]
@@ -1019,12 +1230,14 @@ mod tests {
         let s = coverage_snapshot();
         assert_eq!(s.scenarios_total, 18);
         // The catalog has 4 fully shipped rows, 2 partial rows
-        // that need additive coverage, 11 non-a11y gap rows,
-        // and one a11y scenario blocked on its comparator.
+        // that need additive coverage, 11 non-a11y gap rows, and
+        // one a11y scenario with a headless + native comparator
+        // contract.
         assert_eq!(s.shipped, 4);
         assert_eq!(s.partial, 2);
         assert_eq!(s.gap, 11);
-        assert_eq!(s.blocked, 1);
+        assert_eq!(s.blocked, 0);
+        assert_eq!(s.headless_shipped, 1);
         assert_eq!(s.shipped + s.partial, 6);
         assert_eq!(s.partial + s.gap, 13);
     }
