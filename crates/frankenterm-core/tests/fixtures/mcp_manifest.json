@@ -1780,6 +1780,15 @@
             "description": "Preview without sending",
             "type": "boolean"
           },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
           "pane_id": {
             "description": "Pane ID to send to",
             "minimum": 0,
