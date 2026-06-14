@@ -24886,17 +24886,10 @@ async fn distributed_persist_payload(
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(&canonical_sender, gap.pane_id);
-            let seq_key = (sequence_scope.clone(), gap.pane_id);
-            let previous_seq;
-            {
-                let mut seq_guard = pane_seq_by_sender.lock().await;
-                previous_seq = seq_guard.get(&seq_key).copied();
-                let next_expected_seq = gap.seq_after.saturating_sub(1);
-                seq_guard
-                    .entry(seq_key.clone())
-                    .and_modify(|current| *current = (*current).max(next_expected_seq))
-                    .or_insert(next_expected_seq);
-            }
+            // A GapNotice is forensic evidence from the sender, not proof that
+            // all intermediate pane deltas were observed by the aggregator. Keep
+            // the delta acceptance frontier driven only by accepted PaneDelta
+            // payloads; otherwise a forged high seq_after can silence the pane.
 
             let persist_result: anyhow::Result<()> = async {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -24938,18 +24931,6 @@ async fn distributed_persist_payload(
                 Ok(())
             }
             .await;
-
-            if persist_result.is_err() {
-                let mut seq_guard = pane_seq_by_sender.lock().await;
-                match previous_seq {
-                    Some(previous_seq) => {
-                        seq_guard.insert(seq_key, previous_seq);
-                    }
-                    None => {
-                        seq_guard.remove(&seq_key);
-                    }
-                }
-            }
 
             persist_result?;
         }
@@ -64993,10 +64974,10 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_persist_payload_explicit_gap_advances_sender_sequence_tracker() {
+    fn distributed_persist_payload_explicit_gap_does_not_advance_sender_sequence_tracker() {
         run_async_test(async {
             let (storage_handle, db_path) =
-                setup_storage("distributed_explicit_gap_advances_sender_tracker").await;
+                setup_storage("distributed_explicit_gap_does_not_advance_sender_tracker").await;
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
@@ -65036,8 +65017,8 @@ recorder_backend = "frankensqlite"
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
                         seq_before: 0,
-                        seq_after: 4,
-                        reason: "timeout".to_string(),
+                        seq_after: u64::MAX,
+                        reason: "forged-high-gap".to_string(),
                         detected_at_ms: now_ms_i64(),
                     },
                 ),
@@ -65054,7 +65035,7 @@ recorder_backend = "frankensqlite"
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 4,
+                        seq: 1,
                         content: "after-gap".to_string(),
                         content_len: "after-gap".len(),
                         captured_at_ms: now_ms(),
@@ -65075,15 +65056,33 @@ recorder_backend = "frankensqlite"
                     .filter(|gap| gap.pane_id == remote_pane_id)
                     .collect();
                 assert_eq!(pane_gaps.len(), 1);
-                assert_eq!(pane_gaps[0].reason, "distributed_gap:timeout:0:4");
+                assert_eq!(
+                    pane_gaps.first().map(|gap| gap.reason.as_str()),
+                    Some("distributed_gap:forged-high-gap:0:18446744073709551615")
+                );
 
                 let segments = storage_handle
                     .get_segments(remote_pane_id, 10)
                     .await
                     .unwrap();
                 assert_eq!(segments.len(), 2);
-                assert_eq!(segments[0].content, "after-gap");
-                assert_eq!(segments[1].content, "before-gap");
+                assert_eq!(
+                    segments.first().map(|segment| segment.content.as_str()),
+                    Some("after-gap")
+                );
+                assert_eq!(
+                    segments.get(1).map(|segment| segment.content.as_str()),
+                    Some("before-gap")
+                );
+            }
+
+            {
+                let pane_seq_guard = pane_seq_by_sender.lock().await;
+                assert_eq!(
+                    pane_seq_guard.get(&(sender.to_string(), source_pane_id)),
+                    Some(&1),
+                    "accepted PaneDelta payloads, not explicit gaps, advance the sequence tracker"
+                );
             }
 
             {
