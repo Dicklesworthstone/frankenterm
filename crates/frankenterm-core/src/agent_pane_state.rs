@@ -65,6 +65,141 @@ impl AgentPaneState {
     pub fn is_alert(&self) -> bool {
         matches!(self, Self::Stuck)
     }
+
+    /// Lowercase, parse-stable token for `ft robot await state:<pane>:<token>`
+    /// condition specs (ft-7h5da.4.3). Counterpart to the uppercase display
+    /// [`label`](Self::label); round-trips with [`from_token`](Self::from_token).
+    #[must_use]
+    pub fn as_token(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Thinking => "thinking",
+            Self::Stuck => "stuck",
+            Self::Idle => "idle",
+            Self::Human => "human",
+        }
+    }
+
+    /// Parse a `state:` condition token (case-insensitive, surrounding
+    /// whitespace ignored) into a classification. Returns `None` for an
+    /// unrecognized token so callers can emit a precise parse error
+    /// (ft-7h5da.4.3).
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "active" => Some(Self::Active),
+            "thinking" => Some(Self::Thinking),
+            "stuck" => Some(Self::Stuck),
+            "idle" => Some(Self::Idle),
+            "human" => Some(Self::Human),
+            _ => None,
+        }
+    }
+}
+
+/// A parsed `ft robot await` pane-state/quiescence condition (ft-7h5da.4.3).
+///
+/// These generalize `wait-for` over the watcher's pane-state classification and
+/// quiescence, alongside the event-`rule:` source the CLI already supports. The
+/// parsing + matching logic lives here (pure, unit-tested via
+/// `cargo test -p frankenterm-core --lib`) so the CLI and any MCP mirror
+/// (ft-7h5da.4.4) share one implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwaitPaneCondition {
+    /// `state:<pane>:<class>` — pane's classification equals `class`.
+    State { pane_id: u64, class: AgentPaneState },
+    /// `quiescence:<pane>[:<idle_ms>]` — no output for at least `idle_ms`
+    /// (defaults to the agent-detection `idle_silence_ms` when omitted).
+    Quiescence { pane_id: u64, idle_ms: Option<u64> },
+}
+
+impl AwaitPaneCondition {
+    /// Parse a `state:` / `quiescence:` condition spec. Returns `Ok(None)` when
+    /// the spec is neither (the caller handles `rule:` and unknown sources);
+    /// `Err` for a recognized-but-malformed spec so the CLI fails fast with a
+    /// precise message instead of blocking forever on an uninterpretable
+    /// condition.
+    ///
+    /// # Errors
+    /// Returns a human-readable message for a malformed pane id, class token,
+    /// or idle threshold.
+    pub fn parse(spec: &str) -> Result<Option<Self>, String> {
+        let spec = spec.trim();
+        if let Some(rest) = spec.strip_prefix("state:") {
+            // state:<pane>:<class>
+            let (pane_part, class_part) = rest.split_once(':').ok_or_else(|| {
+                format!("condition `{spec}`: expected `state:<pane>:<class>`")
+            })?;
+            let pane_id = pane_part.trim().parse::<u64>().map_err(|_| {
+                format!("condition `{spec}`: invalid pane id `{}`", pane_part.trim())
+            })?;
+            let class = AgentPaneState::from_token(class_part).ok_or_else(|| {
+                format!(
+                    "condition `{spec}`: unknown pane-state `{}` \
+                     (expected active|thinking|stuck|idle|human)",
+                    class_part.trim()
+                )
+            })?;
+            Ok(Some(Self::State { pane_id, class }))
+        } else if let Some(rest) = spec.strip_prefix("quiescence:") {
+            // quiescence:<pane>[:<idle_ms>]
+            let mut parts = rest.splitn(2, ':');
+            let pane_part = parts.next().unwrap_or("");
+            let pane_id = pane_part.trim().parse::<u64>().map_err(|_| {
+                format!("condition `{spec}`: invalid pane id `{}`", pane_part.trim())
+            })?;
+            let idle_ms = match parts.next() {
+                Some(ms) if !ms.trim().is_empty() => {
+                    Some(ms.trim().parse::<u64>().map_err(|_| {
+                        format!("condition `{spec}`: invalid idle_ms `{}`", ms.trim())
+                    })?)
+                }
+                _ => None,
+            };
+            Ok(Some(Self::Quiescence { pane_id, idle_ms }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The pane id this condition targets.
+    #[must_use]
+    pub fn pane_id(&self) -> u64 {
+        match self {
+            Self::State { pane_id, .. } | Self::Quiescence { pane_id, .. } => *pane_id,
+        }
+    }
+
+    /// Evaluate the condition against an observed pane snapshot. `observed_state`
+    /// is the pane's current classification (or `None` if unknown), and
+    /// `last_output_ms`/`now_ms` drive the quiescence window. Returns whether
+    /// the condition is currently satisfied.
+    #[must_use]
+    pub fn matches(
+        &self,
+        observed_state: Option<AgentPaneState>,
+        last_output_ms: u64,
+        now_ms: u64,
+        config: &AgentDetectionConfig,
+    ) -> bool {
+        match self {
+            Self::State { class, .. } => observed_state == Some(*class),
+            Self::Quiescence { idle_ms, .. } => {
+                let threshold = idle_ms.unwrap_or(config.idle_silence_ms);
+                pane_is_quiescent(last_output_ms, now_ms, threshold)
+            }
+        }
+    }
+}
+
+/// Pure quiescence predicate for `ft robot await quiescence:<pane>`
+/// (ft-7h5da.4.3): a pane is quiescent when no output has been observed for at
+/// least `quiescent_after_ms`. Derivable from the latest captured segment's
+/// timestamp, so it needs no in-process watcher gauge. `now_ms < last_output_ms`
+/// (clock skew) saturates to "not quiescent".
+#[must_use]
+pub fn pane_is_quiescent(last_output_ms: u64, now_ms: u64, quiescent_after_ms: u64) -> bool {
+    now_ms.saturating_sub(last_output_ms) >= quiescent_after_ms
 }
 
 /// Configuration for agent pane state detection thresholds.
@@ -206,6 +341,103 @@ pub enum AutoLayoutPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_pane_state_token_round_trips() {
+        for state in [
+            AgentPaneState::Active,
+            AgentPaneState::Thinking,
+            AgentPaneState::Stuck,
+            AgentPaneState::Idle,
+            AgentPaneState::Human,
+        ] {
+            assert_eq!(AgentPaneState::from_token(state.as_token()), Some(state));
+        }
+        // Case-insensitive + whitespace-tolerant.
+        assert_eq!(AgentPaneState::from_token("  STUCK "), Some(AgentPaneState::Stuck));
+        assert_eq!(AgentPaneState::from_token("Idle"), Some(AgentPaneState::Idle));
+        // Unknown token rejected.
+        assert_eq!(AgentPaneState::from_token("bogus"), None);
+        assert_eq!(AgentPaneState::from_token(""), None);
+    }
+
+    #[test]
+    fn pane_is_quiescent_threshold() {
+        // Exactly at the threshold counts as quiescent.
+        assert!(pane_is_quiescent(0, 60_000, 60_000));
+        assert!(pane_is_quiescent(1_000, 61_000, 60_000));
+        // Below threshold is not quiescent.
+        assert!(!pane_is_quiescent(0, 59_999, 60_000));
+        // Clock skew (now < last_output) saturates to not-quiescent.
+        assert!(!pane_is_quiescent(100_000, 50_000, 10_000));
+    }
+
+    #[test]
+    fn await_pane_condition_parse_state() {
+        let cond = AwaitPaneCondition::parse("state:7:stuck").unwrap().unwrap();
+        assert_eq!(
+            cond,
+            AwaitPaneCondition::State {
+                pane_id: 7,
+                class: AgentPaneState::Stuck
+            }
+        );
+        assert_eq!(cond.pane_id(), 7);
+        // Unknown class → precise error, not a silent block.
+        assert!(AwaitPaneCondition::parse("state:7:bogus").is_err());
+        // Missing class.
+        assert!(AwaitPaneCondition::parse("state:7").is_err());
+        // Bad pane id.
+        assert!(AwaitPaneCondition::parse("state:x:idle").is_err());
+    }
+
+    #[test]
+    fn await_pane_condition_parse_quiescence() {
+        assert_eq!(
+            AwaitPaneCondition::parse("quiescence:3").unwrap().unwrap(),
+            AwaitPaneCondition::Quiescence {
+                pane_id: 3,
+                idle_ms: None
+            }
+        );
+        assert_eq!(
+            AwaitPaneCondition::parse("quiescence:3:2500").unwrap().unwrap(),
+            AwaitPaneCondition::Quiescence {
+                pane_id: 3,
+                idle_ms: Some(2500)
+            }
+        );
+        assert!(AwaitPaneCondition::parse("quiescence:x").is_err());
+        assert!(AwaitPaneCondition::parse("quiescence:3:bad").is_err());
+        // Non-state/quiescence specs return Ok(None) for the caller to handle.
+        assert_eq!(AwaitPaneCondition::parse("rule:codex.*").unwrap(), None);
+    }
+
+    #[test]
+    fn await_pane_condition_matches() {
+        let config = AgentDetectionConfig::default();
+        let state_cond = AwaitPaneCondition::State {
+            pane_id: 1,
+            class: AgentPaneState::Stuck,
+        };
+        assert!(state_cond.matches(Some(AgentPaneState::Stuck), 0, 0, &config));
+        assert!(!state_cond.matches(Some(AgentPaneState::Active), 0, 0, &config));
+        // Unknown observed state never matches.
+        assert!(!state_cond.matches(None, 0, 0, &config));
+
+        let quiet = AwaitPaneCondition::Quiescence {
+            pane_id: 1,
+            idle_ms: Some(5_000),
+        };
+        assert!(quiet.matches(None, 10_000, 20_000, &config)); // 10s silence ≥ 5s
+        assert!(!quiet.matches(None, 18_000, 20_000, &config)); // 2s silence < 5s
+        // Default threshold falls back to config.idle_silence_ms.
+        let quiet_default = AwaitPaneCondition::Quiescence {
+            pane_id: 1,
+            idle_ms: None,
+        };
+        assert!(quiet_default.matches(None, 0, config.idle_silence_ms, &config));
+    }
 
     #[test]
     fn human_pane_always_returns_human() {
