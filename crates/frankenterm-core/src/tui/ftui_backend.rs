@@ -3,14 +3,14 @@
 //! Implements the Elm-style `Model` trait from `ftui::runtime` to drive the
 //! wa interactive terminal UI.  The app shell handles:
 //!
-//! - View routing (Home, Panes, Events, Triage, History, Search, Help)
+//! - View routing (Home, Panes, Events, Triage, History, Search, Help, Deck)
 //! - Tab bar rendering with highlighted active view
 //! - Global keybindings (Tab always; character shortcuts when the active view
 //!   does not own that character input)
 //! - Periodic data refresh via background tasks
 //!
 //! All view bodies (Home, Panes, Search, Help, Events, Triage, History,
-//! Timeline) are backed by live state — no placeholders remain.
+//! Timeline, Deck) are backed by live state — no placeholders remain.
 //!
 //! # Architecture
 //!
@@ -55,6 +55,8 @@ pub enum View {
     Help,
     /// Unified event timeline with cross-pane correlations (wa-6sk.4).
     Timeline,
+    /// Operator deck composing fleet, attention, approval, and intervention surfaces.
+    Deck,
 }
 
 impl View {
@@ -69,6 +71,7 @@ impl View {
             Self::Search => "Search",
             Self::Help => "Help",
             Self::Timeline => "Timeline",
+            Self::Deck => "Deck",
         }
     }
 
@@ -83,10 +86,11 @@ impl View {
             Self::Search,
             Self::Help,
             Self::Timeline,
+            Self::Deck,
         ]
     }
 
-    /// Shortcut key for direct navigation (1-8).
+    /// Shortcut key for direct navigation (1-9).
     #[must_use]
     pub const fn shortcut(&self) -> char {
         match self {
@@ -98,6 +102,7 @@ impl View {
             Self::Search => '6',
             Self::Help => '7',
             Self::Timeline => '8',
+            Self::Deck => '9',
         }
     }
 
@@ -112,7 +117,8 @@ impl View {
             Self::History => Self::Search,
             Self::Search => Self::Help,
             Self::Help => Self::Timeline,
-            Self::Timeline => Self::Home,
+            Self::Timeline => Self::Deck,
+            Self::Deck => Self::Home,
         }
     }
 
@@ -120,7 +126,7 @@ impl View {
     #[must_use]
     pub const fn prev(&self) -> Self {
         match self {
-            Self::Home => Self::Timeline,
+            Self::Home => Self::Deck,
             Self::Panes => Self::Home,
             Self::Events => Self::Panes,
             Self::Triage => Self::Events,
@@ -128,6 +134,7 @@ impl View {
             Self::Search => Self::History,
             Self::Help => Self::Search,
             Self::Timeline => Self::Help,
+            Self::Deck => Self::Timeline,
         }
     }
 
@@ -142,6 +149,7 @@ impl View {
             '6' => Some(Self::Search),
             '7' => Some(Self::Help),
             '8' => Some(Self::Timeline),
+            '9' => Some(Self::Deck),
             _ => None,
         }
     }
@@ -655,6 +663,7 @@ impl WaModel {
             View::History => self.handle_history_key(key),
             View::Search => self.handle_search_key(key),
             View::Timeline => self.handle_timeline_key(key),
+            View::Deck => self.handle_deck_key(key),
             _ => ftui::Cmd::None,
         }
     }
@@ -864,6 +873,53 @@ impl WaModel {
                 ftui::Cmd::None
             }
             _ => ftui::Cmd::None,
+        }
+    }
+
+    /// Handle operator-deck shortcuts.
+    ///
+    /// The deck never creates decisions. It only queues commands that already
+    /// arrived through the existing triage action feed.
+    fn handle_deck_key(&mut self, key: &ftui::KeyEvent) -> ftui::Cmd<WaMsg> {
+        use ftui::KeyCode;
+
+        let plain_char = !has_command_modifier(key);
+        match key.code {
+            KeyCode::Char('a') if plain_char => {
+                self.queue_first_deck_action("Approve", is_approval_command);
+                ftui::Cmd::None
+            }
+            KeyCode::Char('i') if plain_char => {
+                self.queue_first_deck_action("Intervention", is_intervention_command);
+                ftui::Cmd::None
+            }
+            KeyCode::Enter => {
+                self.view_state.current_view = View::Triage;
+                ftui::Cmd::None
+            }
+            _ => ftui::Cmd::None,
+        }
+    }
+
+    fn queue_first_deck_action(&mut self, title: &str, predicate: fn(&str) -> bool) {
+        let command = self
+            .triage_items
+            .iter()
+            .flat_map(|item| item.action_commands.iter().zip(item.action_labels.iter()))
+            .find(|(command, _)| predicate(command))
+            .map(|(command, label)| (command.clone(), label.clone()));
+
+        if let Some((command, label)) = command {
+            self.show_modal(ModalState::confirm(
+                format!("{title} Action"),
+                format!("Run \"{label}\"?\n\n  {command}"),
+                ConfirmAction::ExecuteCommand(command),
+            ));
+        } else {
+            self.show_modal(ModalState::info(
+                format!("{title} Action"),
+                format!("No {title} command is currently present in the attention feed."),
+            ));
         }
     }
 
@@ -1630,7 +1686,7 @@ impl WaModel {
                 Some(ftui::Cmd::None)
             }
             // In Events/Triage/History views, digits go to view-specific handlers.
-            KeyCode::Char(ch @ '1'..='8')
+            KeyCode::Char(ch @ '1'..='9')
                 if plain_char && !has_text_input && !in_events && !in_triage =>
             {
                 if let Some(view) = View::from_shortcut(ch) {
@@ -1812,6 +1868,18 @@ impl ftui::Model for WaModel {
                 self.timeline_selected,
                 self.timeline_zoom,
                 self.timeline_scroll,
+            ),
+            View::Deck => render_deck_view(
+                frame,
+                content_y,
+                width,
+                content_h,
+                self.health.as_ref(),
+                &self.panes,
+                &self.triage_items,
+                &self.workflows,
+                self.view_state.events.items.len(),
+                self.unhandled_count,
             ),
         }
 
@@ -2386,6 +2454,476 @@ fn render_home_footer(frame: &mut ftui::Frame, area: UiRect, error: Option<&str>
         CellStyle::new().fg(color_dark_gray())
     };
     write_styled_clipped(frame, area.x, area.y + 1, &msg, style, area.width);
+}
+
+fn is_approval_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains("ft approve")
+        || lower.contains("ft approvals approve")
+        || lower.contains(" robot approve ")
+}
+
+fn is_intervention_command(command: &str) -> bool {
+    command.to_ascii_lowercase().contains("ft intervene")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeckPaneBucket {
+    Active,
+    Thinking,
+    Stuck,
+    Idle,
+}
+
+impl DeckPaneBucket {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Thinking => "Thinking",
+            Self::Stuck => "Stuck",
+            Self::Idle => "Idle",
+        }
+    }
+
+    fn style(self) -> CellStyle {
+        match self {
+            Self::Active => CellStyle::new().fg(color_green()).bold(),
+            Self::Thinking => CellStyle::new().fg(color_cyan()),
+            Self::Stuck => CellStyle::new().fg(color_yellow()).bold(),
+            Self::Idle => CellStyle::new().fg(color_dark_gray()),
+        }
+    }
+}
+
+fn deck_pane_bucket(pane: &PaneRow) -> DeckPaneBucket {
+    if !pane.unhandled_badge.is_empty() {
+        return DeckPaneBucket::Stuck;
+    }
+    match pane.state_label.as_str() {
+        "PromptActive" => DeckPaneBucket::Active,
+        "CommandRunning" => DeckPaneBucket::Thinking,
+        "AltScreen" => DeckPaneBucket::Active,
+        _ => DeckPaneBucket::Idle,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_deck_view(
+    frame: &mut ftui::Frame,
+    y: u16,
+    width: u16,
+    height: u16,
+    health: Option<&HealthModel>,
+    panes: &[PaneRow],
+    triage_items: &[TriageRow],
+    workflows: &[WorkflowRow],
+    event_count: usize,
+    unhandled_count: usize,
+) {
+    if height == 0 {
+        return;
+    }
+
+    let viewport = viewport_class(width, height);
+    let header_h = height.min(3);
+    let header = UiRect::new(0, y, width, header_h);
+    render_deck_header(
+        frame,
+        header,
+        health,
+        panes.len(),
+        triage_items.len(),
+        event_count,
+        unhandled_count,
+    );
+
+    let body_y = y.saturating_add(header_h);
+    let body_h = height.saturating_sub(header_h);
+    if body_h == 0 {
+        return;
+    }
+
+    if matches!(viewport, ViewportClass::Compact) {
+        let section_h = (body_h / 4).max(3);
+        let fleet_h = section_h.min(body_h);
+        let attention_h = section_h.min(body_h.saturating_sub(fleet_h));
+        let approval_h = section_h.min(body_h.saturating_sub(fleet_h + attention_h));
+        let intervention_h = body_h.saturating_sub(fleet_h + attention_h + approval_h);
+        render_deck_fleet_panel(frame, UiRect::new(0, body_y, width, fleet_h), panes);
+        render_deck_attention_panel(
+            frame,
+            UiRect::new(0, body_y + fleet_h, width, attention_h),
+            triage_items,
+        );
+        render_deck_approval_panel(
+            frame,
+            UiRect::new(0, body_y + fleet_h + attention_h, width, approval_h),
+            triage_items,
+        );
+        render_deck_intervention_panel(
+            frame,
+            UiRect::new(
+                0,
+                body_y + fleet_h + attention_h + approval_h,
+                width,
+                intervention_h,
+            ),
+            triage_items,
+            workflows,
+        );
+    } else {
+        let left_w = width / 2;
+        let right_w = width.saturating_sub(left_w);
+        let top_h = body_h / 2;
+        let bottom_h = body_h.saturating_sub(top_h);
+        render_deck_fleet_panel(frame, UiRect::new(0, body_y, left_w, top_h), panes);
+        render_deck_attention_panel(
+            frame,
+            UiRect::new(left_w, body_y, right_w, top_h),
+            triage_items,
+        );
+        render_deck_approval_panel(
+            frame,
+            UiRect::new(0, body_y + top_h, left_w, bottom_h),
+            triage_items,
+        );
+        render_deck_intervention_panel(
+            frame,
+            UiRect::new(left_w, body_y + top_h, right_w, bottom_h),
+            triage_items,
+            workflows,
+        );
+    }
+}
+
+fn render_deck_header(
+    frame: &mut ftui::Frame,
+    area: UiRect,
+    health: Option<&HealthModel>,
+    pane_count: usize,
+    triage_count: usize,
+    event_count: usize,
+    unhandled_count: usize,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let status = health.map_or("loading", |h| {
+        if h.watcher_label == "running" && h.db_label == "ok" {
+            "online"
+        } else {
+            "degraded"
+        }
+    });
+    write_segments(
+        frame,
+        area.x,
+        area.y,
+        area.width,
+        &[
+            ("Deck  ", CellStyle::new().fg(color_cyan()).bold()),
+            ("status=", CellStyle::new().fg(color_dark_gray())),
+            (status, status_style(status)),
+            ("  panes=", CellStyle::new().fg(color_dark_gray())),
+            (&pane_count.to_string(), CellStyle::new()),
+            ("  attention=", CellStyle::new().fg(color_dark_gray())),
+            (&triage_count.to_string(), CellStyle::new()),
+            ("  events=", CellStyle::new().fg(color_dark_gray())),
+            (&event_count.to_string(), CellStyle::new()),
+            ("  unhandled=", CellStyle::new().fg(color_dark_gray())),
+            (
+                &unhandled_count.to_string(),
+                CellStyle::new().fg(color_yellow()),
+            ),
+        ],
+    );
+    if area.height > 1 {
+        write_styled_clipped(
+            frame,
+            area.x,
+            area.y + 1,
+            "Composition only: fleet grid, attention list, approval queue, intervention handoff.",
+            CellStyle::new().fg(color_dark_gray()),
+            area.width,
+        );
+    }
+    if area.height > 2 {
+        write_styled_clipped(
+            frame,
+            area.x,
+            area.y + 2,
+            "Keys: a approve first queued approval | i run first intervention | Enter open Triage",
+            CellStyle::new().fg(color_dark_gray()),
+            area.width,
+        );
+    }
+}
+
+fn render_deck_fleet_panel(frame: &mut ftui::Frame, area: UiRect, panes: &[PaneRow]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    draw_block_all(frame, area, Some("Fleet Grid"));
+    let inner = area.inner_all();
+    if inner.height == 0 {
+        return;
+    }
+
+    let mut counts = [0usize; 4];
+    for pane in panes {
+        let idx = match deck_pane_bucket(pane) {
+            DeckPaneBucket::Active => 0,
+            DeckPaneBucket::Thinking => 1,
+            DeckPaneBucket::Stuck => 2,
+            DeckPaneBucket::Idle => 3,
+        };
+        counts[idx] += 1;
+    }
+
+    write_segments(
+        frame,
+        inner.x,
+        inner.y,
+        inner.width,
+        &[
+            (" Active ", DeckPaneBucket::Active.style()),
+            (&counts[0].to_string(), DeckPaneBucket::Active.style()),
+            ("  Thinking ", DeckPaneBucket::Thinking.style()),
+            (&counts[1].to_string(), DeckPaneBucket::Thinking.style()),
+            ("  Stuck ", DeckPaneBucket::Stuck.style()),
+            (&counts[2].to_string(), DeckPaneBucket::Stuck.style()),
+            ("  Idle ", DeckPaneBucket::Idle.style()),
+            (&counts[3].to_string(), DeckPaneBucket::Idle.style()),
+        ],
+    );
+
+    let mut row = inner.y.saturating_add(1);
+    for pane in panes.iter().take(inner.height.saturating_sub(1) as usize) {
+        if row >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+        let bucket = deck_pane_bucket(pane);
+        let line = format!(
+            " P{:<4} {:<8} {:<8} {}",
+            truncate_str(&pane.pane_id, 4),
+            bucket.label(),
+            truncate_str(&pane.agent_label, 8),
+            truncate_str(&pane.title, inner.width.saturating_sub(24) as usize),
+        );
+        write_styled_clipped(frame, inner.x, row, &line, bucket.style(), inner.width);
+        row += 1;
+    }
+}
+
+fn render_deck_attention_panel(frame: &mut ftui::Frame, area: UiRect, triage_items: &[TriageRow]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    draw_block_all(frame, area, Some("Attention"));
+    let inner = area.inner_all();
+    if inner.height == 0 {
+        return;
+    }
+    if triage_items.is_empty() {
+        write_styled_clipped(
+            frame,
+            inner.x,
+            inner.y,
+            "All clear. No attention items.",
+            CellStyle::new().fg(color_green()),
+            inner.width,
+        );
+        return;
+    }
+    for (idx, item) in triage_items.iter().take(inner.height as usize).enumerate() {
+        let row = inner.y.saturating_add(idx as u16);
+        let line = format!(
+            " {} {:<7} {}",
+            idx + 1,
+            truncate_str(&item.severity_label, 7),
+            truncate_str(&item.title, inner.width.saturating_sub(12) as usize),
+        );
+        write_styled_clipped(
+            frame,
+            inner.x,
+            row,
+            &line,
+            severity_cell_style(item),
+            inner.width,
+        );
+    }
+}
+
+fn render_deck_approval_panel(frame: &mut ftui::Frame, area: UiRect, triage_items: &[TriageRow]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    draw_block_all(frame, area, Some("Approval Queue"));
+    let inner = area.inner_all();
+    if inner.height == 0 {
+        return;
+    }
+
+    let mut row = inner.y;
+    for (item, command, label) in deck_action_rows(triage_items, is_approval_command)
+        .into_iter()
+        .take(inner.height as usize)
+    {
+        let line = format!(
+            " a {} | {}",
+            truncate_str(&label, 16),
+            truncate_str(&item.title, inner.width.saturating_sub(22) as usize),
+        );
+        write_styled_clipped(
+            frame,
+            inner.x,
+            row,
+            &line,
+            CellStyle::new().fg(color_green()),
+            inner.width,
+        );
+        row += 1;
+        if row >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+        write_styled_clipped(
+            frame,
+            inner.x,
+            row,
+            &format!(
+                "   {}",
+                truncate_str(&command, inner.width.saturating_sub(3) as usize)
+            ),
+            CellStyle::new().fg(color_dark_gray()),
+            inner.width,
+        );
+        row += 1;
+    }
+
+    if row == inner.y {
+        write_styled_clipped(
+            frame,
+            inner.x,
+            inner.y,
+            "No approval action is currently queued in attention.",
+            CellStyle::new().fg(color_dark_gray()),
+            inner.width,
+        );
+    }
+}
+
+fn render_deck_intervention_panel(
+    frame: &mut ftui::Frame,
+    area: UiRect,
+    triage_items: &[TriageRow],
+    workflows: &[WorkflowRow],
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    draw_block_all(frame, area, Some("Interventions"));
+    let inner = area.inner_all();
+    if inner.height == 0 {
+        return;
+    }
+
+    let mut row = inner.y;
+    for (item, command, label) in deck_action_rows(triage_items, is_intervention_command)
+        .into_iter()
+        .take(inner.height as usize)
+    {
+        let line = format!(
+            " i {} | {}",
+            truncate_str(&label, 16),
+            truncate_str(&item.title, inner.width.saturating_sub(22) as usize),
+        );
+        write_styled_clipped(
+            frame,
+            inner.x,
+            row,
+            &line,
+            CellStyle::new().fg(color_yellow()),
+            inner.width,
+        );
+        row += 1;
+        if row >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+        write_styled_clipped(
+            frame,
+            inner.x,
+            row,
+            &format!(
+                "   {}",
+                truncate_str(&command, inner.width.saturating_sub(3) as usize)
+            ),
+            CellStyle::new().fg(color_dark_gray()),
+            inner.width,
+        );
+        row += 1;
+    }
+
+    if row == inner.y {
+        write_styled_clipped(
+            frame,
+            inner.x,
+            row,
+            "No intervention action is queued. Open Triage for gated actions.",
+            CellStyle::new().fg(color_dark_gray()),
+            inner.width,
+        );
+        row += 1;
+    }
+
+    if row < inner.y.saturating_add(inner.height) && !workflows.is_empty() {
+        write_styled_clipped(
+            frame,
+            inner.x,
+            row,
+            &format!("Active workflows: {}", workflows.len()),
+            CellStyle::new().bold(),
+            inner.width,
+        );
+        row += 1;
+        for workflow in workflows
+            .iter()
+            .take(inner.y.saturating_add(inner.height).saturating_sub(row) as usize)
+        {
+            let line = format!(
+                " wf {} P{} {}",
+                truncate_str(&workflow.name, 18),
+                workflow.pane_id,
+                workflow.progress_label
+            );
+            write_styled_clipped(frame, inner.x, row, &line, CellStyle::new(), inner.width);
+            row += 1;
+        }
+    }
+}
+
+fn deck_action_rows(
+    triage_items: &[TriageRow],
+    predicate: fn(&str) -> bool,
+) -> Vec<(&TriageRow, String, String)> {
+    triage_items
+        .iter()
+        .flat_map(|item| {
+            item.action_commands
+                .iter()
+                .zip(item.action_labels.iter())
+                .filter(move |(command, _)| predicate(command))
+                .map(move |(command, label)| (item, command.clone(), label.clone()))
+        })
+        .collect()
+}
+
+fn severity_cell_style(item: &TriageRow) -> CellStyle {
+    match item.severity_label.as_str() {
+        "error" | "critical" => CellStyle::new().fg(color_red()).bold(),
+        "warning" => CellStyle::new().fg(color_yellow()),
+        "info" => CellStyle::new().fg(color_cyan()),
+        _ => CellStyle::new(),
+    }
 }
 
 fn status_word<'a>(label: &str, ok: &'a str, bad: &'a str) -> &'a str {
@@ -3175,7 +3713,7 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
         ("    r          Refresh current view", false),
         ("    Tab        Next view", false),
         ("    Shift+Tab  Previous view", false),
-        ("    1-8        Jump to view by number", false),
+        ("    1-9        Jump to view by number", false),
         ("", false),
         ("  List Navigation:", true),
         ("    j / Down   Move selection down", false),
@@ -3201,6 +3739,12 @@ fn render_help_view(frame: &mut ftui::Frame, y: u16, width: u16, height: u16) {
         ("    6. Search  Full-text search", false),
         ("    7. Help    This screen", false),
         ("    8. Timeline Cross-pane event timeline", false),
+        ("    9. Deck    Fleet + attention composition", false),
+        ("", false),
+        ("  Deck:", true),
+        ("    a          Queue first approval action", false),
+        ("    i          Queue first intervention action", false),
+        ("    Enter      Open Triage", false),
     ];
 
     for &(line, bold) in help_lines {
@@ -4786,6 +5330,25 @@ mod tests {
             }
         }
 
+        fn with_deck_actions() -> Self {
+            use crate::tui::query::TriageAction;
+
+            let mut query = Self::with_triage();
+            if let Some(item) = query.triage_items_detailed.get_mut(0) {
+                item.actions = vec![
+                    TriageAction {
+                        label: "Approve allow-once".to_string(),
+                        command: "ft approve ABCD1234".to_string(),
+                    },
+                    TriageAction {
+                        label: "Pause pane".to_string(),
+                        command: "ft intervene pause 7 --reason operator-review".to_string(),
+                    },
+                ];
+            }
+            query
+        }
+
         fn with_history() -> Self {
             Self {
                 healthy: true,
@@ -5032,20 +5595,22 @@ mod tests {
     }
 
     #[test]
-    fn view_all_returns_eight_views() {
-        assert_eq!(View::all().len(), 8);
+    fn view_all_returns_nine_views() {
+        assert_eq!(View::all().len(), 9);
     }
 
     #[test]
     fn view_next_wraps() {
         assert_eq!(View::Help.next(), View::Timeline);
-        assert_eq!(View::Timeline.next(), View::Home);
+        assert_eq!(View::Timeline.next(), View::Deck);
+        assert_eq!(View::Deck.next(), View::Home);
         assert_eq!(View::Home.next(), View::Panes);
     }
 
     #[test]
     fn view_prev_wraps() {
-        assert_eq!(View::Home.prev(), View::Timeline);
+        assert_eq!(View::Home.prev(), View::Deck);
+        assert_eq!(View::Deck.prev(), View::Timeline);
         assert_eq!(View::Timeline.prev(), View::Help);
         assert_eq!(View::Panes.prev(), View::Home);
     }
@@ -5062,7 +5627,6 @@ mod tests {
     #[test]
     fn view_from_shortcut_invalid() {
         assert_eq!(View::from_shortcut('0'), None);
-        assert_eq!(View::from_shortcut('9'), None);
         assert_eq!(View::from_shortcut('a'), None);
     }
 
@@ -5275,6 +5839,69 @@ mod tests {
             }
         }
         assert!(found_help, "Quick help not found");
+    }
+
+    #[test]
+    fn render_deck_composes_fleet_attention_approval_and_intervention() {
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(132, 36, &mut pool);
+
+        let mut model = make_model(MockQuery::with_deck_actions());
+        model.refresh_data();
+
+        render_deck_view(
+            &mut frame,
+            0,
+            132,
+            34,
+            model.health.as_ref(),
+            &model.panes,
+            &model.triage_items,
+            &model.workflows,
+            model.view_state.events.items.len(),
+            model.unhandled_count,
+        );
+
+        let text = (0..34)
+            .map(|row| read_row(&frame, row))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Deck"));
+        assert!(text.contains("Fleet Grid"));
+        assert!(text.contains("Attention"));
+        assert!(text.contains("Approval Queue"));
+        assert!(text.contains("Interventions"));
+        assert!(text.contains("Approve allow-once"));
+        assert!(text.contains("Pause pane"));
+    }
+
+    #[test]
+    fn deck_shortcuts_queue_existing_attention_actions() {
+        let mut model = make_model(MockQuery::with_deck_actions());
+        model.refresh_data();
+        model.view_state.current_view = View::Deck;
+
+        let approve_key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('a'),
+            modifiers: ftui::Modifiers::empty(),
+            kind: ftui::KeyEventKind::Press,
+        };
+        let _ = model.handle_view_key(&approve_key);
+        let modal = model.active_modal.as_ref().expect("approval modal");
+        assert_eq!(modal.title, "Approve Action");
+        assert!(modal.body.contains("ft approve ABCD1234"));
+
+        model.active_modal = None;
+        let intervene_key = ftui::KeyEvent {
+            code: ftui::KeyCode::Char('i'),
+            modifiers: ftui::Modifiers::empty(),
+            kind: ftui::KeyEventKind::Press,
+        };
+        let _ = model.handle_view_key(&intervene_key);
+        let modal = model.active_modal.as_ref().expect("intervention modal");
+        assert_eq!(modal.title, "Intervention Action");
+        assert!(modal.body.contains("ft intervene pause 7"));
     }
 
     #[test]
