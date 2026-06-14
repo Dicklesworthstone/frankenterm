@@ -14,7 +14,7 @@
 //! - wa-upg.10.1: Schema-driven API strategy
 //! - wa-upg.10.2: Schema-driven docs generator
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -27,9 +27,11 @@ use frankenterm_core::docs_gen::{
     DocGenConfig, EndpointCategory, categorize_endpoint, generate_endpoint_summary,
     generate_reference, parse_schema,
 };
+use frankenterm_core::error_codes::ErrorCategory;
 use frankenterm_core::fleet_memory_controller::{
     FleetMemoryTier, FleetMemoryTierReclamationAction, FleetPressureTier,
 };
+use frankenterm_core::robot_types::{ErrorCode, hint_for};
 use frankenterm_core::memory_pressure::MacosResidencyBucket;
 use frankenterm_core::runtime_telemetry::{
     SWARM_RESOURCE_COCKPIT_CONTRACT_ID, SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION,
@@ -104,10 +106,22 @@ fn load_all_schemas() -> Vec<(String, Value)> {
 
 fn load_schema(name: &str) -> Value {
     let path = schema_dir().join(name);
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read schema {}: {err}", path.display()));
-    serde_json::from_str(&content)
-        .unwrap_or_else(|err| panic!("failed to parse schema {}: {err}", path.display()))
+    let content = fs::read_to_string(&path).unwrap_or_else(|err| {
+        assert!(
+            false,
+            "failed to read schema {}: {err}",
+            path.display()
+        );
+        String::new()
+    });
+    serde_json::from_str(&content).unwrap_or_else(|err| {
+        assert!(
+            false,
+            "failed to parse schema {}: {err}",
+            path.display()
+        );
+        Value::Null
+    })
 }
 
 fn compile_draft_2020_schema(schema: &Value) -> Validator {
@@ -122,7 +136,10 @@ fn assert_schema_accepts(label: &str, validator: &Validator, value: &Value) {
             .map(|error| format!("{}: {}", error.instance_path, error))
             .collect::<Vec<_>>()
             .join("\n");
-        panic!("{label} did not match resource cockpit schema:\n{messages}");
+        assert!(
+            false,
+            "{label} did not match resource cockpit schema:\n{messages}"
+        );
     }
 }
 
@@ -153,13 +170,16 @@ fn all_schema_files_are_valid_json() {
     for entry in entries {
         let path = entry.path();
         let content = fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("Failed to read {}: {e}", path.display());
+            assert!(false, "Failed to read {}: {e}", path.display());
+            String::new()
         });
         let _: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
-            panic!(
+            assert!(
+                false,
                 "Invalid JSON in {}: {e}",
                 entry.file_name().to_string_lossy()
             );
+            Value::Null
         });
     }
 }
@@ -258,10 +278,12 @@ fn schema_provenance_covers_all_disk_schemas() {
 
     let path = schema_provenance_path();
     let provenance = fs::read_to_string(&path).unwrap_or_else(|err| {
-        panic!(
+        assert!(
+            false,
             "failed to read schema provenance at {}: {err}",
             path.display()
-        )
+        );
+        String::new()
     });
 
     let mut documented = HashSet::new();
@@ -1394,6 +1416,131 @@ fn robot_envelope_schema_tracks_current_core_error_codes() {
     assert_eq!(
         codes, expected,
         "wa-robot-envelope.json drifted from the current robot error-code contract"
+    );
+}
+
+#[test]
+fn robot_envelope_error_codes_have_taxonomy_and_hint_verdicts() {
+    let schemas = load_all_schemas();
+    let envelope = schemas
+        .iter()
+        .find(|(name, _)| name == "wa-robot-envelope.json")
+        .map(|(_, schema)| schema)
+        .expect("wa-robot-envelope.json should exist");
+
+    let codes: BTreeSet<&str> = envelope
+        .pointer("/$defs/error_codes/enum")
+        .and_then(Value::as_array)
+        .expect("wa-robot-envelope.json should define error_codes enum")
+        .iter()
+        .map(|value| value.as_str().expect("schema error code must be a string"))
+        .collect();
+
+    let intentional_hint_none: BTreeSet<&str> = [
+        "robot.assignment_not_found",
+        "robot.cass_error",
+        "robot.caut_error",
+        "robot.code_not_found",
+        "robot.fleet.approval_required",
+        "robot.fleet.daemon_unavailable",
+        "robot.fleet.inventory_unavailable",
+        "robot.fleet.launch_failed",
+        "robot.fleet.mutation_failed",
+        "robot.fleet.no_eligible_targets",
+        "robot.fleet.plan_error",
+        "robot.fleet.policy_denied",
+        "robot.fleet.reassign_conflict",
+        "robot.fleet.reassign_failed",
+        "robot.fleet.spawn_failed",
+        "robot.fleet.stop_failed",
+        "robot.fleet.target_not_reached",
+        "robot.fleet.validation_failed",
+        "robot.fleet.work_item_approval_blocked",
+        "robot.fleet.work_item_blocked",
+        "robot.fleet.work_item_completed",
+        "robot.fleet.work_item_not_found",
+        "robot.fleet.work_item_reserved",
+        "robot.fleet.work_queue_unavailable",
+        "robot.invalid_service",
+        "robot.mission_error",
+        "robot.mission_invalid_json",
+        "robot.mission_not_found",
+        "robot.mission_read_failed",
+        "robot.mission_validation_failed",
+        "robot.profile.apply_log",
+        "robot.profile.bad_params",
+        "robot.profile.bootstrap_failed",
+        "robot.profile.compensation_failed",
+        "robot.profile.daemon_unavailable",
+        "robot.profile.mutation_plan",
+        "robot.profile.not_found",
+        "robot.profile.policy_denied",
+        "robot.profile.require_approval",
+        "robot.profile.spawn_failed",
+        "robot.profile.storage",
+        "robot.profile.unknown_action",
+        "robot.profile.validation_failed",
+        "robot.rule_not_found",
+        "robot.tx_error",
+        "robot.tx_execution_failed",
+        "robot.tx_invalid_json",
+        "robot.tx_not_found",
+        "robot.tx_read_failed",
+        "robot.tx_validation_failed",
+        "robot.workflow_aborted",
+        "robot.workflow_error",
+        "robot.workflow_not_found",
+    ]
+    .into_iter()
+    .collect();
+
+    let mut observed_hint_none = BTreeSet::new();
+    for raw_code in &codes {
+        let Some(code) = ErrorCode::parse(raw_code) else {
+            assert!(
+                false,
+                "schema-published robot error code must parse: {raw_code}"
+            );
+            continue;
+        };
+        match code.category() {
+            ErrorCategory::Wezterm
+            | ErrorCategory::Storage
+            | ErrorCategory::Pattern
+            | ErrorCategory::Policy
+            | ErrorCategory::Workflow
+            | ErrorCategory::Network
+            | ErrorCategory::Config
+            | ErrorCategory::Internal => {}
+        }
+
+        let _retryability_verdict = code.is_retryable();
+        match hint_for(&code) {
+            Some(hint) => {
+                assert!(
+                    !hint.trim().is_empty(),
+                    "hint for schema-published robot error code {raw_code} must be non-empty"
+                );
+            }
+            None => {
+                assert!(
+                    intentional_hint_none.contains(raw_code),
+                    "schema-published robot error code {raw_code} lacks a hint and is not in the intentional hint=None registry"
+                );
+                observed_hint_none.insert(*raw_code);
+            }
+        }
+    }
+
+    assert_eq!(
+        observed_hint_none, intentional_hint_none,
+        "intentional hint=None registry drifted from schema-published robot error codes"
+    );
+
+    let unknown = ErrorCode::parse("robot.w12_taxonomy_unknown").expect("valid unknown code");
+    assert!(
+        hint_for(&unknown).is_none(),
+        "unknown robot error codes must not receive fabricated generic hints"
     );
 }
 
