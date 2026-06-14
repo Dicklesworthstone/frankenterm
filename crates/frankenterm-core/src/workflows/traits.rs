@@ -271,6 +271,20 @@ pub trait Workflow: Send + Sync {
         WorkflowTriggerPolicy::allow_all()
     }
 
+    /// Whether this workflow must only run on a pane that is not currently
+    /// rate/usage-limited (ft-7h5da.8.3, W7.3).
+    ///
+    /// When `true`, the runner consults the durable `limit_windows` ledger
+    /// before acquiring a lock or creating engine/audit state. If the target
+    /// pane has an active limit window, the trigger is declined with a typed
+    /// `WorkflowStartResult::PaneRateLimited { reset_at_ms }` reason rather
+    /// than running against a pane that cannot make progress. The default
+    /// `false` preserves prior behavior (workflows run regardless of limit
+    /// state).
+    fn requires_unlimited_pane(&self) -> bool {
+        false
+    }
+
     // ========================================================================
     // Plan-first execution support (wa-upg.2.3)
     // ========================================================================

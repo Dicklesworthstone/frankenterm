@@ -289,6 +289,23 @@ pub enum WorkflowStartResult {
         /// The detection rule_id that would have fired.
         rule_id: String,
     },
+    /// The target pane is rate/usage-limited and the workflow declared
+    /// `requires_unlimited_pane()` (ft-7h5da.8.3, W7.3). Declined before any
+    /// lock, engine state, or audit row is created.
+    PaneRateLimited {
+        /// The pane that is currently limited.
+        pane_id: u64,
+        /// The matched workflow's name.
+        workflow_name: String,
+        /// The detection rule_id that would have fired.
+        rule_id: String,
+        /// Effective reset deadline (epoch ms) when the pane is expected to
+        /// become usable again — the latest active limit window's deadline.
+        reset_at_ms: i64,
+        /// False when `reset_at_ms` is a conservative fallback (the underlying
+        /// window had no parseable reset, `reset_source == "unknown_ttl"`).
+        reset_known: bool,
+    },
     /// An error occurred
     Error {
         /// Error message
@@ -314,6 +331,14 @@ impl WorkflowStartResult {
     #[must_use]
     pub fn is_source_pane_not_trusted(&self) -> bool {
         matches!(self, Self::SourcePaneNotTrusted { .. })
+    }
+
+    /// Returns true if the trigger was declined because the target pane is
+    /// rate/usage-limited and the workflow requires an unlimited pane
+    /// (ft-7h5da.8.3).
+    #[must_use]
+    pub fn is_pane_rate_limited(&self) -> bool {
+        matches!(self, Self::PaneRateLimited { .. })
     }
 
     /// Returns the execution ID if the workflow was started.
@@ -653,6 +678,56 @@ impl WorkflowRunner {
                 workflow_name,
                 rule_id: detection.rule_id.clone(),
             };
+        }
+
+        // ft-7h5da.8.3 (W7.3): decline workflows that require an unlimited pane
+        // when the target pane has an active rate/usage-limit window. Runs
+        // before lock acquisition so a declined trigger leaves no lock, engine
+        // state, or audit row (mirrors the ft-j0ufc check above). Fails closed:
+        // if the ledger cannot be consulted, the workflow is not run.
+        if workflow.requires_unlimited_pane() {
+            match self
+                .storage
+                .list_active_limit_windows_with_cx(cx, now_ms())
+                .await
+            {
+                Ok(windows) => {
+                    if let Some(window) = windows
+                        .iter()
+                        .filter(|w| w.pane_id == pane_id)
+                        .max_by_key(|w| w.effective_reset_at_ms())
+                    {
+                        let reset_at_ms = window.effective_reset_at_ms();
+                        let reset_known = window.reset_known();
+                        tracing::info!(
+                            pane_id,
+                            workflow = %workflow_name,
+                            rule_id = %detection.rule_id,
+                            reset_at_ms,
+                            reset_known,
+                            "workflow trigger declined: target pane rate-limited (ft-7h5da.8.3)"
+                        );
+                        return WorkflowStartResult::PaneRateLimited {
+                            pane_id,
+                            workflow_name,
+                            rule_id: detection.rule_id.clone(),
+                            reset_at_ms,
+                            reset_known,
+                        };
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        pane_id,
+                        workflow = %workflow_name,
+                        error = %err,
+                        "limit-window lookup failed; declining requires_unlimited_pane workflow"
+                    );
+                    return WorkflowStartResult::Error {
+                        error: format!("limit-window lookup failed: {err}"),
+                    };
+                }
+            }
         }
 
         let execution_id = generate_workflow_id(&workflow_name);
@@ -2632,6 +2707,23 @@ impl WorkflowRunner {
                                     "ft-j0ufc: trigger refused (source pane not in trust scope) (cx)"
                                 );
                             }
+                            WorkflowStartResult::PaneRateLimited {
+                                pane_id,
+                                workflow_name,
+                                rule_id,
+                                reset_at_ms,
+                                reset_known,
+                            } => {
+                                tracing::info!(
+                                    pane_id,
+                                    workflow = %workflow_name,
+                                    rule_id,
+                                    reset_at_ms,
+                                    reset_known,
+                                    explicit_cx = true,
+                                    "ft-7h5da.8.3: trigger declined (target pane rate-limited) (cx)"
+                                );
+                            }
                             WorkflowStartResult::Error { error } => {
                                 tracing::error!(
                                     error,
@@ -4081,6 +4173,315 @@ mod tests {
                 }
                 other => panic!("missing terminal persistence must not report success: {other:?}"),
             }
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    // ── ft-7h5da.8.3 (W7.3): requires_unlimited_pane scheduling gate ──
+
+    struct UnlimitedGateProbeWorkflow {
+        requires_unlimited: bool,
+    }
+
+    impl Workflow for UnlimitedGateProbeWorkflow {
+        fn name(&self) -> &'static str {
+            "unlimited_gate_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "Probes the requires_unlimited_pane scheduling gate (ft-7h5da.8.3)"
+        }
+
+        fn handles(&self, _detection: &crate::patterns::Detection) -> bool {
+            true
+        }
+
+        fn requires_unlimited_pane(&self) -> bool {
+            self.requires_unlimited
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("finish", "Finish")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async move {
+                match step_idx {
+                    0 => StepResult::done(serde_json::json!({ "ok": true })),
+                    _ => StepResult::abort("unexpected step"),
+                }
+            })
+        }
+    }
+
+    fn unlimited_gate_detection() -> crate::patterns::Detection {
+        crate::patterns::Detection {
+            rule_id: "unlimited_gate.trigger".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "test".to_string(),
+            severity: crate::patterns::Severity::Info,
+            confidence: 1.0,
+            extracted: serde_json::Value::Null,
+            matched_text: "trigger".to_string(),
+            span: (0, 0),
+        }
+    }
+
+    async fn unlimited_gate_runner(
+        db_path: &str,
+    ) -> (
+        Arc<crate::storage::StorageHandle>,
+        WorkflowRunner,
+        Arc<PaneWorkflowLockManager>,
+    ) {
+        let storage = Arc::new(crate::storage::StorageHandle::new(db_path).await.unwrap());
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let handle: crate::wezterm::WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
+        let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+            crate::policy::PolicyEngine::permissive(),
+            handle,
+        ));
+        let runner = WorkflowRunner::new(
+            WorkflowEngine::default(),
+            Arc::clone(&lock_manager),
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+        (storage, runner, lock_manager)
+    }
+
+    async fn seed_limited_pane(
+        storage: &crate::storage::StorageHandle,
+        pane_id: u64,
+        reset_at: Option<i64>,
+        reset_source: &str,
+        last_seen_at: i64,
+        conservative_ttl_ms: i64,
+    ) {
+        storage
+            .upsert_pane(crate::storage::PaneRecord {
+                pane_id,
+                pane_uuid: Some(format!("pane-{pane_id}")),
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("codex".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: last_seen_at,
+                last_seen_at,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
+        storage
+            .upsert_limit_window(crate::storage::LimitWindowRecord {
+                id: 0,
+                pane_id,
+                service: "openai".to_string(),
+                account_id: "acct-a".to_string(),
+                account_db_id: None,
+                account_known: false,
+                agent_type: Some("codex".to_string()),
+                rule_id: "codex.usage.reached".to_string(),
+                event_type: "usage.reached".to_string(),
+                limited_at: last_seen_at,
+                reset_at,
+                reset_source: reset_source.to_string(),
+                reset_text: None,
+                conservative_ttl_ms,
+                last_seen_at,
+                seen_count: 1,
+                metadata: None,
+                created_at: last_seen_at,
+                updated_at: last_seen_at,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn pre_hold_pane_lock(
+        lock_manager: &Arc<PaneWorkflowLockManager>,
+        pane_id: u64,
+    ) -> crate::workflows::lock::OwnedPaneWorkflowLockGuard {
+        let Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(guard)) =
+            lock_manager.try_acquire_with_limit_owned_full(pane_id, "holder", "holder-exec", 8)
+        else {
+            panic!("failed to pre-acquire pane {pane_id} lock");
+        };
+        guard
+    }
+
+    #[test]
+    fn requires_unlimited_pane_declines_with_absolute_reset() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_absolute.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, _locks) = unlimited_gate_runner(&db_path).await;
+            let reset_at = crate::storage::now_ms() + 3_600_000;
+            seed_limited_pane(
+                &storage,
+                77,
+                Some(reset_at),
+                "absolute",
+                crate::storage::now_ms(),
+                0,
+            )
+            .await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: true,
+            }));
+
+            let result = runner
+                .handle_detection(77, &unlimited_gate_detection(), None)
+                .await;
+
+            match result {
+                WorkflowStartResult::PaneRateLimited {
+                    pane_id,
+                    reset_at_ms,
+                    reset_known,
+                    ..
+                } => {
+                    assert_eq!(pane_id, 77);
+                    assert_eq!(reset_at_ms, reset_at);
+                    assert!(reset_known, "absolute reset must be reported as known");
+                }
+                other => panic!("expected PaneRateLimited, got {other:?}"),
+            }
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn requires_unlimited_pane_declines_with_unknown_ttl_reset() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_unknown.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, _locks) = unlimited_gate_runner(&db_path).await;
+            let last_seen = crate::storage::now_ms();
+            seed_limited_pane(&storage, 88, None, "unknown_ttl", last_seen, 300_000).await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: true,
+            }));
+
+            let result = runner
+                .handle_detection(88, &unlimited_gate_detection(), None)
+                .await;
+
+            match result {
+                WorkflowStartResult::PaneRateLimited {
+                    reset_at_ms,
+                    reset_known,
+                    ..
+                } => {
+                    assert_eq!(reset_at_ms, last_seen + 300_000);
+                    assert!(
+                        !reset_known,
+                        "unknown_ttl reset must be reported as estimated"
+                    );
+                }
+                other => panic!("expected PaneRateLimited, got {other:?}"),
+            }
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn requires_unlimited_pane_allows_when_not_limited() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_clear.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, lock_manager) = unlimited_gate_runner(&db_path).await;
+            // Pane exists with only an EXPIRED window — no active limit.
+            seed_limited_pane(
+                &storage,
+                99,
+                Some(crate::storage::now_ms() - 1_000),
+                "absolute",
+                crate::storage::now_ms() - 1_000,
+                0,
+            )
+            .await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: true,
+            }));
+            // Pre-hold the pane lock so the post-gate path returns PaneLocked
+            // before any engine/spawn work — a deterministic "gate passed" signal.
+            let _guard = pre_hold_pane_lock(&lock_manager, 99);
+
+            let result = runner
+                .handle_detection(99, &unlimited_gate_detection(), None)
+                .await;
+
+            assert!(
+                !result.is_pane_rate_limited(),
+                "pane with no active limit window must not be declined: {result:?}"
+            );
+            assert!(
+                result.is_locked(),
+                "gate should pass through to lock acquisition: {result:?}"
+            );
+
+            storage.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn default_workflow_runs_on_limited_pane() {
+        run_async_test(async {
+            let temp_dir = tempfile::TempDir::new().unwrap();
+            let db_path = temp_dir
+                .path()
+                .join("unlimited_gate_default.db")
+                .to_string_lossy()
+                .to_string();
+            let (storage, runner, lock_manager) = unlimited_gate_runner(&db_path).await;
+            // Pane IS limited, but the workflow does not require an unlimited pane.
+            seed_limited_pane(
+                &storage,
+                55,
+                Some(crate::storage::now_ms() + 3_600_000),
+                "absolute",
+                crate::storage::now_ms(),
+                0,
+            )
+            .await;
+            runner.register_workflow(Arc::new(UnlimitedGateProbeWorkflow {
+                requires_unlimited: false,
+            }));
+            let _guard = pre_hold_pane_lock(&lock_manager, 55);
+
+            let result = runner
+                .handle_detection(55, &unlimited_gate_detection(), None)
+                .await;
+
+            assert!(
+                !result.is_pane_rate_limited(),
+                "default workflow must be unaffected by limit state: {result:?}"
+            );
 
             storage.shutdown().await.unwrap();
         });

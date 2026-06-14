@@ -286,6 +286,24 @@ impl MissionDispatcher {
                 )),
                 dispatch_ms,
             },
+            WorkflowStartResult::PaneRateLimited {
+                pane_id,
+                workflow_name,
+                rule_id,
+                reset_at_ms,
+                reset_known,
+            } => DispatchResult {
+                assignment_id: assignment_id.to_string(),
+                target_agent: target_agent.to_string(),
+                accepted: false,
+                execution_id: None,
+                reason: Some(format!(
+                    "ft-7h5da.8.3: workflow '{workflow_name}' declined; pane {pane_id} \
+                     rate-limited (reset_at_ms={reset_at_ms}, reset_known={reset_known}, \
+                     rule_id={rule_id})"
+                )),
+                dispatch_ms,
+            },
             WorkflowStartResult::Error { error } => DispatchResult {
                 assignment_id: assignment_id.to_string(),
                 target_agent: target_agent.to_string(),

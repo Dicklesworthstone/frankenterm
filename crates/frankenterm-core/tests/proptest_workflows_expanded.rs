@@ -167,6 +167,24 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
                 }
             }
         ),
+        (
+            any::<u64>(),
+            arb_short_text(),
+            arb_step_id(),
+            any::<i64>(),
+            any::<bool>(),
+        )
+            .prop_map(
+                |(pane_id, workflow_name, rule_id, reset_at_ms, reset_known)| {
+                    WorkflowStartResult::PaneRateLimited {
+                        pane_id,
+                        workflow_name,
+                        rule_id,
+                        reset_at_ms,
+                        reset_known,
+                    }
+                },
+            ),
         arb_short_text().prop_map(|error| WorkflowStartResult::Error { error }),
     ]
 }
@@ -519,6 +537,9 @@ proptest! {
             }
             WorkflowStartResult::SourcePaneNotTrusted { .. } => {
                 prop_assert_eq!(ty, "source_pane_not_trusted");
+            }
+            WorkflowStartResult::PaneRateLimited { .. } => {
+                prop_assert_eq!(ty, "pane_rate_limited");
             }
             WorkflowStartResult::Error { .. } => prop_assert_eq!(ty, "error"),
         }
