@@ -202,6 +202,27 @@ pub fn pane_is_quiescent(last_output_ms: u64, now_ms: u64, quiescent_after_ms: u
     now_ms.saturating_sub(last_output_ms) >= quiescent_after_ms
 }
 
+/// Storage-derived quiescence for `ft robot await quiescence:<pane>` (ft-r0977).
+///
+/// `last_output_ms` is the latest captured output-segment timestamp for the
+/// pane (e.g. `StorageHandle::pane_last_output_at`), or `None` when the pane has
+/// no captured output at all. A pane with no captured output is treated as
+/// quiescent: it has, by definition, produced no output within the last
+/// `quiescent_after_ms` (the limit case of [`pane_is_quiescent`]). When a
+/// timestamp is present this delegates to [`pane_is_quiescent`], so clock skew
+/// (`now_ms < last_output_ms`) still saturates to "not quiescent".
+#[must_use]
+pub fn pane_is_quiescent_from_last_output(
+    last_output_ms: Option<u64>,
+    now_ms: u64,
+    quiescent_after_ms: u64,
+) -> bool {
+    match last_output_ms {
+        None => true,
+        Some(last_output_ms) => pane_is_quiescent(last_output_ms, now_ms, quiescent_after_ms),
+    }
+}
+
 /// Configuration for agent pane state detection thresholds.
 ///
 /// All durations are in milliseconds. Maps to the `[agent_detection]` section
@@ -370,6 +391,32 @@ mod tests {
         assert!(!pane_is_quiescent(0, 59_999, 60_000));
         // Clock skew (now < last_output) saturates to not-quiescent.
         assert!(!pane_is_quiescent(100_000, 50_000, 10_000));
+    }
+
+    #[test]
+    fn pane_is_quiescent_from_last_output_semantics() {
+        // No captured output → quiescent (no output within the window).
+        assert!(pane_is_quiescent_from_last_output(None, 0, 60_000));
+        assert!(pane_is_quiescent_from_last_output(None, 1_000_000, 60_000));
+        // Present timestamp delegates to pane_is_quiescent: idle past the
+        // threshold is quiescent.
+        assert!(pane_is_quiescent_from_last_output(
+            Some(1_000),
+            61_000,
+            60_000
+        ));
+        // Recent output (below threshold) is not quiescent.
+        assert!(!pane_is_quiescent_from_last_output(
+            Some(10_000),
+            59_999,
+            60_000
+        ));
+        // Clock skew still saturates to not-quiescent via the delegate.
+        assert!(!pane_is_quiescent_from_last_output(
+            Some(100_000),
+            50_000,
+            10_000
+        ));
     }
 
     #[test]

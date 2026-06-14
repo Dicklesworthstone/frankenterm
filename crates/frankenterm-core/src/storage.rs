@@ -5669,6 +5669,35 @@ impl StorageHandle {
         .await
     }
 
+    /// ft-r0977: latest captured output-segment timestamp (epoch ms) for a pane,
+    /// or `None` when the pane has no captured output. Backs the storage-derived
+    /// `ft robot await quiescence:<pane>` path — feed the result to
+    /// [`crate::agent_pane_state::pane_is_quiescent_from_last_output`] with no
+    /// in-process watcher gauge required.
+    pub async fn pane_last_output_at(&self, pane_id: u64) -> Result<Option<i64>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.pane_last_output_at_with_cx(&cx, pane_id).await
+    }
+
+    /// Cx-first sibling of [`Self::pane_last_output_at`].
+    pub async fn pane_last_output_at_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Result<Option<i64>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("pane_last_output_at cancelled: {err}"))
+        })?;
+        let db_path = Arc::clone(&self.db_path);
+
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_pane_last_output_at_backend(backend, pane_id)
+            })
+        })
+        .await
+    }
+
     /// Get all panes
     pub async fn get_panes(&self) -> Result<Vec<PaneRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -17989,6 +18018,29 @@ fn query_max_seq_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<O
     });
     #[allow(clippy::cast_sign_loss)]
     Ok(max.map(|v| v as u64))
+}
+
+/// ft-r0977: latest captured-segment timestamp (epoch ms) for a pane, or `None`
+/// when the pane has no captured output. `MAX(captured_at)` over an empty/absent
+/// pane yields SQL NULL → `None`.
+fn query_pane_last_output_at_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+) -> Result<Option<i64>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let row = backend
+        .query_row_cells(
+            "SELECT MAX(captured_at) FROM output_segments WHERE pane_id = ?1",
+            &[ToSqlValue::Integer(pane_id_i64)],
+        )
+        .map_err(|err| storage_backend_error("Query pane last output at", err))?;
+    Ok(row.and_then(|cells| {
+        cells.into_iter().next().and_then(|cell| match cell {
+            SqlCell::Integer(v) => Some(v),
+            // SQL NULL (no segments for this pane) maps to None.
+            _ => None,
+        })
+    }))
 }
 
 fn pane_record_from_backend_cells(row: &[SqlCell]) -> Result<PaneRecord> {
