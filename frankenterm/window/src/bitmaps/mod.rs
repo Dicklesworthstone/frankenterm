@@ -727,9 +727,21 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "image dimensions overflow bgra32 byte length")]
+    #[should_panic(expected = "image dimensions overflow pixel count")]
     fn image_new_rejects_overflowing_dimensions() {
+        // `usize::MAX * 2` overflows the pixel-count product before the *4
+        // bgra32 step is ever reached, so the explicit failure is the
+        // pixel-count guard (checked_pixel_count).
         let _ = Image::new(usize::MAX, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "image dimensions overflow bgra32 byte length")]
+    fn image_new_rejects_bgra32_byte_length_overflow() {
+        // Dimensions whose pixel count fits in usize but whose bgra32 byte
+        // length (pixels * 4) overflows: this exercises the checked_mul(4)
+        // guard in checked_bgra32_len, distinct from the pixel-count guard.
+        let _ = Image::new(usize::MAX / 4 + 1, 1);
     }
 
     #[test]
