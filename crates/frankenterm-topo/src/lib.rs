@@ -7,12 +7,13 @@
 //! regression tests, not a replacement for a full cubical-complex package.
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 const H0_DIMENSION: u8 = 0;
 const H1_DIMENSION: u8 = 1;
+pub const DEADWIRE_WIRING_STATUS_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitmapSizeError {
@@ -145,6 +146,181 @@ pub struct TopologyComparison {
     pub passed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionApiDeclaration {
+    pub symbol: String,
+    pub defining_path: String,
+}
+
+impl DecisionApiDeclaration {
+    pub fn new(symbol: impl Into<String>, defining_path: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            defining_path: defining_path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionApiSourceFile {
+    pub path: String,
+    pub text: String,
+}
+
+impl DecisionApiSourceFile {
+    pub fn new(path: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DormantDecisionApiExemption {
+    pub bead_id: String,
+    pub expires_on: String,
+}
+
+impl DormantDecisionApiExemption {
+    pub fn new(bead_id: impl Into<String>, expires_on: impl Into<String>) -> Self {
+        Self {
+            bead_id: bead_id.into(),
+            expires_on: expires_on.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DormantDecisionApiExemptionEntry {
+    pub symbol: String,
+    pub exemption: DormantDecisionApiExemption,
+}
+
+impl DormantDecisionApiExemptionEntry {
+    pub fn new(symbol: impl Into<String>, exemption: DormantDecisionApiExemption) -> Self {
+        Self {
+            symbol: symbol.into(),
+            exemption,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionApiCaller {
+    pub path: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionApiWiringStatus {
+    Wired,
+    Dormant,
+    Deadwire,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadwireViolationReason {
+    MissingProductionCaller,
+    MissingDormantBead,
+    MissingDormantExpiry,
+    InvalidDormantExpiry,
+    ExpiredDormantExemption,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadwireViolation {
+    pub symbol: String,
+    pub reason: DeadwireViolationReason,
+    pub required_action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionApiWiringRecord {
+    pub symbol: String,
+    pub defining_path: String,
+    pub production_callers: Vec<DecisionApiCaller>,
+    pub status: DecisionApiWiringStatus,
+    pub dormant_exemption: Option<DormantDecisionApiExemption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionApiWiringReport {
+    pub schema_version: u32,
+    pub produced_by_bead: String,
+    pub generated_at_ms: u64,
+    pub records: Vec<DecisionApiWiringRecord>,
+    pub violations: Vec<DeadwireViolation>,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DecisionApiWiringInput<'a> {
+    pub declarations: &'a [DecisionApiDeclaration],
+    pub source_files: &'a [DecisionApiSourceFile],
+    pub dormant_exemptions: &'a [DormantDecisionApiExemptionEntry],
+    pub produced_by_bead: &'a str,
+    pub generated_at_ms: u64,
+    pub today_utc: &'a str,
+}
+
+pub fn analyze_decision_api_wiring(input: DecisionApiWiringInput<'_>) -> DecisionApiWiringReport {
+    let dormant_by_symbol: BTreeMap<&str, &DormantDecisionApiExemption> = input
+        .dormant_exemptions
+        .iter()
+        .map(|entry| (entry.symbol.as_str(), &entry.exemption))
+        .collect();
+    let mut records = Vec::with_capacity(input.declarations.len());
+    let mut violations = Vec::new();
+
+    for declaration in input.declarations {
+        let production_callers =
+            production_callers_for_symbol(&declaration.symbol, input.source_files);
+        let dormant_exemption = dormant_by_symbol.get(declaration.symbol.as_str()).copied();
+        let mut status = DecisionApiWiringStatus::Wired;
+
+        if production_callers.is_empty() {
+            if let Some(exemption) = dormant_exemption {
+                let exemption_violations =
+                    dormant_exemption_violations(&declaration.symbol, exemption, input.today_utc);
+                if exemption_violations.is_empty() {
+                    status = DecisionApiWiringStatus::Dormant;
+                } else {
+                    status = DecisionApiWiringStatus::Deadwire;
+                    violations.extend(exemption_violations);
+                }
+            } else {
+                status = DecisionApiWiringStatus::Deadwire;
+                violations.push(deadwire_violation(
+                    &declaration.symbol,
+                    DeadwireViolationReason::MissingProductionCaller,
+                    "add a non-test production caller or declare a dormant exemption with bead_id and expires_on",
+                ));
+            }
+        }
+
+        records.push(DecisionApiWiringRecord {
+            symbol: declaration.symbol.clone(),
+            defining_path: declaration.defining_path.clone(),
+            production_callers,
+            status,
+            dormant_exemption: dormant_exemption.cloned(),
+        });
+    }
+
+    let passed = violations.is_empty();
+    DecisionApiWiringReport {
+        schema_version: DEADWIRE_WIRING_STATUS_SCHEMA_VERSION,
+        produced_by_bead: input.produced_by_bead.to_string(),
+        generated_at_ms: input.generated_at_ms,
+        records,
+        violations,
+        passed,
+    }
+}
+
 pub fn betti_curve(bitmap: &GrayBitmap) -> Vec<BettiSample> {
     let thresholds = nonzero_thresholds(bitmap);
     if thresholds.is_empty() {
@@ -223,6 +399,222 @@ pub fn compare_bitmaps(
         thresholds,
         passed,
     }
+}
+
+fn production_callers_for_symbol(
+    symbol: &str,
+    source_files: &[DecisionApiSourceFile],
+) -> Vec<DecisionApiCaller> {
+    let mut callers = Vec::new();
+    for source_file in source_files {
+        if is_test_path(&source_file.path) {
+            continue;
+        }
+
+        for (line_index, line) in source_file.text.lines().enumerate() {
+            if line_mentions_symbol(line, symbol) && !line_declares_symbol(line, symbol) {
+                callers.push(DecisionApiCaller {
+                    path: source_file.path.clone(),
+                    line: line_index + 1,
+                });
+            }
+        }
+    }
+    callers
+}
+
+fn dormant_exemption_violations(
+    symbol: &str,
+    exemption: &DormantDecisionApiExemption,
+    today_utc: &str,
+) -> Vec<DeadwireViolation> {
+    let mut violations = Vec::new();
+    if exemption.bead_id.trim().is_empty() {
+        violations.push(deadwire_violation(
+            symbol,
+            DeadwireViolationReason::MissingDormantBead,
+            "set dormant exemption bead_id to the tracking bead that owns wiring the API",
+        ));
+    }
+    if exemption.expires_on.trim().is_empty() {
+        violations.push(deadwire_violation(
+            symbol,
+            DeadwireViolationReason::MissingDormantExpiry,
+            "set dormant exemption expires_on to a YYYY-MM-DD date",
+        ));
+    } else if !is_yyyy_mm_dd(&exemption.expires_on) {
+        violations.push(deadwire_violation(
+            symbol,
+            DeadwireViolationReason::InvalidDormantExpiry,
+            "set dormant exemption expires_on to a valid YYYY-MM-DD date",
+        ));
+    } else if is_yyyy_mm_dd(today_utc) && exemption.expires_on.as_str() < today_utc {
+        violations.push(deadwire_violation(
+            symbol,
+            DeadwireViolationReason::ExpiredDormantExemption,
+            "wire the API or renew the dormant exemption with a fresh bead-owned expiry",
+        ));
+    }
+    violations
+}
+
+fn deadwire_violation(
+    symbol: &str,
+    reason: DeadwireViolationReason,
+    required_action: &str,
+) -> DeadwireViolation {
+    DeadwireViolation {
+        symbol: symbol.to_string(),
+        reason,
+        required_action: required_action.to_string(),
+    }
+}
+
+fn is_test_path(path: &str) -> bool {
+    path == "tests.rs"
+        || path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.ends_with("_test.rs")
+        || path.ends_with("_tests.rs")
+}
+
+fn line_mentions_symbol(line: &str, symbol: &str) -> bool {
+    if symbol.is_empty() {
+        return false;
+    }
+
+    for (start, _) in line.match_indices(symbol) {
+        let bytes = line.as_bytes();
+        let before = start
+            .checked_sub(1)
+            .and_then(|index| bytes.get(index))
+            .copied();
+        let after = line.as_bytes().get(start + symbol.len()).copied();
+        if !before.is_some_and(is_identifier_byte) && !after.is_some_and(is_identifier_byte) {
+            return true;
+        }
+    }
+    false
+}
+
+fn line_declares_symbol(line: &str, symbol: &str) -> bool {
+    let rest = strip_declaration_modifiers(strip_visibility(line.trim_start()));
+    let mut tokens = rest.split_whitespace();
+    matches!(tokens.next(), Some("fn"))
+        && tokens
+            .next()
+            .is_some_and(|name_token| function_name_matches(name_token, symbol))
+}
+
+fn strip_visibility(rest: &str) -> &str {
+    for prefix in ["pub ", "pub(crate) ", "pub(super) ", "pub(self) "] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            return after;
+        }
+    }
+
+    if let Some(after_pub) = rest.strip_prefix("pub(") {
+        if let Some((_, after_visibility)) = after_pub.split_once(") ") {
+            return after_visibility;
+        }
+    }
+
+    rest
+}
+
+fn strip_declaration_modifiers(mut rest: &str) -> &str {
+    loop {
+        if let Some(after) = rest.strip_prefix("async ") {
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("const ") {
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("unsafe ") {
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("extern ") {
+            rest = strip_extern_abi(after);
+        } else {
+            return rest;
+        }
+    }
+}
+
+fn strip_extern_abi(rest: &str) -> &str {
+    let rest = rest.trim_start();
+    if let Some(after_quote) = rest.strip_prefix('"') {
+        if let Some((_, after_abi)) = after_quote.split_once("\" ") {
+            return after_abi;
+        }
+    }
+    rest
+}
+
+fn function_name_matches(name_token: &str, symbol: &str) -> bool {
+    name_token
+        .strip_prefix(symbol)
+        .is_some_and(|suffix| suffix.starts_with('(') || suffix.starts_with('<'))
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_yyyy_mm_dd(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let (Some(year), Some(month), Some(day), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+
+    let Some(year) = parse_four_digits(year) else {
+        return false;
+    };
+    let Some(month) = parse_two_digits(month) else {
+        return false;
+    };
+    let Some(day) = parse_two_digits(day) else {
+        return false;
+    };
+    let Some(max_day) = days_in_month(year, month) else {
+        return false;
+    };
+
+    (1..=max_day).contains(&day)
+}
+
+fn parse_four_digits(value: &str) -> Option<u16> {
+    match value.as_bytes() {
+        [thousands @ b'0'..=b'9', hundreds @ b'0'..=b'9', tens @ b'0'..=b'9', ones @ b'0'..=b'9'] => {
+            Some(
+                u16::from(thousands - b'0') * 1000
+                    + u16::from(hundreds - b'0') * 100
+                    + u16::from(tens - b'0') * 10
+                    + u16::from(ones - b'0'),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn parse_two_digits(value: &str) -> Option<u8> {
+    match value.as_bytes() {
+        [tens @ b'0'..=b'9', ones @ b'0'..=b'9'] => Some((tens - b'0') * 10 + (ones - b'0')),
+        _ => None,
+    }
+}
+
+fn days_in_month(year: u16, month: u8) -> Option<u8> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 if is_leap_year(year) => Some(29),
+        2 => Some(28),
+        _ => None,
+    }
+}
+
+fn is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 pub fn diagram_distance(left: &PersistenceDiagram, right: &PersistenceDiagram) -> TopologyDistance {
@@ -555,6 +947,194 @@ mod tests {
         )
     }
 
+    fn decision_report(
+        declarations: &[DecisionApiDeclaration],
+        source_files: &[DecisionApiSourceFile],
+        dormant_exemptions: &[DormantDecisionApiExemptionEntry],
+    ) -> DecisionApiWiringReport {
+        analyze_decision_api_wiring(DecisionApiWiringInput {
+            declarations,
+            source_files,
+            dormant_exemptions,
+            produced_by_bead: "ft-7h5da.5.5",
+            generated_at_ms: 1_704_000_000_000,
+            today_utc: "2026-06-14",
+        })
+    }
+
+    #[test]
+    fn deadwire_gate_fails_unwired_api_without_dormant_exemption() {
+        let declarations = [DecisionApiDeclaration::new(
+            "allow_operation",
+            "crates/frankenterm-core/src/policy.rs",
+        )];
+        let source_files = [DecisionApiSourceFile::new(
+            "crates/frankenterm-core/src/policy.rs",
+            "pub async fn allow_operation() {}\n",
+        )];
+
+        let report = decision_report(&declarations, &source_files, &[]);
+
+        assert!(!report.passed);
+        assert_eq!(report.records[0].status, DecisionApiWiringStatus::Deadwire);
+        assert_eq!(
+            report.violations[0].reason,
+            DeadwireViolationReason::MissingProductionCaller
+        );
+    }
+
+    #[test]
+    fn deadwire_gate_ignores_test_only_callers() {
+        let declarations = [DecisionApiDeclaration::new(
+            "evaluate",
+            "crates/frankenterm-core/src/governor.rs",
+        )];
+        let source_files = [
+            DecisionApiSourceFile::new(
+                "crates/frankenterm-core/src/governor.rs",
+                "pub fn evaluate() {}\n",
+            ),
+            DecisionApiSourceFile::new(
+                "crates/frankenterm-core/tests/governor.rs",
+                "fn test_uses_api() { policy.evaluate(); }\n",
+            ),
+        ];
+
+        let report = decision_report(&declarations, &source_files, &[]);
+
+        assert!(!report.passed);
+        assert!(report.records[0].production_callers.is_empty());
+        assert_eq!(report.records[0].status, DecisionApiWiringStatus::Deadwire);
+    }
+
+    #[test]
+    fn production_caller_wires_decision_api() {
+        let declarations = [DecisionApiDeclaration::new(
+            "execute",
+            "crates/frankenterm-core/src/decision.rs",
+        )];
+        let source_files = [
+            DecisionApiSourceFile::new(
+                "crates/frankenterm-core/src/decision.rs",
+                "pub(in crate::decision) async fn execute<T>() {}\n",
+            ),
+            DecisionApiSourceFile::new(
+                "crates/frankenterm-core/src/dispatcher.rs",
+                "fn dispatch(decision: &Decision) { decision.execute(); }\n",
+            ),
+        ];
+
+        let report = decision_report(&declarations, &source_files, &[]);
+
+        assert!(report.passed);
+        assert_eq!(report.records[0].status, DecisionApiWiringStatus::Wired);
+        assert_eq!(
+            report.records[0].production_callers,
+            vec![DecisionApiCaller {
+                path: "crates/frankenterm-core/src/dispatcher.rs".to_string(),
+                line: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn valid_dormant_exemption_keeps_unwired_api_from_failing() {
+        let declarations = [DecisionApiDeclaration::new(
+            "observe",
+            "crates/frankenterm-core/src/observer.rs",
+        )];
+        let source_files = [DecisionApiSourceFile::new(
+            "crates/frankenterm-core/src/observer.rs",
+            "pub fn observe() {}\n",
+        )];
+        let exemptions = [DormantDecisionApiExemptionEntry::new(
+            "observe",
+            DormantDecisionApiExemption::new("ft-7h5da.5.6", "2026-07-01"),
+        )];
+
+        let report = decision_report(&declarations, &source_files, &exemptions);
+
+        assert!(report.passed);
+        assert_eq!(report.records[0].status, DecisionApiWiringStatus::Dormant);
+        assert_eq!(
+            report.records[0].dormant_exemption,
+            Some(exemptions[0].exemption.clone())
+        );
+    }
+
+    #[test]
+    fn dormant_exemption_requires_bead_and_valid_unexpired_date() {
+        let declarations = [
+            DecisionApiDeclaration::new("allow_operation", "src/policy.rs"),
+            DecisionApiDeclaration::new("evaluate", "src/governor.rs"),
+            DecisionApiDeclaration::new("execute", "src/runner.rs"),
+            DecisionApiDeclaration::new("observe", "src/observer.rs"),
+        ];
+        let exemptions = [
+            DormantDecisionApiExemptionEntry::new(
+                "allow_operation",
+                DormantDecisionApiExemption::new("", "2026-07-01"),
+            ),
+            DormantDecisionApiExemptionEntry::new(
+                "evaluate",
+                DormantDecisionApiExemption::new("ft-7h5da.5.6", "not-a-date"),
+            ),
+            DormantDecisionApiExemptionEntry::new(
+                "execute",
+                DormantDecisionApiExemption::new("ft-7h5da.5.6", "2026-01-01"),
+            ),
+            DormantDecisionApiExemptionEntry::new(
+                "observe",
+                DormantDecisionApiExemption::new("ft-7h5da.5.6", "2026-02-31"),
+            ),
+        ];
+
+        let report = decision_report(&declarations, &[], &exemptions);
+        let reasons: Vec<_> = report
+            .violations
+            .iter()
+            .map(|violation| violation.reason)
+            .collect();
+
+        assert!(!report.passed);
+        assert_eq!(
+            reasons,
+            vec![
+                DeadwireViolationReason::MissingDormantBead,
+                DeadwireViolationReason::InvalidDormantExpiry,
+                DeadwireViolationReason::ExpiredDormantExemption,
+                DeadwireViolationReason::InvalidDormantExpiry
+            ]
+        );
+    }
+
+    #[test]
+    fn wiring_report_serializes_machine_facing_schema() -> Result<(), serde_json::Error> {
+        let declarations = [DecisionApiDeclaration::new(
+            "allow_operation",
+            "crates/frankenterm-core/src/policy.rs",
+        )];
+        let source_files = [DecisionApiSourceFile::new(
+            "crates/frankenterm-core/src/workflows/runner.rs",
+            "fn run(policy: &PolicyEngine) { policy.allow_operation(); }\n",
+        )];
+
+        let report = decision_report(&declarations, &source_files, &[]);
+        let json = serde_json::to_string(&report)?;
+
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"schema_version":1,"produced_by_bead":"ft-7h5da.5.5","#,
+                r#""generated_at_ms":1704000000000,"records":[{"symbol":"allow_operation","#,
+                r#""defining_path":"crates/frankenterm-core/src/policy.rs","#,
+                r#""production_callers":[{"path":"crates/frankenterm-core/src/workflows/runner.rs","line":1}],"#,
+                r#""status":"wired","dormant_exemption":null}],"violations":[],"passed":true}"#
+            )
+        );
+        Ok(())
+    }
+
     #[test]
     fn rejects_mismatched_pixel_count() {
         let error = GrayBitmap::new(2, 3, vec![0; 5]).expect_err("size mismatch");
@@ -602,14 +1182,12 @@ mod tests {
         assert_eq!(curve[0].beta1, 1);
 
         let diagram = persistence_diagram(&image);
-        assert!(
-            diagram
-                .features
-                .iter()
-                .any(|feature| feature.dimension == H1_DIMENSION
-                    && (feature.birth - 255.0).abs() < f64::EPSILON
-                    && (feature.death - 0.0).abs() < f64::EPSILON)
-        );
+        assert!(diagram
+            .features
+            .iter()
+            .any(|feature| feature.dimension == H1_DIMENSION
+                && (feature.birth - 255.0).abs() < f64::EPSILON
+                && (feature.death - 0.0).abs() < f64::EPSILON));
     }
 
     #[test]

@@ -194,6 +194,14 @@
       "description": "Deferred RCH proof replay convergence proof for the proof-debt queue contracts, ownership/admission fail-closed guards, retained live-attempt record, and focused remote-only replay proof. Uses the existing robot-contracts release category because the queue is a schema-backed operator/Robot/MCP contract; it does not claim that every queued proof debt has passed."
     },
     {
+      "category": "proofs/robot-contracts",
+      "path": "docs/attestations/doctrine/wiring-status.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-7h5da.5.5",
+      "proof_categories": [4, 11],
+      "description": "Decision-API deadwire wiring-status doctrine artifact for designated allow_operation/evaluate/execute/observe entry points. The artifact publishes the schema and analyzer surface that CI can invoke to reject unwired production APIs unless a bead-owned dormant exemption is present."
+    },
+    {
       "category": "proofs/rehearsal-score",
       "path": "crates/frankenterm-core/tests/fixtures/rehearsal_score_receipt_golden_matrix.json",
       "media_type": "application/json",

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "kind": "decision-api-wiring-status",
+  "category": "proofs/robot-contracts",
+  "doctrine_artifact": "doctrine/wiring-status",
+  "generated_at": "2026-06-14T04:21:34Z",
+  "produced_by_bead": "ft-7h5da.5.5",
+  "status": "substrate_pending_ci_invocation",
+  "scope": "Machine-readable wiring inventory schema and deadwire analyzer for designated decision API entry points.",
+  "designated_entrypoint_names": [
+    "allow_operation",
+    "evaluate",
+    "execute",
+    "observe"
+  ],
+  "library_surface": {
+    "crate": "frankenterm-topo",
+    "schema_version_constant": "DEADWIRE_WIRING_STATUS_SCHEMA_VERSION",
+    "input_type": "DecisionApiWiringInput",
+    "report_type": "DecisionApiWiringReport",
+    "analyzer": "analyze_decision_api_wiring"
+  },
+  "gate_semantics": {
+    "production_caller_required": true,
+    "test_only_callers_count_as_wired": false,
+    "dormant_exemption_required_fields": [
+      "bead_id",
+      "expires_on"
+    ],
+    "dormant_exemption_expiry_format": "YYYY-MM-DD",
+    "dormant_exemption_expired_status": "deadwire",
+    "failed_status": "deadwire"
+  },
+  "current_limitations": [
+    {
+      "kind": "ci_invocation_pending",
+      "tracking_bead": "ft-7h5da.5.5",
+      "detail": "This slice adds the analyzer, machine-facing report schema, manifest slot, and artifact. CI still needs a repo-source invocation that feeds the live designated declarations and dormant exemptions into frankenterm-topo."
+    }
+  ],
+  "validation": [
+    {
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da-5-5-cod10-target CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p frankenterm-topo --lib -- --nocapture",
+      "status": "blocked",
+      "result": "RCH refused local fallback before assigning a worker: no admissible workers: insufficient_slots=2,hard_preflight=2,active_project_exclusion=5."
+    },
+    {
+      "command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da-5-5-cod10-target cargo test -p frankenterm-topo --lib deadwire -- --nocapture",
+      "status": "blocked",
+      "worker": "vmi1264463",
+      "job_id": 29884604911452290,
+      "result": "Remote command reached execution and stalled after fetching https://github.com/Dicklesworthstone/asupersync; job was cancelled by cod_10 after fresh heartbeats with no progress so shared RCH slots were released."
+    },
+    {
+      "command": "ubs crates/frankenterm-topo/src/lib.rs crates/frankenterm-topo/Cargo.toml",
+      "status": "pass",
+      "result": "Local hygiene passed before the manifest/artifact follow-up; RCH remains the required build/test proof."
+    }
+  ],
+  "manifest_wiring": {
+    "category": "proofs/robot-contracts",
+    "manifest_path": "docs/attestations/manifest.json",
+    "required_category": true,
+    "slot_path": "docs/attestations/doctrine/wiring-status.json",
+    "proof_categories": [
+      4,
+      11
+    ]
+  }
+}
