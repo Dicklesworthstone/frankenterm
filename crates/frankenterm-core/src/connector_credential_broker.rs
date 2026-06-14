@@ -393,7 +393,7 @@ impl CredentialLease {
 
     /// Check if the broker-owned lease record is still valid at the given time.
     #[must_use]
-    fn is_valid_at(&self, now_ms: u64) -> bool {
+    pub fn is_valid_at(&self, now_ms: u64) -> bool {
         self.state == LeaseState::Active && now_ms < self.expires_at_ms
     }
 }
@@ -549,14 +549,11 @@ impl ConnectorCredentialBroker {
         credential: ManagedCredential,
         now_ms: u64,
     ) -> Result<(), CredentialBrokerError> {
-        // Verify provider exists
-        if !self.providers.contains_key(&credential.provider_id) {
-            return Err(CredentialBrokerError::ProviderNotFound {
+        let provider = self.providers.get(&credential.provider_id).ok_or_else(|| {
+            CredentialBrokerError::ProviderNotFound {
                 provider_id: credential.provider_id.clone(),
-            });
-        }
-        // Verify provider supports this sensitivity level
-        let provider = &self.providers[&credential.provider_id];
+            }
+        })?;
         if credential.sensitivity > provider.config.max_sensitivity {
             return Err(CredentialBrokerError::NotAuthorized {
                 connector_id: String::new(),
@@ -845,7 +842,9 @@ impl ConnectorCredentialBroker {
             }
         }
         for lease_id in &expired {
-            let lease = &self.leases[lease_id];
+            let Some(lease) = self.leases.get(lease_id) else {
+                continue;
+            };
             let credential_id = lease.credential_id.clone();
             let connector_id = lease.connector_id.clone();
             if let Some(cred) = self.credentials.get_mut(&credential_id) {
