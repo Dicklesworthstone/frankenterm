@@ -153,6 +153,66 @@ pub fn build_limits_forecast(
     }
 }
 
+/// A pane/account whose rate/usage-limit window crossed its reset deadline
+/// since the previous maintenance check — i.e. it just became usable again.
+///
+/// This is the payload for the forthcoming `limit.window.reset` bus event
+/// (W7.2, ft-0q7a2): a maintenance driver emits one event per entry so that,
+/// with W3 (watch-events), dispatchers can resume the moment capacity returns
+/// instead of polling. Emission wiring (the `Event::LimitWindowReset` variant +
+/// runtime maintenance loop) and the watch-events stream forwarding are tracked
+/// separately; this is the deterministic detection core they build on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitWindowReset {
+    /// Pane the limit was detected on.
+    pub pane_id: u64,
+    /// Service/provider namespace for the account key.
+    pub service: String,
+    /// Stable account key (`unknown` when the detector lacked account context).
+    pub account_id: String,
+    /// The effective reset deadline (epoch ms) that elapsed.
+    pub reset_at_ms: i64,
+}
+
+/// Detect limit windows whose effective reset deadline elapsed in the half-open
+/// interval `(prev_check_ms, now_ms]` — the windows that became usable since the
+/// previous maintenance check.
+///
+/// `windows` should include the windows that were active at the previous check
+/// (rows whose effective reset is `> prev_check_ms`). Rows that reset at or
+/// before `prev_check_ms` are already-reported and ignored; rows that reset
+/// after `now_ms` are still limited and excluded. Results are sorted by
+/// `(pane_id, service, account_id)` so a driver emits events in a stable,
+/// golden-testable order. Effective reset mirrors
+/// [`LimitWindowRecord::effective_reset_at_ms`] (parsed reset, else conservative
+/// TTL deadline).
+#[must_use]
+pub fn limit_windows_reset_between(
+    prev_check_ms: i64,
+    now_ms: i64,
+    windows: &[LimitWindowRecord],
+) -> Vec<LimitWindowReset> {
+    let mut out: Vec<LimitWindowReset> = windows
+        .iter()
+        .filter_map(|w| {
+            let reset = w.effective_reset_at_ms();
+            (reset > prev_check_ms && reset <= now_ms).then(|| LimitWindowReset {
+                pane_id: w.pane_id,
+                service: w.service.clone(),
+                account_id: w.account_id.clone(),
+                reset_at_ms: reset,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.pane_id
+            .cmp(&b.pane_id)
+            .then_with(|| a.service.cmp(&b.service))
+            .then_with(|| a.account_id.cmp(&b.account_id))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +381,67 @@ mod tests {
             assert_eq!(point.usable_panes + point.limited_panes, 2);
         }
         assert_eq!(forecast.timeline.last().unwrap().usable_panes, 2);
+    }
+
+    #[test]
+    fn limit_windows_reset_between_selects_crossed_deadlines() {
+        let windows = [
+            window(1, "openai", "a", Some(5_000), "absolute", 0, 0), // in (3000,8000]
+            window(2, "openai", "a", Some(3_000), "absolute", 0, 0), // == prev: excluded
+            window(3, "openai", "a", Some(8_000), "absolute", 0, 0), // == now: included
+            window(4, "openai", "a", Some(9_000), "absolute", 0, 0), // > now: still limited
+            window(5, "openai", "a", Some(1_000), "absolute", 0, 0), // < prev: already reported
+        ];
+        let resets = limit_windows_reset_between(3_000, 8_000, &windows);
+        let ids: Vec<u64> = resets.iter().map(|r| r.pane_id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "only windows resetting in (prev, now] are reported"
+        );
+        assert_eq!(resets[0].reset_at_ms, 5_000);
+        assert_eq!(resets[1].reset_at_ms, 8_000);
+    }
+
+    #[test]
+    fn limit_windows_reset_between_is_deterministically_sorted() {
+        let windows = [
+            window(9, "openai", "z", Some(5_000), "absolute", 0, 0),
+            window(2, "openai", "a", Some(5_000), "absolute", 0, 0),
+            window(2, "anthropic", "a", Some(5_000), "absolute", 0, 0),
+        ];
+        let resets = limit_windows_reset_between(0, 10_000, &windows);
+        let keys: Vec<(u64, &str)> = resets
+            .iter()
+            .map(|r| (r.pane_id, r.service.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![(2, "anthropic"), (2, "openai"), (9, "openai")],
+            "results sorted by (pane_id, service, account_id)"
+        );
+    }
+
+    #[test]
+    fn limit_windows_reset_between_uses_conservative_ttl_deadline() {
+        // unknown_ttl: effective reset = last_seen + conservative_ttl (5000).
+        let windows = [window(7, "google", "a", None, "unknown_ttl", 1_000, 4_000)];
+        let resets = limit_windows_reset_between(4_000, 6_000, &windows);
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].pane_id, 7);
+        assert_eq!(resets[0].reset_at_ms, 5_000);
+        assert!(
+            limit_windows_reset_between(5_000, 6_000, &windows).is_empty(),
+            "reset == prev_check is already reported"
+        );
+        assert!(
+            limit_windows_reset_between(0, 4_999, &windows).is_empty(),
+            "reset > now is still limited"
+        );
+    }
+
+    #[test]
+    fn limit_windows_reset_between_empty() {
+        assert!(limit_windows_reset_between(0, 1_000, &[]).is_empty());
     }
 }
