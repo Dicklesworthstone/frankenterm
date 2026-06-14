@@ -305,6 +305,10 @@ SEE ALSO:
         #[arg(long, short = 'p')]
         pane: Option<u64>,
 
+        /// Filter by semantic zone type: prompt, input, or output
+        #[arg(long)]
+        zone: Option<String>,
+
         /// Filter by bookmark alias
         #[arg(long)]
         bookmark: Option<String>,
@@ -3272,6 +3276,10 @@ enum RobotCommands {
         /// Filter by pane ID
         #[arg(long)]
         pane: Option<u64>,
+
+        /// Filter by semantic zone type: prompt, input, or output
+        #[arg(long)]
+        zone: Option<String>,
 
         /// Only return results since this timestamp (epoch ms)
         #[arg(long)]
@@ -30369,6 +30377,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             query,
                             limit,
                             pane,
+                            zone,
                             since,
                             until,
                             snippets,
@@ -30380,6 +30389,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         query,
                                         limit: Some(limit),
                                         pane,
+                                        zone,
                                         since,
                                         until,
                                         snippets,
@@ -36090,6 +36100,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             format,
             limit,
             pane,
+            zone,
             bookmark,
             bookmark_tag,
             since,
@@ -36516,6 +36527,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let options = frankenterm_core::storage::SearchOptions {
                                 limit: Some(limit),
                                 pane_id: saved.pane_id,
+                                zone_type: None,
                                 since,
                                 until: None,
                                 include_snippets: Some(true),
@@ -37098,11 +37110,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                     let redacted_query = redact_for_output(&query);
                     tracing::info!(
-                        "Searching for '{}' (mode={:?}, limit={}, pane={:?}, since={:?}, until={:?}, bookmark={:?}, bookmark_tag={:?})",
+                        "Searching for '{}' (mode={:?}, limit={}, pane={:?}, zone={:?}, since={:?}, until={:?}, bookmark={:?}, bookmark_tag={:?})",
                         redacted_query,
                         mode,
                         limit,
                         pane,
+                        zone,
                         since,
                         until,
                         bookmark,
@@ -37114,6 +37127,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             query: query.clone(),
                             limit: Some(limit),
                             pane: None,
+                            zone,
                             since,
                             until,
                             snippets: Some(true),
@@ -74606,19 +74620,22 @@ log_level = "debug"
     #[test]
     fn cli_search_parses_time_window_and_mode() {
         let cli = Cli::try_parse_from([
-            "ft", "search", "error", "--since", "100", "--until", "200", "--mode", "hybrid",
+            "ft", "search", "error", "--zone", "output", "--since", "100", "--until", "200",
+            "--mode", "hybrid",
         ])
         .expect("search time window + mode should parse");
 
         match cli.command.map(|b| *b) {
             Some(Commands::Search {
                 query,
+                zone,
                 since,
                 until,
                 mode,
                 ..
             }) => {
                 assert_eq!(query.as_deref(), Some("error"));
+                assert_eq!(zone.as_deref(), Some("output"));
                 assert_eq!(since, Some(100));
                 assert_eq!(until, Some(200));
                 assert_eq!(mode, SearchModeArg::Hybrid);
@@ -74634,6 +74651,8 @@ log_level = "debug"
             "robot",
             "search",
             "error",
+            "--zone",
+            "input",
             "--until",
             "200",
             "--snippets",
@@ -74647,12 +74666,14 @@ log_level = "debug"
             Some(Commands::Robot { command, .. }) => match command {
                 Some(RobotCommands::Search {
                     query,
+                    zone,
                     until,
                     snippets,
                     mode,
                     ..
                 }) => {
                     assert_eq!(query, "error");
+                    assert_eq!(zone.as_deref(), Some("input"));
                     assert_eq!(until, Some(200));
                     assert_eq!(snippets, Some(false));
                     assert_eq!(mode, SearchModeArg::Semantic);

@@ -48,9 +48,9 @@ use crate::fleet_scrollback_coordinator::{
     CoordinatorConfig, FleetScrollbackCoordinator, SnapshotPaneScrollbackAccess,
 };
 use crate::gc::{CacheCompactionStats, CacheGcSettings, compact_u64_map, should_vacuum};
-use crate::ingest::persist_captured_segment_with_cx;
 use crate::ingest::{
-    CapturedSegment, PaneCursor, PaneRegistry, PersistedCapture, bounded_segment_for_persistence,
+    CapturedSegment, CapturedSegmentKind, PaneCursor, PaneRegistry, PersistedCapture,
+    bounded_segment_for_persistence, persist_captured_segment_with_zone_with_cx,
 };
 use crate::memory_budget::BudgetLevel;
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
@@ -77,8 +77,8 @@ use crate::vendored::subscribe_pane_output_with_inherited_cx;
 use crate::vendored::{DirectMuxClient, DirectMuxClientConfig, PaneDelta, SubscriptionConfig};
 use crate::watchdog::HeartbeatRegistry;
 use crate::wezterm::{
-    PaneInfo, PaneTieredScrollbackSummary, WeztermHandle, WeztermHandleSource, WeztermInterface,
-    wezterm_handle_with_timeout,
+    MuxSemanticSnapshot, MuxSemanticZoneKind, PaneInfo, PaneTieredScrollbackSummary, WeztermHandle,
+    WeztermHandleSource, WeztermInterface, wezterm_handle_with_timeout,
 };
 
 fn runtime_cancelled_error(operation: &'static str, err: impl std::fmt::Display) -> Error {
@@ -120,8 +120,111 @@ async fn persist_captured_segment_for_runtime(
     storage: &StorageHandle,
     captured: &CapturedSegment,
     max_segment_bytes: usize,
+    zone_type: Option<&str>,
 ) -> Result<PersistedCapture> {
-    persist_captured_segment_with_cx(runtime_cx, storage, captured, max_segment_bytes).await
+    persist_captured_segment_with_zone_with_cx(
+        runtime_cx,
+        storage,
+        captured,
+        max_segment_bytes,
+        zone_type,
+    )
+    .await
+}
+
+#[derive(Debug, Clone)]
+struct CachedSemanticZoneSnapshot {
+    refreshed_at: Instant,
+    snapshot: Option<MuxSemanticSnapshot>,
+}
+
+async fn semantic_zone_type_for_captured_segment(
+    runtime_cx: &RuntimeLoopCx,
+    wezterm_handle: &WeztermHandle,
+    cache: &mut HashMap<u64, CachedSemanticZoneSnapshot>,
+    cache_ttl: Duration,
+    captured: &CapturedSegment,
+) -> Option<String> {
+    if !matches!(&captured.kind, CapturedSegmentKind::Delta) || captured.content.trim().is_empty() {
+        return None;
+    }
+
+    let now = Instant::now();
+    if let Some(cached) = cache.get(&captured.pane_id)
+        && now.saturating_duration_since(cached.refreshed_at) <= cache_ttl
+    {
+        return cached
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| infer_semantic_zone_type_for_segment(captured, snapshot))
+            .map(str::to_string);
+    }
+
+    let snapshot = match wezterm_handle
+        .get_semantic_zones_with_cx(runtime_cx, captured.pane_id)
+        .await
+    {
+        Ok(snapshot) => Some(snapshot),
+        Err(err) => {
+            debug!(
+                pane_id = captured.pane_id,
+                error = %err,
+                "semantic zone snapshot unavailable while stamping captured segment"
+            );
+            None
+        }
+    };
+    cache.insert(
+        captured.pane_id,
+        CachedSemanticZoneSnapshot {
+            refreshed_at: now,
+            snapshot: snapshot.clone(),
+        },
+    );
+    snapshot
+        .as_ref()
+        .and_then(|snapshot| infer_semantic_zone_type_for_segment(captured, snapshot))
+        .map(str::to_string)
+}
+
+fn infer_semantic_zone_type_for_segment(
+    captured: &CapturedSegment,
+    snapshot: &MuxSemanticSnapshot,
+) -> Option<&'static str> {
+    if !matches!(&captured.kind, CapturedSegmentKind::Delta) {
+        return None;
+    }
+    let content = captured.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    snapshot
+        .zones
+        .iter()
+        .filter(|zone| !zone.text.trim().is_empty())
+        .filter(|zone| {
+            let zone_text = zone.text.trim();
+            content.contains(zone_text) || zone_text.contains(content)
+        })
+        .max_by_key(|zone| (zone.start_y, zone.start_x))
+        .map(|zone| semantic_zone_type_label(zone.semantic_type))
+        .or_else(|| {
+            snapshot
+                .zones
+                .iter()
+                .filter(|zone| zone.semantic_type == MuxSemanticZoneKind::Output)
+                .max_by_key(|zone| (zone.start_y, zone.start_x))
+                .map(|zone| semantic_zone_type_label(zone.semantic_type))
+        })
+}
+
+const fn semantic_zone_type_label(kind: MuxSemanticZoneKind) -> &'static str {
+    match kind {
+        MuxSemanticZoneKind::Prompt => "prompt",
+        MuxSemanticZoneKind::Input => "input",
+        MuxSemanticZoneKind::Output => "output",
+    }
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)] // update-taking watch APIs require &mut here
@@ -3149,14 +3252,17 @@ impl ObservationRuntime {
         let recording = self.recording.clone();
         let heartbeats = Arc::clone(&self.heartbeats);
         let tuning = Arc::clone(&self.tuning);
+        let wezterm_handle = Arc::clone(&self.wezterm_handle);
         let mut config_rx = self.config_rx.clone();
         let mut current_patterns = self.config.patterns.clone();
         let patterns_root = self.config.patterns_root.clone();
+        let semantic_zone_cache_ttl = self.config.capture_interval.max(Duration::from_millis(1));
         let registry = Arc::clone(&registry);
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let max_persist_segment_bytes = tuning.ingest.max_persist_segment_bytes;
+            let mut semantic_zone_cache = HashMap::<u64, CachedSemanticZoneSnapshot>::new();
             let mut bocpd_manager =
                 crate::bocpd::BocpdManager::new(crate::bocpd::BocpdConfig::default());
             let mut bocpd_last_capture_at = HashMap::<u64, i64>::new();
@@ -3198,6 +3304,14 @@ impl ObservationRuntime {
                     bounded_segment_for_persistence(&event.segment, max_persist_segment_bytes);
                 let captured_at = bounded_segment.captured_at;
                 let captured_seq = bounded_segment.seq;
+                let zone_type = semantic_zone_type_for_captured_segment(
+                    &loop_cx,
+                    &wezterm_handle,
+                    &mut semantic_zone_cache,
+                    semantic_zone_cache_ttl,
+                    &bounded_segment,
+                )
+                .await;
 
                 // Persist the segment
                 // ft-xbnl0.2.3 tick 254: cx-first segment persist.
@@ -3206,6 +3320,7 @@ impl ObservationRuntime {
                     &storage,
                     &bounded_segment,
                     max_persist_segment_bytes,
+                    zone_type.as_deref(),
                 )
                 .await
                 {
@@ -5258,6 +5373,72 @@ mod tests {
                 RuntimeOperationSource::Backend("watch channel closed".to_string())
             );
         }
+    }
+
+    #[test]
+    fn semantic_zone_inference_uses_matching_zone_text() {
+        let captured = CapturedSegment {
+            pane_id: 9,
+            seq: 1,
+            content: "cargo test failed\n".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: 1_700_000_000_000,
+        };
+        let snapshot = MuxSemanticSnapshot {
+            zones: vec![
+                crate::wezterm::MuxSemanticZone {
+                    start_y: 0,
+                    start_x: 0,
+                    end_y: 0,
+                    end_x: 1,
+                    semantic_type: MuxSemanticZoneKind::Prompt,
+                    text: "$ ".to_string(),
+                },
+                crate::wezterm::MuxSemanticZone {
+                    start_y: 1,
+                    start_x: 0,
+                    end_y: 1,
+                    end_x: 18,
+                    semantic_type: MuxSemanticZoneKind::Output,
+                    text: "cargo test failed".to_string(),
+                },
+            ],
+            last_exit_code: Some(101),
+        };
+
+        assert_eq!(
+            infer_semantic_zone_type_for_segment(&captured, &snapshot),
+            Some("output")
+        );
+    }
+
+    #[test]
+    fn semantic_zone_inference_leaves_gap_segments_untyped() {
+        let captured = CapturedSegment {
+            pane_id: 9,
+            seq: 2,
+            content: "full snapshot after overlap miss\n".to_string(),
+            kind: CapturedSegmentKind::Gap {
+                reason: "overlap_not_found".to_string(),
+            },
+            captured_at: 1_700_000_000_001,
+        };
+        let snapshot = MuxSemanticSnapshot {
+            zones: vec![crate::wezterm::MuxSemanticZone {
+                start_y: 1,
+                start_x: 0,
+                end_y: 1,
+                end_x: 20,
+                semantic_type: MuxSemanticZoneKind::Output,
+                text: "some output".to_string(),
+            }],
+            last_exit_code: None,
+        };
+
+        assert_eq!(
+            infer_semantic_zone_type_for_segment(&captured, &snapshot),
+            None
+        );
     }
 
     async fn send_mpsc<T>(tx: &mpsc::Sender<T>, value: T) {

@@ -444,11 +444,12 @@ fn action_plan_record_from_plan(
 
 /// Commands sent to the writer thread
 enum WriteCommand {
-    /// Append a segment (pane_id, content, content_hash, response channel)
+    /// Append a segment (pane_id, content, content_hash, zone_type, response channel)
     AppendSegment {
         pane_id: u64,
         content: String,
         content_hash: Option<String>,
+        zone_type: Option<String>,
         respond: oneshot::Sender<Result<Segment>>,
     },
     /// Record a gap event
@@ -1776,7 +1777,7 @@ impl StorageHandle {
         content_hash: Option<String>,
     ) -> Result<Segment> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.append_segment_with_cx(&cx, pane_id, content, content_hash)
+        self.append_segment_with_zone_with_cx(&cx, pane_id, content, content_hash, None)
             .await
     }
 
@@ -1798,6 +1799,36 @@ impl StorageHandle {
         content: &str,
         content_hash: Option<String>,
     ) -> Result<Segment> {
+        self.append_segment_with_zone_with_cx(cx, pane_id, content, content_hash, None)
+            .await
+    }
+
+    /// Append a segment and stamp optional semantic zone metadata.
+    ///
+    /// `zone_type` is additive metadata only. `None` means the segment is
+    /// untyped, either because it predates the schema or because the capture
+    /// path could not determine a live semantic zone.
+    pub async fn append_segment_with_zone(
+        &self,
+        pane_id: u64,
+        content: &str,
+        content_hash: Option<String>,
+        zone_type: Option<&str>,
+    ) -> Result<Segment> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.append_segment_with_zone_with_cx(&cx, pane_id, content, content_hash, zone_type)
+            .await
+    }
+
+    /// Cx-first sibling of [`append_segment_with_zone`].
+    pub async fn append_segment_with_zone_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        content: &str,
+        content_hash: Option<String>,
+        zone_type: Option<&str>,
+    ) -> Result<Segment> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("append_segment cancelled: {err}")))?;
         let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageWrite, 0);
@@ -1809,6 +1840,7 @@ impl StorageHandle {
                     pane_id,
                     content: content.to_string(),
                     content_hash,
+                    zone_type: zone_type.map(str::to_string),
                     respond: tx,
                 },
             )
@@ -6054,10 +6086,7 @@ impl StorageHandle {
     /// effective reset deadline — parsed reset or conservative TTL — is in the
     /// future), ordered deterministically by pane/service/account. This is the
     /// read path behind the `ft robot limits` capacity forecast (W7.2).
-    pub async fn list_active_limit_windows(
-        &self,
-        now_ms: i64,
-    ) -> Result<Vec<LimitWindowRecord>> {
+    pub async fn list_active_limit_windows(&self, now_ms: i64) -> Result<Vec<LimitWindowRecord>> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.list_active_limit_windows_with_cx(&cx, now_ms).await
     }
@@ -6703,6 +6732,8 @@ pub struct SearchOptions {
     pub limit: Option<usize>,
     /// Filter by pane ID
     pub pane_id: Option<u64>,
+    /// Filter by semantic zone type (`prompt`, `input`, or `output`).
+    pub zone_type: Option<String>,
     /// Filter by time range (epoch ms)
     pub since: Option<i64>,
     /// Filter by time range (epoch ms)
@@ -6814,6 +6845,7 @@ pub struct SemanticBudgetSnapshot {
 struct SemanticQueryCacheKey {
     embedder_id: String,
     pane_id: Option<u64>,
+    zone_type: Option<String>,
     since: Option<i64>,
     until: Option<i64>,
     limit: usize,
@@ -7054,6 +7086,7 @@ fn semantic_query_cache_key(
     SemanticQueryCacheKey {
         embedder_id: embedder_id.to_string(),
         pane_id: options.pane_id,
+        zone_type: options.zone_type.clone(),
         since: options.since,
         until: options.until,
         limit: options.limit.unwrap_or(100),
@@ -7960,6 +7993,7 @@ struct PendingAppendSegmentWrite {
     pane_id: u64,
     content: String,
     content_hash: Option<String>,
+    zone_type: Option<String>,
     respond: WriterResultResponder<Segment>,
 }
 
@@ -7969,6 +8003,7 @@ impl PendingAppendSegmentWrite {
             pane_id: self.pane_id,
             content: self.content,
             content_hash: self.content_hash,
+            zone_type: self.zone_type,
             respond: self.respond.into_sender(),
         }
     }
@@ -7982,11 +8017,13 @@ fn pending_append_segment_from_command(
             pane_id,
             content,
             content_hash,
+            zone_type,
             respond,
         } => Ok(PendingAppendSegmentWrite {
             pane_id,
             content,
             content_hash,
+            zone_type,
             respond: WriterResultResponder::new(respond),
         }),
         other => Err(other),
@@ -8513,6 +8550,7 @@ mod writer_io_scheduler_tests {
             pane_id,
             content: content.to_string(),
             content_hash: None,
+            zone_type: None,
             respond: tx,
         }
     }
@@ -8782,12 +8820,14 @@ mod writer_io_scheduler_tests {
                 pane_id: 77,
                 content: "first group append".to_string(),
                 content_hash: Some("hash-first".to_string()),
+                zone_type: None,
                 respond: first_tx,
             });
             batch.push_back(WriteCommand::AppendSegment {
                 pane_id: 77,
                 content: "second group append".to_string(),
                 content_hash: None,
+                zone_type: None,
                 respond: second_tx,
             });
 
@@ -9084,6 +9124,7 @@ fn dispatch_write_command_raw(
             pane_id,
             content,
             content_hash,
+            zone_type,
             respond,
         } => {
             let respond = WriterResultResponder::new(respond);
@@ -9097,7 +9138,13 @@ fn dispatch_write_command_raw(
                 } else {
                     None
                 };
-                append_segment_backend(backend, pane_id, &redacted_content, persisted_hash)
+                append_segment_backend(
+                    backend,
+                    pane_id,
+                    &redacted_content,
+                    persisted_hash,
+                    zone_type.as_deref(),
+                )
             })();
             if moved_retained_tail {
                 disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pane_id);
@@ -10230,6 +10277,7 @@ fn append_segment_backend(
     pane_id: u64,
     content: &str,
     content_hash: Option<&str>,
+    zone_type: Option<&str>,
 ) -> Result<Segment> {
     let next_seq = next_output_segment_seq_backend(backend, pane_id)?;
     insert_output_segment_with_seq_backend(
@@ -10238,6 +10286,7 @@ fn append_segment_backend(
         next_seq,
         content,
         content_hash,
+        zone_type,
         now_ms(),
         crate::redact_backfill::current_catalog_version(),
     )
@@ -10307,6 +10356,7 @@ fn append_segment_group_commit_inner(
             next_seq,
             &content,
             content_hash,
+            write.zone_type.as_deref(),
             now,
             catalog_version,
         )?;
@@ -10384,6 +10434,7 @@ fn insert_output_segment_with_seq_backend(
     seq: u64,
     content: &str,
     content_hash: Option<&str>,
+    zone_type: Option<&str>,
     captured_at: i64,
     redaction_catalog_version: &str,
 ) -> Result<Segment> {
@@ -10397,8 +10448,11 @@ fn insert_output_segment_with_seq_backend(
         .query_row_typed(
         // ft-7h5da.1.5: stamp the redaction catalog version in effect at capture
         // so corpus cleanliness ("clean as of catalog vN?") is a queryable fact.
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at, redaction_catalog_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        //
+        // ft-7h5da.2.3: stamp best-effort semantic zone metadata when the
+        // runtime can infer it; NULL means historical/unavailable/untyped.
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, content_hash, captured_at, redaction_catalog_version, zone_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          RETURNING id",
         &[
             ToSqlValue::Integer(pane_id_i64),
@@ -10408,6 +10462,7 @@ fn insert_output_segment_with_seq_backend(
             ToSqlValue::optional_text(content_hash),
             ToSqlValue::Integer(captured_at),
             ToSqlValue::Text(redaction_catalog_version),
+            ToSqlValue::optional_text(zone_type),
         ],
     )
     .map_err(|e| storage_backend_error("Failed to insert segment", e))?
@@ -14910,6 +14965,10 @@ fn append_fts_filter_backend_params(
         sql.push_str(" AND s.pane_id = ?");
         params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
     }
+    if let Some(zone_type) = options.zone_type.as_deref() {
+        sql.push_str(" AND s.zone_type = ?");
+        params.push(ToSqlValue::OwnedText(zone_type.to_string()));
+    }
     if let Some(since) = options.since {
         sql.push_str(" AND s.captured_at >= ?");
         params.push(ToSqlValue::Integer(since));
@@ -15214,6 +15273,10 @@ fn search_semantic_backend_with_scan_limit(
     if let Some(pane_id) = options.pane_id {
         sql.push_str(" AND s.pane_id = ?");
         params.push(ToSqlValue::Integer(u64_to_i64(pane_id, "pane_id")?));
+    }
+    if let Some(zone_type) = options.zone_type.as_deref() {
+        sql.push_str(" AND s.zone_type = ?");
+        params.push(ToSqlValue::OwnedText(zone_type.to_string()));
     }
     if let Some(since) = options.since {
         sql.push_str(" AND s.captured_at >= ?");
@@ -18166,18 +18229,30 @@ fn append_segment_assigns_gapless_monotonic_independent_seqs() {
 
     // Pane 1: the first five appends must return seq 0,1,2,3,4 in order.
     for expected in 0u64..5 {
-        let seg = append_segment_backend(&backend, 1, &format!("p1-{expected}"), None).unwrap();
+        let seg =
+            append_segment_backend(&backend, 1, &format!("p1-{expected}"), None, None).unwrap();
         assert_eq!(seg.seq, expected, "pane 1 seq must be gapless and start at 0");
         assert_eq!(seg.pane_id, 1);
     }
     // Pane 2 is independent — its sequence also starts at 0.
     for expected in 0u64..3 {
-        let seg = append_segment_backend(&backend, 2, &format!("p2-{expected}"), None).unwrap();
+        let seg =
+            append_segment_backend(&backend, 2, &format!("p2-{expected}"), None, None).unwrap();
         assert_eq!(seg.seq, expected, "pane 2 seq is independent of pane 1");
     }
     // Interleaving resumes each pane's own counter.
-    assert_eq!(append_segment_backend(&backend, 1, "p1-5", None).unwrap().seq, 5);
-    assert_eq!(append_segment_backend(&backend, 2, "p2-3", None).unwrap().seq, 3);
+    assert_eq!(
+        append_segment_backend(&backend, 1, "p1-5", None, None)
+            .unwrap()
+            .seq,
+        5
+    );
+    assert_eq!(
+        append_segment_backend(&backend, 2, "p2-3", None, None)
+            .unwrap()
+            .seq,
+        3
+    );
 
     // DB-level: per pane, gapless ⟺ MAX(seq)+1 == COUNT(*), and no duplicate
     // (pane_id, seq) pairs exist anywhere.
@@ -18300,11 +18375,22 @@ fn seed_segment_backend(
     content: &str,
     captured_at: i64,
 ) -> i64 {
+    seed_segment_with_zone_backend(backend, pane_id, seq, content, captured_at, None)
+}
+
+fn seed_segment_with_zone_backend(
+    backend: &dyn StorageBackend,
+    pane_id: i64,
+    seq: i64,
+    content: &str,
+    captured_at: i64,
+    zone_type: Option<&str>,
+) -> i64 {
     let content_len = i64::try_from(content.len()).unwrap();
     let row = backend
         .query_row_typed(
-            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at, zone_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              RETURNING id",
             &[
                 ToSqlValue::Integer(pane_id),
@@ -18312,6 +18398,7 @@ fn seed_segment_backend(
                 ToSqlValue::Text(content),
                 ToSqlValue::Integer(content_len),
                 ToSqlValue::Integer(captured_at),
+                ToSqlValue::optional_text(zone_type),
             ],
         )
         .unwrap()
@@ -18504,6 +18591,28 @@ fn fts_search_respects_pane_filter() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].segment.pane_id, 1);
+}
+
+#[test]
+fn fts_search_respects_zone_type_filter() {
+    let backend = memory_backend();
+
+    let now_ms = 1_700_000_000_000i64;
+
+    seed_pane_backend(&backend, 1, now_ms);
+    seed_segment_with_zone_backend(&backend, 1, 0, "zone needle prompt", now_ms, Some("prompt"));
+    seed_segment_with_zone_backend(&backend, 1, 1, "zone needle output", now_ms + 1, Some("output"));
+    seed_segment_with_zone_backend(&backend, 1, 2, "zone needle untyped", now_ms + 2, None);
+
+    let options = SearchOptions {
+        zone_type: Some("output".to_string()),
+        ..Default::default()
+    };
+    let results = search_fts_with_snippets_backend(&backend, "needle", &options).unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].segment.seq, 1);
+    assert_eq!(results[0].segment.content, "zone needle output");
 }
 
 #[test]

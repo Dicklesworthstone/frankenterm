@@ -71,6 +71,7 @@ pub struct SearchQueryInput {
     pub query: String,
     pub limit: Option<usize>,
     pub pane: Option<u64>,
+    pub zone: Option<String>,
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub snippets: Option<bool>,
@@ -86,6 +87,8 @@ pub struct UnifiedSearchQuery {
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +118,9 @@ pub enum SearchQueryValidationError {
         since: i64,
         until: i64,
     },
+    InvalidZoneType {
+        provided: String,
+    },
     InvalidQuery {
         lints: Vec<SearchLint>,
     },
@@ -131,6 +137,7 @@ impl SearchQueryValidationError {
         match self {
             Self::InvalidLimit { .. } => "search.invalid_limit",
             Self::InvalidTimeRange { .. } => "search.invalid_time_range",
+            Self::InvalidZoneType { .. } => "search.invalid_zone_type",
             Self::InvalidQuery { .. } => "search.invalid_query",
             Self::UnsupportedMode { .. } => "search.unsupported_mode",
         }
@@ -149,6 +156,9 @@ impl SearchQueryValidationError {
             Self::InvalidTimeRange { since, until } => format!(
                 "Invalid time range: since ({since}) cannot be greater than until ({until})."
             ),
+            Self::InvalidZoneType { provided } => {
+                format!("Invalid search zone: {provided}. Zone must be prompt, input, or output.")
+            }
             Self::InvalidQuery { .. } => "Invalid search query.".to_string(),
             Self::UnsupportedMode { mode, supported } => {
                 let supported = supported
@@ -174,6 +184,9 @@ impl SearchQueryValidationError {
             }
             Self::InvalidTimeRange { .. } => {
                 Some("Set --since <= --until (both epoch milliseconds).".to_string())
+            }
+            Self::InvalidZoneType { .. } => {
+                Some("Use --zone prompt, --zone input, or --zone output.".to_string())
             }
             Self::InvalidQuery { lints } => format_lint_hint(lints),
             Self::UnsupportedMode { supported, .. } => {
@@ -249,6 +262,18 @@ pub fn parse_unified_search_query(
     defaults: SearchQueryDefaults,
 ) -> std::result::Result<SearchQueryParseOutput, SearchQueryValidationError> {
     let query = input.query.trim().to_string();
+    let zone = match input.zone.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(zone) => {
+            let normalized = zone.to_ascii_lowercase();
+            if !matches!(normalized.as_str(), "prompt" | "input" | "output") {
+                return Err(SearchQueryValidationError::InvalidZoneType {
+                    provided: zone.to_string(),
+                });
+            }
+            Some(normalized)
+        }
+    };
     let limit = input.limit.unwrap_or(defaults.limit);
     if limit == 0 || limit > defaults.max_limit {
         return Err(SearchQueryValidationError::InvalidLimit {
@@ -273,6 +298,7 @@ pub fn parse_unified_search_query(
             query,
             limit,
             pane: input.pane,
+            zone,
             since: input.since,
             until: input.until,
             snippets: input.snippets.unwrap_or(defaults.snippets),
@@ -303,6 +329,7 @@ pub fn to_storage_search_options(query: &UnifiedSearchQuery) -> SearchOptions {
     SearchOptions {
         limit: Some(query.limit),
         pane_id: query.pane,
+        zone_type: query.zone.clone(),
         since: query.since,
         until: query.until,
         include_snippets: Some(query.snippets),
@@ -335,6 +362,7 @@ mod tests {
         assert_eq!(parsed.query.limit, SEARCH_LIMIT_DEFAULT);
         assert!(parsed.query.snippets);
         assert_eq!(parsed.query.mode, UnifiedSearchMode::Lexical);
+        assert_eq!(parsed.query.zone, None);
         assert!(!parsed.query.explain);
         assert!(parsed.lints.is_empty());
     }
@@ -346,6 +374,7 @@ mod tests {
                 query: "warning".to_string(),
                 limit: Some(7),
                 pane: Some(42),
+                zone: Some(" Output ".to_string()),
                 since: Some(100),
                 until: Some(200),
                 snippets: Some(false),
@@ -358,6 +387,7 @@ mod tests {
 
         assert_eq!(parsed.query.limit, 7);
         assert_eq!(parsed.query.pane, Some(42));
+        assert_eq!(parsed.query.zone.as_deref(), Some("output"));
         assert_eq!(parsed.query.since, Some(100));
         assert_eq!(parsed.query.until, Some(200));
         assert!(!parsed.query.snippets);
@@ -403,6 +433,21 @@ mod tests {
         )
         .expect_err("since > until should fail");
         assert_eq!(err.code(), "search.invalid_time_range");
+    }
+
+    #[test]
+    fn parse_rejects_invalid_zone_type() {
+        let err = parse_unified_search_query(
+            SearchQueryInput {
+                query: "error".to_string(),
+                zone: Some("command".to_string()),
+                ..SearchQueryInput::default()
+            },
+            SearchQueryDefaults::default(),
+        )
+        .expect_err("invalid zone should fail");
+        assert_eq!(err.code(), "search.invalid_zone_type");
+        assert!(err.message().contains("prompt, input, or output"));
     }
 
     #[test]
@@ -714,6 +759,7 @@ mod tests {
             query: "test".to_string(),
             limit: 50,
             pane: Some(7),
+            zone: Some("output".to_string()),
             since: Some(100),
             until: Some(200),
             snippets: true,
@@ -723,6 +769,7 @@ mod tests {
         let opts = to_storage_search_options(&query);
         assert_eq!(opts.limit, Some(50));
         assert_eq!(opts.pane_id, Some(7));
+        assert_eq!(opts.zone_type.as_deref(), Some("output"));
         assert_eq!(opts.since, Some(100));
         assert_eq!(opts.until, Some(200));
         assert_eq!(opts.include_snippets, Some(true));
@@ -743,6 +790,7 @@ mod tests {
             query: "test".to_string(),
             limit: 20,
             pane: None,
+            zone: None,
             since: None,
             until: None,
             snippets: false,
@@ -751,6 +799,7 @@ mod tests {
         };
         let opts = to_storage_search_options(&query);
         assert!(opts.pane_id.is_none());
+        assert!(opts.zone_type.is_none());
         assert!(opts.since.is_none());
         assert!(opts.until.is_none());
         assert_eq!(opts.include_snippets, Some(false));
@@ -823,6 +872,7 @@ mod tests {
             query: "hello world".to_string(),
             limit: 50,
             pane: Some(7),
+            zone: Some("input".to_string()),
             since: Some(100),
             until: Some(200),
             snippets: true,
@@ -840,6 +890,7 @@ mod tests {
             query: "test".to_string(),
             limit: 20,
             pane: None,
+            zone: None,
             since: None,
             until: None,
             snippets: false,
@@ -848,6 +899,7 @@ mod tests {
         };
         let json = serde_json::to_string(&query).unwrap();
         assert!(!json.contains("pane"));
+        assert!(!json.contains("zone"));
         assert!(!json.contains("since"));
         assert!(!json.contains("until"));
     }
@@ -860,6 +912,7 @@ mod tests {
         assert!(input.query.is_empty());
         assert!(input.limit.is_none());
         assert!(input.pane.is_none());
+        assert!(input.zone.is_none());
         assert!(input.since.is_none());
         assert!(input.until.is_none());
         assert!(input.snippets.is_none());
@@ -916,6 +969,7 @@ mod tests {
             query: "test".to_string(),
             limit: 20,
             pane: None,
+            zone: None,
             since: None,
             until: None,
             snippets: false,
@@ -932,6 +986,7 @@ mod tests {
             query: "test".to_string(),
             limit: 20,
             pane: None,
+            zone: None,
             since: None,
             until: None,
             snippets: false,
@@ -948,6 +1003,7 @@ mod tests {
             query: "test".to_string(),
             limit: 20,
             pane: None,
+            zone: None,
             since: None,
             until: None,
             snippets: true,

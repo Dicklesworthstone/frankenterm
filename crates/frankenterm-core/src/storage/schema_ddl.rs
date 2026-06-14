@@ -49,7 +49,9 @@
 /// redaction catalog version in effect at capture (corpus-hygiene queries).
 /// Per ft-ayy9x: bumped 29 → 30 to normalize `segment_embeddings.embedded_at`
 /// from epoch seconds to epoch milliseconds (schema-wide ms convention).
-pub const SCHEMA_VERSION: i32 = 30;
+/// Per ft-7h5da.2.3: bumped 30 → 31 to stamp best-effort semantic zone type
+/// metadata on new output segments for zone-scoped historical search.
+pub const SCHEMA_VERSION: i32 = 31;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -137,11 +139,13 @@ CREATE TABLE IF NOT EXISTS output_segments (
     content_hash TEXT,                -- for overlap detection (optional)
     captured_at INTEGER NOT NULL,     -- epoch ms
     redaction_catalog_version TEXT,   -- redaction catalog fingerprint at capture (ft-7h5da.1.5); NULL = unknown
+    zone_type TEXT,                   -- best-effort semantic zone at capture (prompt/input/output); NULL = untyped/unavailable
     UNIQUE(pane_id, seq)
 );
 
 CREATE INDEX IF NOT EXISTS idx_segments_pane_seq ON output_segments(pane_id, seq);
 CREATE INDEX IF NOT EXISTS idx_segments_captured ON output_segments(captured_at);
+CREATE INDEX IF NOT EXISTS idx_segments_zone_type ON output_segments(zone_type);
 
 -- Segment embeddings for semantic search
 CREATE TABLE IF NOT EXISTS segment_embeddings (

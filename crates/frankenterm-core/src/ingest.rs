@@ -1667,63 +1667,22 @@ pub async fn persist_captured_segment(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
 ) -> Result<PersistedCapture> {
-    let (bounded_segment, truncation) =
-        enforce_segment_size_for_persistence(captured, max_segment_bytes);
+    persist_captured_segment_with_zone(storage, captured, max_segment_bytes, None).await
+}
 
-    if let Some(detail) = truncation.as_ref() {
-        warn!(
-            pane_id = bounded_segment.pane_id,
-            seq = bounded_segment.seq,
-            original_bytes = detail.original_bytes,
-            kept_bytes = detail.kept_bytes,
-            max_bytes = detail.max_bytes,
-            "Captured segment exceeded max bytes and was truncated with explicit GAP"
-        );
-    }
-
-    // Record gap if the captured segment itself represents a discontinuity (overlap failure)
-    let mut gap = match &bounded_segment.kind {
-        CapturedSegmentKind::Gap { reason } => {
-            storage.record_gap(bounded_segment.pane_id, reason).await?
-        }
-        CapturedSegmentKind::Delta => None,
-    };
-
-    let redacted_content = redact_segment_for_persist(&bounded_segment.content);
-    let stored = storage
-        .append_segment(bounded_segment.pane_id, &redacted_content, None)
-        .await?;
-
-    // If this was the very first segment in a pane, `record_gap` above returns
-    // `None` (no prior sequence context). Emit the gap now that a first segment
-    // exists so discontinuity/data-loss metadata is always explicit.
-    if gap.is_none()
-        && let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind
-    {
-        gap = storage.record_gap(bounded_segment.pane_id, reason).await?;
-    }
-
-    // Check for sequence discontinuity between cursor and storage
-    if stored.seq != bounded_segment.seq {
-        // Record gap for the discontinuity (this is in addition to any overlap-failure gap)
-        let discontinuity_reason = format!(
-            "seq_discontinuity:expected={},actual={}",
-            bounded_segment.seq, stored.seq
-        );
-        let discontinuity_gap = storage
-            .record_gap(bounded_segment.pane_id, &discontinuity_reason)
-            .await?;
-
-        // If we didn't already have a gap, use this one; otherwise the overlap gap takes precedence
-        if gap.is_none() {
-            gap = discontinuity_gap;
-        }
-    }
-
-    Ok(PersistedCapture {
-        segment: stored,
-        gap,
-    })
+/// Persist a captured segment with optional semantic zone metadata.
+///
+/// The `zone_type` stamp is additive metadata only; it is ignored for gap
+/// segments so discontinuity rows remain explicitly untyped.
+pub async fn persist_captured_segment_with_zone(
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+    zone_type: Option<&str>,
+) -> Result<PersistedCapture> {
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    persist_captured_segment_with_zone_with_cx(&cx, storage, captured, max_segment_bytes, zone_type)
+        .await
 }
 
 /// Cx-first [`persist_captured_segment`] (ft-xbnl0.2.3).
@@ -1748,6 +1707,17 @@ pub async fn persist_captured_segment_with_cx(
     storage: &StorageHandle,
     captured: &CapturedSegment,
     max_segment_bytes: usize,
+) -> Result<PersistedCapture> {
+    persist_captured_segment_with_zone_with_cx(cx, storage, captured, max_segment_bytes, None).await
+}
+
+/// Cx-first [`persist_captured_segment_with_zone`].
+pub async fn persist_captured_segment_with_zone_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+    zone_type: Option<&str>,
 ) -> Result<PersistedCapture> {
     cx.checkpoint()
         .map_err(|err| ingest_cancelled_error("persist_captured_segment", err))?;
@@ -1776,8 +1746,18 @@ pub async fn persist_captured_segment_with_cx(
     };
 
     let redacted_content = redact_segment_for_persist(&bounded_segment.content);
+    let stored_zone_type = match &bounded_segment.kind {
+        CapturedSegmentKind::Delta => zone_type,
+        CapturedSegmentKind::Gap { .. } => None,
+    };
     let stored = storage
-        .append_segment_with_cx(cx, bounded_segment.pane_id, &redacted_content, None)
+        .append_segment_with_zone_with_cx(
+            cx,
+            bounded_segment.pane_id,
+            &redacted_content,
+            None,
+            stored_zone_type,
+        )
         .await?;
 
     if gap.is_none()
@@ -3496,6 +3476,42 @@ mod tests {
             assert!(segments.iter().any(|seg| seg.content == "world\n"));
 
             handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn persist_captured_segment_with_zone_stamps_output_segment() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+            let mut cursor = PaneCursor::new(1);
+            let seg = cursor
+                .capture_snapshot("semantic zone row\n", 1024, None)
+                .expect("capture");
+
+            let stored = persist_captured_segment_with_zone(
+                &handle,
+                &seg,
+                TEST_MAX_PERSIST_SEGMENT_BYTES,
+                Some("output"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stored.segment.seq, seg.seq);
+
+            handle.shutdown().await.unwrap();
+            let conn = rusqlite::Connection::open(&db_path).expect("open persisted db");
+            let zone_type: Option<String> = conn
+                .query_row(
+                    "SELECT zone_type FROM output_segments WHERE pane_id = ?1 AND seq = ?2",
+                    (1_i64, i64::try_from(stored.segment.seq).unwrap()),
+                    |row| row.get(0),
+                )
+                .expect("read stamped zone_type");
+            assert_eq!(zone_type.as_deref(), Some("output"));
             cleanup_db(&db_path);
         });
     }

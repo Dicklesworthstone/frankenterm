@@ -299,6 +299,7 @@ pub(super) fn handle_search(
     let options = SearchOptions {
         limit: Some(parse_limit(&qs, runtime_limits)),
         pane_id: parse_u64(&qs, "pane_id"),
+        zone_type: None,
         since: parse_i64(&qs, "since"),
         until: parse_i64(&qs, "until"),
         include_snippets: Some(true),

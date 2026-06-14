@@ -24,6 +24,14 @@ fn arb_search_mode() -> impl Strategy<Value = UnifiedSearchMode> {
     ]
 }
 
+fn arb_zone() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("prompt".to_string()),
+        Just("input".to_string()),
+        Just("output".to_string()),
+    ]
+}
+
 fn arb_lint_severity() -> impl Strategy<Value = SearchLintSeverity> {
     prop_oneof![
         Just(SearchLintSeverity::Warning),
@@ -61,6 +69,7 @@ fn arb_valid_search_input() -> impl Strategy<Value = SearchQueryInput> {
         arb_valid_query(),
         proptest::option::of(1_usize..=SEARCH_LIMIT_MAX),
         proptest::option::of(0_u64..10_000),
+        proptest::option::of(arb_zone()),
         proptest::option::of(0_i64..100_000),
         proptest::option::of(0_i64..100_000),
         proptest::option::of(proptest::bool::ANY),
@@ -68,7 +77,7 @@ fn arb_valid_search_input() -> impl Strategy<Value = SearchQueryInput> {
         proptest::option::of(proptest::bool::ANY),
     )
         .prop_map(
-            |(query, limit, pane, since, until, snippets, mode, explain)| {
+            |(query, limit, pane, zone, since, until, snippets, mode, explain)| {
                 // Ensure since <= until when both are present
                 let (since, until) = match (since, until) {
                     (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
@@ -78,6 +87,7 @@ fn arb_valid_search_input() -> impl Strategy<Value = SearchQueryInput> {
                     query,
                     limit,
                     pane,
+                    zone,
                     since,
                     until,
                     snippets,
@@ -93,6 +103,7 @@ fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
         arb_valid_query(),
         1_usize..=SEARCH_LIMIT_MAX,
         proptest::option::of(0_u64..10_000),
+        proptest::option::of(arb_zone()),
         proptest::option::of(0_i64..100_000),
         proptest::option::of(0_i64..100_000),
         proptest::bool::ANY,
@@ -100,7 +111,7 @@ fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
         proptest::bool::ANY,
     )
         .prop_map(
-            |(query, limit, pane, since, until, snippets, mode, explain)| {
+            |(query, limit, pane, zone, since, until, snippets, mode, explain)| {
                 let (since, until) = match (since, until) {
                     (Some(s), Some(u)) if s > u => (Some(u), Some(s)),
                     other => other,
@@ -109,6 +120,7 @@ fn arb_unified_search_query() -> impl Strategy<Value = UnifiedSearchQuery> {
                     query,
                     limit,
                     pane,
+                    zone,
                     since,
                     until,
                     snippets,
@@ -192,6 +204,7 @@ proptest! {
             query: query.clone(),
             limit: Some(limit),
             pane,
+            zone: None,
             since: None,
             until: None,
             snippets: Some(snippets),
@@ -475,6 +488,7 @@ proptest! {
             query,
             limit,
             pane: None,
+            zone: None,
             since: None,
             until: None,
             snippets: false,
@@ -483,6 +497,7 @@ proptest! {
         };
         let json = serde_json::to_string(&q).expect("serialize");
         prop_assert!(!json.contains("pane"), "pane:None should be omitted");
+        prop_assert!(!json.contains("zone"), "zone:None should be omitted");
         prop_assert!(!json.contains("since"), "since:None should be omitted");
         prop_assert!(!json.contains("until"), "until:None should be omitted");
         prop_assert!(!json.contains("explain"), "explain:false should be omitted");
@@ -500,6 +515,7 @@ proptest! {
         let opts = to_storage_search_options(&query);
         prop_assert_eq!(opts.limit, Some(query.limit));
         prop_assert_eq!(opts.pane_id, query.pane);
+        prop_assert_eq!(opts.zone_type, query.zone);
         prop_assert_eq!(opts.since, query.since);
         prop_assert_eq!(opts.until, query.until);
         prop_assert_eq!(opts.include_snippets, Some(query.snippets));
@@ -540,6 +556,14 @@ proptest! {
         let msg = err.message();
         prop_assert!(msg.contains(&since.to_string()), "message should contain since");
         prop_assert!(msg.contains(&until.to_string()), "message should contain until");
+    }
+
+    /// InvalidZoneType error code is always "search.invalid_zone_type".
+    #[test]
+    fn invalid_zone_type_code_stable(zone in "[a-z]{4,12}") {
+        let err = SearchQueryValidationError::InvalidZoneType { provided: zone.clone() };
+        prop_assert_eq!(err.code(), "search.invalid_zone_type");
+        prop_assert!(err.message().contains(&zone), "message should contain provided zone");
     }
 
     /// UnsupportedMode error code is always "search.unsupported_mode".

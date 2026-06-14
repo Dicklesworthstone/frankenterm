@@ -1615,6 +1615,21 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         // would wrongly divide both. Leave as a forward-only normalization.
         down_sql: None,
     },
+    Migration {
+        version: 31,
+        description: "Stamp output_segments with best-effort semantic zone type \
+                      metadata at capture (ft-7h5da.2.3). Existing historical \
+                      rows keep NULL = untyped/unavailable; raw captured bytes \
+                      remain canonical.",
+        up_sql: r"
+        ALTER TABLE output_segments ADD COLUMN zone_type TEXT;
+        CREATE INDEX IF NOT EXISTS idx_segments_zone_type ON output_segments(zone_type);
+        ",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS idx_segments_zone_type;
+             ALTER TABLE output_segments DROP COLUMN zone_type;",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -1813,6 +1828,27 @@ fn ensure_output_segments_redaction_catalog_version(conn: &Connection) -> Result
         "ALTER TABLE output_segments ADD COLUMN redaction_catalog_version TEXT;",
         "migration v29",
     )
+}
+
+/// ft-7h5da.2.3: `zone_type` is present in the current `SCHEMA_SQL` baseline,
+/// so guard the v31 ALTER for the same fresh-DB/upgrade split as v29.
+fn ensure_output_segments_zone_type(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "output_segments",
+        "zone_type",
+        "ALTER TABLE output_segments ADD COLUMN zone_type TEXT;",
+        "migration v31",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_segments_zone_type ON output_segments(zone_type);",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to create idx_segments_zone_type during migration v31: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
@@ -2559,6 +2595,10 @@ pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> R
                     ensure_output_segments_redaction_catalog_version(conn)?;
                     apply_raw_up_sql = false;
                 }
+                31 => {
+                    ensure_output_segments_zone_type(conn)?;
+                    apply_raw_up_sql = false;
+                }
                 _ => {}
             }
             if apply_raw_up_sql && !migration.up_sql.is_empty() {
@@ -3252,6 +3292,86 @@ mod tests {
         conn.execute_batch(m30.up_sql).expect("re-apply v30");
         assert_eq!(read(1), 1_700_000_000_000, "re-run is a no-op for seg 1");
         assert_eq!(read(2), 1_700_000_000_000, "re-run is a no-op for seg 2");
+    }
+
+    #[test]
+    fn zone_type_migration_entry_present_at_version_31() {
+        let m31 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 31)
+            .expect("version 31 migration must be registered");
+        assert!(
+            m31.description.contains("semantic zone type"),
+            "description must reference semantic zone type metadata, got: {:?}",
+            m31.description,
+        );
+        assert!(
+            m31.up_sql
+                .contains("ALTER TABLE output_segments ADD COLUMN zone_type"),
+            "up_sql must add the zone_type column",
+        );
+        assert!(
+            m31.up_sql.contains("idx_segments_zone_type"),
+            "up_sql must create the zone_type index",
+        );
+        let down = m31.down_sql.expect("down_sql must be supported");
+        assert!(down.contains("DROP INDEX IF EXISTS idx_segments_zone_type"));
+        assert!(down.contains("DROP COLUMN zone_type"));
+    }
+
+    #[test]
+    fn zone_type_migration_adds_indexed_nullable_column() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE output_segments (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                content_len INTEGER NOT NULL,
+                content_hash TEXT,
+                captured_at INTEGER NOT NULL,
+                redaction_catalog_version TEXT,
+                UNIQUE(pane_id, seq)
+            );",
+        )
+        .expect("base output_segments");
+
+        let m31 = MIGRATIONS.iter().find(|m| m.version == 31).expect("v31");
+        conn.execute_batch(m31.up_sql).expect("apply v31");
+        assert!(
+            output_segments_has_column(&conn, "zone_type"),
+            "column must exist after v31",
+        );
+        assert!(
+            output_segments_has_index(&conn, "idx_segments_zone_type"),
+            "zone_type index must exist after v31",
+        );
+
+        conn.execute_batch(m31.down_sql.unwrap())
+            .expect("rollback v31");
+        assert!(
+            !output_segments_has_column(&conn, "zone_type"),
+            "column must be gone after down-rollback",
+        );
+        assert!(
+            !output_segments_has_index(&conn, "idx_segments_zone_type"),
+            "zone_type index must be gone after down-rollback",
+        );
+    }
+
+    fn output_segments_has_index(conn: &rusqlite::Connection, index: &str) -> bool {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_index_list('output_segments')")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        names.iter().any(|n| n == index)
     }
 
     /// br-ft-4yr9i: applying the version-25 migration to a fresh
