@@ -4,13 +4,13 @@
     "policy_verdict": "envelope.admit",
     "receipt": {
       "schema_version": 1,
-      "receipt_id": "steer:3fd97d6c484dd2ced843b76528b0d0c0",
+      "receipt_id": "steer:6829d09d5dd81d373bc310395c99677d",
       "objective": "ship the W3 family",
       "workspace_id": "ws-golden",
       "mission_contract_hash": null,
       "tx_contract_hash": null,
       "envelope_verdict": "envelope.admit",
-      "rehearsal_score": 950,
+      "rehearsal_score": 1000,
       "required_approvals": [],
       "created_at_ms": 1704000000000,
       "ttl_ms": null
@@ -40,13 +40,13 @@
     "policy_verdict": "envelope.blocked.rch_substrate",
     "receipt": {
       "schema_version": 1,
-      "receipt_id": "steer:739d4d04f5cfd3a6245345a98f03df62",
+      "receipt_id": "steer:e74f1566713aa3f04d0c8625ffb489f9",
       "objective": "ship the W3 family",
       "workspace_id": "ws-golden",
       "mission_contract_hash": null,
       "tx_contract_hash": null,
       "envelope_verdict": "envelope.blocked.rch_substrate",
-      "rehearsal_score": 150,
+      "rehearsal_score": 200,
       "required_approvals": [],
       "created_at_ms": 1704000000000,
       "ttl_ms": null
@@ -57,7 +57,7 @@
     "policy_verdict": "envelope.requires_approval",
     "receipt": {
       "schema_version": 1,
-      "receipt_id": "steer:9df25ee645b875227fb546718104dde8",
+      "receipt_id": "steer:334eb11874014f417c023d56e7cfd137",
       "objective": "ship the W3 family",
       "workspace_id": "ws-golden",
       "mission_contract_hash": null,
@@ -65,7 +65,8 @@
       "envelope_verdict": "envelope.requires_approval",
       "rehearsal_score": 600,
       "required_approvals": [
-        "approval:owner_handoff"
+        "approval:owner_handoff",
+        "approval:policy.alt_screen_unknown"
       ],
       "created_at_ms": 1704000000000,
       "ttl_ms": null
