@@ -366,9 +366,10 @@ fn has_fail_closed_rch_prefix(command: &str) -> bool {
 }
 
 fn evaluate_doctrine_stateless(command: &str) -> Option<(String, String, String, Vec<String>)> {
+    let normalized_command = normalize_command_for_guard(command);
     DOCTRINE_RULES
         .iter()
-        .find(|rule| rule.matches(command))
+        .find(|rule| rule.matches(&normalized_command))
         .map(|rule| {
             (
                 rule.id.to_string(),
@@ -379,36 +380,399 @@ fn evaluate_doctrine_stateless(command: &str) -> Option<(String, String, String,
         })
 }
 
+fn normalize_command_for_guard(command: &str) -> String {
+    let tokens = tokenize_command_for_guard(command);
+    if tokens.is_empty() {
+        return String::new();
+    }
+
+    let mut normalized = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while let Some(part) = tokens.get(index) {
+        if part.eq_ignore_ascii_case("git") {
+            index = normalize_git_invocation(&tokens, index, &mut normalized);
+        } else if part.eq_ignore_ascii_case("rm") {
+            index = normalize_rm_invocation(&tokens, index, &mut normalized);
+        } else if part.eq_ignore_ascii_case("chmod") {
+            index = normalize_chmod_invocation(&tokens, index, &mut normalized);
+        } else {
+            normalized.push(part.clone());
+            index += 1;
+        }
+    }
+
+    normalized.join(" ")
+}
+
+fn tokenize_command_for_guard(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            push_token_if_present(&mut tokens, &mut current);
+            continue;
+        }
+
+        match ch {
+            ';' => {
+                push_token_if_present(&mut tokens, &mut current);
+                tokens.push(";".to_string());
+            }
+            '&' => {
+                push_token_if_present(&mut tokens, &mut current);
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push("&&".to_string());
+                } else {
+                    tokens.push("&".to_string());
+                }
+            }
+            '|' => {
+                push_token_if_present(&mut tokens, &mut current);
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push("||".to_string());
+                } else {
+                    tokens.push("|".to_string());
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    push_token_if_present(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_token_if_present(tokens: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        tokens.push(std::mem::take(current));
+    }
+}
+
+fn is_command_separator(token: &str) -> bool {
+    matches!(token, ";" | "&" | "&&" | "|" | "||")
+}
+
+fn push_unique_flag(flags: &mut String, flag: char) {
+    if !flags.contains(flag) {
+        flags.push(flag);
+    }
+}
+
+fn normalize_rm_invocation(tokens: &[String], start: usize, normalized: &mut Vec<String>) -> usize {
+    normalized.push("rm".to_string());
+    let mut flags = String::new();
+    let mut rest = Vec::new();
+    let mut index = start + 1;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part.eq_ignore_ascii_case("--recursive") {
+            push_unique_flag(&mut flags, 'r');
+        } else if part.eq_ignore_ascii_case("--force") {
+            push_unique_flag(&mut flags, 'f');
+        } else if part.starts_with('-') && !part.starts_with("--") {
+            let mut other_flags = String::from("-");
+            for flag in part.chars().skip(1) {
+                if flag == 'r' || flag == 'R' {
+                    push_unique_flag(&mut flags, 'r');
+                } else if flag == 'f' {
+                    push_unique_flag(&mut flags, 'f');
+                } else {
+                    other_flags.push(flag);
+                }
+            }
+            if other_flags.len() > 1 {
+                rest.push(other_flags);
+            }
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if flags.contains('r') && flags.contains('f') {
+        normalized.push("-rf".to_string());
+    } else if flags.contains('r') {
+        normalized.push("-r".to_string());
+    } else if flags.contains('f') {
+        normalized.push("-f".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn normalize_chmod_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    normalized.push("chmod".to_string());
+    let mut has_recursive = false;
+    let mut rest = Vec::new();
+    let mut index = start + 1;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part.eq_ignore_ascii_case("--recursive") {
+            has_recursive = true;
+        } else if part.starts_with('-') && !part.starts_with("--") {
+            let mut other_flags = String::from("-");
+            for flag in part.chars().skip(1) {
+                if flag == 'R' {
+                    has_recursive = true;
+                } else {
+                    other_flags.push(flag);
+                }
+            }
+            if other_flags.len() > 1 {
+                rest.push(other_flags);
+            }
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if has_recursive {
+        normalized.push("-R".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn normalize_git_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    normalized.push("git".to_string());
+    let mut index = start + 1;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if git_global_option_has_inline_value(part) || git_global_boolean_option(part) {
+            index += 1;
+        } else if git_global_option_takes_value(part) {
+            index += 1;
+            if tokens
+                .get(index)
+                .is_some_and(|next_part| !is_command_separator(next_part))
+            {
+                index += 1;
+            }
+        } else {
+            let subcommand = part.to_ascii_lowercase();
+            normalized.push(part.clone());
+            index += 1;
+            return match subcommand.as_str() {
+                "branch" => normalize_git_branch_invocation(tokens, index, normalized),
+                "clean" => normalize_git_clean_invocation(tokens, index, normalized),
+                "push" => normalize_git_push_invocation(tokens, index, normalized),
+                _ => copy_until_separator(tokens, index, normalized),
+            };
+        }
+    }
+
+    index
+}
+
+fn git_global_option_takes_value(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "-c" | "--attr-source"
+            | "--config-env"
+            | "--exec-path"
+            | "--git-dir"
+            | "--namespace"
+            | "--object-format"
+            | "--path-format"
+            | "--super-prefix"
+            | "--work-tree"
+    )
+}
+
+fn git_global_option_has_inline_value(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    ((token.starts_with("-c") || token.starts_with("-C"))
+        && token.len() > 2
+        && !token.starts_with("--"))
+        || lower.starts_with("--attr-source=")
+        || lower.starts_with("--config-env=")
+        || lower.starts_with("--exec-path=")
+        || lower.starts_with("--git-dir=")
+        || lower.starts_with("--namespace=")
+        || lower.starts_with("--object-format=")
+        || lower.starts_with("--path-format=")
+        || lower.starts_with("--super-prefix=")
+        || lower.starts_with("--work-tree=")
+}
+
+fn git_global_boolean_option(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "-p" | "--bare"
+            | "--glob-pathspecs"
+            | "--icase-pathspecs"
+            | "--literal-pathspecs"
+            | "--no-optional-locks"
+            | "--no-pager"
+            | "--no-replace-objects"
+            | "--noglob-pathspecs"
+            | "--paginate"
+    )
+}
+
+fn normalize_git_push_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    let mut index = start;
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part == "--force" {
+            normalized.push("-f".to_string());
+        } else {
+            normalized.push(part.clone());
+        }
+        index += 1;
+    }
+    index
+}
+
+fn normalize_git_clean_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    let mut flags = String::new();
+    let mut rest = Vec::new();
+    let mut index = start;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part == "--force" {
+            push_unique_flag(&mut flags, 'f');
+        } else if part == "--directory" {
+            push_unique_flag(&mut flags, 'd');
+        } else if part.starts_with('-') && !part.starts_with("--") {
+            let mut other_flags = String::from("-");
+            for flag in part.chars().skip(1) {
+                if flag == 'f' || flag == 'd' {
+                    push_unique_flag(&mut flags, flag);
+                } else {
+                    other_flags.push(flag);
+                }
+            }
+            if other_flags.len() > 1 {
+                rest.push(other_flags);
+            }
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if flags.contains('f') && flags.contains('d') {
+        normalized.push("-fd".to_string());
+    } else if flags.contains('f') {
+        normalized.push("-f".to_string());
+    } else if flags.contains('d') {
+        normalized.push("-d".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn normalize_git_branch_invocation(
+    tokens: &[String],
+    start: usize,
+    normalized: &mut Vec<String>,
+) -> usize {
+    let mut has_delete = false;
+    let mut has_force = false;
+    let mut rest = Vec::new();
+    let mut index = start;
+
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        if part == "--delete" {
+            has_delete = true;
+        } else if part == "--force" {
+            has_force = true;
+        } else if part == "-D" {
+            has_delete = true;
+            has_force = true;
+        } else if part == "-d" {
+            has_delete = true;
+        } else if part == "-f" {
+            has_force = true;
+        } else {
+            rest.push(part.clone());
+        }
+        index += 1;
+    }
+
+    if has_delete && has_force {
+        normalized.push("-D".to_string());
+    } else if has_delete {
+        normalized.push("-d".to_string());
+    } else if has_force {
+        normalized.push("--force".to_string());
+    }
+    normalized.extend(rest);
+    index
+}
+
+fn copy_until_separator(tokens: &[String], start: usize, normalized: &mut Vec<String>) -> usize {
+    let mut index = start;
+    while let Some(part) = tokens.get(index) {
+        if is_command_separator(part) {
+            break;
+        }
+        normalized.push(part.clone());
+        index += 1;
+    }
+    index
+}
+
 // ---------------------------------------------------------------------------
 // Pack: core.filesystem
 // ---------------------------------------------------------------------------
 
-// `(?:-[a-z]*r[a-z]*|--recursive)` / `(?:-[a-z]*f[a-z]*|--force)`: the
-// short-flag clusters (`-r`, `-rf`, `-R`) AND the GNU long forms. The previous
-// patterns matched only single-dash clusters, so `rm --recursive --force /`
-// (and `rm --force --recursive /`) slipped past the catastrophic-deletion
-// hard-deny entirely — in default `Native` dcg mode these regexes are the whole
-// enforcement, so that was a fail-OPEN on `rm -rf /`-class commands.
+// Destructive patterns run over `normalize_command_for_guard`, so GNU long
+// flags such as `--recursive` / `--force` are canonicalized before regex
+// matching instead of every rule carrying every spelling variant.
 static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\brm\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:(?:-[a-z]*f[a-z]*|--force)\s+)?|(?:-[a-z]*f[a-z]*|--force)\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+)?)\s*(/\s*$|~\s*$|\$HOME\s*$)").unwrap()
+    Regex::new(r"(?i)\brm\s+-[a-z]*(?:r|f)[a-z]*\s+(/\s*$|~\s*$|\$HOME\s*$)").unwrap()
 });
-static RM_RF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\brm\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+(?:(?:-[a-z]*f[a-z]*|--force)\s+)?|(?:-[a-z]*f[a-z]*|--force)\s+(?:(?:-[a-z]*r[a-z]*|--recursive)\s+)?)",
-    )
-    .unwrap()
-});
+static RM_RF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-[a-z]*(?:r|f)[a-z]*\b").unwrap());
 static RM_RF_SAFE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*f?[a-z]*\s+)(node_modules|target|__pycache__|\.cache|dist|build|\.next|\.turbo|tmp)\s*(?:;|$|&&|\|\||\||\n)").unwrap()
 });
-// Accept the long `--recursive` flag (not just `-R`), and treat any
-// world-writable octal mode as wide-open, not just the literal `777|666|000`
-// — the old list let `chmod -R 757 /x` (and `--recursive 777`) through.
+// Treat any world-writable octal mode as wide-open, not just the literal
+// `777|666|000`; `normalize_command_for_guard` canonicalizes `--recursive`.
 // `[0-7]{0,2}[2367]` matches a 1–3 digit octal whose final (other) digit has
 // the write bit set; `755`/`644`/`750` stay allowed.
 static CHMOD_RECURSIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bchmod\s+(?:(?:-[a-z]*R[a-z]*|--recursive)\s+)?(?:000|[0-7]{0,2}[2367])\s")
-        .unwrap()
+    Regex::new(r"(?i)\bchmod\s+(?:-[a-z]*R[a-z]*\s+)?(?:000|[0-7]{0,2}[2367])\s").unwrap()
 });
 static DD_OF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bdd\b.*\bof=\s*/dev/(sd[a-z]|nvme|disk|hd[a-z])").unwrap());
@@ -458,32 +822,19 @@ static PACK_FILESYSTEM: SecurityPack = SecurityPack {
 // Pack: core.git
 // ---------------------------------------------------------------------------
 
-// `\bgit\b(?:\s+(?:-flag|key=val))*\s+<subcmd>`: allow global options
-// (`--no-pager`, `-c x=y`, `--git-dir=/x`) between `git` and the subcommand so
-// `git --no-pager push --force` / `git --git-dir=/x reset --hard` no longer
-// bypass the force-push / reset-hard denies. The prefix only consumes
-// flag-shaped or `key=value` tokens, so `git config push.default …` (a non-flag
-// subcommand) is NOT matched — avoiding a false positive. The lease safe rule
-// is broadened the same way so `--force-with-lease` stays exempt with globals.
-static GIT_PUSH_FORCE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+push\b.*(\s--force\b|\s-f\b)",
-    )
-    .unwrap()
-});
+// Git scans also run over `normalize_command_for_guard`, which strips known
+// global options (`--no-pager`, `-c x=y`, `--git-dir=/x`) before the subcommand.
+static GIT_PUSH_FORCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+push\b.*(\s--force\b|\s-f\b)").unwrap());
 static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+push\b[^;&|\n]*--force-with-lease[^;&|\n]*(?:;|$|&&|\|\||\||\n)")
+    Regex::new(r"(?i)\bgit\s+push\b[^;&|\n]*--force-with-lease[^;&|\n]*(?:;|$|&&|\|\||\||\n)")
         .unwrap()
 });
-static GIT_RESET_HARD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\b(?:\s+(?:-[^\s;&|\n]+|[^\s;&|\n]*=[^\s;&|\n]*))*\s+reset\s+--hard\b")
-        .unwrap()
-});
+static GIT_RESET_HARD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap());
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\bgit\s+clean\b[^;&|\n]*(?:-[a-z]*f[a-z]*d[a-z]*|-[a-z]*d[a-z]*f[a-z]*|(?:-[a-z]*f[a-z]*|--force)\b[^;&|\n]*(?:-[a-z]*d[a-z]*|--directory)\b|(?:-[a-z]*d[a-z]*|--directory)\b[^;&|\n]*(?:-[a-z]*f[a-z]*|--force)\b)",
-    )
-    .unwrap()
+    Regex::new(r"(?i)\bgit\s+clean\b[^;&|\n]*(?:-[a-z]*f[a-z]*d[a-z]*|-[a-z]*d[a-z]*f[a-z]*)")
+        .unwrap()
 });
 static GIT_BRANCH_DELETE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+branch\s+-D\b").unwrap());
@@ -1027,8 +1378,10 @@ impl CommandGuard {
             return GuardDecision::Allow;
         }
 
+        let normalized_command = normalize_command_for_guard(command);
+
         // Quick-reject: check if command contains any pack keywords.
-        let relevant_packs = self.keyword_filter(command, &pane_config);
+        let relevant_packs = self.keyword_filter(&normalized_command, &pane_config);
         if relevant_packs.is_empty() {
             let elapsed = elapsed_micros_u64(start);
             self.record(pane_id, command, "allow", None, None, elapsed);
@@ -1038,7 +1391,7 @@ impl CommandGuard {
         }
 
         // Scan relevant packs for destructive patterns.
-        let decision = Self::scan_packs(command, &relevant_packs, trust);
+        let decision = Self::scan_packs(&normalized_command, &relevant_packs, trust);
         let elapsed = elapsed_micros_u64(start);
 
         let (dec_str, rule, pack) = match &decision {
@@ -1090,12 +1443,13 @@ impl CommandGuard {
             return GuardDecision::Allow;
         }
 
-        let relevant_packs = self.keyword_filter(command, &pane_config);
+        let normalized_command = normalize_command_for_guard(command);
+        let relevant_packs = self.keyword_filter(&normalized_command, &pane_config);
         if relevant_packs.is_empty() {
             return GuardDecision::Allow;
         }
 
-        Self::scan_packs(command, &relevant_packs, trust)
+        Self::scan_packs(&normalized_command, &relevant_packs, trust)
     }
 
     /// Get the current audit log entries.
@@ -1325,10 +1679,12 @@ pub fn evaluate_stateless(command: &str) -> Option<(String, String, String, Vec<
         return Some(doctrine_match);
     }
 
+    let normalized_command = normalize_command_for_guard(command);
+
     // Quick-reject via keyword scan.
     let mut relevant_pack_ids: Vec<&str> = Vec::new();
-    for mat in KEYWORD_AUTOMATON.find_iter(command) {
-        let matched = &command[mat.start()..mat.end()];
+    for mat in KEYWORD_AUTOMATON.find_iter(&normalized_command) {
+        let matched = &normalized_command[mat.start()..mat.end()];
         let key = matched.to_ascii_lowercase();
         if let Some(packs) = KEYWORD_TO_PACKS.get(&key) {
             for pack_id in packs {
@@ -1349,7 +1705,7 @@ pub fn evaluate_stateless(command: &str) -> Option<(String, String, String, Vec<
         }
 
         // Safe patterns first - replace them with empty string so they don't trigger destructive matches.
-        let mut check_command = command.to_string();
+        let mut check_command = normalized_command.clone();
         for safe in pack.safe_rules {
             check_command = safe.pattern.replace_all(&check_command, "").to_string();
         }
@@ -2385,10 +2741,38 @@ mod tests {
         assert!(!pack.is_empty());
     }
 
+    #[test]
+    fn command_normalization_canonicalizes_flags_and_git_globals() {
+        assert_eq!(
+            normalize_command_for_guard("rm --force --recursive target"),
+            "rm -rf target"
+        );
+        assert_eq!(
+            normalize_command_for_guard("chmod --recursive 777 /x"),
+            "chmod -R 777 /x"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --no-pager -c color.ui=always -C /repo push --force"),
+            "git push -f"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --git-dir=/tmp/git --work-tree /repo reset --hard"),
+            "git reset --hard"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --no-pager clean --directory --force ignored"),
+            "git clean -fd ignored"
+        );
+        assert_eq!(
+            normalize_command_for_guard("git --no-pager branch --delete --force stale"),
+            "git branch -D stale"
+        );
+    }
+
     /// Regression: long-flag (`--recursive`/`--force`) spellings and global
-    /// options must not bypass the destructive-command denies. In default
-    /// `Native` dcg mode these regexes are the entire enforcement, so a miss is
-    /// a fail-OPEN on catastrophic commands.
+    /// options must not bypass destructive-command denies. The scanner now runs
+    /// over a normalized command form instead of depending on every regex to
+    /// carry every surface spelling.
     #[test]
     fn stateless_long_flag_bypasses_are_now_denied() {
         // rm: catastrophic hard-deny (root/home) + general recursive deny.
@@ -2409,6 +2793,12 @@ mod tests {
         assert!(evaluate_stateless("git --no-pager push --force").is_some());
         assert!(evaluate_stateless("git -c color.ui=always push --force").is_some());
         assert!(evaluate_stateless("git --git-dir=/x reset --hard").is_some());
+        assert!(evaluate_stateless("git -C /repo --no-pager push --force").is_some());
+        assert!(evaluate_stateless("git --no-pager clean --force --directory").is_some());
+        assert!(evaluate_stateless("git --no-pager branch --delete --force stale").is_some());
+        assert!(
+            evaluate_stateless("git --no-pager rm crates/frankenterm-core/src/lib.rs").is_some()
+        );
         // kill: pkill + signal-name + `-s` spellings.
         assert!(evaluate_stateless("pkill -9 node").is_some());
         assert!(evaluate_stateless("kill -s 9 1234").is_some());
@@ -2424,14 +2814,18 @@ mod tests {
     fn stateless_broadened_denies_do_not_overmatch_safe_commands() {
         assert!(evaluate_stateless("rm -rf /tmp/scratch").is_some()); // recursive elsewhere still denied
         assert!(evaluate_stateless("rm file.txt").is_none());
+        assert!(evaluate_stateless("rm --recursive --force target").is_none());
+        assert!(evaluate_stateless("rm --force --recursive node_modules").is_none());
         assert!(evaluate_stateless("chmod -R 755 /x").is_none());
         assert!(evaluate_stateless("chmod 644 file").is_none());
         // --force-with-lease is the SAFE alternative — exempt via the safe rule,
         // including with global options in front of `push`.
         assert!(evaluate_stateless("git push --force-with-lease").is_none());
         assert!(evaluate_stateless("git --no-pager push --force-with-lease").is_none());
+        assert!(evaluate_stateless("git -C /repo --no-pager push --force-with-lease").is_none());
         // a non-flag subcommand named like a flag target must not match.
         assert!(evaluate_stateless("git config push.default current").is_none());
+        assert!(evaluate_stateless("git -C /repo config push.default current").is_none());
         assert!(evaluate_stateless("git reset --soft HEAD~1").is_none());
         // graceful signals stay allowed.
         assert!(evaluate_stateless("kill -15 1234").is_none());
