@@ -3664,6 +3664,7 @@ dependencies = [
  "frankenterm-term",
  "frankenterm-uds",
  "fs2",
+ "ft-perf-gate",
  "ftui",
  "ftui-backend",
  "ftui-core",

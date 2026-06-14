@@ -60,6 +60,7 @@ frankenterm-core-policy-types = { path = "../frankenterm-core-policy-types" }
 # docs/proposals/ft-j1qjt-replay-tier1-blocker.md.
 frankenterm-core-replay-types = { path = "../frankenterm-core-replay-types" }
 frankenterm-core-telemetry-types = { path = "../frankenterm-core-telemetry-types" }
+ft-perf-gate = { path = "../ft-perf-gate" }
 # br-ft-kxopr: x11 resize-coalescing types extracted to a leaf sub-crate
 # so vendored frankenterm/window/ can depend on them directly without
 # inverting the layering.

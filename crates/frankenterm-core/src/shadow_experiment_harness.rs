@@ -47,6 +47,7 @@
 
 use std::time::Duration;
 
+use ft_perf_gate::{sprt, EvidenceSample, GateDecision, SprtConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -318,6 +319,64 @@ pub struct AgentVariantOutcomeSummary {
     pub gap_event_count: u64,
 }
 
+/// Compact, receipt-stable projection of a perf-gate decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExperimentGateDecision {
+    /// Stable gate decision kind (`accept`, `reject`, `continue`, etc.).
+    pub kind: String,
+    /// Operator-facing reason from the proof gate.
+    pub reason: String,
+    /// Confidence converted to basis points when the gate provides one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_bps: Option<u32>,
+}
+
+/// Statistical gate evidence attached to every agent A/B receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentExperimentStatisticalGate {
+    /// Gate implementation used to evaluate time-to-green-proof evidence.
+    pub gate_id: String,
+    /// Claim under evaluation.
+    pub claim_id: String,
+    /// Completed timed baseline samples consumed by the gate.
+    pub baseline_sample_count: u64,
+    /// Completed timed candidate samples consumed by the gate.
+    pub candidate_sample_count: u64,
+    /// Candidate must be at or below this latency to beat baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_better_threshold_ms: Option<u64>,
+    /// Baseline must be at or below this latency to beat candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_better_threshold_ms: Option<u64>,
+    /// Gate verdict for "candidate is faster than baseline".
+    pub candidate_gate: AgentExperimentGateDecision,
+    /// Gate verdict for "baseline is faster than candidate".
+    pub baseline_gate: AgentExperimentGateDecision,
+}
+
+impl Default for AgentExperimentStatisticalGate {
+    fn default() -> Self {
+        Self {
+            gate_id: "sprt_mean_threshold_v1".to_string(),
+            claim_id: "agent_experiment.time_to_green_proof_ms".to_string(),
+            baseline_sample_count: 0,
+            candidate_sample_count: 0,
+            candidate_better_threshold_ms: None,
+            baseline_better_threshold_ms: None,
+            candidate_gate: AgentExperimentGateDecision {
+                kind: "continue".to_string(),
+                reason: "statistical gate not evaluated".to_string(),
+                confidence_bps: None,
+            },
+            baseline_gate: AgentExperimentGateDecision {
+                kind: "continue".to_string(),
+                reason: "statistical gate not evaluated".to_string(),
+                confidence_bps: None,
+            },
+        }
+    }
+}
+
 /// Verdict kind for an agent A/B experiment receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -366,6 +425,9 @@ pub struct AgentExperimentReceipt {
     pub baseline_summary: AgentVariantOutcomeSummary,
     /// Candidate aggregate.
     pub candidate_summary: AgentVariantOutcomeSummary,
+    /// Perf-gate evidence used by the verdict.
+    #[serde(default)]
+    pub statistical_gate: AgentExperimentStatisticalGate,
     /// Verdict kind.
     pub verdict: AgentExperimentVerdictKind,
     /// Operator-facing verdict reason.
@@ -443,8 +505,13 @@ pub fn evaluate_agent_experiment_receipt(
         &sorted_outcomes,
         AgentExperimentVariant::Candidate,
     );
-    let (verdict, verdict_reason, confidence_bps) =
-        decide_agent_experiment_verdict(&baseline_summary, &candidate_summary, evaluation_config);
+    let (verdict, verdict_reason, confidence_bps, statistical_gate) =
+        decide_agent_experiment_verdict(
+            &sorted_outcomes,
+            &baseline_summary,
+            &candidate_summary,
+            evaluation_config,
+        );
 
     let mut receipt = AgentExperimentReceipt {
         schema_version: AGENT_EXPERIMENT_RECEIPT_SCHEMA.to_string(),
@@ -457,6 +524,7 @@ pub fn evaluate_agent_experiment_receipt(
         outcomes: sorted_outcomes,
         baseline_summary,
         candidate_summary,
+        statistical_gate,
         verdict,
         verdict_reason,
         confidence_bps,
@@ -577,7 +645,11 @@ fn stable_partition_offset(experiment_id: &str) -> usize {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    if hash & 1 == 0 { 0 } else { 1 }
+    if hash & 1 == 0 {
+        0
+    } else {
+        1
+    }
 }
 
 fn summarize_variant_outcomes(
@@ -626,10 +698,18 @@ fn summarize_variant_outcomes(
 }
 
 fn decide_agent_experiment_verdict(
+    outcomes: &[AgentOutcomeSample],
     baseline: &AgentVariantOutcomeSummary,
     candidate: &AgentVariantOutcomeSummary,
     config: AgentExperimentEvaluationConfig,
-) -> (AgentExperimentVerdictKind, String, Option<u32>) {
+) -> (
+    AgentExperimentVerdictKind,
+    String,
+    Option<u32>,
+    AgentExperimentStatisticalGate,
+) {
+    let statistical_gate = build_agent_experiment_statistical_gate(outcomes, config);
+
     if baseline.green_proof_count < config.min_completed_samples_per_variant
         || candidate.green_proof_count < config.min_completed_samples_per_variant
     {
@@ -642,6 +722,7 @@ fn decide_agent_experiment_verdict(
                 candidate.green_proof_count
             ),
             None,
+            statistical_gate,
         );
     }
 
@@ -650,6 +731,7 @@ fn decide_agent_experiment_verdict(
             AgentExperimentVerdictKind::EvidenceBlocked,
             "baseline completed samples lack time-to-green-proof evidence".to_string(),
             None,
+            statistical_gate,
         );
     };
     let Some(candidate_mean) = candidate.mean_time_to_green_proof_ms else {
@@ -657,52 +739,197 @@ fn decide_agent_experiment_verdict(
             AgentExperimentVerdictKind::EvidenceBlocked,
             "candidate completed samples lack time-to-green-proof evidence".to_string(),
             None,
+            statistical_gate,
         );
     };
 
-    if practically_faster(
-        candidate_mean,
-        baseline_mean,
-        config.practical_improvement_bps,
-    ) {
+    if statistical_gate.candidate_gate.kind == "accept" {
         return (
             AgentExperimentVerdictKind::CandidateBetter,
             format!(
-                "candidate mean time-to-green-proof {candidate_mean}ms beats baseline {baseline_mean}ms by configured threshold"
+                "candidate time-to-green-proof gate accepted: candidate mean {candidate_mean}ms beats baseline {baseline_mean}ms by configured threshold"
             ),
-            Some(config.confidence_bps),
+            statistical_gate.candidate_gate.confidence_bps,
+            statistical_gate,
         );
     }
-    if practically_faster(
-        baseline_mean,
-        candidate_mean,
-        config.practical_improvement_bps,
-    ) {
+    if statistical_gate.baseline_gate.kind == "accept" {
         return (
             AgentExperimentVerdictKind::BaselineBetter,
             format!(
-                "baseline mean time-to-green-proof {baseline_mean}ms beats candidate {candidate_mean}ms by configured threshold"
+                "baseline time-to-green-proof gate accepted: baseline mean {baseline_mean}ms beats candidate {candidate_mean}ms by configured threshold"
             ),
-            Some(config.confidence_bps),
+            statistical_gate.baseline_gate.confidence_bps,
+            statistical_gate,
         );
     }
 
     (
         AgentExperimentVerdictKind::Inconclusive,
         format!(
-            "mean time-to-green-proof delta did not cross {} basis-point practical threshold",
-            config.practical_improvement_bps
+            "time-to-green-proof gates did not accept either variant; candidate_gate={} baseline_gate={}",
+            statistical_gate.candidate_gate.kind, statistical_gate.baseline_gate.kind
         ),
         None,
+        statistical_gate,
     )
 }
 
-fn practically_faster(lhs_ms: u64, rhs_ms: u64, improvement_bps: u32) -> bool {
+fn build_agent_experiment_statistical_gate(
+    outcomes: &[AgentOutcomeSample],
+    config: AgentExperimentEvaluationConfig,
+) -> AgentExperimentStatisticalGate {
+    let baseline_times =
+        timed_green_samples_for_variant(outcomes, AgentExperimentVariant::Baseline);
+    let candidate_times =
+        timed_green_samples_for_variant(outcomes, AgentExperimentVariant::Candidate);
+    let baseline_mean = mean_u64(&baseline_times);
+    let candidate_mean = mean_u64(&candidate_times);
+    let candidate_threshold =
+        baseline_mean.map(|mean| practical_threshold_ms(mean, config.practical_improvement_bps));
+    let baseline_threshold =
+        candidate_mean.map(|mean| practical_threshold_ms(mean, config.practical_improvement_bps));
+
+    let min_samples = usize::try_from(config.min_completed_samples_per_variant)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let confidence = Some(f64::from(config.confidence_bps) / 10_000.0);
+
+    let candidate_gate = if let Some(threshold) = candidate_threshold {
+        let samples = evidence_samples(
+            "agent_experiment.time_to_green_proof_ms.candidate",
+            &candidate_times,
+        );
+        let cfg = SprtConfig {
+            baseline: u64_to_f64(threshold),
+            relative_threshold: 0.0,
+            min_samples,
+            confidence,
+        };
+        decision_projection(&sprt::evaluate_samples(&samples, &cfg).decision)
+    } else {
+        AgentExperimentGateDecision {
+            kind: "continue".to_string(),
+            reason:
+                "baseline timed green-proof samples are required before candidate gate evaluation"
+                    .to_string(),
+            confidence_bps: None,
+        }
+    };
+
+    let baseline_gate = if let Some(threshold) = baseline_threshold {
+        let samples = evidence_samples(
+            "agent_experiment.time_to_green_proof_ms.baseline",
+            &baseline_times,
+        );
+        let cfg = SprtConfig {
+            baseline: u64_to_f64(threshold),
+            relative_threshold: 0.0,
+            min_samples,
+            confidence,
+        };
+        decision_projection(&sprt::evaluate_samples(&samples, &cfg).decision)
+    } else {
+        AgentExperimentGateDecision {
+            kind: "continue".to_string(),
+            reason:
+                "candidate timed green-proof samples are required before baseline gate evaluation"
+                    .to_string(),
+            confidence_bps: None,
+        }
+    };
+
+    AgentExperimentStatisticalGate {
+        gate_id: "sprt_mean_threshold_v1".to_string(),
+        claim_id: "agent_experiment.time_to_green_proof_ms".to_string(),
+        baseline_sample_count: u64::try_from(baseline_times.len()).unwrap_or(u64::MAX),
+        candidate_sample_count: u64::try_from(candidate_times.len()).unwrap_or(u64::MAX),
+        candidate_better_threshold_ms: candidate_threshold,
+        baseline_better_threshold_ms: baseline_threshold,
+        candidate_gate,
+        baseline_gate,
+    }
+}
+
+fn timed_green_samples_for_variant(
+    outcomes: &[AgentOutcomeSample],
+    variant: AgentExperimentVariant,
+) -> Vec<u64> {
+    outcomes
+        .iter()
+        .filter(|outcome| outcome.variant == variant && outcome.green_proof)
+        .filter_map(|outcome| outcome.time_to_green_proof_ms)
+        .collect()
+}
+
+fn mean_u64(values: &[u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let total = values
+        .iter()
+        .fold(0_u128, |acc, value| acc.saturating_add(u128::from(*value)));
+    let len = u128::try_from(values.len()).unwrap_or(u128::MAX);
+    Some(u64::try_from(total / len).unwrap_or(u64::MAX))
+}
+
+fn practical_threshold_ms(rhs_ms: u64, improvement_bps: u32) -> u64 {
     if improvement_bps >= u32::try_from(BASIS_POINTS_DENOMINATOR).unwrap_or(u32::MAX) {
-        return false;
+        return 0;
     }
     let required_numerator = BASIS_POINTS_DENOMINATOR.saturating_sub(u128::from(improvement_bps));
-    u128::from(lhs_ms) * BASIS_POINTS_DENOMINATOR <= u128::from(rhs_ms) * required_numerator
+    let threshold =
+        u128::from(rhs_ms).saturating_mul(required_numerator) / BASIS_POINTS_DENOMINATOR;
+    u64::try_from(threshold).unwrap_or(u64::MAX)
+}
+
+fn evidence_samples(claim_id: &str, times_ms: &[u64]) -> Vec<EvidenceSample> {
+    times_ms
+        .iter()
+        .enumerate()
+        .map(|(idx, time_ms)| {
+            EvidenceSample::new(
+                claim_id,
+                u64_to_f64(*time_ms),
+                "ms",
+                1,
+                u64::try_from(idx.saturating_add(1)).unwrap_or(u64::MAX),
+            )
+        })
+        .collect()
+}
+
+fn decision_projection(decision: &GateDecision) -> AgentExperimentGateDecision {
+    AgentExperimentGateDecision {
+        kind: decision.kind().to_string(),
+        reason: decision.reason().to_string(),
+        confidence_bps: decision_confidence_bps(decision),
+    }
+}
+
+fn decision_confidence_bps(decision: &GateDecision) -> Option<u32> {
+    let confidence = match decision {
+        GateDecision::Accept { confidence, .. }
+        | GateDecision::Reject { confidence, .. }
+        | GateDecision::LowConfidence { confidence, .. } => *confidence,
+        GateDecision::Continue { .. } | GateDecision::RegimeShift { .. } => None,
+    }?;
+    if !confidence.is_finite() || confidence < 0.0 {
+        return None;
+    }
+    let bps = (confidence.min(1.0) * 10_000.0).round();
+    rounded_f64_to_u32(bps)
+}
+
+fn u64_to_f64(value: u64) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(f64::INFINITY)
+}
+
+fn rounded_f64_to_u32(value: f64) -> Option<u32> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    format!("{value:.0}").parse::<u32>().ok()
 }
 
 fn agent_experiment_receipt_id(receipt: &AgentExperimentReceipt) -> String {
@@ -729,6 +956,7 @@ fn agent_experiment_receipt_id(receipt: &AgentExperimentReceipt) -> String {
         &mut hasher,
         &receipt.evaluation_config.confidence_bps.to_string(),
     );
+    hash_statistical_gate(&mut hasher, &receipt.statistical_gate);
     for assignment in &receipt.assignments {
         hash_string(&mut hasher, &assignment.work_item_id);
         hash_string(&mut hasher, assignment.variant.token());
@@ -763,6 +991,35 @@ fn agent_experiment_receipt_id(receipt: &AgentExperimentReceipt) -> String {
     format!("agent-exp:{}", hex::encode(hasher.finalize()))
 }
 
+fn hash_statistical_gate(hasher: &mut Sha256, gate: &AgentExperimentStatisticalGate) {
+    hash_string(hasher, &gate.gate_id);
+    hash_string(hasher, &gate.claim_id);
+    hash_string(hasher, &gate.baseline_sample_count.to_string());
+    hash_string(hasher, &gate.candidate_sample_count.to_string());
+    hash_option_u64(hasher, gate.candidate_better_threshold_ms);
+    hash_option_u64(hasher, gate.baseline_better_threshold_ms);
+    hash_gate_decision(hasher, &gate.candidate_gate);
+    hash_gate_decision(hasher, &gate.baseline_gate);
+}
+
+fn hash_gate_decision(hasher: &mut Sha256, decision: &AgentExperimentGateDecision) {
+    hash_string(hasher, &decision.kind);
+    hash_string(hasher, &decision.reason);
+    hash_string(
+        hasher,
+        &decision
+            .confidence_bps
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+    );
+}
+
+fn hash_option_u64(hasher: &mut Sha256, value: Option<u64>) {
+    hash_string(
+        hasher,
+        &value.map_or_else(|| "none".to_string(), |value| value.to_string()),
+    );
+}
+
 fn hash_string(hasher: &mut Sha256, value: &str) {
     hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
     hasher.update(value.as_bytes());
@@ -770,7 +1027,7 @@ fn hash_string(hasher: &mut Sha256, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_fixtures::synthetic_swarm::{SyntheticSwarmScale, synthetic_swarm_scenario};
+    use crate::test_fixtures::synthetic_swarm::{synthetic_swarm_scenario, SyntheticSwarmScale};
 
     use super::*;
 
@@ -881,11 +1138,10 @@ mod tests {
             .filter(|assignment| assignment.variant == AgentExperimentVariant::Candidate)
             .count();
         assert!(baseline_count.abs_diff(candidate_count) <= 1);
-        assert!(
-            plan.assignments
-                .iter()
-                .all(|assignment| !assignment.assignment_reason.is_empty())
-        );
+        assert!(plan
+            .assignments
+            .iter()
+            .all(|assignment| !assignment.assignment_reason.is_empty()));
     }
 
     #[test]
@@ -929,6 +1185,15 @@ mod tests {
         assert_eq!(receipt.baseline_summary.green_proof_count, 2);
         assert_eq!(receipt.candidate_summary.green_proof_count, 2);
         assert_eq!(receipt.baseline_summary.error_detection_count, 2);
+        assert_eq!(receipt.statistical_gate.gate_id, "sprt_mean_threshold_v1");
+        assert_eq!(receipt.statistical_gate.baseline_sample_count, 2);
+        assert_eq!(receipt.statistical_gate.candidate_sample_count, 2);
+        assert_eq!(
+            receipt.statistical_gate.candidate_better_threshold_ms,
+            Some(945)
+        );
+        assert_eq!(receipt.statistical_gate.candidate_gate.kind, "accept");
+        assert_eq!(receipt.statistical_gate.baseline_gate.kind, "reject");
     }
 
     #[test]
@@ -989,6 +1254,9 @@ mod tests {
         assert_eq!(receipt.verdict, AgentExperimentVerdictKind::EvidenceBlocked);
         assert_eq!(receipt.baseline_summary.limit_event_count, 1);
         assert_eq!(receipt.baseline_summary.gap_event_count, 2);
+        assert_eq!(receipt.statistical_gate.baseline_sample_count, 0);
+        assert_eq!(receipt.statistical_gate.candidate_sample_count, 2);
+        assert_eq!(receipt.statistical_gate.candidate_gate.kind, "continue");
     }
 
     /// Per-event overhead exceeding the budget aborts with
