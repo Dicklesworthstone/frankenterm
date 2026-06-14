@@ -163,6 +163,14 @@
     },
     {
       "category": "proofs/robot-contracts",
+      "path": "docs/attestations/proofs/operating-envelope.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-booek.7",
+      "proof_categories": [4, 5],
+      "description": "Operating-envelope convergence/no-verdict artifact for the ft.operating_envelope.v1 fail-closed admission contract, retained fixture/proof-calendar corpus, operator runbook, and release-attestation posture. Uses the existing robot-contracts release category because this is a schema-backed read-only planning contract; it records that target-class capacity remains blocked while resource-cockpit target-class evidence is skipped_not_proven."
+    },
+    {
+      "category": "proofs/robot-contracts",
       "path": "docs/attestations/proofs/mission-twin.json",
       "media_type": "application/json",
       "produced_by_bead": "ft-u7r37.8",

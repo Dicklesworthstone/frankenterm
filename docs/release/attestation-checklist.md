@@ -47,6 +47,11 @@ that bead, verify:
   `completed` states, and do not turn a queued receipt into green proof. The
   optional robot-contract manifest slot is
   `docs/attestations/proofs/deferred-proof-replay.json`.
+- [ ] Operating-envelope wording changes cite
+  `docs/attestations/proofs/operating-envelope.json`, preserve the read-only
+  fail-closed admission scope, and keep target-class production capacity blocked
+  unless `docs/attestations/proofs/resource-cockpit-target-class.json` is
+  non-skipped.
 - [ ] The closing comment cites the manifest slot category, artifact path,
   build/verify exit codes, and retained RCH artifact bundle path.
 
@@ -103,6 +108,11 @@ For deferred-proof replay closeout, confirm the optional
 `proofs/robot-contracts` slot points at
 `docs/attestations/proofs/deferred-proof-replay.json` and that the artifact
 keeps queued/deferred receipts visibly distinct from completed remote proof.
+For operating-envelope closeout, confirm the `proofs/robot-contracts` slot
+points at `docs/attestations/proofs/operating-envelope.json`, that the artifact
+records the retained fixture/proof-calendar counts, and that target-class
+capacity remains blocked when the resource-cockpit target-class artifact is
+`skipped_not_proven`.
 
 If any bead is **not closed**, the release MUST NOT proceed —
 the attestation bundle would either be partial (rejected by

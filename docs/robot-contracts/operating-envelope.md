@@ -149,3 +149,19 @@ JSONL serialization contract is validated separately by round-tripping the full
 artifact. The fixture manifest retains this verifier command in `static_checks`
 so manifest consumers can discover the full static proof lane from the artifact
 itself.
+
+## Release Attestation
+
+The release-bundle artifact for this contract is
+`docs/attestations/proofs/operating-envelope.json`, produced by `ft-booek.7`
+under the existing `proofs/robot-contracts` manifest category. The artifact maps
+the operating-envelope implementation, schema, fixture manifest, proof-calendar
+corpus, retained-run contract, static verifier, RCH-only proof lane, and operator
+runbook to release evidence.
+
+The artifact status is the source of truth. A `blocked_rch_no_verdict` status
+records retained wiring and failed/cancelled remote proof attempts, not a
+production proof. Even after this slot has passing proof, it does not prove
+target-class production capacity: the target-class predicate still depends on
+`docs/attestations/proofs/resource-cockpit-target-class.json`, whose current
+state is `skipped_not_proven`.

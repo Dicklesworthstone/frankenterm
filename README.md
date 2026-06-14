@@ -474,6 +474,7 @@ The README claim-to-slot map is intentionally limited to populated manifest slot
 | Bloom prefilter search speedup | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | 200-pane capacity and memory-budget benchmark lane | [`perf/headline-claims`](docs/perf/headline-claims.json) | `ft-syqcz.3` |
 | Robot JSON/TOON envelope contract | [`proofs/robot-contracts`](crates/frankenterm-core/tests/golden_robot_envelope/control_plane_golden_matrix.json) | `ft-0elb9` |
+| Operating-envelope read-only admission contract no-verdict artifact | [`proofs/robot-contracts`](docs/attestations/proofs/operating-envelope.json) | `ft-booek.7` |
 | Redactor coverage matrix | [`security/redactor-coverage`](docs/security/redactor-coverage.json) | `ft-x0666.2` |
 | Distributed wire-protocol safety | [`security/distributed-threat-model`](docs/security/distributed-threat-model.md) | `ft-x0666.3` |
 | `runtime_async` Loom model | [`proofs/loom-runtime-async`](docs/attestations/proofs/loom-runtime-async.json) | `ft-e87u6.12` |
@@ -481,7 +482,17 @@ The README claim-to-slot map is intentionally limited to populated manifest slot
 | Transaction kill-switch proof | [`proofs/tx-killswitch`](docs/attestations/proofs/tx-killswitch.json) | `ft-tf6g3.12` |
 <!-- attestation-claim-map:end -->
 
-The operating-envelope contract (`ft.operating_envelope.v1`) and the renderer SLO suite are tracked under [ft-tf6g3](#engineering-discipline) for inclusion in a future bundle; they don't yet have populated manifest slots. The optional `proofs/rehearsal-score` slot hashes the rehearsal-score golden matrix so blocked, skipped, degraded, missing-evidence, and fixture-only score rows stay visible; it is not a production support claim unless the cited receipt criterion has proven evidence.
+The operating-envelope contract (`ft.operating_envelope.v1`) is wired under the
+`proofs/robot-contracts` manifest category as a retained read-only fail-closed
+admission artifact. Its current artifact status is the source of truth; a
+`blocked_rch_no_verdict` status is not production proof. The slot also does not
+prove target-class production capacity while the target-class resource-cockpit
+artifact remains `skipped_not_proven`. The
+renderer SLO suite is still tracked under [ft-tf6g3](#engineering-discipline)
+for inclusion in a future bundle. The optional `proofs/rehearsal-score` slot
+hashes the rehearsal-score golden matrix so blocked, skipped, degraded,
+missing-evidence, and fixture-only score rows stay visible; it is not a
+production support claim unless the cited receipt criterion has proven evidence.
 
 Verify a release attestation bundle in one command, offline, without trusting GitHub or any registry:
 
