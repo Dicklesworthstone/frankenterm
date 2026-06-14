@@ -332,6 +332,8 @@ pub(super) struct SendParams {
     pub verify_submit: bool,
     #[serde(default)]
     pub submit_level: Option<SubmitGuaranteeLevel>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     pub wait_for: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
