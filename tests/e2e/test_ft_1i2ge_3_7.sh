@@ -42,11 +42,12 @@ SCENARIO_ID="ft_1i2ge_3_7_orchestration"
 CORRELATION_ID="ft-1i2ge.3.7-${RUN_ID}"
 DEFAULT_TARGET_DIR="target/rch-e2e-ft-1i2ge-3-7-${RUN_ID}"
 REQUESTED_TARGET_DIR="${CARGO_TARGET_DIR:-}"
-if [[ -n "${REQUESTED_TARGET_DIR}" && "${REQUESTED_TARGET_DIR}" != /* ]]; then
+if [[ -n "${REQUESTED_TARGET_DIR}" ]]; then
   TARGET_DIR="${REQUESTED_TARGET_DIR}"
 else
   TARGET_DIR="${DEFAULT_TARGET_DIR}"
 fi
+ORCHESTRATION_TEST_FEATURES="subprocess-bridge,__journal_types_placeholder"
 LOG_FILE="${LOG_DIR}/ft_1i2ge_3_7_${RUN_ID}.jsonl"
 STDOUT_FILE="${LOG_DIR}/ft_1i2ge_3_7_${RUN_ID}.stdout.log"
 
@@ -108,6 +109,14 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ ",${ORCHESTRATION_TEST_FEATURES}," != *",subprocess-bridge,"* ||
+  ",${ORCHESTRATION_TEST_FEATURES}," != *",__journal_types_placeholder,"* ]]; then
+  emit_log "failed" "preflight_features" "required_feature_missing" \
+    "orchestration_feature_missing" "$(basename "${LOG_FILE}")" \
+    "features=${ORCHESTRATION_TEST_FEATURES}"
+  exit 1
+fi
+
 TESTS=(
   "journal_lifecycle_transition_append_and_replay"
   "journal_checkpoint_and_recovery"
@@ -144,7 +153,7 @@ command_index=0
 for test_name in "${TESTS[@]}"; do
   command_index=$((command_index + 1))
   step_stdout="${LOG_DIR}/ft_1i2ge_3_7_${RUN_ID}.step_${command_index}.stdout.log"
-  test_cmd=(env CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core --features subprocess-bridge,__journal_types_placeholder --test orchestration_integration "${test_name}" -- --nocapture)
+  test_cmd=(env CARGO_TARGET_DIR="${TARGET_DIR}" cargo test -p frankenterm-core --features "${ORCHESTRATION_TEST_FEATURES}" --test orchestration_integration "${test_name}" -- --nocapture)
 
   emit_log "running" "cargo_test" "none" "none" \
     "$(basename "${STDOUT_FILE}")" "Executing through rch: ${test_cmd[*]}"
