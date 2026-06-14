@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "overall": {
     "recall": 1.0,
     "precision": 1.0,
@@ -210,7 +210,11 @@
     "current_min_positive_vectors_per_class": 3,
     "current_status": "under_sampled",
     "external_corpus_status": "not_vendored_license_signoff_required",
-    "follow_up_bead": "ft-tf6g3.35"
+    "follow_up_bead": "ft-tf6g3.35",
+    "classes_under_floor": 32,
+    "classes_with_corpus_exception": 32,
+    "unexcepted_classes_under_floor": 0,
+    "corpus_exception_reason": "licensed_external_corpus_unavailable"
   },
   "by_pattern_class": {
     "ai_provider_keyed_value": {
@@ -218,224 +222,416 @@
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "anthropic_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "anyscale_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "aws_access_key_id": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "aws_secret_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "bearer_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "database_url": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "datadog_api_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "device_code": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "generic_api_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "generic_password": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "generic_secret": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "generic_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "github_fine_grained_pat": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "github_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "gitlab_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "google_api_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "google_oauth_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "groq_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "huggingface_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "jwt_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "oauth_url": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "openai_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "perplexity_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "pgp_block": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "replicate_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "sendgrid_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "slack_token": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "ssh_private_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "stripe_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "twilio_account_sid": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     },
     "xai_key": {
       "observed_positive_vectors": 3,
       "required_positive_vectors": 459,
       "confidence": 0.99,
       "recall_floor": 0.99,
-      "status": "under_sampled"
+      "status": "under_sampled",
+      "corpus_exception": {
+        "reason": "licensed_external_corpus_unavailable",
+        "tracking_bead": "ft-tf6g3.35",
+        "signoff_status": "pending_operator_license_signoff",
+        "synthetic_shortfall": 456
+      }
     }
   },
   "vectors_total": 112,

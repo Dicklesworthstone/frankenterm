@@ -19,7 +19,10 @@ use frankenterm_core::redactor_coverage_matrix::{
     MatrixSnapshot, RedactorCoverageHealth, RedactorTestVector, fold_snapshot, synthesized_corpus,
 };
 
-const COVERAGE_SCHEMA_VERSION: u32 = 2;
+// Schema v3 (ft-tf6g3.35): per-pattern-class `corpus_exception` records +
+// the under-floor/exception summary counters were added on top of the v2
+// `sample_size_floor` publication from ft-tf6g3.9.
+const COVERAGE_SCHEMA_VERSION: u32 = 3;
 const RECALL_FLOOR: f64 = 0.99;
 const PRECISION_FLOOR_OVERALL: f64 = 0.50; // see methodology doc
 const COVERAGE_REPORT_PATH: &str = "../../docs/security/redactor-coverage.json";
@@ -28,6 +31,13 @@ const CONFIDENCE_TARGET: f64 = 0.99;
 const ALPHA: f64 = 0.01;
 const ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS: u32 = 459;
 const SAMPLE_SIZE_FLOOR_FOLLOW_UP_BEAD: &str = "ft-tf6g3.35";
+// Honest, license-safe alternative to vendoring third-party (gitleaks /
+// trufflehog) corpus material — which is blocked on operator/license
+// sign-off (see ft-tf6g3.35). A class that cannot reach the 459-vector
+// zero-miss floor with synthetic-only data records this exception instead
+// of silently overclaiming coverage.
+const CORPUS_EXCEPTION_REASON: &str = "licensed_external_corpus_unavailable";
+const CORPUS_EXCEPTION_SIGNOFF: &str = "pending_operator_license_signoff";
 
 #[test]
 fn synthesized_corpus_meets_recall_floor() {
@@ -86,6 +96,83 @@ fn fold_snapshot_into_health_is_safe() {
         health.false_negatives_total,
         health.false_positives_total,
     );
+}
+
+/// Fail-closed corpus-honesty invariant (ft-tf6g3.35).
+///
+/// The synthesized in-tree corpus is far below the Fano /
+/// zero-miss sample floor (459 positive vectors per class), and
+/// licensed external corpus (gitleaks / trufflehog) is NOT
+/// vendored because operator/license sign-off is still pending.
+/// Honesty therefore requires the bead's OR-clause: every live
+/// secret pattern class that is under the floor MUST carry an
+/// explicit, tracked unavailable-corpus exception. The coverage
+/// artifact may never sit under the floor for a class without
+/// one (that would silently overclaim coverage), and a class
+/// that reaches the floor must not carry a stale exception.
+#[test]
+fn every_under_floor_class_carries_corpus_exception() {
+    let corpus = synthesized_corpus();
+    let snap = MatrixSnapshot::evaluate(&corpus);
+    let report = CoverageReportShape::from_snapshot_and_corpus(&snap, &corpus);
+
+    for (class, floor) in &report.by_pattern_class {
+        let under_floor = floor.observed_positive_vectors < ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS;
+        match (&floor.corpus_exception, under_floor) {
+            (Some(exc), true) => {
+                assert_eq!(
+                    exc.reason, CORPUS_EXCEPTION_REASON,
+                    "class {class}: unexpected exception reason"
+                );
+                assert_eq!(
+                    exc.tracking_bead, SAMPLE_SIZE_FLOOR_FOLLOW_UP_BEAD,
+                    "class {class}: exception must reference the tracking bead"
+                );
+                assert_eq!(
+                    exc.signoff_status, CORPUS_EXCEPTION_SIGNOFF,
+                    "class {class}: unexpected sign-off status"
+                );
+                assert_eq!(
+                    exc.synthetic_shortfall,
+                    ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS - floor.observed_positive_vectors,
+                    "class {class}: shortfall must equal required - observed"
+                );
+                assert_eq!(
+                    floor.status, "under_sampled",
+                    "class {class}: under-floor class must be marked under_sampled"
+                );
+            }
+            (None, false) => {
+                assert_eq!(
+                    floor.status, "satisfies_floor",
+                    "class {class}: at-or-above floor must be marked satisfies_floor"
+                );
+            }
+            (None, true) => panic!(
+                "class {class} is below the {ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS}-vector \
+                 zero-miss floor but carries NO unavailable-corpus exception — the coverage \
+                 artifact would silently overclaim coverage for an under-sampled class"
+            ),
+            (Some(_), false) => panic!(
+                "class {class} meets the sample floor but still carries a stale \
+                 unavailable-corpus exception"
+            ),
+        }
+    }
+
+    // Summary counters must be internally consistent and the
+    // fail-closed invariant must hold: zero under-floor classes
+    // without an exception.
+    let s = &report.sample_size_floor;
+    assert_eq!(
+        s.unexcepted_classes_under_floor, 0,
+        "every under-floor class must carry a tracked corpus_exception"
+    );
+    assert_eq!(
+        s.classes_with_corpus_exception, s.classes_under_floor,
+        "exception count must cover every under-floor class"
+    );
+    assert_eq!(s.corpus_exception_reason, CORPUS_EXCEPTION_REASON);
 }
 
 /// Coverage report bless flow.
@@ -230,6 +317,19 @@ struct SampleSizeFloorSummary {
     current_status: String,
     external_corpus_status: String,
     follow_up_bead: String,
+    /// Number of live secret pattern classes still below the
+    /// zero-miss sample floor.
+    classes_under_floor: u32,
+    /// Number of those classes that carry an explicit, tracked
+    /// `corpus_exception`. The fail-closed invariant
+    /// (`every_under_floor_class_carries_corpus_exception`)
+    /// requires this to equal `classes_under_floor`.
+    classes_with_corpus_exception: u32,
+    /// Under-floor classes with NO recorded exception. Must be 0
+    /// — a non-zero value means the artifact would silently
+    /// overclaim coverage for an under-sampled class.
+    unexcepted_classes_under_floor: u32,
+    corpus_exception_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -239,6 +339,27 @@ struct PatternClassSampleFloor {
     confidence: f64,
     recall_floor: f64,
     status: String,
+    /// Present iff the class is below the zero-miss floor. Records
+    /// WHY the shortfall is tolerated (licensed external corpus
+    /// unavailable, pending sign-off) and which bead tracks it,
+    /// so an under-sampled class is never silently treated as
+    /// covered. `None` once the class reaches the floor.
+    corpus_exception: Option<CorpusException>,
+}
+
+/// A class-specific, tracked record explaining why a secret
+/// pattern class is allowed to sit below the information-theoretic
+/// zero-miss sample floor without overclaiming coverage. This is
+/// the license-safe alternative to vendoring third-party corpus
+/// material (which is blocked on operator/license sign-off).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct CorpusException {
+    reason: String,
+    tracking_bead: String,
+    signoff_status: String,
+    /// How many additional positive vectors this class needs to
+    /// reach the floor (`required - observed`).
+    synthetic_shortfall: u32,
 }
 
 impl CoverageReportShape {
@@ -280,6 +401,21 @@ impl CoverageReportShape {
                 "under_sampled"
             }
             .to_string();
+        let classes_under_floor = by_pattern_class
+            .values()
+            .filter(|f| f.observed_positive_vectors < ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS)
+            .count() as u32;
+        let classes_with_corpus_exception = by_pattern_class
+            .values()
+            .filter(|f| f.corpus_exception.is_some())
+            .count() as u32;
+        let unexcepted_classes_under_floor = by_pattern_class
+            .values()
+            .filter(|f| {
+                f.observed_positive_vectors < ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS
+                    && f.corpus_exception.is_none()
+            })
+            .count() as u32;
         Self {
             schema_version: COVERAGE_SCHEMA_VERSION,
             overall,
@@ -301,6 +437,10 @@ impl CoverageReportShape {
                 current_status,
                 external_corpus_status: "not_vendored_license_signoff_required".to_string(),
                 follow_up_bead: SAMPLE_SIZE_FLOOR_FOLLOW_UP_BEAD.to_string(),
+                classes_under_floor,
+                classes_with_corpus_exception,
+                unexcepted_classes_under_floor,
+                corpus_exception_reason: CORPUS_EXCEPTION_REASON.to_string(),
             },
             by_pattern_class,
             vectors_total: snap.vectors_total,
@@ -335,12 +475,23 @@ fn pattern_class_sample_floors(
     observed
         .into_iter()
         .map(|(pattern_name, observed_positive_vectors)| {
-            let status = if observed_positive_vectors >= ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS {
+            let meets_floor = observed_positive_vectors >= ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS;
+            let status = if meets_floor {
                 "satisfies_floor"
             } else {
                 "under_sampled"
             }
             .to_string();
+            // Fail-closed honesty: any class below the floor MUST
+            // carry a tracked unavailable-corpus exception so the
+            // shortfall is never silently treated as covered.
+            let corpus_exception = (!meets_floor).then(|| CorpusException {
+                reason: CORPUS_EXCEPTION_REASON.to_string(),
+                tracking_bead: SAMPLE_SIZE_FLOOR_FOLLOW_UP_BEAD.to_string(),
+                signoff_status: CORPUS_EXCEPTION_SIGNOFF.to_string(),
+                synthetic_shortfall: ZERO_MISS_REQUIRED_POSITIVES_PER_CLASS
+                    .saturating_sub(observed_positive_vectors),
+            });
             (
                 pattern_name,
                 PatternClassSampleFloor {
@@ -349,6 +500,7 @@ fn pattern_class_sample_floors(
                     confidence: CONFIDENCE_TARGET,
                     recall_floor: RECALL_FLOOR,
                     status,
+                    corpus_exception,
                 },
             )
         })
