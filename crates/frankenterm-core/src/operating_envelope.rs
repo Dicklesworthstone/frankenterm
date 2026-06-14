@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[cfg(feature = "subprocess-bridge")]
 use crate::beads_types::{BeadReadinessReport, BeadResolverReasonCode, BeadStatusCounts};
@@ -16,6 +17,8 @@ use crate::capacity_governor::GovernorDecision;
 
 pub const OPERATING_ENVELOPE_CONTRACT_ID: &str = "ft.operating_envelope.v1";
 pub const OPERATING_ENVELOPE_SCHEMA_VERSION: u16 = 1;
+pub const OPERATING_ENVELOPE_RETAINED_RUN_ARTIFACT_CONTRACT_ID: &str =
+    "ft.operating_envelope.retained_run_artifact.v1";
 pub const OPERATING_ENVELOPE_MCP_CURRENT_URI: &str = "wa://operating-envelope/current";
 pub const OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE: &str = "wa://operating-envelope/runs/{run_id}";
 pub const OPERATING_ENVELOPE_SURFACE_SAFETY_NOTICE: &str = "read-only plan; not permission to mutate panes, claim Beads, repair or restart services, \
@@ -1712,6 +1715,212 @@ pub struct OperatingEnvelopePlan {
     pub artifact_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeRetainedRunCommand {
+    pub command: String,
+    pub exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub target_dir: String,
+    pub remote_cargo_reached: bool,
+    pub cargo_test_reached: bool,
+}
+
+impl OperatingEnvelopeRetainedRunCommand {
+    #[must_use]
+    pub fn new(command: impl Into<String>, exit_code: i32, target_dir: impl Into<String>) -> Self {
+        Self {
+            command: bounded_string(command, "operating_envelope.harness"),
+            exit_code,
+            worker_id: None,
+            target_dir: bounded_string(target_dir, "target.unknown"),
+            remote_cargo_reached: false,
+            cargo_test_reached: false,
+        }
+    }
+
+    #[must_use]
+    pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
+        self.worker_id = Some(bounded_string(worker_id, "worker.unknown"));
+        self
+    }
+
+    #[must_use]
+    pub const fn remote_cargo_reached(mut self, reached: bool) -> Self {
+        self.remote_cargo_reached = reached;
+        self
+    }
+
+    #[must_use]
+    pub const fn cargo_test_reached(mut self, reached: bool) -> Self {
+        self.cargo_test_reached = reached;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeInputFixtureHash {
+    pub fixture_id: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeOutputHash {
+    pub output_id: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeGoldenUpdateReceipt {
+    pub bless_required: bool,
+    pub bless_command: String,
+    pub old_output_sha256: String,
+    pub new_output_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeSourceFreshnessReceipt {
+    pub source_id: String,
+    pub source_kind: OperatingEnvelopeSourceKind,
+    pub state: OperatingEnvelopeSourceState,
+    pub freshness_state: OperatingEnvelopeFreshnessState,
+    pub freshness_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeReasonCodeDiff {
+    pub baseline: Vec<String>,
+    pub observed: Vec<String>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatingEnvelopeRetainedRunArtifact {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub generated_at_ms: u64,
+    pub run_id: String,
+    pub scenario_id: String,
+    pub dry_run: bool,
+    pub read_only: bool,
+    pub external_provider_calls: bool,
+    pub command: OperatingEnvelopeRetainedRunCommand,
+    pub input_fixture_hashes: Vec<OperatingEnvelopeInputFixtureHash>,
+    pub output_hashes: Vec<OperatingEnvelopeOutputHash>,
+    pub scrub_rules: Vec<String>,
+    pub source_freshness: Vec<OperatingEnvelopeSourceFreshnessReceipt>,
+    pub golden_update: OperatingEnvelopeGoldenUpdateReceipt,
+    pub reason_code_diff: OperatingEnvelopeReasonCodeDiff,
+    pub decision: OperatingEnvelopeDecision,
+    pub admission_windows: Vec<OperatingEnvelopeAdmissionWindow>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_operating_envelope_retained_run_artifact(
+    plan: &OperatingEnvelopePlan,
+    scenario_id: impl Into<String>,
+    command: OperatingEnvelopeRetainedRunCommand,
+    input_fixture_body: &str,
+    baseline_reason_codes: &[String],
+    old_golden_body: &str,
+    new_golden_body: &str,
+) -> Result<OperatingEnvelopeRetainedRunArtifact, serde_json::Error> {
+    let scenario_id = bounded_string(scenario_id, "scenario.unknown");
+    let plan_json = serde_json::to_vec(plan)?;
+    let diff = operating_envelope_reason_code_diff(baseline_reason_codes, &plan.reason_codes);
+
+    Ok(OperatingEnvelopeRetainedRunArtifact {
+        schema_version: OPERATING_ENVELOPE_SCHEMA_VERSION,
+        contract_id: OPERATING_ENVELOPE_RETAINED_RUN_ARTIFACT_CONTRACT_ID.to_string(),
+        generated_at_ms: plan.generated_at_ms,
+        run_id: format!("{}-{scenario_id}", operating_envelope_run_id(plan.generated_at_ms)),
+        scenario_id,
+        dry_run: true,
+        read_only: true,
+        external_provider_calls: false,
+        command,
+        input_fixture_hashes: vec![OperatingEnvelopeInputFixtureHash {
+            fixture_id: "retained_source_snapshot".to_string(),
+            sha256: sha256_prefixed(input_fixture_body.as_bytes()),
+        }],
+        output_hashes: vec![
+            OperatingEnvelopeOutputHash {
+                output_id: "operating_envelope_plan_json".to_string(),
+                sha256: sha256_prefixed(&plan_json),
+            },
+            OperatingEnvelopeOutputHash {
+                output_id: "retained_jsonl_line".to_string(),
+                sha256: sha256_prefixed(new_golden_body.as_bytes()),
+            },
+        ],
+        scrub_rules: operating_envelope_scrub_rules(plan),
+        source_freshness: operating_envelope_sources(plan)
+            .into_iter()
+            .map(|source| OperatingEnvelopeSourceFreshnessReceipt {
+                source_id: source.source_id.clone(),
+                source_kind: source.source_kind,
+                state: source.state,
+                freshness_state: source.freshness_state,
+                freshness_ms: source.freshness_ms,
+            })
+            .collect(),
+        golden_update: OperatingEnvelopeGoldenUpdateReceipt {
+            bless_required: sha256_prefixed(old_golden_body.as_bytes())
+                != sha256_prefixed(new_golden_body.as_bytes()),
+            bless_command: "FT_OPERATING_ENVELOPE_BLESS=1 bash tests/e2e/test_operating_envelope_fixture_manifest.sh".to_string(),
+            old_output_sha256: sha256_prefixed(old_golden_body.as_bytes()),
+            new_output_sha256: sha256_prefixed(new_golden_body.as_bytes()),
+        },
+        reason_code_diff: diff,
+        decision: plan.decision.clone(),
+        admission_windows: plan.admission_windows.clone(),
+    })
+}
+
+#[must_use]
+pub fn operating_envelope_retained_run_jsonl_line(
+    artifact: &OperatingEnvelopeRetainedRunArtifact,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(artifact)
+}
+
+#[must_use]
+pub fn operating_envelope_reason_code_diff(
+    baseline: &[String],
+    observed: &[String],
+) -> OperatingEnvelopeReasonCodeDiff {
+    let baseline_set = baseline.iter().cloned().collect::<BTreeSet<_>>();
+    let observed_set = observed.iter().cloned().collect::<BTreeSet<_>>();
+    OperatingEnvelopeReasonCodeDiff {
+        baseline: baseline_set.iter().cloned().collect(),
+        observed: observed_set.iter().cloned().collect(),
+        added: observed_set.difference(&baseline_set).cloned().collect(),
+        removed: baseline_set.difference(&observed_set).cloned().collect(),
+    }
+}
+
+fn operating_envelope_scrub_rules(plan: &OperatingEnvelopePlan) -> Vec<String> {
+    let mut rules = vec![
+        "source_summaries_only".to_string(),
+        "raw_pane_content_forbidden".to_string(),
+        "secret_material_redacted".to_string(),
+        "agent_mail_bodies_not_retained".to_string(),
+        "rch_logs_classified_by_reason_code".to_string(),
+    ];
+    if plan.raw_pane_content_stored {
+        push_unique(
+            &mut rules,
+            "artifact_invalid_raw_pane_content_seen".to_string(),
+        );
+    }
+    rules
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
 #[must_use]
 pub fn plan_operating_envelope(input: OperatingEnvelopePlannerInput) -> OperatingEnvelopePlan {
     let facts = EnvelopeFacts::from_input(&input);
@@ -2920,8 +3129,8 @@ fn adapter_snapshot(
     snapshot.freshness_ms = provenance.freshness_ms;
     snapshot.freshness_state = provenance.freshness_state;
     snapshot.evidence.clear();
-    for artifact_path in &provenance.artifact_paths {
-        snapshot = snapshot.with_artifact_path(artifact_path.clone());
+    for artifact_path in provenance.artifact_paths.iter().cloned() {
+        snapshot = snapshot.with_artifact_path(artifact_path);
     }
     snapshot
 }
@@ -3139,6 +3348,385 @@ mod tests {
             .iter()
             .map(|window| window.window_id.as_str())
             .collect()
+    }
+
+    struct RetainedHarnessScenario {
+        scenario_id: &'static str,
+        input: OperatingEnvelopePlannerInput,
+        command: OperatingEnvelopeRetainedRunCommand,
+        expected_outcome: OperatingEnvelopeOutcome,
+        required_diff_reason: Option<&'static str>,
+    }
+
+    fn retained_input(
+        envelope_id: &'static str,
+        domains: OperatingEnvelopeInputDomains,
+    ) -> OperatingEnvelopePlannerInput {
+        OperatingEnvelopePlannerInput::new(NOW_MS, envelope_id, envelope_id, domains)
+            .target_class(
+                OperatingEnvelopeTargetClass::target_64_core_256g()
+                    .proof_state(OperatingEnvelopeProofState::Measured),
+            )
+            .budgets(OperatingEnvelopeBudgets::target_class())
+    }
+
+    fn rch_harness_command(
+        exit_code: i32,
+        worker_id: Option<&str>,
+        cargo_reached: bool,
+        test_reached: bool,
+    ) -> OperatingEnvelopeRetainedRunCommand {
+        let mut command = OperatingEnvelopeRetainedRunCommand::new(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-booek-5-cod5-target cargo test -p frankenterm-core --lib operating_envelope",
+            exit_code,
+            "/tmp/ft-booek-5-cod5-target",
+        )
+        .remote_cargo_reached(cargo_reached)
+        .cargo_test_reached(test_reached);
+        if let Some(worker_id) = worker_id {
+            command = command.worker_id(worker_id);
+        }
+        command
+    }
+
+    fn static_harness_command(
+        command: &'static str,
+        exit_code: i32,
+    ) -> OperatingEnvelopeRetainedRunCommand {
+        OperatingEnvelopeRetainedRunCommand::new(command, exit_code, "/tmp/ft-booek-5-cod5-target")
+    }
+
+    fn scenario_no_ready_docs_static() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-docs-static-retained",
+            "br ready --json",
+        ));
+        beads.blocked_count = 3;
+        domains.beads = beads.to_source_snapshot();
+        retained_input("no-ready-docs-static", domains)
+    }
+
+    fn scenario_agent_mail_unavailable() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut agent_mail = OperatingEnvelopeAgentMailSourceInput::new(provenance(
+            "agent-mail-unavailable-retained",
+            "fetch_inbox",
+        ));
+        agent_mail.unavailable_reason = Some("agent_mail.unavailable_after_retry".to_string());
+        domains.agent_mail = agent_mail.to_source_snapshot();
+        retained_input("agent-mail-unavailable", domains)
+    }
+
+    fn scenario_rch_no_workers() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-no-workers-retained",
+            "rch diagnose --dry-run --json",
+        ));
+        rch.no_workers_passed_health = true;
+        rch.remote_cargo_reached = Some(false);
+        domains.rch = rch.to_source_snapshot();
+        retained_input("rch-no-workers", domains)
+    }
+
+    fn scenario_rch_topology_failure() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut rch = OperatingEnvelopeRchSourceInput::new(provenance(
+            "rch-topology-failure-retained",
+            "rch diagnose --dry-run --json",
+        ));
+        rch.topology_preflight_failed = true;
+        rch.remote_cargo_reached = Some(false);
+        domains.rch = rch.to_source_snapshot();
+        retained_input("rch-topology-failure", domains)
+    }
+
+    fn scenario_dirty_overlap_untracked_owner() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-active-owner-retained",
+            "br show ft-booek.5 --json",
+        ));
+        beads.ready_count = 2;
+        beads.active_assignee_count = 1;
+        domains.beads = beads.to_source_snapshot();
+
+        let mut git = OperatingEnvelopeGitSourceInput::new(
+            provenance(
+                "git-overlap-retained",
+                "git status --short --untracked-files=all",
+            ),
+            "main",
+        );
+        git.tracked_dirty_count = 2;
+        git.untracked_count = 1;
+        git.dirty_overlap_count = 1;
+        domains.git = git.to_source_snapshot();
+        retained_input("dirty-overlap-untracked-owner", domains)
+    }
+
+    fn scenario_stale_in_progress_candidate() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut beads = OperatingEnvelopeBeadsSourceInput::new(provenance(
+            "beads-stale-candidate-retained",
+            "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+        ));
+        beads.ready_count = 2;
+        beads.stale_candidate_count = 1;
+        domains.beads = beads.to_source_snapshot();
+        retained_input("stale-in-progress-candidate", domains)
+    }
+
+    fn scenario_target_class_skipped() -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-target-class-skipped-retained",
+            "docs/attestations/proofs/resource-cockpit-target-class.json",
+        ));
+        capacity.pressure_tier = OperatingEnvelopeCapacityPressureTier::Green;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::SkippedNotProven;
+        capacity.heavy_workload_governor_decision = Some(heavy_governor_allow());
+        domains.capacity_resource = capacity.to_source_snapshot();
+        retained_input("target-class-skipped", domains)
+            .target_class(OperatingEnvelopeTargetClass::target_64_core_256g())
+    }
+
+    fn scenario_resource_pressure(
+        tier: OperatingEnvelopeCapacityPressureTier,
+    ) -> OperatingEnvelopePlannerInput {
+        let mut domains = adapter_domains();
+        let mut capacity = OperatingEnvelopeCapacitySourceInput::new(provenance(
+            "capacity-pressure-retained",
+            "ft robot swarm-capacity status --level 2",
+        ));
+        capacity.pressure_tier = tier;
+        capacity.target_class_proof_state = OperatingEnvelopeProofState::Measured;
+        capacity.heavy_workload_governor_decision = Some(heavy_governor_allow());
+        domains.capacity_resource = capacity.to_source_snapshot();
+        retained_input("resource-pressure", domains)
+    }
+
+    fn retained_harness_scenarios() -> Vec<RetainedHarnessScenario> {
+        vec![
+            RetainedHarnessScenario {
+                scenario_id: "clean-ready-healthy-rch",
+                input: retained_input("clean-ready-healthy-rch", adapter_domains()),
+                command: rch_harness_command(0, Some("vmi-retained-healthy"), true, true),
+                expected_outcome: OperatingEnvelopeOutcome::Admit,
+                required_diff_reason: None,
+            },
+            RetainedHarnessScenario {
+                scenario_id: "no-ready-docs-static",
+                input: scenario_no_ready_docs_static(),
+                command: static_harness_command(
+                    "bash tests/e2e/test_operating_envelope_fixture_manifest.sh",
+                    0,
+                ),
+                expected_outcome: OperatingEnvelopeOutcome::Wait,
+                required_diff_reason: Some("beads.ready_empty"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "agent-mail-unavailable",
+                input: scenario_agent_mail_unavailable(),
+                command: static_harness_command("fetch_inbox", 1),
+                expected_outcome: OperatingEnvelopeOutcome::Degrade,
+                required_diff_reason: Some("agent_mail.unavailable_after_retry"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "rch-no-workers",
+                input: scenario_rch_no_workers(),
+                command: rch_harness_command(1, None, false, false),
+                expected_outcome: OperatingEnvelopeOutcome::Defer,
+                required_diff_reason: Some("rch.no_workers_passed_health"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "rch-topology-failure",
+                input: scenario_rch_topology_failure(),
+                command: rch_harness_command(1, None, false, false),
+                expected_outcome: OperatingEnvelopeOutcome::Block,
+                required_diff_reason: Some("rch.topology_preflight_failed"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "dirty-overlap-untracked-owner",
+                input: scenario_dirty_overlap_untracked_owner(),
+                command: static_harness_command("git status --short --untracked-files=all", 0),
+                expected_outcome: OperatingEnvelopeOutcome::Wait,
+                required_diff_reason: Some("dirty_overlap.present"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "stale-in-progress-candidate",
+                input: scenario_stale_in_progress_candidate(),
+                command: static_harness_command(
+                    "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+                    0,
+                ),
+                expected_outcome: OperatingEnvelopeOutcome::Degrade,
+                required_diff_reason: Some("beads.stale_candidate"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "target-class-skipped",
+                input: scenario_target_class_skipped(),
+                command: static_harness_command(
+                    "jq empty docs/attestations/proofs/resource-cockpit-target-class.json",
+                    0,
+                ),
+                expected_outcome: OperatingEnvelopeOutcome::Defer,
+                required_diff_reason: Some("target_hardware.skipped_not_proven"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "resource-pressure-red",
+                input: scenario_resource_pressure(OperatingEnvelopeCapacityPressureTier::Red),
+                command: static_harness_command("ft robot swarm-capacity status --level 2", 0),
+                expected_outcome: OperatingEnvelopeOutcome::Shed,
+                required_diff_reason: Some("capacity.red"),
+            },
+            RetainedHarnessScenario {
+                scenario_id: "resource-pressure-black",
+                input: scenario_resource_pressure(OperatingEnvelopeCapacityPressureTier::Black),
+                command: static_harness_command("ft robot swarm-capacity status --level 2", 0),
+                expected_outcome: OperatingEnvelopeOutcome::Shed,
+                required_diff_reason: Some("capacity.black"),
+            },
+        ]
+    }
+
+    fn assert_sha256(label: &str, value: &str) {
+        assert!(
+            value.starts_with("sha256:") && value.len() == 71,
+            "{label} must be a prefixed SHA-256 digest, got {value}"
+        );
+    }
+
+    #[test]
+    fn retained_harness_artifacts_cover_required_no_mock_scenarios() {
+        let baseline_plan = plan_operating_envelope(retained_input(
+            "baseline-clean-ready-healthy-rch",
+            adapter_domains(),
+        ));
+        let baseline_reason_codes = baseline_plan.reason_codes.clone();
+        let scenarios = retained_harness_scenarios();
+        assert_eq!(scenarios.len(), 10);
+
+        for scenario in scenarios {
+            let input_fixture_body = match serde_json::to_string(&scenario.input) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "serialize retained fixture input failed: {error}");
+                    String::new()
+                }
+            };
+            let plan = plan_operating_envelope(scenario.input);
+            assert_eq!(
+                plan.decision.outcome, scenario.expected_outcome,
+                "{}",
+                scenario.scenario_id
+            );
+            let output_body = match serde_json::to_string(&plan) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "serialize retained plan output failed: {error}");
+                    String::new()
+                }
+            };
+            let artifact = match build_operating_envelope_retained_run_artifact(
+                &plan,
+                scenario.scenario_id,
+                scenario.command,
+                &input_fixture_body,
+                &baseline_reason_codes,
+                "previous retained golden",
+                &output_body,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "build retained run artifact failed: {error}");
+                    continue;
+                }
+            };
+
+            assert_eq!(
+                artifact.contract_id,
+                OPERATING_ENVELOPE_RETAINED_RUN_ARTIFACT_CONTRACT_ID
+            );
+            assert!(artifact.dry_run);
+            assert!(artifact.read_only);
+            assert!(!artifact.external_provider_calls);
+            assert!(!artifact.command.command.is_empty());
+            assert_eq!(artifact.command.target_dir, "/tmp/ft-booek-5-cod5-target");
+            if artifact.command.remote_cargo_reached || artifact.command.cargo_test_reached {
+                assert!(
+                    artifact.command.worker_id.is_some(),
+                    "{} reached remote Cargo/test without a retained worker id",
+                    artifact.scenario_id
+                );
+            }
+            assert!(
+                artifact
+                    .scrub_rules
+                    .contains(&"raw_pane_content_forbidden".to_string())
+            );
+            assert!(
+                artifact
+                    .scrub_rules
+                    .contains(&"agent_mail_bodies_not_retained".to_string())
+            );
+            assert!(artifact.source_freshness.len() >= 5);
+            assert!(
+                artifact
+                    .source_freshness
+                    .iter()
+                    .any(|source| source.source_kind == OperatingEnvelopeSourceKind::Rch)
+            );
+            for fixture_hash in &artifact.input_fixture_hashes {
+                assert_sha256(&fixture_hash.fixture_id, &fixture_hash.sha256);
+            }
+            for output_hash in &artifact.output_hashes {
+                assert_sha256(&output_hash.output_id, &output_hash.sha256);
+            }
+            assert_sha256(
+                "old_output_sha256",
+                &artifact.golden_update.old_output_sha256,
+            );
+            assert_sha256(
+                "new_output_sha256",
+                &artifact.golden_update.new_output_sha256,
+            );
+            assert!(artifact.golden_update.bless_required);
+
+            if let Some(required_reason) = scenario.required_diff_reason {
+                assert!(
+                    artifact
+                        .reason_code_diff
+                        .added
+                        .contains(&required_reason.to_string()),
+                    "{} missing reason-code diff {required_reason}; diff={:?}",
+                    artifact.scenario_id,
+                    artifact.reason_code_diff
+                );
+            }
+
+            let jsonl = match operating_envelope_retained_run_jsonl_line(&artifact) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "serialize retained run JSONL failed: {error}");
+                    String::new()
+                }
+            };
+            assert!(
+                !jsonl.contains('\n'),
+                "{} JSONL record must be one line",
+                artifact.scenario_id
+            );
+            let decoded: OperatingEnvelopeRetainedRunArtifact = match serde_json::from_str(&jsonl) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert!(false, "decode retained run JSONL failed: {error}");
+                    continue;
+                }
+            };
+            assert_eq!(decoded, artifact);
+        }
     }
 
     #[test]
@@ -3813,11 +4401,17 @@ mod tests {
         let plan = plan_operating_envelope(input);
         assert_eq!(plan.decision.outcome, OperatingEnvelopeOutcome::Degrade);
 
-        let docs_window = plan
+        let docs_window = match plan
             .admission_windows
             .iter()
             .find(|w| w.window_id == "docs_only")
-            .expect("degraded plan must expose a docs_only window");
+        {
+            Some(window) => window,
+            None => {
+                assert!(false, "degraded plan must expose a docs_only window");
+                return;
+            }
+        };
         assert_eq!(
             docs_window.max_parallel_agents,
             OperatingEnvelopeBudgets::conservative().docs_static_checks,
