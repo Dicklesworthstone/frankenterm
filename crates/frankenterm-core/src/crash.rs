@@ -2468,6 +2468,153 @@ fn write_incident_json_source(
     })
 }
 
+#[derive(Debug)]
+struct StoredIncidentPaneRow {
+    pane_id: i64,
+    pane_uuid: Option<String>,
+    domain: String,
+    window_id: Option<i64>,
+    tab_id: Option<i64>,
+    title: Option<String>,
+    cwd: Option<String>,
+    first_seen_at: i64,
+    last_seen_at: i64,
+    observed: i64,
+    ignore_reason: Option<String>,
+}
+
+fn incident_db_panes_source_surface(db_path: &Path) -> String {
+    format!("rusqlite read-only panes table {}", db_path.display())
+}
+
+fn nonnegative_i64_to_u64(value: i64, column: &str) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("{column} contained negative value {value}"))
+}
+
+fn non_empty_string(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    })
+}
+
+fn stored_incident_pane_to_robot_state(
+    row: StoredIncidentPaneRow,
+) -> Result<IncidentRobotPaneState, String> {
+    let pane_id = nonnegative_i64_to_u64(row.pane_id, "panes.pane_id")?;
+    let window_id = row
+        .window_id
+        .map(|value| nonnegative_i64_to_u64(value, "panes.window_id"))
+        .transpose()?
+        .unwrap_or(0);
+    let tab_id = row
+        .tab_id
+        .map(|value| nonnegative_i64_to_u64(value, "panes.tab_id"))
+        .transpose()?
+        .unwrap_or(0);
+    let first_seen_at = nonnegative_i64_to_u64(row.first_seen_at, "panes.first_seen_at")?;
+    let last_seen_at = nonnegative_i64_to_u64(row.last_seen_at, "panes.last_seen_at")?;
+    let observed = row.observed != 0;
+    let mut pane = IncidentRobotPaneState::new(pane_id, tab_id, window_id, row.domain, observed)
+        .with_timestamps(Some(first_seen_at), Some(last_seen_at));
+
+    pane.pane_uuid = non_empty_string(row.pane_uuid);
+    if let Some(title) = non_empty_string(row.title) {
+        pane = pane.with_title(title);
+    }
+    if let Some(cwd) = non_empty_string(row.cwd) {
+        pane = pane.with_cwd(cwd);
+    }
+    if let Some(ignore_reason) = non_empty_string(row.ignore_reason) {
+        pane = pane.with_ignore_reason(ignore_reason);
+    }
+
+    Ok(pane)
+}
+
+fn load_incident_robot_panes_from_db(
+    db_path: &Path,
+) -> Result<Vec<IncidentRobotPaneState>, String> {
+    if !db_path.exists() {
+        return Err(format!(
+            "incident DB path does not exist: {}",
+            db_path.display()
+        ));
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("failed to open incident DB read-only: {error}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT pane_id, pane_uuid, domain, window_id, tab_id, title, cwd,
+             first_seen_at, last_seen_at, observed, ignore_reason
+             FROM panes
+             ORDER BY last_seen_at DESC, pane_id ASC
+             LIMIT 500",
+        )
+        .map_err(|error| format!("failed to prepare panes query: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(StoredIncidentPaneRow {
+                pane_id: row.get(0)?,
+                pane_uuid: row.get(1)?,
+                domain: row.get(2)?,
+                window_id: row.get(3)?,
+                tab_id: row.get(4)?,
+                title: row.get(5)?,
+                cwd: row.get(6)?,
+                first_seen_at: row.get(7)?,
+                last_seen_at: row.get(8)?,
+                observed: row.get(9)?,
+                ignore_reason: row.get(10)?,
+            })
+        })
+        .map_err(|error| format!("failed to query panes: {error}"))?;
+
+    let rows: Result<Vec<_>, _> = rows.collect();
+    rows.map_err(|error| format!("failed to decode pane row: {error}"))?
+        .into_iter()
+        .map(stored_incident_pane_to_robot_state)
+        .collect()
+}
+
+fn incident_robot_state_snapshot_from_db(
+    db_path: &Path,
+) -> Result<IncidentRobotStateSnapshot, String> {
+    Ok(IncidentRobotStateSnapshot::new(
+        epoch_millis(),
+        incident_db_panes_source_surface(db_path),
+        load_incident_robot_panes_from_db(db_path)?,
+    ))
+}
+
+fn incident_pane_text_summaries_snapshot_from_db(
+    db_path: &Path,
+) -> Result<IncidentPaneTextSummariesSnapshot, String> {
+    let reason = "incident DB fallback exports pane ids only because the default incident privacy policy forbids pane text collection";
+    let panes = load_incident_robot_panes_from_db(db_path)?
+        .into_iter()
+        .map(|pane| IncidentPaneTextSummary::excluded(pane.pane_id, 0, reason))
+        .collect();
+    Ok(IncidentPaneTextSummariesSnapshot::new(
+        epoch_millis(),
+        format!(
+            "{} + incident privacy policy pane_text_allowed=false",
+            incident_db_panes_source_surface(db_path)
+        ),
+        0,
+        0,
+        false,
+        panes,
+    )
+    .with_privacy_reason(reason))
+}
+
 // Swarm incident capture assembles each evidence source from shared bundle context.
 #[allow(clippy::too_many_arguments)]
 fn add_swarm_incident_sources(
@@ -2479,8 +2626,9 @@ fn add_swarm_incident_sources(
     files: &mut Vec<String>,
     total_size: &mut u64,
     redaction_entries: &mut Vec<FileRedactionEntry>,
+    db_path: Option<&Path>,
 ) -> std::io::Result<()> {
-    add_robot_state_source(
+    add_robot_state_source_with_db(
         sources,
         warnings,
         exported_at,
@@ -2489,8 +2637,9 @@ fn add_swarm_incident_sources(
         files,
         total_size,
         redaction_entries,
+        db_path,
     )?;
-    add_pane_text_summaries_source(
+    add_pane_text_summaries_source_with_db(
         sources,
         warnings,
         exported_at,
@@ -2499,6 +2648,7 @@ fn add_swarm_incident_sources(
         files,
         total_size,
         redaction_entries,
+        db_path,
     )?;
     add_tailer_capture_health_source(
         sources,
@@ -2564,6 +2714,7 @@ fn add_swarm_incident_sources(
 }
 
 // Robot state evidence needs bundle context, policy, and runtime metadata together.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn add_robot_state_source(
     sources: &mut Vec<IncidentSourceEntry>,
@@ -2575,61 +2726,37 @@ fn add_robot_state_source(
     total_size: &mut u64,
     redaction_entries: &mut Vec<FileRedactionEntry>,
 ) -> std::io::Result<()> {
+    add_robot_state_source_with_db(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+        None,
+    )
+}
+
+// Robot state evidence can fall back to the read-only persisted pane inventory.
+#[allow(clippy::too_many_arguments)]
+fn add_robot_state_source_with_db(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+    db_path: Option<&Path>,
+) -> std::io::Result<()> {
     let started = Instant::now();
-    if let Some(snapshot) = IncidentRobotStateSnapshot::get_global() {
-        let source_surface_raw = if snapshot.source_surface.trim().is_empty() {
-            "IncidentRobotStateSnapshot::get_global".to_string()
-        } else {
-            snapshot.source_surface.clone()
-        };
-        let source_surface = sanitize_manifest_source_text(
-            &source_surface_raw,
-            "sources/robot_state.json",
-            redactor,
-            redaction_entries,
-        );
-        let freshness_ms = epoch_millis().saturating_sub(snapshot.captured_at_ms);
-        let pane_count = snapshot.panes.len();
-        let observed_count = snapshot.panes.iter().filter(|pane| pane.observed).count();
-        let ignored_count = snapshot
-            .panes
-            .iter()
-            .filter(|pane| pane.state == "ignored")
-            .count();
-        let unobserved_count = pane_count.saturating_sub(observed_count + ignored_count);
-        let payload = serde_json::json!({
-            "captured_at_ms": snapshot.captured_at_ms,
-            "collected_at": exported_at,
-            "freshness_ms": freshness_ms,
-            "source_surface": source_surface.clone(),
-            "pane_count": pane_count,
-            "observed_count": observed_count,
-            "ignored_count": ignored_count,
-            "unobserved_count": unobserved_count,
-            "full_text_included": false,
-            "redaction_policy": "bundle_redactor",
-            "panes": &snapshot.panes,
-        });
-        let mut entry = write_incident_json_source(
-            IncidentJsonSourceMeta {
-                name: "robot_state",
-                file: "sources/robot_state.json",
-                source_surface: &source_surface,
-                evidence_state: IncidentEvidenceState::Measured,
-                max_age_ms: Some(30_000),
-                started,
-            },
-            &payload,
-            exported_at,
-            bundle_dir,
-            redactor,
-            files,
-            total_size,
-            redaction_entries,
-        )?;
-        entry.freshness_ms = Some(freshness_ms);
-        sources.push(entry);
-    } else {
+    let snapshot = IncidentRobotStateSnapshot::get_global()
+        .map(Ok)
+        .or_else(|| db_path.map(incident_robot_state_snapshot_from_db));
+    let Some(snapshot) = snapshot else {
         sources.push(degraded_source(
             "robot_state",
             IncidentSourceStatus::Unavailable,
@@ -2640,11 +2767,83 @@ fn add_robot_state_source(
             "no text-free robot-state snapshot has been published in this process".to_string(),
             warnings,
         ));
-    }
+        return Ok(());
+    };
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            sources.push(degraded_source(
+                "robot_state",
+                IncidentSourceStatus::Failed,
+                db_path
+                    .map(incident_db_panes_source_surface)
+                    .unwrap_or_else(|| "IncidentRobotStateSnapshot::get_global".to_string()),
+                Some(30_000),
+                elapsed_ms(started),
+                "robot_state.db_read_failed",
+                error,
+                warnings,
+            ));
+            return Ok(());
+        }
+    };
+    let source_surface_raw = if snapshot.source_surface.trim().is_empty() {
+        "IncidentRobotStateSnapshot::get_global".to_string()
+    } else {
+        snapshot.source_surface.clone()
+    };
+    let source_surface = sanitize_manifest_source_text(
+        &source_surface_raw,
+        "sources/robot_state.json",
+        redactor,
+        redaction_entries,
+    );
+    let freshness_ms = epoch_millis().saturating_sub(snapshot.captured_at_ms);
+    let pane_count = snapshot.panes.len();
+    let observed_count = snapshot.panes.iter().filter(|pane| pane.observed).count();
+    let ignored_count = snapshot
+        .panes
+        .iter()
+        .filter(|pane| pane.state == "ignored")
+        .count();
+    let unobserved_count = pane_count.saturating_sub(observed_count + ignored_count);
+    let payload = serde_json::json!({
+        "captured_at_ms": snapshot.captured_at_ms,
+        "collected_at": exported_at,
+        "freshness_ms": freshness_ms,
+        "source_surface": source_surface.clone(),
+        "pane_count": pane_count,
+        "observed_count": observed_count,
+        "ignored_count": ignored_count,
+        "unobserved_count": unobserved_count,
+        "full_text_included": false,
+        "redaction_policy": "bundle_redactor",
+        "panes": &snapshot.panes,
+    });
+    let mut entry = write_incident_json_source(
+        IncidentJsonSourceMeta {
+            name: "robot_state",
+            file: "sources/robot_state.json",
+            source_surface: &source_surface,
+            evidence_state: IncidentEvidenceState::Measured,
+            max_age_ms: Some(30_000),
+            started,
+        },
+        &payload,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+    )?;
+    entry.freshness_ms = Some(freshness_ms);
+    sources.push(entry);
     Ok(())
 }
 
 // Pane text summaries keep redaction, limits, and bundle metadata explicit.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn add_pane_text_summaries_source(
     sources: &mut Vec<IncidentSourceEntry>,
@@ -2656,8 +2855,61 @@ fn add_pane_text_summaries_source(
     total_size: &mut u64,
     redaction_entries: &mut Vec<FileRedactionEntry>,
 ) -> std::io::Result<()> {
+    add_pane_text_summaries_source_with_db(
+        sources,
+        warnings,
+        exported_at,
+        bundle_dir,
+        redactor,
+        files,
+        total_size,
+        redaction_entries,
+        None,
+    )
+}
+
+// Pane summary evidence can fall back to text-free DB pane ids under privacy policy.
+#[allow(clippy::too_many_arguments)]
+fn add_pane_text_summaries_source_with_db(
+    sources: &mut Vec<IncidentSourceEntry>,
+    warnings: &mut Vec<IncidentBundleWarning>,
+    exported_at: &str,
+    bundle_dir: &Path,
+    redactor: &Redactor,
+    files: &mut Vec<String>,
+    total_size: &mut u64,
+    redaction_entries: &mut Vec<FileRedactionEntry>,
+    db_path: Option<&Path>,
+) -> std::io::Result<()> {
     let started = Instant::now();
-    if let Some(snapshot) = IncidentPaneTextSummariesSnapshot::get_global() {
+    let snapshot = IncidentPaneTextSummariesSnapshot::get_global()
+        .map(Ok)
+        .or_else(|| db_path.map(incident_pane_text_summaries_snapshot_from_db));
+    if let Some(snapshot) = snapshot {
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                sources.push(degraded_source(
+                    "pane_text_summaries",
+                    IncidentSourceStatus::Failed,
+                    db_path.map_or_else(
+                        || "incident privacy policy pane_text_allowed=false".to_string(),
+                        |path| {
+                            format!(
+                                "{} + incident privacy policy pane_text_allowed=false",
+                                incident_db_panes_source_surface(path)
+                            )
+                        },
+                    ),
+                    Some(30_000),
+                    elapsed_ms(started),
+                    "pane_text_summaries.db_read_failed",
+                    error,
+                    warnings,
+                ));
+                return Ok(());
+            }
+        };
         let source_surface_raw = if snapshot.source_surface.trim().is_empty() {
             "IncidentPaneTextSummariesSnapshot::get_global".to_string()
         } else {
@@ -3850,6 +4102,7 @@ fn collect_incident_bundle_inner(
         &mut files,
         &mut total_size,
         &mut redaction_entries,
+        opts.db_path,
     )?;
 
     // 1. Include latest crash bundle contents (if crash kind)
@@ -6330,6 +6583,43 @@ mod tests {
         IncidentAgentMailSnapshot::clear_global_for_test();
     }
 
+    fn seed_incident_panes_db() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("incident.sqlite3");
+        let conn = rusqlite::Connection::open(&db_path).expect("open incident db");
+        conn.execute_batch(
+            "CREATE TABLE panes (
+                pane_id INTEGER PRIMARY KEY,
+                pane_uuid TEXT,
+                domain TEXT NOT NULL,
+                window_id INTEGER,
+                tab_id INTEGER,
+                title TEXT,
+                cwd TEXT,
+                tty_name TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                observed INTEGER NOT NULL,
+                ignore_reason TEXT,
+                last_decision_at INTEGER
+            );
+            INSERT INTO panes (
+                pane_id, pane_uuid, domain, window_id, tab_id, title, cwd,
+                tty_name, first_seen_at, last_seen_at, observed, ignore_reason,
+                last_decision_at
+            ) VALUES
+                (7, 'pane-uuid-7', 'local', 1, 2, 'build pane',
+                 '/repo/frankenterm', '/dev/ttys007', 1700000000000, 1700000004000,
+                 1, NULL, 1700000004000),
+                (8, NULL, 'local', 1, 3, 'ignored pane',
+                 '/tmp', '/dev/ttys008', 1700000001000, 1700000003000,
+                 0, 'title excluded by pane filter', 1700000003000);",
+        )
+        .expect("seed panes table");
+        drop(conn);
+        (tmp, db_path)
+    }
+
     fn test_snapshot() -> HealthSnapshot {
         HealthSnapshot {
             timestamp: 1_234_567_890,
@@ -6576,6 +6866,72 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].id, "robot_state.snapshot_unavailable");
         assert!(!tmp.path().join("sources/robot_state.json").exists());
+    }
+
+    #[test]
+    fn incident_robot_state_db_fallback_collects_panes_without_provider() {
+        let _guard = INCIDENT_ROBOT_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        IncidentRobotStateSnapshot::clear_global_for_test();
+
+        let (_db_tmp, db_path) = seed_incident_panes_db();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_robot_state_source_with_db(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+            Some(&db_path),
+        )
+        .expect("robot_state source");
+
+        assert!(warnings.is_empty());
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "robot_state");
+        assert_eq!(source.status, IncidentSourceStatus::Collected);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Measured);
+        assert!(
+            source
+                .source_surface
+                .contains("rusqlite read-only panes table")
+        );
+        assert_eq!(source.file.as_deref(), Some("sources/robot_state.json"));
+        assert!(!source.mutates_state);
+
+        let payload_path = tmp.path().join("sources/robot_state.json");
+        let payload: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(payload_path).expect("payload file"))
+                .expect("payload json");
+        assert_eq!(payload["full_text_included"], false);
+        assert!(payload.get("pane_text").is_none());
+        assert_eq!(payload["pane_count"], 2);
+        assert_eq!(payload["observed_count"], 1);
+        assert_eq!(payload["ignored_count"], 1);
+
+        let panes = payload["panes"].as_array().expect("panes array");
+        assert_eq!(panes[0]["pane_id"], 7);
+        assert_eq!(panes[0]["pane_uuid"], "pane-uuid-7");
+        assert_eq!(panes[0]["title"], "build pane");
+        assert_eq!(panes[0]["cwd"], "/repo/frankenterm");
+        assert_eq!(panes[0]["state"], "observed");
+        assert_eq!(panes[0]["observed_at_ms"], 1_700_000_000_000_u64);
+        assert_eq!(panes[0]["last_activity_at_ms"], 1_700_000_004_000_u64);
+        assert_eq!(panes[1]["pane_id"], 8);
+        assert_eq!(panes[1]["state"], "ignored");
+        assert_eq!(panes[1]["ignore_reason"], "title excluded by pane filter");
     }
 
     #[test]
@@ -7007,6 +7363,69 @@ mod tests {
         assert_eq!(payload["panes"][0]["summary"], "[PANE_TEXT_EXCLUDED]");
         assert_eq!(payload["panes"][0]["code"], "pane_text.privacy_disabled");
         assert_eq!(payload["panes"][0]["message"], reason);
+    }
+
+    #[test]
+    fn incident_pane_text_summaries_db_fallback_writes_privacy_placeholders() {
+        let _guard = INCIDENT_PANE_TEXT_SUMMARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        IncidentPaneTextSummariesSnapshot::clear_global_for_test();
+
+        let (_db_tmp, db_path) = seed_incident_panes_db();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let redactor = Redactor::new();
+        let mut sources = Vec::new();
+        let mut warnings = Vec::new();
+        let mut files = Vec::new();
+        let mut total_size = 0;
+        let mut redaction_entries = Vec::new();
+
+        add_pane_text_summaries_source_with_db(
+            &mut sources,
+            &mut warnings,
+            "2026-05-16T00:00:00Z",
+            tmp.path(),
+            &redactor,
+            &mut files,
+            &mut total_size,
+            &mut redaction_entries,
+            Some(&db_path),
+        )
+        .expect("pane_text_summaries source");
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, "pane_text_summaries.privacy_disabled");
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.name, "pane_text_summaries");
+        assert_eq!(source.status, IncidentSourceStatus::Skipped);
+        assert_eq!(source.evidence_state, IncidentEvidenceState::Unavailable);
+        assert!(
+            source
+                .source_surface
+                .contains("rusqlite read-only panes table")
+        );
+        assert_eq!(
+            source.file.as_deref(),
+            Some("sources/pane_text_summaries.json")
+        );
+        assert!(!source.mutates_state);
+
+        let payload_path = tmp.path().join("sources/pane_text_summaries.json");
+        let payload_text = fs::read_to_string(payload_path).expect("payload file");
+        assert!(!payload_text.contains("build pane"));
+        assert!(!payload_text.contains("/repo/frankenterm"));
+        let payload: serde_json::Value = serde_json::from_str(&payload_text).expect("payload json");
+        assert_eq!(payload["privacy_allowed"], false);
+        assert_eq!(payload["summary_count"], 2);
+        assert_eq!(payload["excluded_count"], 2);
+        assert_eq!(payload["redaction_count"], 0);
+        assert_eq!(payload["panes"][0]["pane_id"], 7);
+        assert_eq!(payload["panes"][0]["summary"], "[PANE_TEXT_EXCLUDED]");
+        assert_eq!(payload["panes"][0]["code"], "pane_text.privacy_disabled");
+        assert_eq!(payload["panes"][1]["pane_id"], 8);
+        assert_eq!(payload["panes"][1]["summary"], "[PANE_TEXT_EXCLUDED]");
     }
 
     #[test]
