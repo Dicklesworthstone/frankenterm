@@ -40,6 +40,13 @@ use crate::connector_reliability::{
 use crate::context_budget::{
     CompactionTrigger, ContextBudgetConfig, ContextBudgetRegistry, ContextPressureTier,
 };
+use crate::large_swarm_replay::{
+    LargeSwarmReplayError, LargeSwarmReplaySummary, LargeSwarmScenario,
+    generate_large_swarm_corpus, summarize_large_swarm_replay,
+};
+
+/// Schema version for replay-corpus load-rig reports.
+pub const REPLAY_CORPUS_LOAD_RIG_SCHEMA_VERSION: &str = "ft.replay_corpus_load_rig.v1";
 
 // =============================================================================
 // Scale profile
@@ -188,6 +195,88 @@ pub struct PaneScaleProbeResult {
     pub total_compactions: u64,
 }
 
+/// Capture mode exercised by the replay-corpus load rig.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    /// Periodic mux polling path.
+    Poll,
+    /// Native event bridge push path.
+    NativePush,
+}
+
+/// Configuration for a replay-corpus-backed load-rig run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayCorpusLoadRigConfig {
+    /// Built-in replay-corpus scale point to exercise.
+    pub pane_count: u64,
+    /// Poll interval used when simulating poll-mode capture.
+    pub poll_interval_ms: u64,
+    /// Native push-event bridge deduplication window.
+    pub native_push_dedup_window_ms: u64,
+    /// Per-pane queue-depth ceiling for the rig verdict.
+    pub queue_depth_limit_events_per_pane: u64,
+    /// Whole-run memory ceiling for the rig verdict.
+    pub memory_limit_bytes: u64,
+    /// Capture-lag p99 ceiling for each mode.
+    pub max_capture_lag_ms: f64,
+}
+
+impl ReplayCorpusLoadRigConfig {
+    /// Default 200-pane replay-corpus target for ft-7h5da.10.3.
+    #[must_use]
+    pub const fn target_200_pane() -> Self {
+        Self {
+            pane_count: 200,
+            poll_interval_ms: 300,
+            native_push_dedup_window_ms: 16,
+            queue_depth_limit_events_per_pane: 32,
+            memory_limit_bytes: 256 * 1024 * 1024,
+            max_capture_lag_ms: 750.0,
+        }
+    }
+}
+
+/// Per-capture-mode metrics emitted by the replay-corpus load rig.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayCorpusCaptureModeResult {
+    pub mode: CaptureMode,
+    pub pane_count: u64,
+    pub replay_events: u64,
+    pub replay_frames: u64,
+    pub output_bytes: u64,
+    pub capture_lag_p50_ms: f64,
+    pub capture_lag_p95_ms: f64,
+    pub capture_lag_p99_ms: f64,
+    pub max_queue_depth_events_per_pane: u64,
+    pub memory_bytes: u64,
+    pub duplicate_events_suppressed: u64,
+    pub dropped_events: u64,
+    pub capture_gap_count: u64,
+    pub threshold_passed: bool,
+}
+
+/// Full report from a replay-corpus-backed 200-pane load-rig run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayCorpusLoadRigReport {
+    pub schema_version: String,
+    pub profile_label: String,
+    pub scenario_id: String,
+    pub pane_count: u64,
+    pub replay_summary: LargeSwarmReplaySummary,
+    pub capture_modes: Vec<ReplayCorpusCaptureModeResult>,
+    pub overall_pass: bool,
+    pub limitations: Vec<String>,
+}
+
+impl ReplayCorpusLoadRigReport {
+    /// Fetch one mode's result.
+    #[must_use]
+    pub fn mode_result(&self, mode: CaptureMode) -> Option<&ReplayCorpusCaptureModeResult> {
+        self.capture_modes.iter().find(|result| result.mode == mode)
+    }
+}
+
 /// Result of a connector stress probe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorStressResult {
@@ -308,6 +397,40 @@ impl ChaosScaleHarness {
     /// Override the governor config.
     pub fn set_governor_config(&mut self, config: CapacityGovernorConfig) {
         self.governor = CapacityGovernor::new(config);
+    }
+
+    /// Run the replay-corpus load rig for a built-in scale point.
+    pub fn run_replay_corpus_load_rig(
+        config: ReplayCorpusLoadRigConfig,
+    ) -> Result<ReplayCorpusLoadRigReport, LargeSwarmReplayError> {
+        let scenario = LargeSwarmScenario::scale_point(config.pane_count).ok_or_else(|| {
+            LargeSwarmReplayError::InvalidScenario(format!(
+                "unsupported replay-corpus pane_count {}",
+                config.pane_count
+            ))
+        })?;
+        let corpus = generate_large_swarm_corpus(&scenario)?;
+        let summary = summarize_large_swarm_replay(&corpus)?;
+        let capture_modes = vec![
+            simulate_replay_capture_mode(CaptureMode::Poll, &summary, &config),
+            simulate_replay_capture_mode(CaptureMode::NativePush, &summary, &config),
+        ];
+        let overall_pass = capture_modes.iter().all(|mode| mode.threshold_passed);
+
+        Ok(ReplayCorpusLoadRigReport {
+            schema_version: REPLAY_CORPUS_LOAD_RIG_SCHEMA_VERSION.to_string(),
+            profile_label: format!("{}-pane-replay-corpus-load-rig", config.pane_count),
+            scenario_id: scenario.scenario_id,
+            pane_count: config.pane_count,
+            replay_summary: summary,
+            capture_modes,
+            overall_pass,
+            limitations: vec![
+                "deterministic replay corpus; no live mux panes are launched".to_string(),
+                "native_push mode models the bridge contract and dedup window; it is not live OS event proof".to_string(),
+                "poll and native_push modes share identical replay input so lag and queue metrics are comparable".to_string(),
+            ],
+        })
     }
 
     /// Run the full validation harness and produce a report.
@@ -693,6 +816,77 @@ fn default_slos() -> Vec<SloDefinition> {
             higher_is_better: false,
         },
     ]
+}
+
+fn simulate_replay_capture_mode(
+    mode: CaptureMode,
+    summary: &LargeSwarmReplaySummary,
+    config: &ReplayCorpusLoadRigConfig,
+) -> ReplayCorpusCaptureModeResult {
+    let max_events_per_pane = summary.max_events_per_pane.max(1);
+    let (p50, p95, p99, queue_depth, duplicates, memory_overhead_per_pane) = match mode {
+        CaptureMode::Poll => {
+            let interval = config.poll_interval_ms as f64;
+            (
+                interval / 2.0,
+                interval,
+                interval * 2.0,
+                max_events_per_pane.saturating_add(summary.output_bursts_per_pane_hint()),
+                0,
+                32 * 1024,
+            )
+        }
+        CaptureMode::NativePush => {
+            let window = config.native_push_dedup_window_ms.max(1);
+            (
+                4.0,
+                window as f64,
+                window.saturating_mul(2) as f64,
+                max_events_per_pane.div_ceil(4).max(1),
+                summary.event_count / 20,
+                16 * 1024,
+            )
+        }
+    };
+    let memory_bytes = summary
+        .output_bytes
+        .saturating_add(summary.pane_count.saturating_mul(memory_overhead_per_pane));
+    let threshold_passed = p99 <= config.max_capture_lag_ms
+        && queue_depth <= config.queue_depth_limit_events_per_pane
+        && memory_bytes <= config.memory_limit_bytes;
+
+    ReplayCorpusCaptureModeResult {
+        mode,
+        pane_count: summary.pane_count,
+        replay_events: summary.event_count,
+        replay_frames: summary.replay_frames,
+        output_bytes: summary.output_bytes,
+        capture_lag_p50_ms: p50,
+        capture_lag_p95_ms: p95,
+        capture_lag_p99_ms: p99,
+        max_queue_depth_events_per_pane: queue_depth,
+        memory_bytes,
+        duplicate_events_suppressed: duplicates,
+        dropped_events: 0,
+        capture_gap_count: 0,
+        threshold_passed,
+    }
+}
+
+trait ReplaySummaryHints {
+    fn output_bursts_per_pane_hint(&self) -> u64;
+}
+
+impl ReplaySummaryHints for LargeSwarmReplaySummary {
+    fn output_bursts_per_pane_hint(&self) -> u64 {
+        self.replay_frames
+            .saturating_sub(self.compaction_waves)
+            .saturating_sub(self.search_queries)
+            .saturating_sub(self.mission_actions)
+            .checked_div(self.pane_count.max(1))
+            .unwrap_or(0)
+            .max(1)
+    }
 }
 
 // =============================================================================
@@ -1186,5 +1380,72 @@ mod tests {
         let report = harness.run();
         // Every 7th pane gets compacted.
         assert!(report.pane_probe.total_compactions > 0);
+    }
+
+    #[test]
+    fn replay_corpus_load_rig_exercises_200_panes_in_both_capture_modes() {
+        let report = ChaosScaleHarness::run_replay_corpus_load_rig(
+            ReplayCorpusLoadRigConfig::target_200_pane(),
+        )
+        .expect("200-pane replay-corpus rig should run");
+
+        assert_eq!(report.schema_version, REPLAY_CORPUS_LOAD_RIG_SCHEMA_VERSION);
+        assert_eq!(report.pane_count, 200);
+        assert_eq!(report.replay_summary.pane_count, 200);
+        assert!(report.replay_summary.event_count > 0);
+        assert_eq!(report.capture_modes.len(), 2);
+        assert!(report.mode_result(CaptureMode::Poll).is_some());
+        assert!(report.mode_result(CaptureMode::NativePush).is_some());
+        assert!(report.overall_pass);
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|line| line.contains("replay"))
+        );
+    }
+
+    #[test]
+    fn native_push_load_rig_records_lower_lag_and_queue_depth_than_poll() {
+        let report = ChaosScaleHarness::run_replay_corpus_load_rig(
+            ReplayCorpusLoadRigConfig::target_200_pane(),
+        )
+        .expect("200-pane replay-corpus rig should run");
+        let poll = report
+            .mode_result(CaptureMode::Poll)
+            .expect("poll mode is recorded");
+        let native_push = report
+            .mode_result(CaptureMode::NativePush)
+            .expect("native push mode is recorded");
+
+        assert!(native_push.capture_lag_p95_ms < poll.capture_lag_p95_ms);
+        assert!(native_push.capture_lag_p99_ms < poll.capture_lag_p99_ms);
+        assert!(native_push.max_queue_depth_events_per_pane < poll.max_queue_depth_events_per_pane);
+        assert!(native_push.duplicate_events_suppressed > 0);
+        assert_eq!(native_push.replay_events, poll.replay_events);
+        assert_eq!(native_push.output_bytes, poll.output_bytes);
+    }
+
+    #[test]
+    fn replay_corpus_load_rig_fails_closed_when_memory_limit_is_too_low() {
+        let mut config = ReplayCorpusLoadRigConfig::target_200_pane();
+        config.memory_limit_bytes = 1;
+
+        let report = ChaosScaleHarness::run_replay_corpus_load_rig(config)
+            .expect("memory-limit failure still emits a report");
+
+        assert!(!report.overall_pass);
+        assert!(
+            report
+                .capture_modes
+                .iter()
+                .all(|mode| !mode.threshold_passed)
+        );
+        assert!(
+            report
+                .capture_modes
+                .iter()
+                .all(|mode| mode.memory_bytes > 1)
+        );
     }
 }
