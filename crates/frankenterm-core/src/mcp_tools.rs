@@ -1061,6 +1061,49 @@ async fn persist_mcp_policy_denial_async(
     }
 }
 
+/// ft-p8git: audit a denied MCP action with degraded-mode fidelity.
+///
+/// ALWAYS emits the primary `tracing::warn!` denial signal — including when
+/// `storage` is `None` (degraded mode: `db_path` unset, no `StorageHandle`) —
+/// then best-effort persists the `policy_denied_audit` row when storage is
+/// available. The Option-storage deny sites previously persisted only inside
+/// `if let Some(storage)`, with no tracing of their own, so a denial in
+/// degraded mode produced NO record at all: no audit row AND no log line. The
+/// log line is the floor of audit fidelity that survives a missing database.
+async fn audit_mcp_policy_denial_async(
+    storage: Option<&StorageHandle>,
+    tool_name: &str,
+    command_text: &str,
+    reason: &str,
+    rule_id: Option<&str>,
+    decision: &str,
+    reason_code: &str,
+) {
+    tracing::warn!(
+        target: "ft::security::policy",
+        tool = %tool_name,
+        command = %command_text,
+        decision = %decision,
+        rule_id = ?rule_id,
+        reason = %reason,
+        reason_code = %reason_code,
+        storage_attached = storage.is_some(),
+        "MCP action denied by policy"
+    );
+    if let Some(storage) = storage {
+        persist_mcp_policy_denial_async(
+            storage,
+            tool_name,
+            command_text,
+            reason,
+            rule_id,
+            decision,
+            reason_code,
+        )
+        .await;
+    }
+}
+
 /// Short 16-hex-char correlation fingerprint of the command_text so
 /// operators can group repeated identical denies without persisting the
 /// raw args. DefaultHasher is used deliberately — this is a
@@ -2571,18 +2614,16 @@ impl ToolHandler for WaGetTextTool {
                         .unwrap_or("Read denied by policy")
                         .to_string();
                     // ft-mw1zb: persist to policy_denied_audit alongside tracing.
-                    if let Some(storage_ref) = storage.as_ref() {
-                        persist_mcp_policy_denial_async(
-                            storage_ref,
-                            "wa.get_text",
-                            &summary,
-                            &reason,
-                            decision.rule_id(),
-                            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
-                            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
-                        )
-                        .await;
-                    }
+                    audit_mcp_policy_denial_async(
+                        storage.as_ref(),
+                        "wa.get_text",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
                     return Err(McpToolError::new(
                         MCP_ERR_POLICY,
                         reason,
@@ -2826,18 +2867,16 @@ impl ToolHandler for WaDomTool {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Read denied by policy")
                         .to_string();
-                    if let Some(storage_ref) = storage.as_ref() {
-                        persist_mcp_policy_denial_async(
-                            storage_ref,
-                            "wa.dom",
-                            &summary,
-                            &reason,
-                            decision.rule_id(),
-                            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
-                            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
-                        )
-                        .await;
-                    }
+                    audit_mcp_policy_denial_async(
+                        storage.as_ref(),
+                        "wa.dom",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
                     return Err(McpToolError::new(
                         MCP_ERR_POLICY,
                         reason,
@@ -3146,18 +3185,16 @@ impl ToolHandler for WaWaitForTool {
                 let reason = policy_reason(&decision)
                     .unwrap_or("Read denied by policy")
                     .to_string();
-                if let Some(storage_ref) = storage.as_ref() {
-                    persist_mcp_policy_denial_async(
-                        storage_ref,
-                        "wa.wait_for",
-                        &summary,
-                        &reason,
-                        decision.rule_id(),
-                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
-                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
-                    )
-                    .await;
-                }
+                audit_mcp_policy_denial_async(
+                    storage.as_ref(),
+                    "wa.wait_for",
+                    &summary,
+                    &reason,
+                    decision.rule_id(),
+                    crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                    crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                )
+                .await;
                 return Err(McpToolError::new(
                     MCP_ERR_POLICY,
                     reason,
@@ -3346,6 +3383,7 @@ impl ToolHandler for WaSearchTool {
                 query: params.query,
                 limit: params.limit,
                 pane: params.pane,
+                zone: None,
                 since: params.since,
                 until: params.until,
                 snippets: params.snippets,
@@ -12063,6 +12101,73 @@ exit 17",
             // mcp_tools.rs:1807-1809 — verify it round-trips intact.
             assert_eq!(reason, "wait-for reads are blocked");
         });
+    }
+
+    /// ft-p8git: in degraded mode (storage = None / db_path unset) a denied
+    /// MCP action must still leave an audit trail via the primary tracing
+    /// signal — no policy_denied_audit row can be written without a DB, so the
+    /// log line is the floor of audit fidelity. Before the fix the
+    /// Option-storage deny sites persisted only inside `if let Some(storage)`
+    /// and emitted no tracing of their own, so the denial was completely
+    /// silent (no row AND no log).
+    #[test]
+    fn audit_mcp_policy_denial_emits_tracing_signal_in_degraded_mode() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for CaptureWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Clone)]
+        struct CaptureMaker(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for CaptureMaker {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(Arc::clone(&self.0))
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureMaker(Arc::clone(&buf)))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(audit_mcp_policy_denial_async(
+                None, // degraded mode: no StorageHandle / db_path
+                "wa.get_text",
+                "get-text pane_id=7",
+                "reads are blocked",
+                Some("policy.read_block"),
+                crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+            ));
+        });
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("MCP action denied by policy"),
+            "degraded-mode denial must emit the primary tracing signal; got: {captured:?}"
+        );
+        assert!(
+            captured.contains("wa.get_text"),
+            "tracing must name the denied tool; got: {captured:?}"
+        );
+        assert!(
+            captured.contains("storage_attached=false"),
+            "tracing must flag the degraded (no-storage) state; got: {captured:?}"
+        );
     }
 
     #[test]
