@@ -447,18 +447,18 @@ where
     let slot_estimate_mismatch = installed_selector_estimated_slots
         .is_some_and(|installed_slots| installed_slots != estimated_slots);
     let classification = classify_cargo_command(cargo_subcommand.as_deref());
-    let explanation = cargo_analysis_explanation(
+    let explanation = cargo_analysis_explanation(CargoAnalysisExplanationInput {
         explicit_jobs,
         effective_jobs,
         job_source,
         estimated_slots,
         installed_selector_estimated_slots,
         slot_estimate_mismatch,
-        &package_scope,
-        &test_scope,
-        target_dir.as_deref(),
-        target_triple.as_deref(),
-    );
+        package_scope: &package_scope,
+        test_scope: &test_scope,
+        target_dir: target_dir.as_deref(),
+        target_triple: target_triple.as_deref(),
+    });
 
     RchAdmissionCargoCommandAnalysis {
         raw: nonempty_string(raw, "unknown"),
@@ -1290,20 +1290,33 @@ fn classify_cargo_command(cargo_subcommand: Option<&str>) -> String {
     .to_string()
 }
 
-// Cargo admission explanations mirror the analyzed scheduler inputs.
-#[allow(clippy::too_many_arguments)]
-fn cargo_analysis_explanation(
+struct CargoAnalysisExplanationInput<'a> {
     explicit_jobs: Option<u32>,
     effective_jobs: u32,
     job_source: RchAdmissionCargoJobSource,
     estimated_slots: u32,
     installed_selector_estimated_slots: Option<u32>,
     slot_estimate_mismatch: bool,
-    package_scope: &[String],
-    test_scope: &[String],
-    target_dir: Option<&str>,
-    target_triple: Option<&str>,
-) -> String {
+    package_scope: &'a [String],
+    test_scope: &'a [String],
+    target_dir: Option<&'a str>,
+    target_triple: Option<&'a str>,
+}
+
+fn cargo_analysis_explanation(input: CargoAnalysisExplanationInput<'_>) -> String {
+    let CargoAnalysisExplanationInput {
+        explicit_jobs,
+        effective_jobs,
+        job_source,
+        estimated_slots,
+        installed_selector_estimated_slots,
+        slot_estimate_mismatch,
+        package_scope,
+        test_scope,
+        target_dir,
+        target_triple,
+    } = input;
+
     let job_phrase = if let Some(explicit_jobs) = explicit_jobs {
         format!(
             "explicit cargo job count {explicit_jobs} from {}",
