@@ -21091,14 +21091,16 @@ enum AwaitCondition {
     /// An event whose rule-id matches the glob has appeared since the await
     /// started (or since `--cursor`).
     Rule(String),
+    /// Storage-derived pane quiescence: no captured output for at least the
+    /// requested idle threshold.
+    Quiescence { pane_id: u64, idle_ms: Option<u64> },
 }
 
 /// Parse one `ft robot await` condition. Supported in DB-cursor mode:
-/// `rule:<glob>` (the rule-id glob from watch-events). The `state:<pane>:<s>`
-/// and `quiescence:<pane>` sources require the watcher's live in-process state
-/// (AgentPaneState needs input-sent tracking; quiescence gauges are in-process
-/// AtomicU64s) — they ride the .4.1 IPC-subscribe transport and are rejected
-/// here with a clear, scoped message rather than silently mis-evaluated.
+/// `rule:<glob>` (the rule-id glob from watch-events) and
+/// `quiescence:<pane>[:<idle_ms>]` (latest output timestamp from storage).
+/// The `state:<pane>:<s>` source still requires the watcher's live in-process
+/// state because AgentPaneState depends on input-sent tracking.
 fn parse_await_condition(spec: &str) -> Result<AwaitCondition, String> {
     let spec = spec.trim();
     if let Some(glob) = spec.strip_prefix("rule:") {
@@ -21106,17 +21108,24 @@ fn parse_await_condition(spec: &str) -> Result<AwaitCondition, String> {
             return Err(format!("empty rule glob in condition `{spec}`"));
         }
         Ok(AwaitCondition::Rule(glob.to_string()))
-    } else if spec.starts_with("state:") || spec.starts_with("quiescence:") {
-        Err(format!(
-            "condition `{spec}`: state:/quiescence: sources need the watcher's \
-             live in-process state over the IPC transport (ft-7h5da.4.3 \
-             follow-on, blocked on the .4.1 IPC-subscribe path); only \
-             rule:<glob> is supported in DB-cursor mode"
-        ))
+    } else if let Some(condition) =
+        frankenterm_core::agent_pane_state::AwaitPaneCondition::parse(spec)?
+    {
+        match condition {
+            frankenterm_core::agent_pane_state::AwaitPaneCondition::State { .. } => Err(format!(
+                "condition `{spec}`: state: sources need the watcher's live \
+                 in-process state over the IPC transport; rule:<glob> and \
+                 quiescence:<pane>[:<idle_ms>] are supported in DB-cursor mode"
+            )),
+            frankenterm_core::agent_pane_state::AwaitPaneCondition::Quiescence {
+                pane_id,
+                idle_ms,
+            } => Ok(AwaitCondition::Quiescence { pane_id, idle_ms }),
+        }
     } else {
         Err(format!(
             "unrecognized condition `{spec}`; expected `rule:<glob>` \
-             (state:/quiescence: require the watcher IPC transport)"
+             or `quiescence:<pane>[:<idle_ms>]`"
         ))
     }
 }
@@ -21128,7 +21137,55 @@ fn await_condition_matches(
 ) -> bool {
     match cond {
         AwaitCondition::Rule(glob) => watch_rule_glob_matches(glob, &event.rule_id),
+        AwaitCondition::Quiescence { .. } => false,
     }
+}
+
+/// Whether a storage-derived pane snapshot satisfies a quiescence condition.
+fn await_condition_matches_quiescence(
+    cond: &AwaitCondition,
+    last_output_at: Option<i64>,
+    now_ms: u64,
+    config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
+) -> Option<bool> {
+    match cond {
+        AwaitCondition::Rule(_) => None,
+        AwaitCondition::Quiescence { idle_ms, .. } => {
+            let last_output_ms = last_output_at.map(|ts| u64::try_from(ts).unwrap_or(0));
+            let threshold = idle_ms.unwrap_or(config.idle_silence_ms);
+            Some(
+                frankenterm_core::agent_pane_state::pane_is_quiescent_from_last_output(
+                    last_output_ms,
+                    now_ms,
+                    threshold,
+                ),
+            )
+        }
+    }
+}
+
+async fn update_await_quiescence_conditions(
+    storage: &frankenterm_core::storage::StorageHandle,
+    config: &frankenterm_core::agent_pane_state::AgentDetectionConfig,
+    conditions: &[AwaitCondition],
+    met: &mut [bool],
+) -> frankenterm_core::Result<()> {
+    let now = now_ms();
+    for (condition, is_met) in conditions.iter().zip(met.iter_mut()) {
+        if *is_met {
+            continue;
+        }
+        let AwaitCondition::Quiescence { pane_id, .. } = condition else {
+            continue;
+        };
+        let last_output_at = storage.pane_last_output_at(*pane_id).await?;
+        if await_condition_matches_quiescence(condition, last_output_at, now, config)
+            .unwrap_or(false)
+        {
+            *is_met = true;
+        }
+    }
+    Ok(())
 }
 
 /// Composite satisfaction for `ft robot await`: every `--all` condition is met
@@ -21479,9 +21536,23 @@ mod watch_events_tests {
             parse_await_condition("  rule:build.done  "),
             Ok(AwaitCondition::Rule("build.done".to_string()))
         );
+        assert_eq!(
+            parse_await_condition("quiescence:7"),
+            Ok(AwaitCondition::Quiescence {
+                pane_id: 7,
+                idle_ms: None
+            })
+        );
+        assert_eq!(
+            parse_await_condition("quiescence:7:250"),
+            Ok(AwaitCondition::Quiescence {
+                pane_id: 7,
+                idle_ms: Some(250)
+            })
+        );
         assert!(parse_await_condition("rule:").is_err());
         assert!(parse_await_condition("state:7:stuck").is_err());
-        assert!(parse_await_condition("quiescence:7").is_err());
+        assert!(parse_await_condition("quiescence:bogus").is_err());
         assert!(parse_await_condition("bogus").is_err());
     }
 
@@ -21510,6 +21581,37 @@ mod watch_events_tests {
             &AwaitCondition::Rule("claude.*".to_string()),
             &e
         ));
+    }
+
+    #[test]
+    fn await_condition_matches_storage_quiescence() {
+        let config = frankenterm_core::agent_pane_state::AgentDetectionConfig::default();
+        let cond = AwaitCondition::Quiescence {
+            pane_id: 7,
+            idle_ms: Some(500),
+        };
+
+        assert_eq!(
+            await_condition_matches_quiescence(&cond, Some(1_000), 1_500, &config),
+            Some(true)
+        );
+        assert_eq!(
+            await_condition_matches_quiescence(&cond, Some(1_001), 1_500, &config),
+            Some(false)
+        );
+        assert_eq!(
+            await_condition_matches_quiescence(&cond, None, 1_500, &config),
+            Some(true)
+        );
+        assert_eq!(
+            await_condition_matches_quiescence(
+                &AwaitCondition::Rule("codex.*".to_string()),
+                None,
+                1_500,
+                &config,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -33848,6 +33950,44 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             all_met[i] = true;
                                         }
                                     }
+                                }
+                                if let Err(e) = update_await_quiescence_conditions(
+                                    &storage,
+                                    &config.agent_detection,
+                                    &any_conds,
+                                    &mut any_met,
+                                )
+                                .await
+                                {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query pane output timestamps: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    storage.shutdown().await.ok();
+                                    return Ok(());
+                                }
+                                if let Err(e) = update_await_quiescence_conditions(
+                                    &storage,
+                                    &config.agent_detection,
+                                    &all_conds,
+                                    &mut all_met,
+                                )
+                                .await
+                                {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to query pane output timestamps: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    storage.shutdown().await.ok();
+                                    return Ok(());
                                 }
                                 if await_is_satisfied(&any_met, &all_met) {
                                     break (true, false);
