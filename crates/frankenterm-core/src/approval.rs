@@ -2,6 +2,7 @@
 
 use rand::Rng;
 use rand::distr::Alphanumeric;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -51,6 +52,170 @@ pub struct ApprovalAuditContext {
     pub(crate) correlation_id: Option<String>,
     /// Decision context JSON to attach to the audit record
     pub(crate) decision_context: Option<String>,
+}
+
+/// Speaker identity for a pre-approval cross-examination transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreApprovalCrossExaminationSpeaker {
+    /// The human/operator asking for justification before approval.
+    Operator,
+    /// The paused agent answering while the approval gate remains closed.
+    Agent,
+}
+
+impl PreApprovalCrossExaminationSpeaker {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// One audited message in a pre-approval cross-examination exchange.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreApprovalCrossExaminationTurn {
+    speaker: PreApprovalCrossExaminationSpeaker,
+    message: String,
+    created_at_ms: i64,
+}
+
+impl PreApprovalCrossExaminationTurn {
+    #[must_use]
+    pub fn new(
+        speaker: PreApprovalCrossExaminationSpeaker,
+        message: impl Into<String>,
+        created_at_ms: i64,
+    ) -> Self {
+        Self {
+            speaker,
+            message: message.into(),
+            created_at_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn operator_question(message: impl Into<String>, created_at_ms: i64) -> Self {
+        Self::new(
+            PreApprovalCrossExaminationSpeaker::Operator,
+            message,
+            created_at_ms,
+        )
+    }
+
+    #[must_use]
+    pub fn agent_response(message: impl Into<String>, created_at_ms: i64) -> Self {
+        Self::new(
+            PreApprovalCrossExaminationSpeaker::Agent,
+            message,
+            created_at_ms,
+        )
+    }
+
+    #[must_use]
+    pub const fn speaker(&self) -> PreApprovalCrossExaminationSpeaker {
+        self.speaker
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[must_use]
+    pub const fn created_at_ms(&self) -> i64 {
+        self.created_at_ms
+    }
+}
+
+/// Transcript captured while an action is paused on RequireApproval.
+///
+/// Recording this transcript is audit-only. It never consumes or grants an
+/// allow-once token; the existing approval consume path remains the only gate
+/// that can authorize the underlying action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreApprovalCrossExamination {
+    transcript_id: String,
+    turns: Vec<PreApprovalCrossExaminationTurn>,
+}
+
+impl PreApprovalCrossExamination {
+    #[must_use]
+    pub fn new(transcript_id: impl Into<String>) -> Self {
+        Self {
+            transcript_id: transcript_id.into(),
+            turns: Vec::new(),
+        }
+    }
+
+    pub fn push_turn(&mut self, turn: PreApprovalCrossExaminationTurn) -> &mut Self {
+        self.turns.push(turn);
+        self
+    }
+
+    pub fn push_operator_question(
+        &mut self,
+        message: impl Into<String>,
+        created_at_ms: i64,
+    ) -> &mut Self {
+        self.push_turn(PreApprovalCrossExaminationTurn::operator_question(
+            message,
+            created_at_ms,
+        ))
+    }
+
+    pub fn push_agent_response(
+        &mut self,
+        message: impl Into<String>,
+        created_at_ms: i64,
+    ) -> &mut Self {
+        self.push_turn(PreApprovalCrossExaminationTurn::agent_response(
+            message,
+            created_at_ms,
+        ))
+    }
+
+    #[must_use]
+    pub fn transcript_id(&self) -> &str {
+        &self.transcript_id
+    }
+
+    #[must_use]
+    pub fn turns(&self) -> &[PreApprovalCrossExaminationTurn] {
+        &self.turns
+    }
+
+    #[must_use]
+    pub fn turn_count(&self) -> usize {
+        self.turns.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.turns.is_empty()
+    }
+
+    #[must_use]
+    pub fn transcript_hash(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut canonical = String::new();
+        canonical.push_str("transcript_id=");
+        canonical.push_str(&self.transcript_id);
+        for turn in &self.turns {
+            canonical.push('|');
+            let _ = write!(
+                canonical,
+                "{}@{}:",
+                turn.speaker.as_str(),
+                turn.created_at_ms
+            );
+            canonical.push_str(&turn.message);
+        }
+        format!("sha256:{}", sha256_hex(&canonical))
+    }
 }
 
 impl ApprovalScope {
@@ -704,6 +869,65 @@ impl<'a> ApprovalStore<'a> {
         Ok(record)
     }
 
+    /// Record the operator/agent exchange that happened before an approval
+    /// decision was made.
+    ///
+    /// This is deliberately audit-only: it does not issue, consume, or mutate
+    /// any allow-once approval token. The underlying action still requires the
+    /// normal approval consume path to run later.
+    pub async fn record_pre_approval_cross_examination(
+        &self,
+        input: &PolicyInput,
+        transcript: &PreApprovalCrossExamination,
+        correlation_id: Option<String>,
+    ) -> Result<i64> {
+        if transcript.is_empty() {
+            return Err(Error::Policy(
+                "pre-approval cross-examination requires at least one transcript turn".to_string(),
+            ));
+        }
+
+        let ts = now_ms();
+        let fingerprint = fingerprint_for_input(input);
+        let transcript_hash = transcript.transcript_hash();
+        let decision_context = build_pre_approval_cross_examination_decision_context(
+            &self.workspace_id,
+            input,
+            transcript,
+            &transcript_hash,
+            ts,
+        );
+        let audit = AuditActionRecord {
+            id: 0,
+            ts,
+            actor_kind: input.actor.as_str().to_string(),
+            actor_id: None,
+            correlation_id,
+            pane_id: input.pane_id,
+            domain: input.domain.clone(),
+            action_kind: "pre_approval_cross_examination".to_string(),
+            policy_decision: "require_approval".to_string(),
+            decision_reason: Some("paused agent questioned before approval decision".to_string()),
+            rule_id: Some("approval.cross_examination.record".to_string()),
+            input_summary: Some(format!(
+                "pre-approval cross-examination for {}",
+                input.action.as_str()
+            )),
+            verification_summary: Some(format!(
+                "workspace={}, fingerprint={}, transcript_id={}, transcript_hash={}, turns={}",
+                self.workspace_id,
+                fingerprint,
+                transcript.transcript_id(),
+                transcript_hash,
+                transcript.turn_count()
+            )),
+            decision_context,
+            result: "recorded".to_string(),
+        };
+
+        self.storage.record_audit_action_redacted(audit).await
+    }
+
     async fn audit_approval_grant(
         &self,
         input: &PolicyInput,
@@ -817,6 +1041,55 @@ fn build_approval_grant_decision_context(
     context.add_evidence("approval_actor", input.actor.as_str());
     context.add_evidence("approval_surface", input.surface.as_str());
     context.add_evidence("approval_action_kind", input.action.as_str());
+    if let Some(pane_id) = input.pane_id {
+        context.add_evidence("approval_pane_id", pane_id.to_string());
+    }
+    if let Some(domain) = input.domain.as_deref() {
+        context.add_evidence("approval_domain", domain);
+    }
+    serde_json::to_string(&context).ok()
+}
+
+fn build_pre_approval_cross_examination_decision_context(
+    workspace_id: &str,
+    input: &PolicyInput,
+    transcript: &PreApprovalCrossExamination,
+    transcript_hash: &str,
+    timestamp_ms: i64,
+) -> Option<String> {
+    let transcript_json = serde_json::to_string(transcript).ok()?;
+    let mut context = DecisionContext::new_audit(
+        timestamp_ms,
+        input.action,
+        input.actor,
+        input.surface,
+        input.pane_id,
+        input.domain.clone(),
+        input.text_summary.clone().or_else(|| {
+            Some(format!(
+                "pre-approval cross-examination for {}",
+                input.action.as_str()
+            ))
+        }),
+        input.workflow_id.clone(),
+    );
+    context.capabilities = input.capabilities.clone();
+    context.record_rule(
+        "approval.cross_examination.record",
+        true,
+        Some("require_approval"),
+        Some("operator questioned paused agent before approval decision".to_string()),
+    );
+    context.set_determining_rule("approval.cross_examination.record");
+    context.add_evidence("stage", "pre_approval_cross_examination");
+    context.add_evidence("workspace_id", workspace_id);
+    context.add_evidence("approval_action_kind", input.action.as_str());
+    context.add_evidence("approval_actor", input.actor.as_str());
+    context.add_evidence("approval_surface", input.surface.as_str());
+    context.add_evidence("transcript_id", transcript.transcript_id());
+    context.add_evidence("transcript_turn_count", transcript.turn_count().to_string());
+    context.add_evidence("transcript_hash", transcript_hash);
+    context.add_evidence("transcript", transcript_json);
     if let Some(pane_id) = input.pane_id {
         context.add_evidence("approval_pane_id", pane_id.to_string());
     }
@@ -1130,6 +1403,46 @@ mod tests {
             .with_decision_context(r#"{"k":"v"}"#);
         assert_eq!(ctx.correlation_id(), Some("trace-abc"));
         assert_eq!(ctx.decision_context(), Some(r#"{"k":"v"}"#));
+    }
+
+    #[test]
+    fn pre_approval_cross_examination_context_carries_transcript_evidence() {
+        let input = base_input();
+        let mut transcript = PreApprovalCrossExamination::new("cross-exam-1");
+        transcript
+            .push_operator_question("Why is this safe?", 1_700_000_000_001)
+            .push_agent_response("It only explains the pending plan.", 1_700_000_000_002);
+        let transcript_hash = transcript.transcript_hash();
+
+        let serialized = build_pre_approval_cross_examination_decision_context(
+            "ws",
+            &input,
+            &transcript,
+            &transcript_hash,
+            1_700_000_000_003,
+        );
+        let context = parse_decision_context(serialized.as_deref());
+
+        assert_eq!(
+            context.determining_rule.as_deref(),
+            Some("approval.cross_examination.record")
+        );
+        assert_eq!(
+            evidence(&context, "stage"),
+            Some("pre_approval_cross_examination")
+        );
+        assert_eq!(evidence(&context, "transcript_id"), Some("cross-exam-1"));
+        assert_eq!(evidence(&context, "transcript_turn_count"), Some("2"));
+        assert_eq!(
+            evidence(&context, "transcript_hash"),
+            Some(transcript_hash.as_str())
+        );
+        assert!(
+            evidence(&context, "transcript")
+                .expect("transcript evidence")
+                .contains("Why is this safe?"),
+            "transcript evidence should carry the operator question for the redacted audit path"
+        );
     }
 
     #[test]
@@ -2390,6 +2703,79 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    }
+
+    #[test]
+    fn pre_approval_cross_examination_audit_does_not_consume_token() {
+        run_async_test(async {
+            let (storage, db_path) = setup_test_storage("pre_approval_cross_exam").await;
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = base_input();
+            let plan_hash = "sha256:pre-approval-plan";
+            let request = store
+                .issue_for_plan(
+                    &input,
+                    plan_hash,
+                    Some(1),
+                    Some("needs operator review".to_string()),
+                )
+                .await
+                .unwrap();
+
+            let mut transcript = PreApprovalCrossExamination::new("cross-exam-audit-1");
+            transcript
+                .push_operator_question("Justify this mutation before approval.", 1_700_000_001_000)
+                .push_agent_response(
+                    "The pending action is still gated by the approval token.",
+                    1_700_000_001_001,
+                );
+
+            let audit_id = store
+                .record_pre_approval_cross_examination(
+                    &input,
+                    &transcript,
+                    Some("corr-pre-approval-cross-exam".to_string()),
+                )
+                .await
+                .unwrap();
+            assert!(audit_id > 0);
+
+            let audits = storage
+                .get_audit_actions(AuditQuery {
+                    correlation_id: Some("corr-pre-approval-cross-exam".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(audits.len(), 1);
+            let Some(audit) = audits.into_iter().next() else {
+                return;
+            };
+            assert_eq!(audit.action_kind, "pre_approval_cross_examination");
+            assert_eq!(audit.policy_decision, "require_approval");
+            assert_eq!(audit.result, "recorded");
+
+            let context = parse_decision_context(audit.decision_context.as_deref());
+            assert_eq!(
+                evidence(&context, "stage"),
+                Some("pre_approval_cross_examination")
+            );
+            assert_eq!(
+                evidence(&context, "transcript_hash"),
+                Some(transcript.transcript_hash().as_str())
+            );
+
+            let consumed = store
+                .consume_for_plan(&request.allow_once_code, &input, plan_hash)
+                .await
+                .unwrap();
+            assert!(
+                consumed.is_some(),
+                "recording cross-examination must not consume or grant the approval token"
+            );
+
+            cleanup_storage(storage, &db_path).await;
+        });
     }
 
     #[test]
