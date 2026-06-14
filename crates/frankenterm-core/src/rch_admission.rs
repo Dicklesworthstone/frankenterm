@@ -11,8 +11,14 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::proof_intent::{
+    ProofIntent, ProofIntentEnvVar, ProofIntentQueueEntry, ProofKind, ProofRedactionPolicy,
+    ProofScope,
+};
+
 pub const RCH_ADMISSION_CONTRACT_ID: &str = "ft.rch_admission.v1";
 pub const RCH_ADMISSION_SCHEMA_VERSION: u16 = 1;
+pub const RCH_ADMISSION_PREFLIGHT_CONTRACT_ID: &str = "ft.rch_admission.preflight.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +98,166 @@ pub enum RchAdmissionProofStatus {
     Runnable,
     Blocked,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RchAdmissionPreflightVerdict {
+    Admitted,
+    Deferred,
+    Invalid,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RchAdmissionTargetDirHygiene {
+    UniqueTmpTarget,
+    ExplicitNonTmpTarget,
+    SharedWorkspaceTarget,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RchAdmissionProofCommandRisk {
+    NonCargoCommand,
+    UnsupportedProofKind,
+    MultiPackageScope,
+    MissingRchExecWrapper,
+    MissingRemoteRequiredEnv,
+    MissingNoSelfHealingEnv,
+    LocalFallbackRequested,
+    MissingNoSelfHealingFlag,
+    MissingTargetDir,
+    SharedWorkspaceTargetDir,
+}
+
+impl RchAdmissionProofCommandRisk {
+    #[must_use]
+    fn permits_local_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::MissingRemoteRequiredEnv
+                | Self::MissingNoSelfHealingEnv
+                | Self::LocalFallbackRequested
+                | Self::MissingNoSelfHealingFlag
+        )
+    }
+
+    #[must_use]
+    fn invalidates_hygiene(self) -> bool {
+        matches!(
+            self,
+            Self::NonCargoCommand
+                | Self::UnsupportedProofKind
+                | Self::MultiPackageScope
+                | Self::MissingRchExecWrapper
+                | Self::MissingTargetDir
+                | Self::SharedWorkspaceTargetDir
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RchAdmissionProofCommandAnalysis {
+    pub raw: String,
+    pub normalized: String,
+    pub classification: String,
+    pub proof_kind: Option<ProofKind>,
+    pub proof_scope: Option<ProofScope>,
+    pub package_scope: Vec<String>,
+    pub test_scope: Vec<String>,
+    pub target_dir: Option<String>,
+    pub target_triple: Option<String>,
+    pub estimated_slots: u32,
+    pub target_dir_hygiene: RchAdmissionTargetDirHygiene,
+    pub remote_required: bool,
+    pub no_self_healing: bool,
+    pub rch_exec_wrapped: bool,
+    pub risks: Vec<RchAdmissionProofCommandRisk>,
+    pub proof_intent_compatible: bool,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RchAdmissionPreflightReport {
+    pub schema_version: u16,
+    pub contract_id: String,
+    pub predicted_at_ms: u64,
+    pub advisory_only: bool,
+    pub verdict: RchAdmissionPreflightVerdict,
+    pub rch_admission_state: String,
+    pub queue_intent_recommended: bool,
+    pub selected_worker: Option<String>,
+    pub estimated_slots: Option<u32>,
+    pub reason_codes: Vec<RchAdmissionReasonCode>,
+    pub proof_command: RchAdmissionProofCommandAnalysis,
+    pub admission_report: RchAdmissionReport,
+    pub summary: String,
+}
+
+impl RchAdmissionPreflightReport {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn to_deferred_proof_intent(
+        &self,
+        source_hash: impl Into<String>,
+        expected_artifact_path: Option<String>,
+        bead_id: Option<String>,
+        attestation_slot: Option<String>,
+        redaction_policy: ProofRedactionPolicy,
+        created_at_ms: i64,
+    ) -> Option<ProofIntent> {
+        if self.verdict != RchAdmissionPreflightVerdict::Deferred || !self.queue_intent_recommended
+        {
+            return None;
+        }
+
+        Some(ProofIntent::new(
+            self.proof_command.raw.clone(),
+            self.proof_command.proof_scope.clone()?,
+            self.proof_command.proof_kind?,
+            source_hash,
+            expected_artifact_path,
+            true,
+            bead_id,
+            attestation_slot,
+            redaction_policy,
+            created_at_ms,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn to_deferred_proof_intent_queue_entry(
+        &self,
+        source_hash: impl Into<String>,
+        expected_artifact_path: Option<String>,
+        bead_id: Option<String>,
+        attestation_slot: Option<String>,
+        redaction_policy: ProofRedactionPolicy,
+        queued_at_ms: i64,
+    ) -> Option<ProofIntentQueueEntry> {
+        let intent = self.to_deferred_proof_intent(
+            source_hash,
+            expected_artifact_path,
+            bead_id,
+            attestation_slot,
+            redaction_policy,
+            queued_at_ms,
+        )?;
+        let (command_env, command_argv) = proof_command_replay_parts(&self.proof_command.raw);
+
+        Some(ProofIntentQueueEntry::new(
+            intent,
+            command_argv,
+            command_env,
+            self.proof_command.target_dir.clone(),
+            self.rch_admission_state.clone(),
+            queued_at_ms,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +643,119 @@ where
         installed_selector_estimated_slots,
         slot_estimate_mismatch,
         explanation,
+    }
+}
+
+#[must_use]
+pub fn analyze_rch_admission_proof_command<I, K, V>(
+    raw: impl AsRef<str>,
+    env: I,
+    installed_selector_estimated_slots: Option<u32>,
+) -> RchAdmissionProofCommandAnalysis
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let raw = raw.as_ref().trim().to_string();
+    let words = shell_words_lossy(&raw);
+    let command_env = env
+        .into_iter()
+        .map(|(key, value)| (key.as_ref().to_string(), value.as_ref().to_string()))
+        .collect::<Vec<_>>();
+    let cargo = analyze_rch_admission_cargo_command(
+        &raw,
+        command_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+        installed_selector_estimated_slots,
+    );
+    proof_command_analysis_from_cargo(raw, &words, &cargo)
+}
+
+#[must_use]
+pub fn build_rch_admission_preflight_report(
+    input: &RchAdmissionCollectorInput,
+    proof_command: RchAdmissionProofCommandAnalysis,
+) -> RchAdmissionPreflightReport {
+    let admission_report = build_rch_admission_report(input);
+    let command_permits_local_fallback = proof_command
+        .risks
+        .iter()
+        .any(|risk| risk.permits_local_fallback());
+    let command_requests_local_fallback = proof_command
+        .risks
+        .contains(&RchAdmissionProofCommandRisk::LocalFallbackRequested);
+    let command_invalid = proof_command
+        .risks
+        .iter()
+        .any(|risk| risk.invalidates_hygiene());
+
+    let (verdict, rch_admission_state, queue_intent_recommended, summary) =
+        if command_requests_local_fallback {
+            (
+                RchAdmissionPreflightVerdict::Blocked,
+                "blocked_command".to_string(),
+                false,
+                format!(
+                    "blocked: command permits local fallback; predicted_at_ms={}",
+                    input.generated_at_ms
+                ),
+            )
+        } else if command_invalid {
+            (
+                RchAdmissionPreflightVerdict::Invalid,
+                "invalid".to_string(),
+                false,
+                format!(
+                    "invalid: local-only or target-dir hygiene cannot produce RCH proof; predicted_at_ms={}",
+                    input.generated_at_ms
+                ),
+            )
+        } else if command_permits_local_fallback {
+            (
+                RchAdmissionPreflightVerdict::Blocked,
+                "blocked_command".to_string(),
+                false,
+                format!(
+                    "blocked: command permits local fallback; predicted_at_ms={}",
+                    input.generated_at_ms
+                ),
+            )
+        } else if admission_report.proof_status == RchAdmissionProofStatus::Runnable {
+            (
+                RchAdmissionPreflightVerdict::Admitted,
+                "admitted".to_string(),
+                false,
+                admitted_preflight_summary(
+                    input.generated_at_ms,
+                    &proof_command,
+                    &admission_report,
+                ),
+            )
+        } else {
+            (
+                RchAdmissionPreflightVerdict::Deferred,
+                "wait_rch".to_string(),
+                proof_command.proof_intent_compatible,
+                deferred_preflight_summary(input.generated_at_ms, &admission_report),
+            )
+        };
+
+    RchAdmissionPreflightReport {
+        schema_version: RCH_ADMISSION_SCHEMA_VERSION,
+        contract_id: RCH_ADMISSION_PREFLIGHT_CONTRACT_ID.to_string(),
+        predicted_at_ms: input.generated_at_ms,
+        advisory_only: true,
+        verdict,
+        rch_admission_state,
+        queue_intent_recommended,
+        selected_worker: admission_report.rch_queue.selected_worker.clone(),
+        estimated_slots: admission_report.estimated_slots,
+        reason_codes: admission_report.reason_codes.clone(),
+        proof_command,
+        admission_report,
+        summary,
     }
 }
 
@@ -1361,6 +1640,296 @@ fn cargo_analysis_explanation(input: CargoAnalysisExplanationInput<'_>) -> Strin
     )
 }
 
+fn proof_command_analysis_from_cargo(
+    raw: String,
+    words: &[String],
+    cargo: &RchAdmissionCargoCommandAnalysis,
+) -> RchAdmissionProofCommandAnalysis {
+    let proof_kind = proof_kind_for_classification(&cargo.classification);
+    let proof_scope = proof_scope_for_packages(&cargo.package_scope);
+    let target_dir_hygiene = classify_target_dir_hygiene(cargo.target_dir.as_deref());
+    let remote_required = env_assignment_equals_before_cargo(words, "RCH_REQUIRE_REMOTE", "1");
+    let no_self_healing_env = env_assignment_equals_before_cargo(words, "RCH_NO_SELF_HEALING", "1");
+    let local_fallback_requested =
+        explicit_env_assignment_not_equal_before_cargo(words, "RCH_REQUIRE_REMOTE", "1")
+            || explicit_env_assignment_not_equal_before_cargo(words, "RCH_NO_SELF_HEALING", "1");
+    let rch_exec_wrapped = rch_exec_wrapped(words);
+    let no_self_healing_flag = rch_no_self_healing_flag(words);
+    let no_self_healing = no_self_healing_env && no_self_healing_flag;
+    let mut risks = Vec::new();
+
+    if cargo.classification == "non_cargo" {
+        push_risk(&mut risks, RchAdmissionProofCommandRisk::NonCargoCommand);
+    }
+    if proof_kind.is_none() && cargo.classification != "non_cargo" {
+        push_risk(
+            &mut risks,
+            RchAdmissionProofCommandRisk::UnsupportedProofKind,
+        );
+    }
+    if cargo.package_scope.len() > 1 {
+        push_risk(&mut risks, RchAdmissionProofCommandRisk::MultiPackageScope);
+    }
+    if !rch_exec_wrapped {
+        push_risk(
+            &mut risks,
+            RchAdmissionProofCommandRisk::MissingRchExecWrapper,
+        );
+    }
+    if !remote_required {
+        push_risk(
+            &mut risks,
+            RchAdmissionProofCommandRisk::MissingRemoteRequiredEnv,
+        );
+    }
+    if !no_self_healing_env {
+        push_risk(
+            &mut risks,
+            RchAdmissionProofCommandRisk::MissingNoSelfHealingEnv,
+        );
+    }
+    if local_fallback_requested {
+        push_risk(
+            &mut risks,
+            RchAdmissionProofCommandRisk::LocalFallbackRequested,
+        );
+    }
+    if !no_self_healing_flag {
+        push_risk(
+            &mut risks,
+            RchAdmissionProofCommandRisk::MissingNoSelfHealingFlag,
+        );
+    }
+    match target_dir_hygiene {
+        RchAdmissionTargetDirHygiene::Missing => {
+            push_risk(&mut risks, RchAdmissionProofCommandRisk::MissingTargetDir);
+        }
+        RchAdmissionTargetDirHygiene::SharedWorkspaceTarget => {
+            push_risk(
+                &mut risks,
+                RchAdmissionProofCommandRisk::SharedWorkspaceTargetDir,
+            );
+        }
+        RchAdmissionTargetDirHygiene::UniqueTmpTarget
+        | RchAdmissionTargetDirHygiene::ExplicitNonTmpTarget => {}
+    }
+
+    let proof_intent_compatible = proof_kind.is_some()
+        && proof_scope.is_some()
+        && !risks.iter().any(|risk| {
+            matches!(
+                risk,
+                RchAdmissionProofCommandRisk::NonCargoCommand
+                    | RchAdmissionProofCommandRisk::UnsupportedProofKind
+                    | RchAdmissionProofCommandRisk::MultiPackageScope
+            )
+        });
+    let explanation = proof_command_explanation(
+        remote_required,
+        no_self_healing,
+        rch_exec_wrapped,
+        target_dir_hygiene,
+        proof_intent_compatible,
+        cargo,
+    );
+
+    RchAdmissionProofCommandAnalysis {
+        raw,
+        normalized: cargo.normalized.clone(),
+        classification: cargo.classification.clone(),
+        proof_kind,
+        proof_scope,
+        package_scope: cargo.package_scope.clone(),
+        test_scope: cargo.test_scope.clone(),
+        target_dir: cargo.target_dir.clone(),
+        target_triple: cargo.target_triple.clone(),
+        estimated_slots: cargo.estimated_slots,
+        target_dir_hygiene,
+        remote_required,
+        no_self_healing,
+        rch_exec_wrapped,
+        risks,
+        proof_intent_compatible,
+        explanation,
+    }
+}
+
+fn proof_kind_for_classification(classification: &str) -> Option<ProofKind> {
+    match classification {
+        "cargo_test" => Some(ProofKind::Test),
+        "cargo_check" => Some(ProofKind::Check),
+        "cargo_clippy" => Some(ProofKind::Clippy),
+        "cargo_fuzz" => Some(ProofKind::Fuzz),
+        _ => None,
+    }
+}
+
+fn proof_scope_for_packages(packages: &[String]) -> Option<ProofScope> {
+    match packages {
+        [package] => Some(ProofScope::Package {
+            package: package.clone(),
+        }),
+        [] => Some(ProofScope::Workspace),
+        _ => None,
+    }
+}
+
+fn classify_target_dir_hygiene(target_dir: Option<&str>) -> RchAdmissionTargetDirHygiene {
+    let Some(target_dir) = target_dir.map(str::trim).filter(|value| !value.is_empty()) else {
+        return RchAdmissionTargetDirHygiene::Missing;
+    };
+    if matches!(target_dir, "target" | "./target") || target_dir.ends_with("/target") {
+        return RchAdmissionTargetDirHygiene::SharedWorkspaceTarget;
+    }
+    if target_dir.starts_with("/tmp/ft-") && target_dir.ends_with("-target") {
+        return RchAdmissionTargetDirHygiene::UniqueTmpTarget;
+    }
+    RchAdmissionTargetDirHygiene::ExplicitNonTmpTarget
+}
+
+fn push_risk(risks: &mut Vec<RchAdmissionProofCommandRisk>, risk: RchAdmissionProofCommandRisk) {
+    if !risks.contains(&risk) {
+        risks.push(risk);
+    }
+}
+
+fn proof_command_replay_parts(raw: &str) -> (Vec<ProofIntentEnvVar>, Vec<String>) {
+    let words = shell_words_lossy(raw);
+    let argv_start = words
+        .iter()
+        .position(|word| !is_shell_env_assignment(word))
+        .unwrap_or(words.len());
+    let command_env = words
+        .iter()
+        .take(argv_start)
+        .filter_map(|word| {
+            let (name, value) = word.split_once('=')?;
+            Some(ProofIntentEnvVar {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+        })
+        .collect();
+    let command_argv = words.into_iter().skip(argv_start).collect();
+    (command_env, command_argv)
+}
+
+fn is_shell_env_assignment(word: &str) -> bool {
+    let Some((name, _value)) = word.split_once('=') else {
+        return false;
+    };
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn env_assignment_equals_before_cargo(words: &[String], name: &str, expected: &str) -> bool {
+    words_before_cargo(words).any(|word| {
+        word.split_once('=')
+            .is_some_and(|(key, value)| key == name && value == expected)
+    })
+}
+
+fn explicit_env_assignment_not_equal_before_cargo(
+    words: &[String],
+    name: &str,
+    expected: &str,
+) -> bool {
+    words_before_cargo(words).any(|word| {
+        word.split_once('=')
+            .is_some_and(|(key, value)| key == name && value != expected)
+    })
+}
+
+fn words_before_cargo(words: &[String]) -> impl Iterator<Item = &String> {
+    let limit = words
+        .iter()
+        .position(|word| word == "cargo")
+        .unwrap_or(words.len());
+    words.iter().take(limit)
+}
+
+fn rch_exec_wrapped(words: &[String]) -> bool {
+    let Some(rch_index) = words.iter().position(|word| word == "rch") else {
+        return false;
+    };
+    let Some(exec_index) = words
+        .iter()
+        .enumerate()
+        .skip(rch_index + 1)
+        .find_map(|(index, word)| (word == "exec").then_some(index))
+    else {
+        return false;
+    };
+    words
+        .get(exec_index + 1)
+        .is_some_and(|word| word.as_str() == "--")
+}
+
+fn rch_no_self_healing_flag(words: &[String]) -> bool {
+    let Some(rch_index) = words.iter().position(|word| word == "rch") else {
+        return false;
+    };
+    let exec_index = words
+        .iter()
+        .enumerate()
+        .skip(rch_index + 1)
+        .find_map(|(index, word)| (word == "exec").then_some(index))
+        .unwrap_or(words.len());
+    words
+        .iter()
+        .skip(rch_index + 1)
+        .take(exec_index.saturating_sub(rch_index + 1))
+        .any(|word| word == "--no-self-healing")
+}
+
+fn proof_command_explanation(
+    remote_required: bool,
+    no_self_healing: bool,
+    rch_exec_wrapped: bool,
+    target_dir_hygiene: RchAdmissionTargetDirHygiene,
+    proof_intent_compatible: bool,
+    cargo: &RchAdmissionCargoCommandAnalysis,
+) -> String {
+    format!(
+        "remote_required={remote_required}; no_self_healing={no_self_healing}; rch_exec_wrapped={rch_exec_wrapped}; target_dir_hygiene={target_dir_hygiene:?}; proof_intent_compatible={proof_intent_compatible}; {}",
+        cargo.explanation
+    )
+}
+
+fn admitted_preflight_summary(
+    predicted_at_ms: u64,
+    proof_command: &RchAdmissionProofCommandAnalysis,
+    admission_report: &RchAdmissionReport,
+) -> String {
+    let worker_count = admission_report
+        .rch_queue
+        .workers_healthy
+        .or(admission_report.rch_queue.worker_slots_available)
+        .unwrap_or(0);
+    let scope = match &proof_command.proof_scope {
+        Some(ProofScope::Package { .. }) => "package-scoped",
+        Some(ProofScope::Workspace) => "workspace-scoped",
+        None => "unknown-scope",
+    };
+    format!("admitted: {worker_count} worker(s), {scope}; predicted_at_ms={predicted_at_ms}")
+}
+
+fn deferred_preflight_summary(
+    predicted_at_ms: u64,
+    admission_report: &RchAdmissionReport,
+) -> String {
+    let reason = admission_report
+        .reason_codes
+        .first()
+        .map_or("unknown".to_string(), |reason| format!("{reason:?}"));
+    format!("deferred: {reason}; queue intent; predicted_at_ms={predicted_at_ms}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1397,11 +1966,9 @@ mod tests {
         );
         assert!(analysis.slot_estimate_mismatch);
         assert!(analysis.explanation.contains("explicit cargo job count 1"));
-        assert!(
-            analysis
-                .explanation
-                .contains("installed_selector_estimated_slots=4")
-        );
+        assert!(analysis
+            .explanation
+            .contains("installed_selector_estimated_slots=4"));
         assert!(analysis.explanation.contains("slot_estimate_mismatch=true"));
     }
 
@@ -1443,11 +2010,9 @@ mod tests {
         assert_eq!(analysis.estimated_slots, 2);
         assert!(!analysis.slot_estimate_mismatch);
         assert!(analysis.explanation.contains("explicit cargo job count 2"));
-        assert!(
-            analysis
-                .explanation
-                .contains("target_triple=x86_64-pc-windows-gnu")
-        );
+        assert!(analysis
+            .explanation
+            .contains("target_triple=x86_64-pc-windows-gnu"));
     }
 
     #[test]
@@ -1534,16 +2099,12 @@ mod tests {
             ]
         );
         assert!(report.advisory_only);
-        assert!(
-            report
-                .forbidden_actions
-                .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof)
-        );
-        assert!(
-            report
-                .forbidden_actions
-                .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval)
-        );
+        assert!(report
+            .forbidden_actions
+            .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof));
+        assert!(report
+            .forbidden_actions
+            .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval));
         assert!(report.recommendations[0].operator_approval_required);
     }
 
@@ -1568,11 +2129,9 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::LocalEnoSpace)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::LocalEnoSpace));
         assert_eq!(report.citations.len(), 1);
         let citation = report.citations.first();
         assert!(citation.is_some(), "expected local disk citation");
@@ -1605,16 +2164,12 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::CriticalPressure)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
     }
 
     #[test]
@@ -1642,21 +2197,15 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::CriticalPressure)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::TelemetryGap)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::TelemetryGap));
     }
 
     #[test]
@@ -1686,21 +2235,16 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::WorkerToolchainMissingTarget)
-        );
-        assert!(
-            report
-                .recommendations
-                .iter()
-                .find(|recommendation| {
-                    recommendation.reason_code
-                        == RchAdmissionReasonCode::WorkerToolchainMissingTarget
-                })
-                .is_some_and(|recommendation| recommendation.operator_approval_required)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::WorkerToolchainMissingTarget));
+        assert!(report
+            .recommendations
+            .iter()
+            .find(|recommendation| {
+                recommendation.reason_code == RchAdmissionReasonCode::WorkerToolchainMissingTarget
+            })
+            .is_some_and(|recommendation| recommendation.operator_approval_required));
     }
 
     #[test]
@@ -1731,21 +2275,15 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::ActiveProjectExclusion)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::CriticalPressure)
-        );
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::ActiveProjectExclusion));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
         assert_eq!(
             report.worker_rejections[0].worker.as_deref(),
             Some("vmi1149989")
@@ -1824,16 +2362,12 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Runnable);
-        assert!(
-            !report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::InsufficientSlots)
-        );
-        assert!(
-            !report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::CriticalPressure)
-        );
+        assert!(!report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::InsufficientSlots));
+        assert!(!report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::CriticalPressure));
         assert_eq!(
             report.rch_queue.selected_worker.as_deref(),
             Some("vmi1264463")
@@ -1863,11 +2397,9 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(
-            report
-                .reason_codes
-                .contains(&RchAdmissionReasonCode::InsufficientSlots)
-        );
+        assert!(report
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::InsufficientSlots));
     }
 
     #[test]
@@ -1895,23 +2427,209 @@ mod tests {
 
         assert_eq!(report.beads.active_bead.as_deref(), Some("ft-69gwh.2"));
         assert_eq!(report.beads.blocking_beads, vec!["ft-4tp7g"]);
-        assert!(
-            report
-                .citations
-                .iter()
-                .any(|citation| citation.summary.contains("ready bead ft-69gwh.3"))
+        assert!(report
+            .citations
+            .iter()
+            .any(|citation| citation.summary.contains("ready bead ft-69gwh.3")));
+        assert!(report
+            .citations
+            .iter()
+            .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1")));
+        assert!(report
+            .citations
+            .iter()
+            .any(|citation| citation.summary.contains("git status reported M")));
+    }
+
+    #[test]
+    fn preflight_admits_remote_required_package_command_with_timestamp() {
+        let proof_command = analyze_rch_admission_proof_command(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da94-cod8-target cargo test -p frankenterm-core --lib rch_admission",
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
         );
-        assert!(
-            report
-                .citations
-                .iter()
-                .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1"))
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.preflight_admitted",
+            RchAdmissionCommandDiagnostic::new("placeholder"),
+        )
+        .with_cargo_command_analysis(&analyze_rch_admission_cargo_command(
+            &proof_command.raw,
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
+        ))
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("healthy".to_string()),
+            active_project_exclusion: false,
+            active_builds: 0,
+            queued_builds: 0,
+            selected_worker: Some("vmi-healthy".to_string()),
+            worker_slots_available: Some(1),
+            workers_healthy: Some(1),
+            workers_total: Some(8),
+        });
+
+        let preflight = build_rch_admission_preflight_report(&input, proof_command);
+
+        assert_eq!(preflight.verdict, RchAdmissionPreflightVerdict::Admitted);
+        assert_eq!(preflight.rch_admission_state, "admitted");
+        assert_eq!(preflight.predicted_at_ms, 1_779_013_898_000);
+        assert_eq!(preflight.selected_worker.as_deref(), Some("vmi-healthy"));
+        assert_eq!(preflight.proof_command.proof_kind, Some(ProofKind::Test));
+        assert!(matches!(
+            preflight.proof_command.proof_scope,
+            Some(ProofScope::Package { ref package }) if package == "frankenterm-core"
+        ));
+        assert!(preflight.proof_command.risks.is_empty());
+        assert!(preflight.summary.contains("admitted: 1 worker"));
+        assert!(preflight.summary.contains("package-scoped"));
+    }
+
+    #[test]
+    fn preflight_defers_no_worker_remote_command_as_queueable_intent() -> Result<(), String> {
+        let proof_command = analyze_rch_admission_proof_command(
+            "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da94-cod8-target cargo test -p frankenterm-core --lib rch_admission",
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
         );
-        assert!(
-            report
-                .citations
-                .iter()
-                .any(|citation| citation.summary.contains("git status reported M"))
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.preflight_deferred",
+            RchAdmissionCommandDiagnostic::new("placeholder"),
+        )
+        .with_cargo_command_analysis(&analyze_rch_admission_cargo_command(
+            &proof_command.raw,
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
+        ))
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("blocked".to_string()),
+            active_project_exclusion: false,
+            active_builds: 0,
+            queued_builds: 0,
+            selected_worker: None,
+            worker_slots_available: Some(0),
+            workers_healthy: Some(0),
+            workers_total: Some(8),
+        });
+
+        let preflight = build_rch_admission_preflight_report(&input, proof_command);
+
+        assert_eq!(preflight.verdict, RchAdmissionPreflightVerdict::Deferred);
+        assert_eq!(preflight.rch_admission_state, "wait_rch");
+        assert!(preflight.queue_intent_recommended);
+        assert!(preflight
+            .reason_codes
+            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(preflight.summary.contains("queue intent"));
+
+        let Some(entry) = preflight.to_deferred_proof_intent_queue_entry(
+            "sha256:preflight-tree",
+            None,
+            Some("ft-7h5da.9.4".to_string()),
+            None,
+            ProofRedactionPolicy::Standard,
+            1_779_013_898_000,
+        ) else {
+            return Err("deferred preflight did not yield a queueable proof intent".to_string());
+        };
+        entry.validate().map_err(|error| error.to_string())?;
+        assert_eq!(entry.rch_admission_state, "wait_rch");
+        assert_eq!(
+            entry.target_dir.as_deref(),
+            Some("/tmp/ft-7h5da94-cod8-target")
         );
+        assert_eq!(entry.intent.kind, ProofKind::Test);
+        assert_eq!(entry.intent.bead_id.as_deref(), Some("ft-7h5da.9.4"));
+        assert!(entry.intent.required_remote);
+        assert!(entry
+            .command_env
+            .iter()
+            .any(|env| { env.name == "RCH_REQUIRE_REMOTE" && env.value == "1" }));
+        assert_eq!(entry.command_argv.first().map(String::as_str), Some("rch"));
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_invalidates_local_cargo_and_shared_target_dir() {
+        let proof_command = analyze_rch_admission_proof_command(
+            "cargo test -p frankenterm-core --target-dir target --lib rch_admission",
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
+        );
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.preflight_invalid",
+            RchAdmissionCommandDiagnostic::new("placeholder"),
+        )
+        .with_cargo_command_analysis(&analyze_rch_admission_cargo_command(
+            &proof_command.raw,
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
+        ))
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("healthy".to_string()),
+            active_project_exclusion: false,
+            active_builds: 0,
+            queued_builds: 0,
+            selected_worker: Some("vmi-healthy".to_string()),
+            worker_slots_available: Some(1),
+            workers_healthy: Some(1),
+            workers_total: Some(8),
+        });
+
+        let preflight = build_rch_admission_preflight_report(&input, proof_command);
+
+        assert_eq!(preflight.verdict, RchAdmissionPreflightVerdict::Invalid);
+        assert_eq!(preflight.rch_admission_state, "invalid");
+        assert!(!preflight.queue_intent_recommended);
+        assert!(preflight
+            .proof_command
+            .risks
+            .contains(&RchAdmissionProofCommandRisk::MissingRchExecWrapper));
+        assert!(preflight
+            .proof_command
+            .risks
+            .contains(&RchAdmissionProofCommandRisk::SharedWorkspaceTargetDir));
+    }
+
+    #[test]
+    fn preflight_blocks_explicit_local_fallback_request() {
+        let proof_command = analyze_rch_admission_proof_command(
+            "RCH_REQUIRE_REMOTE=0 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da94-cod8-target cargo test -p frankenterm-core --lib rch_admission",
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
+        );
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.preflight_blocked",
+            RchAdmissionCommandDiagnostic::new("placeholder"),
+        )
+        .with_cargo_command_analysis(&analyze_rch_admission_cargo_command(
+            &proof_command.raw,
+            std::iter::empty::<(&str, &str)>(),
+            Some(1),
+        ))
+        .with_rch_queue(RchAdmissionQueueDiagnostic {
+            posture: Some("healthy".to_string()),
+            active_project_exclusion: false,
+            active_builds: 0,
+            queued_builds: 0,
+            selected_worker: Some("vmi-healthy".to_string()),
+            worker_slots_available: Some(1),
+            workers_healthy: Some(1),
+            workers_total: Some(8),
+        });
+
+        let preflight = build_rch_admission_preflight_report(&input, proof_command);
+
+        assert_eq!(preflight.verdict, RchAdmissionPreflightVerdict::Blocked);
+        assert_eq!(preflight.rch_admission_state, "blocked_command");
+        assert!(!preflight.queue_intent_recommended);
+        assert!(preflight
+            .proof_command
+            .risks
+            .contains(&RchAdmissionProofCommandRisk::LocalFallbackRequested));
+        assert!(preflight.summary.contains("permits local fallback"));
     }
 }
