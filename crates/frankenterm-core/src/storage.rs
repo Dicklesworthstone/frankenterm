@@ -8303,6 +8303,22 @@ fn dispatch_append_segment_group_commit_result(
 ) {
     match result {
         Ok(committed_segments) => {
+            let pending_count = group.len();
+            let committed_count = committed_segments.len();
+            if committed_count != pending_count {
+                let message = format!(
+                    "storage append segment group commit returned {committed_count} committed \
+                     segments for {pending_count} pending appends"
+                );
+                tracing::error!(
+                    committed_count,
+                    pending_count,
+                    "storage writer append group commit returned mismatched results; failing grouped append callers"
+                );
+                fail_pending_append_segments(group, message);
+                return;
+            }
+
             for (pending, committed) in group.into_iter().zip(committed_segments) {
                 if committed.retained_tail_moved {
                     disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pending.pane_id);
@@ -9110,6 +9126,66 @@ mod writer_io_scheduler_tests {
             assert_eq!(
                 insert_queries, 2,
                 "both grouped segments should insert inside the transaction; got {writer_queries:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn writer_batch_group_commit_mismatched_result_count_fails_all_callers() {
+        run_storage_async_test(async {
+            let (first_tx, first_rx) = oneshot::channel();
+            let (second_tx, second_rx) = oneshot::channel();
+            let group = vec![
+                PendingAppendSegmentWrite {
+                    pane_id: 77,
+                    content: "first mismatched group append".to_string(),
+                    content_hash: None,
+                    zone_type: None,
+                    respond: WriterResultResponder::new(first_tx),
+                },
+                PendingAppendSegmentWrite {
+                    pane_id: 77,
+                    content: "second mismatched group append".to_string(),
+                    content_hash: None,
+                    zone_type: None,
+                    respond: WriterResultResponder::new(second_tx),
+                },
+            ];
+            let committed = vec![CommittedAppendSegment {
+                segment: Segment {
+                    id: 501,
+                    pane_id: 77,
+                    seq: 0,
+                    content: "first mismatched group append".to_string(),
+                    content_len: "first mismatched group append".len(),
+                    content_hash: None,
+                    captured_at: 123,
+                },
+                retained_tail_moved: false,
+            }];
+            let mut mmap_mirror = None;
+
+            dispatch_append_segment_group_commit_result(Ok(committed), group, &mut mmap_mirror);
+
+            let first_result = crate::runtime_async::oneshot_recv(first_rx)
+                .await
+                .expect("first grouped append should receive a mismatch error");
+            let first_error = first_result.expect_err("first grouped append should fail closed");
+            assert!(
+                first_error
+                    .to_string()
+                    .contains("returned 1 committed segments for 2 pending appends"),
+                "{first_error}"
+            );
+            let second_result = crate::runtime_async::oneshot_recv(second_rx)
+                .await
+                .expect("second grouped append should receive a mismatch error");
+            let second_error = second_result.expect_err("second grouped append should fail closed");
+            assert!(
+                second_error
+                    .to_string()
+                    .contains("returned 1 committed segments for 2 pending appends"),
+                "{second_error}"
             );
         });
     }
