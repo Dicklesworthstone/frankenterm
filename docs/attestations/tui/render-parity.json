@@ -191,7 +191,7 @@
     "produced_by_bead": "ft-tf6g3.3.7",
     "generated_at": "2026-06-07T01:04:09Z",
     "source_catalog_path": "docs/perf/resize-quality-slo.json",
-    "source_catalog_sha256": "2985ed90d5e0233539761c08b807424a5c104081e6968c8cfe9f04fa6d615cbe",
+    "source_catalog_sha256": "0888613f2f60f2be9ba2da7b7fd449e09a81e276eeddee7c94f4339a5f2be132",
     "closeout_status": "blocked_pending_missing_retained_runs",
     "summary": "The renderer-SLO umbrella does not yet have five retained target-run proofs. RQ-S1, RQ-S10, and RQ-S13 have retained remote RCH proof; RQ-S2/RQ-S3/RQ-S5 remain substrate-only pending target runs.",
     "entries": [
@@ -242,7 +242,19 @@
         "source_artifact_sha256": "6997ac32a2eb813771c88336ec7158e774d26a1a1703c0c295a7dcd86c0cb2cd",
         "declared_structured_log": "target/criterion/slo-idle_gpu.jsonl",
         "gap_evidence_path": "docs/perf/resize-quality-slo.json",
-        "gap_evidence_sha256": "d4e8271c1aa812efb59555113c57d807bd940b29d5e91ef73d1a55512bd1faa1",
+        "gap_evidence_sha256": "0888613f2f60f2be9ba2da7b7fd449e09a81e276eeddee7c94f4339a5f2be132",
+        "latest_fail_closed_probe": {
+          "classification": "remote_lib_probe_cancelled_not_target_run",
+          "worker_id": "vmi1264463",
+          "rch_job": "j-29884604911452495",
+          "command": "cargo test -p frankenterm-core --lib idle_gpu -- --nocapture",
+          "requested_target_dir": "/tmp/ft-tf6g339-cod7-target",
+          "exit_code": 130,
+          "cargo_reached": true,
+          "rustc_reached": true,
+          "test_or_bench_reached": false,
+          "status_effect": "no_validated_flip"
+        },
         "follow_up_bead": "ft-tf6g3.3.9"
       },
       {

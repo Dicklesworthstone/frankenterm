@@ -168,12 +168,37 @@
         "target_run_attempt": {
           "classification": "platform_target_run_unavailable",
           "platform": "gpu_counter_lab",
-          "reason": "The RCH fleet is GPU-less / headless, so no Metal (GPUCommandBuffer.GPUEndTime) or Vulkan (VK_EXT_calibrated_timestamps) GPU-counter sampling is available for a retained idle-GPU target run; RCH admission additionally refused this session (no_admissible_workers: health_below_fallback / hard_preflight / active_project_exclusion). A `-p frankenterm-core --lib` run does not satisfy this bead, and the scheduler/predicate proxy bench MUST NOT upgrade the row to retained_run_validated without sampled GPU counters.",
+          "reason": "The RCH fleet is GPU-less / headless, so no Metal (GPUCommandBuffer.GPUEndTime) or Vulkan (VK_EXT_calibrated_timestamps) GPU-counter sampling is available for a retained idle-GPU target run; RCH admission additionally refused earlier sessions (no_admissible_workers: health_below_fallback / hard_preflight / active_project_exclusion). A `-p frankenterm-core --lib` run does not satisfy this bead, and the scheduler/predicate proxy bench MUST NOT upgrade the row to retained_run_validated without sampled GPU counters.",
           "cargo_reached": false,
           "test_or_bench_reached": false,
           "rch_admission": "refused_no_admissible_workers",
           "command": "cargo bench -p frankenterm-core --bench idle_gpu",
           "target_dir": "/tmp/ft-tf6g3-3-cc4-target",
+          "latest_fail_closed_probe": {
+            "classification": "remote_lib_probe_cancelled_not_target_run",
+            "platform": "linux_headless_rch_worker",
+            "worker_id": "vmi1264463",
+            "rch_job": "j-29884604911452495",
+            "rch_build_id": 29884604911452495,
+            "location": "remote",
+            "command": "cargo test -p frankenterm-core --lib idle_gpu -- --nocapture",
+            "requested_target_dir": "/tmp/ft-tf6g339-cod7-target",
+            "effective_remote_target_dir": "/Users/jemanuel/projects/frankenterm/.rch-target-vmi1264463-job-29884604911452495-1781477553761342000-0",
+            "started_at": "2026-06-14T22:52:24.198904+00:00",
+            "completed_at": "2026-06-14T23:29:10.203716+00:00",
+            "duration_ms": 2206024,
+            "exit_code": 130,
+            "cargo_reached": true,
+            "rustc_reached": true,
+            "test_or_bench_reached": false,
+            "bench_reached": false,
+            "cancellation_origin": "user",
+            "cancellation_reason_code": "user",
+            "cancellation_decision_path": ["requested", "term_sent", "completed"],
+            "cleanup_ok": true,
+            "status_effect": "no_validated_flip",
+            "reason": "Remote RCH admitted the fail-closed lib probe on vmi1264463 and compiled for 36m46s, then exited 130 via user-originated cancellation before the filtered lib test completed. This proves remote admission/Cargo reachability for the synced tree, but it is not a retained idle-GPU target run and includes no sampled GPU counters."
+          },
           "follow_up_bead": "ft-tf6g3.3.9"
         }
       },
@@ -409,6 +434,12 @@
       "date": "2026-06-14",
       "bead": "ft-tf6g3.3",
       "note": "RQ-S5 idle GPU retained_evidence now carries a structured target_run_attempt block (classification platform_target_run_unavailable): the RCH fleet is GPU-less so Metal/Vulkan GPU-counter sampling is unavailable, and RCH admission refused (no_admissible_workers); status stays substrate_wired_pending_rch_target_run with no validated flip. This moves the idle-GPU unavailability finding from the ft-tf6g3.3.9 triage comment into the operator-facing ledger and makes the umbrella's three unproven SLOs (RQ-S2/RQ-S3 input-to-photon, RQ-S5 idle GPU) consistently carry structured target_run_attempt evidence. Umbrella closeout still gated on a GPU-capable lab lane + RCH admission (ft-tf6g3.3.8/.3.9)."
+    },
+    {
+      "version": "0.1.10",
+      "date": "2026-06-14",
+      "bead": "ft-tf6g3.3.9",
+      "note": "Recorded cod_7's fail-closed remote RCH lib probe for RQ-S5: vmi1264463 admitted and compiled cargo test -p frankenterm-core --lib idle_gpu for 36m46s, then exited 130 via user-originated cancellation before test/bench completion. Status remains substrate_wired_pending_rch_target_run because no idle-GPU target-run artifact or GPU-counter sample exists."
     }
   ]
 }
