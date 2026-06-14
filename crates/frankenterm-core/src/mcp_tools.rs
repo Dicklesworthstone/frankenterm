@@ -8862,10 +8862,10 @@ mod tests {
         mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
         redact_mcp_output_secrets, redact_mcp_pane_state_fields,
         redact_mcp_wait_pattern_for_output, serialize_mcp_audit_decision_context,
-        set_mcp_test_pane_state_override, tx_run_test_wezterm_override_slot,
-        validate_cass_timeout_secs,
+        tx_run_test_wezterm_override_slot, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{IpcPaneState, McpPaneState, StateParams};
+    use crate::mcp::set_mcp_test_pane_state_override;
     #[cfg(unix)]
     use crate::mcp_error::{
         MCP_ERR_CASS, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,

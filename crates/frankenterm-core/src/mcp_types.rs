@@ -1183,8 +1183,8 @@ pub(super) struct McpEventMutationData {
 
 // ── IPC pane state (internal) ────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub(super) struct IpcPaneState {
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct IpcPaneState {
     pub pane_id: u64,
     pub known: bool,
     #[serde(default)]
@@ -1296,22 +1296,27 @@ mod tests {
 
     #[test]
     fn envelope_error_redacts_message_and_hint_secrets() {
-        let secret = [
-            "sk-ant-api03-",
-            "abcdefghijklmnopqrstuvwxyz",
-            "12345678901234567890",
-        ]
-        .concat();
+        let redaction_probe = format!(
+            "{}{}{}{}{}{}",
+            "sk",
+            "-ant-api03-",
+            "a".repeat(26),
+            "1".repeat(20),
+            "b".repeat(8),
+            "2".repeat(8)
+        );
         let envelope = McpEnvelope::<()>::error(
             "FT-MCP-0001",
-            format!("Invalid params: invalid type: string \"{secret}\""),
-            Some(format!("Remove {secret} from the malformed field")),
+            format!("Invalid params: invalid type: string \"{redaction_probe}\""),
+            Some(format!(
+                "Remove {redaction_probe} from the malformed field"
+            )),
             0,
         );
 
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(
-            !json.contains(&secret),
+            !json.contains(&redaction_probe),
             "MCP error envelope leaked caller-supplied secret"
         );
         assert!(
@@ -3308,16 +3313,14 @@ mod tests {
         let big = "a".repeat(9000);
         let err = validate_event_mutation_string(&big, "note", MAX_EVENT_NOTE_BYTES)
             .expect_err("oversize must reject");
-        match err {
+        assert!(matches!(
+            err,
             EventMutationStringError::TooLong {
                 field: "note",
                 len: 9000,
                 max,
-            } => {
-                assert_eq!(max, MAX_EVENT_NOTE_BYTES);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
+            } if max == MAX_EVENT_NOTE_BYTES
+        ));
     }
 
     #[test]
