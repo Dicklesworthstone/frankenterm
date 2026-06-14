@@ -13938,6 +13938,7 @@ impl RobotProfileApplyMuxExecutor {
         if !exports.is_empty() {
             lines.push(format!("export {}", exports.join(" ")));
         }
+        lines.extend(spec.setup_preamble_commands.iter().cloned());
         if let Some(command) = spec
             .command
             .as_ref()

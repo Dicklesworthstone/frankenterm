@@ -42,6 +42,7 @@ use crate::fleet_mutation::{
     FleetMutationPlan, FleetMutationPlanError, FleetMutationPolicyDecision, FleetMutationReceipt,
     FleetMutationReceiptStatus, FleetMutationStep, FleetMutationStepOutput,
 };
+use crate::setup::ShellType;
 
 // br-ft-iwg7x: bootstrap-commands metadata can hold malformed JSON.
 // `parse_bootstrap_commands` silently substituted Vec::new() on
@@ -394,6 +395,7 @@ pub struct ProfileApplySpawnSpec {
     pub working_directory: Option<String>,
     pub domain: Option<String>,
     pub env: BTreeMap<String, String>,
+    pub setup_preamble_commands: Vec<String>,
     pub bootstrap_commands: Vec<String>,
 }
 
@@ -521,6 +523,10 @@ impl<E: ProfileApplyMutationExecutor> FleetMutationExecutor
                 if let Some(cwd) = &spec.working_directory {
                     output.details.insert("cwd".to_string(), cwd.clone());
                 }
+                output.details.insert(
+                    "setup_preamble_command_count".to_string(),
+                    spec.setup_preamble_commands.len().to_string(),
+                );
                 output.details.insert(
                     "bootstrap_command_count".to_string(),
                     spec.bootstrap_commands.len().to_string(),
@@ -788,6 +794,7 @@ fn profile_apply_spawn_specs<S: BuildHasher>(
     for (key, value) in env_overrides {
         env.insert(key.clone(), value.clone());
     }
+    let setup_preamble_commands = profile_apply_setup_preamble_commands(&profile.shell);
     let bootstrap_commands = parse_bootstrap_commands(&profile.metadata);
     let working_directory = profile.metadata.get("working_directory").cloned();
     let domain = profile.metadata.get("domain").cloned();
@@ -802,9 +809,16 @@ fn profile_apply_spawn_specs<S: BuildHasher>(
             working_directory: working_directory.clone(),
             domain: domain.clone(),
             env: env.clone(),
+            setup_preamble_commands: setup_preamble_commands.clone(),
             bootstrap_commands: bootstrap_commands.clone(),
         })
         .collect()
+}
+
+fn profile_apply_setup_preamble_commands(shell: &str) -> Vec<String> {
+    ShellType::from_path(shell)
+        .map(|shell| vec![shell.osc133_snippet().to_string()])
+        .unwrap_or_default()
 }
 
 fn profile_apply_plan<E: ProfileApplyMutationExecutor>(
@@ -1761,6 +1775,69 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = (100..112).rev().collect::<Vec<_>>();
         assert_eq!(stopped, expected);
+    }
+
+    #[test]
+    fn spawn_specs_prepend_shell_integration_for_supported_shells() {
+        let mut profile = synth("ready", "r", vec![]);
+        profile.shell = "/bin/zsh".to_string();
+        profile.metadata.insert(
+            "bootstrap_commands".to_string(),
+            r#"["echo warmup"]"#.to_string(),
+        );
+        let specs = profile_apply_spawn_specs(&profile, 1, &HashMap::new());
+
+        assert_eq!(specs.len(), 1);
+        for spec in &specs {
+            assert_eq!(spec.setup_preamble_commands.len(), 1);
+            for preamble in &spec.setup_preamble_commands {
+                assert!(preamble.contains("133;A"));
+                assert!(preamble.contains("133;B"));
+                assert!(preamble.contains("133;C"));
+                assert!(preamble.contains("133;D"));
+                assert!(preamble.contains("]7;file://"));
+            }
+            assert_eq!(spec.command.as_deref(), Some("echo"));
+            assert_eq!(spec.bootstrap_commands, vec!["echo warmup"]);
+        }
+    }
+
+    #[test]
+    fn spawn_specs_do_not_guess_shell_integration_for_unknown_shells() {
+        let mut profile = synth("ready", "r", vec![]);
+        profile.shell = "/opt/custom-shell".to_string();
+        let specs = profile_apply_spawn_specs(&profile, 1, &HashMap::new());
+
+        assert_eq!(specs.len(), 1);
+        for spec in &specs {
+            assert!(spec.setup_preamble_commands.is_empty());
+            assert_eq!(spec.command.as_deref(), Some("echo"));
+        }
+    }
+
+    #[test]
+    fn profile_apply_receipt_reports_setup_preamble_count()
+    -> Result<(), FleetMutationExecutionError> {
+        let mut profile = synth("ready", "r", vec![]);
+        profile.shell = "/bin/bash".to_string();
+        let env_overrides = HashMap::new();
+        let specs = profile_apply_spawn_specs(&profile, 1, &env_overrides);
+        let mut executor = FakeApplyExecutor::new();
+        let plan = profile_apply_plan("profile-apply-test", false, &specs, &executor);
+
+        let mut fleet_executor = ProfileFleetMutationExecutor::new(&mut executor, &specs);
+        let mut observed_steps = 0usize;
+        for step in &plan.steps {
+            let output = fleet_executor.execute_step(step)?;
+            observed_steps = observed_steps.saturating_add(1);
+            assert_eq!(
+                output.details.get("setup_preamble_command_count"),
+                Some(&"1".to_string())
+            );
+        }
+
+        assert_eq!(observed_steps, 1);
+        Ok(())
     }
 
     #[test]

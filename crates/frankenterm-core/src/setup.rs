@@ -133,18 +133,21 @@ impl ShellType {
 
 /// OSC 133 integration snippet for Bash
 ///
-/// Emits markers at prompt start (A), command start (C), and command end (D with exit code).
+/// Emits markers at prompt start (A), input/output boundary (B/C), command end
+/// (D with exit code), and current working directory (OSC 7).
 const BASH_OSC133_SNIPPET: &str = r#"# ft: OSC 133 prompt markers for deterministic state detection
 # These markers help ft detect prompt boundaries and command execution.
 __ft_prompt_start() { printf '\e]133;A\e\\'; }
-__ft_command_start() { printf '\e]133;C\e\\'; }
+__ft_command_start() { printf '\e]133;B\e\\'; printf '\e]133;C\e\\'; }
 __ft_command_end() { printf '\e]133;D;%s\e\\' "$__ft_last_exit"; }
+__ft_current_dir() { printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }
 __ft_preexec() {
     __ft_command_start
 }
 __ft_precmd() {
     __ft_last_exit=$?
     __ft_command_end
+    __ft_current_dir
     __ft_prompt_start
 }
 # Install hooks if not already installed
@@ -164,13 +167,15 @@ fi"#;
 const ZSH_OSC133_SNIPPET: &str = r#"# ft: OSC 133 prompt markers for deterministic state detection
 # These markers help ft detect prompt boundaries and command execution.
 __ft_prompt_start() { printf '\e]133;A\e\\'; }
-__ft_command_start() { printf '\e]133;C\e\\'; }
+__ft_command_start() { printf '\e]133;B\e\\'; printf '\e]133;C\e\\'; }
 __ft_command_end() { printf '\e]133;D;%s\e\\' "$__ft_last_exit"; }
+__ft_current_dir() { printf '\e]7;file://%s%s\e\\' "${HOST:-${HOSTNAME:-localhost}}" "$PWD"; }
 
 # Hook functions
 __ft_precmd() {
     __ft_last_exit=$?
     __ft_command_end
+    __ft_current_dir
     __ft_prompt_start
 }
 __ft_preexec() {
@@ -190,10 +195,12 @@ const FISH_OSC133_SNIPPET: &str = r"# ft: OSC 133 prompt markers for determinist
 # These markers help ft detect prompt boundaries and command execution.
 
 function __ft_prompt_start --on-event fish_prompt
+    printf '\e]7;file://%s%s\e\\' (hostname) $PWD
     printf '\e]133;A\e\\'
 end
 
 function __ft_command_start --on-event fish_preexec
+    printf '\e]133;B\e\\'
     printf '\e]133;C\e\\'
 end
 
@@ -3558,8 +3565,10 @@ return config
     fn bash_snippet_has_all_markers() {
         let snippet = ShellType::Bash.osc133_snippet();
         assert!(snippet.contains("133;A")); // prompt start
-        assert!(snippet.contains("133;C")); // command start
+        assert!(snippet.contains("133;B")); // command/input start
+        assert!(snippet.contains("133;C")); // output start
         assert!(snippet.contains("133;D")); // command end
+        assert!(snippet.contains("]7;file://")); // current working directory
         assert!(snippet.contains("__ft_precmd"));
         assert!(snippet.contains("__ft_preexec"));
     }
@@ -3567,6 +3576,9 @@ return config
     #[test]
     fn zsh_snippet_uses_hook_arrays() {
         let snippet = ShellType::Zsh.osc133_snippet();
+        assert!(snippet.contains("133;B"));
+        assert!(snippet.contains("133;C"));
+        assert!(snippet.contains("]7;file://"));
         assert!(snippet.contains("precmd_functions"));
         assert!(snippet.contains("preexec_functions"));
         // Should NOT use bash-specific PROMPT_COMMAND
@@ -3576,6 +3588,9 @@ return config
     #[test]
     fn fish_snippet_uses_events() {
         let snippet = ShellType::Fish.osc133_snippet();
+        assert!(snippet.contains("133;B"));
+        assert!(snippet.contains("133;C"));
+        assert!(snippet.contains("]7;file://"));
         assert!(snippet.contains("--on-event fish_prompt"));
         assert!(snippet.contains("--on-event fish_preexec"));
         assert!(snippet.contains("--on-event fish_postexec"));
