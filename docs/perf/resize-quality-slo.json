@@ -164,7 +164,18 @@
         "follow_up_bead": "ft-tf6g3.3.9",
         "source_bench": "crates/frankenterm-core/benches/idle_gpu.rs",
         "structured_log": "target/criterion/slo-idle_gpu.jsonl",
-        "reason": "Source bench now exists and emits a scheduler/predicate proxy evidence row; retained RCH target-run artifact and platform GPU-counter proof remain pending."
+        "reason": "Source bench now exists and emits a scheduler/predicate proxy evidence row; retained RCH target-run artifact and platform GPU-counter proof remain pending.",
+        "target_run_attempt": {
+          "classification": "platform_target_run_unavailable",
+          "platform": "gpu_counter_lab",
+          "reason": "The RCH fleet is GPU-less / headless, so no Metal (GPUCommandBuffer.GPUEndTime) or Vulkan (VK_EXT_calibrated_timestamps) GPU-counter sampling is available for a retained idle-GPU target run; RCH admission additionally refused this session (no_admissible_workers: health_below_fallback / hard_preflight / active_project_exclusion). A `-p frankenterm-core --lib` run does not satisfy this bead, and the scheduler/predicate proxy bench MUST NOT upgrade the row to retained_run_validated without sampled GPU counters.",
+          "cargo_reached": false,
+          "test_or_bench_reached": false,
+          "rch_admission": "refused_no_admissible_workers",
+          "command": "cargo bench -p frankenterm-core --bench idle_gpu",
+          "target_dir": "/tmp/ft-tf6g3-3-cc4-target",
+          "follow_up_bead": "ft-tf6g3.3.9"
+        }
       },
       "blocked_by": ["ft-tf6g3.3.9"],
       "owner_bead": "ft-tf6g3.3.9"
@@ -392,6 +403,12 @@
       "date": "2026-06-07",
       "bead": "ft-tf6g3.3.7",
       "note": "RQ-S1 resize FPS retained release evidence passed through remote RCH on vmi1153651; retained JSONL has 20 rows, all within target, with max p99 frame time 106us for the 200-pane continuous-resize workload."
+    },
+    {
+      "version": "0.1.9",
+      "date": "2026-06-14",
+      "bead": "ft-tf6g3.3",
+      "note": "RQ-S5 idle GPU retained_evidence now carries a structured target_run_attempt block (classification platform_target_run_unavailable): the RCH fleet is GPU-less so Metal/Vulkan GPU-counter sampling is unavailable, and RCH admission refused (no_admissible_workers); status stays substrate_wired_pending_rch_target_run with no validated flip. This moves the idle-GPU unavailability finding from the ft-tf6g3.3.9 triage comment into the operator-facing ledger and makes the umbrella's three unproven SLOs (RQ-S2/RQ-S3 input-to-photon, RQ-S5 idle GPU) consistently carry structured target_run_attempt evidence. Umbrella closeout still gated on a GPU-capable lab lane + RCH admission (ft-tf6g3.3.8/.3.9)."
     }
   ]
 }
