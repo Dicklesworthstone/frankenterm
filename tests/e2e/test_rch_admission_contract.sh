@@ -88,6 +88,7 @@ EXPECTED_CODES = %w[
   active_project_exclusion
   speedscore_response_shape
   dry_run_inconsistent_worker
+  worker_toolchain_missing_target
   unknown
 ].freeze
 EXPECTED_ROOT_FIELDS = %w[
@@ -160,7 +161,7 @@ EXPECTED_FUZZ_CORPUS = {
   "libtest_args" => ["-- --nocapture"],
   "malformed_quote" => ['"unterminated'],
   "non_cargo" => ["echo not cargo"],
-  "target_dir" => ["--target-dir="],
+  "target_dir" => ["--target-dir=", "--target x86_64-pc-windows-gnu"],
   "test_filter" => ["rch_admission"]
 }.freeze
 CANONICAL_BEADS_READY_COMMAND = "br ready --json --no-auto-import --no-auto-flush".freeze
@@ -349,6 +350,7 @@ fail!("doc must reject dry-run as proof") unless doc.include?("dry-run") && doc.
   command.normalized
   command.classification
   command.target_dir
+  target_triple
   cargo_jobs
   estimated_slots
   selected_worker
@@ -414,6 +416,7 @@ end
   selected_worker
   worker_slots_available
   --exclude
+  --target
   --target-dir
   CARGO_BUILD_JOBS
   malformed_quote

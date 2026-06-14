@@ -1,1 +1,1 @@
-cargo test --target-dir=/tmp/ft-proof --workspace rch_admission
+cargo test --target-dir=/tmp/ft-proof --target x86_64-pc-windows-gnu --workspace rch_admission

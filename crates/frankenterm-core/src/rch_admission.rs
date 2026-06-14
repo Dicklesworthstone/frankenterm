@@ -25,6 +25,7 @@ pub enum RchAdmissionReasonCode {
     ActiveProjectExclusion,
     SpeedscoreResponseShape,
     DryRunInconsistentWorker,
+    WorkerToolchainMissingTarget,
     Unknown,
 }
 
@@ -54,13 +55,19 @@ impl RchAdmissionReasonCode {
             Self::DryRunInconsistentWorker => {
                 "Preserve the inconsistent dry-run envelope and treat it as advisory only."
             }
+            Self::WorkerToolchainMissingTarget => {
+                "Keep the proof bead blocked until the selected worker has the requested Rust target or is quarantined for that target."
+            }
             Self::Unknown => "Retain the artifact and file or update a Beads diagnosis.",
         }
     }
 
     #[must_use]
     pub fn operator_approval_required(self) -> bool {
-        matches!(self, Self::LocalEnoSpace | Self::CriticalPressure)
+        matches!(
+            self,
+            Self::LocalEnoSpace | Self::CriticalPressure | Self::WorkerToolchainMissingTarget
+        )
     }
 
     #[must_use]
@@ -73,6 +80,7 @@ impl RchAdmissionReasonCode {
                 | Self::InsufficientSlots
                 | Self::ActiveProjectExclusion
                 | Self::DryRunInconsistentWorker
+                | Self::WorkerToolchainMissingTarget
         )
     }
 }
@@ -221,6 +229,7 @@ pub struct RchAdmissionCargoCommandAnalysis {
     pub classification: String,
     pub would_intercept: bool,
     pub target_dir: Option<String>,
+    pub target_triple: Option<String>,
     pub cargo_subcommand: Option<String>,
     pub package_scope: Vec<String>,
     pub test_scope: Vec<String>,
@@ -290,6 +299,7 @@ where
             classification: "non_cargo".to_string(),
             would_intercept: false,
             target_dir: env_value(&command_env, "CARGO_TARGET_DIR"),
+            target_triple: None,
             cargo_subcommand: None,
             package_scope: Vec::new(),
             test_scope: Vec::new(),
@@ -311,6 +321,7 @@ where
     let mut test_scope = Vec::new();
     let mut jobs_flag = None;
     let mut target_dir = env_value(&command_env, "CARGO_TARGET_DIR");
+    let mut target_triple = None;
     let mut i = 1;
     let mut after_double_dash = false;
 
@@ -343,6 +354,19 @@ where
                 .and_then(|value| parse_positive_u32(value))
             {
                 jobs_flag = Some(value);
+            }
+            i += 2;
+            continue;
+        }
+
+        if let Some(value) = word.strip_prefix("--target=") {
+            target_triple = Some(nonempty_string(value, "unknown"));
+            i += 1;
+            continue;
+        }
+        if word == "--target" {
+            if let Some(value) = cargo_words.get(i + 1) {
+                target_triple = Some(nonempty_string(value.as_str(), "unknown"));
             }
             i += 2;
             continue;
@@ -433,6 +457,7 @@ where
         &package_scope,
         &test_scope,
         target_dir.as_deref(),
+        target_triple.as_deref(),
     );
 
     RchAdmissionCargoCommandAnalysis {
@@ -441,6 +466,7 @@ where
         classification,
         would_intercept: true,
         target_dir,
+        target_triple,
         cargo_subcommand,
         package_scope,
         test_scope,
@@ -1115,6 +1141,16 @@ fn reason_codes_from_error_category(error_category: &str) -> Vec<RchAdmissionRea
     if normalized.contains("dry_run") && normalized.contains("worker") {
         reason_codes.push(RchAdmissionReasonCode::DryRunInconsistentWorker);
     }
+    if normalized.contains("worker_toolchain_missing_target")
+        || normalized.contains("missing_target_stdlib")
+        || normalized.contains("target may not be installed")
+        || normalized.contains("rustup target add")
+        || normalized.contains("error[e0463]")
+        || (normalized.contains("can't find crate for")
+            && (normalized.contains("`core`") || normalized.contains(" core")))
+    {
+        reason_codes.push(RchAdmissionReasonCode::WorkerToolchainMissingTarget);
+    }
     reason_codes
 }
 
@@ -1266,6 +1302,7 @@ fn cargo_analysis_explanation(
     package_scope: &[String],
     test_scope: &[String],
     target_dir: Option<&str>,
+    target_triple: Option<&str>,
 ) -> String {
     let job_phrase = if let Some(explicit_jobs) = explicit_jobs {
         format!(
@@ -1301,9 +1338,13 @@ fn cargo_analysis_explanation(
         || "target_dir=unspecified".to_string(),
         |target_dir| format!("target_dir={target_dir}"),
     );
+    let target_triple_phrase = target_triple.map_or_else(
+        || "target_triple=unspecified".to_string(),
+        |target_triple| format!("target_triple={target_triple}"),
+    );
 
     format!(
-        "{job_phrase}; estimated_slots={estimated_slots}; {selector_phrase}; {mismatch_phrase}; {package_phrase}; {test_phrase}; {target_phrase}"
+        "{job_phrase}; estimated_slots={estimated_slots}; {selector_phrase}; {mismatch_phrase}; {package_phrase}; {test_phrase}; {target_phrase}; {target_triple_phrase}"
     )
 }
 
@@ -1343,9 +1384,11 @@ mod tests {
         );
         assert!(analysis.slot_estimate_mismatch);
         assert!(analysis.explanation.contains("explicit cargo job count 1"));
-        assert!(analysis
-            .explanation
-            .contains("installed_selector_estimated_slots=4"));
+        assert!(
+            analysis
+                .explanation
+                .contains("installed_selector_estimated_slots=4")
+        );
         assert!(analysis.explanation.contains("slot_estimate_mismatch=true"));
     }
 
@@ -1366,12 +1409,16 @@ mod tests {
     #[test]
     fn cargo_command_analysis_honors_env_jobs_and_target_dir_flag() {
         let analysis = analyze_rch_admission_cargo_command(
-            "cargo check -p mux --target-dir /tmp/target-rch --all-targets",
+            "cargo check -p mux --target x86_64-pc-windows-gnu --target-dir /tmp/target-rch --all-targets",
             [("CARGO_BUILD_JOBS", "2")],
             Some(2),
         );
 
         assert_eq!(analysis.classification, "cargo_check");
+        assert_eq!(
+            analysis.target_triple.as_deref(),
+            Some("x86_64-pc-windows-gnu")
+        );
         assert_eq!(analysis.target_dir.as_deref(), Some("/tmp/target-rch"));
         assert_eq!(analysis.package_scope, vec![String::from("mux")]);
         assert!(analysis.test_scope.is_empty());
@@ -1383,6 +1430,11 @@ mod tests {
         assert_eq!(analysis.estimated_slots, 2);
         assert!(!analysis.slot_estimate_mismatch);
         assert!(analysis.explanation.contains("explicit cargo job count 2"));
+        assert!(
+            analysis
+                .explanation
+                .contains("target_triple=x86_64-pc-windows-gnu")
+        );
     }
 
     #[test]
@@ -1469,12 +1521,16 @@ mod tests {
             ]
         );
         assert!(report.advisory_only);
-        assert!(report
-            .forbidden_actions
-            .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof));
-        assert!(report
-            .forbidden_actions
-            .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval));
+        assert!(
+            report
+                .forbidden_actions
+                .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof)
+        );
+        assert!(
+            report
+                .forbidden_actions
+                .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval)
+        );
         assert!(report.recommendations[0].operator_approval_required);
     }
 
@@ -1499,11 +1555,17 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::LocalEnoSpace));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::LocalEnoSpace)
+        );
         assert_eq!(report.citations.len(), 1);
-        let citation = &report.citations[0];
+        let citation = report.citations.first();
+        assert!(citation.is_some(), "expected local disk citation");
+        let Some(citation) = citation else {
+            return;
+        };
         assert_eq!(citation.kind, RchAdmissionCitationKind::CommandOutput);
         assert_eq!(citation.path.as_deref(), Some("/System/Volumes/Data"));
         assert!(citation.summary.contains("df -h /System/Volumes/Data"));
@@ -1530,12 +1592,16 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
     }
 
     #[test]
@@ -1563,15 +1629,65 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::TelemetryGap));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::TelemetryGap)
+        );
+    }
+
+    #[test]
+    fn missing_worker_target_stdlib_normalizes_to_toolchain_reason() {
+        let input = RchAdmissionCollectorInput::new(
+            1_779_013_898_000,
+            "test.missing_worker_target",
+            RchAdmissionCommandDiagnostic::new(
+                "rch exec -- cargo check -p window --lib --target x86_64-pc-windows-gnu",
+            )
+            .normalized("cargo check -p window --lib --target x86_64-pc-windows-gnu")
+            .classification("cargo_check")
+            .would_intercept(true)
+            .target_dir("/tmp/ft-window-target"),
+        )
+        .with_collector_observation(
+            RchAdmissionCollectorObservation::new(
+                "rch.remote.cargo_stderr",
+                "rch exec -- cargo check -p window --lib --target x86_64-pc-windows-gnu",
+                "remote Cargo failed before crate checking because the worker is missing the requested Rust target",
+            )
+            .error_category(
+                "error[E0463]: can't find crate for `core`; note: the x86_64-pc-windows-gnu target may not be installed; help: rustup target add x86_64-pc-windows-gnu",
+            ),
+        );
+
+        let report = build_rch_admission_report(&input);
+
+        assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::WorkerToolchainMissingTarget)
+        );
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .find(|recommendation| {
+                    recommendation.reason_code
+                        == RchAdmissionReasonCode::WorkerToolchainMissingTarget
+                })
+                .is_some_and(|recommendation| recommendation.operator_approval_required)
+        );
     }
 
     #[test]
@@ -1602,15 +1718,21 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::ActiveProjectExclusion));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::ActiveProjectExclusion)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
         assert_eq!(
             report.worker_rejections[0].worker.as_deref(),
             Some("vmi1149989")
@@ -1689,12 +1811,16 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Runnable);
-        assert!(!report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::InsufficientSlots));
-        assert!(!report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(
+            !report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::InsufficientSlots)
+        );
+        assert!(
+            !report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
         assert_eq!(
             report.rch_queue.selected_worker.as_deref(),
             Some("vmi1264463")
@@ -1724,9 +1850,11 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::InsufficientSlots));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::InsufficientSlots)
+        );
     }
 
     #[test]
@@ -1754,17 +1882,23 @@ mod tests {
 
         assert_eq!(report.beads.active_bead.as_deref(), Some("ft-69gwh.2"));
         assert_eq!(report.beads.blocking_beads, vec!["ft-4tp7g"]);
-        assert!(report
-            .citations
-            .iter()
-            .any(|citation| citation.summary.contains("ready bead ft-69gwh.3")));
-        assert!(report
-            .citations
-            .iter()
-            .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1")));
-        assert!(report
-            .citations
-            .iter()
-            .any(|citation| citation.summary.contains("git status reported M")));
+        assert!(
+            report
+                .citations
+                .iter()
+                .any(|citation| citation.summary.contains("ready bead ft-69gwh.3"))
+        );
+        assert!(
+            report
+                .citations
+                .iter()
+                .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1"))
+        );
+        assert!(
+            report
+                .citations
+                .iter()
+                .any(|citation| citation.summary.contains("git status reported M"))
+        );
     }
 }

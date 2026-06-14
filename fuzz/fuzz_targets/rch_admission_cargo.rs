@@ -2,12 +2,11 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use frankenterm_core::rch_admission::{
-    analyze_rch_admission_cargo_command, build_rch_admission_report,
     RchAdmissionAgentMailDiagnostic, RchAdmissionCargoCommandAnalysis, RchAdmissionCollectorInput,
     RchAdmissionCollectorObservation, RchAdmissionCommandDiagnostic,
     RchAdmissionLocalDiskDiagnostic, RchAdmissionProbeDiagnostic, RchAdmissionProofStatus,
     RchAdmissionQueueDiagnostic, RchAdmissionReasonCode, RchAdmissionSeverity,
-    RchAdmissionWorkerRejection,
+    RchAdmissionWorkerRejection, analyze_rch_admission_cargo_command, build_rch_admission_report,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -36,6 +35,7 @@ enum CommandInput<'a> {
         subcommand: CargoSubcommand,
         jobs: JobsInput,
         target_dir: OptionalText<'a>,
+        target_triple: OptionalText<'a>,
         packages: Vec<TextInput<'a>>,
         excludes: Vec<TextInput<'a>>,
         test_filters: Vec<TextInput<'a>>,
@@ -113,6 +113,7 @@ enum ReasonInput {
     ActiveProjectExclusion,
     SpeedscoreResponseShape,
     DryRunInconsistentWorker,
+    WorkerToolchainMissingTarget,
     Unknown,
 }
 
@@ -206,6 +207,7 @@ impl<'a> CommandInput<'a> {
                 subcommand,
                 jobs,
                 target_dir,
+                target_triple,
                 packages,
                 excludes,
                 test_filters,
@@ -220,6 +222,10 @@ impl<'a> CommandInput<'a> {
                 if let Some(target_dir) = target_dir.value("target-rch") {
                     parts.push("--target-dir".to_string());
                     parts.push(target_dir);
+                }
+                if let Some(target_triple) = target_triple.value("x86_64-pc-windows-gnu") {
+                    parts.push("--target".to_string());
+                    parts.push(target_triple);
                 }
                 for package in packages.into_iter().take(MAX_ITEMS) {
                     parts.push("-p".to_string());
@@ -380,6 +386,9 @@ impl ReasonInput {
             Self::ActiveProjectExclusion => RchAdmissionReasonCode::ActiveProjectExclusion,
             Self::SpeedscoreResponseShape => RchAdmissionReasonCode::SpeedscoreResponseShape,
             Self::DryRunInconsistentWorker => RchAdmissionReasonCode::DryRunInconsistentWorker,
+            Self::WorkerToolchainMissingTarget => {
+                RchAdmissionReasonCode::WorkerToolchainMissingTarget
+            }
             Self::Unknown => RchAdmissionReasonCode::Unknown,
         }
     }
@@ -394,6 +403,9 @@ impl ReasonInput {
             Self::ActiveProjectExclusion => "active_project_exclusion",
             Self::SpeedscoreResponseShape => "speedscore response_shape",
             Self::DryRunInconsistentWorker => "dry_run inconsistent worker",
+            Self::WorkerToolchainMissingTarget => {
+                "error[E0463]: can't find crate for `core`; target may not be installed; rustup target add x86_64-pc-windows-gnu"
+            }
             Self::Unknown => "unclassified",
         }
         .to_string()
@@ -479,10 +491,12 @@ fn assert_analysis_invariants(analysis: &RchAdmissionCargoCommandAnalysis) {
     assert!(!analysis.explanation.is_empty());
     let diagnostic = analysis.command_diagnostic();
     assert!(!diagnostic.raw.is_empty());
-    assert!(diagnostic
-        .classification
-        .as_deref()
-        .is_some_and(|classification| !classification.is_empty()));
+    assert!(
+        diagnostic
+            .classification
+            .as_deref()
+            .is_some_and(|classification| !classification.is_empty())
+    );
 }
 
 fn assert_report_invariants(

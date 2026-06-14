@@ -128,6 +128,7 @@
         "active_project_exclusion",
         "speedscore_response_shape",
         "dry_run_inconsistent_worker",
+        "worker_toolchain_missing_target",
         "unknown"
       ]
     },

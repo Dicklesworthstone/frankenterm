@@ -42,6 +42,7 @@ The schema lives at `docs/json-schema/ft-rch-admission.json` and uses
 | `active_project_exclusion` | Same-project RCH active build excludes another proof lane. | Wait for that build or use Beads/Agent Mail to coordinate ownership. |
 | `speedscore_response_shape` | SpeedScore or related RCH API response shape failed parsing. | Treat ranking data as unavailable and rely on stable worker/status evidence. |
 | `dry_run_inconsistent_worker` | Dry-run envelope claims worker availability while selected worker is null or skipped. | Preserve both fields and classify the result as advisory/inconclusive. |
+| `worker_toolchain_missing_target` | A remote worker was selected, but Cargo failed before crate checking because the requested Rust target stdlib is not installed on that worker. | Keep the proof bead blocked until an operator installs the target or quarantines that worker for the target; do not retry locally. |
 | `unknown` | The blocker is real but does not fit a stable code yet. | File or update a bead with the retained artifact and propose a new code. |
 
 Installed RCH versions may surface lower-level pressure strings before the
@@ -50,8 +51,11 @@ contract can receive structured selector diagnostics. The normalizer treats
 `disk_free_below_critical_gb`, `disk_ratio_below_critical`, and
 `disk_critical_without_fresh_telemetry` as `critical_pressure`; and
 `disk_metrics_unavailable` or `disk_critical_without_fresh_telemetry` as
-`telemetry_gap`. These aliases are still advisory evidence, not proof that
-Cargo, rustc, or a test binary ran.
+`telemetry_gap`. A selected-worker Cargo failure containing `error[E0463]`,
+`can't find crate for core`, `target may not be installed`, or
+`rustup target add` normalizes to `worker_toolchain_missing_target`. These
+aliases are still advisory evidence, not proof that Cargo, rustc, or a test
+binary ran.
 
 ## Forbidden Actions
 
@@ -159,6 +163,7 @@ surface:
 | `command.normalized` | The `cargo ...` suffix after wrappers such as `RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec --` or `env`. |
 | `command.classification` | Cargo subcommand family such as `cargo_test`, `cargo_check`, `cargo_clippy`, or `cargo_build`. |
 | `command.target_dir` | `CARGO_TARGET_DIR`, `--target-dir VALUE`, or `--target-dir=VALUE`. |
+| `target_triple` | The citation summary records `--target VALUE` or `--target=VALUE`; v1 keeps this in citations rather than adding a new serialized command field. |
 | `cargo_jobs` | Explicit `cargo -j`, `cargo --jobs`, or `CARGO_BUILD_JOBS` value when present. |
 | `estimated_slots` | The explicit job count when present; otherwise the installed selector estimate when supplied, falling back to one advisory slot. |
 | `citations` | A summary explaining explicit versus inferred job count, package scope, test scope, target dir, installed selector estimate, and whether the selector estimate mismatched the explicit command. |
@@ -171,13 +176,19 @@ sets `slot_estimate_mismatch=true` in the citation summary. That mismatch is
 evidence for humans and follow-up beads; it is not by itself compiled proof and
 must not be cited as a Cargo result.
 
+Target triples are parsed for explanation because target-specific proof lanes
+can fail in worker toolchain preflight even after RCH selects a worker. A
+selected worker missing `x86_64-pc-windows-gnu` or another requested stdlib is a
+blocked RCH/toolchain condition, not evidence that FrankenTerm source failed to
+compile.
+
 ## Fuzz Target Coverage
 
 `fuzz/fuzz_targets/rch_admission_cargo.rs` is the coverage-guided harness for
 the pure Cargo command analyzer and v1 report normalization path. It exercises
 `analyze_rch_admission_cargo_command`, `build_rch_admission_report`, reason-code
-normalization, queue diagnostic inputs, explicit job parsing, target-dir
-parsing, package/exclude handling, test-filter handling, libtest argument
+normalization, queue diagnostic inputs, explicit job parsing, target-dir and
+target-triple parsing, package/exclude handling, test-filter handling, libtest argument
 handling, malformed quoting, and non-Cargo command classification. Like the core
 normalizer, the fuzz target must not shell out, run Cargo as proof, restart
 services, mutate RCH workers, write Beads state, or delete files.
@@ -192,7 +203,7 @@ below:
 | `non_cargo` | A command outside Cargo that still contains the word cargo in text. |
 | `inline_env` | `rch ... env` wrapping with `CARGO_BUILD_JOBS` and `CARGO_TARGET_DIR`. |
 | `jobs_forms` | `-j`, `--jobs=N`, and `--jobs N` forms. |
-| `target_dir` | `--target-dir=VALUE` parsing. |
+| `target_dir` | `--target-dir=VALUE` plus `--target VALUE` parsing. |
 | `exclude_not_filter` | `--exclude` values are package exclusions, not test filters. |
 | `test_filter` | Positional `cargo test` filters remain test scope. |
 | `libtest_args` | Arguments after `--` stay out of Cargo package/test classification. |
