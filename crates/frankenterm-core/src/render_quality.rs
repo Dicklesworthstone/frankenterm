@@ -462,6 +462,12 @@ pub const RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI: &str =
 pub const RENDERER_SSIM_PARITY_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/ssim_parity";
 /// Current non-claiming status for the input-to-photon SLO substrate.
 pub const RENDERER_INPUT_TO_PHOTON_STATUS: &str = "stage_telemetry_substrate_wired_pending_lab_run";
+/// Retained-evidence ledger status for the input-to-photon SLOs.
+pub const RENDERER_INPUT_TO_PHOTON_RETAINED_EVIDENCE_STATUS: &str =
+    "substrate_only_pending_lab_run";
+/// Gap-evidence artifact for input-to-photon until a retained lab run lands.
+pub const RENDERER_INPUT_TO_PHOTON_GAP_EVIDENCE: &str =
+    "docs/attestations/perf/lindley-bounds.json";
 /// Current status for the SSIM parity SLO substrate.
 pub const RENDERER_SSIM_PARITY_STATUS: &str = "ssim_oracle_corpus_retained_release_run_validated";
 /// Current degradation state for the SSIM parity SLO substrate.
@@ -504,6 +510,11 @@ pub const RENDERER_ATLAS_STABILITY_STATUS: &str =
     "evict_recover_harness_retained_jsonl_pending_suite_attestation";
 /// Current non-claiming status for the idle-GPU-power SLO substrate.
 pub const RENDERER_IDLE_GPU_POWER_STATUS: &str = "power_sampler_pending_target_run";
+/// Retained-evidence ledger status for idle-GPU-power until target proof lands.
+pub const RENDERER_IDLE_GPU_POWER_RETAINED_EVIDENCE_STATUS: &str =
+    "substrate_wired_pending_rch_target_run";
+/// Structured-log path emitted by the idle-GPU-power Criterion substrate.
+pub const RENDERER_IDLE_GPU_POWER_STRUCTURED_LOG: &str = "target/criterion/slo-idle_gpu.jsonl";
 /// Real input-to-photon harness path retained in the SLO attestation ledger.
 pub const RENDERER_INPUT_TO_PHOTON_SOURCE_BENCH: &str =
     "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs";
@@ -544,6 +555,8 @@ pub struct RendererInputToPhotonSloStatus {
     pub max_instrumentation_overhead_pct: u64,
     pub source_bench: String,
     pub structured_log_template: String,
+    pub retained_evidence_status: String,
+    pub gap_evidence: String,
     pub mcp_resource_uri: String,
     pub degradation_states: Vec<String>,
     pub pending_reason: String,
@@ -618,6 +631,8 @@ pub struct RendererIdleGpuPowerSloStatus {
     /// Published metric (e.g. `median_watts`).
     pub metric: String,
     pub source_bench: String,
+    pub structured_log: String,
+    pub retained_evidence_status: String,
     pub mcp_resource_uri: String,
     pub degradation_states: Vec<String>,
     pub pending_reason: String,
@@ -642,6 +657,9 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
             source_bench: RENDERER_INPUT_TO_PHOTON_SOURCE_BENCH.to_string(),
             structured_log_template: "target/criterion/slo-input_to_photon_<platform>.jsonl"
                 .to_string(),
+            retained_evidence_status: RENDERER_INPUT_TO_PHOTON_RETAINED_EVIDENCE_STATUS
+                .to_string(),
+            gap_evidence: RENDERER_INPUT_TO_PHOTON_GAP_EVIDENCE.to_string(),
             mcp_resource_uri: RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI.to_string(),
             degradation_states: vec![
                 "instrumentation_unavailable".to_string(),
@@ -723,6 +741,8 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
             linux_samplers: vec!["intel_gpu_top".to_string(), "amdgpu_top".to_string()],
             metric: "median_watts".to_string(),
             source_bench: RENDERER_IDLE_GPU_POWER_SOURCE_BENCH.to_string(),
+            structured_log: RENDERER_IDLE_GPU_POWER_STRUCTURED_LOG.to_string(),
+            retained_evidence_status: RENDERER_IDLE_GPU_POWER_RETAINED_EVIDENCE_STATUS.to_string(),
             mcp_resource_uri: RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI.to_string(),
             degradation_states: vec![
                 "power_sampler_unavailable".to_string(),
@@ -977,6 +997,14 @@ mod tests {
             report.input_to_photon.source_bench,
             RENDERER_INPUT_TO_PHOTON_SOURCE_BENCH
         );
+        assert_eq!(
+            report.input_to_photon.retained_evidence_status,
+            RENDERER_INPUT_TO_PHOTON_RETAINED_EVIDENCE_STATUS
+        );
+        assert_eq!(
+            report.input_to_photon.gap_evidence,
+            RENDERER_INPUT_TO_PHOTON_GAP_EVIDENCE
+        );
         assert!(
             report
                 .input_to_photon
@@ -1012,6 +1040,22 @@ mod tests {
             "input-to-photon must NOT claim a validated p95 bound without a retained target-run \
              artifact (RQ-S2/RQ-S3 are blocked on an admissible GPU lab host): \
              {RENDERER_INPUT_TO_PHOTON_STATUS}"
+        );
+        assert_eq!(
+            report.input_to_photon.retained_evidence_status,
+            RENDERER_INPUT_TO_PHOTON_RETAINED_EVIDENCE_STATUS
+        );
+        assert!(
+            report
+                .input_to_photon
+                .retained_evidence_status
+                .contains("pending_lab_run"),
+            "input-to-photon retained evidence must stay pending until ft-tf6g3.3.8 lands: {}",
+            report.input_to_photon.retained_evidence_status
+        );
+        assert_eq!(
+            report.input_to_photon.gap_evidence,
+            "docs/attestations/perf/lindley-bounds.json"
         );
         // The pending reason must surface the outstanding target-run
         // gap rather than implying coverage exists.
@@ -1156,6 +1200,15 @@ mod tests {
         assert!(slo.macos_sampler.contains("powermetrics"));
         assert!(slo.linux_samplers.iter().any(|s| s == "intel_gpu_top"));
         assert_eq!(slo.source_bench, RENDERER_IDLE_GPU_POWER_SOURCE_BENCH);
+        assert_eq!(slo.structured_log, RENDERER_IDLE_GPU_POWER_STRUCTURED_LOG);
+        assert_eq!(
+            slo.retained_evidence_status,
+            RENDERER_IDLE_GPU_POWER_RETAINED_EVIDENCE_STATUS
+        );
+        assert!(
+            slo.retained_evidence_status
+                .contains("pending_rch_target_run")
+        );
         assert_eq!(
             slo.mcp_resource_uri,
             RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI
