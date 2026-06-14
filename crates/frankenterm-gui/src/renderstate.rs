@@ -13,6 +13,7 @@ use ::window::*;
 use anyhow::Context;
 use frankenterm_core::{atlas_tier_doctor::TierSwapDoctorReport, atlas_tiered_swap::MemoryBudget};
 use frankenterm_font::FontConfiguration;
+use frankenterm_gui::owner_last_guard::OwnerLastGuardedMapping;
 use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryInto;
 use std::rc::Rc;
@@ -243,7 +244,7 @@ impl MappedVertexBuffer {
         match self {
             Self::Glium(g) => &mut g.mapping[range],
             Self::WebGpu(g) => {
-                let mapping: &mut [Vertex] = bytemuck::cast_slice_mut(&mut g.mapping);
+                let mapping: &mut [Vertex] = bytemuck::cast_slice_mut(g.parts.mapping_mut());
                 &mut mapping[range]
             }
         }
@@ -257,11 +258,13 @@ pub struct MappedQuads<'a> {
 }
 
 pub struct WebGpuMappedVertexBuffer {
-    mapping: wgpu::BufferViewMut<'static>,
-    // Owner mapping, must be dropped after mapping.
-    _slice: wgpu::BufferSlice<'static>,
-    // Drop the vertex buffer owner after the mapped view and slice.
-    _owner: RefMut<'static, VertexBuffer>,
+    // The mapped range and slice borrow from the vertex-buffer owner. Keep the
+    // owner alive until both derived WebGPU views are dropped.
+    parts: OwnerLastGuardedMapping<
+        wgpu::BufferViewMut<'static>,
+        wgpu::BufferSlice<'static>,
+        RefMut<'static, VertexBuffer>,
+    >,
 }
 
 pub struct WebGpuVertexBuffer {
@@ -487,9 +490,7 @@ impl TripleVertexBuffer {
                 let mapping = slice.get_mapped_range_mut();
 
                 MappedVertexBuffer::WebGpu(WebGpuMappedVertexBuffer {
-                    mapping,
-                    _slice: slice,
-                    _owner: bufs,
+                    parts: OwnerLastGuardedMapping::new(mapping, slice, bufs),
                 })
             }
         };

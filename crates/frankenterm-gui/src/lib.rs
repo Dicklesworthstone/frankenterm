@@ -44,6 +44,87 @@ pub fn checked_stable_row_range_from_top(
     Some(top..end)
 }
 
+#[doc(hidden)]
+pub mod owner_last_guard {
+    use std::mem::ManuallyDrop;
+
+    pub struct OwnerLastGuardedMapping<M, S, O> {
+        mapping: ManuallyDrop<M>,
+        slice: ManuallyDrop<S>,
+        owner: ManuallyDrop<O>,
+    }
+
+    impl<M, S, O> OwnerLastGuardedMapping<M, S, O> {
+        pub fn new(mapping: M, slice: S, owner: O) -> Self {
+            Self {
+                mapping: ManuallyDrop::new(mapping),
+                slice: ManuallyDrop::new(slice),
+                owner: ManuallyDrop::new(owner),
+            }
+        }
+
+        pub fn mapping_mut(&mut self) -> &mut M {
+            &mut self.mapping
+        }
+    }
+
+    impl<M, S, O> Drop for OwnerLastGuardedMapping<M, S, O> {
+        fn drop(&mut self) {
+            unsafe {
+                // SAFETY: each field is wrapped in ManuallyDrop and is dropped exactly
+                // once here, in dependency order, so derived views go away before owner.
+                ManuallyDrop::drop(&mut self.mapping);
+                ManuallyDrop::drop(&mut self.slice);
+                ManuallyDrop::drop(&mut self.owner);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::OwnerLastGuardedMapping;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct DropProbe {
+            name: &'static str,
+            log: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl DropProbe {
+            fn new(name: &'static str, log: &Rc<RefCell<Vec<&'static str>>>) -> Self {
+                Self {
+                    name,
+                    log: Rc::clone(log),
+                }
+            }
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.log.borrow_mut().push(self.name);
+            }
+        }
+
+        #[test]
+        fn drops_derived_mapping_and_slice_before_owner() {
+            let log = Rc::new(RefCell::new(Vec::new()));
+
+            {
+                let mut guard = OwnerLastGuardedMapping::new(
+                    DropProbe::new("mapping", &log),
+                    DropProbe::new("slice", &log),
+                    DropProbe::new("owner", &log),
+                );
+
+                assert_eq!(guard.mapping_mut().name, "mapping");
+            }
+
+            assert_eq!(&*log.borrow(), &["mapping", "slice", "owner"]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod selection_lifecycle_tests {
     use super::{
@@ -712,12 +793,14 @@ pub mod gui_debug_log {
             let _guard = lock_test();
             reset_for_tests();
 
-            let handle = std::thread::spawn(|| {
-                let _guard = ENTRIES.lock().unwrap();
-                panic!("simulate GUI debug log poison");
+            let poison_result = std::panic::catch_unwind(|| {
+                let _guard = ENTRIES
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::panic::resume_unwind(Box::new("simulate GUI debug log poison"));
             });
 
-            assert!(handle.join().is_err());
+            assert!(poison_result.is_err());
 
             let sequence = record(Level::Error, "test", "after poison");
             let entries = entries_after(None);
