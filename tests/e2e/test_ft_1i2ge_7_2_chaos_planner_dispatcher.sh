@@ -47,6 +47,13 @@ if [[ ${chaos_rc} -ne 0 ]]; then
   echo "  See: ${chaos_log}"
   exit 1
 fi
+chaos_pass_count="$(awk '/^test .+ \.\.\. ok$/ { count++ } END { print count + 0 }' "${chaos_log}")"
+if [[ "${chaos_pass_count}" -lt 24 ]]; then
+  echo "FAIL: chaos planner+dispatcher pass-count threshold not met (expected >= 24, got ${chaos_pass_count})" >&2
+  echo "  See: ${chaos_log}"
+  exit 1
+fi
+echo "PASS: chaos planner+dispatcher pass-count ${chaos_pass_count}/24"
 echo ""
 
 # Step 2: Regression check against tx_e2e_scenario_matrix
