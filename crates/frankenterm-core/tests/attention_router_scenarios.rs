@@ -86,18 +86,32 @@ struct ScenarioDecisionRecord {
     schema_version: u32,
     scenario_id: String,
     source_count: usize,
+    // `#[serde(default)]` on the collection/option/bool fields keeps the strict
+    // TOON-equivalent round-trip robust: a compact renderer may legitimately
+    // omit an empty array, a `false` boolean, or a null option. Genuine data
+    // loss is still caught because the decoded records are compared field-for-
+    // field against the source records below.
+    #[serde(default)]
     retained_source_ids: Vec<String>,
+    #[serde(default)]
     evidence_source_ids: Vec<String>,
     classification: AttentionRouterClassification,
     recommended_safe_action: AttentionRouterSafeAction,
     confidence: AttentionRouterConfidence,
     nudge_kind: AttentionRouterNudgeKind,
+    #[serde(default)]
     reason_codes: Vec<String>,
+    #[serde(default)]
     engine_forbidden_actions: Vec<String>,
+    #[serde(default)]
     inventory_forbidden_actions: Vec<String>,
+    #[serde(default)]
     volatility_level: Option<u8>,
+    #[serde(default)]
     side_effects_executed: bool,
+    #[serde(default)]
     action_mutates: bool,
+    #[serde(default)]
     nudge_mutates: bool,
 }
 
@@ -422,6 +436,46 @@ fn sorted_unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// Canonicalize a TOON-decoded JSON value by collapsing integral floating-point
+/// numbers back into integer JSON numbers.
+///
+/// TOON renders every JSON number through a floating-point model, so an integer
+/// field such as `schema_version: 1` decodes as `1.0`. `serde_json` refuses to
+/// deserialize `1.0` into a `u32`/`usize`/`u8`, so the strict typed round-trip
+/// needs a documented TOON-equivalent normalization. This collapse is lossless
+/// for `ScenarioDecisionRecord` because every one of its numeric fields
+/// (`schema_version`, `source_count`, `volatility_level`) holds an integer.
+fn normalize_integral_floats(value: &mut Value) {
+    match value {
+        Value::Number(number) => {
+            // Only rewrite genuine floats; a number that already round-trips as
+            // an integer is left untouched.
+            if number.as_u64().is_none() && number.as_i64().is_none() {
+                if let Some(float) = number.as_f64() {
+                    if float.is_finite() && float.fract() == 0.0 {
+                        *value = if float >= 0.0 {
+                            Value::Number((float as u64).into())
+                        } else {
+                            Value::Number((float as i64).into())
+                        };
+                    }
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_integral_floats(item);
+            }
+        }
+        Value::Object(map) => {
+            for (_key, child) in map {
+                normalize_integral_floats(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn matching_decision_item<'a>(
     scenario: &Scenario,
     items: &'a [AttentionRouterItem],
@@ -664,13 +718,16 @@ fn every_scenario_executes_through_engine_json_and_toon_goldens() {
     let decoded_json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
     let decoded_value: Value =
         serde_json::from_str(&decoded_json).expect("decoded TOON is valid JSON");
-    let toon_records: Vec<ScenarioDecisionRecord> = serde_json::from_value(
-        decoded_value
-            .get("records")
-            .cloned()
-            .expect("TOON-equivalent wrapper contains records"),
-    )
-    .expect("TOON-equivalent records deserialize");
+    let mut toon_records_value = decoded_value
+        .get("records")
+        .cloned()
+        .expect("TOON-equivalent wrapper contains records");
+    // Apply the documented TOON-equivalent normalization (integral floats ->
+    // integers) before strict typed deserialization. See
+    // `normalize_integral_floats` for why this is lossless here.
+    normalize_integral_floats(&mut toon_records_value);
+    let toon_records: Vec<ScenarioDecisionRecord> =
+        serde_json::from_value(toon_records_value).expect("TOON-equivalent records deserialize");
     assert_eq!(
         toon_records, records,
         "TOON-equivalent rendering must preserve scenario records"
