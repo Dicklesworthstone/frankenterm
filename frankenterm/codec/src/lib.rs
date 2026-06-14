@@ -95,17 +95,14 @@ pub struct CorruptResponse(String);
 
 /// Returns the encoded length of the leb128 representation of value
 fn encoded_length(value: u64) -> usize {
-    struct NullWrite {}
-    impl std::io::Write for NullWrite {
-        fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, std::io::Error> {
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::result::Result<(), std::io::Error> {
-            Ok(())
-        }
+    let mut len = 1;
+    let mut remaining = value >> 7;
+    while remaining != 0 {
+        len += 1;
+        remaining >>= 7;
     }
 
-    leb128::write::unsigned(&mut NullWrite {}, value).unwrap()
+    len
 }
 
 const COMPRESSED_MASK: u64 = 1 << 63;
@@ -114,6 +111,13 @@ const COMPRESSED_MASK: u64 = 1 << 63;
 const MAX_PDU_SIZE: usize = 256 * 1024 * 1024;
 const PAYLOAD_READ_CHUNK: usize = 64 * 1024;
 
+fn max_pdu_read_limit() -> anyhow::Result<u64> {
+    u64::try_from(MAX_PDU_SIZE)
+        .context("MAX_PDU_SIZE does not fit in u64")?
+        .checked_add(1)
+        .context("MAX_PDU_SIZE read limit overflow")
+}
+
 fn encode_raw_as_vec(
     ident: u64,
     serial: u64,
@@ -121,16 +125,20 @@ fn encode_raw_as_vec(
     is_compressed: bool,
 ) -> anyhow::Result<Vec<u8>> {
     let len = data.len() + encoded_length(ident) + encoded_length(serial);
+    let len_u64 = u64::try_from(len).context("encoded PDU length does not fit in u64")?;
     let masked_len = if is_compressed {
-        (len as u64) | COMPRESSED_MASK
+        len_u64 | COMPRESSED_MASK
     } else {
-        len as u64
+        len_u64
     };
 
     // Double-buffer the data; since we run with nodelay enabled, it is
     // desirable for the write to be a single packet (or at least, for
     // the header portion to go out in a single packet)
-    let mut buffer = Vec::with_capacity(len + encoded_length(masked_len));
+    let capacity = len
+        .checked_add(encoded_length(masked_len))
+        .context("encoded PDU frame capacity overflow")?;
+    let mut buffer = Vec::with_capacity(capacity);
 
     leb128::write::unsigned(&mut buffer, masked_len).context("writing pdu len")?;
     leb128::write::unsigned(&mut buffer, serial).context("writing pdu serial")?;
@@ -197,7 +205,8 @@ where
 
             return Err(err.into());
         }
-        buf.push(byte[0]);
+        let [decoded_byte] = byte;
+        buf.push(decoded_byte);
 
         match leb128::read::unsigned(&mut buf.as_slice()) {
             Ok(n) => {
@@ -223,7 +232,8 @@ fn read_u64_with_len<R: std::io::Read>(r: &mut R) -> anyhow::Result<(u64, usize)
     loop {
         let mut byte = [0u8];
         r.read_exact(&mut byte).context("reading leb128")?;
-        buf.push(byte[0]);
+        let [decoded_byte] = byte;
+        buf.push(decoded_byte);
 
         match leb128::read::unsigned(&mut buf.as_slice()) {
             Ok(n) => return Ok((n, buf.len())),
@@ -330,7 +340,10 @@ fn read_payload_chunked<R: std::io::Read>(
     let mut data = Vec::new();
     while data.len() < data_len {
         let (start, end) = reserve_next_payload_chunk(&mut data, data_len, len, serial, ident)?;
-        r.read_exact(&mut data[start..end]).with_context(|| {
+        let payload_chunk = data
+            .get_mut(start..end)
+            .context("reserved payload chunk range missing")?;
+        r.read_exact(payload_chunk).with_context(|| {
             format!(
                 "reading bytes {}..{} of {} for PDU of length {} \
                 with serial={} ident={}",
@@ -351,7 +364,10 @@ async fn read_payload_chunked_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     let mut data = Vec::new();
     while data.len() < data_len {
         let (start, end) = reserve_next_payload_chunk(&mut data, data_len, len, serial, ident)?;
-        r.read_exact(&mut data[start..end]).await.with_context(|| {
+        let payload_chunk = data
+            .get_mut(start..end)
+            .context("reserved async payload chunk range missing")?;
+        r.read_exact(payload_chunk).await.with_context(|| {
             format!(
                 "decode_raw_async failed to read bytes {}..{} of {} \
                 for PDU of length {} with serial={} ident={}",
@@ -540,7 +556,8 @@ fn serialize_with_mode<T: serde::Serialize>(
     // It's a little heavy; compress the already-serialized buffer.
     // Replaces the previous "serialize a second time through zstd::Encoder"
     // pattern, which doubled serializer work above the threshold (ft-gbpoy).
-    let compressed = zstd::stream::encode_all(&uncompressed[..], zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    let compressed =
+        zstd::stream::encode_all(uncompressed.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)?;
 
     log::debug!(
         "serialized+compress len {} vs {}",
@@ -563,11 +580,12 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     r: R,
     is_compressed: bool,
 ) -> Result<T, Error> {
+    let read_limit = max_pdu_read_limit()?;
     if is_compressed {
-        let mut decompress = zstd::Decoder::new(r)?.take((MAX_PDU_SIZE as u64) + 1);
+        let mut decompress = zstd::Decoder::new(r)?.take(read_limit);
         bounded_varbincode::deserialize(&mut decompress).map_err(Into::into)
     } else {
-        let mut limited = r.take((MAX_PDU_SIZE as u64) + 1);
+        let mut limited = r.take(read_limit);
         bounded_varbincode::deserialize(&mut limited).map_err(Into::into)
     }
 }
@@ -910,7 +928,10 @@ impl Pdu {
             return Ok(None);
         };
 
-        let mut cursor = Cursor::new(&buffer[..frame_len]);
+        let frame = buffer
+            .get(..frame_len)
+            .context("stream_decode frame length beyond buffer")?;
+        let mut cursor = Cursor::new(frame);
         let decoded = match Self::decode(&mut cursor) {
             Ok(decoded) => {
                 let consumed = cursor.position() as usize;
@@ -962,7 +983,10 @@ impl Pdu {
                 );
             }
 
-            buffer.extend_from_slice(&buf[0..size]);
+            let read_chunk = buf
+                .get(..size)
+                .context("read returned more bytes than buffer length")?;
+            buffer.extend_from_slice(read_chunk);
         }
     }
 
@@ -2363,35 +2387,40 @@ mod test {
     }
 
     #[test]
-    fn stream_decode_partial_compressed_frame() {
+    fn stream_decode_partial_compressed_frame() -> anyhow::Result<()> {
         let mut encoded = Vec::new();
         let pdu = Pdu::WriteToPane(WriteToPane {
             pane_id: 1,
             data: vec![b'A'; 1024],
         });
-        pdu.encode_with_mode(&mut encoded, 42, CompressionMode::Always)
-            .expect("encode compressed frame");
+        pdu.encode_with_mode(&mut encoded, 42, CompressionMode::Always)?;
 
         let split = (encoded.len() / 2).max(1).min(encoded.len() - 1);
-        let mut partial = encoded[..split].to_vec();
-        let result = Pdu::stream_decode(&mut partial).expect("partial compressed decode");
+        let prefix = encoded
+            .get(..split)
+            .context("split prefix must stay inside encoded frame")?;
+        let mut partial = prefix.to_vec();
+        let result = Pdu::stream_decode(&mut partial).context("partial compressed decode")?;
         assert!(
             result.is_none(),
             "partial compressed frame should not decode"
         );
         assert_eq!(
-            partial,
-            encoded[..split],
+            partial, prefix,
             "partial compressed bytes should remain buffered"
         );
 
-        partial.extend_from_slice(&encoded[split..]);
+        let suffix = encoded
+            .get(split..)
+            .context("split suffix must stay inside encoded frame")?;
+        partial.extend_from_slice(suffix);
         let decoded = Pdu::stream_decode(&mut partial)
-            .expect("complete compressed decode")
-            .expect("compressed frame should decode");
+            .context("complete compressed decode")?
+            .context("compressed frame should decode")?;
         assert_eq!(decoded.serial, 42);
         assert_eq!(decoded.pdu, pdu);
         assert!(partial.is_empty(), "full frame should be consumed");
+        Ok(())
     }
 
     #[test]
@@ -2776,7 +2805,10 @@ mod test {
 
         impl Read for PrefixThenEof {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let mut max_requested = self.max_requested.lock().expect("lock max request");
+                let mut max_requested = match self.max_requested.lock() {
+                    Ok(max_requested) => max_requested,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 *max_requested = (*max_requested).max(buf.len());
                 drop(max_requested);
                 // Disambiguate: under `--features async-asupersync` the module's
@@ -2804,7 +2836,10 @@ mod test {
             "incomplete max-size frame should surface a typed error"
         );
 
-        let observed = *max_requested.lock().expect("lock max request");
+        let observed = match max_requested.lock() {
+            Ok(max_requested) => *max_requested,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
         assert!(
             observed <= PAYLOAD_READ_CHUNK,
             "decoder requested a {} byte payload read; expected chunked reads no larger than {}",
@@ -2997,7 +3032,7 @@ mod test {
     }
 
     #[test]
-    fn pdu_roundtrip_get_codec_version_response() {
+    fn pdu_roundtrip_get_codec_version_response() -> anyhow::Result<()> {
         let mut buf = Vec::new();
         let pdu = Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
             codec_vers: CODEC_VERSION,
@@ -3006,8 +3041,8 @@ mod test {
             config_file_path: None,
             min_supported: CODEC_VERSION_MIN_SUPPORTED,
         });
-        pdu.encode(&mut buf, 444).unwrap();
-        let decoded = Pdu::decode(buf.as_slice()).unwrap();
+        pdu.encode(&mut buf, 444)?;
+        let decoded = Pdu::decode(buf.as_slice())?;
         assert_eq!(decoded.serial, 444);
         assert_eq!(decoded.pdu, pdu);
         // ft-kuxho.B.3: explicit field-level check that min_supported
@@ -3021,8 +3056,9 @@ mod test {
                 "min_supported must survive the wire roundtrip byte-for-byte"
             );
         } else {
-            panic!("decoded PDU was not GetCodecVersionResponse");
+            bail!("decoded PDU was not GetCodecVersionResponse");
         }
+        Ok(())
     }
 
     #[test]
@@ -3584,13 +3620,13 @@ mod test {
     /// matrix. Returns the canonical encoded bytes so caller-level guards
     /// (e.g. the skip_serializing_if regression check) can compare lengths
     /// across configurations.
-    fn assert_pdu_conforms(label: &str, pdu: Pdu, serial: u64) -> Vec<u8> {
+    fn assert_pdu_conforms(label: &str, pdu: Pdu, serial: u64) -> anyhow::Result<Vec<u8>> {
         // 1. Canonical encode → decode equality.
         let mut canonical = Vec::new();
         pdu.encode(&mut canonical, serial)
-            .unwrap_or_else(|e| panic!("{}: canonical encode failed: {}", label, e));
+            .with_context(|| format!("{label}: canonical encode failed"))?;
         let decoded = Pdu::decode(canonical.as_slice())
-            .unwrap_or_else(|e| panic!("{}: canonical decode failed: {}", label, e));
+            .with_context(|| format!("{label}: canonical decode failed"))?;
         assert_eq!(decoded.pdu, pdu, "{label}: canonical roundtrip not equal");
         assert_eq!(decoded.serial, serial, "{label}: serial drift");
 
@@ -3599,7 +3635,7 @@ mod test {
         decoded
             .pdu
             .encode(&mut reencoded, serial)
-            .unwrap_or_else(|e| panic!("{}: re-encode failed: {}", label, e));
+            .with_context(|| format!("{label}: re-encode failed"))?;
         assert_eq!(
             canonical, reencoded,
             "{label}: encode-decode-encode not byte-stable"
@@ -3612,12 +3648,12 @@ mod test {
         for tail in [vec![0x00u8], vec![0xFFu8; 16], b"GARBAGE_TAIL".to_vec()] {
             let mut padded = canonical.clone();
             padded.extend_from_slice(&tail);
-            let decoded_padded = Pdu::decode(padded.as_slice()).unwrap_or_else(|e| {
-                panic!(
-                    "{label}: tail-padded decode failed (tail={} bytes): {e}",
+            let decoded_padded = Pdu::decode(padded.as_slice()).with_context(|| {
+                format!(
+                    "{label}: tail-padded decode failed (tail={} bytes)",
                     tail.len()
                 )
-            });
+            })?;
             assert_eq!(
                 decoded_padded.pdu, pdu,
                 "{label}: tail-padded decode produced different PDU"
@@ -3633,18 +3669,16 @@ mod test {
         ] {
             let mut encoded = Vec::new();
             pdu.encode_with_mode(&mut encoded, serial, mode)
-                .unwrap_or_else(|e| {
-                    panic!("{}: encode_with_mode({:?}) failed: {}", label, mode, e)
-                });
+                .with_context(|| format!("{label}: encode_with_mode({mode:?}) failed"))?;
             let d = Pdu::decode(encoded.as_slice())
-                .unwrap_or_else(|e| panic!("{}: decode after {:?} failed: {}", label, mode, e));
+                .with_context(|| format!("{label}: decode after {mode:?} failed"))?;
             assert_eq!(
                 d.pdu, pdu,
                 "{label}: compression mode {mode:?} altered semantic payload"
             );
         }
 
-        canonical
+        Ok(canonical)
     }
 
     /// ft-e1emx: drive the conformance contract across the full custom-PDU
@@ -3652,7 +3686,7 @@ mod test {
     /// to exercise the Option<T> tag-byte path that the varbincode positional
     /// format depends on.
     #[test]
-    fn custom_pdu_conformance_matrix() {
+    fn custom_pdu_conformance_matrix() -> anyhow::Result<()> {
         let cases: Vec<(&str, Pdu)> = vec![
             (
                 "MoveFloatingPane",
@@ -3785,9 +3819,10 @@ mod test {
 
         let mut serial: u64 = 0x1000;
         for (label, pdu) in cases {
-            assert_pdu_conforms(label, pdu, serial);
+            assert_pdu_conforms(label, pdu, serial)?;
             serial = serial.wrapping_add(1);
         }
+        Ok(())
     }
 
     /// ft-e1emx (varbincode positional-format guard): every `Option<T>` field
@@ -3879,7 +3914,7 @@ mod test {
     /// simulated (encoder=v+1, decoder=v) pair to confirm the window
     /// agrees on `v` for this case before the decode attempt.
     #[test]
-    fn cross_version_additive_end_of_struct_decodes_canonically() {
+    fn cross_version_additive_end_of_struct_decodes_canonically() -> anyhow::Result<()> {
         // (a) Compat window: simulated v+1 encoder, v decoder; both
         // sides advertise CODEC_VERSION as their minimum. The window
         // overlap is [v, v+1] → [v, v] = {v}; agreed = v.
@@ -3889,7 +3924,7 @@ mod test {
             CODEC_VERSION,     // decoder remote (== our current)
             CODEC_VERSION,     // decoder remote_min
         )
-        .expect("v+1 vs v with min=v must be compat-window-compatible");
+        .context("v+1 vs v with min=v must be compat-window-compatible")?;
         assert_eq!(
             decision,
             CompatDecision::Compatible {
@@ -3908,7 +3943,7 @@ mod test {
         });
         let mut encoded = Vec::new();
         pdu.encode_with_mode(&mut encoded, 0xCAFE, CompressionMode::Never)
-            .expect("canonical encode must succeed");
+            .context("canonical encode must succeed")?;
 
         // (c) Append simulated future-field bytes after the canonical
         // frame. The existing tail-padded property is the load-bearing
@@ -3921,12 +3956,12 @@ mod test {
             let mut framed = encoded.clone();
             framed.extend_from_slice(&tail);
 
-            let decoded = Pdu::decode(framed.as_slice()).unwrap_or_else(|e| {
-                panic!(
-                    "cross-version additive-end decode failed (tail={} bytes): {e}",
+            let decoded = Pdu::decode(framed.as_slice()).with_context(|| {
+                format!(
+                    "cross-version additive-end decode failed (tail={} bytes)",
                     tail.len()
                 )
-            });
+            })?;
             assert_eq!(
                 decoded.pdu,
                 pdu,
@@ -3940,6 +3975,7 @@ mod test {
                 tail.len()
             );
         }
+        Ok(())
     }
 
     /// ft-kuxho.B.2: a middle-insert mutation (a byte spliced into the
@@ -3950,7 +3986,7 @@ mod test {
     /// is the bug class that requires bumping CODEC_VERSION_MIN_SUPPORTED
     /// and forcing an atomic redeploy.
     #[test]
-    fn cross_version_middle_insert_does_not_silently_decode_canonically() {
+    fn cross_version_middle_insert_does_not_silently_decode_canonically() -> anyhow::Result<()> {
         // Same window setup as the additive-end test: a v+1 encoder
         // talking to a v decoder is "compatible" per check_compat for
         // strictly-additive changes. Middle-insert is NOT additive, and
@@ -3963,7 +3999,7 @@ mod test {
             CODEC_VERSION,
             CODEC_VERSION,
         )
-        .expect("window must permit v+1 vs v for the test to be meaningful");
+        .context("window must permit v+1 vs v for the test to be meaningful")?;
         assert_eq!(
             decision,
             CompatDecision::Compatible {
@@ -3977,7 +4013,7 @@ mod test {
         });
         let mut encoded = Vec::new();
         pdu.encode_with_mode(&mut encoded, 0xCAFE, CompressionMode::Never)
-            .expect("canonical encode must succeed");
+            .context("canonical encode must succeed")?;
 
         // Try every interior byte position. For each, inject a single
         // byte and assert that the decoder either fails OR produces a
@@ -3996,13 +4032,12 @@ mod test {
 
             match Pdu::decode(corrupted.as_slice()) {
                 Ok(decoded) => {
-                    if decoded.pdu == pdu && decoded.serial == 0xCAFE {
-                        panic!(
-                            "middle-insert at byte {} silently decoded \
-                             to canonical PDU — varbincode positional drift not detected",
-                            insert_pos
-                        );
-                    }
+                    assert!(
+                        decoded.pdu != pdu || decoded.serial != 0xCAFE,
+                        "middle-insert at byte {} silently decoded \
+                         to canonical PDU — varbincode positional drift not detected",
+                        insert_pos
+                    );
                     // Decoded but to a different PDU: detection counts.
                     detected_count += 1;
                 }
@@ -4018,5 +4053,6 @@ mod test {
             encoded.len() - 1,
             "every interior insertion position must surface as detect-or-error"
         );
+        Ok(())
     }
 }
