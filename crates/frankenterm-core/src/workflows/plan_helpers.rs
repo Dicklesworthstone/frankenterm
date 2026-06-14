@@ -67,6 +67,33 @@ pub enum IdempotencyCheckResult {
     LedgerUnavailable,
 }
 
+/// Whether a logged step row represents a *confirmed-completed* step for
+/// idempotency purposes.
+///
+/// Fails closed (ft-3rc59): a `send_text` row counts as completed ONLY when
+/// its policy summary records an explicit `allow`. An absent policy summary
+/// (`None`) is NOT treated as completed — a successful injection never
+/// produces one (`policy_summary_from_injection` always serializes a summary
+/// for every `InjectionResult`), so a missing summary marks an anomalous /
+/// degraded log row whose completion cannot be confirmed. Treating that row
+/// as completed (the previous behaviour) let crash-resume silently SKIP a
+/// side-effecting send, dropping it. Returning `false` instead routes the row
+/// to [`IdempotencyCheckResult::PartiallyExecuted`] (the runner aborts),
+/// surfacing the ambiguity rather than dropping the send. A denied /
+/// require-approval summary (`Some` but not `allow`) is likewise not
+/// completed, matching the established partial-execution handling.
+///
+/// `continue` / `done` control results are always completed; any other result
+/// type is not.
+fn step_log_is_completed(result_type: &str, policy_summary: Option<&str>) -> bool {
+    match result_type {
+        "continue" | "done" => true,
+        "send_text" => policy_summary
+            .is_some_and(|summary| policy_summary_decision_is_allow(summary).unwrap_or(false)),
+        _ => false,
+    }
+}
+
 /// Check if a step has already been executed based on its idempotency key.
 ///
 /// This enables safe replay by checking the step log for previous executions.
@@ -130,17 +157,8 @@ pub async fn check_step_idempotency_with_cx(
             continue;
         }
 
-        let is_completed = match log.result_type.as_str() {
-            "continue" | "done" => true,
-            "send_text" => {
-                if let Some(ref summary) = log.policy_summary {
-                    policy_summary_decision_is_allow(summary).unwrap_or(false)
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
+        let is_completed =
+            step_log_is_completed(log.result_type.as_str(), log.policy_summary.as_deref());
 
         if is_completed {
             let should_replace = latest_completed
@@ -225,6 +243,62 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    // ========================================================================
+    // step_log_is_completed — fail-closed completion determination (ft-3rc59)
+    // ========================================================================
+
+    #[test]
+    fn send_text_with_missing_policy_summary_is_not_completed() {
+        // Regression guard for ft-3rc59: a send_text log row whose policy
+        // summary is absent must NOT be treated as completed — otherwise
+        // crash-resume reads it as AlreadyCompleted and silently SKIPS the
+        // side-effecting send, dropping it. Fail closed.
+        assert!(!step_log_is_completed("send_text", None));
+    }
+
+    #[test]
+    fn send_text_with_allow_summary_is_completed() {
+        // The genuine idempotent-skip path: a confirmed `allow` send is
+        // completed and is correctly skipped on replay.
+        assert!(step_log_is_completed(
+            "send_text",
+            Some(r#"{"decision":"allow"}"#)
+        ));
+    }
+
+    #[test]
+    fn send_text_with_deny_summary_is_not_completed() {
+        // A denied send is not "completed"; replay must re-evaluate/abort
+        // rather than skip — same handling the absent-summary case now gets.
+        assert!(!step_log_is_completed(
+            "send_text",
+            Some(r#"{"decision":"deny"}"#)
+        ));
+    }
+
+    #[test]
+    fn send_text_with_unparseable_summary_is_not_completed() {
+        // An unparseable summary cannot confirm an allow → fail closed.
+        assert!(!step_log_is_completed("send_text", Some("not json")));
+    }
+
+    #[test]
+    fn control_results_are_completed_without_summary() {
+        // Non-side-effecting control results carry no policy summary and are
+        // always completed.
+        assert!(step_log_is_completed("continue", None));
+        assert!(step_log_is_completed("done", None));
+    }
+
+    #[test]
+    fn unknown_result_type_is_never_completed() {
+        assert!(!step_log_is_completed("something_else", None));
+        assert!(!step_log_is_completed(
+            "send_text_v2",
+            Some(r#"{"decision":"allow"}"#)
+        ));
     }
 
     // ========================================================================
