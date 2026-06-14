@@ -451,7 +451,13 @@ impl SecretScanEngine {
     }
 }
 
-fn hash_secret(secret: &str) -> String {
+/// Canonical SHA-256 hex hash of a secret's bytes. This is the stable key used
+/// across the secret-scan reporting surface ([`SecretScanSample::secret_hash`])
+/// and `ft redact purge --secret-hash` (ft-7h5da.1.4), so a hash reported by a
+/// scan can be fed straight back to a targeted purge — the plaintext never
+/// leaves at-rest storage.
+#[must_use]
+pub fn hash_secret(secret: &str) -> String {
     hash_bytes(secret.as_bytes())
 }
 
