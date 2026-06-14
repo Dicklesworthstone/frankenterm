@@ -997,6 +997,14 @@ mod tests {
         assert_eq!(report.layers_rendered, 1);
         assert_eq!(report.layers_skipped_clean, 0);
         assert_eq!(report.total_commands, 1);
+        assert_eq!(
+            report.commands,
+            vec![DrawCmd::TiledGridQuads {
+                pane_id: 3,
+                damage: DirtyRect::new(0, 0, 720, 432),
+                dirty_rows: 24,
+            }]
+        );
         assert_eq!(report.damage, DirtyRect::new(0, 0, 720, 432));
     }
 

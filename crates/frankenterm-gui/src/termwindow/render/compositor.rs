@@ -37,10 +37,9 @@
 //!   the paint.rs migration can lower into wgpu / glium work.
 //! - `LayerKind` — the canonical 5 named layers from the bead so
 //!   z_order conventions stay consistent across implementations.
-//! - `RenderReport` — telemetry returned from `LayerStack::render`
-//!   (layers_rendered / layers_skipped / total commands) so the
-//!   continuation bead's structured-log emission has a typed
-//!   payload.
+//! - `RenderReport` — telemetry and ordered `DrawCmd` payloads
+//!   returned from `LayerStack::render` so the continuation bead's
+//!   structured-log emission and paint lowering have typed input.
 //!
 //! ## What is deferred (continuation, see follow-up bead)
 //!
@@ -275,6 +274,8 @@ pub struct RenderReport {
     /// Total `DrawCmd` count returned across every rendered
     /// layer.
     pub total_commands: u64,
+    /// Ordered command payloads returned by rendered layers.
+    pub commands: Vec<DrawCmd>,
     /// Union of every rendered layer's `dirty_rect()` — the
     /// stack-wide damage region for this frame.
     pub damage: DirtyRect,
@@ -370,6 +371,7 @@ impl LayerStack {
             let cmds = layer.render(ctx);
             report.layers_rendered = report.layers_rendered.saturating_add(1);
             report.total_commands = report.total_commands.saturating_add(cmds.len() as u64);
+            report.commands.extend(cmds);
             report.damage = report.damage.union(&dirty);
         }
         report
@@ -707,11 +709,8 @@ mod tests {
         );
     }
 
-    fn layer_position(order: &[(LayerKind, u8)], kind: LayerKind) -> usize {
-        order
-            .iter()
-            .position(|(observed, _)| *observed == kind)
-            .unwrap_or_else(|| panic!("layer {kind:?} missing from frame builder order {order:?}"))
+    fn layer_position(order: &[(LayerKind, u8)], kind: LayerKind) -> Option<usize> {
+        order.iter().position(|(observed, _)| *observed == kind)
     }
 
     fn assert_dependency_graph_conforms(label: &str, stack: &LayerStack) {
@@ -720,7 +719,15 @@ mod tests {
             let below_pos = layer_position(&order, below);
             let above_pos = layer_position(&order, above);
             assert!(
-                below_pos < above_pos,
+                below_pos.is_some(),
+                "{label}: layer {below:?} missing from frame builder order {order:?}"
+            );
+            assert!(
+                above_pos.is_some(),
+                "{label}: layer {above:?} missing from frame builder order {order:?}"
+            );
+            assert!(
+                below_pos.unwrap_or_default() < above_pos.unwrap_or_default(),
                 "{label}: dependency edge {below:?} -> {above:?} violated by {order:?}"
             );
             assert!(
@@ -775,6 +782,11 @@ mod tests {
                 .saturating_add(report.layers_skipped_opaque_above),
             "{label}: every layer must be rendered or accounted as skipped"
         );
+        assert_eq!(
+            report.total_commands as usize,
+            report.commands.len(),
+            "{label}: command count must match retained payloads"
+        );
     }
 
     fn assert_stack_dirty_rects_conform(label: &str, stack: &LayerStack) {
@@ -822,6 +834,7 @@ mod tests {
         assert_eq!(report.layer_count, 0);
         assert_eq!(report.layers_rendered, 0);
         assert_eq!(report.total_commands, 0);
+        assert!(report.commands.is_empty());
         assert!(report.damage.is_empty());
     }
 
@@ -838,6 +851,14 @@ mod tests {
         assert_eq!(report.layers_skipped_clean, 0);
         assert_eq!(report.layers_skipped_opaque_above, 0);
         assert_eq!(report.total_commands, 1);
+        assert_eq!(
+            report.commands,
+            vec![DrawCmd::LayerQuadBatch {
+                layer: LayerKind::TiledGrid,
+                damage: DirtyRect::new(0, 0, 100, 100),
+                quad_count: 1,
+            }]
+        );
         assert_eq!(report.damage, DirtyRect::new(0, 0, 100, 100));
     }
 
@@ -1107,6 +1128,22 @@ mod tests {
         assert_eq!(report.layers_rendered, 3);
         assert_eq!(report.layers_skipped_clean, 0);
         assert_eq!(report.layers_skipped_opaque_above, 0);
+        assert!(
+            report.commands.iter().any(|cmd| matches!(
+                cmd,
+                DrawCmd::TiledGridQuads {
+                    pane_id: 7,
+                    damage: DirtyRect {
+                        x: 4,
+                        y: 8,
+                        w: 720,
+                        h: 432,
+                    },
+                    dirty_rows: 24,
+                }
+            )),
+            "LayerStack::render must retain the tiled-grid command payload"
+        );
     }
 
     #[test]
