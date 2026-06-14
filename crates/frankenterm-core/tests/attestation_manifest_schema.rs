@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use jsonschema::{Draft, Validator};
 use serde_json::{Value, json};
 
+use frankenterm_core::redact_backfill::catalog_version;
+use frankenterm_core::redactor::secret_pattern_names;
+
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -1041,4 +1044,95 @@ fn attestation_retraction_schema_rejects_blank_metadata() {
             "standalone attestation retraction must reject blank {surface}"
         );
     }
+}
+
+#[test]
+fn redaction_hygiene_attestation_matches_live_catalog() -> Result<(), Box<dyn std::error::Error>> {
+    let path = workspace_root()
+        .join("docs")
+        .join("security")
+        .join("redaction-hygiene.json");
+    let contents = fs::read_to_string(&path)?;
+    let attestation: Value = serde_json::from_str(&contents)?;
+    let live_families: Vec<&'static str> = secret_pattern_names().collect();
+    let attested_families = attestation
+        .pointer("/catalog/families")
+        .ok_or("redaction hygiene catalog.families is present")?
+        .as_array()
+        .ok_or("redaction hygiene catalog.families is an array")?;
+
+    assert_eq!(
+        attestation
+            .pointer("/schema_version")
+            .and_then(Value::as_str)
+            .ok_or("redaction hygiene schema_version is a string")?,
+        "ft.security.redaction_hygiene.v1"
+    );
+    assert_eq!(
+        attestation
+            .pointer("/category")
+            .and_then(Value::as_str)
+            .ok_or("redaction hygiene category is a string")?,
+        "security/redaction-hygiene"
+    );
+    assert_eq!(
+        attestation
+            .pointer("/produced_by_bead")
+            .and_then(Value::as_str)
+            .ok_or("redaction hygiene produced_by_bead is a string")?,
+        "ft-7h5da.1.5"
+    );
+    assert_eq!(
+        attestation
+            .pointer("/attestation_manifest_slot/path")
+            .and_then(Value::as_str)
+            .ok_or("redaction hygiene attestation manifest path is a string")?,
+        "docs/security/redaction-hygiene.json",
+    );
+    assert_eq!(
+        attestation
+            .pointer("/temporal_redaction/ingest_stamping/column")
+            .and_then(Value::as_str)
+            .ok_or("redaction hygiene ingest-stamping column is a string")?,
+        "output_segments.redaction_catalog_version",
+    );
+    assert_eq!(
+        attestation
+            .pointer("/temporal_redaction/ingest_stamping/since_schema_version")
+            .and_then(Value::as_u64)
+            .ok_or("redaction hygiene ingest-stamping schema version is a number")?,
+        29,
+    );
+    assert_eq!(
+        attestation
+            .pointer("/catalog/fingerprint")
+            .and_then(Value::as_str)
+            .ok_or("redaction hygiene catalog fingerprint is a string")?,
+        catalog_version(),
+        "checked-in redaction-hygiene attestation must track the live secret-pattern catalog",
+    );
+    assert_eq!(
+        attestation
+            .pointer("/catalog/family_count")
+            .and_then(Value::as_u64)
+            .ok_or("redaction hygiene catalog family_count is a number")?,
+        u64::try_from(live_families.len())?,
+        "attested family_count must track the live secret-pattern catalog",
+    );
+    assert_eq!(
+        attested_families.len(),
+        live_families.len(),
+        "attested family array must track the live secret-pattern catalog",
+    );
+    for (attested, live) in attested_families.iter().zip(&live_families) {
+        assert_eq!(
+            attested
+                .as_str()
+                .ok_or("redaction hygiene catalog family is a string")?,
+            *live,
+            "attested families must remain in the same order as secret_pattern_names()",
+        );
+    }
+
+    Ok(())
 }
