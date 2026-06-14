@@ -725,6 +725,7 @@ pub mod van_emde_boas;
 pub mod vc_export;
 pub mod viewport_reflow_planner;
 pub mod voi;
+pub mod virtual_pane;
 pub mod vrr_negotiation;
 pub mod wait;
 pub mod wal_engine;
