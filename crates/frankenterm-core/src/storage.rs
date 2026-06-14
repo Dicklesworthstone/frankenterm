@@ -611,6 +611,12 @@ enum WriteCommand {
         workspace_id: String,
         respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
     },
+    /// Consume an approval token by row id within a workspace.
+    ConsumeApprovalTokenById {
+        token_id: i64,
+        workspace_id: String,
+        respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
+    },
     /// Record a maintenance event
     RecordMaintenance {
         record: MaintenanceRecord,
@@ -880,6 +886,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::InsertApprovalToken { .. } => "InsertApprovalToken",
             Self::ConsumeApprovalToken { .. } => "ConsumeApprovalToken",
             Self::ConsumeApprovalTokenByCode { .. } => "ConsumeApprovalTokenByCode",
+            Self::ConsumeApprovalTokenById { .. } => "ConsumeApprovalTokenById",
             Self::RecordMaintenance { .. } => "RecordMaintenance",
             Self::RecordSecretScanReport { .. } => "RecordSecretScanReport",
             Self::InsertSavedSearch { .. } => "InsertSavedSearch",
@@ -4169,6 +4176,46 @@ impl StorageHandle {
         Self::recv_writer_response(rx).await
     }
 
+    /// Consume an approval token by storage row id within a workspace.
+    ///
+    /// This is the queue-oriented sibling for operator approval surfaces that
+    /// list pending approval rows but intentionally do not store the raw
+    /// allow-once code.
+    pub async fn consume_approval_token_by_id(
+        &self,
+        token_id: i64,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.consume_approval_token_by_id_with_cx(&cx, token_id, workspace_id)
+            .await
+    }
+
+    /// Cx-first sibling of [`Self::consume_approval_token_by_id`].
+    pub async fn consume_approval_token_by_id_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        token_id: i64,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("consume_approval_token_by_id cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ConsumeApprovalTokenById {
+                    token_id,
+                    workspace_id: workspace_id.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
     /// Upsert a pane record
     pub async fn upsert_pane(&self, pane: PaneRecord) -> Result<()> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -5491,6 +5538,50 @@ impl StorageHandle {
         .await
     }
 
+    /// List approval tokens for a workspace.
+    ///
+    /// By default callers should pass `include_inactive=false` to surface the
+    /// operator approval queue: unused, unexpired one-shot tokens only.
+    pub async fn list_approval_tokens(
+        &self,
+        workspace_id: &str,
+        include_inactive: bool,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<ApprovalTokenRecord>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_approval_tokens_with_cx(&cx, workspace_id, include_inactive, limit, now_ms)
+            .await
+    }
+
+    /// Cx-first sibling of [`Self::list_approval_tokens`].
+    pub async fn list_approval_tokens_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        workspace_id: &str,
+        include_inactive: bool,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("list_approval_tokens cancelled: {err}"))
+        })?;
+        let db_path = Arc::clone(&self.db_path);
+        let workspace_id = workspace_id.to_string();
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_approval_tokens_backend(
+                    backend,
+                    &workspace_id,
+                    include_inactive,
+                    limit,
+                    now_ms,
+                )
+            })
+        })
+        .await
+    }
+
     /// Look up an approval token by code hash (without consuming it)
     ///
     /// Returns the token record if found, regardless of whether it's expired or consumed.
@@ -5515,6 +5606,38 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             pooled_backend(db_path.as_str(), |backend| {
                 query_approval_token_by_hash_backend(backend, &code_hash)
+            })
+        })
+        .await
+    }
+
+    /// Look up an approval token by row id within a workspace.
+    pub async fn get_approval_token_by_id(
+        &self,
+        token_id: i64,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_approval_token_by_id_with_cx(&cx, token_id, workspace_id)
+            .await
+    }
+
+    /// Cx-first sibling of [`Self::get_approval_token_by_id`].
+    pub async fn get_approval_token_by_id_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        token_id: i64,
+        workspace_id: &str,
+    ) -> Result<Option<ApprovalTokenRecord>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_approval_token_by_id cancelled: {err}"))
+        })?;
+        let db_path = Arc::clone(&self.db_path);
+        let workspace_id = workspace_id.to_string();
+
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_backend(db_path.as_str(), |backend| {
+                query_approval_token_by_id_backend(backend, token_id, &workspace_id)
             })
         })
         .await
@@ -8264,7 +8387,8 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         WriteCommand::ConsumeApprovalToken { respond, .. }
-        | WriteCommand::ConsumeApprovalTokenByCode { respond, .. } => {
+        | WriteCommand::ConsumeApprovalTokenByCode { respond, .. }
+        | WriteCommand::ConsumeApprovalTokenById { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         WriteCommand::SyncFts { respond, .. } | WriteCommand::RebuildFts { respond, .. } => {
@@ -9468,6 +9592,15 @@ fn dispatch_write_command_raw(
             let result = consume_approval_token_by_code_backend(backend, &code_hash, &workspace_id);
             respond_oneshot_best_effort(respond, result);
         }
+        WriteCommand::ConsumeApprovalTokenById {
+            token_id,
+            workspace_id,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = consume_approval_token_by_id_backend(backend, token_id, &workspace_id);
+            respond_oneshot_best_effort(respond, result);
+        }
         WriteCommand::RecordMaintenance { record, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = record_maintenance_backend(backend, &record);
@@ -10240,6 +10373,60 @@ fn query_approval_token_by_code_backend(
     row.as_deref()
         .map(approval_token_from_backend_row)
         .transpose()
+}
+
+fn query_approval_token_by_id_backend(
+    backend: &dyn StorageBackend,
+    token_id: i64,
+    workspace_id: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                    pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
+             FROM approval_tokens
+             WHERE id = ?1
+               AND workspace_id = ?2
+             LIMIT 1",
+            &[ToSqlValue::Integer(token_id), ToSqlValue::Text(workspace_id)],
+        )
+        .map_err(|err| storage_backend_error("Query approval token by id", err))?;
+
+    row.as_deref()
+        .map(approval_token_from_backend_row)
+        .transpose()
+}
+
+fn query_approval_tokens_backend(
+    backend: &dyn StorageBackend,
+    workspace_id: &str,
+    include_inactive: bool,
+    limit: usize,
+    now_ms: i64,
+) -> Result<Vec<ApprovalTokenRecord>> {
+    let limit = if limit == 0 { 1 } else { limit };
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut sql = String::from(
+        "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
+         FROM approval_tokens
+         WHERE workspace_id = ?1",
+    );
+    let mut params = vec![ToSqlValue::Text(workspace_id)];
+    if !include_inactive {
+        sql.push_str(" AND used_at IS NULL AND expires_at >= ?2");
+        params.push(ToSqlValue::Integer(now_ms));
+    }
+    let limit_param = params.len() + 1;
+    sql.push_str(&format!(" ORDER BY created_at ASC LIMIT ?{limit_param}"));
+    params.push(ToSqlValue::Integer(limit));
+
+    let rows = backend
+        .query_map_typed(&sql, &params)
+        .map_err(|err| storage_backend_error("List approval tokens", err))?;
+    rows.iter()
+        .map(|row| approval_token_from_backend_row(row))
+        .collect()
 }
 
 fn query_active_approvals_count_backend(
@@ -14952,6 +15139,41 @@ fn consume_approval_token_by_code_backend(
     }
 
     Ok(None)
+}
+
+/// Consume an approval token by queue row id.
+///
+/// This is the operator-queue counterpart to code-based consumption. It still
+/// scopes to `workspace_id`, requires the token to be unused and unexpired, and
+/// returns the consumed row for audit/output.
+fn consume_approval_token_by_id_backend(
+    backend: &dyn StorageBackend,
+    token_id: i64,
+    workspace_id: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let now = now_ms_strict()?;
+
+    let row = backend
+        .query_row_typed(
+            "UPDATE approval_tokens
+             SET used_at = ?3
+             WHERE id = ?1
+               AND workspace_id = ?2
+               AND used_at IS NULL
+               AND expires_at >= ?3
+             RETURNING id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                       pane_id, action_fingerprint, plan_hash, plan_version, risk_summary",
+            &[
+                ToSqlValue::Integer(token_id),
+                ToSqlValue::Text(workspace_id),
+                ToSqlValue::Integer(now),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to consume approval token by id", err))?;
+
+    row.as_deref()
+        .map(approval_token_from_backend_row)
+        .transpose()
 }
 
 // =============================================================================
