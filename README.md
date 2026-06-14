@@ -339,12 +339,13 @@ Honest status of every shipped surface, without migration-era hand-waving.
 |---|---|---|
 | Watch / status / triage / doctor / reproduce | **Supported** | Native operator surfaces; `ft doctor`, `ft status --health`, and `ft triage` are the first-run and incident entrypoints |
 | Search / events / audit / workflows / mission / tx | **Supported** | Backed by local storage, policy, and workflow subsystems |
-| Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflows`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `approvals`, `checkpoint`, `context`, `work`, `fleet`, `profile`. NTM-gap fallback retired. **Caveat:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)) |
+| Robot mode | **Supported** | All core families: `state`, `get-text`, `send`, `wait-for`, `search`, `events`, `rules`, `workflows`, `agents`, `accounts`, `reservations`, `mission`, `tx`, `health`, `proof status`, `approvals`, `checkpoint`, `context`, `work`, `fleet`, `profile`. NTM-gap fallback retired. **Caveat:** the `agents` family is gated behind the (default-on) `agent-detection` feature — a `--no-default-features` build returns `robot.feature_not_available` for it (see the [Compile-Time Feature Matrix](#compile-time-feature-matrix)) |
 | Operating envelope | **Supported** | `ft.operating_envelope.v1` planner contract + golden fixtures; fails closed on missing or critical-pressure telemetry |
 | Mission objective planner | **Supported** | Capacity-aware planner for safe swarm orchestration (ft-auy2g) |
 | Incident bundles | **Supported** | Wired to live collectors; publish-side snapshot path; beads coordination snapshot included |
 | Session persistence | **Supported with backend prerequisite** | Snapshots, session inspection, and `ft session doctor` are cross-platform; live restore (`ft restart`, `ft snapshot restore`) is currently Unix-only |
 | Reality-check + attestation | **Supported** | `ft attestation verify` / `show` ship as a thin Rust wrapper over `scripts/attestation-verify.sh`. Signed bundles live in `docs/attestations/` |
+| Deferred proof queue | **Supported with fail-closed proof prerequisite** | `ft proof queue/status/replay/attach` and `ft robot proof status` expose source-landed proof intents. Replay executes only through remote-required RCH when admission is explicitly `admitted`; local Cargo is never substituted. Release-slot evidence stays under `docs/attestations/proofs/deferred-proof-replay.json`; current W8.2 remote proof remains blocked on RCH admission. |
 | Web API / SSE | **Supported behind `--features web`** | `/health`, `/panes`, `/events`, `/search`, `/stream/events`, `/stream/deltas` |
 | Distributed mode | **Supported behind `--features distributed`** | Remote panes persist into the same DB and surface through status/search/state; live `get-text` for distributed panes is intentionally unavailable |
 | MCP server | **Supported behind `--features mcp`** | stdio + tool surface mirroring Robot Mode |
@@ -1126,6 +1127,19 @@ ft robot send 1 "y" --wait-for "confirmed"          # send and wait for confirma
 ft robot wait-for 0 "codex.usage.reached" --timeout-secs 3600
 ft robot wait-for 0 "Done" --timeout-secs 60
 ```
+
+### Deferred proof queue
+
+```bash
+ft proof queue --bead ft-w8 --kind test --package frankenterm-core -- RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-w8-target cargo test -p frankenterm-core --lib proof_intent
+ft proof status --format json
+ft proof replay --admission-state admitted --dry-run
+ft robot proof status
+```
+
+The queue is a fail-closed proof-debt surface. Status and dry-run replay explain
+what would run; live replay refuses stale source hashes and never replaces a
+remote-required RCH proof with local Cargo.
 
 ### Search
 

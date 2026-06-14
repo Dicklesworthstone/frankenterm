@@ -1,9 +1,10 @@
 # Deferred Proof Queue Surface Contract
 
-`ft.deferred_proof_queue_surface.v1` is the static contract for the human,
-Robot, and MCP surfaces that expose the deferred RCH proof replay queue
-(`ft-zbnz4`). It lets an operator or agent answer four questions without DB or
-comment archaeology:
+`ft.deferred_proof_queue_surface.v1` is the static contract for projections of
+the deferred RCH proof replay queue (`ft-zbnz4`). As of `ft-7h5da.9.2`, the
+runtime surface ships as human CLI `ft proof queue/status/replay/attach` plus
+read-only Robot `ft robot proof status`; MCP parity remains deferred. It lets an
+operator or agent answer four questions without DB or comment archaeology:
 
 1. What proof debt exists?
 2. What can run right now?
@@ -11,9 +12,30 @@ comment archaeology:
 4. What exact command would run if RCH admits it?
 
 The schema is `docs/json-schema/ft-deferred-proof-queue-surface.json`; the golden
-payload lives at `fixtures/deferred-proof-replay/queue-surface/`. The surface is
-**read-only**: no view may suggest local Cargo, worker mutation, service repair,
-deletion, reset, or broad formatting as an automatic action.
+payload lives at `fixtures/deferred-proof-replay/queue-surface/`. The original
+contract is read-only: no view may suggest local Cargo, worker mutation, service
+repair, deletion, reset, or broad formatting as an automatic action. The W8.2
+runtime CLI adds explicit queue and attach mutations, but replay still remains
+fail-closed: it refuses stale source hashes and executes only a canonical
+remote-only RCH command when admission is explicitly `admitted`.
+
+## Shipped runtime surfaces
+
+The W8.2 runtime JSON contracts are:
+
+| Command | Contract id | Mutation | Notes |
+| --- | --- | --- | --- |
+| `ft proof queue` | `ft.proof_queue.queue.v1` | Yes | Stores one idempotent intent keyed by command, scope, source hash, and bead. |
+| `ft proof status` | `ft.proof_queue.status.v1` | No | Reports source freshness, queue counts, replay eligibility, blockers, attempts, and attached receipts. |
+| `ft robot proof status` | `ft.proof_queue.status.v1` | No | Robot-mode JSON/TOON projection of the same status payload. |
+| `ft proof replay` | `ft.proof_queue.replay.v1` | Conditional | Dry-run is read-only. Live replay is allowed only with current source and `--admission-state admitted`. |
+| `ft proof attach` | `ft.proof_queue.attach.v1` | Yes | Records an explicit retained receipt path against an existing intent. |
+
+Release-slot evidence for this family uses the existing `proofs/robot-contracts`
+attestation entry at `docs/attestations/proofs/deferred-proof-replay.json`. The
+checked-in W8.2 implementation is source-landed, but its focused remote proof is
+currently blocked on RCH admission; no local Cargo output counts as release
+proof.
 
 ## Read-only guardrails
 

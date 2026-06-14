@@ -116,6 +116,21 @@ Transaction-contract control is currently surfaced under robot mode as
 `ft robot tx plan|run|rollback|show`; the top-level human CLI does not expose
 `ft tx` today.
 
+### Proof queue and deferred replay
+
+```bash
+ft proof queue [--queue-file <path>] [--bead <id>] [--package <crate>] [--kind <test|check|clippy|fmt|schema|fuzz|replay|attestation>] [--source-hash <hash>] [--expected-artifact <path>] [--attestation-slot <slot>] [--redaction-policy <standard|strict>] [--admission-state <state>] [-f <plain|json|toon>] -- <remote-required-rch-command>
+ft proof status [--queue-file <path>] [--source-hash <hash>] [--admission-state <state>] [-f <plain|json|toon>]
+ft proof replay [--queue-file <path>] [--source-hash <hash>] [--admission-state <state>] [--artifact-dir <dir>] [--dry-run] [-f <plain|json|toon>]
+ft proof attach <intent_id> [--queue-file <path>] --receipt <path> [-f <plain|json|toon>]
+```
+
+`ft proof` is a fail-closed proof-debt surface. `queue` stores the exact
+remote-required RCH command and source hash, `status` classifies stale/deferred
+or replayable intents, `replay --dry-run` explains the selected candidate, and
+live replay only executes when admission is explicitly `admitted` and the source
+hash still matches. It never substitutes local Cargo for a remote proof.
+
 ### Rules
 
 ```bash
@@ -284,6 +299,7 @@ ft robot reservations list|reserve|release
 ft robot mission state|decisions
 ft robot tx plan|run|rollback|show
 ft robot health
+ft robot proof status [--queue-file <path>] [--source-hash <hash>] [--admission-state <state>]
 ft robot approve <code> [--pane <id>] [--fingerprint <hash>] [--dry-run]
 ft robot why <code>
 ft robot agent-mail-outbox [--manifest <path>] [--entry <path> ...]
@@ -309,6 +325,11 @@ explicitly under `active_agent_sources` instead of being inferred.
 queued-entry files. It is a read-only contract/replay surface: queued or
 `replay_dry_run_ok` rows are not Agent Mail delivery proof, and the command does
 not repair, restart, or mutate the shared Agent Mail service.
+
+`ft robot proof status` is the read-only robot projection of the deferred proof
+queue. It returns the same status payload as `ft proof status --format json`,
+including source freshness, replay eligibility, RCH admission blockers, attempt
+counts, and attached-receipt counts.
 
 Examples:
 - `ft robot search "compilation failed" --mode lexical`

@@ -27,6 +27,16 @@ or contract artifact, and the proof lane that keeps the row honest.
 | tx | 4 | 4 | 0 | 4 | 0 |
 | workflow | 4 | 4 | 0 | 4 | 0 |
 
+## Deferred Proof Queue Surface
+
+`ft proof queue/status/replay/attach` and `ft robot proof status` shipped under
+`ft-7h5da.9.2`, but they are not counted in `ApiSurface::ALL` yet. Their
+runtime contracts are documented in
+`docs/robot-contracts/deferred-proof-queue-surface.md`, and the release evidence
+maps to `docs/attestations/proofs/deferred-proof-replay.json` under the existing
+`proofs/robot-contracts` category. Status is intentionally partial until the
+surface receives a schema/golden ApiSurface row and MCP parity.
+
 ## Matrix
 
 | Surface | Category | Robot CLI | MCP surface | Schema artifact | Docs artifact | Golden or matrix artifact | Proof lane | Status |
