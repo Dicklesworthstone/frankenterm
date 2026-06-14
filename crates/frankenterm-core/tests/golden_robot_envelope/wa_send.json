@@ -21,6 +21,16 @@
         "minimum": 0,
         "type": "integer"
       },
+      "submit_level": {
+        "description": "Optional SubmitReceipt guarantee level; setting this enables verified-submit receipts",
+        "enum": [
+          "write",
+          "composer",
+          "submitted",
+          "working"
+        ],
+        "type": "string"
+      },
       "text": {
         "description": "Text to send",
         "type": "string"
@@ -31,6 +41,11 @@
         "maximum": 600,
         "minimum": 1,
         "type": "integer"
+      },
+      "verify_submit": {
+        "default": false,
+        "description": "Return a SubmitReceipt using the submitted guarantee level unless submit_level is set",
+        "type": "boolean"
       },
       "wait_for": {
         "description": "Wait for a pattern after sending",
