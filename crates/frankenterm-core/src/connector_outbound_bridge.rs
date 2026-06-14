@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use crate::connector_credential_broker::{CredentialScope, CredentialSensitivity};
 use crate::connector_governor::GovernorVerdict;
 use crate::connector_host_runtime::{ConnectorCapability, ConnectorSandboxZone};
+use crate::connector_reliability::ConnectorErrorKind;
 use crate::policy::{
     ActionKind as PolicyActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyEngine,
     PolicyInput, PolicySurface,
@@ -53,10 +54,10 @@ pub struct ConnectorOutboundBridgeConfig {
     /// Whether to enforce sandbox capability checks before dispatch.
     #[serde(default = "default_enforce_sandbox")]
     pub enforce_sandbox: bool,
-    /// Per-connector reliability/governor enforcement switch.
+    /// Per-connector reliability/governor enforcement override.
     ///
-    /// Missing connectors remain log-only so existing connectors can be rolled
-    /// into enforcement deliberately.
+    /// Missing connectors are enforced; set an entry to `false` only for an
+    /// explicit, connector-scoped diagnostic rollout.
     #[serde(default)]
     pub enforce_connector_admission: HashMap<String, bool>,
 }
@@ -978,7 +979,7 @@ impl ConnectorOutboundBridge {
             .enforce_connector_admission
             .get(connector)
             .copied()
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     fn policy_actor_for_event(event: &OutboundEvent) -> ActorKind {
@@ -1615,6 +1616,50 @@ impl ConnectorOutboundBridge {
         actions
     }
 
+    /// Record successful completion of a connector action after the host
+    /// runtime has executed it.
+    ///
+    /// This is the feedback path for the production dispatch boundary: the
+    /// governor clears adaptive backoff and the reliability controller observes
+    /// the successful probe/result.
+    pub fn record_action_success(&mut self, action: &ConnectorAction, completed_at_ms: u64) {
+        self.policy.connector_governor_mut().record_outcome(
+            &action.target_connector,
+            true,
+            completed_at_ms,
+        );
+        self.policy
+            .reliability_registry_mut()
+            .get_or_create(&action.target_connector)
+            .record_success();
+    }
+
+    /// Record failed completion of a connector action after the host runtime
+    /// has executed it.
+    ///
+    /// Returns the dead-letter queue entry ID when the reliability controller
+    /// enqueues retryable failed work. Caller-initiated cancellation is not a
+    /// connector failure and therefore does not feed governor adaptive backoff.
+    pub fn record_action_failure(
+        &mut self,
+        action: &ConnectorAction,
+        error: impl Into<String>,
+        error_kind: ConnectorErrorKind,
+        completed_at_ms: u64,
+    ) -> Option<u64> {
+        if error_kind != ConnectorErrorKind::Cancelled {
+            self.policy.connector_governor_mut().record_outcome(
+                &action.target_connector,
+                false,
+                completed_at_ms,
+            );
+        }
+        self.policy
+            .reliability_registry_mut()
+            .get_or_create(&action.target_connector)
+            .record_failure(action, error, error_kind, completed_at_ms)
+    }
+
     /// Peek at the next pending action without removing it.
     #[must_use]
     pub fn peek_action(&self) -> Option<&ConnectorAction> {
@@ -1735,6 +1780,11 @@ mod tests {
         assert!(!config.reject_unmatched_events);
         assert!(config.enforce_sandbox);
         assert!(config.enforce_connector_admission.is_empty());
+        let bridge = ConnectorOutboundBridge::new(config);
+        assert!(
+            bridge.connector_admission_enforced("slack"),
+            "missing connector admission override must fail closed"
+        );
     }
 
     #[test]
@@ -2371,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_outbound_bridge_governor_log_only_by_default_ft_x3211() {
+    fn connector_outbound_bridge_governor_fail_closed_by_default_ft_x3211() {
         let mut safety = crate::config::SafetyConfig::default();
         safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
             max_actions: 1,
@@ -2397,13 +2447,178 @@ mod tests {
             make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
         let second_result = bridge.process_event(&second).unwrap();
 
-        assert_eq!(second_result.actions_dispatched.len(), 1);
-        assert!(second_result.actions_blocked.is_empty());
-        assert_eq!(bridge.pending_action_count(), 2);
+        assert!(second_result.actions_dispatched.is_empty());
+        assert_eq!(second_result.actions_blocked.len(), 1);
+        assert!(
+            second_result.actions_blocked[0]
+                .reason
+                .contains("governor(reject: connector_quota_exhausted")
+        );
+        let denial = second_result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("default fail-closed governor block should emit typed denial");
+        assert_eq!(denial.error_code, "connector.governor_denied");
+        assert_eq!(denial.reason_code, "connector_quota_exhausted");
+        assert_eq!(bridge.pending_action_count(), 1);
 
         let tel = bridge.telemetry();
-        assert_eq!(tel.actions_dispatched, 2);
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_blocked_governor, 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_outcome_failure_feeds_governor_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let failed_action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        bridge.record_action_failure(
+            &failed_action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1000,
+        );
+        bridge.record_action_failure(
+            &failed_action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1100,
+        );
+
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(1200);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(result.actions_dispatched.is_empty());
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("governor(throttle: adaptive_backoff")
+        );
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("adaptive-backoff governor block should emit typed denial");
+        assert_eq!(denial.error_code, "connector.governor_denied");
+        assert_eq!(denial.reason_code, "adaptive_backoff");
+        assert_eq!(bridge.pending_action_count(), 0);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 0);
+        assert_eq!(tel.actions_blocked_governor, 1);
+        assert_eq!(tel.actions_blocked_reliability, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_outcome_failure_feeds_reliability_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let failed_action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        for completed_at_ms in 1000..1003 {
+            bridge.record_action_failure(
+                &failed_action,
+                "connector timed out",
+                ConnectorErrorKind::Timeout,
+                completed_at_ms,
+            );
+        }
+
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(1200);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(result.actions_dispatched.is_empty());
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("reliability(circuit=Open")
+        );
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("reliability block should emit typed denial");
+        assert_eq!(denial.error_code, "connector.reliability_denied");
+        assert_eq!(denial.reason_code, "circuit_open");
+        assert_eq!(bridge.pending_action_count(), 0);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 0);
+        assert_eq!(tel.actions_blocked_reliability, 1);
         assert_eq!(tel.actions_blocked_governor, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_outcome_success_clears_governor_backoff_ft_x3211() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let action = ConnectorAction {
+            target_connector: "slack".to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: "seed".to_string(),
+            params: serde_json::json!({"source": "regression"}),
+            created_at_ms: 900,
+        };
+        bridge.record_action_failure(
+            &action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1000,
+        );
+        bridge.record_action_failure(
+            &action,
+            "connector timed out",
+            ConnectorErrorKind::Timeout,
+            1100,
+        );
+        bridge.record_action_success(&action, 5000);
+
+        let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(5000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert!(result.actions_blocked.is_empty());
+        assert_eq!(bridge.pending_action_count(), 1);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_blocked_governor, 0);
+        assert_eq!(tel.actions_blocked_reliability, 0);
     }
 
     #[test]
