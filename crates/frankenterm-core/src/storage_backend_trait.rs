@@ -1117,7 +1117,7 @@ impl StorageBackend for RusqliteBackend {
     fn query_scalar(&self, sql: &str) -> Result<Option<String>, BackendError> {
         let conn = self.conn_guard();
         let mut stmt = conn
-            .prepare(sql)
+            .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
         let mut rows = stmt
             .query([])
@@ -1180,7 +1180,7 @@ impl StorageBackend for RusqliteBackend {
     ) -> Result<Option<Vec<String>>, BackendError> {
         let conn = self.conn_guard();
         let mut stmt = conn
-            .prepare(sql)
+            .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
         let column_count = stmt.column_count();
         // rusqlite::params_from_iter accepts an IntoIterator over
@@ -1213,7 +1213,7 @@ impl StorageBackend for RusqliteBackend {
     ) -> Result<Vec<Vec<String>>, BackendError> {
         let conn = self.conn_guard();
         let mut stmt = conn
-            .prepare(sql)
+            .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
         let column_count = stmt.column_count();
         let mut rows = stmt
@@ -1253,7 +1253,7 @@ impl StorageBackend for RusqliteBackend {
     ) -> Result<Option<Vec<String>>, BackendError> {
         let conn = self.conn_guard();
         let mut stmt = conn
-            .prepare(sql)
+            .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
         let column_count = stmt.column_count();
         let typed_values: Vec<rusqlite::types::Value> =
@@ -1285,7 +1285,7 @@ impl StorageBackend for RusqliteBackend {
     ) -> Result<Vec<Vec<String>>, BackendError> {
         let conn = self.conn_guard();
         let mut stmt = conn
-            .prepare(sql)
+            .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
         let column_count = stmt.column_count();
         let typed_values: Vec<rusqlite::types::Value> =
@@ -1325,7 +1325,7 @@ impl StorageBackend for RusqliteBackend {
     ) -> Result<Option<Vec<SqlCell>>, BackendError> {
         let conn = self.conn_guard();
         let mut stmt = conn
-            .prepare(sql)
+            .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
         let column_count = stmt.column_count();
         let typed_values: Vec<rusqlite::types::Value> =
@@ -1357,7 +1357,7 @@ impl StorageBackend for RusqliteBackend {
     ) -> Result<Vec<Vec<SqlCell>>, BackendError> {
         let conn = self.conn_guard();
         let mut stmt = conn
-            .prepare(sql)
+            .prepare_cached(sql)
             .map_err(|e| BackendError::Query(e.to_string()))?;
         let column_count = stmt.column_count();
         let typed_values: Vec<rusqlite::types::Value> =

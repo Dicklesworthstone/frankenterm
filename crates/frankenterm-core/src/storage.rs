@@ -7870,6 +7870,8 @@ fn flush_storage_io_pending_commands(
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
 ) -> Option<String> {
+    let mut pending_append_segments = Vec::new();
+
     while !pending_io.is_empty() && !*should_break {
         let Some(dispatched) = io_gate.pop_next() else {
             let message =
@@ -7877,6 +7879,10 @@ fn flush_storage_io_pending_commands(
             tracing::error!(
                 pending = pending_io.len(),
                 "storage IO scheduler returned no dispatchable work for queued commands"
+            );
+            fail_pending_append_segments(
+                std::mem::take(&mut pending_append_segments),
+                message.clone(),
             );
             fail_pending_storage_io_commands(std::mem::take(pending_io), message);
             io_gate.reset_after_scheduler_loss();
@@ -7902,6 +7908,26 @@ fn flush_storage_io_pending_commands(
             queued_for_ms = dispatched.queued_for_ms,
             "storage IO scheduler dispatching writer command"
         );
+
+        let cmd = match pending_append_segment_from_command(cmd) {
+            Ok(pending_append) => {
+                pending_append_segments.push(pending_append);
+                continue;
+            }
+            Err(cmd) => cmd,
+        };
+
+        if let Some(message) = flush_append_segment_group_recovering(
+            backend,
+            &mut pending_append_segments,
+            mmap_mirror,
+            segment_redactors,
+        ) {
+            fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+            io_gate.reset_after_panic();
+            return Some(message);
+        }
+
         if let Some(message) = dispatch_write_command_raw_recovering(
             backend,
             cmd,
@@ -7914,7 +7940,136 @@ fn flush_storage_io_pending_commands(
             return Some(message);
         }
     }
+
+    if let Some(message) = flush_append_segment_group_recovering(
+        backend,
+        &mut pending_append_segments,
+        mmap_mirror,
+        segment_redactors,
+    ) {
+        io_gate.reset_after_panic();
+        return Some(message);
+    }
     None
+}
+
+#[allow(dead_code)]
+struct PendingAppendSegmentWrite {
+    pane_id: u64,
+    content: String,
+    content_hash: Option<String>,
+    respond: WriterResultResponder<Segment>,
+}
+
+impl PendingAppendSegmentWrite {
+    fn into_write_command(self) -> WriteCommand {
+        WriteCommand::AppendSegment {
+            pane_id: self.pane_id,
+            content: self.content,
+            content_hash: self.content_hash,
+            respond: self.respond.into_sender(),
+        }
+    }
+}
+
+fn pending_append_segment_from_command(
+    cmd: WriteCommand,
+) -> std::result::Result<PendingAppendSegmentWrite, WriteCommand> {
+    match cmd {
+        WriteCommand::AppendSegment {
+            pane_id,
+            content,
+            content_hash,
+            respond,
+        } => Ok(PendingAppendSegmentWrite {
+            pane_id,
+            content,
+            content_hash,
+            respond: WriterResultResponder::new(respond),
+        }),
+        other => Err(other),
+    }
+}
+
+fn flush_append_segment_group_recovering(
+    backend: &dyn StorageBackend,
+    pending_append_segments: &mut Vec<PendingAppendSegmentWrite>,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) -> Option<String> {
+    if pending_append_segments.is_empty() {
+        return None;
+    }
+
+    let mut group = std::mem::take(pending_append_segments);
+    if group.len() == 1 {
+        let cmd = group.pop().expect("append group length already checked");
+        let mut should_break = false;
+        return dispatch_write_command_raw_recovering(
+            backend,
+            cmd.into_write_command(),
+            &mut should_break,
+            mmap_mirror,
+            segment_redactors,
+        );
+    }
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch_append_segment_group_commit(backend, group, mmap_mirror, segment_redactors);
+    }));
+    match outcome {
+        Ok(()) => None,
+        Err(payload) => {
+            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            let message = format!(
+                "storage writer recovered from append group commit panic: {}",
+                panic_payload_summary(payload.as_ref())
+            );
+            tracing::error!(
+                writer_panics_total = storage_writer_panics_total(),
+                error = %message,
+                "storage writer append group commit panic recovered; failing undispatched batch commands"
+            );
+            flush_segment_redactors(backend, mmap_mirror, segment_redactors);
+            Some(message)
+        }
+    }
+}
+
+fn dispatch_append_segment_group_commit(
+    backend: &dyn StorageBackend,
+    group: Vec<PendingAppendSegmentWrite>,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) {
+    let result = append_segment_group_commit_backend(backend, &group, segment_redactors);
+    match result {
+        Ok(committed_segments) => {
+            for (pending, committed) in group.into_iter().zip(committed_segments) {
+                if committed.retained_tail_moved {
+                    disable_mmap_mirror_after_retained_tail_move(mmap_mirror, pending.pane_id);
+                }
+                mirror_segment_into_mmap(mmap_mirror, &committed.segment);
+                pending.respond.respond_best_effort(Ok(committed.segment));
+            }
+        }
+        Err(error) => {
+            let message = format!("storage append segment group commit failed: {error}");
+            tracing::warn!(
+                segments = group.len(),
+                error = %error,
+                "storage writer append group commit failed; failing grouped append callers"
+            );
+            fail_pending_append_segments(group, message);
+        }
+    }
+}
+
+fn fail_pending_append_segments(commands: Vec<PendingAppendSegmentWrite>, message: String) {
+    for cmd in commands {
+        cmd.respond
+            .respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+    }
 }
 
 fn fail_pending_storage_io_commands(commands: HashMap<u64, WriteCommand>, message: String) {
@@ -8234,20 +8389,17 @@ fn storage_io_fts_rebuild_bytes(config: &FtsSyncConfig) -> u64 {
 
 /// Main loop for the writer thread.
 ///
-/// Opportunistically processes burst traffic while preserving immediate
-/// per-command dispatch semantics.
-///
-/// Every `WriteCommand` resolves a caller-facing oneshot from
-/// `dispatch_write_command_raw()`. Wrapping multiple commands in an explicit
-/// transaction would let individual commands report success before a later
-/// `COMMIT` could still fail, turning a durability failure into a false `Ok`.
-/// Until the response path can defer replies until the transaction outcome is
-/// known, the writer must stay in SQLite's per-statement autocommit mode.
+/// Opportunistically processes burst traffic while preserving caller-visible
+/// durability. Consecutive scheduler-dispatched append-segment commands may be
+/// grouped into one explicit SQLite transaction; their caller-facing oneshots
+/// are held until the shared `COMMIT` outcome is known, so a commit failure is
+/// never reported as `Ok`.
 ///
 /// Additional queued commands are still drained opportunistically after the first
 /// wakeup. Segment, gap, event, and audit commands first pass through the
 /// storage IO scheduler; non-routed commands act as barriers and every routed
-/// command is executed before its caller receives `Ok`.
+/// command is durable, failed, or explicitly rejected before its caller receives
+/// a response.
 fn writer_loop(
     backend: &dyn StorageBackend,
     rx: &mut mpsc::Receiver<WriteCommand>,
@@ -8610,6 +8762,92 @@ mod writer_io_scheduler_tests {
     }
 
     #[test]
+    fn writer_batch_group_commits_consecutive_append_segments_same_pane() {
+        run_storage_async_test(async {
+            let backend = crate::storage_backend_trait::MockBackend::new();
+            backend.enqueue_row_response(Some(vec!["0".to_string()]));
+            backend.enqueue_row_response(Some(vec!["101".to_string()]));
+            backend.enqueue_row_response(Some(vec!["102".to_string()]));
+
+            let mut gate = StorageIoWriterGate::default();
+            let mut should_break = false;
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let (first_tx, first_rx) = oneshot::channel();
+            let (second_tx, second_rx) = oneshot::channel();
+            let mut batch = VecDeque::new();
+            batch.push_back(WriteCommand::AppendSegment {
+                pane_id: 77,
+                content: "first group append".to_string(),
+                content_hash: Some("hash-first".to_string()),
+                respond: first_tx,
+            });
+            batch.push_back(WriteCommand::AppendSegment {
+                pane_id: 77,
+                content: "second group append".to_string(),
+                content_hash: None,
+                respond: second_tx,
+            });
+
+            dispatch_write_command_batch(
+                &backend,
+                batch,
+                &mut should_break,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+                &mut gate,
+            );
+
+            assert!(!should_break);
+            let first = crate::runtime_async::oneshot_recv(first_rx)
+                .await
+                .expect("first append response should arrive")
+                .expect("first grouped append should succeed");
+            let second = crate::runtime_async::oneshot_recv(second_rx)
+                .await
+                .expect("second append response should arrive")
+                .expect("second grouped append should succeed");
+
+            assert_eq!(first.id, 101);
+            assert_eq!(first.pane_id, 77);
+            assert_eq!(first.seq, 0);
+            assert_eq!(first.content, "first group append");
+            assert_eq!(first.content_hash.as_deref(), Some("hash-first"));
+            assert_eq!(second.id, 102);
+            assert_eq!(second.pane_id, 77);
+            assert_eq!(second.seq, 1);
+            assert_eq!(second.content, "second group append");
+
+            let executed = backend.executed();
+            assert_eq!(
+                executed,
+                vec!["BEGIN".to_string(), "COMMIT".to_string()],
+                "grouped append dispatch must use one explicit transaction"
+            );
+            let writer_queries = backend.observed_queries();
+            let next_seq_queries = writer_queries
+                .iter()
+                .filter(|(sql, params)| {
+                    sql.contains("SELECT COALESCE(MAX(seq) + 1, 0)")
+                        && params == &vec!["77".to_string()]
+                })
+                .count();
+            let insert_queries = writer_queries
+                .iter()
+                .filter(|(sql, _)| sql.contains("INSERT INTO output_segments"))
+                .count();
+            assert_eq!(
+                next_seq_queries, 1,
+                "same-pane group should query the starting seq once; got {writer_queries:?}"
+            );
+            assert_eq!(
+                insert_queries, 2,
+                "both grouped segments should insert inside the transaction; got {writer_queries:?}"
+            );
+        });
+    }
+
+    #[test]
     fn writer_batch_recovers_from_dispatch_panic_and_fails_undispatched_tail() {
         reset_storage_writer_panics_total_for_test();
 
@@ -8708,6 +8946,12 @@ impl<T> WriterResultResponder<T> {
         Self {
             respond: Some(respond),
         }
+    }
+
+    fn into_sender(mut self) -> oneshot::Sender<Result<T>> {
+        self.respond
+            .take()
+            .expect("writer result responder should not be consumed twice")
     }
 }
 
@@ -9985,8 +10229,133 @@ fn append_segment_backend(
     content: &str,
     content_hash: Option<&str>,
 ) -> Result<Segment> {
-    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let next_seq = next_output_segment_seq_backend(backend, pane_id)?;
+    insert_output_segment_with_seq_backend(
+        backend,
+        pane_id,
+        next_seq,
+        content,
+        content_hash,
+        now_ms(),
+        crate::redact_backfill::current_catalog_version(),
+    )
+}
 
+struct CommittedAppendSegment {
+    segment: Segment,
+    retained_tail_moved: bool,
+}
+
+fn append_segment_group_commit_backend(
+    backend: &dyn StorageBackend,
+    writes: &[PendingAppendSegmentWrite],
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) -> Result<Vec<CommittedAppendSegment>> {
+    if writes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    backend
+        .execute("BEGIN")
+        .map_err(|err| storage_backend_error("Begin append segment group commit", err))?;
+
+    let result = append_segment_group_commit_inner(backend, writes, segment_redactors);
+    match result {
+        Ok(committed_segments) => {
+            if let Err(err) = backend.execute("COMMIT") {
+                rollback_append_segment_group_best_effort(backend, "commit failure");
+                return Err(storage_backend_error("Commit append segment group", err).into());
+            }
+            Ok(committed_segments)
+        }
+        Err(error) => {
+            rollback_append_segment_group_best_effort(backend, "append failure");
+            Err(error)
+        }
+    }
+}
+
+fn append_segment_group_commit_inner(
+    backend: &dyn StorageBackend,
+    writes: &[PendingAppendSegmentWrite],
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) -> Result<Vec<CommittedAppendSegment>> {
+    let mut next_seq_by_pane = HashMap::new();
+    let now = now_ms();
+    let catalog_version = crate::redact_backfill::current_catalog_version();
+    let mut committed_segments = Vec::with_capacity(writes.len());
+
+    for write in writes {
+        let (content, retained_tail_moved) = redact_segment_for_persistence(
+            backend,
+            write.pane_id,
+            &write.content,
+            segment_redactors,
+        )?;
+        let content_hash = if content == write.content {
+            write.content_hash.as_deref()
+        } else {
+            None
+        };
+        let next_seq =
+            next_output_segment_seq_for_group(backend, &mut next_seq_by_pane, write.pane_id)?;
+        let segment = insert_output_segment_with_seq_backend(
+            backend,
+            write.pane_id,
+            next_seq,
+            &content,
+            content_hash,
+            now,
+            catalog_version,
+        )?;
+        committed_segments.push(CommittedAppendSegment {
+            segment,
+            retained_tail_moved,
+        });
+    }
+
+    Ok(committed_segments)
+}
+
+fn rollback_append_segment_group_best_effort(backend: &dyn StorageBackend, cause: &str) {
+    if let Err(err) = backend.execute("ROLLBACK") {
+        tracing::error!(
+            cause,
+            error = %err,
+            "failed to roll back append segment group transaction"
+        );
+    }
+}
+
+fn next_output_segment_seq_for_group(
+    backend: &dyn StorageBackend,
+    next_seq_by_pane: &mut HashMap<u64, u64>,
+    pane_id: u64,
+) -> Result<u64> {
+    if let Some(next_seq) = next_seq_by_pane.get_mut(&pane_id) {
+        let seq = *next_seq;
+        *next_seq = seq.checked_add(1).ok_or_else(|| {
+            StorageError::Database(format!(
+                "output_segments.next_seq overflow for pane_id={pane_id}"
+            ))
+        })?;
+        return Ok(seq);
+    }
+
+    let next_seq = next_output_segment_seq_backend(backend, pane_id)?;
+    next_seq_by_pane.insert(
+        pane_id,
+        next_seq.checked_add(1).ok_or_else(|| {
+            StorageError::Database(format!(
+                "output_segments.next_seq overflow for pane_id={pane_id}"
+            ))
+        })?,
+    );
+    Ok(next_seq)
+}
+
+fn next_output_segment_seq_backend(backend: &dyn StorageBackend, pane_id: u64) -> Result<u64> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let next_seq_i64 = backend
         .query_row_typed(
             "SELECT COALESCE(MAX(seq) + 1, 0) FROM output_segments WHERE pane_id = ?1", // ubs:ignore - plus is fixed SQL arithmetic, not string concatenation.
@@ -10004,11 +10373,22 @@ fn append_segment_backend(
             "output_segments.next_seq out of range: {next_seq_i64}"
         ))
     })?;
+    Ok(next_seq)
+}
 
-    let now = now_ms();
+fn insert_output_segment_with_seq_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    seq: u64,
+    content: &str,
+    content_hash: Option<&str>,
+    captured_at: i64,
+    redaction_catalog_version: &str,
+) -> Result<Segment> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let content_len = content.len();
 
-    let next_seq_i64 = u64_to_i64(next_seq, "seq")?;
+    let seq_i64 = u64_to_i64(seq, "seq")?;
     let content_len_i64 = usize_to_i64(content_len, "content_len")?;
 
     let row = backend
@@ -10020,12 +10400,12 @@ fn append_segment_backend(
          RETURNING id",
         &[
             ToSqlValue::Integer(pane_id_i64),
-            ToSqlValue::Integer(next_seq_i64),
+            ToSqlValue::Integer(seq_i64),
             ToSqlValue::Text(content),
             ToSqlValue::Integer(content_len_i64),
             ToSqlValue::optional_text(content_hash),
-            ToSqlValue::Integer(now),
-            ToSqlValue::Text(crate::redact_backfill::current_catalog_version()),
+            ToSqlValue::Integer(captured_at),
+            ToSqlValue::Text(redaction_catalog_version),
         ],
     )
     .map_err(|e| storage_backend_error("Failed to insert segment", e))?
@@ -10037,11 +10417,11 @@ fn append_segment_backend(
     Ok(Segment {
         id,
         pane_id,
-        seq: next_seq,
+        seq,
         content: content.to_string(),
         content_len,
         content_hash: content_hash.map(String::from),
-        captured_at: now,
+        captured_at,
     })
 }
 
