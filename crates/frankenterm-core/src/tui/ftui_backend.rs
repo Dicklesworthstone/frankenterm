@@ -2754,6 +2754,9 @@ fn render_deck_attention_panel(frame: &mut ftui::Frame, area: UiRect, triage_ite
     }
 }
 
+const DECK_ACTION_LABEL_WIDTH: usize = 20;
+const DECK_ACTION_LABEL_CHROME_WIDTH: u16 = DECK_ACTION_LABEL_WIDTH as u16 + 6;
+
 fn render_deck_approval_panel(frame: &mut ftui::Frame, area: UiRect, triage_items: &[TriageRow]) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -2771,8 +2774,11 @@ fn render_deck_approval_panel(frame: &mut ftui::Frame, area: UiRect, triage_item
     {
         let line = format!(
             " a {} | {}",
-            truncate_str(&label, 16),
-            truncate_str(&item.title, inner.width.saturating_sub(22) as usize),
+            truncate_str(&label, DECK_ACTION_LABEL_WIDTH),
+            truncate_str(
+                &item.title,
+                inner.width.saturating_sub(DECK_ACTION_LABEL_CHROME_WIDTH) as usize,
+            ),
         );
         write_styled_clipped(
             frame,
@@ -2834,8 +2840,11 @@ fn render_deck_intervention_panel(
     {
         let line = format!(
             " i {} | {}",
-            truncate_str(&label, 16),
-            truncate_str(&item.title, inner.width.saturating_sub(22) as usize),
+            truncate_str(&label, DECK_ACTION_LABEL_WIDTH),
+            truncate_str(
+                &item.title,
+                inner.width.saturating_sub(DECK_ACTION_LABEL_CHROME_WIDTH) as usize,
+            ),
         );
         write_styled_clipped(
             frame,

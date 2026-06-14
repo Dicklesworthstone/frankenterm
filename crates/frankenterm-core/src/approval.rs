@@ -326,7 +326,7 @@ impl<'a> ApprovalStore<'a> {
         let fingerprint = fingerprint_for_input(input);
         let expires_at = now.saturating_add(expiry_ms(self.config.token_expiry_secs));
 
-        let token = ApprovalTokenRecord {
+        let approval_record = ApprovalTokenRecord {
             id: 0,
             code_hash: code_hash.clone(),
             created_at: now,
@@ -340,7 +340,7 @@ impl<'a> ApprovalStore<'a> {
             plan_version: None,
             risk_summary: None,
         };
-        self.storage.insert_approval_token(token).await?;
+        self.storage.insert_approval_token(approval_record).await?;
 
         let summary = summary.unwrap_or_else(|| summary_for_input(input));
         Ok(ApprovalRequest {
@@ -397,7 +397,7 @@ impl<'a> ApprovalStore<'a> {
         let fingerprint = fingerprint_for_input(input);
         let expires_at = now.saturating_add(expiry_ms(self.config.token_expiry_secs));
 
-        let token = ApprovalTokenRecord {
+        let approval_record = ApprovalTokenRecord {
             id: 0,
             code_hash: code_hash.clone(),
             created_at: now,
@@ -412,7 +412,7 @@ impl<'a> ApprovalStore<'a> {
             risk_summary: None,
         };
         self.storage
-            .insert_approval_token_with_cx(cx, token)
+            .insert_approval_token_with_cx(cx, approval_record)
             .await?;
 
         let summary = summary.unwrap_or_else(|| summary_for_input(input));
@@ -458,7 +458,7 @@ impl<'a> ApprovalStore<'a> {
             .clone()
             .unwrap_or_else(|| summary_for_input(input));
 
-        let token = ApprovalTokenRecord {
+        let approval_record = ApprovalTokenRecord {
             id: 0,
             code_hash: code_hash.clone(),
             created_at: now,
@@ -472,7 +472,7 @@ impl<'a> ApprovalStore<'a> {
             plan_version,
             risk_summary: risk_summary.clone(),
         };
-        self.storage.insert_approval_token(token).await?;
+        self.storage.insert_approval_token(approval_record).await?;
 
         Ok(ApprovalRequest {
             allow_once_code: code.clone(),
@@ -530,7 +530,7 @@ impl<'a> ApprovalStore<'a> {
             .clone()
             .unwrap_or_else(|| summary_for_input(input));
 
-        let token = ApprovalTokenRecord {
+        let approval_record = ApprovalTokenRecord {
             id: 0,
             code_hash: code_hash.clone(),
             created_at: now,
@@ -545,7 +545,7 @@ impl<'a> ApprovalStore<'a> {
             risk_summary: risk_summary.clone(),
         };
         self.storage
-            .insert_approval_token_with_cx(cx, token)
+            .insert_approval_token_with_cx(cx, approval_record)
             .await?;
 
         Ok(ApprovalRequest {
@@ -1236,6 +1236,17 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn wait_until_after_ms(timestamp_ms: i64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while now_ms() <= timestamp_ms {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "test clock did not advance beyond issued approval expiry"
+            );
+            std::hint::spin_loop();
         }
     }
 
@@ -2023,15 +2034,19 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let attached_code = match &with_approval {
-                PolicyDecision::RequireApproval { approval, .. } => {
-                    assert!(
-                        approval.is_some(),
-                        "attach_to_decision_with_cx must attach approval when required"
-                    );
-                    approval.as_ref().unwrap().allow_once_code.clone()
-                }
-                other => panic!("expected RequireApproval, got {other:?}"),
+            let PolicyDecision::RequireApproval { approval, .. } = &with_approval else {
+                assert!(
+                    false,
+                    "attach_to_decision_with_cx must preserve RequireApproval decisions"
+                );
+                return;
+            };
+            let attached_code = {
+                assert!(
+                    approval.is_some(),
+                    "attach_to_decision_with_cx must attach approval when required"
+                );
+                approval.as_ref().unwrap().allow_once_code.clone()
             };
 
             // Verify the attached token is consumable (round-trip).
@@ -2222,10 +2237,13 @@ mod tests {
                 matched.is_some(),
                 "matching plan_hash must consume Cx-issued plan-bound token"
             );
-            let token = matched.unwrap();
-            assert_eq!(token.plan_hash.as_deref(), Some(plan_hash));
-            assert_eq!(token.plan_version, Some(7));
-            assert_eq!(token.risk_summary.as_deref(), Some("Cx-first plan binding"));
+            let approval_record = matched.unwrap();
+            assert_eq!(approval_record.plan_hash.as_deref(), Some(plan_hash));
+            assert_eq!(approval_record.plan_version, Some(7));
+            assert_eq!(
+                approval_record.risk_summary.as_deref(),
+                Some("Cx-first plan binding")
+            );
 
             // Token 2: test mismatched plan_hash rejects.
             // The legacy semantic is TOCTOU-safe — a mismatched
@@ -2527,8 +2545,7 @@ mod tests {
             // Issue a token (will have expires_at = now)
             let request = store.issue(&input, None).await.unwrap();
 
-            // Wait a tiny bit to ensure time has passed
-            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
+            wait_until_after_ms(request.expires_at);
 
             // Try to consume - should fail because token has expired
             let consumed = store
@@ -2697,12 +2714,23 @@ mod tests {
         (storage, db_path)
     }
 
+    fn remove_storage_files(paths: Vec<std::path::PathBuf>) {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     async fn cleanup_storage(storage: StorageHandle, db_path: &std::path::Path) {
         storage.shutdown().await.unwrap();
         let db_path_str = db_path.to_string_lossy();
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
-        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+        let paths = vec![
+            db_path.to_path_buf(),
+            std::path::PathBuf::from(format!("{db_path_str}-wal")),
+            std::path::PathBuf::from(format!("{db_path_str}-shm")),
+        ];
+        crate::runtime_async::spawn_blocking(move || remove_storage_files(paths))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -2800,10 +2828,10 @@ mod tests {
                 .unwrap();
             assert!(consumed.is_some(), "Matching plan_hash should succeed");
 
-            let token = consumed.unwrap();
-            assert_eq!(token.plan_hash.as_deref(), Some(plan_hash));
-            assert_eq!(token.plan_version, Some(1));
-            assert_eq!(token.risk_summary.as_deref(), Some("Low risk"));
+            let approval_record = consumed.unwrap();
+            assert_eq!(approval_record.plan_hash.as_deref(), Some(plan_hash));
+            assert_eq!(approval_record.plan_version, Some(1));
+            assert_eq!(approval_record.risk_summary.as_deref(), Some("Low risk"));
 
             cleanup_storage(storage, &db_path).await;
         });
@@ -2938,8 +2966,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Wait for expiry
-            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
+            wait_until_after_ms(request.expires_at);
 
             let consumed = store
                 .consume_for_plan(&request.allow_once_code, &input, plan_hash)
@@ -3270,16 +3297,36 @@ mod tests {
             let (storage, db_path) = setup_test_storage("actor_kind_parity").await;
             let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
 
-            for actor in [ActorKind::Robot, ActorKind::Mcp, ActorKind::Workflow] {
+            let cases = [
+                (
+                    ActorKind::Robot,
+                    "echo robot",
+                    "sha256:actor-robot".to_string(),
+                    "sha256:actor-robot".to_string(),
+                ),
+                (
+                    ActorKind::Mcp,
+                    "echo mcp",
+                    "sha256:actor-mcp".to_string(),
+                    "sha256:actor-mcp".to_string(),
+                ),
+                (
+                    ActorKind::Workflow,
+                    "echo workflow",
+                    "sha256:actor-workflow".to_string(),
+                    "sha256:actor-workflow".to_string(),
+                ),
+            ];
+
+            for (actor, text_summary, audit_correlation_id, query_correlation_id) in cases {
                 let input = PolicyInput::new(ActionKind::SendText, actor)
                     .with_pane(1)
                     .with_domain("local")
-                    .with_text_summary(format!("echo {}", actor.as_str()))
+                    .with_text_summary(text_summary)
                     .with_capabilities(PaneCapabilities::prompt());
                 let request = store.issue(&input, None).await.unwrap();
-                let correlation_id = format!("sha256:actor-{}", actor.as_str());
                 let audit_context = ApprovalAuditContext {
-                    correlation_id: Some(correlation_id.clone()),
+                    correlation_id: Some(audit_correlation_id),
                     decision_context: None,
                 };
 
@@ -3291,14 +3338,17 @@ mod tests {
 
                 let audits = storage
                     .get_audit_actions(AuditQuery {
-                        correlation_id: Some(correlation_id),
+                        correlation_id: Some(query_correlation_id),
                         ..Default::default()
                     })
                     .await
                     .unwrap();
                 assert_eq!(audits.len(), 1);
-                assert_eq!(audits[0].actor_kind, actor.as_str());
-                let context = parse_decision_context(audits[0].decision_context.as_deref());
+                let audit = audits
+                    .first()
+                    .expect("actor audit query must return one record");
+                assert_eq!(audit.actor_kind, actor.as_str());
+                let context = parse_decision_context(audit.decision_context.as_deref());
                 assert_eq!(context.actor, actor);
                 assert_eq!(context.surface, PolicySurface::default_for_actor(actor));
                 assert_eq!(evidence(&context, "approval_actor"), Some(actor.as_str()));
@@ -3416,14 +3466,17 @@ mod tests {
                 .unwrap();
 
             assert!(result.requires_approval());
-            if let PolicyDecision::RequireApproval { approval, .. } = &result {
-                assert!(approval.is_some(), "Approval payload should be attached");
-                let ap = approval.as_ref().unwrap();
-                assert!(ap.allow_once_full_hash.starts_with("sha256:"));
-                assert_eq!(ap.allow_once_code.len(), DEFAULT_CODE_LEN);
-            } else {
-                panic!("Expected RequireApproval decision");
-            }
+            let PolicyDecision::RequireApproval { approval, .. } = &result else {
+                assert!(
+                    false,
+                    "attach_to_decision must preserve RequireApproval decisions"
+                );
+                return;
+            };
+            assert!(approval.is_some(), "Approval payload should be attached");
+            let ap = approval.as_ref().unwrap();
+            assert!(ap.allow_once_full_hash.starts_with("sha256:"));
+            assert_eq!(ap.allow_once_code.len(), DEFAULT_CODE_LEN);
 
             cleanup_storage(storage, &db_path).await;
         });
@@ -3484,12 +3537,15 @@ mod tests {
                 .await
                 .unwrap();
 
-            if let PolicyDecision::RequireApproval { approval, .. } = &result {
-                let ap = approval.as_ref().unwrap();
-                assert_eq!(ap.summary, "Please review this action");
-            } else {
-                panic!("Expected RequireApproval decision");
-            }
+            let PolicyDecision::RequireApproval { approval, .. } = &result else {
+                assert!(
+                    false,
+                    "attach_to_decision must preserve RequireApproval decisions"
+                );
+                return;
+            };
+            let ap = approval.as_ref().unwrap();
+            assert_eq!(ap.summary, "Please review this action");
 
             cleanup_storage(storage, &db_path).await;
         });
@@ -3577,9 +3633,9 @@ mod tests {
                 .unwrap();
             assert!(consumed.is_some());
 
-            let token = consumed.unwrap();
-            assert_eq!(token.plan_version, None);
-            assert_eq!(token.risk_summary, None);
+            let approval_record = consumed.unwrap();
+            assert_eq!(approval_record.plan_version, None);
+            assert_eq!(approval_record.risk_summary, None);
 
             cleanup_storage(storage, &db_path).await;
         });
@@ -3605,7 +3661,9 @@ mod tests {
             let audits = storage.get_audit_actions(query).await.unwrap();
             assert_eq!(audits.len(), 1);
 
-            let audit = &audits[0];
+            let audit = audits
+                .first()
+                .expect("approval audit query returns one row");
             assert_eq!(audit.actor_kind, "robot");
             assert_eq!(audit.action_kind, "approve_allow_once");
             assert_eq!(audit.policy_decision, "allow");
