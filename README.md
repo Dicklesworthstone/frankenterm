@@ -49,7 +49,7 @@
 | Auditing the claims | [Trust & Attestation](#trust--attestation) → [Threat Model](#deep-dive-threat-model) → [Formal Methods](#deep-dive-formal-methods-in-this-repo) |
 | Reading the algorithms | [Algorithm & Data Structure Catalog](#algorithm--data-structure-catalog) → [Pattern Engine](#deep-dive-pattern-engine-architecture) → [Cx Cancellation Model](#deep-dive-the-cx-cancellation-model) |
 
-**A swarm-native terminal platform that observes, controls, and audits fleets of 200+ concurrent AI coding agents.** <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->512<!--/count--> core-library modules, <!--count:core_loc-->1027531<!--/count-->+ lines of Rust, <!--count:test_count-->56461<!--/count-->+ test annotations across <!--count:core_rust_test_files-->970<!--/count--> integration test files.
+**A swarm-native terminal platform that observes, controls, and audits fleets of 200+ concurrent AI coding agents.** <!--count:workspace_members-->77<!--/count--> workspace crates, <!--count:core_subcrates-->19<!--/count--> sub-crates carved out of the core, <!--count:core_top_level_modules-->531<!--/count--> core-library modules, <!--count:core_loc-->1089341<!--/count-->+ lines of Rust, <!--count:test_count-->57556<!--/count-->+ test annotations across <!--count:core_rust_test_files-->984<!--/count--> integration test files.
 
 _Counts are auto-stamped by `scripts/stamp-readme-counts.sh` and drift fast. See [Maintainers: how counts stay honest](#maintainers-how-counts-stay-honest) at the bottom for the exact recipe. Developer checks use the live worktree by default; release snapshots use `--source=head` so unrelated dirty files cannot alter the attested counts._
 
@@ -1493,7 +1493,7 @@ frankenterm/                              # 77 workspace members (auto-stamped)
 │   ├── env-bootstrap/  tabout/  gui-subcommands/  toast-notification/  open-url/
 │   └── lua-api-crates/{termwiz-funcs,mux-lua,url-funcs}/
 ├── fuzz/                                 # 48 fuzz targets
-├── docs/                                 # <!--count:doc_markdown_files-->455<!--/count--> Markdown documentation files
+├── docs/                                 # <!--count:doc_markdown_files-->464<!--/count--> Markdown documentation files
 ├── tests/e2e/                            # 276 shell E2E scripts
 └── fixtures/                             # Test fixtures (including operating-envelope goldens)
 ```
@@ -3854,7 +3854,7 @@ The wire protocol's safety review and diff-fuzz coverage are tracked in [`docs/s
 
 ## Performance Benchmarks
 
-Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->111<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts. In the shared agent checkout, proof and closeout benchmark runs must go through RCH:
+Benchmarks live under `crates/frankenterm-core/benches/` (<!--count:criterion_bench_files-->112<!--/count--> Criterion bench files) and use human-readable budgets with machine-readable artifacts. In the shared agent checkout, proof and closeout benchmark runs must go through RCH:
 
 ```bash
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-bench-compile \
@@ -3893,11 +3893,11 @@ The project maintains extensive test coverage:
 
 | Category | Count | Purpose |
 |---|---|---|
-| Test annotations | <!--count:test_count-->56461<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
-| Core Rust test files | <!--count:core_rust_test_files-->970<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
+| Test annotations | <!--count:test_count-->57556<!--/count-->+ | Module-level correctness, property checks, and async test coverage |
+| Core Rust test files | <!--count:core_rust_test_files-->984<!--/count--> | Cross-module behavior under `crates/frankenterm-core/tests/` |
 | E2E shell scripts | <!--count:e2e_scripts-->276<!--/count--> | Full-pipeline validation |
-| Criterion bench files | <!--count:criterion_bench_files-->111<!--/count--> | Performance regression detection |
-| Fuzz targets | <!--count:fuzz_targets-->51<!--/count--> | Security / robustness |
+| Criterion bench files | <!--count:criterion_bench_files-->112<!--/count--> | Performance regression detection |
+| Fuzz targets | <!--count:fuzz_targets-->54<!--/count--> | Security / robustness |
 
 ```bash
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-test \
@@ -4162,6 +4162,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*<!--count:workspace_members-->77<!--/count--> workspace crates. <!--count:core_top_level_modules-->512<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1027531<!--/count-->+ lines. <!--count:test_count-->56461<!--/count-->+ tests. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->77<!--/count--> workspace crates. <!--count:core_top_level_modules-->531<!--/count--> top-level core modules + <!--count:core_subcrates-->19<!--/count--> sub-crates. <!--count:core_loc-->1089341<!--/count-->+ lines. <!--count:test_count-->57556<!--/count-->+ tests. asupersync-native, Cx-first, `tokio`-banned, `unsafe`-forbidden. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>
