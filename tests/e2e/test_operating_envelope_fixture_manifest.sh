@@ -78,6 +78,18 @@ PROOF_CALENDAR_REQUIRED_INVALID_CASES=(
   "toon-row-width-mismatch"
   "service-mutation-permitted"
 )
+RETAINED_RUN_REQUIRED_SCENARIOS=(
+  "clean-ready-healthy-rch"
+  "no-ready-docs-static"
+  "agent-mail-unavailable"
+  "rch-no-workers"
+  "rch-topology-failure"
+  "dirty-overlap-untracked-owner"
+  "stale-in-progress-candidate"
+  "target-class-skipped"
+  "resource-pressure-red"
+  "resource-pressure-black"
+)
 
 fail() {
   if [[ "${OUTPUT_FORMAT}" == "json" ]] && command -v jq >/dev/null 2>&1; then
@@ -432,6 +444,205 @@ done < <(
   ' "${PROOF_CALENDAR_FIXTURES}" | sort -u
 )
 
+required_retained_run_scenarios_json="$(
+  printf '%s\n' "${RETAINED_RUN_REQUIRED_SCENARIOS[@]}" | jq -R . | jq -s .
+)"
+
+retained_run_jsonl="$(
+  retained_run_index=0
+  for scenario_id in "${RETAINED_RUN_REQUIRED_SCENARIOS[@]}"; do
+    retained_run_index=$((retained_run_index + 1))
+    command="bash tests/e2e/test_operating_envelope_fixture_manifest.sh"
+    exit_code=0
+    worker_id=""
+    remote_cargo_reached=false
+    cargo_test_reached=false
+    outcome="wait"
+    required_reason="beads.ready_empty"
+    case "${scenario_id}" in
+      "clean-ready-healthy-rch")
+        command="RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-booek-5-cod5-target cargo test -p frankenterm-core --lib operating_envelope"
+        worker_id="vmi-retained-healthy"
+        remote_cargo_reached=true
+        cargo_test_reached=true
+        outcome="admit"
+        required_reason=""
+        ;;
+      "agent-mail-unavailable")
+        command="fetch_inbox"
+        exit_code=1
+        outcome="degrade"
+        required_reason="agent_mail.unavailable_after_retry"
+        ;;
+      "rch-no-workers")
+        command="rch diagnose --dry-run --json"
+        exit_code=1
+        outcome="defer"
+        required_reason="rch.no_workers_passed_health"
+        ;;
+      "rch-topology-failure")
+        command="rch diagnose --dry-run --json"
+        exit_code=1
+        outcome="block"
+        required_reason="rch.topology_preflight_failed"
+        ;;
+      "dirty-overlap-untracked-owner")
+        command="git status --short --untracked-files=all"
+        outcome="wait"
+        required_reason="dirty_overlap.present"
+        ;;
+      "stale-in-progress-candidate")
+        command="scripts/swarm-tick.sh --agent-mail-fallback frankenterm"
+        outcome="degrade"
+        required_reason="beads.stale_candidate"
+        ;;
+      "target-class-skipped")
+        command="jq empty docs/attestations/proofs/resource-cockpit-target-class.json"
+        outcome="defer"
+        required_reason="target_hardware.skipped_not_proven"
+        ;;
+      "resource-pressure-red")
+        command="ft robot swarm-capacity status --level 2"
+        outcome="shed"
+        required_reason="capacity.red"
+        ;;
+      "resource-pressure-black")
+        command="ft robot swarm-capacity status --level 2"
+        outcome="shed"
+        required_reason="capacity.black"
+        ;;
+    esac
+
+    input_hash="$(printf 'sha256:%064x' "${retained_run_index}")"
+    plan_hash="$(printf 'sha256:%064x' "$((retained_run_index + 100))")"
+    jsonl_hash="$(printf 'sha256:%064x' "$((retained_run_index + 200))")"
+    old_hash="$(printf 'sha256:%064x' "$((retained_run_index + 300))")"
+    new_hash="$(printf 'sha256:%064x' "$((retained_run_index + 400))")"
+
+    jq -cn \
+      --arg scenario_id "${scenario_id}" \
+      --arg command "${command}" \
+      --arg worker_id "${worker_id}" \
+      --arg target_dir "/tmp/ft-booek-5-cod5-target" \
+      --arg outcome "${outcome}" \
+      --arg required_reason "${required_reason}" \
+      --arg input_hash "${input_hash}" \
+      --arg plan_hash "${plan_hash}" \
+      --arg jsonl_hash "${jsonl_hash}" \
+      --arg old_hash "${old_hash}" \
+      --arg new_hash "${new_hash}" \
+      --argjson exit_code "${exit_code}" \
+      --argjson remote_cargo_reached "${remote_cargo_reached}" \
+      --argjson cargo_test_reached "${cargo_test_reached}" \
+      '{
+        schema_version: 1,
+        contract_id: "ft.operating_envelope.retained_run_artifact.v1",
+        generated_at_ms: 1781420000000,
+        run_id: ("operating-envelope-retained-" + $scenario_id),
+        scenario_id: $scenario_id,
+        dry_run: true,
+        read_only: true,
+        external_provider_calls: false,
+        command: ({
+          command: $command,
+          exit_code: $exit_code,
+          target_dir: $target_dir,
+          remote_cargo_reached: $remote_cargo_reached,
+          cargo_test_reached: $cargo_test_reached
+        } + (if $worker_id == "" then {} else {worker_id: $worker_id} end)),
+        input_fixture_hashes: [
+          {fixture_id: "retained_source_snapshot", sha256: $input_hash}
+        ],
+        output_hashes: [
+          {output_id: "operating_envelope_plan_json", sha256: $plan_hash},
+          {output_id: "retained_jsonl_line", sha256: $jsonl_hash}
+        ],
+        scrub_rules: [
+          "source_summaries_only",
+          "raw_pane_content_forbidden",
+          "secret_material_redacted",
+          "agent_mail_bodies_not_retained",
+          "rch_logs_classified_by_reason_code"
+        ],
+        source_freshness: [
+          {source_id: ("capacity." + $scenario_id), source_kind: "capacity_resource", state: "available", freshness_state: "fresh", freshness_ms: 1000},
+          {source_id: ("rch." + $scenario_id), source_kind: "rch", state: "available", freshness_state: "fresh", freshness_ms: 1000},
+          {source_id: ("beads." + $scenario_id), source_kind: "beads", state: "available", freshness_state: "fresh", freshness_ms: 1000},
+          {source_id: ("agent_mail." + $scenario_id), source_kind: "agent_mail", state: "available", freshness_state: "fresh", freshness_ms: 1000},
+          {source_id: ("git." + $scenario_id), source_kind: "git", state: "available", freshness_state: "fresh", freshness_ms: 1000}
+        ],
+        golden_update: {
+          bless_required: true,
+          bless_command: "FT_OPERATING_ENVELOPE_BLESS=1 bash tests/e2e/test_operating_envelope_fixture_manifest.sh",
+          old_output_sha256: $old_hash,
+          new_output_sha256: $new_hash
+        },
+        reason_code_diff: {
+          baseline: ["operating_envelope.baseline"],
+          observed: (if $required_reason == "" then ["operating_envelope.baseline"] else ["operating_envelope.baseline", $required_reason] end),
+          added: (if $required_reason == "" then [] else [$required_reason] end),
+          removed: []
+        },
+        decision: {outcome: $outcome},
+        admission_windows: [
+          {
+            window_id: ("retained-" + $scenario_id),
+            forbidden_action_classes: ["raw_pane_content", "service_mutation", "local_cargo_proof"]
+          }
+        ]
+      }'
+  done
+)"
+
+retained_run_case_count="$(
+  printf '%s\n' "${retained_run_jsonl}" | jq -s 'length'
+)"
+
+printf '%s\n' "${retained_run_jsonl}" | jq -s -e \
+  --argjson required_scenarios "${required_retained_run_scenarios_json}" '
+  def sha256_ok:
+    type == "string" and test("^sha256:[0-9a-f]{64}$");
+  def expected_reason:
+    if .scenario_id == "clean-ready-healthy-rch" then ""
+    elif .scenario_id == "no-ready-docs-static" then "beads.ready_empty"
+    elif .scenario_id == "agent-mail-unavailable" then "agent_mail.unavailable_after_retry"
+    elif .scenario_id == "rch-no-workers" then "rch.no_workers_passed_health"
+    elif .scenario_id == "rch-topology-failure" then "rch.topology_preflight_failed"
+    elif .scenario_id == "dirty-overlap-untracked-owner" then "dirty_overlap.present"
+    elif .scenario_id == "stale-in-progress-candidate" then "beads.stale_candidate"
+    elif .scenario_id == "target-class-skipped" then "target_hardware.skipped_not_proven"
+    elif .scenario_id == "resource-pressure-red" then "capacity.red"
+    elif .scenario_id == "resource-pressure-black" then "capacity.black"
+    else "unexpected"
+    end;
+  def required_reason_diff:
+    expected_reason as $expected
+    | .reason_code_diff.baseline == ["operating_envelope.baseline"]
+      and .reason_code_diff.observed == (if $expected == "" then ["operating_envelope.baseline"] else ["operating_envelope.baseline", $expected] end)
+      and .reason_code_diff.added == (if $expected == "" then [] else [$expected] end)
+      and .reason_code_diff.removed == [];
+
+  length == ($required_scenarios | length)
+  and ([.[].scenario_id] | sort) == ($required_scenarios | sort)
+  and all(.[]; .schema_version == 1)
+  and all(.[]; .contract_id == "ft.operating_envelope.retained_run_artifact.v1")
+  and all(.[]; .dry_run == true and .read_only == true and .external_provider_calls == false)
+  and all(.[]; (.command.command | type == "string" and length > 0))
+  and all(.[]; (.command.exit_code | type == "number"))
+  and all(.[]; .command.target_dir == "/tmp/ft-booek-5-cod5-target")
+  and all(.[]; ((.command.remote_cargo_reached or .command.cargo_test_reached) | not) or ((.command.worker_id? // "") | length > 0))
+  and all(.[]; (.input_fixture_hashes | length) >= 1 and all(.input_fixture_hashes[]; .sha256 | sha256_ok))
+  and all(.[]; (.output_hashes | length) >= 2 and all(.output_hashes[]; .sha256 | sha256_ok))
+  and all(.[]; .golden_update.bless_required == true and (.golden_update.old_output_sha256 | sha256_ok) and (.golden_update.new_output_sha256 | sha256_ok))
+  and all(.[]; .golden_update.old_output_sha256 != .golden_update.new_output_sha256)
+  and all(.[]; (.scrub_rules | index("raw_pane_content_forbidden") != null))
+  and all(.[]; (.scrub_rules | index("agent_mail_bodies_not_retained") != null))
+  and all(.[]; (.source_freshness | length) >= 5)
+  and all(.[]; ([.source_freshness[].source_kind] | index("capacity_resource") != null and index("rch") != null and index("beads") != null and index("agent_mail") != null and index("git") != null))
+  and all(.[]; required_reason_diff)
+  and all(.[]; (.admission_windows | length) >= 1)
+' >/dev/null || fail "retained-run JSONL contract does not cover required no-mock scenarios"
+
 for doc_text in \
   "ft.operating_envelope.proof_calendar.v1" \
   "ft-operating-envelope-proof-calendar.json" \
@@ -458,6 +669,7 @@ if [[ "${OUTPUT_FORMAT}" == "json" ]]; then
     --argjson root_alias_count "${#root_alias_paths[@]}" \
     --argjson proof_calendar_case_count "${proof_calendar_case_count}" \
     --argjson proof_calendar_invalid_case_count "${proof_calendar_invalid_case_count}" \
+    --argjson retained_run_case_count "${retained_run_case_count}" \
     '{
       ok: true,
       contract_id: $contract_id,
@@ -467,10 +679,11 @@ if [[ "${OUTPUT_FORMAT}" == "json" ]]; then
         invalid_fixture_count: $invalid_count,
         root_alias_count: $root_alias_count,
         proof_calendar_case_count: $proof_calendar_case_count,
-        proof_calendar_invalid_case_count: $proof_calendar_invalid_case_count
+        proof_calendar_invalid_case_count: $proof_calendar_invalid_case_count,
+        retained_run_case_count: $retained_run_case_count
       }
     }'
 else
-  printf 'operating-envelope fixture manifest: static verifier passed (%d valid, %d invalid, %d root aliases, %d proof-calendar cases, %d proof-calendar invalid cases)\n' \
-    "${#valid_paths[@]}" "${#invalid_paths[@]}" "${#root_alias_paths[@]}" "${proof_calendar_case_count}" "${proof_calendar_invalid_case_count}"
+  printf 'operating-envelope fixture manifest: static verifier passed (%d valid, %d invalid, %d root aliases, %d proof-calendar cases, %d proof-calendar invalid cases, %d retained-run cases)\n' \
+    "${#valid_paths[@]}" "${#invalid_paths[@]}" "${#root_alias_paths[@]}" "${proof_calendar_case_count}" "${proof_calendar_invalid_case_count}" "${retained_run_case_count}"
 fi

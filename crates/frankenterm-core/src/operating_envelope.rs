@@ -3730,6 +3730,62 @@ mod tests {
     }
 
     #[test]
+    fn fixture_manifest_shell_verifier_retains_run_jsonl_contract() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = match manifest_dir.parent().and_then(std::path::Path::parent) {
+            Some(path) => path,
+            None => {
+                assert!(false, "resolve repository root from CARGO_MANIFEST_DIR");
+                return;
+            }
+        };
+        let output = match std::process::Command::new("bash")
+            .arg("tests/e2e/test_operating_envelope_fixture_manifest.sh")
+            .arg("--json")
+            .current_dir(repo_root)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                assert!(
+                    false,
+                    "run operating-envelope fixture manifest verifier: {error}"
+                );
+                return;
+            }
+        };
+        let stdout = match String::from_utf8(output.stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                assert!(
+                    false,
+                    "operating-envelope fixture manifest stdout is not UTF-8: {error}"
+                );
+                return;
+            }
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "operating-envelope fixture manifest verifier failed; stdout={stdout}; stderr={stderr}"
+        );
+        let payload: serde_json::Value = match serde_json::from_str(&stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                assert!(
+                    false,
+                    "operating-envelope fixture manifest stdout is not JSON: {error}; stdout={stdout}"
+                );
+                return;
+            }
+        };
+        assert_eq!(
+            payload.pointer("/summary/retained_run_case_count"),
+            Some(&serde_json::Value::from(10))
+        );
+    }
+
+    #[test]
     fn clean_ready_queue_admits_ranked_windows() {
         let plan = plan_with(base_domains());
 
