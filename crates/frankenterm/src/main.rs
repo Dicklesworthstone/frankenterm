@@ -3246,6 +3246,46 @@ enum RedactCommands {
         #[arg(long)]
         pretty: bool,
     },
+
+    /// Excise one leaked secret from at-rest output_segments by SHA-256 hash
+    /// and emit an append-only purge tombstone receipt.
+    #[command(after_help = r#"EXAMPLES:
+    ft redact purge --secret-hash 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    ft redact purge --secret-hash 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --dry-run
+    ft redact purge --secret-hash 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --format json --pretty"#)]
+    Purge {
+        /// SHA-256 hex digest of the target secret (never the plaintext)
+        #[arg(long)]
+        secret_hash: String,
+
+        /// Output format: auto, plain, or json
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Scan and count, but mutate nothing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Segments scanned per batch
+        #[arg(long, default_value = "1000")]
+        batch_size: u32,
+
+        /// Resume strictly after this segment id (0 = from the start)
+        #[arg(long, default_value = "0")]
+        resume_after: i64,
+
+        /// Skip rebuilding the FTS5 index after rewriting
+        #[arg(long)]
+        no_rebuild_fts: bool,
+
+        /// Keep (do not invalidate) embeddings for rewritten segments
+        #[arg(long)]
+        keep_embeddings: bool,
+
+        /// Pretty-print JSON output
+        #[arg(long)]
+        pretty: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -45474,7 +45514,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         Some(Commands::Redact { command }) => {
             use frankenterm_core::output::{OutputFormat, detect_format};
             use frankenterm_core::redact_backfill::{
-                RedactBackfillConfig, run_redact_backfill_on_path,
+                RedactBackfillConfig, run_redact_backfill_on_path, run_redact_purge_on_path,
             };
 
             let layout = match config.workspace_layout(Some(&workspace_root)) {
@@ -45551,6 +45591,83 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             if receipt.tantivy_rebuild_requested {
                                 println!(
                                     "  note: Tantivy reindex signaled (handled by the search daemon)"
+                                );
+                            }
+                            if receipt.dry_run {
+                                println!("  (dry-run: no changes were written)");
+                            }
+                        }
+                    }
+                }
+                RedactCommands::Purge {
+                    secret_hash,
+                    format,
+                    dry_run,
+                    batch_size,
+                    resume_after,
+                    no_rebuild_fts,
+                    keep_embeddings,
+                    pretty,
+                } => {
+                    let cfg = RedactBackfillConfig {
+                        batch_size,
+                        dry_run,
+                        resume_after_id: resume_after,
+                        rebuild_fts: !no_rebuild_fts,
+                        invalidate_embeddings: !keep_embeddings,
+                    };
+
+                    // Offline incident-response maintenance over the db file
+                    // (stop `ft watch` first). The target is a SHA-256 digest;
+                    // plaintext never enters argv, receipts, or audit rows.
+                    let receipt = match run_redact_purge_on_path(&db_path, &secret_hash, &cfg) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Error: redact purge failed: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    let output_format = match format.to_lowercase().as_str() {
+                        "json" => OutputFormat::Json,
+                        "plain" => OutputFormat::Plain,
+                        _ => detect_format(),
+                    };
+                    match output_format {
+                        OutputFormat::Json => {
+                            let rendered = if pretty {
+                                serde_json::to_string_pretty(&receipt)
+                            } else {
+                                serde_json::to_string(&receipt)
+                            }
+                            .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+                            println!("{rendered}");
+                        }
+                        _ => {
+                            println!("{}", receipt.summary_line());
+                            println!("  secret_hash: {}", receipt.secret_hash);
+                            println!("  scanned:     {}", receipt.segments_scanned);
+                            println!("  segments:    {}", receipt.segments_purged);
+                            println!("  occurrences: {}", receipt.occurrences_purged);
+                            if receipt.family_counts.is_empty() {
+                                println!("  families:    (none matched)");
+                            } else {
+                                println!("  per-family purges:");
+                                for (family, count) in &receipt.family_counts {
+                                    println!("    {family:<28} {count}");
+                                }
+                            }
+                            println!(
+                                "  surfaces:    output_segments={}, fts5={}, embeddings={}, tantivy={}, backups_review={}",
+                                receipt.segments_purged,
+                                receipt.fts_rebuilt,
+                                receipt.embeddings_invalidated,
+                                receipt.tantivy_rebuild_requested,
+                                receipt.backups_review_required,
+                            );
+                            if receipt.backups_review_required {
+                                println!(
+                                    "  warning: existing backup archives may still contain the hashed secret"
                                 );
                             }
                             if receipt.dry_run {
