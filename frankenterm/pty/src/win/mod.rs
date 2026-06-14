@@ -1,6 +1,6 @@
 use crate::{Child, ChildKiller, ExitStatus};
 use anyhow::Context as _;
-use std::io::{Error as IoError, Result as IoResult};
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::os::windows::io::AsRawHandle;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -18,9 +18,49 @@ mod psuedocon;
 use filedescriptor::OwnedHandle;
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| {
+        mutex.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HandleCloneError {
+    kind: ErrorKind,
+    raw_os_error: Option<i32>,
+}
+
+impl HandleCloneError {
+    fn into_io_error(self) -> IoError {
+        if let Some(code) = self.raw_os_error {
+            IoError::from_raw_os_error(code)
+        } else {
+            IoError::new(self.kind, "failed to clone Windows process handle")
+        }
+    }
+
+    fn to_io_error(&self) -> IoError {
+        (*self).into_io_error()
+    }
+}
+
+impl From<IoError> for HandleCloneError {
+    fn from(error: IoError) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+}
+
+impl From<HandleCloneError> for IoError {
+    fn from(error: HandleCloneError) -> Self {
+        error.into_io_error()
+    }
+}
+
+fn clone_handle(handle: &OwnedHandle) -> Result<OwnedHandle, HandleCloneError> {
+    handle.try_clone().map_err(HandleCloneError::from)
 }
 
 #[derive(Debug)]
@@ -32,7 +72,7 @@ pub struct WinChild {
 impl WinChild {
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
         let mut status: DWORD = 0;
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = clone_handle(&lock_or_recover(&self.proc))?;
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
             if status == STILL_ACTIVE {
@@ -46,7 +86,7 @@ impl WinChild {
     }
 
     fn do_kill(&mut self) -> IoResult<()> {
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = clone_handle(&lock_or_recover(&self.proc))?;
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         // TerminateProcess returns non-zero (TRUE) on success
         if res == 0 {
@@ -59,24 +99,24 @@ impl WinChild {
 
 impl ChildKiller for WinChild {
     fn kill(&mut self) -> IoResult<()> {
-        self.do_kill().ok();
-        Ok(())
+        self.do_kill()
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = clone_handle(&lock_or_recover(&self.proc));
         Box::new(WinChildKiller { proc })
     }
 }
 
 #[derive(Debug)]
 pub struct WinChildKiller {
-    proc: OwnedHandle,
+    proc: Result<OwnedHandle, HandleCloneError>,
 }
 
 impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
-        let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
+        let proc = self.proc.as_ref().map_err(HandleCloneError::to_io_error)?;
+        let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         // TerminateProcess returns non-zero (TRUE) on success
         if res == 0 {
             Err(IoError::last_os_error())
@@ -86,7 +126,10 @@ impl ChildKiller for WinChildKiller {
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        let proc = self.proc.try_clone().unwrap();
+        let proc = self
+            .proc
+            .as_ref()
+            .map_or_else(|error| Err(*error), clone_handle);
         Box::new(WinChildKiller { proc })
     }
 }
@@ -100,7 +143,7 @@ impl Child for WinChild {
         if let Ok(Some(status)) = self.try_wait() {
             return Ok(status);
         }
-        let proc = lock_or_recover(&self.proc).try_clone().unwrap();
+        let proc = clone_handle(&lock_or_recover(&self.proc))?;
         unsafe {
             WaitForSingleObject(proc.as_raw_handle() as _, INFINITE);
         }
@@ -115,11 +158,7 @@ impl Child for WinChild {
 
     fn process_id(&self) -> Option<u32> {
         let res = unsafe { GetProcessId(lock_or_recover(&self.proc).as_raw_handle() as _) };
-        if res == 0 {
-            None
-        } else {
-            Some(res)
-        }
+        if res == 0 { None } else { Some(res) }
     }
 
     fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
@@ -137,6 +176,8 @@ impl std::future::Future for WinChild {
             Err(err) => Poll::Ready(Err(err).context("Failed to retrieve process exit status")),
             Ok(None) => {
                 struct PassHandleToWaiterThread(pub OwnedHandle);
+                // SAFETY: Windows process handles are process-wide values; this
+                // wrapper moves a cloned handle to a waiter thread that only waits.
                 unsafe impl Send for PassHandleToWaiterThread {}
 
                 let spawn_error = {
