@@ -5060,7 +5060,6 @@ fn bocpd_change_point_to_detection(change_point: &crate::bocpd::PaneChangePoint)
             "pane_id": change_point.pane_id,
             "observation_index": change_point.observation_index,
             "posterior_probability": change_point.posterior_probability,
-            "map_run_length": change_point.map_run_length,
             "timestamp_secs": change_point.timestamp_secs,
             "features_at_change": &change_point.features_at_change,
         }),
@@ -5518,7 +5517,6 @@ mod tests {
             pane_id: 42,
             observation_index: 11,
             posterior_probability: 0.75,
-            map_run_length: 3,
             features_at_change: Some(crate::bocpd::OutputFeatures {
                 output_rate: 123.0,
                 byte_rate: 456.0,

@@ -477,12 +477,46 @@ pub const RENDERER_SSIM_PARITY_DEFAULT_MAX_L_INF: u8 = 8;
 /// Default changed-pixel fraction floor in parts per million.
 pub const RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM: u32 = 1_000;
 
+// ── ft-tf6g3.3 (G18): full renderer SLO catalog — resize FPS, atlas
+// stability, idle GPU power (joining input-to-photon + SSIM parity). ──
+
+/// Read-only MCP resource URI for the resize-FPS SLO status.
+pub const RENDERER_RESIZE_FPS_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/resize_fps";
+/// Read-only MCP resource URI for the atlas-stability SLO status.
+pub const RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/atlas_stability";
+/// Read-only MCP resource URI for the idle-GPU-power SLO status.
+pub const RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/idle_gpu_power";
+/// Consolidated suite attestation slot (extends the per-SLO render-parity slot).
+pub const RENDERER_SLO_SUITE_ATTESTATION_SLOT: &str = "docs/attestations/tui/render-slo-suite.json";
+/// Per-PR regression gate threshold: an SLO degrading more than this percentage
+/// fires the SPRT-suppressed regression gate.
+pub const RENDERER_SLO_REGRESSION_GATE_PCT: u32 = 10;
+/// Resize-FPS storm pane range driven by the deterministic resize storm.
+pub const RENDERER_RESIZE_FPS_STORM_PANE_RANGE: &str = "20..=200";
+/// Target achieved-FPS p50 floor during the resize storm.
+pub const RENDERER_RESIZE_FPS_TARGET_MIN_P50: u32 = 60;
+/// Current non-claiming status for the resize-FPS SLO substrate.
+pub const RENDERER_RESIZE_FPS_STATUS: &str =
+    "resize_storm_harness_retained_jsonl_pending_suite_attestation";
+/// Current non-claiming status for the atlas-stability SLO substrate.
+pub const RENDERER_ATLAS_STABILITY_STATUS: &str =
+    "evict_recover_harness_retained_jsonl_pending_suite_attestation";
+/// Current non-claiming status for the idle-GPU-power SLO substrate.
+pub const RENDERER_IDLE_GPU_POWER_STATUS: &str = "power_sampler_pending_target_run";
+
 /// `ft doctor --json .renderer_slos` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererSloDoctorReport {
     pub schema_version: String,
+    /// Consolidated suite attestation slot covering the full SLO catalog.
+    pub suite_attestation_slot: String,
+    /// SPRT-gated per-PR regression threshold shared across SLOs (percent).
+    pub regression_gate_pct: u32,
     pub input_to_photon: RendererInputToPhotonSloStatus,
     pub ssim_parity: RendererSsimParitySloStatus,
+    pub resize_fps: RendererResizeFpsSloStatus,
+    pub atlas_stability: RendererAtlasStabilitySloStatus,
+    pub idle_gpu_power: RendererIdleGpuPowerSloStatus,
 }
 
 /// Operator-facing status for the input-to-photon renderer SLO.
@@ -521,6 +555,59 @@ pub struct RendererSsimParitySloStatus {
     pub pending_reason: String,
 }
 
+/// Operator-facing status for the resize-FPS renderer SLO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererResizeFpsSloStatus {
+    pub claim_id: String,
+    pub status: String,
+    /// Pane range driven through the deterministic resize storm (e.g. `20..=200`).
+    pub storm_pane_range: String,
+    /// Target achieved-FPS p50 floor during the storm.
+    pub target_min_fps_p50: u32,
+    /// SPRT-gated per-PR regression threshold (percent degradation).
+    pub regression_gate_pct: u32,
+    pub source_bench: String,
+    /// Retained JSONL evidence glob under the suite attestation directory.
+    pub retained_evidence: String,
+    pub mcp_resource_uri: String,
+    pub degradation_states: Vec<String>,
+    pub pending_reason: String,
+}
+
+/// Operator-facing status for the atlas-stability (anti-flicker) renderer SLO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererAtlasStabilitySloStatus {
+    pub claim_id: String,
+    pub status: String,
+    /// The invariant asserted across a cache-evict / cache-recover cycle.
+    pub invariant: String,
+    pub regression_gate_pct: u32,
+    pub source_bench: String,
+    pub retained_evidence: String,
+    pub mcp_resource_uri: String,
+    pub degradation_states: Vec<String>,
+    pub pending_reason: String,
+}
+
+/// Operator-facing status for the idle-GPU-power renderer SLO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererIdleGpuPowerSloStatus {
+    pub claim_id: String,
+    pub status: String,
+    /// The idle workload sampled (e.g. `200 panes, no input`).
+    pub workload: String,
+    /// macOS power sampler command.
+    pub macos_sampler: String,
+    /// Linux power samplers (per GPU vendor).
+    pub linux_samplers: Vec<String>,
+    /// Published metric (e.g. `median_watts`).
+    pub metric: String,
+    pub source_bench: String,
+    pub mcp_resource_uri: String,
+    pub degradation_states: Vec<String>,
+    pub pending_reason: String,
+}
+
 /// Build the stable renderer SLO doctor block.
 ///
 /// This surface is deliberately non-claiming until a retained target-run
@@ -529,6 +616,8 @@ pub struct RendererSsimParitySloStatus {
 pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
     RendererSloDoctorReport {
         schema_version: RENDERER_SLOS_DOCTOR_SCHEMA_VERSION.to_string(),
+        suite_attestation_slot: RENDERER_SLO_SUITE_ATTESTATION_SLOT.to_string(),
+        regression_gate_pct: RENDERER_SLO_REGRESSION_GATE_PCT,
         input_to_photon: RendererInputToPhotonSloStatus {
             claim_id: "renderer.input_to_photon_p95".to_string(),
             status: RENDERER_INPUT_TO_PHOTON_STATUS.to_string(),
@@ -575,6 +664,60 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
                 "topology_cross_check_required".to_string(),
             ],
             pending_reason: "retained release-gate evidence has validated the backend-driver oracle and GUI SSIM corpus through remote RCH proof"
+                .to_string(),
+        },
+        resize_fps: RendererResizeFpsSloStatus {
+            claim_id: "renderer.resize_fps_p50".to_string(),
+            status: RENDERER_RESIZE_FPS_STATUS.to_string(),
+            storm_pane_range: RENDERER_RESIZE_FPS_STORM_PANE_RANGE.to_string(),
+            target_min_fps_p50: RENDERER_RESIZE_FPS_TARGET_MIN_P50,
+            regression_gate_pct: RENDERER_SLO_REGRESSION_GATE_PCT,
+            source_bench: "crates/frankenterm-gui/benches/renderer_slo/resize_fps.rs".to_string(),
+            retained_evidence: "docs/attestations/tui/resize-fps-rq-*.jsonl".to_string(),
+            mcp_resource_uri: RENDERER_RESIZE_FPS_MCP_RESOURCE_URI.to_string(),
+            degradation_states: vec![
+                "storm_driver_unavailable".to_string(),
+                "frame_timestamps_unavailable".to_string(),
+                "achieved_fps_below_floor".to_string(),
+                "retained-target-run-pending".to_string(),
+            ],
+            pending_reason: "deterministic 20→200 pane resize-storm harness has retained JSONL frame-timing evidence; consolidated suite p50/p95/p99 attestation remains pending"
+                .to_string(),
+        },
+        atlas_stability: RendererAtlasStabilitySloStatus {
+            claim_id: "renderer.atlas_stability_identical".to_string(),
+            status: RENDERER_ATLAS_STABILITY_STATUS.to_string(),
+            invariant: "glyph rendering is byte-identical across a cache-evict / cache-recover cycle (anti-flicker)"
+                .to_string(),
+            regression_gate_pct: RENDERER_SLO_REGRESSION_GATE_PCT,
+            source_bench: "crates/frankenterm-gui/benches/renderer_slo/atlas_stability.rs"
+                .to_string(),
+            retained_evidence: "docs/attestations/tui/atlas-stability-rq-*.jsonl".to_string(),
+            mcp_resource_uri: RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI.to_string(),
+            degradation_states: vec![
+                "atlas_evict_unavailable".to_string(),
+                "glyph_divergence_after_recover".to_string(),
+                "retained-target-run-pending".to_string(),
+            ],
+            pending_reason: "evict/recover glyph-identity harness has retained JSONL evidence; consolidated suite attestation remains pending"
+                .to_string(),
+        },
+        idle_gpu_power: RendererIdleGpuPowerSloStatus {
+            claim_id: "renderer.idle_gpu_power_median_watts".to_string(),
+            status: RENDERER_IDLE_GPU_POWER_STATUS.to_string(),
+            workload: "200 panes, no input (idle swarm)".to_string(),
+            macos_sampler: "powermetrics --samplers gpu_power".to_string(),
+            linux_samplers: vec!["intel_gpu_top".to_string(), "amdgpu_top".to_string()],
+            metric: "median_watts".to_string(),
+            source_bench: "crates/frankenterm-gui/benches/renderer_slo/idle_gpu_power.rs"
+                .to_string(),
+            mcp_resource_uri: RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI.to_string(),
+            degradation_states: vec![
+                "power_sampler_unavailable".to_string(),
+                "median_watts_above_ceiling".to_string(),
+                "retained-target-run-pending".to_string(),
+            ],
+            pending_reason: "platform power samplers identified; a retained idle-swarm median-watts target-run is pending"
                 .to_string(),
         },
     }
@@ -867,6 +1010,101 @@ mod tests {
                 .contains(&"retained-release-run-pending".to_string())
         );
         assert_eq!(report.ssim_parity.current_degradation, "none");
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_covers_full_catalog() {
+        // ft-tf6g3.3 (G18): the report must expose the full renderer SLO
+        // catalog (5 SLOs) with distinct claim_ids and the consolidated suite
+        // attestation slot + shared regression gate.
+        let report = renderer_slos_doctor_report();
+        assert_eq!(
+            report.suite_attestation_slot,
+            RENDERER_SLO_SUITE_ATTESTATION_SLOT
+        );
+        assert_eq!(report.regression_gate_pct, RENDERER_SLO_REGRESSION_GATE_PCT);
+        let claim_ids = [
+            report.input_to_photon.claim_id.as_str(),
+            report.ssim_parity.claim_id.as_str(),
+            report.resize_fps.claim_id.as_str(),
+            report.atlas_stability.claim_id.as_str(),
+            report.idle_gpu_power.claim_id.as_str(),
+        ];
+        let unique: std::collections::BTreeSet<&str> = claim_ids.iter().copied().collect();
+        assert_eq!(unique.len(), 5, "every SLO has a distinct claim_id");
+        // MCP resource URIs are all under the renderer-slo namespace.
+        for uri in [
+            report.resize_fps.mcp_resource_uri.as_str(),
+            report.atlas_stability.mcp_resource_uri.as_str(),
+            report.idle_gpu_power.mcp_resource_uri.as_str(),
+        ] {
+            assert!(
+                uri.starts_with("wa://perf/renderer-slo/"),
+                "unexpected SLO resource uri: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_exposes_resize_fps_contract() {
+        let report = renderer_slos_doctor_report();
+        let slo = &report.resize_fps;
+        assert_eq!(slo.claim_id, "renderer.resize_fps_p50");
+        assert_eq!(slo.status, RENDERER_RESIZE_FPS_STATUS);
+        assert_eq!(slo.storm_pane_range, RENDERER_RESIZE_FPS_STORM_PANE_RANGE);
+        assert_eq!(slo.target_min_fps_p50, RENDERER_RESIZE_FPS_TARGET_MIN_P50);
+        assert_eq!(slo.regression_gate_pct, RENDERER_SLO_REGRESSION_GATE_PCT);
+        assert_eq!(slo.mcp_resource_uri, RENDERER_RESIZE_FPS_MCP_RESOURCE_URI);
+        assert!(
+            slo.retained_evidence
+                .starts_with("docs/attestations/tui/resize-fps-rq-")
+        );
+        assert!(
+            slo.degradation_states
+                .contains(&"achieved_fps_below_floor".to_string())
+        );
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_exposes_atlas_stability_contract() {
+        let report = renderer_slos_doctor_report();
+        let slo = &report.atlas_stability;
+        assert_eq!(slo.claim_id, "renderer.atlas_stability_identical");
+        assert_eq!(slo.status, RENDERER_ATLAS_STABILITY_STATUS);
+        assert_eq!(
+            slo.mcp_resource_uri,
+            RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI
+        );
+        assert!(slo.invariant.contains("evict"));
+        assert!(
+            slo.retained_evidence
+                .starts_with("docs/attestations/tui/atlas-stability-rq-")
+        );
+        assert!(
+            slo.degradation_states
+                .contains(&"glyph_divergence_after_recover".to_string())
+        );
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_exposes_idle_gpu_power_contract() {
+        let report = renderer_slos_doctor_report();
+        let slo = &report.idle_gpu_power;
+        assert_eq!(slo.claim_id, "renderer.idle_gpu_power_median_watts");
+        assert_eq!(slo.status, RENDERER_IDLE_GPU_POWER_STATUS);
+        assert_eq!(slo.metric, "median_watts");
+        assert!(slo.workload.contains("200 panes"));
+        assert!(slo.macos_sampler.contains("powermetrics"));
+        assert!(slo.linux_samplers.iter().any(|s| s == "intel_gpu_top"));
+        assert_eq!(slo.mcp_resource_uri, RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI);
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_serde_roundtrips() {
+        let report = renderer_slos_doctor_report();
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: RendererSloDoctorReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(report, back);
     }
 
     #[test]

@@ -44,6 +44,7 @@ use crate::robot_types::{
     WorkflowStepLog,
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
+use crate::storage::EventStreamQuery;
 use fs2::FileExt;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
@@ -68,7 +69,7 @@ use super::mcp_types::{
 use super::{
     AccountRecord, ActionKind, ActorKind, AgentProvider, AgentType, ApprovalStore, CassAgent,
     CassClient, CassError, CassSearchOptions, CassSearchResult, CassStatus, CassViewOptions,
-    CassViewResult, CautClient, CautService, Config, DecisionContext, EventQuery, EventStreamQuery,
+    CassViewResult, CautClient, CautService, Config, DecisionContext, EventQuery,
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
     HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
     MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
