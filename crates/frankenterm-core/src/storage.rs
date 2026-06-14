@@ -13211,24 +13211,59 @@ fn prune_session_checkpoints_backend(
     retention: usize,
 ) -> Result<usize> {
     let keep_count = i64::try_from(retention).unwrap_or(i64::MAX);
-    let returned = backend
-        .query_map_typed(
-            "DELETE FROM session_checkpoints
-             WHERE session_id = ?1
-             AND id NOT IN (
-                 SELECT id FROM session_checkpoints
+
+    backend
+        .execute("BEGIN IMMEDIATE")
+        .map_err(|err| storage_backend_error("Failed to begin checkpoint prune txn", err))?;
+
+    let tx_result = (|| -> Result<usize> {
+        let returned = backend
+            .query_map_typed(
+                "DELETE FROM session_checkpoints
                  WHERE session_id = ?1
-                 ORDER BY checkpoint_at DESC
-                 LIMIT ?2
-             )
-             RETURNING id",
-            &[
-                ToSqlValue::Text(session_id),
-                ToSqlValue::Integer(keep_count),
-            ],
+                 AND id NOT IN (
+                     SELECT id FROM session_checkpoints
+                     WHERE session_id = ?1
+                     ORDER BY checkpoint_at DESC
+                     LIMIT ?2
+                 )
+                 RETURNING id",
+                &[
+                    ToSqlValue::Text(session_id),
+                    ToSqlValue::Integer(keep_count),
+                ],
+            )
+            .map_err(|err| storage_backend_error("Failed to prune session checkpoints", err))?;
+
+        execute_typed(
+            backend,
+            "DELETE FROM mux_sessions
+             WHERE session_id = ?1
+             AND last_checkpoint_at IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM session_checkpoints
+                 WHERE session_id = ?1
+             )",
+            &[ToSqlValue::Text(session_id)],
         )
-        .map_err(|err| storage_backend_error("Failed to prune session checkpoints", err))?;
-    Ok(returned.len())
+        .map_err(|err| storage_backend_error("Failed to prune empty mux session", err))?;
+
+        Ok(returned.len())
+    })();
+
+    match tx_result {
+        Ok(pruned) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(pruned),
+            Err(commit_err) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error("Failed to commit checkpoint prune", commit_err).into())
+            }
+        },
+        Err(err) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(err)
+        }
+    }
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
@@ -21622,6 +21657,108 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
         assert_eq!(pane_sessions[0].id, agent_session_id);
 
         storage.shutdown_with_cx(&cx).await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+#[test]
+fn prune_session_checkpoints_reclaims_checkpointed_empty_mux_session() {
+    run_storage_async_test(async {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("wa_test_prune_mux_session_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let cx = crate::cx::for_testing();
+        let storage = StorageHandle::new_with_cx(&cx, &db_path_str).await.unwrap();
+
+        let checkpointed_session = "sess-prune-empty".to_string();
+        storage
+            .insert_mux_session_with_cx(
+                &cx,
+                checkpointed_session.clone(),
+                "{\"panes\":[]}".to_string(),
+                "test-ft-version".to_string(),
+                Some("host-prune".to_string()),
+            )
+            .await
+            .unwrap();
+        storage
+            .insert_session_checkpoint_with_cx(
+                &cx,
+                checkpointed_session.clone(),
+                "periodic".to_string(),
+                "state-hash-prune".to_string(),
+                0,
+                0,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let pending_session = "sess-prune-pending".to_string();
+        storage
+            .insert_mux_session_with_cx(
+                &cx,
+                pending_session.clone(),
+                "{\"panes\":[]}".to_string(),
+                "test-ft-version".to_string(),
+                Some("host-prune".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let pruned = storage
+            .prune_session_checkpoints_with_cx(&cx, checkpointed_session.clone(), 0)
+            .await
+            .unwrap();
+        assert_eq!(pruned, 1, "retention=0 should prune the only checkpoint");
+
+        let pending_pruned = storage
+            .prune_session_checkpoints_with_cx(&cx, pending_session.clone(), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_pruned, 0,
+            "session with no checkpoints should not report checkpoint pruning"
+        );
+
+        storage.shutdown_with_cx(&cx).await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite connection");
+        let checkpointed_session_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_sessions WHERE session_id = ?1",
+                rusqlite::params![checkpointed_session],
+                |row| row.get(0),
+            )
+            .expect("count pruned mux session");
+        assert_eq!(
+            checkpointed_session_rows, 0,
+            "checkpointed mux session should be reclaimed once all checkpoints are pruned"
+        );
+
+        let pending_session_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_sessions WHERE session_id = ?1",
+                rusqlite::params![pending_session],
+                |row| row.get(0),
+            )
+            .expect("count pending mux session");
+        assert_eq!(
+            pending_session_rows, 1,
+            "mux session inserted before its first checkpoint must not be reclaimed"
+        );
+
+        let remaining_checkpoints: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .expect("count remaining checkpoints");
+        assert_eq!(remaining_checkpoints, 0);
+
+        drop(conn);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
