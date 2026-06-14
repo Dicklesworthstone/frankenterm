@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Number of bits per storage word.
 const BITS_PER_WORD: usize = 64;
@@ -15,10 +15,43 @@ const BITS_PER_WORD: usize = 64;
 ///
 /// Bit indices run from `0` to `capacity() - 1`.  Operations on indices
 /// beyond capacity panic in debug builds and are masked in release.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct CompactBitset {
     words: Vec<u64>,
     capacity: usize,
+}
+
+#[derive(Deserialize)]
+struct CompactBitsetWire {
+    words: Vec<u64>,
+    capacity: usize,
+}
+
+impl<'de> Deserialize<'de> for CompactBitset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CompactBitsetWire::deserialize(deserializer)?;
+        if wire.capacity == 0 {
+            return Err(de::Error::custom("bitset capacity must be > 0"));
+        }
+        let expected_words = wire.capacity.div_ceil(BITS_PER_WORD);
+        if wire.words.len() != expected_words {
+            return Err(de::Error::custom(format!(
+                "bitset word count {} does not match capacity {}",
+                wire.words.len(),
+                wire.capacity
+            )));
+        }
+
+        let mut bitset = Self {
+            words: wire.words,
+            capacity: wire.capacity,
+        };
+        bitset.mask_tail();
+        Ok(bitset)
+    }
 }
 
 impl CompactBitset {
@@ -784,6 +817,27 @@ mod tests {
         let json = serde_json::to_string(&bs).unwrap();
         let back: CompactBitset = serde_json::from_str(&json).unwrap();
         assert_eq!(bs, back);
+    }
+
+    #[test]
+    fn serde_masks_tail_bits_beyond_capacity() {
+        let value = serde_json::json!({
+            "words": [u64::MAX],
+            "capacity": 5
+        });
+        let back: CompactBitset = serde_json::from_value(value).unwrap();
+        assert_eq!(back.count_ones(), 5);
+        assert_eq!(back.to_vec(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn serde_rejects_impossible_word_count() {
+        let value = serde_json::json!({
+            "words": [],
+            "capacity": 65
+        });
+        let err = serde_json::from_value::<CompactBitset>(value).unwrap_err();
+        assert!(err.to_string().contains("word count"));
     }
 
     #[test]

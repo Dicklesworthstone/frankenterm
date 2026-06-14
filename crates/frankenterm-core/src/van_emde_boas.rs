@@ -29,7 +29,7 @@
 //! pane-ID priority queues, timer scheduling with bounded timestamps,
 //! and fast integer set operations on small universes.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::fmt;
 
 /// Bounded-universe integer set supporting keys in [0, universe_size).
@@ -37,7 +37,7 @@ use std::fmt;
 /// Flat-bitmap implementation of the van Emde Boas interface: O(1)
 /// insert/remove/contains and cached min/max, with successor and
 /// predecessor performed as linear word scans (see module docs).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct VanEmdeBoas {
     universe: usize,
     min: Option<u32>,
@@ -45,6 +45,91 @@ pub struct VanEmdeBoas {
     count: usize,
     // For small universes, use a flat bitset
     bits: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct VanEmdeBoasWire {
+    universe: usize,
+    min: Option<u32>,
+    max: Option<u32>,
+    count: usize,
+    bits: Vec<u64>,
+}
+
+impl<'de> Deserialize<'de> for VanEmdeBoas {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let VanEmdeBoasWire {
+            universe,
+            min: _min,
+            max: _max,
+            count: _count,
+            mut bits,
+        } = VanEmdeBoasWire::deserialize(deserializer)?;
+
+        if universe == 0 {
+            return Err(de::Error::custom("universe size must be positive"));
+        }
+        if universe > 1_048_576 {
+            return Err(de::Error::custom("universe size must be <= 2^20"));
+        }
+        let expected_words = universe.div_ceil(64);
+        if bits.len() != expected_words {
+            return Err(de::Error::custom(format!(
+                "vEB bit word count {} does not match universe {}",
+                bits.len(),
+                universe
+            )));
+        }
+
+        mask_tail_bits(&mut bits, universe);
+        let count = bits.iter().map(|word| word.count_ones() as usize).sum();
+        let min = first_set_bit(&bits, universe);
+        let max = last_set_bit(&bits, universe);
+
+        Ok(Self {
+            universe,
+            min,
+            max,
+            count,
+            bits,
+        })
+    }
+}
+
+fn mask_tail_bits(bits: &mut [u64], universe: usize) {
+    let tail_bits = universe % 64;
+    if tail_bits != 0 {
+        if let Some(last) = bits.last_mut() {
+            *last &= (1u64 << tail_bits) - 1;
+        }
+    }
+}
+
+fn first_set_bit(bits: &[u64], universe: usize) -> Option<u32> {
+    for (word_idx, &word) in bits.iter().enumerate() {
+        if word != 0 {
+            let pos = word_idx * 64 + word.trailing_zeros() as usize;
+            if pos < universe {
+                return Some(pos as u32);
+            }
+        }
+    }
+    None
+}
+
+fn last_set_bit(bits: &[u64], universe: usize) -> Option<u32> {
+    for (word_idx, &word) in bits.iter().enumerate().rev() {
+        if word != 0 {
+            let pos = word_idx * 64 + 63 - word.leading_zeros() as usize;
+            if pos < universe {
+                return Some(pos as u32);
+            }
+        }
+    }
+    None
 }
 
 impl VanEmdeBoas {
@@ -465,6 +550,37 @@ mod tests {
         assert_eq!(restored.min(), veb.min());
         assert_eq!(restored.max(), veb.max());
         assert_eq!(restored.iter(), veb.iter());
+    }
+
+    #[test]
+    fn serde_recomputes_cached_count_and_extrema() {
+        let value = serde_json::json!({
+            "universe": 10,
+            "min": 9,
+            "max": 9,
+            "count": 99,
+            "bits": [(1u64 << 2) | (1u64 << 5)]
+        });
+        let restored: VanEmdeBoas = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored.min(), Some(2));
+        assert_eq!(restored.max(), Some(5));
+        assert_eq!(restored.iter(), vec![2, 5]);
+    }
+
+    #[test]
+    fn serde_masks_tail_bits_outside_universe() {
+        let value = serde_json::json!({
+            "universe": 5,
+            "min": null,
+            "max": null,
+            "count": 0,
+            "bits": [u64::MAX]
+        });
+        let restored: VanEmdeBoas = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.len(), 5);
+        assert_eq!(restored.max(), Some(4));
+        assert_eq!(restored.iter(), vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

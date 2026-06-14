@@ -31,7 +31,7 @@
 //! priority scheduling where worst-case (non-amortized) bounds matter
 //! for insert/extract-min on a single queue.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::fmt;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,13 +44,139 @@ struct BinomialNode<K, V> {
 }
 
 /// Min-binomial heap with arena allocation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct BinomialHeap<K, V> {
     nodes: Vec<BinomialNode<K, V>>,
     head: Option<usize>,
     count: usize,
     min_root: Option<usize>,
     free: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+struct BinomialHeapWire<K, V> {
+    nodes: Vec<BinomialNode<K, V>>,
+    head: Option<usize>,
+    count: usize,
+    min_root: Option<usize>,
+    free: Vec<usize>,
+}
+
+impl<'de, K, V> Deserialize<'de> for BinomialHeap<K, V>
+where
+    K: Ord + Clone + Deserialize<'de>,
+    V: Clone + Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let BinomialHeapWire {
+            nodes,
+            head,
+            count: _count,
+            min_root: _min_root,
+            free,
+        } = BinomialHeapWire::deserialize(deserializer)?;
+
+        let entries =
+            collect_active_binomial_entries(&nodes, head, &free).map_err(de::Error::custom)?;
+        let mut heap = Self::new();
+        for (key, value) in entries {
+            heap.insert(key, value);
+        }
+        Ok(heap)
+    }
+}
+
+fn collect_active_binomial_entries<K: Clone, V: Clone>(
+    nodes: &[BinomialNode<K, V>],
+    head: Option<usize>,
+    free: &[usize],
+) -> Result<Vec<(K, V)>, String> {
+    let mut active = vec![false; nodes.len()];
+    let mut entries = Vec::new();
+
+    let mut root = head;
+    while let Some(idx) = root {
+        if idx >= nodes.len() {
+            return Err(format!("binomial heap root index {idx} out of bounds"));
+        }
+        let next = nodes[idx].sibling;
+        collect_binomial_subtree(idx, nodes, &mut active, &mut entries)?;
+        root = next;
+    }
+
+    let mut free_seen = vec![false; nodes.len()];
+    for &idx in free {
+        if idx >= nodes.len() {
+            return Err(format!("binomial heap free index {idx} out of bounds"));
+        }
+        if active[idx] {
+            return Err(format!(
+                "binomial heap node index {idx} is both active and free"
+            ));
+        }
+        if free_seen[idx] {
+            return Err(format!(
+                "binomial heap free index {idx} appears more than once"
+            ));
+        }
+        free_seen[idx] = true;
+    }
+
+    let active_count = active.iter().filter(|&&is_active| is_active).count();
+    let free_count = free_seen.iter().filter(|&&is_free| is_free).count();
+    if active_count + free_count != nodes.len() {
+        return Err(format!(
+            "binomial heap arena has {} unreachable node(s)",
+            nodes.len() - active_count - free_count
+        ));
+    }
+
+    Ok(entries)
+}
+
+fn collect_binomial_subtree<K: Clone, V: Clone>(
+    idx: usize,
+    nodes: &[BinomialNode<K, V>],
+    active: &mut [bool],
+    entries: &mut Vec<(K, V)>,
+) -> Result<(), String> {
+    if idx >= nodes.len() {
+        return Err(format!("binomial heap node index {idx} out of bounds"));
+    }
+    if active[idx] {
+        return Err(format!(
+            "binomial heap node index {idx} appears more than once"
+        ));
+    }
+
+    active[idx] = true;
+    entries.push((nodes[idx].key.clone(), nodes[idx].value.clone()));
+
+    let mut child = nodes[idx].child;
+    let mut child_count = 0usize;
+    while let Some(child_idx) = child {
+        if child_idx >= nodes.len() {
+            return Err(format!(
+                "binomial heap child index {child_idx} out of bounds"
+            ));
+        }
+        let next = nodes[child_idx].sibling;
+        collect_binomial_subtree(child_idx, nodes, active, entries)?;
+        child_count += 1;
+        child = next;
+    }
+
+    if child_count != nodes[idx].order {
+        return Err(format!(
+            "binomial heap node {idx} order {} does not match {child_count} children",
+            nodes[idx].order
+        ));
+    }
+
+    Ok(())
 }
 
 impl<K: Ord + Clone, V: Clone> BinomialHeap<K, V> {
@@ -436,6 +562,42 @@ mod tests {
         let sorted = restored.sorted();
         let keys: Vec<i32> = sorted.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![1, 3, 5, 7, 9]);
+    }
+
+    #[test]
+    fn serde_rebuilds_count_and_min_root() {
+        let mut heap = BinomialHeap::new();
+        for i in [5, 3, 7, 1, 9] {
+            heap.insert(i, i * 10);
+        }
+        let mut value = serde_json::to_value(&heap).unwrap();
+        value["count"] = serde_json::json!(999);
+        value["min_root"] = serde_json::json!(null);
+
+        let restored: BinomialHeap<i32, i32> = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.len(), 5);
+        assert_eq!(restored.peek(), Some((&1, &10)));
+        let keys: Vec<i32> = restored.sorted().into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, vec![1, 3, 5, 7, 9]);
+    }
+
+    #[test]
+    fn serde_rejects_duplicate_active_node_reference() {
+        let value = serde_json::json!({
+            "nodes": [{
+                "key": 1,
+                "value": 10,
+                "order": 0,
+                "child": null,
+                "sibling": 0
+            }],
+            "head": 0,
+            "count": 1,
+            "min_root": 0,
+            "free": []
+        });
+        let err = serde_json::from_value::<BinomialHeap<i32, i32>>(value).unwrap_err();
+        assert!(err.to_string().contains("appears more than once"));
     }
 
     #[test]

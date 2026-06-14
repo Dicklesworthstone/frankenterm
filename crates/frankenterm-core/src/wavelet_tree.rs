@@ -25,7 +25,7 @@ use std::fmt;
 // ── Bitvector ──────────────────────────────────────────────────────────
 
 /// Simple bitvector with rank support.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 struct BitVec {
     bits: Vec<u64>,
     len: usize,
@@ -94,7 +94,7 @@ impl BitVec {
 // ── WaveletTree ────────────────────────────────────────────────────────
 
 /// Internal node of the wavelet tree.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 struct WaveletNode {
     bv: BitVec,
     left: Option<usize>,
@@ -106,13 +106,28 @@ struct WaveletNode {
 /// Wavelet tree over a byte sequence.
 ///
 /// Supports efficient rank, select, and quantile queries.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct WaveletTree {
     nodes: Vec<WaveletNode>,
     root: Option<usize>,
     data_len: usize,
     // Store original data for select and reconstruction
     original: Vec<u8>,
+}
+
+impl<'de> Deserialize<'de> for WaveletTree {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WaveletTreeWire {
+            original: Vec<u8>,
+        }
+
+        let wire = WaveletTreeWire::deserialize(deserializer)?;
+        Ok(Self::new(&wire.original))
+    }
 }
 
 impl WaveletTree {
@@ -509,6 +524,21 @@ mod tests {
         for i in 0..data.len() {
             assert_eq!(restored.access(i), wt.access(i));
         }
+    }
+
+    #[test]
+    fn serde_rebuilds_tree_from_original_data() {
+        let value = serde_json::json!({
+            "nodes": [],
+            "root": null,
+            "data_len": 999,
+            "original": [b'a', b'b', b'a']
+        });
+        let restored: WaveletTree = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored.access(2), Some(b'a'));
+        assert_eq!(restored.rank(b'a', 3), 2);
+        assert_eq!(restored.select(b'b', 1), Some(1));
     }
 
     #[test]
