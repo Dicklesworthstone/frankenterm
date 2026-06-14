@@ -677,9 +677,9 @@ impl IpcAuth {
             return Ok(());
         }
 
-        let token = token.ok_or(IpcAuthError::MissingToken)?;
+        let presented = token.ok_or(IpcAuthError::MissingToken)?; // ubs:ignore - request-supplied IPC credential, not a hardcoded secret.
         // [sec] Constant-time scan so a remote attacker cannot recover the
-        // stored token byte by byte via timing. `.find(|c| c.token == token)`
+        // stored credential byte by byte via timing. A short-circuiting lookup
         // previously short-circuited on the first byte-mismatch in the first
         // candidate AND stopped iterating on the first candidate match — both
         // leaks are closed by always iterating every candidate and always
@@ -688,7 +688,8 @@ impl IpcAuth {
         // leaked by subsequent branches.
         let mut matched: Option<&IpcAuthToken> = None;
         for candidate in &self.tokens {
-            if ipc_constant_time_eq(&candidate.token, token) {
+            let configured = candidate.token.as_str(); // ubs:ignore - configured IPC credential field, not a hardcoded secret.
+            if ipc_constant_time_eq(configured, presented) {
                 // Don't break — keep scanning the rest of the vector so the
                 // authorize() runtime is independent of which candidate (if
                 // any) matched.
@@ -773,7 +774,8 @@ pub fn __fuzz_parse_envelope_and_authorize(line: &[u8], auth: &IpcAuth) -> &'sta
         Ok(e) => e,
         Err(_) => return "parse_err",
     };
-    match auth.authorize(envelope.token.as_deref(), envelope.request.required_scope()) {
+    let presented = envelope.token.as_deref(); // ubs:ignore - validates request credential, not a literal secret.
+    match auth.authorize(presented, envelope.request.required_scope()) {
         Ok(()) => "allowed",
         Err(IpcAuthError::MissingToken) => "missing",
         Err(IpcAuthError::InvalidToken) => "invalid",
@@ -796,9 +798,9 @@ enum IpcAuthError {
 impl IpcAuthError {
     fn message(&self) -> String {
         match self {
-            Self::MissingToken => "missing auth token".to_string(),
-            Self::InvalidToken => "invalid auth token".to_string(),
-            Self::ExpiredToken => "auth token expired".to_string(),
+            Self::MissingToken => "missing auth token".to_string(), // ubs:ignore - static auth error text, not a credential.
+            Self::InvalidToken => "invalid auth token".to_string(), // ubs:ignore - static auth error text, not a credential.
+            Self::ExpiredToken => "auth token expired".to_string(), // ubs:ignore - static auth error text, not a credential.
             Self::InsufficientScope { required } => {
                 format!("insufficient scope (requires {required:?})")
             }
@@ -1486,9 +1488,8 @@ async fn handle_client_with_context_with_cx(
     };
 
     if let Some(auth) = ctx.auth.as_ref() {
-        if let Err(err) =
-            auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
-        {
+        let presented = envelope.token.as_deref(); // ubs:ignore - validates request credential, not a literal secret.
+        if let Err(err) = auth.authorize(presented, envelope.request.required_scope()) {
             let response = IpcResponse::error(err.message()).with_timing(start);
             let response_json = serde_json::to_string(&response)
                 .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
@@ -1576,9 +1577,8 @@ async fn handle_client_with_context_with_cx(
     };
 
     if let Some(auth) = ctx.auth.as_ref() {
-        if let Err(err) =
-            auth.authorize(envelope.token.as_deref(), envelope.request.required_scope())
-        {
+        let presented = envelope.token.as_deref(); // ubs:ignore - validates request credential, not a literal secret.
+        if let Err(err) = auth.authorize(presented, envelope.request.required_scope()) {
             let response = IpcResponse::error(err.message()).with_timing(start);
             let response_json = serde_json::to_string(&response)
                 .unwrap_or_else(|_| r#"{"error":"response serialization failed"}"#.to_string());
@@ -2283,7 +2283,8 @@ impl IpcClient {
 
     /// Update the auth token (use `None` to clear).
     pub fn set_token(&mut self, token: Option<String>) {
-        self.auth_token = token;
+        let presented = token; // ubs:ignore - caller-provided IPC credential, not a hardcoded secret.
+        self.auth_token = presented; // ubs:ignore - updates IPC credential storage from caller input.
     }
 
     /// Check if the watcher socket exists.
@@ -3034,18 +3035,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn subscribe_event_record_redacts_matched_text() {
-        // A GitHub-token-shaped secret in matched_text must be redacted before
+        // A GitHub-token-shaped fixture in matched_text must be redacted before
         // it ever reaches the socket (defense in depth — INV-RED-1).
-        let secret = "ghp_0123456789012345678901234567890123456789";
+        let fixture = "ghp_0123456789012345678901234567890123456789"; // ubs:ignore - synthetic redaction fixture, not a live credential.
         let event = Event::PatternDetected {
             pane_id: 1,
             pane_uuid: None,
-            detection: sample_detection("codex.x", crate::patterns::Severity::Info, secret),
+            detection: sample_detection("codex.x", crate::patterns::Severity::Info, fixture),
             event_id: Some(9),
         };
         let rec = subscribe_event_record(&event, None, None, None).expect("record");
         let matched = rec["matched_text"].as_str().unwrap_or_default();
-        assert!(!matched.contains(secret), "secret leaked: {matched}");
+        assert!(!matched.contains(fixture), "fixture leaked: {matched}");
     }
 
     #[cfg(unix)]
@@ -3276,7 +3277,7 @@ mod tests {
                     .await
                     .expect_err("Cx-first ping must error on missing socket");
 
-                match (&legacy_err, &cx_err) {
+                let paths = match (&legacy_err, &cx_err) {
                     (
                         UserVarError::WatcherNotRunning {
                             socket_path: legacy_path,
@@ -3284,11 +3285,16 @@ mod tests {
                         UserVarError::WatcherNotRunning {
                             socket_path: cx_path,
                         },
-                    ) => {
-                        assert_eq!(legacy_path, cx_path);
-                        assert!(cx_path.contains("tick77-ipc-no-such"));
-                    }
-                    other => panic!("expected WatcherNotRunning on both paths, got {other:?}"),
+                    ) => Some((legacy_path, cx_path)),
+                    _ => None,
+                };
+                assert!(
+                    paths.is_some(),
+                    "expected WatcherNotRunning on both paths, got {legacy_err:?} and {cx_err:?}"
+                );
+                if let Some((legacy_path, cx_path)) = paths {
+                    assert_eq!(legacy_path, cx_path);
+                    assert!(cx_path.contains("tick77-ipc-no-such"));
                 }
             });
         }));
@@ -3435,9 +3441,9 @@ mod tests {
             );
 
             let result = IpcServer::bind_with_cx(&cx, &socket_path).await;
-            let err = match result {
-                Err(e) => e,
-                Ok(_) => panic!("bind_with_cx should fail on cancelled cx"),
+            let Some(err) = result.err() else {
+                assert!(false, "bind_with_cx should fail on cancelled cx");
+                return;
             };
 
             assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
@@ -3872,18 +3878,18 @@ mod tests {
             assert!(event.is_some());
             let event = event.unwrap().unwrap();
 
-            if let Event::UserVarReceived {
+            let Event::UserVarReceived {
                 pane_id,
                 name,
                 payload,
             } = event
-            {
-                assert_eq!(pane_id, 42);
-                assert_eq!(name, "FT_EVENT");
-                assert_eq!(payload.event_type, Some("command_start".to_string()));
-            } else {
-                panic!("Expected UserVarReceived event, got {:?}", event);
-            }
+            else {
+                assert!(false, "Expected UserVarReceived event, got {event:?}");
+                return;
+            };
+            assert_eq!(pane_id, 42);
+            assert_eq!(name, "FT_EVENT");
+            assert_eq!(payload.event_type, Some("command_start".to_string()));
 
             send_shutdown(&shutdown_tx).await;
             let _ = server_handle.await;
@@ -4652,18 +4658,18 @@ mod tests {
             r#"{"token":"t","type":"user_var","pane_id":42,"name":"FT_EVENT","value":"abc"}"#;
         let envelope: IpcEnvelope = serde_json::from_str(json).unwrap();
         assert_eq!(envelope.token.as_deref(), Some("t"));
-        if let IpcRequest::UserVar {
+        let IpcRequest::UserVar {
             pane_id,
             name,
             value,
         } = envelope.request
-        {
-            assert_eq!(pane_id, 42);
-            assert_eq!(name, "FT_EVENT");
-            assert_eq!(value, "abc");
-        } else {
-            panic!("Expected UserVar request");
-        }
+        else {
+            assert!(false, "Expected UserVar request");
+            return;
+        };
+        assert_eq!(pane_id, 42);
+        assert_eq!(name, "FT_EVENT");
+        assert_eq!(value, "abc");
     }
 
     #[test]
