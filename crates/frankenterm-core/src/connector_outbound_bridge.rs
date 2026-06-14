@@ -1057,14 +1057,14 @@ impl ConnectorOutboundBridge {
                 Ok(PreparedConnectorCredentialAction {
                     operation: request.operation,
                     connector_id: connector_id.to_string(),
-                    credential_id: Some(lease.credential_id.clone()),
+                    credential_id: Some(lease.credential_id().to_string()),
                     lease_id: None,
-                    scope: lease.granted_scope.clone(),
+                    scope: lease.granted_scope().clone(),
                     sensitivity: request.sensitivity,
                     broker_checked_at_ms: now_ms,
-                    broker_lease_id: Some(lease.lease_id),
-                    broker_lease_expires_at_ms: Some(lease.expires_at_ms),
-                    broker_credential_version: Some(lease.credential_version),
+                    broker_lease_id: Some(lease.lease_id().to_string()),
+                    broker_lease_expires_at_ms: Some(lease.expires_at_ms()),
+                    broker_credential_version: Some(lease.credential_version()),
                 })
             }
             ConnectorCredentialOperation::Rotate
@@ -1101,21 +1101,21 @@ impl ConnectorOutboundBridge {
                     .credential_broker()
                     .active_leases_for_connector(connector_id)
                     .into_iter()
-                    .find(|lease| lease.lease_id == lease_id)
+                    .find(|lease| lease.lease_id() == lease_id)
                     .ok_or_else(|| {
                         format!("active lease not found for connector {connector_id}: {lease_id}")
                     })?;
                 Ok(PreparedConnectorCredentialAction {
                     operation: request.operation,
                     connector_id: connector_id.to_string(),
-                    credential_id: Some(lease.credential_id.clone()),
+                    credential_id: Some(lease.credential_id().to_string()),
                     lease_id: Some(lease_id.to_string()),
                     scope: request.policy_scope().clone(),
                     sensitivity: request.sensitivity,
                     broker_checked_at_ms: now_ms,
-                    broker_lease_id: Some(lease.lease_id.clone()),
-                    broker_lease_expires_at_ms: Some(lease.expires_at_ms),
-                    broker_credential_version: Some(lease.credential_version),
+                    broker_lease_id: Some(lease.lease_id().to_string()),
+                    broker_lease_expires_at_ms: Some(lease.expires_at_ms()),
+                    broker_credential_version: Some(lease.credential_version()),
                 })
             }
         }

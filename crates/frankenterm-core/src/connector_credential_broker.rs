@@ -105,13 +105,13 @@ pub enum CredentialKind {
 impl std::fmt::Display for CredentialKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ApiKey => f.write_str("api_key"),
+            Self::ApiKey => f.write_str("api_key"), // ubs:ignore credential kind label, not a secret
             Self::OAuth2Client => f.write_str("oauth2_client"),
-            Self::OAuth2Token => f.write_str("oauth2_token"),
+            Self::OAuth2Token => f.write_str("oauth2_token"), // ubs:ignore credential kind label, not a secret
             Self::TlsCertificate => f.write_str("tls_certificate"),
             Self::SshKey => f.write_str("ssh_key"),
             Self::SymmetricKey => f.write_str("symmetric_key"),
-            Self::GenericSecret => f.write_str("generic_secret"),
+            Self::GenericSecret => f.write_str("generic_secret"), // ubs:ignore credential kind label, not a secret
         }
     }
 }
@@ -300,31 +300,100 @@ pub enum LeaseState {
     Revoked,
 }
 
-/// A lease granting a connector time-limited access to a credential.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A broker-issued lease granting a connector time-limited access to a credential.
+#[derive(Debug, Clone, Serialize)]
 pub struct CredentialLease {
     /// Unique lease identifier.
-    pub lease_id: String,
+    lease_id: String,
     /// The credential being leased.
-    pub credential_id: String,
+    credential_id: String,
     /// Connector receiving the credential.
-    pub connector_id: String,
+    connector_id: String,
     /// Granted scope (may be narrower than credential's full scope).
-    pub granted_scope: CredentialScope,
+    granted_scope: CredentialScope,
     /// Lease state.
-    pub state: LeaseState,
+    state: LeaseState,
     /// When the lease was issued.
-    pub issued_at_ms: u64,
+    issued_at_ms: u64,
     /// When the lease expires.
-    pub expires_at_ms: u64,
+    expires_at_ms: u64,
     /// Credential version at time of lease.
-    pub credential_version: u32,
+    credential_version: u32,
 }
 
 impl CredentialLease {
-    /// Check if the lease is still valid at the given time.
+    fn new(
+        lease_id: String,
+        credential_id: String,
+        connector_id: String,
+        granted_scope: CredentialScope,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+        credential_version: u32,
+    ) -> Self {
+        Self {
+            lease_id,
+            credential_id,
+            connector_id,
+            granted_scope,
+            state: LeaseState::Active,
+            issued_at_ms,
+            expires_at_ms,
+            credential_version,
+        }
+    }
+
+    /// Unique lease identifier.
     #[must_use]
-    pub fn is_valid_at(&self, now_ms: u64) -> bool {
+    pub fn lease_id(&self) -> &str {
+        &self.lease_id
+    }
+
+    /// The credential this lease grants access to.
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    /// Connector that received the lease.
+    #[must_use]
+    pub fn connector_id(&self) -> &str {
+        &self.connector_id
+    }
+
+    /// Scope granted by the broker.
+    #[must_use]
+    pub fn granted_scope(&self) -> &CredentialScope {
+        &self.granted_scope
+    }
+
+    /// Current lease state as recorded by the broker-issued value.
+    #[must_use]
+    pub fn state(&self) -> LeaseState {
+        self.state
+    }
+
+    /// Time the lease was issued.
+    #[must_use]
+    pub fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    /// Time the lease expires.
+    #[must_use]
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+
+    /// Credential version at lease issue time.
+    #[must_use]
+    pub fn credential_version(&self) -> u32 {
+        self.credential_version
+    }
+
+    /// Check if the broker-owned lease record is still valid at the given time.
+    #[must_use]
+    fn is_valid_at(&self, now_ms: u64) -> bool {
         self.state == LeaseState::Active && now_ms < self.expires_at_ms
     }
 }
@@ -675,16 +744,15 @@ impl ConnectorCredentialBroker {
 
         // Issue the lease
         let lease_id = self.allocate_lease_id();
-        let lease = CredentialLease {
-            lease_id: lease_id.clone(),
-            credential_id: credential_id.to_string(),
-            connector_id: connector_id.to_string(),
-            granted_scope: requested_scope,
-            state: LeaseState::Active,
-            issued_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(lease_ttl),
+        let lease = CredentialLease::new(
+            lease_id.clone(),
+            credential_id.to_string(),
+            connector_id.to_string(),
+            requested_scope,
+            now_ms,
+            now_ms.saturating_add(lease_ttl),
             credential_version,
-        };
+        );
 
         // Update counters
         if let Some(cred) = self.credentials.get_mut(credential_id) {
@@ -1891,16 +1959,15 @@ mod tests {
 
     #[test]
     fn lease_validity_check() {
-        let lease = CredentialLease {
-            lease_id: "l1".to_string(),
-            credential_id: "c1".to_string(),
-            connector_id: "conn-1".to_string(),
-            granted_scope: CredentialScope::new("github", "repos/foo", vec!["read".into()]),
-            state: LeaseState::Active,
-            issued_at_ms: 1000,
-            expires_at_ms: 5000,
-            credential_version: 1,
-        };
+        let lease = CredentialLease::new(
+            "l1".to_string(),
+            "c1".to_string(),
+            "conn-1".to_string(),
+            CredentialScope::new("github", "repos/foo", vec!["read".into()]),
+            1000,
+            5000,
+            1,
+        );
         assert!(lease.is_valid_at(2000));
         assert!(lease.is_valid_at(4999));
         assert!(!lease.is_valid_at(5000));
@@ -1909,16 +1976,16 @@ mod tests {
 
     #[test]
     fn revoked_lease_not_valid() {
-        let lease = CredentialLease {
-            lease_id: "l1".to_string(),
-            credential_id: "c1".to_string(),
-            connector_id: "conn-1".to_string(),
-            granted_scope: CredentialScope::new("github", "repos/foo", vec!["read".into()]),
-            state: LeaseState::Revoked,
-            issued_at_ms: 1000,
-            expires_at_ms: 5000,
-            credential_version: 1,
-        };
+        let mut lease = CredentialLease::new(
+            "l1".to_string(),
+            "c1".to_string(),
+            "conn-1".to_string(),
+            CredentialScope::new("github", "repos/foo", vec!["read".into()]),
+            1000,
+            5000,
+            1,
+        );
+        lease.state = LeaseState::Revoked;
         assert!(!lease.is_valid_at(2000));
     }
 

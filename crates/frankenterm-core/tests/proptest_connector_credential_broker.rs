@@ -8,9 +8,9 @@ use proptest::prelude::*;
 
 use frankenterm_core::connector_credential_broker::{
     ConnectorCredentialBroker, CredentialAccessRule, CredentialAuditType, CredentialBrokerError,
-    CredentialBrokerTelemetry, CredentialBrokerTelemetrySnapshot, CredentialKind, CredentialLease,
-    CredentialScope, CredentialSensitivity, CredentialState, LeaseState, ManagedCredential,
-    ProviderStatus, SecretProviderConfig,
+    CredentialBrokerTelemetry, CredentialBrokerTelemetrySnapshot, CredentialKind, CredentialScope,
+    CredentialSensitivity, CredentialState, LeaseState, ManagedCredential, ProviderStatus,
+    SecretProviderConfig,
 };
 
 // =============================================================================
@@ -493,7 +493,7 @@ proptest! {
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
         let lease = broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
         // The rule in setup_broker has max_lease_ttl_ms=0, so provider default is used
-        prop_assert_eq!(lease.expires_at_ms, 2000u64.saturating_add(ttl));
+        prop_assert_eq!(lease.expires_at_ms(), 2000u64.saturating_add(ttl));
     }
 
     /// Revoking a lease makes it non-active and decrements counters.
@@ -508,7 +508,7 @@ proptest! {
         for i in 0..n {
             let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
             let lease = broker.request_lease(&format!("conn-{i}"), "cred-1", scope, 2000 + i as u64).unwrap();
-            lease_ids.push(lease.lease_id);
+            lease_ids.push(lease.lease_id().to_string());
         }
         // Revoke the first lease
         broker.revoke_lease(&lease_ids[0], 5000).unwrap();
@@ -527,9 +527,9 @@ proptest! {
         );
         let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
         let lease = broker.request_lease("conn-1", "cred-1", scope, 2000).unwrap();
-        broker.revoke_lease(&lease.lease_id, 3000).unwrap();
+        broker.revoke_lease(lease.lease_id(), 3000).unwrap();
         // Second revoke should be a no-op
-        broker.revoke_lease(&lease.lease_id, 4000).unwrap();
+        broker.revoke_lease(lease.lease_id(), 4000).unwrap();
         prop_assert_eq!(broker.telemetry_snapshot(5000).counters.leases_revoked, 1);
     }
 
@@ -566,46 +566,27 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
-    /// A lease is valid strictly before expires_at_ms and if Active.
+    /// Broker-issued lease accessors expose immutable issuance metadata.
     #[test]
-    fn lease_validity_before_expiry(
+    fn broker_issued_lease_accessors_reflect_issuance(
         issued in 0u64..=1_000_000,
         ttl in 1u64..=1_000_000,
-        check_offset in 0u64..=2_000_000,
     ) {
-        let expires = issued.saturating_add(ttl);
-        let lease = CredentialLease {
-            lease_id: "l1".to_string(),
-            credential_id: "c1".to_string(),
-            connector_id: "conn-1".to_string(),
-            granted_scope: CredentialScope::new("github", "repos/x", vec!["read".to_string()]),
-            state: LeaseState::Active,
-            issued_at_ms: issued,
-            expires_at_ms: expires,
-            credential_version: 1,
-        };
-        let check_time = issued.saturating_add(check_offset);
-        let expected_valid = check_time < expires;
-        prop_assert_eq!(lease.is_valid_at(check_time), expected_valid);
-    }
-
-    /// Non-Active leases are never valid regardless of time.
-    #[test]
-    fn non_active_lease_never_valid(
-        state in prop_oneof![Just(LeaseState::Expired), Just(LeaseState::Revoked)],
-        check_time in 0u64..=1_000_000,
-    ) {
-        let lease = CredentialLease {
-            lease_id: "l1".to_string(),
-            credential_id: "c1".to_string(),
-            connector_id: "conn-1".to_string(),
-            granted_scope: CredentialScope::new("github", "repos/x", vec!["read".to_string()]),
-            state,
-            issued_at_ms: 0,
-            expires_at_ms: u64::MAX,
-            credential_version: 1,
-        };
-        prop_assert!(!lease.is_valid_at(check_time));
+        let mut broker = setup_broker_for_leasing(
+            CredentialSensitivity::Critical,
+            CredentialSensitivity::Medium,
+            ttl,
+        );
+        let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
+        let lease = broker.request_lease("conn-1", "cred-1", scope.clone(), issued).unwrap();
+        prop_assert_eq!(lease.lease_id(), "lease-1");
+        prop_assert_eq!(lease.credential_id(), "cred-1");
+        prop_assert_eq!(lease.connector_id(), "conn-1");
+        prop_assert_eq!(lease.granted_scope(), &scope);
+        prop_assert_eq!(lease.state(), LeaseState::Active);
+        prop_assert_eq!(lease.issued_at_ms(), issued);
+        prop_assert_eq!(lease.expires_at_ms(), issued.saturating_add(ttl));
+        prop_assert_eq!(lease.credential_version(), 1);
     }
 }
 
@@ -741,7 +722,7 @@ proptest! {
         // Rotating credential still allows leases
         let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
         let lease = broker.request_lease("conn-1", "cred-1", scope, 4000).unwrap();
-        prop_assert_eq!(lease.credential_version, new_ver);
+        prop_assert_eq!(lease.credential_version(), new_ver);
     }
 }
 
@@ -1014,7 +995,7 @@ proptest! {
         for i in 0..n_lease {
             let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
             let lease = broker.request_lease(&format!("conn-{i}"), "cred-1", scope, 2000 + i as u64).unwrap();
-            lease_ids.push(lease.lease_id);
+            lease_ids.push(lease.lease_id().to_string());
         }
         for (i, lid) in lease_ids.iter().enumerate().take(n_revoke) {
             broker.revoke_lease(lid, 5000 + i as u64).unwrap();
@@ -1187,7 +1168,7 @@ proptest! {
         let now = 5000u64;
         let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
         // Rule TTL should be used (it's > 0), not provider default
-        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(rule_ttl));
+        prop_assert_eq!(lease.expires_at_ms(), now.saturating_add(rule_ttl));
     }
 
     /// When max_lease_ttl_ms == 0 on all matching rules, provider default is used.
@@ -1229,7 +1210,7 @@ proptest! {
         let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
         let now = 5000u64;
         let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
-        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(provider_ttl));
+        prop_assert_eq!(lease.expires_at_ms(), now.saturating_add(provider_ttl));
     }
 
     /// When multiple rules match and have TTL overrides, the minimum is used.
@@ -1281,7 +1262,7 @@ proptest! {
         let now = 5000u64;
         let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
         let expected_ttl = ttl_a.min(ttl_b);
-        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(expected_ttl));
+        prop_assert_eq!(lease.expires_at_ms(), now.saturating_add(expected_ttl));
     }
 }
 
@@ -1376,7 +1357,7 @@ proptest! {
         for i in 0..n_issue {
             let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
             let lease = broker.request_lease(&format!("conn-{i}"), "cred-1", scope, 2000 + i as u64).unwrap();
-            lease_ids.push(lease.lease_id);
+            lease_ids.push(lease.lease_id().to_string());
         }
         let provider = broker.get_provider("prov-1").unwrap();
         prop_assert_eq!(provider.active_leases, n_issue as u32);
@@ -1429,7 +1410,7 @@ proptest! {
         for i in 0..n {
             let scope = CredentialScope::new("github", "repos/foo", vec!["read".to_string()]);
             let lease = broker.request_lease(&format!("conn-{i}"), "cred-1", scope, 2000 + i as u64).unwrap();
-            lease_ids.push(lease.lease_id);
+            lease_ids.push(lease.lease_id().to_string());
         }
         // All unique
         let unique_count = {
@@ -1602,8 +1583,8 @@ proptest! {
         let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
         let lease = broker.request_lease("conn-1", "c1", scope, now).unwrap();
         // Should saturate to u64::MAX, not overflow/wrap
-        prop_assert_eq!(lease.expires_at_ms, now.saturating_add(60_000));
-        prop_assert!(lease.expires_at_ms >= now);
+        prop_assert_eq!(lease.expires_at_ms(), now.saturating_add(60_000));
+        prop_assert!(lease.expires_at_ms() >= now);
     }
 }
 
@@ -1660,7 +1641,7 @@ proptest! {
         for i in 0..total {
             let scope = CredentialScope::new("github", "repos/x", vec!["read".to_string()]);
             let lease = broker.request_lease(&format!("conn-{i}"), "c1", scope, 1000).unwrap();
-            lease_ids.push(lease.lease_id);
+            lease_ids.push(lease.lease_id().to_string());
         }
 
         // Revoke some
