@@ -25716,6 +25716,7 @@ async fn distributed_handle_connection<S>(
         max_bytes: wire_limits.max_message_size,
     };
     let mut connection_sequence_scopes = std::collections::HashSet::new();
+    let mut pinned_connection_sender = normalized_handshake_agent.clone();
 
     loop {
         use std::sync::atomic::Ordering;
@@ -25788,14 +25789,18 @@ async fn distributed_handle_connection<S>(
             };
 
         let canonical_sender = distributed_normalize_identity(&envelope.sender);
-        if let Some(agent_id) = normalized_handshake_agent.as_deref() {
-            if canonical_sender != *agent_id {
+        match pinned_connection_sender.as_deref() {
+            Some(sender) if canonical_sender != *sender => {
                 distributed_publish_security_error(
                     &mut reader,
                     frankenterm_core::distributed::DistributedSecurityError::AuthFailed,
                 )
                 .await;
                 break;
+            }
+            Some(_) => {}
+            None => {
+                pinned_connection_sender = Some(canonical_sender.clone());
             }
         }
 
@@ -67909,6 +67914,147 @@ recorder_backend = "frankensqlite"
                 assert!(segment_text.contains(second_marker));
                 drop(conn);
 
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::remove_file(format!("{db_path}-wal"));
+                let _ = std::fs::remove_file(format!("{db_path}-shm"));
+            });
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_listener_pins_null_handshake_to_first_sender() {
+        frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use frankenterm_core::wire_protocol::{PaneMeta, WireEnvelope, WirePayload};
+
+                let (storage_handle, db_path) =
+                    setup_storage("distributed_listener_pins_null_handshake_sender").await;
+                let shutdown_storage_handle = storage_handle.clone();
+                let storage = std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(
+                    storage_handle,
+                ));
+                let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+                let wire_limits = default_wire_limits();
+                let ingest_state = std::sync::Arc::new(DistributedIngestState::new(wire_limits));
+                let bind_addr = "127.0.0.1:0".parse().expect("valid test bind addr");
+                let peer_addr = "127.0.0.1:49212".parse().expect("valid test peer addr");
+                let distributed_config = distributed_token_config(bind_addr, "dist-pin-token");
+                let expected_token = distributed_config.token.clone();
+                let allow_agent_ids = std::sync::Arc::new(std::collections::HashSet::new());
+                let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let first_sender = "victim-a";
+                let spoofed_sender = "victim-b";
+                let first_pane_id = 101_u64;
+                let spoofed_pane_id = 202_u64;
+                let first_remote_pane_id = distributed_remote_pane_id(first_sender, first_pane_id);
+                let spoofed_remote_pane_id =
+                    distributed_remote_pane_id(spoofed_sender, spoofed_pane_id);
+
+                let handshake = DistributedHandshake {
+                    protocol_version: Some(frankenterm_core::wire_protocol::PROTOCOL_VERSION),
+                    token: distributed_config.token.clone(),
+                    agent_id: None,
+                    session_id: Some("session-pin-null-agent".to_string()),
+                };
+                let first_meta = WireEnvelope::new(
+                    1,
+                    first_sender,
+                    WirePayload::PaneMeta(PaneMeta {
+                        pane_id: first_pane_id,
+                        pane_uuid: Some("victim-a-pane".to_string()),
+                        domain: "prod".to_string(),
+                        title: Some("victim-a-title".to_string()),
+                        cwd: Some("/remote/victim-a".to_string()),
+                        rows: Some(40),
+                        cols: Some(120),
+                        observed: true,
+                        timestamp_ms: now_ms(),
+                    }),
+                );
+                let spoofed_meta = WireEnvelope::new(
+                    2,
+                    spoofed_sender,
+                    WirePayload::PaneMeta(PaneMeta {
+                        pane_id: spoofed_pane_id,
+                        pane_uuid: Some("victim-b-pane".to_string()),
+                        domain: "prod".to_string(),
+                        title: Some("victim-b-title".to_string()),
+                        cwd: Some("/remote/victim-b".to_string()),
+                        rows: Some(40),
+                        cols: Some(120),
+                        observed: true,
+                        timestamp_ms: now_ms(),
+                    }),
+                );
+
+                let mut input = serde_json::to_vec(&handshake).expect("serialize handshake");
+                input.push(b'\n');
+                input.extend_from_slice(&first_meta.to_json().expect("serialize first envelope"));
+                input.push(b'\n');
+                input.extend_from_slice(
+                    &spoofed_meta
+                        .to_json()
+                        .expect("serialize spoofed envelope"),
+                );
+                input.push(b'\n');
+
+                let (io, written) = DistributedScriptedIo::with_write_capture(input);
+                distributed_handle_connection(
+                    io,
+                    peer_addr,
+                    distributed_config,
+                    wire_limits,
+                    expected_token,
+                    allow_agent_ids,
+                    ingest_state,
+                    std::sync::Arc::clone(&storage),
+                    std::sync::Arc::clone(&event_bus),
+                    shutdown_flag,
+                )
+                .await;
+
+                let lines = distributed_captured_test_lines(&written);
+                assert!(
+                    lines.len() >= 2,
+                    "connection should emit handshake acknowledgement and auth failure, got {lines:?}"
+                );
+                let handshake_payload: serde_json::Value =
+                    serde_json::from_str(&lines[0]).expect("parse handshake acknowledgement");
+                assert_eq!(handshake_payload["ok"], serde_json::Value::Bool(true));
+                let auth_failure: serde_json::Value =
+                    serde_json::from_str(&lines[1]).expect("parse auth failure payload");
+                assert_eq!(auth_failure["ok"], serde_json::Value::Bool(false));
+                assert_eq!(auth_failure["error"]["code"], "dist.auth_failed");
+
+                {
+                    let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                    let first_remote = storage_handle
+                        .get_pane(first_remote_pane_id)
+                        .await
+                        .expect("query first remote pane");
+                    assert!(
+                        first_remote.is_some(),
+                        "first sender should bind the legacy null-agent connection"
+                    );
+                    let spoofed_remote = storage_handle
+                        .get_pane(spoofed_remote_pane_id)
+                        .await
+                        .expect("query spoofed remote pane");
+                    assert!(
+                        spoofed_remote.is_none(),
+                        "later sender on the same null-agent connection must be rejected"
+                    );
+                }
+
+                shutdown_storage_handle
+                    .shutdown()
+                    .await
+                    .expect("shutdown storage");
+                drop(storage);
                 let _ = std::fs::remove_file(&db_path);
                 let _ = std::fs::remove_file(format!("{db_path}-wal"));
                 let _ = std::fs::remove_file(format!("{db_path}-shm"));
