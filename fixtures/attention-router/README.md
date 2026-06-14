@@ -17,11 +17,12 @@ The fixture contract is `docs/json-schema/ft-attention-router-scenarios.json`.
 It is a hand-authored Draft 2020-12 schema tracked in
 `docs/json-schema/PROVENANCE.md`.
 
-Future harnesses should turn `scenarios.v1.json` into scenario-specific JSON
-and TOON goldens by collecting reduced command artifacts, canonicalizing
-dynamic fields, and comparing the router output against each scenario's
-expected classification and safe action. The retained surface goldens pin the
-input-backed ready status envelope and are checked by
+The compiled `attention_router_scenarios` harness turns `scenarios.v1.json`
+into scenario-specific JSON records and TOON-equivalent records from the real
+scoring engine. It uses the retained reduced command/API requirements and
+canonical reason codes, then compares the router output against each scenario's
+expected classification, confidence, and safe action. The retained surface
+goldens pin the input-backed ready status envelope and are checked by
 `frankenterm_core::attention_router` tests. Fixtures must not store raw pane
 text, secrets, full Agent Mail message bodies, or unsanitized build logs.
 

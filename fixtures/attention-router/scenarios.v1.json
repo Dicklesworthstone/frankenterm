@@ -3,7 +3,7 @@
   "contract_id": "ft.attention_router.scenario_inventory.v1",
   "producing_bead": "ft-x3nsb.6.1",
   "parent_bead": "ft-x3nsb.6",
-  "purpose": "Static retained scenario inventory for the future attention-router JSON/TOON golden harness.",
+  "purpose": "Static retained scenario inventory for the attention-router JSON/TOON engine golden harness.",
   "source_policy": {
     "raw_pane_content_allowed": false,
     "secret_material_allowed": false,
@@ -851,6 +851,6 @@
       "force-release or reopen happens before a status check and operator review",
       "cleanup candidates are deleted without exact approval and explicit irreversible consent"
     ],
-    "proof_policy": "RCH-only for Rust/e2e harness execution after code exists; static jq and diff checks are sufficient for this inventory."
+    "proof_policy": "RCH-only for Rust/e2e harness execution; static jq and diff checks remain sufficient for inventory-only edits."
   }
 }
