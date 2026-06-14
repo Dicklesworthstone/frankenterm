@@ -334,23 +334,16 @@ pub fn classify_proof_quality(input: ProofQualityInput<'_>) -> ProofQualityRecei
     };
     let artifact_status = artifact_status(input.intent, input.artifact_observation);
     let execution_venue = execution_venue(input.attempt);
-    let mut blockers = blockers_for_attempt(input.attempt);
+    let mut blockers = blockers_for_attempt(input.attempt, execution_venue);
 
     if source_state == ProofSourceState::Stale {
         blockers.push(ProofQualityBlocker::SourceStale);
     }
 
-    if input.attempt.outcome == DeferredProofReplayAttemptOutcome::RemoteProofPassed
-        && artifact_status.invalid_for_valid_proof()
-    {
-        blockers.push(match artifact_status {
-            ProofArtifactStatus::PresentInvalid => ProofQualityBlocker::ArtifactInvalid,
-            ProofArtifactStatus::Missing => ProofQualityBlocker::ArtifactMissing,
-            ProofArtifactStatus::NotChecked => ProofQualityBlocker::ArtifactNotChecked,
-            ProofArtifactStatus::NotExpected | ProofArtifactStatus::PresentValid => {
-                unreachable!("guarded by invalid_for_valid_proof")
-            }
-        });
+    if input.attempt.outcome == DeferredProofReplayAttemptOutcome::RemoteProofPassed {
+        if let Some(blocker) = artifact_blocker(artifact_status) {
+            push_unique_blocker(&mut blockers, blocker);
+        }
     }
 
     let terminal_class = terminal_class(
@@ -484,31 +477,65 @@ fn terminal_class(
     }
 }
 
-fn blockers_for_attempt(attempt: &DeferredProofReplayAttemptRecord) -> Vec<ProofQualityBlocker> {
+fn artifact_blocker(status: ProofArtifactStatus) -> Option<ProofQualityBlocker> {
+    match status {
+        ProofArtifactStatus::PresentInvalid => Some(ProofQualityBlocker::ArtifactInvalid),
+        ProofArtifactStatus::Missing => Some(ProofQualityBlocker::ArtifactMissing),
+        ProofArtifactStatus::NotChecked => Some(ProofQualityBlocker::ArtifactNotChecked),
+        ProofArtifactStatus::NotExpected | ProofArtifactStatus::PresentValid => None,
+    }
+}
+
+fn blockers_for_attempt(
+    attempt: &DeferredProofReplayAttemptRecord,
+    execution_venue: ProofExecutionVenue,
+) -> Vec<ProofQualityBlocker> {
+    let mut blockers = Vec::new();
+    if attempt.local_fallback_detected {
+        push_unique_blocker(&mut blockers, ProofQualityBlocker::RchLocalFallback);
+    }
+
     match attempt.outcome {
-        DeferredProofReplayAttemptOutcome::RemoteProofPassed => Vec::new(),
+        DeferredProofReplayAttemptOutcome::RemoteProofPassed => {
+            if execution_venue == ProofExecutionVenue::RemoteNotConfirmed {
+                push_unique_blocker(&mut blockers, ProofQualityBlocker::RchRemoteNotConfirmed);
+            }
+        }
         DeferredProofReplayAttemptOutcome::RemoteProofFailed => {
-            vec![ProofQualityBlocker::CodeFailure]
+            if execution_venue == ProofExecutionVenue::RemoteWorker {
+                push_unique_blocker(&mut blockers, ProofQualityBlocker::CodeFailure);
+            } else if execution_venue == ProofExecutionVenue::RemoteNotConfirmed {
+                push_unique_blocker(&mut blockers, ProofQualityBlocker::RchRemoteNotConfirmed);
+            }
         }
         DeferredProofReplayAttemptOutcome::BlockedLocalFallback => {
-            vec![ProofQualityBlocker::RchLocalFallback]
+            push_unique_blocker(&mut blockers, ProofQualityBlocker::RchLocalFallback);
         }
         DeferredProofReplayAttemptOutcome::BlockedWorkerNull => {
-            vec![ProofQualityBlocker::RchWorkerNull]
+            push_unique_blocker(&mut blockers, ProofQualityBlocker::RchWorkerNull);
         }
         DeferredProofReplayAttemptOutcome::BlockedNoAdmissibleWorkers => {
-            vec![ProofQualityBlocker::RchNoAdmissibleWorkers]
+            push_unique_blocker(&mut blockers, ProofQualityBlocker::RchNoAdmissibleWorkers);
         }
-        DeferredProofReplayAttemptOutcome::BlockedExit143 => vec![ProofQualityBlocker::RchExit143],
+        DeferredProofReplayAttemptOutcome::BlockedExit143 => {
+            push_unique_blocker(&mut blockers, ProofQualityBlocker::RchExit143);
+        }
         DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout => {
-            vec![ProofQualityBlocker::RchRemoteTimeout]
+            push_unique_blocker(&mut blockers, ProofQualityBlocker::RchRemoteTimeout);
         }
         DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight => {
-            vec![ProofQualityBlocker::RchTopologyPreflight]
+            push_unique_blocker(&mut blockers, ProofQualityBlocker::RchTopologyPreflight);
         }
         DeferredProofReplayAttemptOutcome::BlockedRemoteNotConfirmed => {
-            vec![ProofQualityBlocker::RchRemoteNotConfirmed]
+            push_unique_blocker(&mut blockers, ProofQualityBlocker::RchRemoteNotConfirmed);
         }
+    }
+    blockers
+}
+
+fn push_unique_blocker(blockers: &mut Vec<ProofQualityBlocker>, blocker: ProofQualityBlocker) {
+    if !blockers.contains(&blocker) {
+        blockers.push(blocker);
     }
 }
 
@@ -540,10 +567,10 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn nibble_to_hex(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => unreachable!("nibble masked to four bits"),
+    match nibble & 0x0f {
+        value @ 0..=9 => char::from(b'0' + value),
+        value @ 10..=15 => char::from(b'a' + (value - 10)),
+        _ => '?',
     }
 }
 
@@ -792,5 +819,214 @@ mod tests {
         assert_eq!(receipt.terminal_class, ProofTerminalClass::CodeFailure);
         assert!(!receipt.valid_remote_proof);
         assert_eq!(receipt.blockers, vec!["proof.code_failure"]);
+    }
+
+    #[test]
+    fn passed_attempt_with_local_fallback_flag_records_local_fallback_blocker() {
+        let intent = sample_intent(
+            ProofKind::Check,
+            ProofScope::Package {
+                package: "frankenterm-core".to_string(),
+            },
+            "sha256:tree-a",
+            None,
+            None,
+        );
+        let attempt = attempt(
+            DeferredProofReplayAttemptOutcome::RemoteProofPassed,
+            false,
+            true,
+            Some(0),
+        );
+
+        let receipt = classify_proof_quality(ProofQualityInput {
+            intent: &intent,
+            live_source_hash: "sha256:tree-a",
+            attempt: &attempt,
+            artifact_observation: ProofArtifactObservation::NotChecked,
+            release_impact: None,
+        });
+
+        assert_eq!(receipt.execution_venue, ProofExecutionVenue::LocalFallback);
+        assert_eq!(
+            receipt.terminal_class,
+            ProofTerminalClass::TerminalInfraBlocker
+        );
+        assert!(!receipt.valid_remote_proof);
+        assert_eq!(receipt.blockers, vec!["rch.local_fallback"]);
+    }
+
+    #[test]
+    fn passed_attempt_without_confirmed_worker_records_remote_not_confirmed() {
+        let intent = sample_intent(
+            ProofKind::Test,
+            ProofScope::Package {
+                package: "frankenterm-core".to_string(),
+            },
+            "sha256:tree-a",
+            None,
+            None,
+        );
+        let attempt = attempt(
+            DeferredProofReplayAttemptOutcome::RemoteProofPassed,
+            false,
+            false,
+            Some(0),
+        );
+
+        let receipt = classify_proof_quality(ProofQualityInput {
+            intent: &intent,
+            live_source_hash: "sha256:tree-a",
+            attempt: &attempt,
+            artifact_observation: ProofArtifactObservation::NotChecked,
+            release_impact: None,
+        });
+
+        assert_eq!(
+            receipt.execution_venue,
+            ProofExecutionVenue::RemoteNotConfirmed
+        );
+        assert_eq!(
+            receipt.terminal_class,
+            ProofTerminalClass::TerminalInfraBlocker
+        );
+        assert!(!receipt.valid_remote_proof);
+        assert_eq!(receipt.blockers, vec!["rch.remote_not_confirmed"]);
+    }
+
+    #[test]
+    fn remote_failure_without_confirmed_worker_is_infra_not_code_failure() {
+        let intent = sample_intent(
+            ProofKind::Test,
+            ProofScope::Package {
+                package: "frankenterm-core".to_string(),
+            },
+            "sha256:tree-a",
+            None,
+            None,
+        );
+        let attempt = attempt(
+            DeferredProofReplayAttemptOutcome::RemoteProofFailed,
+            false,
+            false,
+            Some(101),
+        );
+
+        let receipt = classify_proof_quality(ProofQualityInput {
+            intent: &intent,
+            live_source_hash: "sha256:tree-a",
+            attempt: &attempt,
+            artifact_observation: ProofArtifactObservation::NotChecked,
+            release_impact: None,
+        });
+
+        assert_eq!(
+            receipt.terminal_class,
+            ProofTerminalClass::TerminalInfraBlocker
+        );
+        assert!(!receipt.blockers.contains(&"proof.code_failure".to_string()));
+        assert_eq!(receipt.blockers, vec!["rch.remote_not_confirmed"]);
+    }
+
+    #[test]
+    fn infra_blocker_outcomes_preserve_reason_codes() {
+        let cases = [
+            (
+                DeferredProofReplayAttemptOutcome::BlockedWorkerNull,
+                "rch.worker_null",
+            ),
+            (
+                DeferredProofReplayAttemptOutcome::BlockedNoAdmissibleWorkers,
+                "rch.no_admissible_workers",
+            ),
+            (
+                DeferredProofReplayAttemptOutcome::BlockedExit143,
+                "rch.exit_143",
+            ),
+            (
+                DeferredProofReplayAttemptOutcome::BlockedRemoteTimeout,
+                "rch.remote_timeout",
+            ),
+            (
+                DeferredProofReplayAttemptOutcome::BlockedTopologyPreflight,
+                "rch.topology_preflight_failed",
+            ),
+            (
+                DeferredProofReplayAttemptOutcome::BlockedRemoteNotConfirmed,
+                "rch.remote_not_confirmed",
+            ),
+        ];
+
+        for (outcome, blocker) in cases {
+            let intent = sample_intent(
+                ProofKind::Test,
+                ProofScope::Package {
+                    package: "frankenterm-core".to_string(),
+                },
+                "sha256:tree-a",
+                None,
+                None,
+            );
+            let attempt = attempt(outcome, false, false, None);
+
+            let receipt = classify_proof_quality(ProofQualityInput {
+                intent: &intent,
+                live_source_hash: "sha256:tree-a",
+                attempt: &attempt,
+                artifact_observation: ProofArtifactObservation::NotChecked,
+                release_impact: None,
+            });
+
+            assert_eq!(
+                receipt.terminal_class,
+                ProofTerminalClass::TerminalInfraBlocker
+            );
+            assert_eq!(receipt.blockers, vec![blocker]);
+            assert!(!receipt.valid_remote_proof);
+        }
+    }
+
+    #[test]
+    fn all_proof_kinds_survive_classification() {
+        let kinds = [
+            ProofKind::Test,
+            ProofKind::Check,
+            ProofKind::Clippy,
+            ProofKind::Fmt,
+            ProofKind::Schema,
+            ProofKind::Fuzz,
+            ProofKind::Replay,
+            ProofKind::Attestation,
+        ];
+
+        for kind in kinds {
+            let intent = sample_intent(
+                kind,
+                ProofScope::Package {
+                    package: "frankenterm-core".to_string(),
+                },
+                "sha256:tree-a",
+                None,
+                None,
+            );
+            let attempt = attempt(
+                DeferredProofReplayAttemptOutcome::RemoteProofPassed,
+                true,
+                false,
+                Some(0),
+            );
+
+            let receipt = classify_proof_quality(ProofQualityInput {
+                intent: &intent,
+                live_source_hash: "sha256:tree-a",
+                attempt: &attempt,
+                artifact_observation: ProofArtifactObservation::NotChecked,
+                release_impact: None,
+            });
+
+            assert_eq!(receipt.proof_kind, kind);
+            assert_eq!(receipt.terminal_class, ProofTerminalClass::ValidRemoteProof);
+            assert!(receipt.valid_remote_proof);
+        }
     }
 }
