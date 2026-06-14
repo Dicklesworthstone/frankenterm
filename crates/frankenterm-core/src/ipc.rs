@@ -1614,6 +1614,24 @@ fn watch_heartbeat_record(now: i64) -> serde_json::Value {
     serde_json::json!({ "type": "heartbeat", "cursor": serde_json::Value::Null, "now": now })
 }
 
+/// ft-7h5da.4.2 explicit gap record for the streaming subscribe path. When the
+/// bounded broadcast buffer drops `missed_count` detections (the subscriber
+/// fell behind), the server emits this instead of silently skipping — the
+/// no-silent-gaps capture doctrine. The follower passes it through and
+/// re-baselines via the DB-cursor path (those events are persisted), so the
+/// dropped events are still delivered at-least-once, never lost.
+#[cfg(unix)]
+fn watch_lag_gap_record(missed_count: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "gap",
+        "reason": "broadcast_lag",
+        "missed_count": missed_count,
+        "cursor": serde_json::Value::Null,
+        "message": "live broadcast buffer overflowed; missed events are still \
+                    persisted — resync via the DB cursor (at-least-once, no silent loss)",
+    })
+}
+
 /// ft-7h5da.4.1: build the NDJSON record for one live detection, applying the
 /// same pane/severity/rule-glob filters as the DB-cursor path and redacting
 /// `matched_text` + nested `extracted` secrets before emission (defense in
@@ -1729,10 +1747,13 @@ where
                     None => continue,
                 },
                 Ok(Err(RecvError::Cancelled | RecvError::Closed)) => return Ok(()),
-                // Fell behind the broadcast buffer: the follower will
-                // re-baseline any missed events via the DB-cursor path, so
-                // just resume live streaming.
-                Ok(Err(RecvError::Lagged { .. })) => continue,
+                // Fell behind the bounded broadcast buffer: emit an explicit
+                // gap record (ft-7h5da.4.2, no-silent-gaps) so the follower
+                // re-baselines the missed (but still persisted) events via the
+                // DB cursor — at-least-once, never a silent drop.
+                Ok(Err(RecvError::Lagged { missed_count })) => {
+                    watch_lag_gap_record(missed_count)
+                }
             }
         } else {
             match subscriber.recv_cx(cx).await {
@@ -1746,7 +1767,7 @@ where
                     None => continue,
                 },
                 Err(RecvError::Cancelled | RecvError::Closed) => return Ok(()),
-                Err(RecvError::Lagged { .. }) => continue,
+                Err(RecvError::Lagged { missed_count }) => watch_lag_gap_record(missed_count),
             }
         };
 
@@ -2982,6 +3003,18 @@ mod tests {
     fn subscribe_event_record_ignores_non_detection_events() {
         let event = Event::PaneDisappeared { pane_id: 1 };
         assert!(subscribe_event_record(&event, None, None, None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_lag_gap_record_is_explicit_not_silent() {
+        // ft-7h5da.4.2: broadcast lag surfaces as an explicit gap record with a
+        // non-silent missed_count, never a dropped event.
+        let rec = watch_lag_gap_record(7);
+        assert_eq!(rec["type"], "gap");
+        assert_eq!(rec["reason"], "broadcast_lag");
+        assert_eq!(rec["missed_count"], 7);
+        assert!(rec["cursor"].is_null());
     }
 
     #[test]

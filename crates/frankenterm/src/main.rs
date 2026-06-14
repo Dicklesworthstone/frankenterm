@@ -19914,6 +19914,9 @@ enum IpcRelayAction {
     Emitted,
     /// A duplicate event (cursor already emitted via the DB drain) was skipped.
     Skipped,
+    /// A broadcast-lag gap record was emitted; the follower must re-drain the
+    /// DB cursor to backfill the dropped-but-persisted events (ft-7h5da.4.2).
+    Resync,
     /// The downstream consumer closed the pipe; the follower should stop.
     PipeClosed,
 }
@@ -19995,6 +19998,20 @@ async fn relay_ipc_event_line(
                 return Ok(IpcRelayAction::PipeClosed);
             }
             Ok(IpcRelayAction::Emitted)
+        }
+        "gap" => {
+            // Pass the explicit broadcast-lag gap through to the consumer, then
+            // signal the relay loop to re-drain the DB cursor so the dropped
+            // (but persisted) events are backfilled at-least-once
+            // (ft-7h5da.4.2, no-silent-gaps).
+            let mut lock = stdout.lock();
+            let cont = write_ndjson_line(&mut lock, &value)?;
+            let _ = lock.flush();
+            drop(lock);
+            if !cont {
+                return Ok(IpcRelayAction::PipeClosed);
+            }
+            Ok(IpcRelayAction::Resync)
         }
         _ => {
             // Pass through any other control record unchanged.
@@ -32132,6 +32149,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     {
                                                         IpcRelayAction::PipeClosed => {
                                                             break 'follow;
+                                                        }
+                                                        // Broadcast lag: drop
+                                                        // out of the relay so the
+                                                        // outer loop re-drains the
+                                                        // DB cursor (backfilling
+                                                        // the missed events) and
+                                                        // then re-subscribes.
+                                                        IpcRelayAction::Resync => {
+                                                            break;
                                                         }
                                                         IpcRelayAction::Emitted
                                                         | IpcRelayAction::Skipped => {
