@@ -129,6 +129,116 @@ pub enum LockError {
     /// Failed to serialize/deserialize metadata.
     #[error("metadata error: {0}")]
     Metadata(#[from] serde_json::Error),
+
+    /// Handoff sidecar contained an invalid protocol record.
+    #[error("watcher handoff metadata invalid: {0}")]
+    InvalidHandoff(#[from] WatcherHandoffError),
+}
+
+/// Versioned protocol marker for zero-downtime watcher handoff records.
+pub const WATCHER_HANDOFF_PROTOCOL_VERSION: u32 = 1;
+
+/// Validation failures for watcher handoff sidecar records.
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum WatcherHandoffError {
+    /// The sidecar came from an unsupported protocol version.
+    #[error("unsupported protocol_version {got}, expected {expected}")]
+    UnsupportedProtocolVersion { got: u32, expected: u32 },
+
+    /// Generation zero is reserved for the pre-handoff single-watcher state.
+    #[error("handoff generation must be greater than zero")]
+    ZeroGeneration,
+
+    /// A takeover cannot transfer ownership from a process to itself.
+    #[error("predecessor and successor pid are both {pid}")]
+    SameProcess { pid: u32 },
+
+    /// Persisted cursors are event/segment ids and must not be negative.
+    #[error("handoff cursor must be non-negative, got {cursor}")]
+    NegativeCursor { cursor: i64 },
+}
+
+/// Lifecycle phase for the zero-downtime watcher handoff sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatcherHandoffPhase {
+    /// Successor has created a handoff request and is waiting for the holder.
+    Standby,
+    /// Current holder should finish its tick, flush, and checkpoint.
+    DrainRequested,
+    /// Current holder has flushed and recorded the cursor/checkpoint boundary.
+    Drained,
+    /// Successor has taken the lock and resumed from the recorded boundary.
+    TakeoverComplete,
+    /// Handoff was abandoned; ordinary single-instance locking applies again.
+    Aborted,
+}
+
+/// Versioned handoff record written next to the watcher lock.
+///
+/// This is intentionally separate from [`LockMetadata`]: the existing lock
+/// holder metadata remains a simple contention diagnostic, while handoff state
+/// carries the generation/cursor/checkpoint fields needed by the future
+/// drain-and-takeover runtime wiring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatcherHandoffRecord {
+    /// Protocol schema version for forward-compatible parsing.
+    pub protocol_version: u32,
+    /// Monotonic handoff generation. Generation 0 means no handoff.
+    pub generation: u64,
+    /// PID of the currently running watcher that must drain.
+    pub predecessor_pid: u32,
+    /// PID of the standby successor, if already known.
+    pub successor_pid: Option<u32>,
+    /// Last durable event/segment cursor at the drain boundary.
+    pub cursor: Option<i64>,
+    /// Millisecond timestamp when the predecessor checkpointed the boundary.
+    pub checkpoint_ms: Option<u64>,
+    /// Current handoff phase.
+    pub phase: WatcherHandoffPhase,
+}
+
+impl WatcherHandoffRecord {
+    /// Build a new drain request from a standby watcher.
+    #[must_use]
+    pub fn drain_requested(generation: u64, predecessor_pid: u32, successor_pid: u32) -> Self {
+        Self {
+            protocol_version: WATCHER_HANDOFF_PROTOCOL_VERSION,
+            generation,
+            predecessor_pid,
+            successor_pid: Some(successor_pid),
+            cursor: None,
+            checkpoint_ms: None,
+            phase: WatcherHandoffPhase::DrainRequested,
+        }
+    }
+
+    /// Validate the sidecar before a watcher acts on it.
+    pub fn validate(&self) -> Result<(), WatcherHandoffError> {
+        if self.protocol_version != WATCHER_HANDOFF_PROTOCOL_VERSION {
+            return Err(WatcherHandoffError::UnsupportedProtocolVersion {
+                got: self.protocol_version,
+                expected: WATCHER_HANDOFF_PROTOCOL_VERSION,
+            });
+        }
+        if self.generation == 0 {
+            return Err(WatcherHandoffError::ZeroGeneration);
+        }
+        if self
+            .successor_pid
+            .is_some_and(|successor| successor == self.predecessor_pid)
+        {
+            return Err(WatcherHandoffError::SameProcess {
+                pid: self.predecessor_pid,
+            });
+        }
+        if let Some(cursor) = self.cursor
+            && cursor < 0
+        {
+            return Err(WatcherHandoffError::NegativeCursor { cursor });
+        }
+        Ok(())
+    }
 }
 
 /// Diagnostic metadata written alongside the lock file.
@@ -280,6 +390,50 @@ fn metadata_path(lock_path: &Path) -> PathBuf {
         .unwrap_or("lock");
     meta_path.set_file_name(format!("{file_name}.meta.json"));
     meta_path
+}
+
+/// Compute the zero-downtime handoff sidecar path for a given lock path.
+#[must_use]
+pub fn watcher_handoff_path(lock_path: &Path) -> PathBuf {
+    let mut path = lock_path.to_path_buf();
+    let file_name = lock_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("lock");
+    path.set_file_name(format!("{file_name}.handoff.json"));
+    path
+}
+
+/// Persist a watcher handoff record next to the lock file.
+pub fn write_watcher_handoff_record(
+    lock_path: &Path,
+    record: &WatcherHandoffRecord,
+) -> Result<PathBuf, LockError> {
+    record.validate()?;
+    let path = watcher_handoff_path(lock_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(record)?;
+    let mut file = File::create(&path)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    Ok(path)
+}
+
+/// Read a watcher handoff record if the sidecar exists.
+pub fn read_watcher_handoff_record(
+    lock_path: &Path,
+) -> Result<Option<WatcherHandoffRecord>, LockError> {
+    let path = watcher_handoff_path(lock_path);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(LockError::Io(err)),
+    };
+    let record: WatcherHandoffRecord = serde_json::from_str(&raw)?;
+    record.validate()?;
+    Ok(Some(record))
 }
 
 /// Read metadata from an existing lock to provide a helpful error message.
@@ -468,6 +622,108 @@ mod tests {
     }
 
     #[test]
+    fn watcher_handoff_path_appends_handoff_json() {
+        let path = PathBuf::from("/tmp/watch.lock");
+        let handoff = watcher_handoff_path(&path);
+        assert_eq!(handoff, PathBuf::from("/tmp/watch.lock.handoff.json"));
+    }
+
+    #[test]
+    fn watcher_handoff_drain_request_uses_protocol_version() {
+        let record = WatcherHandoffRecord::drain_requested(7, 100, 200);
+        assert_eq!(record.protocol_version, WATCHER_HANDOFF_PROTOCOL_VERSION);
+        assert_eq!(record.generation, 7);
+        assert_eq!(record.predecessor_pid, 100);
+        assert_eq!(record.successor_pid, Some(200));
+        assert_eq!(record.phase, WatcherHandoffPhase::DrainRequested);
+        assert!(record.validate().is_ok());
+    }
+
+    #[test]
+    fn watcher_handoff_validation_rejects_unsafe_records() {
+        let mut record = WatcherHandoffRecord::drain_requested(1, 100, 200);
+        record.protocol_version = WATCHER_HANDOFF_PROTOCOL_VERSION + 1;
+        assert!(matches!(
+            record.validate(),
+            Err(WatcherHandoffError::UnsupportedProtocolVersion { .. })
+        ));
+
+        let mut record = WatcherHandoffRecord::drain_requested(1, 100, 200);
+        record.generation = 0;
+        assert!(matches!(
+            record.validate(),
+            Err(WatcherHandoffError::ZeroGeneration)
+        ));
+
+        let record = WatcherHandoffRecord::drain_requested(1, 100, 100);
+        assert!(matches!(
+            record.validate(),
+            Err(WatcherHandoffError::SameProcess { pid: 100 })
+        ));
+
+        let mut record = WatcherHandoffRecord::drain_requested(1, 100, 200);
+        record.cursor = Some(-1);
+        assert!(matches!(
+            record.validate(),
+            Err(WatcherHandoffError::NegativeCursor { cursor: -1 })
+        ));
+    }
+
+    #[test]
+    fn watcher_handoff_record_roundtrip_preserves_boundary_fields() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+        let mut record = WatcherHandoffRecord::drain_requested(3, 111, 222);
+        record.phase = WatcherHandoffPhase::Drained;
+        record.cursor = Some(42);
+        record.checkpoint_ms = Some(1_700_000_123_456);
+
+        let path = write_watcher_handoff_record(&lock_path, &record).unwrap();
+        assert_eq!(path, watcher_handoff_path(&lock_path));
+
+        let loaded = read_watcher_handoff_record(&lock_path)
+            .unwrap()
+            .expect("handoff record should exist");
+        assert_eq!(loaded, record);
+        assert_eq!(loaded.cursor, Some(42));
+        assert_eq!(loaded.checkpoint_ms, Some(1_700_000_123_456));
+    }
+
+    #[test]
+    fn watcher_handoff_read_missing_sidecar_is_none() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+        assert!(read_watcher_handoff_record(&lock_path).unwrap().is_none());
+    }
+
+    #[test]
+    fn watcher_handoff_read_rejects_invalid_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+        let handoff_path = watcher_handoff_path(&lock_path);
+        fs::write(
+            &handoff_path,
+            r#"{
+                "protocol_version": 1,
+                "generation": 0,
+                "predecessor_pid": 10,
+                "successor_pid": 20,
+                "cursor": null,
+                "checkpoint_ms": null,
+                "phase": "drain_requested"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            read_watcher_handoff_record(&lock_path),
+            Err(LockError::InvalidHandoff(
+                WatcherHandoffError::ZeroGeneration
+            ))
+        ));
+    }
+
+    #[test]
     fn read_existing_lock_error_with_valid_meta() {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("test.lock");
@@ -487,7 +743,10 @@ mod tests {
                 assert_eq!(pid, 42);
                 assert_eq!(started_at, "unix:1234");
             }
-            other => panic!("Expected AlreadyRunning, got: {other}"),
+            other => assert!(
+                matches!(other, LockError::AlreadyRunning { .. }),
+                "expected AlreadyRunning"
+            ),
         }
     }
 
@@ -583,10 +842,11 @@ mod tests {
     fn lock_error_io_kind_preserved() {
         let io_err = io::Error::new(io::ErrorKind::NotFound, "file gone");
         let lock_err = LockError::Io(io_err);
-        match lock_err {
-            LockError::Io(ref e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
-            _ => panic!("expected Io variant"),
-        }
+        let kind = match lock_err {
+            LockError::Io(ref e) => Some(e.kind()),
+            _ => None,
+        };
+        assert_eq!(kind, Some(io::ErrorKind::NotFound));
     }
 
     #[test]
@@ -697,7 +957,10 @@ mod tests {
                 assert_eq!(pid, std::process::id());
                 assert!(started_at.starts_with("unix:"));
             }
-            other => panic!("expected AlreadyRunning, got: {other}"),
+            other => assert!(
+                matches!(other, LockError::AlreadyRunning { .. }),
+                "expected AlreadyRunning"
+            ),
         }
     }
 
