@@ -884,6 +884,32 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         contract: &mut MissionTxContract,
         now_ms: i64,
     ) -> Result<TxExecutionResult, TxExecutionError> {
+        self.execute_inner(contract, now_ms, None)
+    }
+
+    /// Execute the full tx lifecycle while consulting and updating a cross-instance
+    /// idempotency store before any commit or compensation side effects dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract is invalid, a phase transition fails, the
+    /// store cannot create or update the execution ledger, or a prior non-success
+    /// idempotency outcome would make replay ambiguous.
+    pub fn execute_with_store(
+        &self,
+        contract: &mut MissionTxContract,
+        store: &mut IdempotencyStore,
+        now_ms: i64,
+    ) -> Result<TxExecutionResult, TxExecutionError> {
+        self.execute_inner(contract, now_ms, Some(store))
+    }
+
+    fn execute_inner(
+        &self,
+        contract: &mut MissionTxContract,
+        now_ms: i64,
+        mut store: Option<&mut IdempotencyStore>,
+    ) -> Result<TxExecutionResult, TxExecutionError> {
         contract
             .validate()
             .map_err(TxExecutionError::InvalidContract)?;
@@ -891,6 +917,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let execution_id = format!("txe-{now_ms}");
         let plan_id = contract.plan.plan_id.0.clone();
         let mut ledger = TxExecutionLedger::new(&execution_id, &plan_id, 0);
+        if let Some(store) = store.as_deref_mut() {
+            let compiled_plan = compiled_plan_from_contract(contract);
+            store
+                .create_ledger(&execution_id, &compiled_plan)
+                .map_err(|err| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "failed to create store-backed ledger {execution_id}: {err}"
+                    ))
+                })?;
+        }
         let mut events: Vec<TxObservabilityEvent> = Vec::new();
         let mut decision_path = String::new();
         let economic_hard_stop = contract
@@ -940,9 +976,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             };
             decision_path.push_str("->prepare_not_eligible");
             if final_state == MissionTxState::Failed {
-                ledger
-                    .transition_phase(TxPhase::Aborted)
-                    .map_err(|err| TxExecutionError::PhaseTransition(err.to_string()))?;
+                transition_execution_ledger_pair(
+                    &mut ledger,
+                    store.as_deref_mut(),
+                    &execution_id,
+                    TxPhase::Aborted,
+                )?;
             }
 
             let forensic_bundle = self.maybe_build_forensic_bundle(
@@ -970,12 +1009,18 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
         // Transition: Planned → Prepared → Committing
         contract.lifecycle_state = MissionTxState::Prepared;
-        ledger
-            .transition_phase(TxPhase::Preparing)
-            .map_err(|e| TxExecutionError::PhaseTransition(e.to_string()))?;
-        ledger
-            .transition_phase(TxPhase::Committing)
-            .map_err(|e| TxExecutionError::PhaseTransition(e.to_string()))?;
+        transition_execution_ledger_pair(
+            &mut ledger,
+            store.as_deref_mut(),
+            &execution_id,
+            TxPhase::Preparing,
+        )?;
+        transition_execution_ledger_pair(
+            &mut ledger,
+            store.as_deref_mut(),
+            &execution_id,
+            TxPhase::Committing,
+        )?;
 
         // Phase 2: Commit
         contract.lifecycle_state = MissionTxState::Committing;
@@ -985,6 +1030,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &mut events,
             &mut decision_path,
             effective_kill_switch,
+            store.as_deref(),
             now_ms,
         )?;
 
@@ -997,6 +1043,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &commit_report,
             &execution_id,
             &mut ledger,
+            store.as_deref_mut(),
             &mut events,
             now_ms,
         )?;
@@ -1005,9 +1052,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let compensation_report =
             if Self::should_run_compensation(&commit_report, self.config.auto_compensate) {
                 contract.lifecycle_state = MissionTxState::Compensating;
-                ledger
-                    .transition_phase(TxPhase::Compensating)
-                    .map_err(|e| TxExecutionError::PhaseTransition(e.to_string()))?;
+                transition_execution_ledger_pair(
+                    &mut ledger,
+                    store.as_deref_mut(),
+                    &execution_id,
+                    TxPhase::Compensating,
+                )?;
 
                 let comp = self.run_compensation_phase(
                     contract,
@@ -1015,6 +1065,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     &execution_id,
                     &mut events,
                     &mut decision_path,
+                    store.as_deref(),
                     now_ms,
                 )?;
 
@@ -1026,6 +1077,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     &comp,
                     &execution_id,
                     &mut ledger,
+                    store.as_deref_mut(),
                     &mut events,
                     now_ms,
                 )?;
@@ -1053,7 +1105,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             } else {
                 TxPhase::Aborted
             };
-            ledger.transition_phase(terminal_phase).map_err(|err| {
+            transition_execution_ledger_pair(
+                &mut ledger,
+                store.as_deref_mut(),
+                &execution_id,
+                terminal_phase,
+            )
+            .map_err(|err| {
                 TxExecutionError::LedgerWrite(format!(
                     "failed to transition ledger to terminal phase {terminal_phase:?}: {err}"
                 ))
@@ -1098,7 +1156,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
     pub fn resume(
         &self,
         contract: &mut MissionTxContract,
-        store: &IdempotencyStore,
+        store: &mut IdempotencyStore,
         execution_id: &str,
         now_ms: i64,
     ) -> Result<TxExecutionResult, TxExecutionError> {
@@ -1162,7 +1220,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     ledger.phase(),
                     now_ms,
                 ));
-                self.execute(contract, now_ms)
+                self.execute_with_store(contract, store, now_ms)
             }
             recommendation @ (ResumeRecommendation::CompensateAndAbort
             | ResumeRecommendation::ContinueFromCheckpoint) => {
@@ -1179,7 +1237,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                         ledger.phase(),
                         now_ms,
                     ));
-                    return self.execute(contract, now_ms);
+                    return self.execute_with_store(contract, store, now_ms);
                 }
 
                 Err(TxExecutionError::UnsafeResume {
@@ -1251,6 +1309,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
         kill_switch: MissionKillSwitchLevel,
+        store: Option<&IdempotencyStore>,
         now_ms: i64,
     ) -> Result<TxCommitReport, TxExecutionError> {
         events.push(self.make_event(
@@ -1277,8 +1336,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let commit_inputs = if kill_switch != MissionKillSwitchLevel::Off || safety_paused {
             Vec::new()
         } else {
-            self.executor
-                .execute_steps(contract, self.config.fail_step.as_deref(), now_ms)
+            self.commit_inputs_with_dedup(contract, store, now_ms)?
         };
 
         let report =
@@ -1296,6 +1354,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         execution_id: &str,
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
+        store: Option<&IdempotencyStore>,
         now_ms: i64,
     ) -> Result<TxCompensationReport, TxExecutionError> {
         events.push(self.make_event(
@@ -1308,12 +1367,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             now_ms,
         ));
 
-        let comp_inputs = self.executor.execute_compensations(
-            contract,
-            commit_report,
-            self.config.fail_compensation_for_step.as_deref(),
-            now_ms,
-        );
+        let comp_inputs =
+            self.compensation_inputs_with_dedup(contract, commit_report, store, now_ms)?;
 
         let report = execute_compensation_phase(contract, commit_report, &comp_inputs, now_ms)
             .map_err(TxExecutionError::CompensationPhase)?;
@@ -1342,6 +1397,97 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         Ok(report)
     }
 
+    fn commit_inputs_with_dedup(
+        &self,
+        contract: &MissionTxContract,
+        store: Option<&IdempotencyStore>,
+        now_ms: i64,
+    ) -> Result<Vec<TxCommitStepInput>, TxExecutionError> {
+        let Some(store) = store else {
+            return Ok(self.executor.execute_steps(
+                contract,
+                self.config.fail_step.as_deref(),
+                now_ms,
+            ));
+        };
+
+        let mut commit_inputs = Vec::new();
+        let mut dispatch_contract = contract.clone();
+        dispatch_contract.plan.steps.clear();
+
+        for step in &contract.plan.steps {
+            let idem_key = IdempotencyKey::new(&contract.plan.plan_id.0, &step.step_id.0, "commit");
+            if let Some(outcome) = store.check_dedup(&idem_key) {
+                commit_inputs.push(deduped_commit_input(&step.step_id, outcome, now_ms)?);
+            } else {
+                dispatch_contract.plan.steps.push(step.clone());
+            }
+        }
+
+        if !dispatch_contract.plan.steps.is_empty() {
+            commit_inputs.extend(self.executor.execute_steps(
+                &dispatch_contract,
+                self.config.fail_step.as_deref(),
+                now_ms,
+            ));
+        }
+
+        Ok(commit_inputs)
+    }
+
+    fn compensation_inputs_with_dedup(
+        &self,
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        store: Option<&IdempotencyStore>,
+        now_ms: i64,
+    ) -> Result<Vec<TxCompensationStepInput>, TxExecutionError> {
+        let Some(store) = store else {
+            return Ok(self.executor.execute_compensations(
+                contract,
+                commit_report,
+                self.config.fail_compensation_for_step.as_deref(),
+                now_ms,
+            ));
+        };
+
+        let mut compensation_inputs = Vec::new();
+        let mut dispatch_report = commit_report.clone();
+        dispatch_report.step_results.clear();
+
+        for step_result in &commit_report.step_results {
+            if !step_result.outcome.is_committed() {
+                continue;
+            }
+
+            let idem_key = IdempotencyKey::for_compensation(
+                &contract.plan.plan_id.0,
+                &step_result.step_id.0,
+                "rollback",
+            );
+            if let Some(outcome) = store.check_dedup(&idem_key) {
+                compensation_inputs.push(deduped_compensation_input(
+                    &step_result.step_id,
+                    outcome,
+                    now_ms,
+                )?);
+            } else {
+                dispatch_report.step_results.push(step_result.clone());
+            }
+        }
+
+        if !dispatch_report.step_results.is_empty() {
+            compensation_inputs.extend(self.executor.execute_compensations(
+                contract,
+                &dispatch_report,
+                self.config.fail_compensation_for_step.as_deref(),
+                now_ms,
+            ));
+        }
+
+        Ok(compensation_inputs)
+    }
+
     // ── Ledger Recording ─────────────────────────────────────────────────────
 
     fn record_commit_results_to_ledger(
@@ -1350,6 +1496,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         commit_report: &TxCommitReport,
         execution_id: &str,
         ledger: &mut TxExecutionLedger,
+        mut store: Option<&mut IdempotencyStore>,
         events: &mut Vec<TxObservabilityEvent>,
         now_ms: i64,
     ) -> Result<(), TxExecutionError> {
@@ -1377,14 +1524,29 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 },
             };
 
+            let risk = contract_step_risk(contract, step_result.step_id.0.as_str());
+            let agent_id = format!("agent-{}", step_result.step_id.0);
+            let timestamp_ms = now_ms as u64;
+            if let Some(store) = store.as_deref_mut() {
+                store
+                    .record_execution(
+                        execution_id,
+                        idem_key.clone(),
+                        outcome.clone(),
+                        risk,
+                        &agent_id,
+                        timestamp_ms,
+                    )
+                    .map_err(|err| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "failed to record commit step {} in idempotency store: {err}",
+                            step_result.step_id.0
+                        ))
+                    })?;
+            }
+
             ledger
-                .append(
-                    idem_key,
-                    outcome,
-                    contract_step_risk(contract, step_result.step_id.0.as_str()),
-                    &format!("agent-{}", step_result.step_id.0),
-                    now_ms as u64,
-                )
+                .append(idem_key, outcome, risk, &agent_id, timestamp_ms)
                 .map_err(|err| {
                     TxExecutionError::LedgerWrite(format!(
                         "failed to record commit step {} in idempotency ledger: {err}",
@@ -1425,6 +1587,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         comp_report: &TxCompensationReport,
         execution_id: &str,
         ledger: &mut TxExecutionLedger,
+        mut store: Option<&mut IdempotencyStore>,
         events: &mut Vec<TxObservabilityEvent>,
         now_ms: i64,
     ) -> Result<(), TxExecutionError> {
@@ -1458,14 +1621,28 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     }
                 };
 
+                let risk = compensation_step_risk(contract, step_id);
+                let agent_id = format!("agent-{step_id}");
+                let timestamp_ms = now_ms as u64;
+                if let Some(store) = store.as_deref_mut() {
+                    store
+                        .record_execution(
+                            execution_id,
+                            idem_key.clone(),
+                            outcome.clone(),
+                            risk,
+                            &agent_id,
+                            timestamp_ms,
+                        )
+                        .map_err(|err| {
+                            TxExecutionError::LedgerWrite(format!(
+                                "failed to record compensation step {step_id} in idempotency store: {err}"
+                            ))
+                        })?;
+                }
+
                 ledger
-                    .append(
-                        idem_key,
-                        outcome,
-                        compensation_step_risk(contract, step_id),
-                        &format!("agent-{step_id}"),
-                        now_ms as u64,
-                    )
+                    .append(idem_key, outcome, risk, &agent_id, timestamp_ms)
                     .map_err(|err| {
                         TxExecutionError::LedgerWrite(format!(
                             "failed to record compensation step {step_id} in idempotency ledger: {err}"
@@ -1702,12 +1879,74 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
     }
 }
 
+fn transition_execution_ledger_pair(
+    ledger: &mut TxExecutionLedger,
+    store: Option<&mut IdempotencyStore>,
+    execution_id: &str,
+    next: TxPhase,
+) -> Result<(), TxExecutionError> {
+    ledger
+        .transition_phase(next)
+        .map_err(|err| TxExecutionError::PhaseTransition(err.to_string()))?;
+
+    if let Some(store) = store {
+        let store_ledger = store
+            .get_ledger_mut(execution_id)
+            .ok_or_else(|| TxExecutionError::LedgerNotFound(execution_id.to_string()))?;
+        store_ledger
+            .transition_phase(next)
+            .map_err(|err| TxExecutionError::PhaseTransition(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
 fn reason_code_for_outcome(outcome: &TxOutcome) -> &'static str {
     match outcome {
         TxOutcome::Pending => "pending",
         TxOutcome::Committed => "committed",
         TxOutcome::Failed => "failed",
         TxOutcome::Compensated => "compensated",
+    }
+}
+
+fn deduped_commit_input(
+    step_id: &crate::plan::TxStepId,
+    outcome: &StepOutcome,
+    now_ms: i64,
+) -> Result<TxCommitStepInput, TxExecutionError> {
+    match outcome {
+        StepOutcome::Success { .. } => Ok(TxCommitStepInput {
+            step_id: step_id.clone(),
+            success: true,
+            reason_code: "commit_step_deduped".to_string(),
+            error_code: None,
+            completed_at_ms: now_ms,
+        }),
+        other => Err(TxExecutionError::DedupConflict {
+            step_id: step_id.0.clone(),
+            outcome: format!("{other:?}"),
+        }),
+    }
+}
+
+fn deduped_compensation_input(
+    step_id: &crate::plan::TxStepId,
+    outcome: &StepOutcome,
+    now_ms: i64,
+) -> Result<TxCompensationStepInput, TxExecutionError> {
+    match outcome {
+        StepOutcome::Compensated { .. } => Ok(TxCompensationStepInput {
+            for_step_id: step_id.clone(),
+            success: true,
+            reason_code: "compensation_step_deduped".to_string(),
+            error_code: None,
+            completed_at_ms: now_ms,
+        }),
+        other => Err(TxExecutionError::DedupConflict {
+            step_id: step_id.0.clone(),
+            outcome: format!("{other:?}"),
+        }),
     }
 }
 
@@ -1878,6 +2117,8 @@ pub enum TxExecutionError {
         execution_id: String,
         recommendation: ResumeRecommendation,
     },
+    /// A cross-instance dedup record exists but is not safe to replay as a successful input.
+    DedupConflict { step_id: String, outcome: String },
 }
 
 impl std::fmt::Display for TxExecutionError {
@@ -1898,6 +2139,10 @@ impl std::fmt::Display for TxExecutionError {
                 "Unsafe resume for {execution_id}: recommendation {:?} requires checkpoint-aware replay",
                 recommendation
             ),
+            Self::DedupConflict { step_id, outcome } => write!(
+                f,
+                "Dedup conflict for step {step_id}: prior outcome {outcome} cannot be replayed as a successful side-effect input"
+            ),
         }
     }
 }
@@ -1914,8 +2159,10 @@ mod tests {
         MissionTokenUsageSample, MissionTxContract, MissionTxState, StepAction, TxCompensation,
         TxId, TxIntent, TxOutcome, TxPlan as ContractTxPlan, TxPlanId, TxStep, TxStepId,
     };
-    use crate::tx_idempotency::{IdempotencyPolicy, IdempotencyStore, StepOutcome};
+    use crate::tx_idempotency::{IdempotencyKey, IdempotencyPolicy, IdempotencyStore, StepOutcome};
     use crate::tx_plan_compiler::StepRisk;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn make_test_contract(num_steps: usize) -> MissionTxContract {
         let steps: Vec<TxStep> = (0..num_steps)
@@ -1966,21 +2213,74 @@ mod tests {
 
         fn execute_steps(
             &self,
-            _contract: &MissionTxContract,
+            contract: &MissionTxContract,
             _fail_step: Option<&str>,
-            _now_ms: i64,
+            now_ms: i64,
         ) -> Vec<TxCommitStepInput> {
-            panic!("commit executor must not dispatch under kill switch or pause")
+            crate::plan::mission_tx_commit_step_inputs(contract, None, now_ms)
         }
 
         fn execute_compensations(
             &self,
             _contract: &MissionTxContract,
-            _commit_report: &TxCommitReport,
+            commit_report: &TxCommitReport,
             _fail_for_step: Option<&str>,
-            _now_ms: i64,
+            now_ms: i64,
         ) -> Vec<TxCompensationStepInput> {
-            panic!("compensation executor must not dispatch under kill switch or pause")
+            crate::plan::mission_tx_compensation_inputs(commit_report, None, now_ms)
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingExecutor {
+        dispatched_steps: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl RecordingExecutor {
+        fn new() -> (Self, Rc<RefCell<Vec<String>>>) {
+            let dispatched_steps = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    dispatched_steps: Rc::clone(&dispatched_steps),
+                },
+                dispatched_steps,
+            )
+        }
+    }
+
+    impl StepExecutor for RecordingExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            _now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            crate::plan::tx_prepare_gate_inputs_allow_all(contract)
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            self.dispatched_steps.borrow_mut().extend(
+                contract
+                    .plan
+                    .steps
+                    .iter()
+                    .map(|step| step.step_id.0.clone()),
+            );
+            crate::plan::mission_tx_commit_step_inputs(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            _contract: &MissionTxContract,
+            commit_report: &TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            crate::plan::mission_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
         }
     }
 
@@ -2010,6 +2310,91 @@ mod tests {
         assert_eq!(commit.committed_count, 5);
         assert_eq!(commit.failed_count, 0);
         assert_eq!(commit.skipped_count, 0);
+    }
+
+    #[test]
+    fn execute_with_store_dedups_full_replay_before_dispatch() -> Result<(), String> {
+        let (executor, dispatched_steps) = RecordingExecutor::new();
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let mut first_contract = make_test_contract(2);
+        let first = engine
+            .execute_with_store(&mut first_contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        assert_eq!(first.final_state, MissionTxState::Committed);
+        assert_eq!(
+            dispatched_steps.borrow().as_slice(),
+            ["step-0".to_string(), "step-1".to_string()]
+        );
+
+        dispatched_steps.borrow_mut().clear();
+        let mut replay_contract = make_test_contract(2);
+        let replay = engine
+            .execute_with_store(&mut replay_contract, &mut store, 6_000)
+            .map_err(|err| err.to_string())?;
+
+        assert!(dispatched_steps.borrow().is_empty());
+        let commit = replay
+            .commit_report
+            .as_ref()
+            .ok_or_else(|| "missing replay commit report".to_string())?;
+        assert_eq!(commit.committed_count, 2);
+        assert_eq!(commit.failed_count, 0);
+        assert!(
+            commit
+                .step_results
+                .iter()
+                .all(|step| step.decision_path == "commit_phase->committed")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execute_with_store_dedups_partial_prior_commit_before_dispatch() -> Result<(), String> {
+        let (executor, dispatched_steps) = RecordingExecutor::new();
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let contract = make_test_contract(2);
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("prior-exec", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        store
+            .record_execution(
+                "prior-exec",
+                IdempotencyKey::new(&contract.plan.plan_id.0, "step-0", "commit"),
+                StepOutcome::Success {
+                    result: Some("prior_commit".to_string()),
+                },
+                StepRisk::High,
+                "agent-step-0",
+                5_000,
+            )
+            .map_err(|err| err.to_string())?;
+
+        let mut replay_contract = make_test_contract(2);
+        let replay = engine
+            .execute_with_store(&mut replay_contract, &mut store, 6_000)
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(dispatched_steps.borrow().as_slice(), ["step-1".to_string()]);
+        let commit = replay
+            .commit_report
+            .as_ref()
+            .ok_or_else(|| "missing replay commit report".to_string())?;
+        assert_eq!(commit.committed_count, 2);
+        assert_eq!(commit.failed_count, 0);
+        assert_eq!(
+            store.check_dedup(&IdempotencyKey::new(
+                &replay_contract.plan.plan_id.0,
+                "step-1",
+                "commit"
+            )),
+            Some(&StepOutcome::Success {
+                result: Some("commit_step_succeeded".to_string())
+            })
+        );
+        Ok(())
     }
 
     #[test]
@@ -2277,10 +2662,10 @@ mod tests {
 
     #[test]
     fn execute_rejects_ambiguous_tx_contract_topology() {
-        fn invalid_contract_message(err: TxExecutionError) -> String {
+        fn invalid_contract_message(err: TxExecutionError) -> Result<String, TxExecutionError> {
             match err {
-                TxExecutionError::InvalidContract(message) => message,
-                other => panic!("expected invalid contract, got {other:?}"),
+                TxExecutionError::InvalidContract(message) => Ok(message),
+                other => Err(other),
             }
         }
 
@@ -2289,8 +2674,12 @@ mod tests {
         let mut duplicate_step_id = make_test_contract(2);
         duplicate_step_id.plan.steps[1].step_id = duplicate_step_id.plan.steps[0].step_id.clone();
         let err = engine.execute(&mut duplicate_step_id, 5000).unwrap_err();
+        let message = match invalid_contract_message(err) {
+            Ok(message) => message,
+            Err(other) => format!("unexpected error {other:?}"),
+        };
         assert!(
-            invalid_contract_message(err).contains("duplicate step_id step-0"),
+            message.contains("duplicate step_id step-0"),
             "duplicate step ids must fail before commit dispatch"
         );
 
@@ -2852,7 +3241,7 @@ mod tests {
 
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
         let result = engine
-            .resume(&mut contract, &store, "exec-1", 5000)
+            .resume(&mut contract, &mut store, "exec-1", 5000)
             .unwrap();
 
         assert_eq!(result.final_state, MissionTxState::Committed);
@@ -2890,7 +3279,7 @@ mod tests {
 
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
         let err = engine
-            .resume(&mut contract, &store, "exec-1", 5000)
+            .resume(&mut contract, &mut store, "exec-1", 5000)
             .unwrap_err();
 
         assert!(matches!(
@@ -2942,7 +3331,7 @@ mod tests {
             },
         );
         let result = engine
-            .resume(&mut contract, &store, "exec-1", 5000)
+            .resume(&mut contract, &mut store, "exec-1", 5000)
             .unwrap();
 
         assert_eq!(result.final_state, MissionTxState::Committing);
@@ -3014,7 +3403,7 @@ mod tests {
 
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
         let result = engine
-            .resume(&mut contract, &store, "exec-1", 5000)
+            .resume(&mut contract, &mut store, "exec-1", 5000)
             .unwrap();
 
         assert_eq!(result.final_state, MissionTxState::Failed);
@@ -3058,7 +3447,7 @@ mod tests {
 
         let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
         let result = engine
-            .resume(&mut contract, &store, "exec-1", 5000)
+            .resume(&mut contract, &mut store, "exec-1", 5000)
             .unwrap();
 
         assert_eq!(result.final_state, MissionTxState::Compensated);
