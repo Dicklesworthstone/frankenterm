@@ -504,6 +504,11 @@ pub const RENDERER_ATLAS_STABILITY_STATUS: &str =
     "evict_recover_harness_retained_jsonl_pending_suite_attestation";
 /// Current non-claiming status for the idle-GPU-power SLO substrate.
 pub const RENDERER_IDLE_GPU_POWER_STATUS: &str = "power_sampler_pending_target_run";
+/// Real input-to-photon harness path retained in the SLO attestation ledger.
+pub const RENDERER_INPUT_TO_PHOTON_SOURCE_BENCH: &str =
+    "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs";
+/// Real SSIM parity release-gate test path retained in the SLO attestation ledger.
+pub const RENDERER_SSIM_PARITY_SOURCE_TEST: &str = "crates/frankenterm-gui/tests/ssim_parity.rs";
 /// Real resize-FPS harness path retained in the SLO attestation ledger.
 pub const RENDERER_RESIZE_FPS_SOURCE_BENCH: &str =
     "crates/frankenterm-core/benches/resize_storm.rs";
@@ -634,8 +639,7 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
             target_p95_us_macos: RENDERER_INPUT_TO_PHOTON_MACOS_P95_TARGET_US,
             target_p95_us_wayland: RENDERER_INPUT_TO_PHOTON_WAYLAND_P95_TARGET_US,
             max_instrumentation_overhead_pct: 5,
-            source_bench: "crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs"
-                .to_string(),
+            source_bench: RENDERER_INPUT_TO_PHOTON_SOURCE_BENCH.to_string(),
             structured_log_template: "target/criterion/slo-input_to_photon_<platform>.jsonl"
                 .to_string(),
             mcp_resource_uri: RENDERER_INPUT_TO_PHOTON_MCP_RESOURCE_URI.to_string(),
@@ -661,7 +665,7 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
                 RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM,
             comparator_source: "crates/frankenterm-gui/src/gpu_regression.rs::compare_images"
                 .to_string(),
-            source_test: "crates/frankenterm-gui/tests/ssim_parity.rs".to_string(),
+            source_test: RENDERER_SSIM_PARITY_SOURCE_TEST.to_string(),
             release_gate_script: "tests/e2e/test_ssim_parity_release_gate.sh".to_string(),
             topology_cross_check: "docs/attestations/tui/topology-parity.json".to_string(),
             mcp_resource_uri: RENDERER_SSIM_PARITY_MCP_RESOURCE_URI.to_string(),
@@ -969,6 +973,10 @@ mod tests {
             report.input_to_photon.target_p95_us_wayland,
             RENDERER_INPUT_TO_PHOTON_WAYLAND_P95_TARGET_US
         );
+        assert_eq!(
+            report.input_to_photon.source_bench,
+            RENDERER_INPUT_TO_PHOTON_SOURCE_BENCH
+        );
         assert!(
             report
                 .input_to_photon
@@ -1037,6 +1045,10 @@ mod tests {
         assert_eq!(
             report.ssim_parity.default_max_changed_pixel_fraction_ppm,
             RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM
+        );
+        assert_eq!(
+            report.ssim_parity.source_test,
+            RENDERER_SSIM_PARITY_SOURCE_TEST
         );
         assert_eq!(
             report.ssim_parity.topology_cross_check,
@@ -1156,6 +1168,26 @@ mod tests {
         let json = serde_json::to_string(&report).expect("serialize");
         let back: RendererSloDoctorReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(report, back);
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_declares_existing_source_artifacts() {
+        let report = renderer_slos_doctor_report();
+        for artifact in [
+            report.input_to_photon.source_bench.as_str(),
+            report.ssim_parity.source_test.as_str(),
+            report.resize_fps.source_bench.as_str(),
+            report.atlas_stability.source_bench.as_str(),
+            report.idle_gpu_power.source_bench.as_str(),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(artifact);
+            assert!(
+                path.exists(),
+                "declared renderer SLO artifact is missing: {artifact}"
+            );
+        }
     }
 
     #[test]
