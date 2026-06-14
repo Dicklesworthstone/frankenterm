@@ -366,6 +366,7 @@ pub fn is_drained(state: &KillSwitchModelState) -> bool {
 ///   * Pre-commit states (`Draft`/`Planned`/`Prepared` with no committed steps)
 ///     have nothing to drain; halting until an operator lowers the switch is
 ///     the correct behavior, so the absence of a forward action is allowed.
+///
 /// The current model satisfies this; the predicate now *fails* if a regression
 /// (e.g. dropping `FailCommit` from `Committing` under HardStop) strands
 /// in-flight work.
