@@ -2427,6 +2427,356 @@ fn push_unique(values: &mut Vec<String>, value: impl Into<String>) {
     }
 }
 
+// ── W6.2 (ft-7h5da.7.2): deterministic ranked `ft robot next` advisory view ──
+//
+// Layers a deterministic ranking (severity x age x pane-priority) with a
+// MANDATORY `reasons[]` rationale and a self-teaching `suggested_command` on top
+// of the W6.1 `AttentionRouterSnapshot`. The view is ADVISORY ONLY: every input
+// item remains independently queryable; `next` is never an exclusive gateway.
+// Ordering is integer-only (no floats, no wall-clock) so it is golden-fixture
+// stable, and a token budget elides the tail with a continuation cursor.
+
+/// Schema identifier for the deterministic ranked attention view.
+pub const ATTENTION_ROUTER_NEXT_SCHEMA: &str = "ft.attention_router.next.v1";
+
+/// Upper bound (in minutes) on the age/freshness signal folded into the
+/// composite attention score. Items staler than this saturate, keeping the
+/// integer composite packing bounded and deterministic.
+const ATTENTION_ROUTER_NEXT_AGE_MINUTES_CAP: u64 = 0xFFFF;
+
+/// Fixed per-entry token overhead used by the budget estimator to account for
+/// the JSON scaffolding/fields around an entry's variable text.
+const ATTENTION_ROUTER_NEXT_STRUCTURAL_TOKENS: u32 = 24;
+
+impl AttentionRouterSeverity {
+    /// Composite weight for ranking; higher is more urgent. Severity is the
+    /// dominant factor in the deterministic `next` score.
+    #[must_use]
+    pub fn weight(self) -> u32 {
+        match self {
+            Self::Critical => 5,
+            Self::High => 4,
+            Self::Medium => 3,
+            Self::Low => 2,
+            Self::Info => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Info => "info",
+        }
+    }
+}
+
+fn attention_router_classification_label(classification: AttentionRouterClassification) -> &'static str {
+    match classification {
+        AttentionRouterClassification::ReadyNow => "ready-now",
+        AttentionRouterClassification::BlockedInfra => "blocked-infra",
+        AttentionRouterClassification::BlockedDomain => "blocked-domain",
+        AttentionRouterClassification::WaitingComm => "waiting-comm",
+        AttentionRouterClassification::StaleClaim => "stale-claim",
+        AttentionRouterClassification::DirtyOverlap => "dirty-overlap",
+        AttentionRouterClassification::ProofStarved => "proof-starved",
+        AttentionRouterClassification::DoNotTouch => "do-not-touch",
+    }
+}
+
+fn attention_router_confidence_label(confidence: AttentionRouterConfidence) -> &'static str {
+    match confidence {
+        AttentionRouterConfidence::High => "high",
+        AttentionRouterConfidence::Medium => "medium",
+        AttentionRouterConfidence::Low => "low",
+    }
+}
+
+/// Deterministic composite-score breakdown for a single ranked entry. The
+/// `composite` packs the three factors lexicographically into a single integer
+/// (severity dominates, then age, then pane-priority, then confidence) so the
+/// total order is stable and reproducible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionRouterNextScore {
+    pub severity_weight: u32,
+    pub age_weight: u32,
+    pub priority_weight: u32,
+    pub confidence_weight: u32,
+    pub composite: u64,
+}
+
+/// A single ranked entry in the `ft robot next` advisory view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttentionRouterNextEntry {
+    /// 1-based position in the full ranked list (assigned before any budget
+    /// elision, so ranks remain stable across budgets).
+    pub rank: u32,
+    pub item_id: String,
+    pub kind: AttentionRouterItemKind,
+    pub severity: AttentionRouterSeverity,
+    pub classification: AttentionRouterClassification,
+    pub domain: String,
+    pub owner: Option<String>,
+    pub subject: AttentionRouterSubject,
+    pub redacted_summary: String,
+    pub mutates: bool,
+    pub score: AttentionRouterNextScore,
+    /// MANDATORY human-readable ranking rationale; always non-empty.
+    pub reasons: Vec<String>,
+    /// MANDATORY self-teaching command; always non-empty.
+    pub suggested_command: String,
+    pub estimated_tokens: u32,
+}
+
+/// Continuation cursor emitted when a token budget elides the ranked tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionRouterNextCursor {
+    pub after_rank: u32,
+    pub after_item_id: String,
+    pub remaining_items: usize,
+}
+
+/// The advisory "what deserves attention now" ranked view (W6.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttentionRouterNextView {
+    pub schema: String,
+    pub contract_id: String,
+    pub generated_at_ms: u64,
+    pub workspace: String,
+    /// Always `true`: `next` is advisory and never an exclusive gateway.
+    pub advisory: bool,
+    pub total_items: usize,
+    pub returned_items: usize,
+    pub entries: Vec<AttentionRouterNextEntry>,
+    pub budget_tokens: Option<u32>,
+    pub tokens_used: u32,
+    pub cursor: Option<AttentionRouterNextCursor>,
+    pub elided_items: usize,
+}
+
+fn attention_router_next_composite(item: &AttentionRouterItem) -> AttentionRouterNextScore {
+    let severity_weight = item.severity.weight();
+    let age_minutes = item
+        .freshness_ms
+        .map(|ms| (ms / 60_000).min(ATTENTION_ROUTER_NEXT_AGE_MINUTES_CAP))
+        .unwrap_or(0);
+    let age_weight = u32::try_from(age_minutes).unwrap_or(u32::MAX);
+    // item.priority is ascending-important (lower = more important), matching
+    // `item_order`; invert so higher weight = more important pane priority.
+    let priority_weight = u32::from(u8::MAX - item.priority);
+    let confidence_weight = match item.confidence_label {
+        AttentionRouterConfidence::High => 2,
+        AttentionRouterConfidence::Medium => 1,
+        AttentionRouterConfidence::Low => 0,
+    };
+    // Lexicographic packing into a single u64: severity (bits 48+), age
+    // (bits 32..48), pane-priority (bits 16..24), confidence (low bits).
+    let composite = (u64::from(severity_weight) << 48)
+        | (u64::from(age_weight) << 32)
+        | (u64::from(priority_weight) << 16)
+        | u64::from(confidence_weight);
+    AttentionRouterNextScore {
+        severity_weight,
+        age_weight,
+        priority_weight,
+        confidence_weight,
+        composite,
+    }
+}
+
+fn attention_router_next_reasons(
+    item: &AttentionRouterItem,
+    score: &AttentionRouterNextScore,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    push_unique(
+        &mut reasons,
+        format!(
+            "{} severity ({} classification)",
+            item.severity.label(),
+            attention_router_classification_label(item.classification),
+        ),
+    );
+    if score.age_weight > 0 {
+        push_unique(
+            &mut reasons,
+            format!(
+                "waiting ~{}m (observation freshness {}ms)",
+                score.age_weight,
+                item.freshness_ms.unwrap_or(0),
+            ),
+        );
+    } else {
+        push_unique(&mut reasons, "fresh observation (no aging weight)");
+    }
+    push_unique(
+        &mut reasons,
+        format!(
+            "pane priority {} (rank weight {})",
+            item.priority, score.priority_weight,
+        ),
+    );
+    if !item.evidence.is_empty() {
+        push_unique(
+            &mut reasons,
+            format!(
+                "corroborated by {} source observation(s)",
+                item.evidence.len(),
+            ),
+        );
+    }
+    push_unique(
+        &mut reasons,
+        format!(
+            "{} confidence",
+            attention_router_confidence_label(item.confidence_label),
+        ),
+    );
+    if reasons.is_empty() {
+        push_unique(&mut reasons, "ranked by composite attention score");
+    }
+    reasons
+}
+
+fn attention_router_next_suggested_command(item: &AttentionRouterItem) -> String {
+    // Prefer the W6.1 recommended action's own command hint when present.
+    if let Some(hint) = item.recommended_action.command_hint.as_ref() {
+        let trimmed = hint.trim();
+        if !trimmed.is_empty() {
+            return bounded_string(trimmed, "ft robot next --explain");
+        }
+    }
+    // Otherwise derive a safe, self-teaching default from the subject. `br show`
+    // and `ft robot next --explain` are read-only and always valid.
+    let command = match item.subject.bead_id.as_deref() {
+        Some(bead_id) if !bead_id.trim().is_empty() => format!("br show {}", bead_id.trim()),
+        _ => format!("ft robot next --explain {}", item.item_id),
+    };
+    bounded_string(command, "ft robot next --explain")
+}
+
+fn attention_router_next_estimated_tokens(
+    redacted_summary: &str,
+    reasons: &[String],
+    suggested_command: &str,
+) -> u32 {
+    // Deterministic ~4-chars-per-token heuristic over the entry's variable text
+    // plus a fixed structural overhead. Never zero, so a token budget always
+    // makes monotonic progress.
+    let mut chars = redacted_summary.chars().count() + suggested_command.chars().count();
+    for reason in reasons {
+        chars += reason.chars().count();
+    }
+    let text_tokens = u32::try_from(chars / 4).unwrap_or(u32::MAX);
+    ATTENTION_ROUTER_NEXT_STRUCTURAL_TOKENS.saturating_add(text_tokens)
+}
+
+fn attention_router_next_entry(
+    item: &AttentionRouterItem,
+    score: AttentionRouterNextScore,
+    rank: u32,
+) -> AttentionRouterNextEntry {
+    let reasons = attention_router_next_reasons(item, &score);
+    let suggested_command = attention_router_next_suggested_command(item);
+    let estimated_tokens =
+        attention_router_next_estimated_tokens(&item.redacted_summary, &reasons, &suggested_command);
+    AttentionRouterNextEntry {
+        rank,
+        item_id: item.item_id.clone(),
+        kind: item.kind,
+        severity: item.severity,
+        classification: item.classification,
+        domain: item.domain.clone(),
+        owner: item.owner.clone(),
+        subject: item.subject.clone(),
+        redacted_summary: item.redacted_summary.clone(),
+        mutates: item.recommended_action.mutates,
+        score,
+        reasons,
+        suggested_command,
+        estimated_tokens,
+    }
+}
+
+/// Build the deterministic ranked advisory view from a scored snapshot.
+///
+/// Ranking is `severity x age x pane-priority` packed into a stable integer
+/// composite (descending), with `item_id` as the final tiebreak. When
+/// `budget_tokens` is `Some`, entries are emitted in rank order until the token
+/// budget is exhausted; the top entry is always emitted (so `next` is never
+/// empty when items exist), and any elided tail yields a continuation cursor.
+#[must_use]
+pub fn build_attention_router_next_view(
+    snapshot: &AttentionRouterSnapshot,
+    budget_tokens: Option<u32>,
+) -> AttentionRouterNextView {
+    let mut ranked: Vec<(AttentionRouterNextScore, &AttentionRouterItem)> = snapshot
+        .items
+        .iter()
+        .map(|item| (attention_router_next_composite(item), item))
+        .collect();
+    ranked.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .composite
+            .cmp(&left_score.composite)
+            .then_with(|| left.item_id.cmp(&right.item_id))
+    });
+
+    let total_items = ranked.len();
+    let mut entries: Vec<AttentionRouterNextEntry> = Vec::new();
+    let mut tokens_used: u32 = 0;
+    let mut cursor = None;
+
+    for (index, (score, item)) in ranked.into_iter().enumerate() {
+        let rank = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
+        let entry = attention_router_next_entry(item, score, rank);
+        if let Some(budget) = budget_tokens {
+            let projected = tokens_used.saturating_add(entry.estimated_tokens);
+            // Always emit the top entry even if it alone exceeds the budget.
+            if !entries.is_empty() && projected > budget {
+                cursor = entries.last().map(|last| AttentionRouterNextCursor {
+                    after_rank: last.rank,
+                    after_item_id: last.item_id.clone(),
+                    remaining_items: total_items - entries.len(),
+                });
+                break;
+            }
+            tokens_used = projected;
+        } else {
+            tokens_used = tokens_used.saturating_add(entry.estimated_tokens);
+        }
+        entries.push(entry);
+    }
+
+    let returned_items = entries.len();
+    let elided_items = total_items - returned_items;
+    AttentionRouterNextView {
+        schema: ATTENTION_ROUTER_NEXT_SCHEMA.to_string(),
+        contract_id: ATTENTION_ROUTER_CONTRACT_ID.to_string(),
+        generated_at_ms: snapshot.generated_at_ms,
+        workspace: snapshot.workspace.clone(),
+        advisory: true,
+        total_items,
+        returned_items,
+        entries,
+        budget_tokens,
+        tokens_used,
+        cursor,
+        elided_items,
+    }
+}
+
+/// Convenience: build the ranked advisory view directly from adapter input.
+#[must_use]
+pub fn build_attention_router_next_view_from_input(
+    input: &AttentionRouterSourceAdapterInput,
+    budget_tokens: Option<u32>,
+) -> AttentionRouterNextView {
+    build_attention_router_next_view(&build_attention_router_snapshot(input), budget_tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3989,5 +4339,144 @@ mod tests {
                 "recommendation text must not embed forbidden command {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn attention_router_next_view_is_deterministic_with_mandatory_fields() {
+        let snapshot = score(w6_optional_source_observations());
+        assert!(
+            !snapshot.items.is_empty(),
+            "expected ranked attention items in the W6 snapshot"
+        );
+
+        let view_a = build_attention_router_next_view(&snapshot, None);
+        let view_b = build_attention_router_next_view(&snapshot, None);
+        assert_eq!(
+            view_a, view_b,
+            "ranked next view must be deterministic (golden-fixture stable)"
+        );
+
+        assert_eq!(view_a.schema, ATTENTION_ROUTER_NEXT_SCHEMA);
+        assert!(view_a.advisory, "next is advisory-only, never a gateway");
+        assert_eq!(view_a.total_items, snapshot.items.len());
+        assert_eq!(view_a.returned_items, snapshot.items.len());
+        assert!(view_a.cursor.is_none(), "no budget => no continuation cursor");
+        assert_eq!(view_a.elided_items, 0);
+
+        let mut previous_composite: Option<u64> = None;
+        for (index, entry) in view_a.entries.iter().enumerate() {
+            assert_eq!(
+                entry.rank,
+                u32::try_from(index + 1).expect("rank fits u32"),
+                "ranks must be dense and 1-based"
+            );
+            if let Some(prev) = previous_composite {
+                assert!(
+                    entry.score.composite <= prev,
+                    "composite score must be non-increasing down the ranked list"
+                );
+            }
+            previous_composite = Some(entry.score.composite);
+
+            assert!(
+                !entry.reasons.is_empty(),
+                "every entry must carry a mandatory non-empty reasons[]"
+            );
+            assert!(
+                entry.reasons.iter().all(|reason| !reason.trim().is_empty()),
+                "no reason may be blank"
+            );
+            assert!(
+                !entry.suggested_command.trim().is_empty(),
+                "suggested_command is mandatory and self-teaching"
+            );
+            assert!(
+                entry.estimated_tokens > 0,
+                "token estimate must be positive so budgets make progress"
+            );
+        }
+    }
+
+    #[test]
+    fn attention_router_next_view_order_equals_composite_desc_id_asc() {
+        let snapshot = score(w6_optional_source_observations());
+        let view = build_attention_router_next_view(&snapshot, None);
+
+        // Independently recompute the expected order: composite descending, then
+        // item_id ascending. The emitted ranking must match exactly.
+        let mut expected: Vec<(u64, String)> = snapshot
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    attention_router_next_composite(item).composite,
+                    item.item_id.clone(),
+                )
+            })
+            .collect();
+        expected.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let expected_ids: Vec<String> = expected.into_iter().map(|(_, id)| id).collect();
+        let actual_ids: Vec<String> =
+            view.entries.iter().map(|entry| entry.item_id.clone()).collect();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "ranked order must equal composite-desc / item_id-asc"
+        );
+    }
+
+    #[test]
+    fn attention_router_next_view_budget_elides_with_continuation_cursor() {
+        let snapshot = score(w6_optional_source_observations());
+        let total = snapshot.items.len();
+        assert!(total >= 2, "need >=2 items to exercise budget elision");
+
+        let full = build_attention_router_next_view(&snapshot, None);
+        let first_tokens = full.entries[0].estimated_tokens;
+
+        // A budget that admits exactly the top entry elides the rest and yields a
+        // continuation cursor pointing past the returned item.
+        let view = build_attention_router_next_view(&snapshot, Some(first_tokens));
+        assert_eq!(
+            view.returned_items, 1,
+            "a budget sized to the top entry returns exactly that entry"
+        );
+        assert_eq!(view.elided_items, total - 1);
+        assert!(view.tokens_used <= first_tokens);
+        let cursor = view
+            .cursor
+            .expect("budget elision must yield a continuation cursor");
+        assert_eq!(cursor.after_rank, 1);
+        assert_eq!(cursor.after_item_id, full.entries[0].item_id);
+        assert_eq!(cursor.remaining_items, total - 1);
+
+        // A budget smaller than the top entry still returns it (never empty).
+        let view_min = build_attention_router_next_view(&snapshot, Some(0));
+        assert_eq!(view_min.returned_items, 1, "next is never empty when items exist");
+        assert!(view_min.cursor.is_some());
+
+        // A generous budget returns everything with no cursor and is identical to
+        // the unbudgeted view's entries.
+        let view_all = build_attention_router_next_view(&snapshot, Some(u32::MAX));
+        assert_eq!(view_all.returned_items, total);
+        assert!(view_all.cursor.is_none());
+        assert_eq!(view_all.elided_items, 0);
+        assert_eq!(view_all.entries, full.entries);
+    }
+
+    #[test]
+    fn attention_router_next_composite_packs_severity_dominant() {
+        // Severity dominates age and pane-priority in the composite ordering.
+        let snapshot = score(w6_optional_source_observations());
+        let critical = snapshot
+            .items
+            .iter()
+            .map(attention_router_next_composite)
+            .map(|score| score.composite)
+            .max()
+            .expect("non-empty snapshot");
+        // The most-attention item is the global maximum composite and therefore
+        // ranks first.
+        let view = build_attention_router_next_view(&snapshot, None);
+        assert_eq!(view.entries[0].score.composite, critical);
     }
 }
