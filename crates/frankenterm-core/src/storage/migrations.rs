@@ -1597,6 +1597,24 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         ",
         down_sql: Some("ALTER TABLE output_segments DROP COLUMN redaction_catalog_version;"),
     },
+    Migration {
+        version: 30,
+        description: "Normalize segment_embeddings.embedded_at from epoch seconds \
+                      to epoch milliseconds (ft-ayy9x). The column was written with \
+                      strftime('%s','now') (seconds) while the schema convention is \
+                      epoch ms, a latent 1000x unit trap for future embedding GC. \
+                      Existing rows whose value is clearly seconds (< 1e11, i.e. any \
+                      timestamp before year ~5138 in seconds / ~1973 in ms) are scaled \
+                      to ms; already-ms rows are left untouched. Idempotent: re-running \
+                      is a no-op because converted values are >= 1e11.",
+        up_sql: "UPDATE segment_embeddings \
+                 SET embedded_at = embedded_at * 1000 \
+                 WHERE embedded_at < 100000000000;",
+        // Not cleanly reversible: after the up-migration, genuinely-ms rows and
+        // converted-from-seconds rows are indistinguishable, so a down-migration
+        // would wrongly divide both. Leave as a forward-only normalization.
+        down_sql: None,
+    },
 ];
 
 // =============================================================================
@@ -3167,6 +3185,73 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .collect();
         names.iter().any(|n| n == col)
+    }
+
+    #[test]
+    fn embedded_at_normalization_migration_entry_present_at_version_30() {
+        let m30 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 30)
+            .expect("version 30 migration must be registered");
+        assert!(
+            m30.description.contains("embedded_at") && m30.description.contains("millisecond"),
+            "description must reference the embedded_at ms normalization, got: {:?}",
+            m30.description,
+        );
+        assert!(
+            m30.up_sql.contains("UPDATE segment_embeddings")
+                && m30.up_sql.contains("* 1000")
+                && m30.up_sql.contains("100000000000"),
+            "up_sql must scale sub-1e11 (seconds) embedded_at values by 1000",
+        );
+        assert!(
+            m30.down_sql.is_none(),
+            "v30 is a forward-only normalization (seconds and ms become \
+             indistinguishable after the up-migration)",
+        );
+    }
+
+    /// ft-ayy9x: applying v30 scales epoch-seconds `embedded_at` values to
+    /// epoch ms while leaving already-ms values untouched; re-running is a
+    /// no-op (converted values land above the 1e11 seconds/ms boundary).
+    #[test]
+    fn embedded_at_normalization_migration_seconds_to_ms_is_idempotent() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE segment_embeddings (
+                segment_id INTEGER NOT NULL,
+                embedder_id TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                embedded_at INTEGER NOT NULL,
+                PRIMARY KEY (segment_id, embedder_id)
+            );
+            INSERT INTO segment_embeddings VALUES (1, 'e', 4, X'00', 1700000000);
+            INSERT INTO segment_embeddings VALUES (2, 'e', 4, X'00', 1700000000000);",
+        )
+        .expect("seed segment_embeddings");
+
+        let m30 = MIGRATIONS.iter().find(|m| m.version == 30).expect("v30");
+        conn.execute_batch(m30.up_sql).expect("apply v30");
+
+        let read = |seg: i64| -> i64 {
+            conn.query_row(
+                "SELECT embedded_at FROM segment_embeddings WHERE segment_id = ?1",
+                [seg],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // Seconds row scaled to ms; already-ms row untouched.
+        assert_eq!(read(1), 1_700_000_000_000, "seconds row scaled to ms");
+        assert_eq!(read(2), 1_700_000_000_000, "already-ms row untouched");
+
+        // Idempotent: a second application changes nothing.
+        conn.execute_batch(m30.up_sql).expect("re-apply v30");
+        assert_eq!(read(1), 1_700_000_000_000, "re-run is a no-op for seg 1");
+        assert_eq!(read(2), 1_700_000_000_000, "re-run is a no-op for seg 2");
     }
 
     /// br-ft-4yr9i: applying the version-25 migration to a fresh

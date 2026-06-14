@@ -4790,8 +4790,10 @@ impl StorageHandle {
             pooled_backend(db_path.as_str(), |backend| {
                 execute_typed(
                     backend,
+                    // embedded_at is epoch MILLISECONDS (schema convention); ft-ayy9x.
+                    // strftime('%s','now') is epoch SECONDS, so scale by 1000.
                     "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
-                     VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
+                     VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now') * 1000)",
                     &[
                         ToSqlValue::Integer(segment_id),
                         ToSqlValue::Text(&embedder_id),

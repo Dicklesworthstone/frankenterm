@@ -47,7 +47,9 @@
 ///
 /// Per ft-7h5da.1.5: bumped 28 → 29 to stamp `output_segments` with the
 /// redaction catalog version in effect at capture (corpus-hygiene queries).
-pub const SCHEMA_VERSION: i32 = 29;
+/// Per ft-ayy9x: bumped 29 → 30 to normalize `segment_embeddings.embedded_at`
+/// from epoch seconds to epoch milliseconds (schema-wide ms convention).
+pub const SCHEMA_VERSION: i32 = 30;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with
@@ -147,7 +149,9 @@ CREATE TABLE IF NOT EXISTS segment_embeddings (
     embedder_id TEXT NOT NULL,
     dimension INTEGER NOT NULL,
     vector BLOB NOT NULL,
-    embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    -- epoch MILLISECONDS (schema-wide convention); ft-ayy9x. strftime('%s')
+    -- is epoch seconds, so scale by 1000. Writers also provide ms explicitly.
+    embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
     PRIMARY KEY (segment_id, embedder_id)
 );
 
