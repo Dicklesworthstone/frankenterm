@@ -483,7 +483,8 @@ pub const RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM: u32 = 1_0
 /// Read-only MCP resource URI for the resize-FPS SLO status.
 pub const RENDERER_RESIZE_FPS_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/resize_fps";
 /// Read-only MCP resource URI for the atlas-stability SLO status.
-pub const RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/atlas_stability";
+pub const RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI: &str =
+    "wa://perf/renderer-slo/atlas_stability";
 /// Read-only MCP resource URI for the idle-GPU-power SLO status.
 pub const RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/idle_gpu_power";
 /// Consolidated suite attestation slot (extends the per-SLO render-parity slot).
@@ -503,6 +504,15 @@ pub const RENDERER_ATLAS_STABILITY_STATUS: &str =
     "evict_recover_harness_retained_jsonl_pending_suite_attestation";
 /// Current non-claiming status for the idle-GPU-power SLO substrate.
 pub const RENDERER_IDLE_GPU_POWER_STATUS: &str = "power_sampler_pending_target_run";
+/// Real resize-FPS harness path retained in the SLO attestation ledger.
+pub const RENDERER_RESIZE_FPS_SOURCE_BENCH: &str =
+    "crates/frankenterm-core/benches/resize_storm.rs";
+/// Real atlas-stability harness path retained in the SLO attestation ledger.
+pub const RENDERER_ATLAS_STABILITY_SOURCE_BENCH: &str =
+    "crates/frankenterm-core/benches/atlas_stability.rs";
+/// Real idle-GPU proxy harness path retained in the SLO attestation ledger.
+pub const RENDERER_IDLE_GPU_POWER_SOURCE_BENCH: &str =
+    "crates/frankenterm-core/benches/idle_gpu.rs";
 
 /// `ft doctor --json .renderer_slos` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,7 +682,7 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
             storm_pane_range: RENDERER_RESIZE_FPS_STORM_PANE_RANGE.to_string(),
             target_min_fps_p50: RENDERER_RESIZE_FPS_TARGET_MIN_P50,
             regression_gate_pct: RENDERER_SLO_REGRESSION_GATE_PCT,
-            source_bench: "crates/frankenterm-gui/benches/renderer_slo/resize_fps.rs".to_string(),
+            source_bench: RENDERER_RESIZE_FPS_SOURCE_BENCH.to_string(),
             retained_evidence: "docs/attestations/tui/resize-fps-rq-*.jsonl".to_string(),
             mcp_resource_uri: RENDERER_RESIZE_FPS_MCP_RESOURCE_URI.to_string(),
             degradation_states: vec![
@@ -690,8 +700,7 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
             invariant: "glyph rendering is byte-identical across a cache-evict / cache-recover cycle (anti-flicker)"
                 .to_string(),
             regression_gate_pct: RENDERER_SLO_REGRESSION_GATE_PCT,
-            source_bench: "crates/frankenterm-gui/benches/renderer_slo/atlas_stability.rs"
-                .to_string(),
+            source_bench: RENDERER_ATLAS_STABILITY_SOURCE_BENCH.to_string(),
             retained_evidence: "docs/attestations/tui/atlas-stability-rq-*.jsonl".to_string(),
             mcp_resource_uri: RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI.to_string(),
             degradation_states: vec![
@@ -709,8 +718,7 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
             macos_sampler: "powermetrics --samplers gpu_power".to_string(),
             linux_samplers: vec!["intel_gpu_top".to_string(), "amdgpu_top".to_string()],
             metric: "median_watts".to_string(),
-            source_bench: "crates/frankenterm-gui/benches/renderer_slo/idle_gpu_power.rs"
-                .to_string(),
+            source_bench: RENDERER_IDLE_GPU_POWER_SOURCE_BENCH.to_string(),
             mcp_resource_uri: RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI.to_string(),
             degradation_states: vec![
                 "power_sampler_unavailable".to_string(),
@@ -1091,6 +1099,7 @@ mod tests {
         assert_eq!(slo.storm_pane_range, RENDERER_RESIZE_FPS_STORM_PANE_RANGE);
         assert_eq!(slo.target_min_fps_p50, RENDERER_RESIZE_FPS_TARGET_MIN_P50);
         assert_eq!(slo.regression_gate_pct, RENDERER_SLO_REGRESSION_GATE_PCT);
+        assert_eq!(slo.source_bench, RENDERER_RESIZE_FPS_SOURCE_BENCH);
         assert_eq!(slo.mcp_resource_uri, RENDERER_RESIZE_FPS_MCP_RESOURCE_URI);
         assert!(
             slo.retained_evidence
@@ -1112,6 +1121,7 @@ mod tests {
             slo.mcp_resource_uri,
             RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI
         );
+        assert_eq!(slo.source_bench, RENDERER_ATLAS_STABILITY_SOURCE_BENCH);
         assert!(slo.invariant.contains("evict"));
         assert!(
             slo.retained_evidence
@@ -1133,7 +1143,11 @@ mod tests {
         assert!(slo.workload.contains("200 panes"));
         assert!(slo.macos_sampler.contains("powermetrics"));
         assert!(slo.linux_samplers.iter().any(|s| s == "intel_gpu_top"));
-        assert_eq!(slo.mcp_resource_uri, RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI);
+        assert_eq!(slo.source_bench, RENDERER_IDLE_GPU_POWER_SOURCE_BENCH);
+        assert_eq!(
+            slo.mcp_resource_uri,
+            RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI
+        );
     }
 
     #[test]
