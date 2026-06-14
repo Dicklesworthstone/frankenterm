@@ -373,6 +373,7 @@ impl ErrorCode {
             | "robot.wezterm_socket_not_found"
             | "robot.wezterm_command_failed"
             | "robot.wezterm_parse_error"
+            | "robot.wezterm_output_too_large"
             | "robot.pane_not_found"
             | "robot.circuit_open" => ErrorCategory::Wezterm,
             "robot.internal_error"

@@ -987,6 +987,21 @@ const DEFAULT_RETRY_DELAY_MS: u64 = crate::tuning_config::WeztermTuning::DEFAULT
 /// than once per second.
 const LIST_PANES_CLI_CACHE_MS: u64 = 500;
 
+/// Upper bound on the byte size of a parsed-JSON *metadata* command's stdout
+/// (e.g. `wezterm cli list --format json`).
+///
+/// A hostile or buggy mux can emit unbounded stdout on a metadata call;
+/// `serde_json` then builds a parsed tree roughly 2–3× the input size, so an
+/// uncapped parse is a memory-amplification DoS. Refusing oversized output
+/// before `serde_json::from_str` bounds peak parse memory to ~4× this value.
+///
+/// Sized generously: a single `cli list` row is well under 2 KiB, so 8 MiB
+/// accommodates thousands of panes — far beyond any realistic fleet — while
+/// still rejecting pathological multi-hundred-MB output. Bulk-content paths
+/// (`get-text`) are intentionally **not** bounded by this cap; large scrollback
+/// is legitimate (see ft-9nmmh).
+const MAX_CLI_METADATA_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Environment variable to override the wezterm binary path.
 const WEZTERM_CLI_ENV: &str = "FT_WEZTERM_CLI";
 
@@ -1383,6 +1398,7 @@ impl WeztermClient {
         let output = self
             .run_cli_with_retry(&["cli", "list", "--format", "json"])
             .await?;
+        Self::guard_metadata_output_size("cli list", &output)?;
         let panes: Vec<PaneInfo> =
             serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
 
@@ -1421,6 +1437,7 @@ impl WeztermClient {
         let output = self
             .run_cli_with_retry(&["cli", "list", "--format", "json"])
             .await?;
+        Self::guard_metadata_output_size("cli list", &output)?;
         let panes: Vec<PaneInfo> =
             serde_json::from_str(&output).map_err(|e| WeztermError::ParseError(e.to_string()))?;
 
@@ -2608,6 +2625,32 @@ impl WeztermClient {
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Guards a parsed-JSON *metadata* command's stdout against
+    /// parse-amplification DoS before it reaches `serde_json::from_str`.
+    ///
+    /// Returns [`WeztermError::OutputTooLarge`] when `output` exceeds
+    /// [`MAX_CLI_METADATA_OUTPUT_BYTES`]. `command` is the human-readable
+    /// command label surfaced in the error. Bulk-content paths (`get-text`)
+    /// must NOT call this — large scrollback is legitimate (ft-9nmmh).
+    fn guard_metadata_output_size(command: &str, output: &str) -> Result<()> {
+        Self::check_metadata_output_size(command, output.len(), MAX_CLI_METADATA_OUTPUT_BYTES)
+    }
+
+    /// Pure size-vs-cap check underlying [`Self::guard_metadata_output_size`],
+    /// split out so the boundary behavior is unit-testable without allocating
+    /// a multi-megabyte string.
+    fn check_metadata_output_size(command: &str, len: usize, cap: usize) -> Result<()> {
+        if len > cap {
+            return Err(WeztermError::OutputTooLarge {
+                command: command.to_string(),
+                len,
+                cap,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Categorize I/O errors into specific WeztermError variants
@@ -5503,6 +5546,50 @@ mod tests {
         let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let wez_err = WeztermClient::categorize_io_error(&e);
         assert!(matches!(wez_err, WeztermError::CommandFailed(_)));
+    }
+
+    #[test]
+    fn metadata_output_size_within_cap_ok() {
+        // At-or-below the cap must pass (boundary is inclusive).
+        assert!(WeztermClient::check_metadata_output_size("cli list", 0, 10).is_ok());
+        assert!(WeztermClient::check_metadata_output_size("cli list", 9, 10).is_ok());
+        assert!(WeztermClient::check_metadata_output_size("cli list", 10, 10).is_ok());
+    }
+
+    #[test]
+    fn metadata_output_size_over_cap_rejected_with_typed_error() {
+        let err = WeztermClient::check_metadata_output_size("cli list", 11, 10)
+            .expect_err("output one byte over the cap must be rejected");
+        match err {
+            crate::Error::Wezterm(WeztermError::OutputTooLarge { command, len, cap }) => {
+                assert_eq!(command, "cli list");
+                assert_eq!(len, 11);
+                assert_eq!(cap, 10);
+            }
+            other => panic!("expected WeztermError::OutputTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guard_metadata_output_size_uses_real_cap() {
+        // A realistic `cli list` payload is far below the cap and must pass.
+        let small = r#"[{"pane_id":0,"title":"t"}]"#;
+        assert!(WeztermClient::guard_metadata_output_size("cli list", small).is_ok());
+        // The cap is generous but finite, so an empty string is trivially fine
+        // and the constant itself is a sane positive bound.
+        assert!(WeztermClient::guard_metadata_output_size("cli list", "").is_ok());
+        assert!(MAX_CLI_METADATA_OUTPUT_BYTES >= 1024 * 1024);
+    }
+
+    #[test]
+    fn output_too_large_is_not_retryable() {
+        // The output won't shrink on retry, so this must be a permanent error.
+        let err = crate::Error::Wezterm(WeztermError::OutputTooLarge {
+            command: "cli list".to_string(),
+            len: 1,
+            cap: 0,
+        });
+        assert!(!crate::retry::is_retryable(&err));
     }
 
     #[test]

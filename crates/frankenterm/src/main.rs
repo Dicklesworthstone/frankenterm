@@ -22239,6 +22239,13 @@ fn map_wezterm_error_to_robot(error: &frankenterm_core::Error) -> (&'static str,
                         .to_string(),
                 ),
             ),
+            WeztermError::OutputTooLarge { .. } => (
+                "robot.wezterm_output_too_large",
+                Some(
+                    "Backend returned an oversized metadata response; the parse was refused to protect memory."
+                        .to_string(),
+                ),
+            ),
             WeztermError::Timeout(_) => (
                 ROBOT_ERR_TIMEOUT,
                 Some("WezTerm command timed out. The terminal may be unresponsive.".to_string()),

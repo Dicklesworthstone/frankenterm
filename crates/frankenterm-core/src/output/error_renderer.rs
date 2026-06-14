@@ -41,6 +41,7 @@ impl ErrorRenderer {
                 WeztermError::SocketNotFound(_) => "FT-1003",
                 WeztermError::CommandFailed(_) => "FT-1020",
                 WeztermError::ParseError(_) => "FT-1021",
+                WeztermError::OutputTooLarge { .. } => "FT-1023",
                 WeztermError::Timeout(_) => "FT-1022",
                 WeztermError::CircuitOpen { .. } => "FT-1030",
             },

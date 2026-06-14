@@ -558,6 +558,7 @@ pub fn is_retryable(error: &Error) -> bool {
             WeztermError::PaneNotFound(_) => false,    // Won't magically appear
             WeztermError::SocketNotFound(_) => true,   // Might be initializing
             WeztermError::ParseError(_) => false,      // Structural issue
+            WeztermError::OutputTooLarge { .. } => false, // Output won't shrink on retry
         },
         // Storage errors - only generic database errors are retryable (lock conflicts)
         Error::Storage(e) => match e {

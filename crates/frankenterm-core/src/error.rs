@@ -410,6 +410,20 @@ pub enum WeztermError {
     #[error("Failed to parse WezTerm output: {0}")]
     ParseError(String),
 
+    /// A parsed-JSON metadata command (e.g. `cli list`) returned more output
+    /// than the parse cap allows. Refused before deserialization to bound
+    /// peak parse memory against a hostile/buggy mux (ft-9nmmh). Bulk-content
+    /// paths such as `get-text` are deliberately not bounded by this.
+    #[error("WezTerm `{command}` output too large: {len} bytes exceeds {cap}-byte cap")]
+    OutputTooLarge {
+        /// Human-readable command label (e.g. `"cli list"`).
+        command: String,
+        /// Observed output size in bytes.
+        len: usize,
+        /// Cap that was exceeded, in bytes.
+        cap: usize,
+    },
+
     /// Timeout waiting for command
     #[error("Command timed out after {0} seconds")]
     Timeout(u64),
@@ -468,6 +482,14 @@ impl WeztermError {
                     .command("Check version", "wezterm --version")
                     .alternative("Upgrade WezTerm if the output format changed.")
             }
+            Self::OutputTooLarge { .. } => Remediation::new(
+                "Backend bridge returned an oversized metadata response; the parse was refused to bound memory.",
+            )
+            .command("Check panes", "wezterm cli list --format json")
+            .command("Diagnostics", "ft doctor")
+            .alternative(
+                "Reduce the number of panes/windows, or verify the active backend bridge (current: WezTerm) is not emitting corrupt output.",
+            ),
             Self::Timeout(timeout) => Remediation::new(format!(
                 "Backend bridge CLI timed out after {timeout} seconds. Try again when the system is idle."
             ))
@@ -507,6 +529,7 @@ impl WeztermError {
             | Self::NotRunning
             | Self::SocketNotFound(_)
             | Self::ParseError(_)
+            | Self::OutputTooLarge { .. }
             | Self::PaneNotFound(_) => NetworkErrorKind::Permanent,
             Self::CircuitOpen { .. } => NetworkErrorKind::Degraded,
         }

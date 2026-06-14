@@ -305,6 +305,27 @@ pub static FT_1022: ErrorCodeDef = ErrorCodeDef {
     doc_link: None,
 };
 
+/// WA-1023: WezTerm metadata output too large
+pub static FT_1023: ErrorCodeDef = ErrorCodeDef {
+    code: "FT-1023",
+    category: ErrorCategory::Wezterm,
+    title: "WezTerm metadata output too large",
+    description: "A parsed-JSON metadata command (e.g. `cli list`) returned more output than \
+                  the parse cap allows. The parse was refused before deserialization to bound \
+                  peak memory against a hostile or buggy mux emitting unbounded output.",
+    causes: &[
+        "An extreme number of panes/windows in a single listing",
+        "The backend bridge emitted corrupt or runaway output",
+        "A compromised or buggy mux returning oversized metadata",
+    ],
+    recovery_steps: &[
+        RecoveryStep::with_command("Check panes", "wezterm cli list --format json"),
+        RecoveryStep::with_command("Run diagnostics", "ft doctor"),
+        RecoveryStep::text("Reduce the number of panes/windows, or restart the backend bridge"),
+    ],
+    doc_link: None,
+};
+
 /// WA-1030: JSON parse error from WezTerm
 pub static FT_1030: ErrorCodeDef = ErrorCodeDef {
     code: "FT-1030",
@@ -1040,6 +1061,7 @@ pub static ERROR_CATALOG: LazyLock<HashMap<&'static str, &'static ErrorCodeDef>>
         m.insert("FT-1020", &FT_1020);
         m.insert("FT-1021", &FT_1021);
         m.insert("FT-1022", &FT_1022);
+        m.insert("FT-1023", &FT_1023);
         m.insert("FT-1030", &FT_1030);
         // Storage errors
         m.insert("FT-2001", &FT_2001);
