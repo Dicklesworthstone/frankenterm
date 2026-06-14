@@ -52,7 +52,7 @@
 //! Remove the atomic gate when ftui's `TerminalWriter` fully owns output
 //! routing and provides an equivalent mechanism (FTUI-09.3).
 
-use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
 /// Output gate states — stored as a `u8` in an atomic for lock-free access.
 ///
@@ -753,8 +753,8 @@ pub(crate) mod tests {
 
     #[test]
     fn gate_concurrent_reads_during_transitions() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AOrdering};
+        use std::sync::Arc;
 
         let _lock = lock_gate();
         set_phase(GatePhase::Inactive);
@@ -998,9 +998,9 @@ pub(crate) mod tests {
     #[test]
     fn tui_aware_writer_is_copy() {
         let w1 = TuiAwareWriter;
+        // Both produce writers with same behavior.
         let w2 = w1; // Copy
         let w3 = w1; // still usable
-        // Both produce writers with same behavior
         let _lock = lock_gate();
         set_phase(GatePhase::Inactive);
         assert!(matches!(w2.make(), TuiAwareWriterInner::Stderr(_)));

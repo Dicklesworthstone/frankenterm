@@ -702,9 +702,7 @@ mod tests {
 
         assert_eq!(
             session.history,
-            vec![
-                "enter", "draw", "draw", "suspend", "resume", "draw", "leave"
-            ]
+            vec!["enter", "draw", "draw", "suspend", "resume", "draw", "leave"]
         );
         assert_eq!(session.draw_count, 3);
     }
