@@ -405,6 +405,26 @@ mod tests {
     }
 
     #[test]
+    fn serializes_to_golden_fixture() -> Result<(), serde_json::Error> {
+        let p = sample("sha256:tree-aaaa", 1_704_000_000_000);
+        let json = serde_json::to_string(&p)?;
+
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"schema_version":1,"intent_id":"proof:4be038ac8e943af059823fb25c8d690c","#,
+                r#""command":"RCH_REQUIRE_REMOTE=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/x cargo test -p frankenterm-core --lib steering","#,
+                r#""scope":{"type":"package","package":"frankenterm-core"},"kind":"test","#,
+                r#""source_hash":"sha256:tree-aaaa","#,
+                r#""expected_artifact_path":"target/test-logs/steering/result.jsonl","#,
+                r#""required_remote":true,"bead_id":"ft-7h5da.6.1","attestation_slot":null,"#,
+                r#""redaction_policy":"standard","created_at_ms":1704000000000}"#
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn scope_variants_round_trip() {
         let ws = ProofIntent::new(
             "cargo test --workspace",
