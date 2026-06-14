@@ -165,6 +165,71 @@ pub enum AttentionRouterSourceFactKind {
     Manual,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionRouterMuteScope {
+    Workspace,
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionRouterNotificationMute {
+    pub identity_key: String,
+    pub scope: AttentionRouterMuteScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AttentionRouterNotificationMute {
+    #[must_use]
+    pub fn workspace(identity_key: impl Into<String>, workspace: impl Into<String>) -> Self {
+        Self {
+            identity_key: bounded_string(identity_key, "notification.identity.unknown"),
+            scope: AttentionRouterMuteScope::Workspace,
+            workspace: Some(bounded_string(workspace, ".")),
+            reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn workspace_current(identity_key: impl Into<String>) -> Self {
+        Self {
+            identity_key: bounded_string(identity_key, "notification.identity.unknown"),
+            scope: AttentionRouterMuteScope::Workspace,
+            workspace: None,
+            reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn global(identity_key: impl Into<String>) -> Self {
+        Self {
+            identity_key: bounded_string(identity_key, "notification.identity.unknown"),
+            scope: AttentionRouterMuteScope::Global,
+            workspace: None,
+            reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(bounded_string(reason, "notification mute"));
+        self
+    }
+
+    fn applies_to_workspace(&self, workspace: &str) -> bool {
+        match self.scope {
+            AttentionRouterMuteScope::Global => true,
+            AttentionRouterMuteScope::Workspace => match self.workspace.as_deref() {
+                Some(mute_workspace) => mute_workspace == workspace,
+                None => true,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionRouterSourceFact {
     pub fact: AttentionRouterSourceFactKind,
@@ -174,6 +239,8 @@ pub struct AttentionRouterSourceFact {
     pub agent_names: Vec<String>,
     pub affected_paths: Vec<String>,
     pub reason_codes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_identity_key: Option<String>,
 }
 
 impl AttentionRouterSourceFact {
@@ -187,6 +254,7 @@ impl AttentionRouterSourceFact {
             agent_names: Vec::new(),
             affected_paths: Vec::new(),
             reason_codes: Vec::new(),
+            notification_identity_key: None,
         }
     }
 
@@ -217,6 +285,15 @@ impl AttentionRouterSourceFact {
     #[must_use]
     pub fn with_reason_code(mut self, reason_code: impl Into<String>) -> Self {
         push_unique(&mut self.reason_codes, reason_code);
+        self
+    }
+
+    #[must_use]
+    pub fn with_notification_identity_key(mut self, identity_key: impl Into<String>) -> Self {
+        let identity_key = bounded_string(identity_key, "");
+        if !identity_key.is_empty() {
+            self.notification_identity_key = Some(identity_key);
+        }
         self
     }
 }
@@ -301,6 +378,8 @@ impl AttentionRouterSourceObservation {
 pub struct AttentionRouterSourceAdapterInput {
     pub generated_at_ms: u64,
     pub workspace: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notification_mutes: Vec<AttentionRouterNotificationMute>,
     pub observations: Vec<AttentionRouterSourceObservation>,
 }
 
@@ -310,6 +389,7 @@ impl AttentionRouterSourceAdapterInput {
         Self {
             generated_at_ms,
             workspace: bounded_string(workspace, "."),
+            notification_mutes: Vec::new(),
             observations: Vec::new(),
         }
     }
@@ -317,6 +397,12 @@ impl AttentionRouterSourceAdapterInput {
     #[must_use]
     pub fn with_observation(mut self, observation: AttentionRouterSourceObservation) -> Self {
         self.observations.push(observation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_notification_mute(mut self, mute: AttentionRouterNotificationMute) -> Self {
+        self.notification_mutes.push(mute);
         self
     }
 }
@@ -352,6 +438,8 @@ pub struct AttentionRouterSourceBundle {
     pub contract_id: String,
     pub generated_at_ms: u64,
     pub workspace: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notification_mutes: Vec<AttentionRouterNotificationMute>,
     pub sources: Vec<AttentionRouterSourceSnapshot>,
     pub source_health: Vec<AttentionRouterSourceHealthRecord>,
     pub warnings: Vec<String>,
@@ -824,17 +912,53 @@ pub struct AttentionRouterScoringEngine;
 impl AttentionRouterScoringEngine {
     #[must_use]
     pub fn score(bundle: &AttentionRouterSourceBundle) -> AttentionRouterSnapshot {
-        let mut items = Vec::new();
+        let mut keyed_items: Vec<(String, AttentionRouterItem)> = Vec::new();
+        let mut deduplicated_observations = 0_u64;
+        let mut muted_observations = 0_u64;
         for source in &bundle.sources {
             for fact in &source.facts {
+                if fact_is_muted_for_workspace(fact, &bundle.notification_mutes, &bundle.workspace)
+                {
+                    muted_observations = muted_observations.saturating_add(1);
+                    continue;
+                }
                 if let Some(item) = item_from_fact(source, fact) {
-                    items.push(item);
+                    let dedupe_key = attention_item_dedupe_key(&item, fact);
+                    if let Some((_, existing)) = keyed_items
+                        .iter_mut()
+                        .find(|(existing_key, _)| existing_key == &dedupe_key)
+                    {
+                        merge_attention_items(existing, item);
+                        deduplicated_observations = deduplicated_observations.saturating_add(1);
+                    } else {
+                        keyed_items.push((dedupe_key, item));
+                    }
                 }
             }
         }
+        let mut items = keyed_items
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect::<Vec<_>>();
         items.sort_by(item_order);
 
         let mut warnings = bundle.warnings.clone();
+        if deduplicated_observations > 0 {
+            push_unique(
+                &mut warnings,
+                format!(
+                    "notification dedup collapsed {deduplicated_observations} duplicate attention observation(s)"
+                ),
+            );
+        }
+        if muted_observations > 0 {
+            push_unique(
+                &mut warnings,
+                format!(
+                    "notification mutes suppressed {muted_observations} attention observation(s)"
+                ),
+            );
+        }
         for item in &items {
             for reason_code in &item.reason_codes {
                 if reason_code.contains("local_cargo") {
@@ -984,11 +1108,16 @@ fn item_from_fact(
 
     let rule = rule_from_fact(source, fact, &reason_codes)?;
     let subject = AttentionRouterSubject::from_fact(fact);
+    let subject_slug = fact
+        .notification_identity_key
+        .as_deref()
+        .map(stable_ident)
+        .unwrap_or_else(|| item_subject_slug(&subject, source));
     let item_id = format!(
         "attention:{}:{}:{}",
         stable_ident(rule.classification),
         stable_ident(fact.fact),
-        item_subject_slug(&subject, source)
+        subject_slug
     );
     let evidence = AttentionRouterEvidence {
         source_kind: source.source_kind,
@@ -1038,6 +1167,50 @@ fn item_from_fact(
         nudge_plan_receipt,
         forbidden_actions,
     })
+}
+
+fn fact_is_muted_for_workspace(
+    fact: &AttentionRouterSourceFact,
+    notification_mutes: &[AttentionRouterNotificationMute],
+    workspace: &str,
+) -> bool {
+    let Some(identity_key) = fact.notification_identity_key.as_deref() else {
+        return false;
+    };
+    notification_mutes
+        .iter()
+        .any(|mute| mute.identity_key == identity_key && mute.applies_to_workspace(workspace))
+}
+
+fn attention_item_dedupe_key(
+    item: &AttentionRouterItem,
+    fact: &AttentionRouterSourceFact,
+) -> String {
+    fact.notification_identity_key
+        .as_deref()
+        .map(|identity_key| format!("notification:{identity_key}"))
+        .unwrap_or_else(|| format!("item:{}", item.item_id))
+}
+
+fn merge_attention_items(existing: &mut AttentionRouterItem, mut incoming: AttentionRouterItem) {
+    if item_order(&incoming, existing) == Ordering::Less {
+        std::mem::swap(existing, &mut incoming);
+    }
+    for evidence in incoming.evidence {
+        if !existing.evidence.contains(&evidence) {
+            existing.evidence.push(evidence);
+        }
+    }
+    for reason_code in incoming.reason_codes {
+        push_unique(&mut existing.reason_codes, reason_code);
+    }
+    push_unique(
+        &mut existing.reason_codes,
+        "attention_router.notification_deduplicated",
+    );
+    for forbidden_action in incoming.forbidden_actions {
+        push_unique(&mut existing.forbidden_actions, forbidden_action);
+    }
 }
 
 fn rule_from_fact(
@@ -2162,6 +2335,7 @@ pub fn build_attention_router_source_bundle(
         contract_id: ATTENTION_ROUTER_CONTRACT_ID.to_string(),
         generated_at_ms: input.generated_at_ms,
         workspace: input.workspace.clone(),
+        notification_mutes: input.notification_mutes.clone(),
         sources,
         source_health,
         warnings,
@@ -2473,7 +2647,9 @@ impl AttentionRouterSeverity {
     }
 }
 
-fn attention_router_classification_label(classification: AttentionRouterClassification) -> &'static str {
+fn attention_router_classification_label(
+    classification: AttentionRouterClassification,
+) -> &'static str {
     match classification {
         AttentionRouterClassification::ReadyNow => "ready-now",
         AttentionRouterClassification::BlockedInfra => "blocked-infra",
@@ -2680,8 +2856,11 @@ fn attention_router_next_entry(
 ) -> AttentionRouterNextEntry {
     let reasons = attention_router_next_reasons(item, &score);
     let suggested_command = attention_router_next_suggested_command(item);
-    let estimated_tokens =
-        attention_router_next_estimated_tokens(&item.redacted_summary, &reasons, &suggested_command);
+    let estimated_tokens = attention_router_next_estimated_tokens(
+        &item.redacted_summary,
+        &reasons,
+        &suggested_command,
+    );
     AttentionRouterNextEntry {
         rank,
         item_id: item.item_id.clone(),
@@ -2830,6 +3009,33 @@ mod tests {
 
     fn score(observations: Vec<AttentionRouterSourceObservation>) -> AttentionRouterSnapshot {
         build_attention_router_snapshot(&complete_input(observations))
+    }
+
+    fn notification_event_fact(
+        identity_key: &str,
+        summary: &str,
+        reason_code: &str,
+    ) -> AttentionRouterSourceFact {
+        AttentionRouterSourceFact::new(AttentionRouterSourceFactKind::EventCritical, summary)
+            .with_notification_identity_key(identity_key)
+            .with_reason_code(reason_code)
+    }
+
+    fn notification_events_observation(
+        facts: Vec<AttentionRouterSourceFact>,
+    ) -> AttentionRouterSourceObservation {
+        let mut observation = AttentionRouterSourceObservation::new(
+            "events.notification_storm",
+            AttentionRouterSourceKind::Events,
+            AttentionRouterSourceHealth::Available,
+            "storage.events.read_unhandled",
+            "notification event metadata was collected",
+        )
+        .live(1_770_000_100_000, 1_000);
+        for fact in facts {
+            observation = observation.with_fact(fact);
+        }
+        observation
     }
 
     fn item_with_nudge(
@@ -3109,6 +3315,161 @@ mod tests {
             pane.facts
                 .iter()
                 .all(|fact| { fact.summary.chars().count() <= ATTENTION_ROUTER_SUMMARY_MAX_CHARS })
+        );
+    }
+
+    #[test]
+    fn attention_router_notification_identity_dedup_collapses_storm() {
+        let snapshot = score(vec![notification_events_observation(vec![
+            notification_event_fact(
+                "evt:rate-limit:cod-8",
+                "critical rate-limit detection remains unhandled",
+                "event.critical",
+            ),
+            notification_event_fact(
+                "evt:rate-limit:cod-8",
+                "repeated critical rate-limit detection remains unhandled",
+                "event.critical.repeat",
+            ),
+            notification_event_fact(
+                "evt:rate-limit:cod-8",
+                "third critical rate-limit detection remains unhandled",
+                "event.critical.repeat_again",
+            ),
+        ])]);
+
+        assert_eq!(
+            snapshot.items.len(),
+            1,
+            "repeated notification identity must collapse to one attention item"
+        );
+        let item = snapshot
+            .items
+            .first()
+            .expect("deduped notification item is present");
+        assert!(
+            item.item_id.contains("evt_rate_limit_cod_8"),
+            "item id should be keyed by the notification identity"
+        );
+        assert_eq!(
+            item.evidence.len(),
+            3,
+            "dedup keeps each collapsed observation as evidence"
+        );
+        assert!(
+            item.reason_codes
+                .contains(&"attention_router.notification_deduplicated".to_string())
+        );
+        assert!(snapshot.warnings.iter().any(|warning| {
+            warning.contains("notification dedup collapsed 2 duplicate attention observation")
+        }));
+
+        let next = build_attention_router_next_view(&snapshot, None);
+        assert_eq!(
+            next.total_items, 1,
+            "ft robot next inherits notification dedup from the scored snapshot"
+        );
+        let entry = next
+            .entries
+            .first()
+            .expect("deduped notification next entry is present");
+        assert_eq!(entry.item_id, item.item_id);
+    }
+
+    #[test]
+    fn attention_router_notification_mutes_suppress_snapshot_and_next_view() {
+        let input = complete_input(vec![notification_events_observation(vec![
+            notification_event_fact(
+                "evt:workspace-noisy",
+                "workspace-scoped noisy event remains unhandled",
+                "event.critical.workspace",
+            ),
+            notification_event_fact(
+                "evt:global-noisy",
+                "global noisy event remains unhandled",
+                "event.critical.global",
+            ),
+            notification_event_fact(
+                "evt:still-visible",
+                "unmuted event remains unhandled",
+                "event.critical.visible",
+            ),
+        ])])
+        .with_notification_mute(
+            AttentionRouterNotificationMute::workspace("evt:workspace-noisy", "/repo")
+                .with_reason("workspace storm suppression"),
+        )
+        .with_notification_mute(
+            AttentionRouterNotificationMute::global("evt:global-noisy")
+                .with_reason("global storm suppression"),
+        );
+
+        let snapshot = build_attention_router_snapshot(&input);
+        assert_eq!(
+            snapshot.items.len(),
+            1,
+            "workspace and global notification mutes suppress matching attention items"
+        );
+        let item = snapshot
+            .items
+            .first()
+            .expect("unmuted notification item remains visible");
+        assert!(
+            item.item_id.contains("evt_still_visible"),
+            "only the unmuted notification identity should remain visible"
+        );
+        assert!(snapshot.warnings.iter().any(|warning| {
+            warning.contains("notification mutes suppressed 2 attention observation")
+        }));
+
+        let next = build_attention_router_next_view(&snapshot, None);
+        assert_eq!(
+            next.total_items, 1,
+            "next view must not resurrect muted attention items"
+        );
+        let entry = next
+            .entries
+            .first()
+            .expect("unmuted notification next entry remains visible");
+        assert_eq!(entry.item_id, item.item_id);
+    }
+
+    #[test]
+    fn attention_router_notification_workspace_mute_scope_is_local() {
+        let input = complete_input(vec![notification_events_observation(vec![
+            notification_event_fact(
+                "evt:workspace-noisy",
+                "workspace-scoped event remains unhandled",
+                "event.critical.workspace",
+            ),
+            notification_event_fact(
+                "evt:global-noisy",
+                "globally muted event remains unhandled",
+                "event.critical.global",
+            ),
+        ])])
+        .with_notification_mute(
+            AttentionRouterNotificationMute::workspace("evt:workspace-noisy", "/other-repo")
+                .with_reason("different workspace should not suppress"),
+        )
+        .with_notification_mute(
+            AttentionRouterNotificationMute::global("evt:global-noisy")
+                .with_reason("global mute applies across workspaces"),
+        );
+
+        let snapshot = build_attention_router_snapshot(&input);
+        assert_eq!(
+            snapshot.items.len(),
+            1,
+            "non-matching workspace mute is ignored while global mute still applies"
+        );
+        let item = snapshot
+            .items
+            .first()
+            .expect("workspace-visible notification item remains visible");
+        assert!(
+            item.item_id.contains("evt_workspace_noisy"),
+            "workspace-scoped mute for another workspace must not hide this item"
         );
     }
 
@@ -4360,7 +4721,10 @@ mod tests {
         assert!(view_a.advisory, "next is advisory-only, never a gateway");
         assert_eq!(view_a.total_items, snapshot.items.len());
         assert_eq!(view_a.returned_items, snapshot.items.len());
-        assert!(view_a.cursor.is_none(), "no budget => no continuation cursor");
+        assert!(
+            view_a.cursor.is_none(),
+            "no budget => no continuation cursor"
+        );
         assert_eq!(view_a.elided_items, 0);
 
         let mut previous_composite: Option<u64> = None;
@@ -4416,8 +4780,11 @@ mod tests {
             .collect();
         expected.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
         let expected_ids: Vec<String> = expected.into_iter().map(|(_, id)| id).collect();
-        let actual_ids: Vec<String> =
-            view.entries.iter().map(|entry| entry.item_id.clone()).collect();
+        let actual_ids: Vec<String> = view
+            .entries
+            .iter()
+            .map(|entry| entry.item_id.clone())
+            .collect();
         assert_eq!(
             actual_ids, expected_ids,
             "ranked order must equal composite-desc / item_id-asc"
@@ -4451,7 +4818,10 @@ mod tests {
 
         // A budget smaller than the top entry still returns it (never empty).
         let view_min = build_attention_router_next_view(&snapshot, Some(0));
-        assert_eq!(view_min.returned_items, 1, "next is never empty when items exist");
+        assert_eq!(
+            view_min.returned_items, 1,
+            "next is never empty when items exist"
+        );
         assert!(view_min.cursor.is_some());
 
         // A generous budget returns everything with no cursor and is identical to
