@@ -2523,7 +2523,10 @@ mod tests {
     #[test]
     fn rule_glob_matches_canonical_semantics() {
         // Exact match when no wildcard.
-        assert!(rule_glob_matches("codex.usage.reached", "codex.usage.reached"));
+        assert!(rule_glob_matches(
+            "codex.usage.reached",
+            "codex.usage.reached"
+        ));
         assert!(!rule_glob_matches("codex.usage.reached", "codex.usage"));
         // Prefix, suffix, floating, and bare star.
         assert!(rule_glob_matches("codex.*", "codex.usage.reached"));

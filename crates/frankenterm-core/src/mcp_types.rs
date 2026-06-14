@@ -1310,9 +1310,7 @@ mod tests {
         let envelope = McpEnvelope::<()>::error(
             "FT-MCP-0001",
             format!("Invalid params: invalid type: string \"{redaction_probe}\""),
-            Some(format!(
-                "Remove {redaction_probe} from the malformed field"
-            )),
+            Some(format!("Remove {redaction_probe} from the malformed field")),
             0,
         );
 
