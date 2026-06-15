@@ -1767,9 +1767,21 @@ async fn stream_subscribe_events<W>(
 where
     W: socket_transport::AsyncWrite + Unpin,
 {
-    use crate::events::RecvError;
+    use crate::event_stream::{EventStreamFilter, FilteredEventStream, StreamCursor, StreamItem};
 
-    let mut subscriber = ctx.event_bus.subscribe();
+    // ft-ubuw2: drive the live subscription through the (now gap-aware)
+    // FilteredEventStream so that abstraction is the shared recv + cursor +
+    // gap engine rather than dead code. An accept-all filter is used because
+    // per-request pane/severity/rule_glob filtering and NDJSON record shaping
+    // stay in subscribe_event_record below; FilteredEventStream surfaces a
+    // bounded-broadcast overflow as an explicit StreamItem::Gap (never a silent
+    // drop), which we render with the same watch_lag_gap_record as before.
+    let mut stream = FilteredEventStream::new(
+        &ctx.event_bus,
+        EventStreamFilter::default(),
+        StreamCursor::from_beginning(),
+        1,
+    );
     let heartbeat = Duration::from_millis(heartbeat_interval_ms.max(1));
 
     loop {
@@ -1778,7 +1790,7 @@ where
         }
 
         let record = if heartbeat_interval_ms > 0 {
-            match crate::runtime_async::timeout_with_cx(cx, heartbeat, subscriber.recv_cx(cx)).await
+            match crate::runtime_async::timeout_with_cx(cx, heartbeat, stream.next_item_cx(cx)).await
             {
                 // Idle heartbeat tick (or cx-cancel surfaced as a timeout
                 // error). Re-check cancellation before emitting so a cancelled
@@ -1789,7 +1801,7 @@ where
                     }
                     watch_heartbeat_record(now_ms_i64())
                 }
-                Ok(Ok(event)) => match subscribe_event_record(
+                Ok(Some(StreamItem::Event(event))) => match subscribe_event_record(
                     &event,
                     pane,
                     severity.as_deref(),
@@ -1798,16 +1810,17 @@ where
                     Some(record) => record,
                     None => continue,
                 },
-                Ok(Err(RecvError::Cancelled | RecvError::Closed)) => return Ok(()),
                 // Fell behind the bounded broadcast buffer: emit an explicit
                 // gap record (ft-7h5da.4.2, no-silent-gaps) so the follower
                 // re-baselines the missed (but still persisted) events via the
                 // DB cursor — at-least-once, never a silent drop.
-                Ok(Err(RecvError::Lagged { missed_count })) => watch_lag_gap_record(missed_count),
+                Ok(Some(StreamItem::Gap { missed_count })) => watch_lag_gap_record(missed_count),
+                // Channel closed or cx cancelled.
+                Ok(None) => return Ok(()),
             }
         } else {
-            match subscriber.recv_cx(cx).await {
-                Ok(event) => match subscribe_event_record(
+            match stream.next_item_cx(cx).await {
+                Some(StreamItem::Event(event)) => match subscribe_event_record(
                     &event,
                     pane,
                     severity.as_deref(),
@@ -1816,8 +1829,8 @@ where
                     Some(record) => record,
                     None => continue,
                 },
-                Err(RecvError::Cancelled | RecvError::Closed) => return Ok(()),
-                Err(RecvError::Lagged { missed_count }) => watch_lag_gap_record(missed_count),
+                Some(StreamItem::Gap { missed_count }) => watch_lag_gap_record(missed_count),
+                None => return Ok(()),
             }
         };
 

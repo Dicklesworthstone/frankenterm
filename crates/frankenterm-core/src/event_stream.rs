@@ -697,6 +697,25 @@ impl AllOfTracker {
 // FilteredEventStream — Live streaming with caller-managed cursor metadata
 // =============================================================================
 
+/// One item yielded by [`FilteredEventStream::next_item_cx`]: either a matching
+/// live event or an explicit gap marker.
+///
+/// `Gap` is emitted when the bounded broadcast buffer dropped events before this
+/// subscriber drained them. A cursor-resuming consumer MUST re-baseline the
+/// missed (but still persisted) detections via the storage cursor — the stream
+/// never silently drops events. This mirrors the IPC watch-events gap record
+/// (ft-7h5da.4.2) so every follower path upholds the no-silent-gaps doctrine.
+#[derive(Debug, Clone)]
+pub enum StreamItem {
+    /// A live event that matched the filter.
+    Event(Event),
+    /// The subscriber fell behind; `missed_count` events were dropped.
+    Gap {
+        /// Number of events dropped from the broadcast buffer.
+        missed_count: u64,
+    },
+}
+
 /// A filtered live event stream backed by an `EventBus` subscription.
 ///
 /// Cursor state is maintained for callers that want to checkpoint delivered
@@ -817,6 +836,45 @@ impl FilteredEventStream {
                     return None;
                 }
                 Err(crate::events::RecvError::Closed) => {
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Gap-aware sibling of [`next_cx`](Self::next_cx): yields each matching
+    /// event as [`StreamItem::Event`] and surfaces a subscriber overflow as an
+    /// explicit [`StreamItem::Gap`] instead of silently dropping the lost
+    /// events. Returns `None` on channel close or cx cancellation (the two are
+    /// indistinguishable to the caller, matching the close-returns-None
+    /// contract).
+    ///
+    /// This is the gap-aware path production consumers should use; the bare
+    /// [`next`](Self::next) / [`next_cx`](Self::next_cx) helpers remain
+    /// event-only and intentionally skip gap markers.
+    pub async fn next_item_cx(&mut self, cx: &crate::cx::Cx) -> Option<StreamItem> {
+        loop {
+            match self.subscriber.recv_cx(cx).await {
+                Ok(event) => {
+                    if self.filter.matches_event(&event) {
+                        self.delivered.fetch_add(1, Ordering::Relaxed);
+                        if let Event::PatternDetected {
+                            event_id: Some(id), ..
+                        } = &event
+                        {
+                            self.cursor.advance(*id);
+                        }
+                        return Some(StreamItem::Event(event));
+                    }
+                    self.filtered_out.fetch_add(1, Ordering::Relaxed);
+                }
+                // No-silent-gaps: surface the overflow so a cursor-resuming
+                // follower re-baselines the missed persisted detections via the
+                // storage cursor instead of skipping them unnoticed.
+                Err(crate::events::RecvError::Lagged { missed_count }) => {
+                    return Some(StreamItem::Gap { missed_count });
+                }
+                Err(crate::events::RecvError::Cancelled | crate::events::RecvError::Closed) => {
                     return None;
                 }
             }
@@ -1691,6 +1749,48 @@ mod tests {
         assert_eq!(telem.delivered, 0);
         assert_eq!(telem.filtered_out, 0);
         assert_eq!(telem.cursor_position, 0);
+    }
+
+    #[test]
+    fn next_item_cx_surfaces_lagged_as_explicit_gap() {
+        run_async_test(async {
+            // Capacity-1 bus: publishing several events without draining forces
+            // the subscriber to fall behind so recv reports a Lagged overflow.
+            let bus = EventBus::new(1);
+            let mut stream = FilteredEventStream::new(
+                &bus,
+                EventStreamFilter::default(),
+                StreamCursor::from_beginning(),
+                50,
+            );
+            for i in 0..4_u64 {
+                let _ = bus.publish(Event::PaneDiscovered {
+                    pane_id: i,
+                    domain: "local".to_string(),
+                    title: format!("pane-{i}"),
+                });
+            }
+
+            let cx = crate::cx::for_testing();
+            // The overflow MUST surface as an explicit Gap (ft-ubuw2), never a
+            // silent drop. Drain a bounded number of items to find it.
+            let mut saw_gap = false;
+            for _ in 0..4 {
+                match stream.next_item_cx(&cx).await {
+                    Some(StreamItem::Gap { missed_count }) => {
+                        assert!(missed_count >= 1, "gap must report the missed count");
+                        saw_gap = true;
+                        break;
+                    }
+                    Some(StreamItem::Event(_)) => {}
+                    None => break,
+                }
+            }
+            assert!(
+                saw_gap,
+                "next_item_cx must surface a Gap marker on subscriber overflow"
+            );
+        });
     }
 
     #[test]
