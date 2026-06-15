@@ -15374,6 +15374,87 @@ fn policy_approval_command(decision: &frankenterm_core::policy::PolicyDecision) 
     }
 }
 
+/// ft-56m1h: policy gate for robot `events` mutations (annotate/triage/label).
+///
+/// The MCP siblings `wa.events_annotate`/`triage`/`label` authorize every mutation
+/// via the policy engine and fail closed on Deny/RequireApproval
+/// (`mcp_authorize_mcp_mutation`). The robot CLI handler historically mutated
+/// storage with NO authorize call and then recorded an `AuditActionRecord` whose
+/// `policy_decision` was hardcoded to `"allow"` — an audit row asserting a gate
+/// decision no engine ever computed. This restores robot↔MCP parity: it builds the
+/// same `ExecCommand` policy input the MCP gate uses (only the actor/surface differ)
+/// and authorizes. On Deny/RequireApproval it persists a best-effort
+/// `policy_denied_audit` forensic row (mirroring the MCP siblings'
+/// `persist_mcp_policy_denial`) and returns the robot error envelope so the caller
+/// fails closed BEFORE touching storage. On Allow it returns the real decision so
+/// the caller stamps the audit with the engine's actual verdict + rule id instead
+/// of a literal `"allow"`.
+async fn authorize_robot_event_mutation(
+    config: &frankenterm_core::config::Config,
+    storage: &frankenterm_core::storage::StorageHandle,
+    action_kind: &str,
+    summary: &str,
+) -> Result<frankenterm_core::policy::PolicyDecision, (String, String, Option<String>)> {
+    use frankenterm_core::policy::{
+        ActionKind, ActorKind, PolicyEngine, PolicyInput, PolicySurface,
+    };
+    use frankenterm_core::storage::PolicyDeniedAuditRecord;
+
+    let mut engine = PolicyEngine::new(
+        config.safety.rate_limit_per_pane,
+        config.safety.rate_limit_global,
+        false,
+    )
+    .with_tuning(&config.tuning)
+    .with_command_gate_config(config.safety.command_gate.clone())
+    .with_policy_rules(config.safety.rules.clone());
+
+    let redacted = redact_for_output(summary);
+    let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Robot)
+        .with_surface(PolicySurface::Robot)
+        .with_text_summary(&redacted)
+        .with_command_text(&redacted);
+    let decision = engine.authorize(&input);
+
+    if decision.is_denied() || decision.requires_approval() {
+        let (decision_code, reason_code) = if decision.requires_approval() {
+            (
+                PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+            )
+        } else {
+            (
+                PolicyDeniedAuditRecord::DECISION_DENIED,
+                PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+            )
+        };
+        let (code, reason, hint) =
+            robot_policy_error_from_decision(&decision, "Policy denied this event mutation");
+        // Best-effort forensic parity with the MCP siblings: a failed audit write
+        // logs a warn but never unblocks the (already fail-closed) mutation.
+        let record = PolicyDeniedAuditRecord {
+            id: 0,
+            ts_ms: now_epoch_ms(),
+            agent_id: None,
+            tool_name: action_kind.to_string(),
+            intent_hash: None,
+            reason: reason.clone(),
+            reason_code: reason_code.to_string(),
+            rule_id: decision.rule_id().map(str::to_string),
+            decision: decision_code.to_string(),
+        };
+        if let Err(e) = storage.record_policy_denial_audit(record).await {
+            tracing::warn!(
+                action = action_kind,
+                "Failed to persist robot event-mutation policy denial audit: {e}"
+            );
+        }
+        return Err((code, reason, hint));
+    }
+
+    Ok(decision)
+}
+
 // Audit records intentionally carry the full policy decision context without an intermediate bag type.
 #[allow(clippy::too_many_arguments)]
 async fn record_read_search_policy_audit(
@@ -33701,6 +33782,38 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
 
+                                        let input_summary = if clear {
+                                            format!("ft robot events annotate {event_id} --clear")
+                                        } else {
+                                            format!(
+                                                "ft robot events annotate {event_id} --note <redacted>"
+                                            )
+                                        };
+                                        // ft-56m1h: gate BEFORE mutating (robot↔MCP parity);
+                                        // fail closed on Deny/RequireApproval.
+                                        let decision = match authorize_robot_event_mutation(
+                                            &config,
+                                            &storage,
+                                            "event.annotate",
+                                            &input_summary,
+                                        )
+                                        .await
+                                        {
+                                            Ok(decision) => decision,
+                                            Err((code, reason, hint)) => {
+                                                let response = RobotResponse::<
+                                                    RobotEventMutationData,
+                                                >::error_with_code(
+                                                    &code,
+                                                    reason,
+                                                    hint,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
+
                                         if let Err(e) = {
                                             // ft-xbnl0.2.3 tick 271: cx-first event note set.
                                             let note_cx = frankenterm_core::cx::Cx::current()
@@ -33724,13 +33837,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
 
-                                        let input_summary = if clear {
-                                            format!("ft robot events annotate {event_id} --clear")
-                                        } else {
-                                            format!(
-                                                "ft robot events annotate {event_id} --note <redacted>"
-                                            )
-                                        };
                                         let decision_context =
                                             build_event_mutation_decision_context(
                                                 "robot",
@@ -33754,11 +33860,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             pane_id: None,
                                             domain: None,
                                             action_kind: "event.annotate".to_string(),
-                                            policy_decision: "allow".to_string(),
+                                            policy_decision: decision.as_str().to_string(),
                                             decision_reason: Some(
                                                 "Robot updated event note".to_string(),
                                             ),
-                                            rule_id: None,
+                                            rule_id: decision.rule_id().map(str::to_string),
                                             input_summary: Some(input_summary),
                                             verification_summary: None,
                                             decision_context,
@@ -33798,6 +33904,39 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
 
+                                        let input_summary = if clear {
+                                            format!("ft robot events triage {event_id} --clear")
+                                        } else {
+                                            format!(
+                                                "ft robot events triage {event_id} --state {}",
+                                                state.as_deref().unwrap_or_default()
+                                            )
+                                        };
+                                        // ft-56m1h: gate BEFORE mutating (robot↔MCP parity);
+                                        // fail closed on Deny/RequireApproval.
+                                        let decision = match authorize_robot_event_mutation(
+                                            &config,
+                                            &storage,
+                                            "event.triage",
+                                            &input_summary,
+                                        )
+                                        .await
+                                        {
+                                            Ok(decision) => decision,
+                                            Err((code, reason, hint)) => {
+                                                let response = RobotResponse::<
+                                                    RobotEventMutationData,
+                                                >::error_with_code(
+                                                    &code,
+                                                    reason,
+                                                    hint,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
+
                                         let changed = match storage
                                             .set_event_triage_state(
                                                 event_id,
@@ -33821,14 +33960,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             }
                                         };
 
-                                        let input_summary = if clear {
-                                            format!("ft robot events triage {event_id} --clear")
-                                        } else {
-                                            format!(
-                                                "ft robot events triage {event_id} --state {}",
-                                                state.as_deref().unwrap_or_default()
-                                            )
-                                        };
                                         let decision_context =
                                             build_event_mutation_decision_context(
                                                 "robot",
@@ -33856,11 +33987,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             pane_id: None,
                                             domain: None,
                                             action_kind: "event.triage".to_string(),
-                                            policy_decision: "allow".to_string(),
+                                            policy_decision: decision.as_str().to_string(),
                                             decision_reason: Some(
                                                 "Robot updated event triage state".to_string(),
                                             ),
-                                            rule_id: None,
+                                            rule_id: decision.rule_id().map(str::to_string),
                                             input_summary: Some(input_summary),
                                             verification_summary: None,
                                             decision_context,
@@ -33916,6 +34047,34 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
 
                                         let changed = if let Some(label) = add.clone() {
+                                            let input_summary = format!(
+                                                "ft robot events label {event_id} --add {label}"
+                                            );
+                                            // ft-56m1h: gate BEFORE mutating (robot↔MCP parity);
+                                            // fail closed on Deny/RequireApproval.
+                                            let decision = match authorize_robot_event_mutation(
+                                                &config,
+                                                &storage,
+                                                "event.label.add",
+                                                &input_summary,
+                                            )
+                                            .await
+                                            {
+                                                Ok(decision) => decision,
+                                                Err((code, reason, hint)) => {
+                                                    let response = RobotResponse::<
+                                                        RobotEventMutationData,
+                                                    >::error_with_code(
+                                                        &code,
+                                                        reason,
+                                                        hint,
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(&response, format, stats)?;
+                                                    return Ok(());
+                                                }
+                                            };
+
                                             let inserted = match storage
                                                 .add_event_label(
                                                     event_id,
@@ -33939,9 +34098,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                             };
 
-                                            let input_summary = format!(
-                                                "ft robot events label {event_id} --add {label}"
-                                            );
                                             let decision_context =
                                                 build_event_mutation_decision_context(
                                                     "robot",
@@ -33965,11 +34121,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 pane_id: None,
                                                 domain: None,
                                                 action_kind: "event.label.add".to_string(),
-                                                policy_decision: "allow".to_string(),
+                                                policy_decision: decision.as_str().to_string(),
                                                 decision_reason: Some(
                                                     "Robot added event label".to_string(),
                                                 ),
-                                                rule_id: None,
+                                                rule_id: decision.rule_id().map(str::to_string),
                                                 input_summary: Some(input_summary),
                                                 verification_summary: None,
                                                 decision_context,
@@ -33996,6 +34152,34 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                             Some(inserted)
                                         } else if let Some(label) = remove.clone() {
+                                            let input_summary = format!(
+                                                "ft robot events label {event_id} --remove {label}"
+                                            );
+                                            // ft-56m1h: gate BEFORE mutating (robot↔MCP parity);
+                                            // fail closed on Deny/RequireApproval.
+                                            let decision = match authorize_robot_event_mutation(
+                                                &config,
+                                                &storage,
+                                                "event.label.remove",
+                                                &input_summary,
+                                            )
+                                            .await
+                                            {
+                                                Ok(decision) => decision,
+                                                Err((code, reason, hint)) => {
+                                                    let response = RobotResponse::<
+                                                        RobotEventMutationData,
+                                                    >::error_with_code(
+                                                        &code,
+                                                        reason,
+                                                        hint,
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(&response, format, stats)?;
+                                                    return Ok(());
+                                                }
+                                            };
+
                                             let removed = match storage
                                                 .remove_event_label(event_id, label.clone())
                                                 .await
@@ -34015,9 +34199,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 }
                                             };
 
-                                            let input_summary = format!(
-                                                "ft robot events label {event_id} --remove {label}"
-                                            );
                                             let decision_context =
                                                 build_event_mutation_decision_context(
                                                     "robot",
@@ -34041,11 +34222,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 pane_id: None,
                                                 domain: None,
                                                 action_kind: "event.label.remove".to_string(),
-                                                policy_decision: "allow".to_string(),
+                                                policy_decision: decision.as_str().to_string(),
                                                 decision_reason: Some(
                                                     "Robot removed event label".to_string(),
                                                 ),
-                                                rule_id: None,
+                                                rule_id: decision.rule_id().map(str::to_string),
                                                 input_summary: Some(input_summary),
                                                 verification_summary: None,
                                                 decision_context,
