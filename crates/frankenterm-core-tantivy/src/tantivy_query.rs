@@ -1096,10 +1096,9 @@ impl LexicalSearchService for InMemorySearchService {
 /// Production implementation of [`LexicalSearchService`] backed by a live
 /// Tantivy index managed by [`LexicalIndexer`](crate::recorder_lexical_ingest::LexicalIndexer).
 ///
-/// Performs BM25 search using Tantivy's native query parser, then reconstructs
-/// [`IndexDocumentFields`] from stored fields. Domain-specific filters from
-/// [`SearchFilter`] are applied as Tantivy query clauses where possible and as
-/// post-filters for complex predicates.
+/// Performs BM25 search using Tantivy query clauses for both text and
+/// [`SearchFilter`] predicates, then reconstructs [`IndexDocumentFields`] from
+/// stored fields.
 pub struct TantivySearchService {
     index: tantivy::Index,
     handles: crate::recorder_lexical_schema::LexicalFieldHandles,
@@ -1203,9 +1202,50 @@ impl TantivySearchService {
         filters: &[SearchFilter],
     ) -> Vec<(tantivy::query::Occur, Box<dyn tantivy::query::Query>)> {
         use tantivy::query::{BooleanQuery, Occur, RangeQuery, TermQuery};
+        use tantivy::schema::Field;
         use tantivy::schema::{IndexRecordOption, Term};
 
         let mut clauses = Vec::new();
+
+        let text_clause = |field: Field, value: &str| {
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(field, value),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn tantivy::query::Query>,
+            )
+        };
+
+        let i64_range_clause = |field: Field, min: Option<i64>, max: Option<i64>| {
+            let lower = min
+                .map(|v| Term::from_field_i64(field, v))
+                .map(std::ops::Bound::Included)
+                .unwrap_or(std::ops::Bound::Unbounded);
+            let upper = max
+                .map(|v| Term::from_field_i64(field, v))
+                .map(std::ops::Bound::Included)
+                .unwrap_or(std::ops::Bound::Unbounded);
+            (
+                Occur::Must,
+                Box::new(RangeQuery::new(lower, upper)) as Box<dyn tantivy::query::Query>,
+            )
+        };
+
+        let u64_range_clause = |field: Field, min: Option<u64>, max: Option<u64>| {
+            let lower = min
+                .map(|v| Term::from_field_u64(field, v))
+                .map(std::ops::Bound::Included)
+                .unwrap_or(std::ops::Bound::Unbounded);
+            let upper = max
+                .map(|v| Term::from_field_u64(field, v))
+                .map(std::ops::Bound::Included)
+                .unwrap_or(std::ops::Bound::Unbounded);
+            (
+                Occur::Must,
+                Box::new(RangeQuery::new(lower, upper)) as Box<dyn tantivy::query::Query>,
+            )
+        };
 
         for filter in filters {
             match filter {
@@ -1229,12 +1269,13 @@ impl TantivySearchService {
                     }
                 }
                 SearchFilter::SessionId { value } => {
-                    let term = Term::from_field_text(self.handles.session_id, value);
-                    clauses.push((
-                        Occur::Must,
-                        Box::new(TermQuery::new(term, IndexRecordOption::Basic))
-                            as Box<dyn tantivy::query::Query>,
-                    ));
+                    clauses.push(text_clause(self.handles.session_id, value));
+                }
+                SearchFilter::WorkflowId { value } => {
+                    clauses.push(text_clause(self.handles.workflow_id, value));
+                }
+                SearchFilter::CorrelationId { value } => {
+                    clauses.push(text_clause(self.handles.correlation_id, value));
                 }
                 SearchFilter::Source { values } => {
                     let sub: Vec<_> = values
@@ -1273,6 +1314,30 @@ impl TantivySearchService {
                             Box::new(BooleanQuery::new(sub)) as Box<dyn tantivy::query::Query>,
                         ));
                     }
+                }
+                SearchFilter::IngressKind { value } => {
+                    clauses.push(text_clause(self.handles.ingress_kind, value));
+                }
+                SearchFilter::SegmentKind { value } => {
+                    clauses.push(text_clause(self.handles.segment_kind, value));
+                }
+                SearchFilter::ControlMarkerType { value } => {
+                    clauses.push(text_clause(self.handles.control_marker_type, value));
+                }
+                SearchFilter::LifecyclePhase { value } => {
+                    clauses.push(text_clause(self.handles.lifecycle_phase, value));
+                }
+                SearchFilter::IsGap { value } => {
+                    clauses.push((
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_bool(self.handles.is_gap, *value),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn tantivy::query::Query>,
+                    ));
+                }
+                SearchFilter::Redaction { value } => {
+                    clauses.push(text_clause(self.handles.redaction, value));
                 }
                 SearchFilter::Direction { direction } => match direction {
                     EventDirection::Ingress => {
@@ -1317,38 +1382,44 @@ impl TantivySearchService {
                     }
                 },
                 SearchFilter::TimeRange { min_ms, max_ms } => {
-                    let field = self.handles.occurred_at_ms;
-                    let lower = min_ms
-                        .map(|v| Term::from_field_i64(field, v))
-                        .map(std::ops::Bound::Included)
-                        .unwrap_or(std::ops::Bound::Unbounded);
-                    let upper = max_ms
-                        .map(|v| Term::from_field_i64(field, v))
-                        .map(std::ops::Bound::Included)
-                        .unwrap_or(std::ops::Bound::Unbounded);
-                    let rq = RangeQuery::new(lower, upper);
-                    clauses.push((Occur::Must, Box::new(rq) as Box<dyn tantivy::query::Query>));
+                    clauses.push(i64_range_clause(
+                        self.handles.occurred_at_ms,
+                        *min_ms,
+                        *max_ms,
+                    ));
                 }
-                // Remaining filters applied post-query for simplicity
-                _ => {}
+                SearchFilter::RecordedTimeRange { min_ms, max_ms } => {
+                    clauses.push(i64_range_clause(
+                        self.handles.recorded_at_ms,
+                        *min_ms,
+                        *max_ms,
+                    ));
+                }
+                SearchFilter::SequenceRange { min_seq, max_seq } => {
+                    clauses.push(u64_range_clause(self.handles.sequence, *min_seq, *max_seq));
+                }
+                SearchFilter::LogOffsetRange {
+                    min_offset,
+                    max_offset,
+                } => {
+                    clauses.push(u64_range_clause(
+                        self.handles.log_offset,
+                        *min_offset,
+                        *max_offset,
+                    ));
+                }
             }
         }
 
         clauses
     }
-}
 
-impl LexicalSearchService for TantivySearchService {
-    fn search(&self, query: &SearchQuery) -> Result<SearchResults, SearchError> {
+    fn build_final_query(
+        &self,
+        query: &SearchQuery,
+    ) -> Result<Box<dyn tantivy::query::Query>, SearchError> {
         use tantivy::query::{BooleanQuery, Occur};
 
-        let start = std::time::Instant::now();
-
-        query.validate()?;
-
-        let searcher = self.reader.searcher();
-
-        // Build combined query: text + filters
         let text_query =
             self.build_text_query(&query.text, query.text_boost(), query.text_symbols_boost())?;
         let filter_clauses = self.build_filter_query(&query.filters);
@@ -1360,9 +1431,26 @@ impl LexicalSearchService for TantivySearchService {
             clauses.extend(filter_clauses);
             Box::new(BooleanQuery::new(clauses))
         };
+        Ok(final_query)
+    }
+}
 
-        // Fetch more than limit to account for post-filters
-        let fetch_limit = query.pagination.limit.saturating_add(1).saturating_mul(2);
+impl LexicalSearchService for TantivySearchService {
+    fn search(&self, query: &SearchQuery) -> Result<SearchResults, SearchError> {
+        let start = std::time::Instant::now();
+
+        query.validate()?;
+
+        let searcher = self.reader.searcher();
+        let final_query = self.build_final_query(query)?;
+
+        let total_hits = searcher
+            .search(&final_query, &tantivy::collector::Count)
+            .map_err(|e| SearchError::Internal {
+                reason: format!("count failed: {e}"),
+            })? as u64;
+
+        let fetch_limit = query.pagination.limit.saturating_add(1);
         let top_docs = searcher
             .search(
                 &final_query,
@@ -1383,29 +1471,6 @@ impl LexicalSearchService for TantivySearchService {
             let fields = crate::recorder_lexical_schema::document_to_fields(&doc, &self.handles);
             scored.push((*score, fields));
         }
-
-        // Apply remaining post-filters (those not handled as Tantivy queries)
-        let has_post_filters = query.filters.iter().any(|f| {
-            matches!(
-                f,
-                SearchFilter::WorkflowId { .. }
-                    | SearchFilter::CorrelationId { .. }
-                    | SearchFilter::IngressKind { .. }
-                    | SearchFilter::SegmentKind { .. }
-                    | SearchFilter::ControlMarkerType { .. }
-                    | SearchFilter::LifecyclePhase { .. }
-                    | SearchFilter::IsGap { .. }
-                    | SearchFilter::Redaction { .. }
-                    | SearchFilter::RecordedTimeRange { .. }
-                    | SearchFilter::SequenceRange { .. }
-                    | SearchFilter::LogOffsetRange { .. }
-            )
-        });
-        if has_post_filters {
-            scored.retain(|(_, doc)| query.filters.iter().all(|f| f.matches(doc)));
-        }
-
-        let total_hits = scored.len() as u64;
 
         // Apply cursor filter
         if let Some(ref cursor) = query.pagination.after {
@@ -1453,23 +1518,10 @@ impl LexicalSearchService for TantivySearchService {
     }
 
     fn count(&self, query: &SearchQuery) -> Result<u64, SearchError> {
-        use tantivy::query::{BooleanQuery, Occur};
-
         query.validate()?;
 
         let searcher = self.reader.searcher();
-
-        let text_query =
-            self.build_text_query(&query.text, query.text_boost(), query.text_symbols_boost())?;
-        let filter_clauses = self.build_filter_query(&query.filters);
-
-        let final_query: Box<dyn tantivy::query::Query> = if filter_clauses.is_empty() {
-            text_query
-        } else {
-            let mut clauses = vec![(Occur::Must, text_query)];
-            clauses.extend(filter_clauses);
-            Box::new(BooleanQuery::new(clauses))
-        };
+        let final_query = self.build_final_query(query)?;
 
         let count = searcher
             .search(&final_query, &tantivy::collector::Count)
@@ -2868,16 +2920,6 @@ mod tests {
     // =========================================================================
 
     fn tantivy_service() -> (TantivySearchService, tempfile::TempDir) {
-        use crate::recorder_lexical_ingest::{LexicalIndexer, LexicalIndexerConfig};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let config = LexicalIndexerConfig {
-            index_dir: tmp.path().to_path_buf(),
-            writer_memory_bytes: 15_000_000,
-        };
-        let indexer = LexicalIndexer::open(config).unwrap();
-        let mut writer = indexer.create_writer().unwrap();
-
         // Index same docs as test_service()
         let docs = vec![
             make_ingress("i1", 1, 0, "echo hello world"),
@@ -2888,7 +2930,23 @@ mod tests {
             make_egress("e3", 2, 5, "error[E0308]: mismatched types"),
             make_control("c1", 1, 6),
         ];
-        for doc in &docs {
+        tantivy_service_from_docs(&docs)
+    }
+
+    fn tantivy_service_from_docs(
+        docs: &[IndexDocumentFields],
+    ) -> (TantivySearchService, tempfile::TempDir) {
+        use crate::recorder_lexical_ingest::{LexicalIndexer, LexicalIndexerConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = LexicalIndexerConfig {
+            index_dir: tmp.path().to_path_buf(),
+            writer_memory_bytes: 15_000_000,
+        };
+        let indexer = LexicalIndexer::open(config).unwrap();
+        let mut writer = indexer.create_writer().unwrap();
+
+        for doc in docs {
             writer.add_document(doc).unwrap();
         }
         writer.commit().unwrap();
@@ -3042,6 +3100,64 @@ mod tests {
         let q = SearchQuery::simple("hello echo cargo git Compiling error").with_limit(2);
         let results = svc.search(&q).unwrap();
         assert!(results.hits.len() <= 2);
+    }
+
+    #[test]
+    fn tantivy_indexed_filters_apply_before_limit_and_count_ft_3aiu5() {
+        let mut docs = Vec::new();
+        for seq in 0..32 {
+            let mut decoy = make_ingress(
+                &format!("decoy-{seq}"),
+                1,
+                seq,
+                "needle needle needle needle needle",
+            );
+            decoy.correlation_id = Some("decoy-corr".to_string());
+            docs.push(decoy);
+        }
+
+        let mut target = make_egress("target-doc", 9, 64, "needle");
+        target.correlation_id = Some("target-corr".to_string());
+        target.is_gap = true;
+        docs.push(target);
+
+        let (svc, _tmp) = tantivy_service_from_docs(&docs);
+        let cases = [
+            (
+                "correlation_id",
+                SearchFilter::CorrelationId {
+                    value: "target-corr".to_string(),
+                },
+            ),
+            (
+                "sequence",
+                SearchFilter::SequenceRange {
+                    min_seq: Some(64),
+                    max_seq: Some(64),
+                },
+            ),
+            (
+                "log_offset",
+                SearchFilter::LogOffsetRange {
+                    min_offset: Some(64),
+                    max_offset: Some(64),
+                },
+            ),
+            ("is_gap", SearchFilter::IsGap { value: true }),
+        ];
+
+        for (case, filter) in cases {
+            let query = SearchQuery::simple("needle")
+                .with_filter(filter)
+                .with_limit(1);
+            let results = svc.search(&query).unwrap();
+
+            assert_eq!(svc.count(&query).unwrap(), 1, "{case} count mismatch");
+            assert_eq!(results.total_hits, 1, "{case} total_hits mismatch");
+            assert_eq!(results.hits.len(), 1, "{case} hit count mismatch");
+            assert_eq!(results.hits[0].doc.event_id, "target-doc", "{case}");
+            assert!(!results.has_more, "{case} should not report a second page");
+        }
     }
 
     #[test]
