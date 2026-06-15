@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.incident_bundle.evidence_lifecycle_receipt_canonicalization.fixtures.v1",
+  "producing_bead": "ft-cjmla",
+  "related_bead": "ft-womif",
+  "purpose": "Retained golden fixture for the ft-womif EvidenceLifecycleReceipt delimiter-injection canonicalization incident.",
+  "golden_confidence": {
+    "artifact_kind": "structural_json_golden",
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 1,
+    "strategy": "exact_digest_and_structural_assertions"
+  },
+  "receipt_contract": {
+    "contract_id": "ft.evidence_lifecycle.v1",
+    "schema_version": 1,
+    "receipt_id_prefix": "evidence:lifecycle:",
+    "receipt_id_domain": "ft.evidence_lifecycle.receipt_id.v2",
+    "framing": "decimal-byte-length-colon-field-semicolon",
+    "digest": "sha256",
+    "receipt_id_digest_hex_chars": 32
+  },
+  "required_cases": [
+    "delimiter-injection-collision"
+  ],
+  "cases": [
+    {
+      "case_id": "delimiter-injection-collision",
+      "title": "legacy delimiter payload collision is split by v2 length-prefixed framing",
+      "generated_at_ms": 10,
+      "control": {
+        "decisions": [
+          {
+            "evidence_id": "a",
+            "kind": "receipt",
+            "action": "retain",
+            "reason": "within_policy",
+            "effective_expires_at_ms": null
+          },
+          {
+            "evidence_id": "b",
+            "kind": "receipt",
+            "action": "retain",
+            "reason": "within_policy",
+            "effective_expires_at_ms": null
+          }
+        ],
+        "legacy_payload_sha256": "e7c399dd28feb43d1c601d8a829212593d328e2c20e98c25af164067ccdd0e2a",
+        "legacy_payload_hex": "66742e65766964656e63655f6c6966656379636c652e76310a310a31300a617c726563656970747c72657461696e7c77697468696e5f706f6c6963797c0a627c726563656970747c72657461696e7c77697468696e5f706f6c6963797c",
+        "framed_payload_sha256": "0d741e7d45a86f348bba3c40ace7615bcae82671e5080857d28f0aff4a319b1d",
+        "framed_payload_hex": "33353a66742e65766964656e63655f6c6966656379636c652e726563656970745f69642e76323b32343a66742e65766964656e63655f6c6966656379636c652e76313b313a313b323a31303b313a323b313a613b373a726563656970743b363a72657461696e3b31333a77697468696e5f706f6c6963793b343a6e6f6e653b313a623b373a726563656970743b363a72657461696e3b31333a77697468696e5f706f6c6963793b343a6e6f6e653b",
+        "receipt_id": "evidence:lifecycle:0d741e7d45a86f348bba3c40ace7615b"
+      },
+      "attack": {
+        "decisions": [
+          {
+            "evidence_id": "a|receipt|retain|within_policy|\nb",
+            "kind": "receipt",
+            "action": "retain",
+            "reason": "within_policy",
+            "effective_expires_at_ms": null
+          }
+        ],
+        "legacy_payload_sha256": "e7c399dd28feb43d1c601d8a829212593d328e2c20e98c25af164067ccdd0e2a",
+        "legacy_payload_hex": "66742e65766964656e63655f6c6966656379636c652e76310a310a31300a617c726563656970747c72657461696e7c77697468696e5f706f6c6963797c0a627c726563656970747c72657461696e7c77697468696e5f706f6c6963797c",
+        "framed_payload_sha256": "f3115a20700f8bb41802fe0e662e1d96339f350066cdbdc5368756d2884da7ff",
+        "framed_payload_hex": "33353a66742e65766964656e63655f6c6966656379636c652e726563656970745f69642e76323b32343a66742e65766964656e63655f6c6966656379636c652e76313b313a313b323a31303b313a313b33333a617c726563656970747c72657461696e7c77697468696e5f706f6c6963797c0a623b373a726563656970743b363a72657461696e3b31333a77697468696e5f706f6c6963793b343a6e6f6e653b",
+        "receipt_id": "evidence:lifecycle:f3115a20700f8bb41802fe0e662e1d96"
+      },
+      "expected": {
+        "legacy_payloads_collide": true,
+        "framed_payloads_collide": false,
+        "receipt_ids_collide": false,
+        "receipt_id_prefix": "evidence:lifecycle:",
+        "canonical_field_order": [
+          "domain",
+          "contract_id",
+          "schema_version",
+          "generated_at_ms",
+          "decisions_len",
+          "decision.evidence_id",
+          "decision.kind",
+          "decision.action",
+          "decision.reason",
+          "decision.expiry_tag",
+          "decision.expiry_value_when_some"
+        ]
+      }
+    }
+  ]
+}
