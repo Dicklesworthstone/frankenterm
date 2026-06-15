@@ -54463,6 +54463,7 @@ const MISSION_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Internal failure reason from [`read_mission_file_capped`], mapped by each
 /// loader to its specific not-found / read-failed / too-large error envelope.
+#[derive(Debug)]
 enum MissionFileReadFailure {
     NotFound,
     Io(std::io::Error),
@@ -54529,6 +54530,74 @@ fn read_mission_file_capped(path: &Path) -> Result<String, MissionFileReadFailur
             err.utf8_error(),
         ))
     })
+}
+
+/// ft-sdwhp regression coverage for the ft-99ybo hostile-file DoS cap. The fix
+/// (commit 27cd8baa8) shipped without a test; these lock in the contract that
+/// caller-supplied mission/tx files are bounded at [`MISSION_FILE_MAX_BYTES`]
+/// regardless of what `stat` reports, and that the failure taxonomy maps as the
+/// loaders expect (not-found / io / too-large).
+#[cfg(test)]
+mod read_mission_file_capped_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_under_cap_and_roundtrips_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mission.json");
+        let content = "{\"phase\":\"plan\"}";
+        std::fs::write(&path, content).expect("write under-cap file");
+        let got = read_mission_file_capped(&path).expect("under-cap file should be accepted");
+        assert_eq!(got, content);
+    }
+
+    #[test]
+    fn accepts_file_at_exactly_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("at_cap.json");
+        std::fs::write(&path, vec![b'a'; MISSION_FILE_MAX_BYTES as usize])
+            .expect("write at-cap file");
+        let got = read_mission_file_capped(&path).expect("file exactly at cap must be accepted");
+        assert_eq!(got.len() as u64, MISSION_FILE_MAX_BYTES);
+    }
+
+    #[test]
+    fn rejects_file_one_byte_over_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("over_cap.json");
+        std::fs::write(&path, vec![b'a'; (MISSION_FILE_MAX_BYTES + 1) as usize])
+            .expect("write over-cap file");
+        match read_mission_file_capped(&path) {
+            Err(MissionFileReadFailure::TooLarge { observed }) => assert!(
+                observed > MISSION_FILE_MAX_BYTES,
+                "observed {observed} must exceed cap {MISSION_FILE_MAX_BYTES}"
+            ),
+            other => panic!("expected TooLarge for over-cap file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_path_maps_to_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does_not_exist.json");
+        match read_mission_file_capped(&path) {
+            Err(MissionFileReadFailure::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_maps_to_io_invalid_data() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad_utf8.json");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
+        match read_mission_file_capped(&path) {
+            Err(MissionFileReadFailure::Io(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected Io(InvalidData), got {other:?}"),
+        }
+    }
 }
 
 fn mission_now_ms() -> i64 {
