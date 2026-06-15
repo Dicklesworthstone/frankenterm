@@ -11037,6 +11037,18 @@ fn append_segment_group_commit_inner(
     let catalog_version = crate::redact_backfill::current_catalog_version();
     let mut committed_segments = Vec::with_capacity(writes.len());
 
+    // ft-xx5cl: embed each persisted segment under the SAME embedder the query
+    // path uses (`HashEmbedder::default()` -> "fnv1a-hash-128"), so
+    // `segment_embeddings` finally has a production writer and `wa.search`
+    // mode=semantic|hybrid stops silently degrading to lexical over an empty
+    // table. Built once per group (the embedder is config-free FNV hashing); see
+    // `index_segment_embedding_backend`.
+    let semantic_embedder = crate::search::HashEmbedder::default();
+    let semantic_embedder_id = {
+        use crate::search::Embedder;
+        semantic_embedder.info().name
+    };
+
     for write in writes {
         let (content, retained_tail_moved) = redact_segment_for_persistence(
             backend,
@@ -11061,6 +11073,16 @@ fn append_segment_group_commit_inner(
             now,
             catalog_version,
         )?;
+        // ft-xx5cl: best-effort semantic embedding over the REDACTED content,
+        // on this same writer transaction. `segment.id` is read before the move.
+        index_segment_embedding_backend(
+            backend,
+            &semantic_embedder,
+            &semantic_embedder_id,
+            segment.id,
+            &content,
+            now,
+        );
         committed_segments.push(CommittedAppendSegment {
             segment,
             retained_tail_moved,
@@ -11068,6 +11090,89 @@ fn append_segment_group_commit_inner(
     }
 
     Ok(committed_segments)
+}
+
+/// ft-xx5cl: best-effort — compute and persist the semantic embedding for a
+/// freshly-appended segment on the SAME writer transaction. Before this,
+/// `segment_embeddings` had NO production writer, so `wa.search`
+/// mode=semantic|hybrid silently degraded to lexical over an empty table (and
+/// the v32 `embedded_at` migration was moot).
+///
+/// The embedder MUST match the query path (`mcp_tools.rs` / `main.rs` use
+/// `HashEmbedder::default()`, embedder_id `fnv1a-hash-128`); a mismatch in id or
+/// dimension would mean stored and query vectors never match. The embedding is
+/// computed over the already-REDACTED `content` (the persisted form) so we never
+/// embed secrets, consistent with the lexical FTS path.
+///
+/// Failures are logged and swallowed: a semantic-index hiccup must never block
+/// segment durability, and the `segment_embeddings` FK (`ON DELETE CASCADE`)
+/// keeps the table consistent under retention/size eviction. A failed statement
+/// does not abort the surrounding SQLite transaction, so the segment still
+/// commits.
+fn index_segment_embedding_backend(
+    backend: &dyn StorageBackend,
+    embedder: &crate::search::HashEmbedder,
+    embedder_id: &str,
+    segment_id: i64,
+    content: &str,
+    embedded_at_ms: i64,
+) {
+    use crate::search::Embedder;
+
+    if content.is_empty() {
+        return;
+    }
+    let vector = match embedder.embed(content) {
+        Ok(vector) => vector,
+        Err(err) => {
+            tracing::warn!(
+                segment_id,
+                error = %err,
+                "ft-xx5cl: segment embedding skipped (embed failed)"
+            );
+            return;
+        }
+    };
+    let dimension = match i32::try_from(vector.len()) {
+        Ok(dimension) => dimension,
+        Err(_) => {
+            tracing::warn!(
+                segment_id,
+                dim = vector.len(),
+                "ft-xx5cl: segment embedding skipped (dimension exceeds i32)"
+            );
+            return;
+        }
+    };
+    let blob = match encode_f32_embedding_blob(&vector) {
+        Ok(blob) => blob,
+        Err(err) => {
+            tracing::warn!(
+                segment_id,
+                error = %err,
+                "ft-xx5cl: segment embedding skipped (encode failed)"
+            );
+            return;
+        }
+    };
+    if let Err(err) = execute_typed(
+        backend,
+        "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            ToSqlValue::Integer(segment_id),
+            ToSqlValue::Text(embedder_id),
+            ToSqlValue::Integer(i64::from(dimension)),
+            ToSqlValue::Blob(&blob),
+            ToSqlValue::Integer(embedded_at_ms),
+        ],
+    ) {
+        tracing::warn!(
+            segment_id,
+            error = %err,
+            "ft-xx5cl: segment embedding insert failed (best-effort)"
+        );
+    }
 }
 
 fn rollback_append_segment_group_best_effort(backend: &dyn StorageBackend, cause: &str) {

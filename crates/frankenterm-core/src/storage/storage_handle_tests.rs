@@ -175,6 +175,48 @@ fn storage_handle_embedding_roundtrip_and_unembedded_query() {
     });
 }
 
+// ft-xx5cl: appending a segment must auto-write a semantic embedding under the
+// SAME embedder the query path uses (HashEmbedder::default(), info().name
+// "fnv1a-hash-128"), so wa.search mode=semantic|hybrid is no longer hollow over
+// an empty segment_embeddings table.
+#[test]
+fn storage_handle_append_auto_writes_segment_embedding_ft_xx5cl() {
+    run_async_test(async {
+        // Pinned to the production query embedder (mcp_tools.rs / main.rs use
+        // HashEmbedder::default()); a drift here would mean stored and query
+        // vectors never match.
+        const QUERY_EMBEDDER_ID: &str = "fnv1a-hash-128";
+
+        let db_path = temp_db_path();
+        let handle: StorageHandle = StorageHandle::new(&db_path).await.unwrap();
+        handle.upsert_pane(test_pane(1)).await.unwrap();
+
+        let seg = handle
+            .append_segment(1, "error: compilation failed in module foo", None)
+            .await
+            .unwrap();
+
+        // The append produced an embedding row for this segment under the query
+        // embedder — the production writer that was missing before ft-xx5cl.
+        let stored = handle.get_embedding(seg.id, QUERY_EMBEDDER_ID).await.unwrap();
+        assert!(
+            stored.is_some(),
+            "append must auto-write a segment embedding under {QUERY_EMBEDDER_ID}"
+        );
+
+        let stats = handle.embedding_stats().await.unwrap();
+        assert!(
+            stats.iter().any(
+                |s| s.embedder_id == QUERY_EMBEDDER_ID && s.dimension == 128 && s.count == 1
+            ),
+            "embedding_stats must show the auto-written fnv1a-hash-128 embedding: {stats:?}"
+        );
+
+        handle.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    });
+}
+
 #[test]
 fn storage_handle_semantic_search_ranks_and_respects_filters() {
     run_async_test(async {
