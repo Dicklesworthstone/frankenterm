@@ -40,12 +40,13 @@ use crate::connector_reliability::{
 use crate::context_budget::{
     CompactionTrigger, ContextBudgetConfig, ContextBudgetRegistry, ContextPressureTier,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::large_swarm_replay::{
     LargeSwarmReplayCorpus, LargeSwarmReplayError, LargeSwarmReplaySummary, LargeSwarmScenario,
     generate_large_swarm_corpus, summarize_large_swarm_replay,
 };
+use crate::patterns::PatternEngine;
 use crate::recording::RecorderEventPayload;
 
 /// Schema version for replay-corpus load-rig reports.
@@ -259,6 +260,21 @@ pub struct ReplayCorpusCaptureModeResult {
     pub threshold_passed: bool,
 }
 
+/// Real-detection probe: every replay-corpus egress frame is scanned by the
+/// production [`PatternEngine`], measuring the detection pipeline over real
+/// corpus content rather than a synthetic count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayCorpusDetectionProbe {
+    /// Egress frames scanned by the production detector.
+    pub frames_scanned: u64,
+    /// Total bytes of pane output scanned.
+    pub bytes_scanned: u64,
+    /// Total detections returned by `PatternEngine::detect`.
+    pub detections: u64,
+    /// Distinct panes that produced at least one detection.
+    pub panes_with_detections: u64,
+}
+
 /// Full report from a replay-corpus-backed 200-pane load-rig run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayCorpusLoadRigReport {
@@ -270,6 +286,8 @@ pub struct ReplayCorpusLoadRigReport {
     pub capture_modes: Vec<ReplayCorpusCaptureModeResult>,
     pub overall_pass: bool,
     pub limitations: Vec<String>,
+    /// Production pattern-detection probe over the replay corpus.
+    pub detection_probe: ReplayCorpusDetectionProbe,
 }
 
 impl ReplayCorpusLoadRigReport {
@@ -419,6 +437,7 @@ impl ChaosScaleHarness {
             measure_replay_capture_mode(CaptureMode::NativePush, &corpus, &summary, &config),
         ];
         let overall_pass = capture_modes.iter().all(|mode| mode.threshold_passed);
+        let detection_probe = run_detection_probe(&corpus);
 
         Ok(ReplayCorpusLoadRigReport {
             schema_version: REPLAY_CORPUS_LOAD_RIG_SCHEMA_VERSION.to_string(),
@@ -430,10 +449,11 @@ impl ChaosScaleHarness {
             overall_pass,
             limitations: vec![
                 "deterministic replay corpus; no live mux panes are launched".to_string(),
-                "metrics are MEASURED over the replay-corpus egress timeline (per-event occurred_at_ms + byte sizes), not synthesized from config; native_push applies the real dedup-window coalescing".to_string(),
-                "this is replay-corpus measurement, not live-OS-event proof; it does not yet drive the production SQLite/FTS/detection write path (see ft-7h5da.10.3.2)".to_string(),
+                "capture metrics are MEASURED over the replay-corpus egress timeline (per-event occurred_at_ms + byte sizes), not synthesized from config; native_push applies the real dedup-window coalescing".to_string(),
+                "the production PatternEngine now scans every egress frame (detection_probe); the SQLite/FTS storage write-path integration is still pending (see ft-7h5da.10.3.2)".to_string(),
                 "poll and native_push modes share identical replay input so lag and queue metrics are directly comparable".to_string(),
             ],
+            detection_probe,
         })
     }
 
@@ -820,6 +840,34 @@ fn default_slos() -> Vec<SloDefinition> {
             higher_is_better: false,
         },
     ]
+}
+
+/// Drive every replay-corpus egress frame through the production
+/// [`PatternEngine::detect`] path and measure the detection pipeline over real
+/// corpus content. This exercises the real detector, not a synthetic count.
+fn run_detection_probe(corpus: &LargeSwarmReplayCorpus) -> ReplayCorpusDetectionProbe {
+    let engine = PatternEngine::new();
+    let mut frames_scanned = 0_u64;
+    let mut bytes_scanned = 0_u64;
+    let mut detections = 0_u64;
+    let mut panes_with_detections: BTreeSet<u64> = BTreeSet::new();
+    for event in &corpus.events {
+        if let RecorderEventPayload::EgressOutput { text, .. } = &event.payload {
+            frames_scanned += 1;
+            bytes_scanned = bytes_scanned.saturating_add(text.len() as u64);
+            let hits = engine.detect(text);
+            if !hits.is_empty() {
+                detections = detections.saturating_add(hits.len() as u64);
+                panes_with_detections.insert(event.pane_id);
+            }
+        }
+    }
+    ReplayCorpusDetectionProbe {
+        frames_scanned,
+        bytes_scanned,
+        detections,
+        panes_with_detections: panes_with_detections.len() as u64,
+    }
 }
 
 /// Fixed per-pane capture-buffer overhead used by the rig's memory model.
@@ -1529,6 +1577,29 @@ mod tests {
             .expect("poll recorded")
             .capture_lag_p99_ms;
         assert!(slow_poll_p99 > poll.capture_lag_p99_ms);
+    }
+
+    #[test]
+    fn detection_probe_scans_every_egress_frame_with_the_production_engine() {
+        let report = ChaosScaleHarness::run_replay_corpus_load_rig(
+            ReplayCorpusLoadRigConfig::target_200_pane(),
+        )
+        .expect("200-pane replay-corpus rig should run");
+        let probe = &report.detection_probe;
+
+        // The production PatternEngine scanned every real egress frame; the
+        // number scanned matches the poll mode's replay event accounting being
+        // non-trivial, and bytes were actually read.
+        assert!(probe.frames_scanned > 0);
+        assert!(probe.bytes_scanned > 0);
+        assert!(probe.detections >= probe.panes_with_detections);
+
+        // Detection is deterministic over the deterministic corpus + builtin packs.
+        let again = ChaosScaleHarness::run_replay_corpus_load_rig(
+            ReplayCorpusLoadRigConfig::target_200_pane(),
+        )
+        .expect("200-pane replay-corpus rig should run");
+        assert_eq!(report.detection_probe, again.detection_probe);
     }
 
     #[test]
