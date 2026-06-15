@@ -61,7 +61,7 @@ use crate::ingest::{
     CapturedSegment, CapturedSegmentKind, PaneCursor, PaneRegistry, PersistedCapture,
     bounded_segment_for_persistence, persist_captured_segment_with_zone_with_cx,
 };
-use crate::memory_budget::BudgetLevel;
+use crate::memory_budget::{BudgetLevel, MemoryBudgetConfig};
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
 #[cfg(feature = "native-wezterm")]
 use crate::native_events::{NativeEvent, NativeEventListener};
@@ -2007,6 +2007,13 @@ impl ObservationRuntime {
             let backpressure_manager = BackpressureManager::new(BackpressureConfig::default());
             let memory_pressure_monitor =
                 MemoryPressureMonitor::new(MemoryPressureConfig::default());
+            // Per-pane logical memory budget used to derive the fleet
+            // budget-pressure dimension from PaneRegistry arena accounting on
+            // each health tick (ft-6n7hs). The RSS/cgroup MemoryBudgetManager
+            // is not wired into the observation runtime; the scrollback
+            // coordinator is driven from the same per-pane *logical* accounting
+            // sampled here, which is the eviction-relevant signal.
+            let pane_budget_config = MemoryBudgetConfig::default();
 
             // Fleet scrollback coordinator (ft-dwjtm): evaluates fleet memory
             // pressure from queue depths and triggers warm-page eviction when
@@ -2297,7 +2304,7 @@ impl ObservationRuntime {
                 }
 
                 if now.duration_since(last_health_snapshot) >= health_interval {
-                    let (health_panes, leak_risk_inventory) = {
+                    let (health_panes, leak_risk_inventory, worst_pane_budget) = {
                         let reg = registry.read().await;
                         let cursors = cursors.read().await;
                         let mut tracker = pane_activity_tracker.write().await;
@@ -2309,7 +2316,14 @@ impl ObservationRuntime {
                         );
                         let leak_risk_inventory =
                             build_leak_risk_inventory(&reg, &metrics, &heartbeats);
-                        (health_panes, leak_risk_inventory)
+                        let worst_pane_budget = worst_pane_budget_level(
+                            reg.pane_arena_stats_snapshot()
+                                .iter()
+                                .map(|s| u64::try_from(s.stats.tracked_bytes).unwrap_or(u64::MAX)),
+                            pane_budget_config.default_budget_bytes,
+                            pane_budget_config.high_ratio,
+                        );
+                        (health_panes, leak_risk_inventory, worst_pane_budget)
                     };
                     let observed_panes = health_panes.observed_panes;
                     let last_activity_by_pane = health_panes.last_activity_by_pane;
@@ -2405,7 +2419,7 @@ impl ObservationRuntime {
                             write_capacity: write_cap,
                         },
                         memory_pressure_monitor.sample().tier,
-                        BudgetLevel::Normal,
+                        worst_pane_budget,
                         observed_panes,
                     );
                     let observed_pane_ids = {
@@ -4554,6 +4568,61 @@ fn build_leak_risk_inventory(
             telemetry: Some(heartbeats.telemetry().snapshot()),
         },
     }
+}
+
+/// Classify a single pane's tracked logical bytes against its budget,
+/// mirroring [`crate::memory_budget::PaneBudget`] thresholds:
+/// `>= budget_bytes` is `OverBudget`, `>= budget_bytes * high_ratio` is
+/// `Throttled`, otherwise `Normal`. A zero budget is always `Normal`.
+fn classify_pane_budget_level(tracked_bytes: u64, budget_bytes: u64, high_ratio: f64) -> BudgetLevel {
+    if budget_bytes == 0 {
+        return BudgetLevel::Normal;
+    }
+    // Mirror memory_budget::normalize_high_ratio: NaN falls back to the
+    // default soft-limit ratio, otherwise clamp into [0.0, 1.0].
+    let high_ratio = if high_ratio.is_nan() {
+        MemoryBudgetConfig::default().high_ratio
+    } else {
+        high_ratio.clamp(0.0, 1.0)
+    };
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let high_bytes = (budget_bytes as f64 * high_ratio) as u64;
+    if tracked_bytes >= budget_bytes {
+        BudgetLevel::OverBudget
+    } else if tracked_bytes >= high_bytes {
+        BudgetLevel::Throttled
+    } else {
+        BudgetLevel::Normal
+    }
+}
+
+/// Derive the worst per-pane memory budget level from the registry's
+/// logical arena accounting (ft-6n7hs).
+///
+/// The worst (highest) level across all reserved panes is returned; an
+/// empty iterator is `BudgetLevel::Normal`.
+///
+/// This feeds `PressureSignals.worst_budget`, which
+/// `fleet_memory_controller::map_budget_level` folds into the compound
+/// fleet tier driving scrollback eviction. Previously the runtime passed
+/// a literal `BudgetLevel::Normal`, freezing this dimension so per-pane
+/// budget pressure could never raise the fleet tier on its own. The
+/// RSS/cgroup `MemoryBudgetManager` is not wired into the observation
+/// runtime; the logical arena accounting sampled here is the
+/// eviction-relevant per-pane signal.
+fn worst_pane_budget_level<I>(tracked_bytes_iter: I, budget_bytes: u64, high_ratio: f64) -> BudgetLevel
+where
+    I: IntoIterator<Item = u64>,
+{
+    tracked_bytes_iter
+        .into_iter()
+        .map(|tracked| classify_pane_budget_level(tracked, budget_bytes, high_ratio))
+        .max()
+        .unwrap_or(BudgetLevel::Normal)
 }
 
 fn build_fleet_pressure_signals(
@@ -9621,6 +9690,101 @@ mod tests {
         assert_eq!(signals.worst_budget, BudgetLevel::Normal);
         assert_eq!(signals.pane_count, 5);
         assert_eq!(signals.paused_pane_count, 0);
+    }
+
+    // ft-6n7hs: per-pane logical budget level derivation.
+    const TEST_PANE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+    const TEST_PANE_HIGH_RATIO: f64 = 0.8;
+
+    #[test]
+    fn classify_pane_budget_level_thresholds() {
+        let budget = TEST_PANE_BUDGET_BYTES;
+        let high = (budget as f64 * TEST_PANE_HIGH_RATIO) as u64;
+
+        // Well under the soft limit.
+        assert_eq!(
+            classify_pane_budget_level(high - 1, budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::Normal
+        );
+        // Exactly at the soft limit throttles.
+        assert_eq!(
+            classify_pane_budget_level(high, budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::Throttled
+        );
+        // Between soft limit and budget throttles.
+        assert_eq!(
+            classify_pane_budget_level(budget - 1, budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::Throttled
+        );
+        // At or above the hard budget is over budget.
+        assert_eq!(
+            classify_pane_budget_level(budget, budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::OverBudget
+        );
+        assert_eq!(
+            classify_pane_budget_level(budget * 4, budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::OverBudget
+        );
+    }
+
+    #[test]
+    fn classify_pane_budget_level_zero_budget_is_normal() {
+        // A zero budget disables the dimension rather than reporting everything
+        // as over budget (mirrors PaneBudget::usage_ratio guarding div-by-zero).
+        assert_eq!(
+            classify_pane_budget_level(u64::MAX, 0, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::Normal
+        );
+    }
+
+    #[test]
+    fn classify_pane_budget_level_nan_ratio_falls_back_to_default() {
+        let budget = TEST_PANE_BUDGET_BYTES;
+        let default_high = (budget as f64 * MemoryBudgetConfig::default().high_ratio) as u64;
+        // NaN ratio must not classify a small pane as throttled.
+        assert_eq!(
+            classify_pane_budget_level(default_high - 1, budget, f64::NAN),
+            BudgetLevel::Normal
+        );
+        assert_eq!(
+            classify_pane_budget_level(default_high, budget, f64::NAN),
+            BudgetLevel::Throttled
+        );
+    }
+
+    #[test]
+    fn worst_pane_budget_level_empty_is_normal() {
+        assert_eq!(
+            worst_pane_budget_level(
+                std::iter::empty::<u64>(),
+                TEST_PANE_BUDGET_BYTES,
+                TEST_PANE_HIGH_RATIO
+            ),
+            BudgetLevel::Normal
+        );
+    }
+
+    #[test]
+    fn worst_pane_budget_level_takes_worst_across_panes() {
+        let budget = TEST_PANE_BUDGET_BYTES;
+        let high = (budget as f64 * TEST_PANE_HIGH_RATIO) as u64;
+
+        // All comfortably under budget -> Normal.
+        assert_eq!(
+            worst_pane_budget_level([0u64, 1, high / 2], budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::Normal
+        );
+        // One throttled pane raises the fleet dimension.
+        assert_eq!(
+            worst_pane_budget_level([0u64, high, high / 2], budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::Throttled
+        );
+        // A single over-budget pane wins over throttled/normal peers — this is
+        // the case the old hardcoded BudgetLevel::Normal could never surface.
+        assert_eq!(
+            worst_pane_budget_level([0u64, high, budget + 1], budget, TEST_PANE_HIGH_RATIO),
+            BudgetLevel::OverBudget
+        );
     }
 
     #[test]
