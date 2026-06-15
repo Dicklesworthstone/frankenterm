@@ -36631,11 +36631,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             dry_run,
                                             now_ms,
                                         )
+                                    } else if !dry_run {
+                                        // ft-pmbe1 FAIL-CLOSED: the real tx runtime
+                                        // (storage + terminal backend) is unavailable, so
+                                        // refuse to COMMIT through the synthetic allow-all
+                                        // executor — doing so would bypass policy + approval
+                                        // gates and poison the durable idempotency ledger.
+                                        // Surfaced via the existing Err handler below.
+                                        Err(format!(
+                                            "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
+                                            fallback_reason
+                                                .as_deref()
+                                                .map(|reason| format!(" ({reason})"))
+                                                .unwrap_or_default()
+                                        ))
                                     } else {
                                         if let Some(reason) = fallback_reason.as_deref() {
                                             tracing::warn!(
                                                 %reason,
-                                                "falling back to synthetic robot tx executor"
+                                                "synthetic dry-run preview (real tx runtime unavailable)"
                                             );
                                         }
                                         execute_tx_run_with_executor(
@@ -42749,9 +42763,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         dry_run,
                         now,
                     )
+                } else if !dry_run {
+                    // ft-pmbe1 FAIL-CLOSED: real tx runtime unavailable -> refuse to
+                    // commit through the synthetic allow-all executor (policy + approval
+                    // bypass + durable ledger poisoning). Surfaced via the Err handler.
+                    Err(format!(
+                        "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
+                        fallback_reason
+                            .as_deref()
+                            .map(|reason| format!(" ({reason})"))
+                            .unwrap_or_default()
+                    ))
                 } else {
                     if let Some(reason) = fallback_reason.as_deref() {
-                        tracing::warn!(%reason, "falling back to synthetic steer run executor");
+                        tracing::warn!(%reason, "synthetic dry-run preview (real tx runtime unavailable)");
                     }
                     execute_tx_run_with_executor(
                         SteeringReceiptRevalidatingExecutor::new(
@@ -55965,9 +55990,20 @@ async fn handle_tx_command(
                     dry_run,
                     now_ms,
                 )
+            } else if !dry_run {
+                // ft-pmbe1 FAIL-CLOSED: real tx runtime unavailable -> refuse to commit
+                // through the synthetic allow-all executor (policy + approval bypass +
+                // durable ledger poisoning). Surfaced via the .map_err handler below.
+                Err(format!(
+                    "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
+                    fallback_reason
+                        .as_deref()
+                        .map(|reason| format!(" ({reason})"))
+                        .unwrap_or_default()
+                ))
             } else {
                 if let Some(reason) = fallback_reason.as_deref() {
-                    tracing::warn!(%reason, "falling back to synthetic tx executor");
+                    tracing::warn!(%reason, "synthetic dry-run preview (real tx runtime unavailable)");
                 }
                 execute_tx_run_with_executor(
                     frankenterm_core::tx_execution::SyntheticStepExecutor,
