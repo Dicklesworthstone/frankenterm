@@ -1145,12 +1145,10 @@ fn valid_search_config() -> SearchConfig {
             max_docs_per_second: 1,
             ..SearchIndexingConfig::default()
         },
-        daemon: SearchDaemonConfig {
-            enabled: false,
-            worker_scan_interval_secs: 0,
-            worker_batch_size: 0,
-            ..SearchDaemonConfig::default()
-        },
+        // ft-v46vj: the daemon worker/spawn keys are parsed-but-unconsumed, so a
+        // valid baseline must leave them at their defaults (non-defaults now
+        // fail closed). `enabled` is the only consumed daemon key.
+        daemon: SearchDaemonConfig::default(),
         ..SearchConfig::default()
     }
 }
@@ -1208,18 +1206,25 @@ proptest! {
     }
 
     #[test]
-    fn proptest_search_config_daemon_child_validation_only_matters_when_daemon_enabled(
+    fn proptest_search_config_dead_daemon_keys_reject_non_defaults(
         daemon_enabled in any::<bool>(),
-        worker_scan_interval_secs in 0_u64..=2,
-        worker_batch_size in 0_usize..=2,
+        auto_spawn in any::<bool>(),
+        worker_scan_interval_secs in 0_u64..=64,
+        worker_batch_size in 0_usize..=128,
     ) {
+        // ft-v46vj: the daemon worker/spawn keys are parsed-but-unconsumed.
+        // `enabled` is the only consumed key, so it never affects validity; any
+        // non-default dead-key value must fail closed regardless of `enabled`.
+        let defaults = SearchDaemonConfig::default();
         let mut cfg = valid_search_config();
         cfg.daemon.enabled = daemon_enabled;
+        cfg.daemon.auto_spawn = auto_spawn;
         cfg.daemon.worker_scan_interval_secs = worker_scan_interval_secs;
         cfg.daemon.worker_batch_size = worker_batch_size;
 
-        let expected_ok =
-            !daemon_enabled || (worker_scan_interval_secs > 0 && worker_batch_size > 0);
+        let expected_ok = auto_spawn == defaults.auto_spawn
+            && worker_scan_interval_secs == defaults.worker_scan_interval_secs
+            && worker_batch_size == defaults.worker_batch_size;
         prop_assert_eq!(cfg.validate().is_ok(), expected_ok);
     }
 }
