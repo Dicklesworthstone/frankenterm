@@ -37,6 +37,10 @@ use crate::config::{
     CaptureBudgetConfig, HotReloadableConfig, PaneFilterConfig, PanePriorityConfig, PatternsConfig,
     SnapshotConfig, SnapshotSchedulingMode,
 };
+use crate::connector_inbound_bridge::{
+    BridgeRouteResult, ConnectorBridgeError, ConnectorInboundBridge, ConnectorInboundBridgeConfig,
+    ConnectorSignal,
+};
 use crate::crash::{
     HealthSnapshot, LeakRiskInventorySnapshot, LeakRiskWatchdogComponentSnapshot,
     LeakRiskWatchdogSnapshot, ShutdownSummary,
@@ -1352,6 +1356,8 @@ pub struct ObservationRuntime {
     config_rx: watch::Receiver<HotReloadableConfig>,
     /// Optional event bus for publishing detection events to workflow runners
     event_bus: Option<Arc<EventBus>>,
+    /// Runtime-owned inbound connector bridge feeding the live event bus.
+    connector_inbound_bridge: Option<Arc<StdMutex<ConnectorInboundBridge>>>,
     /// Optional recording manager for capturing session recordings
     recording: Option<Arc<RecordingManager>>,
     /// Optional replay capture adapter for `.ftreplay` recorder events.
@@ -1416,6 +1422,7 @@ impl ObservationRuntime {
             config_tx: Arc::new(config_tx),
             config_rx,
             event_bus: None,
+            connector_inbound_bridge: None,
             recording: None,
             replay_capture: None,
             snapshot_config: None,
@@ -1456,8 +1463,24 @@ impl ObservationRuntime {
     /// subscribe and handle detections in real-time.
     #[must_use]
     pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
+        self.connector_inbound_bridge = Some(Arc::new(StdMutex::new(ConnectorInboundBridge::new(
+            Arc::clone(&event_bus),
+            ConnectorInboundBridgeConfig::default(),
+        ))));
         self.event_bus = Some(event_bus);
         self
+    }
+
+    /// Route an inbound connector signal into the runtime's live event bus.
+    ///
+    /// This is the production ingress path for `ConnectorInboundBridge`: callers
+    /// feed connector webhooks, streams, polls, and lifecycle signals here after
+    /// constructing the observation runtime with [`Self::with_event_bus`].
+    pub fn route_connector_signal(
+        &self,
+        signal: &ConnectorSignal,
+    ) -> std::result::Result<BridgeRouteResult, ConnectorBridgeError> {
+        route_connector_signal_through_bridge(self.connector_inbound_bridge.as_ref(), signal)
     }
 
     /// Set a recording manager for capturing pane output and events.
@@ -1643,6 +1666,7 @@ impl ObservationRuntime {
             start_time: Instant::now(),
             config_tx: Arc::clone(&self.config_tx),
             event_bus: self.event_bus.clone(),
+            connector_inbound_bridge: self.connector_inbound_bridge.clone(),
             heartbeats: Arc::clone(&self.heartbeats),
             capture_tx: capture_tx_probe,
             capture_queue_capacity,
@@ -3872,6 +3896,8 @@ pub struct RuntimeHandle {
     config_tx: Arc<watch::Sender<HotReloadableConfig>>,
     /// Optional event bus for workflow integration
     pub event_bus: Option<Arc<EventBus>>,
+    /// Runtime-owned inbound connector bridge feeding the live event bus.
+    connector_inbound_bridge: Option<Arc<StdMutex<ConnectorInboundBridge>>>,
     /// Heartbeat registry for watchdog monitoring
     pub heartbeats: Arc<HeartbeatRegistry>,
     /// Capture ingress sender retained for runtime-handle lifetime and capacity checks.
@@ -3934,6 +3960,21 @@ fn remove_runtime_pane_state(
         detection_context_removed: detection_contexts.remove(&pane_id).is_some(),
         pane_activity_removed: pane_activity_tracker.remove(&pane_id).is_some(),
     }
+}
+
+fn route_connector_signal_through_bridge(
+    bridge: Option<&Arc<StdMutex<ConnectorInboundBridge>>>,
+    signal: &ConnectorSignal,
+) -> std::result::Result<BridgeRouteResult, ConnectorBridgeError> {
+    let bridge = bridge.ok_or_else(|| ConnectorBridgeError::BridgeUnavailable {
+        reason: "runtime was not configured with an event bus".to_string(),
+    })?;
+    let mut guard = bridge
+        .lock()
+        .map_err(|_| ConnectorBridgeError::BridgeUnavailable {
+            reason: "connector inbound bridge lock poisoned".to_string(),
+        })?;
+    guard.route_signal(signal)
 }
 
 async fn remove_runtime_pane_state_for_pane(
@@ -4366,6 +4407,19 @@ fn record_capture_pipeline_depth(
 }
 
 impl RuntimeHandle {
+    /// Route an inbound connector signal into the runtime's live event bus.
+    ///
+    /// Connector host/SDK ingress paths should call this handle after
+    /// [`ObservationRuntime::start`] so the bridge's deduplication,
+    /// classification, redaction, and `PatternDetected` fanout are shared with
+    /// the observation runtime.
+    pub fn route_connector_signal(
+        &self,
+        signal: &ConnectorSignal,
+    ) -> std::result::Result<BridgeRouteResult, ConnectorBridgeError> {
+        route_connector_signal_through_bridge(self.connector_inbound_bridge.as_ref(), signal)
+    }
+
     /// Current capture channel queue depth (pending items waiting for persistence).
     #[must_use]
     pub fn capture_queue_depth(&self) -> usize {
@@ -5626,6 +5680,65 @@ mod tests {
         (dir, path)
     }
 
+    #[test]
+    fn runtime_routes_connector_signal_to_live_event_bus() {
+        run_async_test(async {
+            let (_dir, db_path) = temp_db_path();
+            let storage = StorageHandle::new(&db_path).await.unwrap();
+            let engine = PatternEngine::new();
+            let bus = Arc::new(EventBus::new(16));
+            let mut subscriber = bus.subscribe_detections();
+
+            let runtime = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage,
+                Arc::new(RwLock::new(engine)),
+            )
+            .with_event_bus(Arc::clone(&bus));
+            let signal = ConnectorSignal::new(
+                "github",
+                crate::connector_inbound_bridge::ConnectorSignalKind::Webhook,
+                serde_json::json!({ "ref": "refs/heads/main" }),
+            )
+            .with_sub_type("push")
+            .with_correlation_id("ft-7h5da.5.9-runtime-route")
+            .with_pane_id(42);
+
+            let result = runtime
+                .route_connector_signal(&signal)
+                .expect("runtime connector ingress should route signal");
+
+            assert!(!result.deduplicated);
+            assert_eq!(result.rule_id, "connector.github:webhook.push");
+            assert_eq!(result.delivered_count, 1);
+
+            let cx = crate::cx::for_testing();
+            let event = subscriber
+                .recv_cx(&cx)
+                .await
+                .expect("detection subscriber should receive routed connector signal");
+            assert!(
+                matches!(event, Event::PatternDetected { .. }),
+                "expected PatternDetected from connector ingress, got {event:?}"
+            );
+            if let Event::PatternDetected {
+                pane_id, detection, ..
+            } = event
+            {
+                assert_eq!(pane_id, 42);
+                assert_eq!(detection.rule_id, "connector.github:webhook.push");
+                assert_eq!(detection.event_type, "connector.push");
+                assert_eq!(
+                    detection
+                        .extracted
+                        .get("source_connector")
+                        .and_then(serde_json::Value::as_str),
+                    Some("github")
+                );
+            }
+        });
+    }
+
     fn stubborn_runtime_task(duration: Duration) -> JoinHandle<()> {
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |_task_cx| async move {
@@ -5663,6 +5776,7 @@ mod tests {
             start_time: Instant::now(),
             config_tx: Arc::clone(&runtime.config_tx),
             event_bus: None,
+            connector_inbound_bridge: None,
             heartbeats: Arc::clone(&runtime.heartbeats),
             capture_tx,
             capture_queue_capacity: 1,
