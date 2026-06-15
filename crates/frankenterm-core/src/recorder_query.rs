@@ -2,10 +2,27 @@
 //!
 //! Bead: wa-0dlq
 //!
-//! Provides the "inner loop" read path for recorder data: every query
-//! goes through authorization check → execution → redaction → audit.
-//! Any interface surface (CLI, robot mode, MCP) calls this module
-//! rather than accessing recorder storage directly.
+//! Implements the intended "inner loop" read path for recorder data: every
+//! query goes through authorization check → execution → redaction → audit.
+//!
+//! # Wiring status (ft-ja9i1)
+//!
+//! **This gate is NOT enforced on any production read path today.** No CLI,
+//! robot-mode, or MCP surface routes recorder reads through
+//! `RecorderQueryExecutor::execute`; there is no `ft recorder query` / `export`
+//! subcommand; and the executor, its elevation grants (`grant_elevation` /
+//! `revoke_elevation`), and the elevation-TTL sweep (`expire_grants`) are
+//! exercised only by tests and the test-only `RecorderExporter`. The executor's
+//! `RecorderEventReader` has a single impl — the in-memory `InMemoryEventStore`
+//! (test); there is no production reader over a real recorder backend.
+//!
+//! Do NOT assume recorder reads are access-controlled, redacted, or audited in
+//! production — they are not gated by this module. Wiring it requires a
+//! production `RecorderEventReader` over a real recorder backend (the
+//! FrankenSqlite recorder backend is currently a stub), an interface surface
+//! that constructs a long-lived executor, and a maintenance-tick call to
+//! `expire_grants`. Until that lands, the flow below is a design, not an
+//! enforced guarantee.
 //!
 //! # Access Control Flow
 //!
@@ -557,6 +574,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
     /// Execute a query as the given actor.
     ///
     /// Performs: authorize → execute → redact → audit → return.
+    ///
+    /// ft-ja9i1: NOT wired to any production interface surface — no CLI/robot/MCP
+    /// path calls this; it is exercised only by tests. Do not treat it as an
+    /// enforced access gate in production. See the module-level "Wiring status".
     pub fn execute(
         &self,
         actor: &ActorIdentity,
@@ -831,6 +852,10 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
     }
 
     /// Clean up expired elevation grants.
+    ///
+    /// ft-ja9i1: NOT scheduled on any production tick. Grants live in this
+    /// (currently test-only) executor instance, so in production there is no
+    /// long-lived grant store to sweep. See the module-level "Wiring status".
     pub fn expire_grants(&self, now_ms: u64) -> usize {
         let mut grants = self
             .elevation_grants
