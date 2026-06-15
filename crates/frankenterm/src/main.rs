@@ -14480,6 +14480,34 @@ impl RobotFleetMuxExecutor {
     > {
         use frankenterm_core::runtime_async::CompatRuntime;
 
+        // ft-3wkpo: fail-closed containment of the profile-derived spawn cwd.
+        // working_directory comes from profile metadata (length-validated only),
+        // so canonicalize + contain it to the workspace root here, at the real
+        // spawn sink, before it reaches mux.spawn. Reject any path that escapes
+        // the workspace (../ traversal, absolute-outside, or symlink escape).
+        if let Some(requested_cwd) = cwd {
+            if !requested_cwd.trim().is_empty() {
+                let workspace_root = std::env::var_os("FT_WORKSPACE")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                if !frankenterm_core::robot_profile_handler::spawn_cwd_is_contained(
+                    &workspace_root,
+                    requested_cwd,
+                ) {
+                    return Err(
+                        frankenterm_core::fleet_mutation::FleetMutationExecutionError::new(
+                            "robot.fleet.spawn_cwd_denied",
+                            format!(
+                                "refusing to spawn fleet agent profile `{profile_name}`: working \
+                                 directory `{requested_cwd}` escapes the workspace root"
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+
         let launch = robot_fleet_launch_script(program, env)?;
         let runtime = Self::runtime()?;
         let pane_id = runtime

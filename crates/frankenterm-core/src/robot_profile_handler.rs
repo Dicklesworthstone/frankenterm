@@ -815,6 +815,59 @@ fn profile_apply_spawn_specs<S: BuildHasher>(
         .collect()
 }
 
+/// ft-3wkpo: fail-closed containment check for a profile-derived spawn working
+/// directory.
+///
+/// A profile's `metadata["working_directory"]` becomes the spawn `cwd` that
+/// reaches `mux.spawn`. Without this guard an unvalidated value (`../../etc`,
+/// `/root/.ssh`, a symlink escaping the workspace) would set an arbitrary
+/// process cwd. Returns `true` only when `cwd` resolves to a path INSIDE
+/// `workspace_root` after canonicalizing the nearest existing ancestor — which
+/// defeats `..` traversal and symlink escapes. Absolute paths are permitted iff
+/// they canonicalize inside the workspace (mirrors the
+/// `resolve_workspace_scoped_path` model used for mission files). Any
+/// filesystem/canonicalize error fails closed (`false`). An empty `cwd` is the
+/// caller's concern (skip the check; the spawn uses its default directory).
+#[must_use]
+pub fn spawn_cwd_is_contained(workspace_root: &std::path::Path, cwd: &str) -> bool {
+    use std::path::{Component, Path, PathBuf};
+
+    let supplied = Path::new(cwd);
+    // Cheap, fs-free reject of explicit parent-dir components.
+    if supplied
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return false;
+    }
+
+    // Fail closed if we cannot establish the canonical containment root.
+    let Ok(root_canon) = workspace_root.canonicalize() else {
+        return false;
+    };
+
+    let candidate: PathBuf = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        root_canon.join(supplied)
+    };
+
+    // The target dir may not exist yet, so canonicalize the nearest existing
+    // ancestor and require it to live within the workspace root. canonicalize()
+    // resolves symlinks, so an escape through a symlink is rejected here.
+    let mut ancestor = candidate.as_path();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(resolved) => return resolved.starts_with(&root_canon),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => match ancestor.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => ancestor = parent,
+                _ => return false,
+            },
+            Err(_) => return false,
+        }
+    }
+}
+
 fn profile_apply_setup_preamble_commands(shell: &str) -> Vec<String> {
     ShellType::from_path(shell)
         .map(|shell| vec![shell.osc133_snippet().to_string()])
@@ -1121,7 +1174,7 @@ pub fn compute_apply_content_hash<S: BuildHasher>(
         hash_len_prefixed(&mut hasher, v.as_bytes());
     }
 
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -1237,6 +1290,52 @@ mod tests {
     use crate::storage::agent_profiles_sql::insert_agent_profile;
     use crate::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend};
     use serde_json::json;
+
+    // ── ft-3wkpo: spawn-cwd containment ──
+
+    #[test]
+    fn spawn_cwd_contained_accepts_paths_inside_workspace() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path();
+        // Relative paths under the root (may not exist yet) are contained.
+        assert!(spawn_cwd_is_contained(root_path, "subdir"));
+        assert!(spawn_cwd_is_contained(root_path, "a/b/c"));
+        // An absolute path that already exists inside the root is contained.
+        let abs_inside = root_path.join("inside");
+        std::fs::create_dir_all(&abs_inside).expect("mkdir inside");
+        assert!(spawn_cwd_is_contained(
+            root_path,
+            abs_inside.to_str().expect("utf8")
+        ));
+        // Empty resolves to the root itself.
+        assert!(spawn_cwd_is_contained(root_path, ""));
+    }
+
+    #[test]
+    fn spawn_cwd_contained_rejects_traversal_and_absolute_escape() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path();
+        // `..` traversal (relative or embedded) is rejected fail-closed.
+        assert!(!spawn_cwd_is_contained(root_path, "../escape"));
+        assert!(!spawn_cwd_is_contained(root_path, "a/../../escape"));
+        // Absolute paths outside the workspace are rejected.
+        assert!(!spawn_cwd_is_contained(root_path, "/etc"));
+        assert!(!spawn_cwd_is_contained(root_path, "/root/.ssh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_cwd_contained_rejects_symlink_escape() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let link = root.path().join("escape_link");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        // A cwd whose canonical form resolves outside the workspace is rejected.
+        assert!(!spawn_cwd_is_contained(
+            root.path(),
+            link.to_str().expect("utf8")
+        ));
+    }
 
     fn fresh_conn() -> RusqliteBackend {
         let backend = RusqliteBackend::open(
