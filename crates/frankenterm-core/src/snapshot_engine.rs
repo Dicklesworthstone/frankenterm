@@ -792,6 +792,11 @@ impl SnapshotEngine {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Option<Vec<PaneInfo>>> + Send,
     {
+        // ft-0yuxe: drive `[snapshots.session_retention]` cleanup from the live
+        // snapshot scheduler. Tracks the last run so the configured
+        // `cleanup_interval_hours` cadence is honored across both scheduling
+        // modes (None = never run yet → triggers the startup pass).
+        let mut last_session_cleanup: Option<Instant> = None;
         match self.config.scheduling.mode {
             SnapshotSchedulingMode::Periodic => {
                 let interval_secs = self.config.interval_seconds.max(30);
@@ -817,6 +822,9 @@ impl SnapshotEngine {
                         tracing::info!("snapshot engine run_periodic: cx cancelled, exiting");
                         break;
                     }
+
+                    self.maybe_run_session_cleanup(cx, &mut last_session_cleanup)
+                        .await;
 
                     let trigger = if is_first {
                         is_first = false;
@@ -882,6 +890,9 @@ impl SnapshotEngine {
                         );
                         break;
                     }
+
+                    self.maybe_run_session_cleanup(cx, &mut last_session_cleanup)
+                        .await;
 
                     // ft-xbnl0.2.3 tick 297: cx-first timeouts in intelligent scheduler.
                     let shutdown_check_fut = shutdown.changed(cx);
@@ -962,6 +973,61 @@ impl SnapshotEngine {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Run `[snapshots.session_retention]` cleanup on the configured cadence
+    /// (ft-0yuxe).
+    ///
+    /// Before this wiring the cleanup engine
+    /// (`session_retention::cleanup_sessions`) had no production caller, so the
+    /// whole `[snapshots.session_retention]` block — and the orphan/data-loss
+    /// fixes inside it — were inert: closed sessions, checkpoints, and pane
+    /// state grew unbounded.
+    ///
+    /// `cleanup_interval_hours == 0` means "only on startup": the first call
+    /// (when `last_cleanup` is `None`) always runs, and subsequent calls are
+    /// skipped. A positive value reruns every N hours. The DB connection is
+    /// opened fresh inside the cleanup engine (a blocking SQLite pipeline run on
+    /// the blocking pool), so this is safe to drive from the async scheduler.
+    async fn maybe_run_session_cleanup(
+        &self,
+        cx: &crate::cx::Cx,
+        last_cleanup: &mut Option<Instant>,
+    ) {
+        let interval_hours = self.config.session_retention.cleanup_interval_hours;
+        if !session_cleanup_due(*last_cleanup, interval_hours, Instant::now()) {
+            return;
+        }
+        *last_cleanup = Some(Instant::now());
+
+        let db_path = Arc::clone(&self.db_path);
+        let config = self.config.session_retention.clone();
+        match crate::session_retention::cleanup_sessions_async_cx(cx, db_path, config).await {
+            Ok(result) => {
+                let total = result.total_sessions_deleted();
+                if total > 0
+                    || result.orphaned_checkpoints > 0
+                    || result.orphaned_pane_states > 0
+                {
+                    tracing::info!(
+                        sessions_deleted = total,
+                        orphaned_checkpoints = result.orphaned_checkpoints,
+                        orphaned_pane_states = result.orphaned_pane_states,
+                        vacuumed = result.vacuumed,
+                        interval_hours,
+                        "Session retention cleanup completed"
+                    );
+                } else {
+                    tracing::debug!(
+                        interval_hours,
+                        "Session retention cleanup: nothing to remove"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Session retention cleanup failed");
             }
         }
     }
@@ -1258,6 +1324,27 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Decide whether `[snapshots.session_retention]` cleanup is due (ft-0yuxe).
+///
+/// * `last_cleanup == None` — cleanup has never run this process; the startup
+///   pass is always due, even when `interval_hours == 0`.
+/// * `interval_hours == 0` — "only on startup": never due again after the first
+///   run.
+/// * otherwise — due once `interval_hours` have elapsed since the last run.
+///
+/// Uses `saturating_duration_since` so a non-monotonic `now < prev` reads as
+/// zero elapsed (not due) rather than panicking.
+fn session_cleanup_due(last_cleanup: Option<Instant>, interval_hours: u64, now: Instant) -> bool {
+    match last_cleanup {
+        None => true,
+        Some(prev) => {
+            interval_hours > 0
+                && now.saturating_duration_since(prev)
+                    >= Duration::from_secs(interval_hours.saturating_mul(3600))
+        }
+    }
+}
+
 /// Generate a time-ordered session ID (UUID v7-like: timestamp prefix + random).
 fn generate_session_id() -> String {
     let ts = epoch_ms();
@@ -1528,6 +1615,46 @@ mod tests {
         rx.recv(&cx)
             .await
             .expect("snapshot trigger recv should succeed")
+    }
+
+    // ft-0yuxe: the scheduler drives `[snapshots.session_retention]` cleanup on
+    // the configured cadence. Pin the cadence decision so it always runs on
+    // startup, honors `cleanup_interval_hours`, and treats `0` as startup-only.
+    #[test]
+    fn session_cleanup_due_runs_on_startup_then_honors_interval() {
+        // Build `now` far ahead of `base` so the elapsed-time subtractions are
+        // safe regardless of system uptime (Instant is monotonic from boot).
+        let base = Instant::now();
+        let now = base
+            .checked_add(Duration::from_secs(100 * 3600))
+            .expect("base + 100h fits in Instant");
+        let one_hour_ago = now
+            .checked_sub(Duration::from_secs(3600))
+            .expect("now - 1h fits in Instant");
+
+        // Startup pass (never run before) is always due, even with interval 0.
+        assert!(session_cleanup_due(None, 0, now), "startup must run with interval=0");
+        assert!(session_cleanup_due(None, 24, now), "startup must run with interval=24");
+
+        // interval_hours == 0 => only-on-startup: never due again after a run.
+        assert!(
+            !session_cleanup_due(Some(base), 0, now),
+            "interval=0 must not rerun after startup"
+        );
+
+        // A configured interval reruns once that many hours have elapsed.
+        assert!(
+            session_cleanup_due(Some(base), 24, now),
+            "100h elapsed >= 24h interval must be due"
+        );
+        assert!(
+            !session_cleanup_due(Some(one_hour_ago), 24, now),
+            "1h elapsed < 24h interval must not be due"
+        );
+        assert!(
+            !session_cleanup_due(Some(now), 24, now),
+            "0 elapsed < 24h interval must not be due"
+        );
     }
 
     fn run_async_test<F>(future: F)
