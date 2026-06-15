@@ -182,6 +182,12 @@ pub enum NativeEvent {
         pane_id: u64,
         data: Vec<u8>,
         timestamp_ms: i64,
+        /// Bytes silently dropped from this frame's tail when the decoded
+        /// payload exceeded `MAX_OUTPUT_BYTES` (ft-wtd5g). `0` means the frame
+        /// was carried whole. A non-zero value MUST be turned into an explicit
+        /// capture gap by the consumer so replay records the loss instead of
+        /// treating the truncated stream as complete.
+        dropped_bytes: u64,
     },
     StateChange {
         pane_id: u64,
@@ -566,7 +572,13 @@ async fn handle_connection_with_cx(
                         debug!(event_kind, pane_id, "native event dispatched (cx path)");
                     }
                     EventDispatchOutcome::Backpressure => {
-                        debug!(
+                        // ft-wtd5g: a dropped event here is silent data loss
+                        // (the read loop holds no capture-pipeline handle, so it
+                        // cannot inject a per-pane gap from this layer). Promote
+                        // to warn so the loss is at least operator-visible rather
+                        // than sinking into a filtered debug line; full per-pane
+                        // gap injection for this path is tracked as a follow-up.
+                        warn!(
                             event_kind,
                             pane_id, "native event queue full; dropping event (cx path)"
                         );
@@ -677,6 +689,11 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(data_b64.as_bytes())
                 .map_err(|e| format!("invalid base64: {e}"))?;
+            // ft-wtd5g: bound the per-frame payload for memory safety, but
+            // record how many tail bytes we dropped so the consumer can inject
+            // an explicit capture gap. Previously the tail was discarded
+            // silently and replay recorded a holed stream as if complete.
+            let dropped_bytes = decoded.len().saturating_sub(MAX_OUTPUT_BYTES) as u64;
             let bounded = if decoded.len() > MAX_OUTPUT_BYTES {
                 decoded[..MAX_OUTPUT_BYTES].to_vec()
             } else {
@@ -686,6 +703,7 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
                 pane_id,
                 data: bounded,
                 timestamp_ms: ts(ts_ms),
+                dropped_bytes,
             }))
         }
         WireEvent::StateChange {
@@ -812,6 +830,7 @@ mod transport_roundtrip_tests {
                     pane_id,
                     data,
                     timestamp_ms,
+                    ..
                 } => {
                     assert_eq!(pane_id, 7);
                     assert_eq!(data, b"hey");
@@ -848,10 +867,57 @@ mod tests {
                 pane_id,
                 data,
                 timestamp_ms,
+                ..
             } => {
                 assert_eq!(pane_id, 1);
                 assert_eq!(data, b"hello");
                 assert_eq!(timestamp_ms, 123);
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_pane_output_under_bound_reports_zero_dropped() {
+        let payload = r#"{"type":"pane_output","pane_id":1,"data_b64":"aGVsbG8=","ts":123}"#;
+        let event = decode_wire_event(payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneOutput {
+                data,
+                dropped_bytes,
+                ..
+            } => {
+                assert_eq!(data, b"hello");
+                assert_eq!(dropped_bytes, 0, "in-bound frame must report no loss");
+            }
+            _ => panic!("wrong event type"),
+        }
+    }
+
+    #[test]
+    fn decode_pane_output_over_bound_truncates_and_reports_dropped_bytes() {
+        // ft-wtd5g: a single well-formed frame whose decoded payload exceeds
+        // MAX_OUTPUT_BYTES must be bounded AND report the dropped tail so the
+        // consumer can inject an explicit capture gap (no more silent loss).
+        let raw = vec![b'a'; MAX_OUTPUT_BYTES + 4096];
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let payload =
+            format!(r#"{{"type":"pane_output","pane_id":9,"data_b64":"{data_b64}","ts":7}}"#);
+        // The base64 line stays under MAX_EVENT_LINE_BYTES so it is NOT dropped
+        // by the read-loop guard; the truncation path is what we exercise.
+        assert!(payload.len() < MAX_EVENT_LINE_BYTES);
+        let event = decode_wire_event(&payload).unwrap().unwrap();
+        match event {
+            NativeEvent::PaneOutput {
+                data,
+                dropped_bytes,
+                ..
+            } => {
+                assert_eq!(data.len(), MAX_OUTPUT_BYTES, "payload must be bounded");
+                assert_eq!(
+                    dropped_bytes, 4096,
+                    "dropped tail must be reported for explicit-gap injection"
+                );
             }
             _ => panic!("wrong event type"),
         }
@@ -1455,6 +1521,7 @@ mod tests {
                     pane_id,
                     data,
                     timestamp_ms,
+                    ..
                 } => {
                     assert_eq!(pane_id, 7);
                     assert_eq!(data, b"hey");
@@ -1833,6 +1900,7 @@ mod tests {
             pane_id: 1,
             data: vec![65, 66, 67],
             timestamp_ms: 1000,
+            dropped_bytes: 0,
         };
         let e2 = e.clone();
         assert!(matches!(e2, NativeEvent::PaneOutput { pane_id: 1, .. }));
@@ -1897,6 +1965,7 @@ mod tests {
                 pane_id: 1,
                 data: vec![],
                 timestamp_ms: 0,
+                dropped_bytes: 0,
             },
             NativeEvent::StateChange {
                 pane_id: 2,
@@ -1941,6 +2010,7 @@ mod tests {
             pane_id: 42,
             data: vec![],
             timestamp_ms: 0,
+            dropped_bytes: 0,
         };
         let (kind, id) = event_metadata(&e);
         assert_eq!(kind, "pane_output");

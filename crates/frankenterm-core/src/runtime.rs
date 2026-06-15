@@ -1515,7 +1515,7 @@ impl ObservationRuntime {
         match bridge.lock() {
             Ok(mut guard) => guard.add_rule(rule),
             Err(_) => {
-                warn!("connector outbound bridge lock poisoned while registering routing rule")
+                warn!("connector outbound bridge lock poisoned while registering routing rule");
             }
         }
         runtime
@@ -3207,6 +3207,7 @@ impl ObservationRuntime {
                                 pane_id,
                                 data,
                                 timestamp_ms,
+                                dropped_bytes,
                             } => {
                                 metrics.record_native_output_input(data.len());
                                 let now_ms =
@@ -3225,6 +3226,39 @@ impl ObservationRuntime {
                                         &capture_tx,
                                         &cursors,
                                         metrics.backpressure_metrics(),
+                                    )
+                                    .await;
+                                }
+                                if dropped_bytes > 0 {
+                                    // ft-wtd5g: the wire frame was truncated at the
+                                    // decode bound. Flush any buffered delta for this
+                                    // pane first so the partial data is recorded in
+                                    // order, then inject an explicit capture gap so
+                                    // replay records the loss instead of treating the
+                                    // holed stream as complete (mirrors the capture-
+                                    // tiering explicit_gap invariant).
+                                    if let Some(item) = coalescer.flush_pane(pane_id) {
+                                        metrics.record_native_output_batch(
+                                            item.input_events,
+                                            item.bytes.len(),
+                                        );
+                                        emit_native_output_delta(
+                                            item.pane_id,
+                                            item.bytes,
+                                            item.timestamp_ms,
+                                            &capture_tx,
+                                            &cursors,
+                                            metrics.backpressure_metrics(),
+                                        )
+                                        .await;
+                                    }
+                                    emit_native_output_gap(
+                                        pane_id,
+                                        &format!(
+                                            "native_output_truncated:dropped_bytes={dropped_bytes}"
+                                        ),
+                                        &capture_tx,
+                                        &cursors,
                                     )
                                     .await;
                                 }
@@ -3700,6 +3734,7 @@ async fn handle_native_event(
             pane_id,
             data,
             timestamp_ms,
+            dropped_bytes,
         } => {
             emit_native_output_delta(
                 pane_id,
@@ -3710,6 +3745,17 @@ async fn handle_native_event(
                 backpressure,
             )
             .await;
+            if dropped_bytes > 0 {
+                // ft-wtd5g: mirror the main loop — a truncated frame must leave
+                // an explicit capture gap so replay records the loss.
+                emit_native_output_gap(
+                    pane_id,
+                    &format!("native_output_truncated:dropped_bytes={dropped_bytes}"),
+                    capture_tx,
+                    cursors,
+                )
+                .await;
+            }
         }
         NativeEvent::StateChange { pane_id, state, .. } => {
             let mut gap_segment = None;
@@ -3888,6 +3934,43 @@ async fn emit_native_output_delta(
             pane_id,
             "Native output received before cursor initialized; dropping"
         );
+    }
+}
+
+/// ft-wtd5g: inject an explicit capture gap for a pane after a native-output
+/// truncation/drop, so replay/recorder records the loss instead of treating the
+/// holed stream as complete (mirrors the capture-tiering `explicit_gap`
+/// invariant). Best-effort under capture backpressure: if the capture queue is
+/// itself full the gap marker is dropped with a debug line — the truncation is
+/// still surfaced by the upstream `dropped_bytes` accounting.
+#[cfg(feature = "native-wezterm")]
+async fn emit_native_output_gap(
+    pane_id: u64,
+    reason: &str,
+    capture_tx: &mpsc::Sender<CaptureEvent>,
+    cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
+) {
+    let gap = {
+        let mut cursors_guard = cursors.write().await;
+        cursors_guard
+            .get_mut(&pane_id)
+            .map(|cursor| cursor.emit_gap(reason))
+    };
+    match gap {
+        Some(segment) => {
+            if capture_tx.try_send(CaptureEvent { segment }).is_err() {
+                debug!(
+                    pane_id,
+                    "native output gap marker dropped; capture queue full"
+                );
+            }
+        }
+        None => {
+            debug!(
+                pane_id,
+                "native output gap: cursor not initialized; loss unrecorded"
+            );
+        }
     }
 }
 
