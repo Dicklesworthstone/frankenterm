@@ -1,12 +1,25 @@
 #![allow(clippy::module_name_repetitions)]
 
-//! Redacted incident autopsy compiler substrate.
+//! Redacted incident autopsy compiler substrate (BUILT BUT NOT WIRED).
 //!
 //! The compiler is deliberately pure: callers provide already-collected
 //! evidence from storage, causal graph, replay, policy, and pane excerpts. The
 //! output is a deterministic manifest, a human report, a compact TOON-like
 //! manifest, source hashes, and a decision log explaining every inclusion or
 //! exclusion.
+//!
+//! ADOPTION STATUS (ft-ske0k): this compiler is fully implemented and tested but
+//! is NOT invoked on any production path. [`IncidentAutopsyCompiler::compile`]
+//! has only test callers, and there is no `ft incident compile` (or robot)
+//! command surface. Live incident capture is a separate implementation in
+//! `crash.rs` (`collect_incident_bundle` / verify / replay) that does not use
+//! this module. Wiring it requires assembling an [`IncidentAutopsyInput`] from
+//! the crash.rs collectors plus a causal graph — the input artifact, pane
+//! excerpt, timeline, and hypothesis types currently have no production
+//! producer, so this is an adapter build, not a one-line dispatch. Until that
+//! lands, do not describe this module as an active incident surface: the "add
+//! `ft incident compile` or equivalent robot surface" acceptance criterion of
+//! ft-1650n.4 is unmet, and ft-ske0k tracks the wiring.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -420,6 +433,10 @@ impl Default for IncidentAutopsyCompilerConfig {
 }
 
 /// Redacted incident autopsy compiler.
+///
+/// Not yet wired to any command surface — see the module-level ADOPTION STATUS
+/// (ft-ske0k). [`IncidentAutopsyCompiler::compile`] currently has only test
+/// callers; there is no `ft incident compile` / robot command.
 #[derive(Debug, Clone)]
 pub struct IncidentAutopsyCompiler {
     config: IncidentAutopsyCompilerConfig,
