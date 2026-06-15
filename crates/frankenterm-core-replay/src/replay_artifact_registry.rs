@@ -723,21 +723,24 @@ impl ArtifactRegistry {
         let mut pruned_paths = Vec::new();
         let mut bytes_freed: u64 = 0;
 
+        // Predicate identifying the EXACT entries to prune: retired AND aged
+        // past retention. Used for both the file-removal targets and the
+        // manifest retain below, so an active artifact that happens to share a
+        // `path` with a pruned retired entry is never collaterally removed
+        // (ft-wbm46 — `retain(|a| !pruned_paths.contains(&a.path))` matched by
+        // path alone and dropped active registrations on duplicate-path manifests).
+        let is_prunable = |a: &ArtifactEntry| -> bool {
+            a.status == ArtifactStatus::Retired
+                && a.retired_at_ms
+                    .is_some_and(|retired_at| opts.now_ms.saturating_sub(retired_at) >= max_age_ms)
+        };
+
         // Identify retired artifacts past retention
         let to_prune: Vec<(String, u64)> = self
             .manifest
             .artifacts
             .iter()
-            .filter(|a| {
-                if a.status != ArtifactStatus::Retired {
-                    return false;
-                }
-                if let Some(retired_at) = a.retired_at_ms {
-                    opts.now_ms.saturating_sub(retired_at) >= max_age_ms
-                } else {
-                    false
-                }
-            })
+            .filter(|a| is_prunable(a))
             .map(|a| (a.path.clone(), a.size_bytes))
             .collect();
 
@@ -753,10 +756,10 @@ impl ArtifactRegistry {
         }
 
         if !opts.dry_run {
-            // Remove pruned entries from manifest
-            self.manifest
-                .artifacts
-                .retain(|a| !pruned_paths.contains(&a.path));
+            // Remove EXACTLY the pruned entries (retired + aged) — NOT every
+            // entry sharing a path. An active artifact at the same path keeps
+            // its checksum/provenance record intact (ft-wbm46).
+            self.manifest.artifacts.retain(|a| !is_prunable(a));
             if !pruned_paths.is_empty() {
                 self.manifest.last_updated_ms = opts.now_ms;
             }
@@ -1621,6 +1624,49 @@ mod tests {
         assert_eq!(result.pruned_count, 1);
         assert_eq!(result.pruned_paths, vec!["old.ftreplay"]);
         assert!(reg.manifest().artifacts.is_empty());
+    }
+
+    #[test]
+    fn prune_preserves_active_entry_sharing_path_with_pruned_retired() {
+        // ft-wbm46: a manifest can carry duplicate `path`s (from_toml does not
+        // dedup, validate is not called before prune). Pruning a retired+aged
+        // entry must NOT collaterally drop an Active entry at the same path.
+        let content = b"dup path";
+        let active = make_entry("dup.ftreplay", "active", content);
+        let mut retired = make_entry("dup.ftreplay", "retired", content);
+        retired.status = ArtifactStatus::Retired;
+        retired.retired_at_ms = Some(1000);
+
+        let fs = MockFs::new();
+        fs.add_file(PathBuf::from("/base/dup.ftreplay"), content.to_vec());
+        let mut reg = setup_registry(vec![active, retired], fs);
+
+        let result = reg.prune(&PruneOptions {
+            dry_run: false,
+            max_age_days: 1,
+            now_ms: 1000 + 2 * 24 * 60 * 60 * 1000, // 2 days later
+        });
+
+        // Exactly the retired+aged entry is pruned...
+        assert_eq!(
+            result.pruned_count, 1,
+            "only the retired+aged entry is pruned"
+        );
+        // ...and the Active registration at the same path is preserved (the old
+        // path-only retain dropped it — ft-wbm46).
+        let surviving: Vec<_> = reg
+            .manifest()
+            .artifacts
+            .iter()
+            .filter(|a| a.path == "dup.ftreplay")
+            .collect();
+        assert_eq!(
+            surviving.len(),
+            1,
+            "the active duplicate-path entry survives"
+        );
+        assert_eq!(surviving[0].status, ArtifactStatus::Active);
+        assert_eq!(surviving[0].label, "active");
     }
 
     #[test]
