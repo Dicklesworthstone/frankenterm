@@ -1,15 +1,36 @@
 //! WASM scripting engine backed by wasmtime.
 //!
 //! Implements [`ScriptingEngine`] using wasmtime's runtime with WASI
-//! support for sandboxed, capability-based extensions and config evaluation.
+//! support for config evaluation and (eventually) capability-gated extensions.
 //!
-//! # Security model
+//! # Security model — what is ACTUALLY enforced (ft-0dki4)
 //!
-//! Each WASM module runs in a sandboxed `Store` with:
-//! - **Memory limit**: configurable, default 64 MiB per module
-//! - **Fuel metering**: configurable instruction budget (default 1 billion)
-//! - **WASI capabilities**: read-only filesystem access to config dirs,
-//!   env var access, stdout/stderr capture
+//! Each WASM module runs in a `Store` with:
+//! - **Memory limit**: enforced via a [`StoreLimits`] resource limiter capping
+//!   linear-memory growth at `max_memory_bytes` (default 64 MiB per module).
+//! - **Fuel metering**: enforced instruction budget (default 1 billion). This
+//!   is the only CPU bound — see the wall-clock caveat below.
+//! - **No host environment leak**: the guest WASI environment is empty; host
+//!   env vars (including secrets) are NOT inherited. stdout is captured;
+//!   stderr is inherited (output only).
+//! - **No filesystem access**: no directories are preopened, so the guest has
+//!   no host filesystem capability.
+//!
+//! # NOT yet enforced (deferred to ft-rxk40, the crate-wiring effort)
+//!
+//! Do not rely on these — they are intentionally absent until the engine is
+//! wired:
+//! - **Wall-clock timeout**: `max_execution_time` is reported in
+//!   [`EngineCapabilities`] but NOT enforced. A host-call or busy stall that
+//!   does not burn fuel has no wall-clock bound (no epoch interruption /
+//!   watchdog). Only fuel-based CPU limiting applies.
+//! - **Capability / permission enforcement**: the manifest `[permissions]`
+//!   allow-list and the [`crate::sandbox::SandboxEnforcer`] + `ft_*` host API
+//!   (`wasm_host`) are NOT registered into this engine's linker — the engine
+//!   only adds the WASI p1 linker. Manifest permissions are not consulted at
+//!   runtime here.
+//! - **Manifest environment allow-list**: not plumbed into the WASI context
+//!   (the guest simply gets no env at all, which is the safe default).
 
 use crate::ScriptingEngine;
 use crate::types::{
@@ -53,6 +74,8 @@ impl Default for WasmEngineConfig {
 pub(crate) struct WasmState {
     wasi: WasiP1Ctx,
     stdout: MemoryOutputPipe,
+    /// Per-store resource limiter enforcing the memory cap (ft-0dki4).
+    limits: StoreLimits,
 }
 
 impl WasmState {
@@ -105,8 +128,13 @@ impl WasmEngine {
     /// Build a fresh WASI context for a module invocation.
     fn build_wasi_ctx(&self) -> Result<(WasiP1Ctx, MemoryOutputPipe)> {
         let stdout = MemoryOutputPipe::new(MAX_STDOUT_CAPTURE_BYTES);
+        // ft-0dki4: do NOT inherit the host environment. `inherit_env()` copied
+        // every host env var (including secrets) into the guest WASI environ,
+        // readable via `environ_get` — a host→guest confidentiality leak that
+        // ignored the manifest environment allow-list. The guest gets no env;
+        // the manifest allow-list will be plumbed here when the capability
+        // enforcer is wired (ft-rxk40).
         let wasi = WasiCtxBuilder::new()
-            .inherit_env()
             .stdout(stdout.clone())
             .inherit_stderr()
             .build_p1();
@@ -119,9 +147,23 @@ impl WasmEngine {
             .map_err(|err| err.context("failed to compile WASM module"))?)
     }
 
-    /// Create a store with fuel and memory limits.
+    /// Create a store with enforced fuel and memory limits.
     fn create_store(&self, wasi: WasiP1Ctx, stdout: MemoryOutputPipe) -> Store<WasmState> {
-        let mut store = Store::new(&self.engine, WasmState { wasi, stdout });
+        // ft-0dki4: enforce the advertised per-module memory cap. Without a
+        // ResourceLimiter a module could grow linear memory to the wasm32
+        // 4 GiB ceiling regardless of `max_memory_bytes`.
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(self.config.max_memory_bytes)
+            .build();
+        let mut store = Store::new(
+            &self.engine,
+            WasmState {
+                wasi,
+                stdout,
+                limits,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
         store.set_fuel(self.config.fuel_per_call).ok();
         store
     }
@@ -711,6 +753,87 @@ mod tests {
             }
             other => std::panic::panic_any(format!("expected object config, got {other:?}")),
         }
+    }
+
+    #[test]
+    fn wasm_memory_limit_is_enforced_ft_0dki4() {
+        // ft-0dki4: the advertised per-module memory cap must be ENFORCED by the
+        // StoreLimits resource limiter installed in create_store. A module
+        // declaring more linear memory than `max_memory_bytes` must be rejected
+        // at instantiation; without the limiter wasmtime honors the declaration
+        // up to the wasm32 4 GiB ceiling.
+        fn module_with_memory_min(pages: u32) -> Vec<u8> {
+            let mut module = b"\0asm\x01\0\0\0".to_vec();
+            let mut mem = Vec::new();
+            push_uleb_u32(&mut mem, 1); // one memory
+            mem.push(0x00); // limits flag: min only
+            push_uleb_u32(&mut mem, pages);
+            push_section(&mut module, 5, &mem);
+            module
+        }
+
+        let engine = WasmEngine::with_defaults().unwrap(); // 64 MiB cap = 1024 pages
+        let dir = tempfile::tempdir().unwrap();
+
+        // 2048 pages = 128 MiB > 64 MiB cap -> rejected by the limiter.
+        let big = dir.path().join("big_mem.wasm");
+        std::fs::write(&big, module_with_memory_min(2048)).unwrap();
+        let big_err = engine
+            .eval_config(&big)
+            .expect_err("oversized-memory module must be rejected");
+        let big_msg = format!("{big_err:?}").to_lowercase();
+        assert!(
+            big_msg.contains("memor") || big_msg.contains("limit") || big_msg.contains("exceed"),
+            "oversized module must fail on the memory limiter, got: {big_msg}"
+        );
+
+        // Control: an under-cap module gets PAST the limiter (it then fails only
+        // for lacking configure()/_start()). This proves the limiter rejects on
+        // size, not unconditionally — and would FAIL if the limiter were dropped
+        // (the big module would then also reach the missing-exports path).
+        let small = dir.path().join("small_mem.wasm");
+        std::fs::write(&small, module_with_memory_min(1)).unwrap();
+        let small_err = engine
+            .eval_config(&small)
+            .expect_err("module without exports must error");
+        let small_msg = format!("{small_err:?}").to_lowercase();
+        assert!(
+            !small_msg.contains("memor")
+                && !small_msg.contains("limit")
+                && !small_msg.contains("exceed"),
+            "under-cap module must pass the memory limiter, got: {small_msg}"
+        );
+    }
+
+    #[test]
+    fn wasm_engine_does_not_leak_host_env_ft_0dki4() {
+        // ft-0dki4 regression guard: the WASI context must not inherit the host
+        // environment (it copied host secrets into the guest environ), and the
+        // store must install a memory limiter. Source-level so it holds without
+        // a WAT toolchain dependency.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/wasm_engine.rs"
+        ))
+        .expect("read wasm_engine.rs source");
+        // Needles are assembled from fragments so this guard does not match its
+        // own assertion text — only genuine production callsites count.
+        let inherit_env_call = concat!(".inherit", "_env(");
+        let limiter_call = concat!(".limit", "er(");
+        let limits_builder = concat!("StoreLimits", "Builder");
+        let memory_size_call = concat!("memory", "_size(");
+        assert!(
+            !src.contains(inherit_env_call),
+            "ft-0dki4 regression: WASI ctx must NOT inherit the host environment \
+             (leaks host secrets into the guest via environ_get)"
+        );
+        assert!(
+            src.contains(limiter_call)
+                && src.contains(limits_builder)
+                && src.contains(memory_size_call),
+            "ft-0dki4 regression: create_store must install a StoreLimits memory limiter \
+             capping memory_size"
+        );
     }
 
     #[test]

@@ -1,8 +1,15 @@
 //! Host function definitions for WASM extensions.
 //!
 //! These functions form the FrankenTerm API that WASM extensions can call.
-//! Each function is registered with the wasmtime `Linker` and dispatches
-//! through the sandbox enforcer for permission checks and audit logging.
+//! When registered via [`register_host_functions`], each dispatches through the
+//! [`SandboxEnforcer`] for permission checks and audit logging.
+//!
+//! NOTE (ft-0dki4): this host API is NOT yet wired into [`crate::WasmEngine`] —
+//! the engine's linker currently adds only the WASI p1 surface, so these
+//! `ft_*` functions and their permission/audit dispatch are not reachable by
+//! modules the engine runs. Wiring `register_host_functions` (and a
+//! per-extension enforcer built from the manifest `[permissions]`) into the
+//! engine is tracked by ft-rxk40.
 
 use crate::audit::AuditOutcome;
 use crate::sandbox::SandboxEnforcer;
