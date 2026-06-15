@@ -52,9 +52,8 @@ fn append_rejects_duplicate_correlation_id() {
 fn distinct_correlation_ids_are_all_accepted() {
     let mut journal = MissionJournal::new(MissionId("m-distinct".into()));
     for i in 0..10_i64 {
-        journal
-            .append(marker(), format!("cid-{i}"), "op", "test", None, 1_000 + i)
-            .unwrap_or_else(|e| panic!("distinct cid-{i} must be accepted: {e:?}"));
+        let appended = journal.append(marker(), format!("cid-{i}"), "op", "test", None, 1_000 + i);
+        assert!(appended.is_ok(), "distinct cid-{i} must be accepted: {appended:?}");
     }
     assert_eq!(journal.len(), 10, "ten distinct correlation_ids → ten entries");
 }
