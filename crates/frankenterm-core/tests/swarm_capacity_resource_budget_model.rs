@@ -14,6 +14,7 @@ use serde_json::Value;
 const GIB: u64 = 1024 * 1024 * 1024;
 const FIXTURE_GENERATED_AT_MS: u64 = 1_700_000_000_000;
 const CAPACITY_ENVELOPE_REL_PATH: &str = "docs/attestations/perf/swarm-capacity-envelope.json";
+const TARGET_CLASS_RUNNER_REL_PATH: &str = "scripts/run-target-class-cockpit.sh";
 const TARGET_CLASS_SUMMARY_FALLBACK: &str = r#"{
   "status": "skipped_not_proven",
   "hardware_predicate": {
@@ -54,8 +55,8 @@ fn capacity_envelope_path() -> PathBuf {
 }
 
 fn parse_json_text(path: &Path, text: &str) -> Value {
-    serde_json::from_str(text)
-        .unwrap_or_else(|err| panic!("failed to parse JSON {}: {err}", path.display()))
+    let context = format!("failed to parse JSON {}", path.display());
+    serde_json::from_str(text).expect(&context)
 }
 
 fn load_target_class_summary() -> Value {
@@ -68,8 +69,8 @@ fn load_target_class_summary() -> Value {
 
 fn load_capacity_envelope() -> Value {
     let path = capacity_envelope_path();
-    let text = fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let context = format!("failed to read {}", path.display());
+    let text = fs::read_to_string(&path).expect(&context);
     parse_json_text(&path, &text)
 }
 
@@ -78,9 +79,15 @@ fn load_manifest() -> Value {
         .join("docs")
         .join("attestations")
         .join("manifest.json");
-    let text = fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let context = format!("failed to read {}", path.display());
+    let text = fs::read_to_string(&path).expect(&context);
     parse_json_text(&path, &text)
+}
+
+fn load_text(rel_path: &str) -> String {
+    let path = workspace_root().join(rel_path);
+    let context = format!("failed to read {}", path.display());
+    fs::read_to_string(&path).expect(&context)
 }
 
 fn subsystem_budget(
@@ -90,7 +97,7 @@ fn subsystem_budget(
     plan.subsystem_budgets
         .iter()
         .find(|row| row.subsystem == subsystem)
-        .unwrap_or_else(|| panic!("missing subsystem row {subsystem:?}"))
+        .expect("missing subsystem row")
 }
 
 #[test]
@@ -250,6 +257,42 @@ fn skipped_target_class_artifact_does_not_grant_high_core_budget() {
     assert!(
         subsystem_budget(&plan, SwarmCapacityBudgetSubsystem::BuildSlots).budget
             < subsystem_budget(high_core, SwarmCapacityBudgetSubsystem::BuildSlots).budget
+    );
+}
+
+#[test]
+fn target_class_runner_requires_rehearsal_and_bench_budget_lanes_before_signing() {
+    let runner = load_text(TARGET_CLASS_RUNNER_REL_PATH);
+
+    assert!(
+        runner.contains("scripts/high-scale-rehearsal.sh"),
+        "target-class runner must execute the W9.3 rehearsal before signing"
+    );
+    assert!(
+        runner.contains("scripts/check_bench_budgets.sh"),
+        "target-class runner must execute the real Criterion budget lane before signing"
+    );
+    assert!(
+        runner.contains("FT_BENCH_BUDGETS_TARGET_DIR"),
+        "target-class runner must isolate the benchmark target directory"
+    );
+    assert!(
+        runner.contains("benches: ["),
+        "target-class summary must expose a benches[] block"
+    );
+    assert!(
+        runner.contains("and $bench_budget_status == \"passed\""),
+        "ready_to_sign must be gated by the benchmark budget verdict"
+    );
+    assert!(
+        runner.contains("and $high_scale_rehearsal_status == \"passed\""),
+        "ready_to_sign must be gated by the W9.3 rehearsal verdict"
+    );
+    assert!(
+        !runner.contains(
+            "ready_to_sign: ($status == \"passed\" and $proof_status == \"proven_predicate_met\"),"
+        ),
+        "ready_to_sign must not regress to conformance-only target-class signing"
     );
 }
 

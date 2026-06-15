@@ -34,8 +34,9 @@ FT_TARGET_CLASS_SKU=linux-x86_64-high-core FT_TARGET_CLASS_PREFLIGHT_ONLY=1 \
   scripts/run-target-class-cockpit.sh
 
 # 3. Run on the rented 64-CPU/256-GiB box. Fails fast with a clear message if
-#    the host misses the floor; on a conforming host it runs the cockpit
-#    conformance lane and emits a NON-skipped, signable summary.json.
+#    the host misses the floor; on a conforming high-scale host it runs the
+#    W9.3 rehearsal, Criterion benchmark-budget lane, and cockpit conformance
+#    lane before emitting a NON-skipped, signable summary.json.
 FT_TARGET_CLASS_SKU=linux-x86_64-high-core FT_TARGET_CLASS_ALLOW_SKIP=0 \
   scripts/run-target-class-cockpit.sh
 ```
@@ -45,14 +46,20 @@ predicate preflight (observed vs required, per-check pass/fail, conforming
 verdict). If the selected SKU predicate is absent it writes a
 `skipped_not_proven` summary; with `FT_TARGET_CLASS_ALLOW_SKIP=0` it instead
 fails fast and refuses to emit a non-proven artifact. If the predicate is
-present it drives the existing RCH-backed cockpit conformance lane in
-`tests/e2e/test_ft_rz0eb_4_resource_cockpit_conformance.sh`.
+present it drives the existing W9.3 rehearsal, RCH-backed benchmark-budget
+lane, and cockpit conformance lane:
+
+- `scripts/high-scale-rehearsal.sh` for the bounded high-scale rehearsal
+  receipt;
+- `scripts/check_bench_budgets.sh` for the real Criterion budget gate;
+- `tests/e2e/test_ft_rz0eb_4_resource_cockpit_conformance.sh` for schema and
+  runtime cockpit conformance.
 
 On a conforming run the emitted `summary.json` carries `ready_to_sign: true`
 (set only when `status == "passed"` and
-`hardware_predicate.proof_status == "proven_predicate_met"`), so the signing
-step is push-button. A skipped or failed artifact always reports
-`ready_to_sign: false`.
+`hardware_predicate.proof_status == "proven_predicate_met"` and every required
+lane reports `passed`), so the signing step is push-button. A skipped, failed,
+or conformance-only artifact always reports `ready_to_sign: false`.
 
 ## Major SKUs
 
@@ -66,6 +73,10 @@ Full target-class proof requires both:
 - a retained artifact under the SKU path above, with
   `hardware_predicate.proof_status = "proven_predicate_met"` and
   `evidence.high_scale_claim_allowed = true`;
+- a retained benchmark budget report in the artifact's `benches[]` block with
+  `status = "passed"`;
+- a retained W9.3 rehearsal summary in the artifact's `rehearsals[]` block with
+  `status = "passed"`;
 - a retained cockpit conformance summary from the RCH-backed
   `ft-rz0eb.4` lane linked through `evidence.conformance_summary`.
 

@@ -16,8 +16,9 @@
 #     BEFORE paying for the full run.
 #   run (rented target-class box): FT_TARGET_CLASS_ALLOW_SKIP=0. Fails fast with
 #     a clear message if the host misses the SKU floor; on a conforming host it
-#     runs the cockpit conformance suite and emits a NON-skipped, signable
-#     summary.json (ready_to_sign=true on pass).
+#     runs the W9.3 rehearsal, benchmark budget lane, and cockpit conformance
+#     suite, then emits a NON-skipped, signable summary.json
+#     (ready_to_sign=true only when all required lanes pass).
 #
 # Operator command for the rented 64-CPU/256-GiB box (see
 # docs/perf/target-class-hardware.md):
@@ -71,6 +72,12 @@ SUMMARY_FILE="${ARTIFACT_DIR}/summary.json"
 HOST_FILE="${ARTIFACT_DIR}/host.json"
 COMMANDS_FILE="${ARTIFACT_DIR}/commands.txt"
 CONFORMANCE_LOG="${ARTIFACT_DIR}/resource-cockpit-conformance.log"
+HIGH_SCALE_REHEARSAL_DIR="${ARTIFACT_DIR}/high-scale-rehearsal"
+HIGH_SCALE_REHEARSAL_LOG="${ARTIFACT_DIR}/high-scale-rehearsal.log"
+HIGH_SCALE_REHEARSAL_VERIFY_LOG="${ARTIFACT_DIR}/high-scale-rehearsal-verify.log"
+BENCH_BUDGET_LOG="${ARTIFACT_DIR}/bench-budget.log"
+BENCH_BUDGET_REPORT="${ARTIFACT_DIR}/bench-budget-report.json"
+BENCH_BUDGET_TARGET_DIR="${FT_TARGET_CLASS_BENCH_TARGET_DIR:-target/ft-target-class-bench-${RUN_ID}}"
 RCH_CAPABILITIES_FILE="${ARTIFACT_DIR}/rch-worker-capabilities.json"
 RCH_CAPABILITIES_STDERR="${ARTIFACT_DIR}/rch-worker-capabilities.stderr.log"
 mkdir -p "${ARTIFACT_DIR}"
@@ -219,6 +226,11 @@ if [[ "${FT_TARGET_CLASS_SKIP_RCH_CAPABILITIES:-0}" != "1" ]] && command -v rch 
   fi
 fi
 
+HIGH_SCALE_REHEARSAL_STATUS="not_run"
+HIGH_SCALE_REHEARSAL_SUMMARY_PATH=""
+BENCH_BUDGET_STATUS="not_run"
+BENCH_BUDGET_SUMMARY_PATH=""
+
 write_summary() {
   local status="$1"
   local conformance_status="$2"
@@ -239,6 +251,11 @@ write_summary() {
     --arg target_hardware_status "${TARGET_HARDWARE_STATUS}" \
     --arg conformance_status "${conformance_status}" \
     --arg conformance_summary_path "${conformance_summary_path}" \
+    --arg high_scale_rehearsal_status "${HIGH_SCALE_REHEARSAL_STATUS}" \
+    --arg high_scale_rehearsal_summary_path "${HIGH_SCALE_REHEARSAL_SUMMARY_PATH}" \
+    --arg bench_budget_status "${BENCH_BUDGET_STATUS}" \
+    --arg bench_budget_summary_path "${BENCH_BUDGET_SUMMARY_PATH}" \
+    --arg bench_budget_target_dir "${BENCH_BUDGET_TARGET_DIR}" \
     --arg rch_capabilities_status "${RCH_CAPABILITIES_STATUS}" \
     --argjson exit_code "${exit_code}" \
     --arg os_family "${OS_FAMILY}" \
@@ -276,7 +293,13 @@ write_summary() {
       run_id: $run_id,
       status: $status,
       exit_code: $exit_code,
-      ready_to_sign: ($status == "passed" and $proof_status == "proven_predicate_met"),
+      ready_to_sign: (
+        $status == "passed"
+        and $proof_status == "proven_predicate_met"
+        and $conformance_status == "passed"
+        and $bench_budget_status == "passed"
+        and $high_scale_rehearsal_status == "passed"
+      ),
       artifact_dir: $artifact_dir,
       sku: {
         id: $sku_id,
@@ -340,11 +363,40 @@ write_summary() {
         high_scale_claim_allowed: $high_scale_claim_allowed,
         conformance: $conformance_status,
         conformance_summary: (if $conformance_summary_path == "" then null else $conformance_summary_path end),
+        high_scale_rehearsal: $high_scale_rehearsal_status,
+        high_scale_rehearsal_summary: (if $high_scale_rehearsal_summary_path == "" then null else $high_scale_rehearsal_summary_path end),
+        bench_budget: $bench_budget_status,
+        bench_budget_report: (if $bench_budget_summary_path == "" then null else $bench_budget_summary_path end),
         rch_capabilities: {
           status: $rch_capabilities_status,
           max_worker_logical_cpus: $rch_max_logical_cpus
         }
       },
+      benches: [
+        {
+          id: "criterion_budget_gate",
+          kind: "criterion_budget",
+          synthetic: false,
+          status: $bench_budget_status,
+          command: "scripts/check_bench_budgets.sh",
+          report: (if $bench_budget_summary_path == "" then null else $bench_budget_summary_path end),
+          log: "bench-budget.log",
+          cargo_target_dir: $bench_budget_target_dir,
+          gates_ready_to_sign: true
+        }
+      ],
+      rehearsals: [
+        {
+          id: "w9_3_high_scale_rehearsal",
+          synthetic: true,
+          status: $high_scale_rehearsal_status,
+          command: "scripts/high-scale-rehearsal.sh",
+          summary: (if $high_scale_rehearsal_summary_path == "" then null else $high_scale_rehearsal_summary_path end),
+          log: "high-scale-rehearsal.log",
+          verify_log: "high-scale-rehearsal-verify.log",
+          gates_ready_to_sign: true
+        }
+      ],
       release_bundle_gate: {
         requires_artifact_per_major_sku: true,
         major_sku: $major_sku,
@@ -355,9 +407,76 @@ write_summary() {
         commands: "commands.txt",
         rch_worker_capabilities: "rch-worker-capabilities.json",
         rch_worker_capabilities_stderr: "rch-worker-capabilities.stderr.log",
-        conformance_log: "resource-cockpit-conformance.log"
+        conformance_log: "resource-cockpit-conformance.log",
+        high_scale_rehearsal_log: "high-scale-rehearsal.log",
+        high_scale_rehearsal_verify_log: "high-scale-rehearsal-verify.log",
+        high_scale_rehearsal_summary: "high-scale-rehearsal/rehearsal-summary.json",
+        bench_budget_log: "bench-budget.log",
+        bench_budget_report: "bench-budget-report.json"
       }
     }' >"${SUMMARY_FILE}"
+}
+
+run_high_scale_rehearsal() {
+  record_command "scripts/high-scale-rehearsal.sh --out-dir ${HIGH_SCALE_REHEARSAL_DIR} --run-id ${RUN_ID}"
+  set +e
+  "${ROOT_DIR}/scripts/high-scale-rehearsal.sh" \
+    --out-dir "${HIGH_SCALE_REHEARSAL_DIR}" \
+    --run-id "${RUN_ID}" >"${HIGH_SCALE_REHEARSAL_LOG}" 2>&1
+  local rehearsal_rc=$?
+  set -e
+  HIGH_SCALE_REHEARSAL_SUMMARY_PATH="${HIGH_SCALE_REHEARSAL_DIR}/rehearsal-summary.json"
+  if [[ "${rehearsal_rc}" -ne 0 ]]; then
+    HIGH_SCALE_REHEARSAL_STATUS="failed"
+    return "${rehearsal_rc}"
+  fi
+
+  record_command "scripts/high-scale-rehearsal.sh --verify ${HIGH_SCALE_REHEARSAL_DIR}"
+  set +e
+  "${ROOT_DIR}/scripts/high-scale-rehearsal.sh" \
+    --verify "${HIGH_SCALE_REHEARSAL_DIR}" >"${HIGH_SCALE_REHEARSAL_VERIFY_LOG}" 2>&1
+  local verify_rc=$?
+  set -e
+  if [[ "${verify_rc}" -ne 0 ]]; then
+    HIGH_SCALE_REHEARSAL_STATUS="failed"
+    return "${verify_rc}"
+  fi
+
+  HIGH_SCALE_REHEARSAL_STATUS="passed"
+  return 0
+}
+
+run_bench_budget_lane() {
+  record_command "FT_BENCH_BUDGETS_TARGET_DIR=${BENCH_BUDGET_TARGET_DIR} scripts/check_bench_budgets.sh"
+  set +e
+  FT_BENCH_BUDGETS_TARGET_DIR="${BENCH_BUDGET_TARGET_DIR}" \
+    "${ROOT_DIR}/scripts/check_bench_budgets.sh" >"${BENCH_BUDGET_LOG}" 2>&1
+  local bench_rc=$?
+  set -e
+
+  local generated_report="${ROOT_DIR}/${BENCH_BUDGET_TARGET_DIR}/criterion/ft-budget-report.json"
+  if [[ -f "${generated_report}" ]]; then
+    cp "${generated_report}" "${BENCH_BUDGET_REPORT}"
+    BENCH_BUDGET_SUMMARY_PATH="${BENCH_BUDGET_REPORT}"
+  fi
+
+  if [[ "${bench_rc}" -ne 0 ]]; then
+    BENCH_BUDGET_STATUS="failed"
+    return "${bench_rc}"
+  fi
+  if [[ -z "${BENCH_BUDGET_SUMMARY_PATH}" ]]; then
+    BENCH_BUDGET_STATUS="failed_missing_report"
+    return 1
+  fi
+  if ! jq -e '.format == "ft-budget-report" and .total > 0 and .fail == 0' \
+    "${BENCH_BUDGET_SUMMARY_PATH}" >/dev/null 2>&1
+  then
+    BENCH_BUDGET_STATUS="failed"
+    return 1
+  fi
+
+  BENCH_BUDGET_STATUS="passed"
+  return 0
 }
 
 record_command "scripts/run-target-class-cockpit.sh FT_TARGET_CLASS_SKU=${SKU_ID}"
@@ -391,6 +510,8 @@ print_preflight_report
 # Preflight-only gate: let the operator confirm a rented box BEFORE the long run.
 # Writes a complete (skipped) artifact, then exits 0 when eligible, non-zero when not.
 if [[ "${FT_TARGET_CLASS_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  HIGH_SCALE_REHEARSAL_STATUS="not_run_preflight_only"
+  BENCH_BUDGET_STATUS="not_run_preflight_only"
   write_summary "skipped_not_proven" "not_run_preflight_only" "" 0
   printf 'summary=%s\n' "${SUMMARY_FILE}"
   if [[ "${HIGH_SCALE_PREDICATE_MET}" == "true" ]]; then
@@ -402,6 +523,8 @@ if [[ "${FT_TARGET_CLASS_PREFLIGHT_ONLY:-0}" == "1" ]]; then
 fi
 
 if [[ "${TARGET_SKU_MATCHED}" != "true" ]]; then
+  HIGH_SCALE_REHEARSAL_STATUS="not_run_predicate_absent"
+  BENCH_BUDGET_STATUS="not_run_predicate_absent"
   write_summary "skipped_not_proven" "not_run_predicate_absent" "" 0
   printf 'summary=%s\n' "${SUMMARY_FILE}"
   if [[ "${ALLOW_SKIP}" == "1" ]]; then
@@ -428,12 +551,36 @@ if [[ -n "${conformance_summary_path}" && -f "${conformance_summary_path}" ]]; t
   conformance_status="$(jq -r '.status // "failed"' "${conformance_summary_path}" 2>/dev/null || printf 'failed')"
 fi
 
-if [[ "${conformance_rc}" -eq 0 && "${conformance_status}" == "passed" ]]; then
+rehearsal_rc=0
+bench_rc=0
+if [[ "${HIGH_SCALE_SKU}" == "true" ]]; then
+  run_high_scale_rehearsal || rehearsal_rc=$?
+  run_bench_budget_lane || bench_rc=$?
+else
+  HIGH_SCALE_REHEARSAL_STATUS="not_required_for_non_high_scale_sku"
+  BENCH_BUDGET_STATUS="not_required_for_non_high_scale_sku"
+fi
+
+if [[ "${conformance_rc}" -eq 0 \
+   && "${conformance_status}" == "passed" \
+   && "${rehearsal_rc}" -eq 0 \
+   && "${bench_rc}" -eq 0 ]]; then
   write_summary "passed" "passed" "${conformance_summary_path}" 0
   printf 'summary=%s\n' "${SUMMARY_FILE}"
   exit 0
 fi
 
-write_summary "failed" "${conformance_status}" "${conformance_summary_path}" "${conformance_rc}"
+failure_rc="${conformance_rc}"
+if [[ "${failure_rc}" -eq 0 && "${rehearsal_rc}" -ne 0 ]]; then
+  failure_rc="${rehearsal_rc}"
+fi
+if [[ "${failure_rc}" -eq 0 && "${bench_rc}" -ne 0 ]]; then
+  failure_rc="${bench_rc}"
+fi
+if [[ "${failure_rc}" -eq 0 ]]; then
+  failure_rc=1
+fi
+
+write_summary "failed" "${conformance_status}" "${conformance_summary_path}" "${failure_rc}"
 printf 'summary=%s\n' "${SUMMARY_FILE}"
-exit "${conformance_rc}"
+exit "${failure_rc}"
