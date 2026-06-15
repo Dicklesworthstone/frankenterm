@@ -396,6 +396,23 @@ pub enum ElementContent {
     Poly { line_width: isize, poly: SizedPoly },
 }
 
+fn text_from_glyph_cluster(text: &str, cluster: u32) -> anyhow::Result<&str> {
+    let offset = usize::try_from(cluster).map_err(|_| {
+        anyhow!(
+            "glyph cluster offset {} cannot be represented as usize for text length {}",
+            cluster,
+            text.len()
+        )
+    })?;
+    text.get(offset..).ok_or_else(|| {
+        anyhow!(
+            "glyph cluster offset {} is outside text length {} or not on a UTF-8 boundary",
+            offset,
+            text.len()
+        )
+    })
+}
+
 pub struct LayoutContext<'a> {
     pub width: DimensionContext,
     pub height: DimensionContext,
@@ -618,7 +635,7 @@ impl super::TermWindow {
                 let max_x = context.bounds.min_x() + max_width;
 
                 for info in infos {
-                    let cell_start = &s[info.cluster as usize..];
+                    let cell_start = text_from_glyph_cluster(s, info.cluster)?;
                     let mut iter = Graphemes::new(cell_start).peekable();
                     let grapheme = iter
                         .next()
@@ -1241,5 +1258,31 @@ impl super::TermWindow {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_from_glyph_cluster;
+
+    #[test]
+    fn text_from_glyph_cluster_accepts_valid_boundary() {
+        assert_eq!(text_from_glyph_cluster("aéz", 1).unwrap(), "éz");
+        assert_eq!(text_from_glyph_cluster("aéz", 3).unwrap(), "z");
+    }
+
+    #[test]
+    fn text_from_glyph_cluster_rejects_out_of_range_offset() {
+        let err = text_from_glyph_cluster("abc", 4).unwrap_err();
+        assert!(
+            err.to_string().contains("outside text length 3"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn text_from_glyph_cluster_rejects_mid_codepoint_offset() {
+        let err = text_from_glyph_cluster("é", 1).unwrap_err();
+        assert!(err.to_string().contains("UTF-8 boundary"), "{err:#}");
     }
 }
