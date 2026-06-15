@@ -328,7 +328,7 @@ impl Modal for PaneSelector {
             *self.labels.borrow_mut() = labels;
         }
         Ok(Ref::map(self.element.borrow(), |v| {
-            v.as_ref().map_or(&[], Vec::as_slice)
+            v.as_deref().unwrap_or(&[])
         }))
     }
 
