@@ -1580,21 +1580,29 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     #[cfg(feature = "distributed")]
+    fn must_err<T, E>(result: Result<T, E>, message: &str) -> E {
+        assert!(result.is_err(), "{message}");
+        result.err().expect("asserted error result")
+    }
+
+    #[cfg(feature = "distributed")]
     fn identity_cert_der(common_name: &str, subject_alt_names: &[&str]) -> CertificateDer<'static> {
         let mut params = rcgen::CertificateParams::new(
             subject_alt_names
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect::<Vec<_>>(),
-        );
+        )
+        .expect("identity cert params");
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, common_name);
-        rcgen::Certificate::from_params(params)
-            .expect("identity cert")
-            .serialize_der()
+        let signing_key = rcgen::KeyPair::generate().expect("identity cert key");
+        params
+            .self_signed(&signing_key)
             .expect("identity cert der")
-            .into()
+            .der()
+            .clone()
     }
 
     #[cfg(feature = "distributed")]
@@ -2212,12 +2220,12 @@ KBAhs4snj5QspGFqkazmIw==
         #[test]
         fn token_parts_parse_round_trip_with_identity(
             identity in "[a-zA-Z0-9_-]{1,12}",
-            secret in "[a-zA-Z0-9_-]{1,24}"
+            credential in "[a-zA-Z0-9_-]{1,24}"
         ) {
-            let token = format!("{identity}:{secret}");
-            let parts = TokenParts::parse(&token).expect("valid identity token");
+            let encoded = [identity.as_str(), credential.as_str()].join(":");
+            let parts = TokenParts::parse(&encoded).expect("valid identity token");
             prop_assert_eq!(parts.identity, Some(identity.as_str()));
-            prop_assert_eq!(parts.secret, secret.as_str());
+            prop_assert_eq!(parts.secret, credential.as_str());
         }
 
         #[test]
@@ -3126,7 +3134,7 @@ KBAhs4snj5QspGFqkazmIw==
     }
 
     // Fail-open regression: validate_token must NOT authenticate an empty
-    // EXPECTED secret. Pre-fix, expected_token=Some("") passed the None check
+    // configured credential. Pre-fix, an empty configured value passed the None check
     // and constant_time_eq("","") returned true, so a blank/unconfigured token
     // (env var or file resolving to "") authenticated any empty presented token
     // while auth appeared enabled.
@@ -3361,10 +3369,7 @@ KBAhs4snj5QspGFqkazmIw==
             ..Default::default()
         };
         // tls.enabled is left as default (false).
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("disabled TLS must fail"),
-            Err(e) => e,
-        };
+        let err = must_err(build_tls_bundle(&config, None), "disabled TLS must fail");
         assert!(
             matches!(err, DistributedTlsError::TlsDisabled),
             "TLS disabled must surface TlsDisabled variant; got: {err:?}"
@@ -3381,10 +3386,7 @@ KBAhs4snj5QspGFqkazmIw==
         config.tls.enabled = true;
         config.tls.key_path = Some("/dev/null".to_string()); // populated
         // cert_path intentionally left None.
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("missing cert must fail"),
-            Err(e) => e,
-        };
+        let err = must_err(build_tls_bundle(&config, None), "missing cert must fail");
         assert!(
             matches!(err, DistributedTlsError::MissingCertPath),
             "missing cert path must surface MissingCertPath variant; got: {err:?}"
@@ -3401,10 +3403,7 @@ KBAhs4snj5QspGFqkazmIw==
         config.tls.enabled = true;
         config.tls.cert_path = Some("/dev/null".to_string()); // populated
         // key_path intentionally left None.
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("missing key must fail"),
-            Err(e) => e,
-        };
+        let err = must_err(build_tls_bundle(&config, None), "missing key must fail");
         assert!(
             matches!(err, DistributedTlsError::MissingKeyPath),
             "missing key path must surface MissingKeyPath variant; got: {err:?}"
@@ -3523,10 +3522,10 @@ KBAhs4snj5QspGFqkazmIw==
         config.tls.key_path = Some(server_key.path().display().to_string());
         // client_ca_path intentionally left as None.
 
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("mTLS without client CA path must fail"),
-            Err(e) => e,
-        };
+        let err = must_err(
+            build_tls_bundle(&config, None),
+            "mTLS without client CA path must fail",
+        );
         assert!(
             matches!(err, DistributedTlsError::MissingClientCaPath),
             "mTLS without client CA must surface MissingClientCaPath variant; got: {err:?}"
@@ -3560,18 +3559,16 @@ KBAhs4snj5QspGFqkazmIw==
         config.tls.cert_path = Some(empty_cert.path().display().to_string());
         config.tls.key_path = Some(server_key.path().display().to_string());
 
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("empty cert PEM must fail"),
-            Err(e) => e,
-        };
-        match err {
-            DistributedTlsError::EmptyCertChain(path) => {
-                assert!(
-                    path.contains(empty_cert.path().file_name().unwrap().to_str().unwrap()),
-                    "EmptyCertChain must carry the offending path; got: {path}"
-                );
-            }
-            other => panic!("empty cert PEM must surface EmptyCertChain variant; got: {other:?}"),
+        let err = must_err(build_tls_bundle(&config, None), "empty cert PEM must fail");
+        assert!(
+            matches!(&err, DistributedTlsError::EmptyCertChain(_)),
+            "empty cert PEM must surface EmptyCertChain variant; got: {err:?}"
+        );
+        if let DistributedTlsError::EmptyCertChain(path) = err {
+            assert!(
+                path.contains(empty_cert.path().file_name().unwrap().to_str().unwrap()),
+                "EmptyCertChain must carry the offending path; got: {path}"
+            );
         }
     }
 
@@ -3594,20 +3591,19 @@ KBAhs4snj5QspGFqkazmIw==
         config.tls.cert_path = Some(server_cert.path().display().to_string());
         config.tls.key_path = Some(wrong_key.path().display().to_string());
 
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("cert-in-key-slot must fail"),
-            Err(e) => e,
-        };
-        match err {
-            DistributedTlsError::EmptyPrivateKey(path) => {
-                assert!(
-                    path.contains(wrong_key.path().file_name().unwrap().to_str().unwrap()),
-                    "EmptyPrivateKey must carry the offending path; got: {path}"
-                );
-            }
-            other => {
-                panic!("cert-in-key-slot must surface EmptyPrivateKey variant; got: {other:?}")
-            }
+        let err = must_err(
+            build_tls_bundle(&config, None),
+            "cert-in-key-slot must fail",
+        );
+        assert!(
+            matches!(&err, DistributedTlsError::EmptyPrivateKey(_)),
+            "cert-in-key-slot must surface EmptyPrivateKey variant; got: {err:?}"
+        );
+        if let DistributedTlsError::EmptyPrivateKey(path) = err {
+            assert!(
+                path.contains(wrong_key.path().file_name().unwrap().to_str().unwrap()),
+                "EmptyPrivateKey must carry the offending path; got: {path}"
+            );
         }
     }
 
@@ -3633,20 +3629,19 @@ KBAhs4snj5QspGFqkazmIw==
         config.tls.cert_path = Some("/nonexistent/frankenterm-rusticmaple-cert.pem".to_string());
         config.tls.key_path = Some("/nonexistent/frankenterm-rusticmaple-key.pem".to_string());
 
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("nonexistent cert path must fail"),
-            Err(e) => e,
-        };
-        match err {
-            DistributedTlsError::Io { path, source: _ } => {
-                assert!(
-                    path.contains("nonexistent"),
-                    "Io variant must include the offending path; got: {path}"
-                );
-            }
-            other => panic!(
-                "nonexistent cert path must surface Io {{ path, source }} variant; got: {other:?}"
-            ),
+        let err = must_err(
+            build_tls_bundle(&config, None),
+            "nonexistent cert path must fail",
+        );
+        assert!(
+            matches!(&err, DistributedTlsError::Io { .. }),
+            "nonexistent cert path must surface Io {{ path, source }} variant; got: {err:?}"
+        );
+        if let DistributedTlsError::Io { path, source: _ } = err {
+            assert!(
+                path.contains("nonexistent"),
+                "Io variant must include the offending path; got: {path}"
+            );
         }
     }
 
@@ -3671,20 +3666,19 @@ KBAhs4snj5QspGFqkazmIw==
         config.tls.key_path = Some(server_key.path().display().to_string());
         config.tls.min_tls_version = "2.0".to_string();
 
-        let err = match build_tls_bundle(&config, None) {
-            Ok(_) => panic!("unsupported TLS version must fail"),
-            Err(e) => e,
-        };
-        match err {
-            DistributedTlsError::InvalidMinTlsVersion(v) => {
-                assert_eq!(
-                    v, "2.0",
-                    "InvalidMinTlsVersion must carry the offending version string"
-                );
-            }
-            other => panic!(
-                "unsupported TLS version must surface InvalidMinTlsVersion variant; got: {other:?}"
-            ),
+        let err = must_err(
+            build_tls_bundle(&config, None),
+            "unsupported TLS version must fail",
+        );
+        assert!(
+            matches!(&err, DistributedTlsError::InvalidMinTlsVersion(_)),
+            "unsupported TLS version must surface InvalidMinTlsVersion variant; got: {err:?}"
+        );
+        if let DistributedTlsError::InvalidMinTlsVersion(v) = err {
+            assert_eq!(
+                v, "2.0",
+                "InvalidMinTlsVersion must carry the offending version string"
+            );
         }
     }
 
@@ -3704,20 +3698,20 @@ KBAhs4snj5QspGFqkazmIw==
         let name = build_tls_server_name("127.0.0.1:8443").expect("IPv4 literal must parse");
         // ServerName::IpAddress variant is what rustls expects for IP-addressed
         // targets; a ServerName::DnsName would attempt DNS verification and fail.
-        match name {
-            ServerName::IpAddress(_) => {}
-            other => panic!("expected ServerName::IpAddress for IPv4 literal, got: {other:?}"),
-        }
+        assert!(
+            matches!(&name, ServerName::IpAddress(_)),
+            "expected ServerName::IpAddress for IPv4 literal, got: {name:?}"
+        );
     }
 
     #[cfg(feature = "distributed")]
     #[test]
     fn build_tls_server_name_accepts_dns_hostname() {
         let name = build_tls_server_name("example.com:443").expect("DNS hostname must parse");
-        match name {
-            ServerName::DnsName(_) => {}
-            other => panic!("expected ServerName::DnsName for hostname, got: {other:?}"),
-        }
+        assert!(
+            matches!(&name, ServerName::DnsName(_)),
+            "expected ServerName::DnsName for hostname, got: {name:?}"
+        );
     }
 
     #[cfg(feature = "distributed")]
@@ -3729,16 +3723,17 @@ KBAhs4snj5QspGFqkazmIw==
         // that falls through to the literal passthrough branch in
         // `distributed_bind_host` — not the empty-host branch.
         let name = build_tls_server_name("").expect("empty bind defaults to localhost");
-        match name {
-            ServerName::DnsName(dns) => {
-                // The DNS name should be "localhost" (case-insensitive).
-                let as_ref: &str = dns.as_ref();
-                assert!(
-                    as_ref.eq_ignore_ascii_case("localhost"),
-                    "empty host must default to 'localhost'; got: {as_ref:?}"
-                );
-            }
-            other => panic!("expected ServerName::DnsName for defaulted host, got: {other:?}"),
+        assert!(
+            matches!(&name, ServerName::DnsName(_)),
+            "expected ServerName::DnsName for defaulted host, got: {name:?}"
+        );
+        if let ServerName::DnsName(dns) = name {
+            // The DNS name should be "localhost" (case-insensitive).
+            let as_ref: &str = dns.as_ref();
+            assert!(
+                as_ref.eq_ignore_ascii_case("localhost"),
+                "empty host must default to 'localhost'; got: {as_ref:?}"
+            );
         }
     }
 
@@ -3746,10 +3741,10 @@ KBAhs4snj5QspGFqkazmIw==
     #[test]
     fn build_tls_server_name_rejects_invalid_host() {
         // Spaces are invalid in DNS names and not a valid IP literal.
-        let err = match build_tls_server_name("bad host name:443") {
-            Ok(n) => panic!("invalid host must fail; got: {n:?}"),
-            Err(e) => e,
-        };
+        let err = must_err(
+            build_tls_server_name("bad host name:443"),
+            "invalid host must fail",
+        );
         assert!(
             matches!(err, DistributedTlsError::Config(_)),
             "invalid host must surface Config variant; got: {err:?}"
@@ -4591,17 +4586,19 @@ KBAhs4snj5QspGFqkazmIw==
                     "empty-body POST must send `Content-Length: 0` header; got: {req:?}"
                 );
                 // After the CRLF CRLF separator, there must be no body bytes.
-                if let Some(idx) = req.find("\r\n\r\n") {
-                    let after_headers = &req.as_bytes()[idx + 4..];
-                    assert!(
-                        after_headers.iter().all(|b| *b == 0),
-                        "empty-body POST must send zero body bytes after header separator; \
-                         got {} bytes: {after_headers:?}",
-                        after_headers.len()
-                    );
-                } else {
-                    panic!("request did not end with CRLF CRLF separator: {req:?}");
-                }
+                let separator = req.find("\r\n\r\n");
+                assert!(
+                    separator.is_some(),
+                    "request did not end with CRLF CRLF separator: {req:?}"
+                );
+                let idx = separator.expect("asserted request header separator");
+                let after_headers = &req.as_bytes()[idx + 4..];
+                assert!(
+                    after_headers.iter().all(|b| *b == 0),
+                    "empty-body POST must send zero body bytes after header separator; \
+                     got {} bytes: {after_headers:?}",
+                    after_headers.len()
+                );
                 let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
                 stream.write_all(response).await.expect("write response");
                 stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
@@ -4926,13 +4923,16 @@ KBAhs4snj5QspGFqkazmIw==
             // Post-tick-387 shape: Ok(Err(ClientError::Cancelled)) — the
             // outer timeout did NOT fire; the cx-cancel watcher race
             // surfaced the Cancelled variant from the inner client.
-            match result {
-                Ok(Err(asupersync::http::h1::http_client::ClientError::Cancelled)) => {}
-                other => panic!(
-                    "mid-flight cancel must produce Ok(Err(ClientError::Cancelled)) \
-                     post-tick-387 fix; got: {other:?}"
+            assert!(
+                matches!(
+                    &result,
+                    Ok(Err(
+                        asupersync::http::h1::http_client::ClientError::Cancelled
+                    ))
                 ),
-            }
+                "mid-flight cancel must produce Ok(Err(ClientError::Cancelled)) \
+                 post-tick-387 fix; got: {result:?}"
+            );
             eprintln!("tick 380 (post-387): mid-flight cancel elapsed={elapsed:?}");
         });
     }
@@ -4977,13 +4977,14 @@ KBAhs4snj5QspGFqkazmIw==
             let result = race_with_cx_cancel(&cx, never_resolves).await;
             let elapsed = started.elapsed();
 
-            match result {
-                Err(asupersync::http::h1::http_client::ClientError::Cancelled) => {}
-                other => panic!(
-                    "race_with_cx_cancel must return Err(Cancelled) when inner never completes \
-                     and cx is cancelled; got: {other:?}"
+            assert!(
+                matches!(
+                    &result,
+                    Err(asupersync::http::h1::http_client::ClientError::Cancelled)
                 ),
-            }
+                "race_with_cx_cancel must return Err(Cancelled) when inner never completes \
+                 and cx is cancelled; got: {result:?}"
+            );
             assert!(
                 elapsed < std::time::Duration::from_secs(1),
                 "race should fire within ~1s (one 50ms poll cycle post-cancel); took {elapsed:?}"
@@ -5276,13 +5277,16 @@ KBAhs4snj5QspGFqkazmIw==
                 "POST mid-flight cancel should fire within ~1s (tick-387 ft-l9mxa fix); \
                  took {elapsed:?}"
             );
-            match result {
-                Ok(Err(asupersync::http::h1::http_client::ClientError::Cancelled)) => {}
-                other => panic!(
-                    "POST mid-flight cancel must produce Ok(Err(ClientError::Cancelled)); \
-                     got: {other:?}"
+            assert!(
+                matches!(
+                    &result,
+                    Ok(Err(
+                        asupersync::http::h1::http_client::ClientError::Cancelled
+                    ))
                 ),
-            }
+                "POST mid-flight cancel must produce Ok(Err(ClientError::Cancelled)); \
+                 got: {result:?}"
+            );
             eprintln!("tick 389: POST mid-flight cancel elapsed={elapsed:?}");
         });
     }
@@ -5818,9 +5822,11 @@ KBAhs4snj5QspGFqkazmIw==
                 let ua_line = req
                     .lines()
                     .find(|line| line.to_ascii_lowercase().starts_with("user-agent:"));
-                let ua_line = ua_line.unwrap_or_else(|| {
-                    panic!("request must include a User-Agent header; got: {req:?}")
-                });
+                assert!(
+                    ua_line.is_some(),
+                    "request must include a User-Agent header; got: {req:?}"
+                );
+                let ua_line = ua_line.expect("asserted user-agent header");
                 // Value must be non-empty (something after the colon).
                 let colon_idx = ua_line.find(':').expect("user-agent line must have colon");
                 let value = ua_line[colon_idx + 1..].trim();
@@ -6233,13 +6239,14 @@ KBAhs4snj5QspGFqkazmIw==
             // (no TCP connect, no server interaction) — distinct from the
             // mid-flight cancel path (ticks 380 + 389) which also produces
             // Cancelled but via the cancel-watcher race mid-read.
-            match &result {
-                Err(asupersync::http::h1::http_client::ClientError::Cancelled) => {}
-                other => panic!(
-                    "pre-cancelled cx must cause get() to return Err(ClientError::Cancelled) \
-                     (tight contract post tick-387 ft-l9mxa fix), got: {other:?}"
+            assert!(
+                matches!(
+                    &result,
+                    Err(asupersync::http::h1::http_client::ClientError::Cancelled)
                 ),
-            }
+                "pre-cancelled cx must cause get() to return Err(ClientError::Cancelled) \
+                 (tight contract post tick-387 ft-l9mxa fix), got: {result:?}"
+            );
             assert!(
                 elapsed < std::time::Duration::from_secs(1),
                 "pre-cancelled cx should fail nearly instantaneously (no TCP activity); \
@@ -6287,13 +6294,14 @@ KBAhs4snj5QspGFqkazmIw==
             // exact contract post tick-387 ft-l9mxa fix — the pre-flight
             // cx.is_cancel_requested() check at DistributedHttpClient::post
             // entry surfaces ClientError::Cancelled deterministically.
-            match &result {
-                Err(asupersync::http::h1::http_client::ClientError::Cancelled) => {}
-                other => panic!(
-                    "pre-cancelled cx must cause post() to return Err(ClientError::Cancelled) \
-                     (tight contract post tick-387 ft-l9mxa fix), got: {other:?}"
+            assert!(
+                matches!(
+                    &result,
+                    Err(asupersync::http::h1::http_client::ClientError::Cancelled)
                 ),
-            }
+                "pre-cancelled cx must cause post() to return Err(ClientError::Cancelled) \
+                 (tight contract post tick-387 ft-l9mxa fix), got: {result:?}"
+            );
             assert!(
                 elapsed < std::time::Duration::from_secs(1),
                 "pre-cancelled cx should fail nearly instantaneously; took {elapsed:?}"

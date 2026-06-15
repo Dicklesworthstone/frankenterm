@@ -495,6 +495,10 @@ pub const RENDERER_ATLAS_STABILITY_MCP_RESOURCE_URI: &str =
 pub const RENDERER_IDLE_GPU_POWER_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/idle_gpu_power";
 /// Consolidated suite attestation slot (extends the per-SLO render-parity slot).
 pub const RENDERER_SLO_SUITE_ATTESTATION_SLOT: &str = "docs/attestations/tui/render-slo-suite.json";
+/// Current umbrella closeout status for the full five-SLO renderer catalog.
+pub const RENDERER_SLO_SUITE_CLOSEOUT_STATUS: &str = "blocked_pending_missing_retained_runs";
+/// Child beads that still own missing retained target-run evidence.
+pub const RENDERER_SLO_SUITE_CLOSEOUT_BLOCKERS: &[&str] = &["ft-tf6g3.3.8", "ft-tf6g3.3.9"];
 /// Per-PR regression gate threshold: an SLO degrading more than this percentage
 /// fires the SPRT-suppressed regression gate.
 pub const RENDERER_SLO_REGRESSION_GATE_PCT: u32 = 10;
@@ -536,6 +540,12 @@ pub struct RendererSloDoctorReport {
     pub schema_version: String,
     /// Consolidated suite attestation slot covering the full SLO catalog.
     pub suite_attestation_slot: String,
+    /// Umbrella closeout verdict for the five-SLO suite.
+    pub suite_closeout_status: String,
+    /// Child beads or lanes that still block a validated suite closeout.
+    pub suite_closeout_blockers: Vec<String>,
+    /// Human-readable reason for the current umbrella closeout verdict.
+    pub suite_closeout_reason: String,
     /// SPRT-gated per-PR regression threshold shared across SLOs (percent).
     pub regression_gate_pct: u32,
     pub input_to_photon: RendererInputToPhotonSloStatus,
@@ -647,6 +657,13 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
     RendererSloDoctorReport {
         schema_version: RENDERER_SLOS_DOCTOR_SCHEMA_VERSION.to_string(),
         suite_attestation_slot: RENDERER_SLO_SUITE_ATTESTATION_SLOT.to_string(),
+        suite_closeout_status: RENDERER_SLO_SUITE_CLOSEOUT_STATUS.to_string(),
+        suite_closeout_blockers: RENDERER_SLO_SUITE_CLOSEOUT_BLOCKERS
+            .iter()
+            .map(|bead| (*bead).to_string())
+            .collect(),
+        suite_closeout_reason: "input-to-photon and idle-GPU retained target-run evidence remain blocked; the suite must not claim validated closeout until those child lanes land"
+            .to_string(),
         regression_gate_pct: RENDERER_SLO_REGRESSION_GATE_PCT,
         input_to_photon: RendererInputToPhotonSloStatus {
             claim_id: "renderer.input_to_photon_p95".to_string(),
@@ -1144,6 +1161,46 @@ mod tests {
                 "unexpected SLO resource uri: {uri}"
             );
         }
+    }
+
+    #[test]
+    fn renderer_slo_doctor_report_blocks_suite_closeout_until_retained_runs_land() {
+        let report = renderer_slos_doctor_report();
+        assert_eq!(
+            report.suite_closeout_status,
+            RENDERER_SLO_SUITE_CLOSEOUT_STATUS
+        );
+        assert_eq!(
+            report.suite_closeout_blockers,
+            RENDERER_SLO_SUITE_CLOSEOUT_BLOCKERS
+                .iter()
+                .map(|bead| (*bead).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            report
+                .suite_closeout_blockers
+                .contains(&"ft-tf6g3.3.8".to_string()),
+            "input-to-photon retained target-run lane must block umbrella closeout"
+        );
+        assert!(
+            report
+                .suite_closeout_blockers
+                .contains(&"ft-tf6g3.3.9".to_string()),
+            "idle-GPU retained target-run lane must block umbrella closeout"
+        );
+        assert!(
+            !report.suite_closeout_status.contains("validated"),
+            "renderer SLO suite must not claim validated closeout while retained target-run lanes are pending: {}",
+            report.suite_closeout_status
+        );
+        assert!(
+            report
+                .suite_closeout_reason
+                .contains("retained target-run evidence remain blocked"),
+            "suite closeout reason must surface the retained-run gap: {}",
+            report.suite_closeout_reason
+        );
     }
 
     #[test]
