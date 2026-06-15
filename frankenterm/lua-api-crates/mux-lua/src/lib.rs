@@ -109,7 +109,7 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
 
     mux_mod.set(
         "spawn_window",
-        lua.create_async_function(|_, spawn: SpawnWindow| async move { spawn.spawn().await })?,
+        lua.create_function(|_, spawn: SpawnWindow| promise::spawn::block_on(spawn.spawn()))?,
     )?;
 
     mux_mod.set(
@@ -132,7 +132,7 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
                 LuaValue::Nil => Ok(Some(MuxDomain(mux.default_domain().domain_id()))),
                 LuaValue::String(s) => match s.to_str() {
                     Ok(name) => Ok(mux
-                        .get_domain_by_name(name)
+                        .get_domain_by_name(&name)
                         .map(|dom| MuxDomain(dom.domain_id()))),
                     Err(err) => Err(mlua::Error::external(format!(
                         "invalid domain identifier passed to mux.get_domain: {err:#}"

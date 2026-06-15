@@ -1,6 +1,20 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Attribute, Error, Field, Lit, Meta, NestedMeta, Path, Result};
+use syn::{punctuated::Punctuated, Attribute, Error, Expr, Field, Lit, Meta, Path, Result, Token};
+
+fn dynamic_metas(attr: &Attribute) -> Result<Punctuated<Meta, Token![,]>> {
+    attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+}
+
+fn name_value_lit_str(value: &syn::MetaNameValue) -> Option<&syn::LitStr> {
+    match &value.value {
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Str(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 pub struct ContainerInfo {
     pub into: Option<Path>,
@@ -14,30 +28,25 @@ pub fn container_info(attrs: &[Attribute]) -> Result<ContainerInfo> {
     let mut debug = false;
 
     for attr in attrs {
-        if !attr.path.is_ident("dynamic") {
+        if !attr.path().is_ident("dynamic") {
             continue;
         }
 
-        let list = match attr.parse_meta()? {
-            Meta::List(list) => list,
-            other => return Err(Error::new_spanned(other, "unsupported attribute")),
-        };
-
-        for meta in &list.nested {
-            match meta {
-                NestedMeta::Meta(Meta::Path(path)) if path.is_ident("debug") => {
+        for meta in dynamic_metas(attr)? {
+            match &meta {
+                Meta::Path(path) if path.is_ident("debug") => {
                     debug = true;
                     continue;
                 }
-                NestedMeta::Meta(Meta::NameValue(value)) => {
+                Meta::NameValue(value) => {
                     if value.path.is_ident("into") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             into = Some(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("try_from") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             try_from = Some(s.parse()?);
                             continue;
                         }
@@ -290,56 +299,51 @@ pub fn field_info(field: &Field) -> Result<FieldInfo<'_>> {
     let mut deprecated = None;
 
     for attr in &field.attrs {
-        if !attr.path.is_ident("dynamic") {
+        if !attr.path().is_ident("dynamic") {
             continue;
         }
 
-        let list = match attr.parse_meta()? {
-            Meta::List(list) => list,
-            other => return Err(Error::new_spanned(other, "unsupported attribute")),
-        };
-
-        for meta in &list.nested {
-            match meta {
-                NestedMeta::Meta(Meta::NameValue(value)) => {
+        for meta in dynamic_metas(attr)? {
+            match &meta {
+                Meta::NameValue(value) => {
                     if value.path.is_ident("rename") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             name = s.value();
                             continue;
                         }
                     }
                     if value.path.is_ident("default") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             allow_default = DefValue::Path(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("deprecated") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             deprecated.replace(s.value());
                             continue;
                         }
                     }
                     if value.path.is_ident("into") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             into = Some(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("try_from") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             try_from = Some(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("validate") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             validate = Some(s.parse()?);
                             continue;
                         }
                     }
                 }
-                NestedMeta::Meta(Meta::Path(path)) => {
+                Meta::Path(path) => {
                     if path.is_ident("skip") {
                         skip = true;
                         continue;

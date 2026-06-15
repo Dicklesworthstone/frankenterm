@@ -1,9 +1,23 @@
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::{
-    Attribute, Error, Field, GenericArgument, Ident, Lit, Meta, NestedMeta, Path, PathArguments,
-    Result, Type,
+    punctuated::Punctuated, Attribute, Error, Expr, Field, GenericArgument, Ident, Lit, Meta, Path,
+    PathArguments, Result, Token, Type,
 };
+
+fn dynamic_metas(attr: &Attribute) -> Result<Punctuated<Meta, Token![,]>> {
+    attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+}
+
+fn name_value_lit_str(value: &syn::MetaNameValue) -> Option<&syn::LitStr> {
+    match &value.value {
+        Expr::Lit(expr_lit) => match &expr_lit.lit {
+            Lit::Str(s) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 #[allow(unused)]
 pub struct ContainerInfo {
@@ -18,30 +32,25 @@ pub fn container_info(attrs: &[Attribute]) -> Result<ContainerInfo> {
     let mut debug = false;
 
     for attr in attrs {
-        if !attr.path.is_ident("dynamic") {
+        if !attr.path().is_ident("dynamic") {
             continue;
         }
 
-        let list = match attr.parse_meta()? {
-            Meta::List(list) => list,
-            other => return Err(Error::new_spanned(other, "unsupported attribute")),
-        };
-
-        for meta in &list.nested {
-            match meta {
-                NestedMeta::Meta(Meta::Path(path)) if path.is_ident("debug") => {
+        for meta in dynamic_metas(attr)? {
+            match &meta {
+                Meta::Path(path) if path.is_ident("debug") => {
                     debug = true;
                     continue;
                 }
-                NestedMeta::Meta(Meta::NameValue(value)) => {
+                Meta::NameValue(value) => {
                     if value.path.is_ident("into") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             into = Some(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("try_from") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             try_from = Some(s.parse()?);
                             continue;
                         }
@@ -204,70 +213,71 @@ pub fn field_info(field: &Field) -> Result<FieldInfo<'_>> {
     };
 
     for attr in &field.attrs {
-        if !attr.path.is_ident("dynamic") && !attr.path.is_ident("doc") {
+        if !attr.path().is_ident("dynamic") && !attr.path().is_ident("doc") {
             continue;
         }
 
-        let list = match attr.parse_meta()? {
-            Meta::List(list) => list,
-            Meta::NameValue(value) if value.path.is_ident("doc") => {
-                if let Lit::Str(s) = &value.lit {
-                    if !doc.is_empty() {
-                        doc.push('\n');
+        if attr.path().is_ident("doc") {
+            match &attr.meta {
+                Meta::NameValue(value) => {
+                    if let Some(s) = name_value_lit_str(value) {
+                        if !doc.is_empty() {
+                            doc.push('\n');
+                        }
+                        doc.push_str(&s.value());
                     }
-                    doc.push_str(&s.value());
+                    continue;
                 }
-                continue;
+                other => {
+                    return Err(Error::new_spanned(
+                        other.clone(),
+                        format!("unsupported attribute {}", other.to_token_stream()),
+                    ));
+                }
             }
-            other => {
-                return Err(Error::new_spanned(
-                    other.clone(),
-                    format!("unsupported attribute {}", other.to_token_stream()),
-                ))
-            }
-        };
+        }
 
-        for meta in &list.nested {
-            match meta {
-                NestedMeta::Meta(Meta::NameValue(value)) => {
+        for meta in dynamic_metas(attr)? {
+            match &meta {
+                Meta::NameValue(value) => {
                     if value.path.is_ident("rename") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             name = s.value();
                             continue;
                         }
                     }
                     if value.path.is_ident("default") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             allow_default = DefValue::Path(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("deprecated") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             deprecated.replace(s.value());
                             continue;
                         }
                     }
                     if value.path.is_ident("into") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             into = Some(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("try_from") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             try_from = Some(s.parse()?);
                             continue;
                         }
                     }
                     if value.path.is_ident("validate") {
-                        if let Lit::Str(s) = &value.lit {
+                        if let Some(s) = name_value_lit_str(value) {
                             validate = Some(s.parse()?);
                             continue;
                         }
                     }
                 }
-                NestedMeta::Meta(Meta::Path(path)) => {
+                Meta::Path(path) => {
                     if path.is_ident("skip") {
                         skip = true;
                         continue;
@@ -315,45 +325,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn field_info_rejects_unsupported_single_arg_container() {
-        let item: syn::DeriveInput = parse_quote! {
-            struct Dummy {
-                unsupported: Result<String>
-            }
+    fn only_field(item: syn::DeriveInput) -> Field {
+        let syn::Data::Struct(data) = item.data else {
+            panic!("expected struct input");
         };
-        let field = match item.data {
-            syn::Data::Struct(s) => s.fields.into_iter().next().unwrap(),
-            _ => panic!("Expected struct"),
-        };
-
-        let err = field_info_error(field);
-
-        assert!(err.contains("unhandled type for unsupported"));
-        assert!(err.contains("Result < String >"));
+        data.fields.into_iter().next().unwrap()
     }
 
     #[test]
-    fn field_info_rejects_unsupported_tuple_type() {
+    fn field_info_rejects_unsupported_single_arg_container() {
         let item: syn::DeriveInput = parse_quote! {
-            struct Dummy {
-                unsupported: (String, String)
+            struct Demo {
+                field: Result<String, String>,
             }
         };
-        let field = match item.data {
-            syn::Data::Struct(s) => s.fields.into_iter().next().unwrap(),
-            _ => panic!("Expected struct"),
+        let field = only_field(item);
+
+        assert_eq!(
+            field_info_error(field),
+            "unhandled type for field: Result < String, String >"
+        );
+    }
+
+    #[test]
+    fn field_info_rejects_unsupported_two_arg_container() {
+        let item: syn::DeriveInput = parse_quote! {
+            struct Demo {
+                field: BTreeMap<String, String>,
+            }
         };
+        let field = only_field(item);
 
-        let err = field_info_error(field);
+        assert_eq!(
+            field_info_error(field),
+            "unhandled type for field: BTreeMap < String, String >"
+        );
+    }
 
-        assert!(err.contains("unhandled type for unsupported"));
-        // The unsupported type is rendered via `ty.to_token_stream()` (see the
-        // error site at the top of this module), whose Display inserts a space
-        // between adjacent tokens — exactly like the sibling test's expected
-        // `Result < String >`. The tuple therefore renders with a space before
-        // the comma; the original `(String, String)` expectation had the wrong
-        // spacing and could never match the real `to_token_stream()` output.
-        assert!(err.contains("(String , String)"));
+    #[test]
+    fn field_info_rejects_tuple_field() {
+        let item: syn::DeriveInput = parse_quote! {
+            struct Demo(String);
+        };
+        let field = only_field(item);
+
+        assert_eq!(field_info_error(field), "config fields must be named");
     }
 }

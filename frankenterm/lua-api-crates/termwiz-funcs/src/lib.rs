@@ -59,7 +59,7 @@ struct NerdFonts {}
 
 #[cfg(feature = "lua")]
 impl mlua::UserData for NerdFonts {
-    fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(
             mlua::MetaMethod::Index,
             |_, _, key: String| -> mlua::Result<Option<String>> {
@@ -207,11 +207,7 @@ pub fn truncate_right(s: &str, max_width: usize) -> String {
 }
 
 #[cfg(feature = "lua")]
-fn permute_mods<'lua>(
-    lua: &'lua Lua,
-    item: mlua::Table,
-    allow_none: bool,
-) -> mlua::Result<Vec<mlua::Value<'lua>>> {
+fn permute_mods(lua: &Lua, item: mlua::Table, allow_none: bool) -> mlua::Result<Vec<mlua::Value>> {
     use frankenterm_input_types::Modifiers;
 
     let mut result = vec![];
@@ -239,18 +235,12 @@ fn permute_mods<'lua>(
 }
 
 #[cfg(feature = "lua")]
-fn permute_any_mods<'lua>(
-    lua: &'lua Lua,
-    item: mlua::Table,
-) -> mlua::Result<Vec<mlua::Value<'lua>>> {
+fn permute_any_mods(lua: &Lua, item: mlua::Table) -> mlua::Result<Vec<mlua::Value>> {
     permute_mods(lua, item, false)
 }
 
 #[cfg(feature = "lua")]
-fn permute_any_or_no_mods<'lua>(
-    lua: &'lua Lua,
-    item: mlua::Table,
-) -> mlua::Result<Vec<mlua::Value<'lua>>> {
+fn permute_any_or_no_mods(lua: &Lua, item: mlua::Table) -> mlua::Result<Vec<mlua::Value>> {
     permute_mods(lua, item, true)
 }
 

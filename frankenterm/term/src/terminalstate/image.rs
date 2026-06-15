@@ -168,9 +168,11 @@ impl TerminalState {
         let first_row = self.screen().visible_row_to_stable_row(self.cursor.y);
 
         let mut ypos = NotNan::new(params.source_origin_y as f32 / params.image_height as f32)
-            .with_context(|| format!("computing ypos {params:#?}"))?;
+            .with_context(|| format!("computing ypos {params:#?}"))?
+            .into_inner();
         let start_xpos = NotNan::new(params.source_origin_x as f32 / params.image_width as f32)
-            .context("computing xpos")?;
+            .context("computing xpos")?
+            .into_inner();
 
         let cursor_x = self.cursor.x;
 
@@ -247,8 +249,8 @@ impl TerminalState {
                     .cloned()
                     .unwrap_or_else(Cell::blank);
                 let img = Box::new(ImageCell::with_z_index(
-                    TextureCoordinate::new(xpos, ypos),
-                    TextureCoordinate::new(xpos + x_delta, ypos + y_delta),
+                    TextureCoordinate::new_f32(xpos, ypos),
+                    TextureCoordinate::new_f32(xpos + x_delta, ypos + y_delta),
                     params.data.clone(),
                     params.z_index,
                     cell_padding_left,

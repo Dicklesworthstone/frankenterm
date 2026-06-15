@@ -14,7 +14,7 @@ impl MuxDomain {
 }
 
 impl UserData for MuxDomain {
-    fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, _: ()| {
             Ok(format!("MuxDomain(domain_id:{}, pid:{})", this.0, unsafe {
                 libc::getpid()
@@ -28,12 +28,12 @@ impl UserData for MuxDomain {
             Ok(domain.spawnable())
         });
 
-        methods.add_async_method(
+        methods.add_method(
             "attach",
-            |_, this, window: Option<UserDataRef<MuxWindow>>| async move {
+            |_, this, window: Option<UserDataRef<MuxWindow>>| {
                 let mux = get_mux()?;
                 let domain = this.resolve(&mux)?;
-                domain.attach(window.map(|w| w.0)).await.map_err(|err| {
+                promise::spawn::block_on(domain.attach(window.map(|w| w.0))).map_err(|err| {
                     mlua::Error::external(format!(
                         "failed to attach domain {}: {err:#}",
                         domain.domain_name()
@@ -68,10 +68,10 @@ impl UserData for MuxDomain {
             Ok(domain.domain_name().to_string())
         });
 
-        methods.add_async_method("label", |_, this, _: ()| async move {
+        methods.add_method("label", |_, this, _: ()| {
             let mux = get_mux()?;
             let domain = this.resolve(&mux)?;
-            Ok(domain.domain_label().await)
+            Ok(promise::spawn::block_on(domain.domain_label()))
         });
 
         methods.add_method("has_any_panes", |_, this, _: ()| {

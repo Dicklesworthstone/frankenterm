@@ -102,13 +102,13 @@ impl TerminalState {
                     // go from sixel red to standard hsl red.
                     // Negative values wrap around the circle.
                     // https://github.com/wezterm/wezterm/issues/775
-                    let angle = (*hue_angle as f64) - 120.0;
-                    let angle = if angle < 0. { 360.0 + angle } else { angle };
+                    let angle = (*hue_angle as f32) - 120.0;
+                    let angle = if angle < 0.0 { 360.0 + angle } else { angle };
                     let c = csscolorparser::Color::from_hsla(
                         angle,
-                        *saturation as f64 / 100.,
-                        *lightness as f64 / 100.,
-                        1.,
+                        *saturation as f32 / 100.0,
+                        *lightness as f32 / 100.0,
+                        1.0,
                     );
                     let [r, g, b, _] = c.to_rgba8();
                     if color_map.len() >= self.config.max_color_map_entries()

@@ -1508,11 +1508,11 @@ impl Config {
     }
 
     #[cfg(feature = "lua")]
-    pub(crate) fn apply_overrides_obj_to<'l>(
-        lua: &'l mlua::Lua,
-        mut config: mlua::Value<'l>,
+    pub(crate) fn apply_overrides_obj_to(
+        lua: &mlua::Lua,
+        mut config: mlua::Value,
         overrides: &frankenterm_dynamic::Value,
-    ) -> anyhow::Result<mlua::Value<'l>> {
+    ) -> anyhow::Result<mlua::Value> {
         // config may be a table, or it may be a config builder.
         // We'll leave it up to lua to call the appropriate
         // index function as managing that from Rust is a PITA.
@@ -1541,10 +1541,10 @@ impl Config {
     }
 
     #[cfg(feature = "lua")]
-    pub(crate) fn apply_overrides_to<'l>(
-        lua: &'l mlua::Lua,
-        mut config: mlua::Value<'l>,
-    ) -> anyhow::Result<mlua::Value<'l>> {
+    pub(crate) fn apply_overrides_to(
+        lua: &mlua::Lua,
+        mut config: mlua::Value,
+    ) -> anyhow::Result<mlua::Value> {
         let overrides = config_overrides_snapshot();
         for (key, value) in &overrides {
             if value == "nil" {

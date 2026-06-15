@@ -364,10 +364,10 @@ impl Surface {
 
     #[cfg(feature = "use_image")]
     fn add_image(&mut self, image: &Image) {
-        use ordered_float::NotNan;
-
-        let xsize = (image.bottom_right.x - image.top_left.x) / image.width as f32;
-        let ysize = (image.bottom_right.y - image.top_left.y) / image.height as f32;
+        let top_left_x = image.top_left.x.into_inner();
+        let top_left_y = image.top_left.y.into_inner();
+        let xsize = (image.bottom_right.x.into_inner() - top_left_x) / image.width as f32;
+        let ysize = (image.bottom_right.y.into_inner() - top_left_y) / image.height as f32;
 
         if self.ypos + image.height > self.height {
             let scroll = (self.ypos + image.height) - self.height;
@@ -377,9 +377,9 @@ impl Surface {
             self.ypos -= scroll;
         }
 
-        let mut ypos = NotNan::new(0.0).unwrap();
+        let mut ypos = 0.0;
         for y in 0..image.height {
-            let mut xpos = NotNan::new(0.0).unwrap();
+            let mut xpos = 0.0;
             for x in 0..image.width {
                 self.lines[self.ypos + y].set_cell(
                     self.xpos + x,
@@ -388,13 +388,10 @@ impl Surface {
                         self.attributes
                             .clone()
                             .set_image(Box::new(ImageCell::new(
-                                TextureCoordinate::new(
-                                    image.top_left.x + xpos,
-                                    image.top_left.y + ypos,
-                                ),
-                                TextureCoordinate::new(
-                                    image.top_left.x + xpos + xsize,
-                                    image.top_left.y + ypos + ysize,
+                                TextureCoordinate::new_f32(top_left_x + xpos, top_left_y + ypos),
+                                TextureCoordinate::new_f32(
+                                    top_left_x + xpos + xsize,
+                                    top_left_y + ypos + ysize,
                                 ),
                                 image.image.clone(),
                             )))

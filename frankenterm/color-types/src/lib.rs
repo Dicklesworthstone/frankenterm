@@ -379,12 +379,7 @@ impl From<SrgbaTuple> for (f32, f32, f32, f32) {
 #[cfg(feature = "std")]
 impl From<Color> for SrgbaTuple {
     fn from(color: Color) -> Self {
-        Self(
-            color.r as f32,
-            color.g as f32,
-            color.b as f32,
-            color.a as f32,
-        )
+        Self(color.r, color.g, color.b, color.a)
     }
 }
 
@@ -575,18 +570,20 @@ impl SrgbaTuple {
 
     #[cfg(feature = "std")]
     pub fn to_laba(self) -> (f64, f64, f64, f64) {
-        Color::new(self.0.into(), self.1.into(), self.2.into(), self.3.into()).to_lab()
+        let [l, a, b, alpha] = Color::new(self.0, self.1, self.2, self.3).to_laba();
+        (l.into(), a.into(), b.into(), alpha.into())
     }
 
     #[cfg(feature = "std")]
     pub fn to_hsla(self) -> (f64, f64, f64, f64) {
-        Color::new(self.0.into(), self.1.into(), self.2.into(), self.3.into()).to_hsla()
+        let [h, s, l, a] = Color::new(self.0, self.1, self.2, self.3).to_hsla();
+        (h.into(), s.into(), l.into(), a.into())
     }
 
     #[cfg(feature = "std")]
     pub fn from_hsla(h: f64, s: f64, l: f64, a: f64) -> Self {
-        let Color { r, g, b, a } = Color::from_hsla(h, s, l, a);
-        Self(r as f32, g as f32, b as f32, a as f32)
+        let Color { r, g, b, a } = Color::from_hsla(h as f32, s as f32, l as f32, a as f32);
+        Self(r, g, b, a)
     }
 
     /// Scale the color towards the maximum saturation by factor, a value ranging from 0.0 to 1.0.
@@ -934,7 +931,7 @@ impl FromStr for SrgbaTuple {
             #[cfg(feature = "std")]
             {
                 if let Ok(c) = csscolorparser::parse(s) {
-                    return Ok(Self(c.r as f32, c.g as f32, c.b as f32, c.a as f32));
+                    return Ok(Self(c.r, c.g, c.b, c.a));
                 }
             }
             Self::try_from_named(s).map_err(|_| ())?.ok_or(())

@@ -1,6 +1,6 @@
 use config::{ConfigHandle, configuration};
 use governor::clock::{Clock, DefaultClock};
-use governor::{NegativeMultiDecision, Quota, RateLimiter as Limiter};
+use governor::{Quota, RateLimiter as Limiter};
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -51,9 +51,11 @@ impl RateLimiter {
     #[allow(dead_code)]
     pub fn non_blocking_admittance_check(&mut self, amount: u32) -> bool {
         self.check_config_reload();
-        self.lim
-            .check_n(NonZeroU32::new(amount).expect("amount to be non-zero"))
-            .is_ok()
+        matches!(
+            self.lim
+                .check_n(NonZeroU32::new(amount).expect("amount to be non-zero")),
+            Ok(Ok(_))
+        )
     }
 
     /// Attempt to admit up to `amount` number of items.
@@ -69,8 +71,8 @@ impl RateLimiter {
                 None => return Ok(0),
             };
             match self.lim.check_n(non_zero_amount) {
-                Ok(_) => return Ok(amount),
-                Err(NegativeMultiDecision::BatchNonConforming(_, over)) if amount == 1 => {
+                Ok(Ok(_)) => return Ok(amount),
+                Ok(Err(over)) if amount == 1 => {
                     return Err(over.wait_time_from(DefaultClock::default().now()));
                 }
                 _ => {}

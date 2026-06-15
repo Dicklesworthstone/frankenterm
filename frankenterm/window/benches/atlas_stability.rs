@@ -16,6 +16,7 @@
 //! state hot path.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 use std::rc::Rc;
 use window::bitmaps::atlas::Atlas;
 use window::bitmaps::ImageTexture;
@@ -37,7 +38,7 @@ fn version_cursor_quiescent_probe(c: &mut Criterion) {
             // Steady-state per-frame work: snapshot, compare, no-op.
             let snap = atlas.version();
             let drifted = snap > last_synced_version;
-            criterion::black_box(drifted);
+            black_box(drifted);
         })
     });
     group.finish();
@@ -59,7 +60,7 @@ fn version_cursor_cost_per_resize_event(c: &mut Criterion) {
                 let snap = atlas.version();
                 drifted |= snap > last_synced_version;
             }
-            criterion::black_box(drifted);
+            black_box(drifted);
         })
     });
     group.finish();

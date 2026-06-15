@@ -58,7 +58,7 @@ fn visible_row_range_for_tail(
 }
 
 impl UserData for MuxPane {
-    fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, _: ()| {
             Ok(format!("MuxPane(pane_id:{}, pid:{})", this.0, unsafe {
                 libc::getpid()
@@ -66,8 +66,8 @@ impl UserData for MuxPane {
         });
         methods.add_method("pane_id", |_, this, _: ()| Ok(this.0));
 
-        methods.add_async_method("split", |_, this, args: Option<SplitPane>| async move {
-            args.unwrap_or_default().run(this).await
+        methods.add_method("split", |_, this, args: Option<SplitPane>| {
+            promise::spawn::block_on(args.unwrap_or_default().run(this))
         });
 
         methods.add_method("send_paste", |_, this, text: String| {
@@ -349,27 +349,25 @@ impl UserData for MuxPane {
             this.get_text_from_semantic_zone(zone)
         });
 
-        methods.add_async_method("move_to_new_tab", |_lua, this, ()| async move {
+        methods.add_method("move_to_new_tab", |_lua, this, ()| {
             let mux = get_mux()?;
             let (_domain, window_id, _tab) = mux
                 .resolve_pane_id(this.0)
                 .ok_or_else(|| mlua::Error::external(format!("pane {} not found", this.0)))?;
-            let (tab, window) = mux
-                .move_pane_to_new_tab(this.0, Some(window_id), None)
-                .await
-                .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
+            let (tab, window) =
+                promise::spawn::block_on(mux.move_pane_to_new_tab(this.0, Some(window_id), None))
+                    .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
 
             Ok((MuxTab(tab.tab_id()), MuxWindow(window)))
         });
 
-        methods.add_async_method(
+        methods.add_method(
             "move_to_new_window",
-            |_lua, this, workspace: Option<String>| async move {
+            |_lua, this, workspace: Option<String>| {
                 let mux = get_mux()?;
-                let (tab, window) = mux
-                    .move_pane_to_new_tab(this.0, None, workspace)
-                    .await
-                    .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
+                let (tab, window) =
+                    promise::spawn::block_on(mux.move_pane_to_new_tab(this.0, None, workspace))
+                        .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
 
                 Ok((MuxTab(tab.tab_id()), MuxWindow(window)))
             },

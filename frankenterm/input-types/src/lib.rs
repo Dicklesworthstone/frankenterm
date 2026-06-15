@@ -11,7 +11,7 @@ use bitflags::*;
 use core::convert::TryFrom;
 use core::fmt::Write;
 use core::sync::atomic::AtomicBool;
-use frankenterm_dynamic::{FromDynamic, ToDynamic};
+use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 #[cfg(feature = "std")]
 use std::sync::LazyLock;
 
@@ -469,10 +469,47 @@ impl ToString for KeyCode {
 }
 
 bitflags! {
-    #[derive(Default, FromDynamic, ToDynamic)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct KeyboardLedStatus: u8 {
         const CAPS_LOCK = 1<<1;
         const NUM_LOCK = 1<<2;
+    }
+}
+
+impl FromDynamic for KeyboardLedStatus {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        let text = String::from_dynamic(value, options)?;
+        Self::try_from(text).map_err(|err| frankenterm_dynamic::Error::Message(format!("{err:#}")))
+    }
+}
+
+impl ToDynamic for KeyboardLedStatus {
+    fn to_dynamic(&self) -> Value {
+        self.to_string().to_dynamic()
+    }
+}
+
+impl TryFrom<String> for KeyboardLedStatus {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<KeyboardLedStatus, String> {
+        let mut status = KeyboardLedStatus::empty();
+        for ele in s.split('|') {
+            let ele = ele.trim();
+            if ele == "CAPS_LOCK" {
+                status |= KeyboardLedStatus::CAPS_LOCK;
+            } else if ele == "NUM_LOCK" {
+                status |= KeyboardLedStatus::NUM_LOCK;
+            } else if ele == "NONE" || ele.is_empty() {
+                status |= KeyboardLedStatus::empty();
+            } else {
+                return Err(format!("invalid keyboard LED name {} in {}", ele, s));
+            }
+        }
+        Ok(status)
     }
 }
 
@@ -494,8 +531,7 @@ impl ToString for KeyboardLedStatus {
 
 bitflags! {
     #[cfg_attr(feature="serde", derive(Serialize, Deserialize))]
-    #[derive(Default, FromDynamic, ToDynamic)]
-    #[dynamic(into="String", try_from="String")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub struct Modifiers: u16 {
         const NONE = 0;
         const SHIFT = 1<<1;
@@ -513,6 +549,22 @@ bitflags! {
         const ENHANCED_KEY = 1<<12;
         const HYPER = 1<<13;
         const META = 1<<14;
+    }
+}
+
+impl FromDynamic for Modifiers {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        let text = String::from_dynamic(value, options)?;
+        Self::try_from(text).map_err(|err| frankenterm_dynamic::Error::Message(format!("{err:#}")))
+    }
+}
+
+impl ToDynamic for Modifiers {
+    fn to_dynamic(&self) -> Value {
+        self.to_string().to_dynamic()
     }
 }
 
@@ -1261,7 +1313,7 @@ impl ToString for PhysKeyCode {
 }
 
 bitflags! {
-    #[derive(Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct MouseButtons: u8 {
         const NONE = 0;
         #[allow(clippy::identity_op)]
@@ -2053,6 +2105,7 @@ fn csi_u_encode(buf: &mut String, c: char, mods: Modifiers) {
 }
 
 bitflags::bitflags! {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KittyKeyboardFlags: u16 {
     const NONE = 0;
     const DISAMBIGUATE_ESCAPE_CODES = 1;
@@ -2064,9 +2117,8 @@ pub struct KittyKeyboardFlags: u16 {
 }
 
 bitflags! {
-    #[derive(FromDynamic, ToDynamic)]
     #[cfg_attr(feature="serde", derive(Serialize, Deserialize), serde(try_from = "String"))]
-    #[dynamic(try_from = "String", into = "String")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct WindowDecorations: u8 {
         const TITLE = 1;
         const RESIZE = 2;
@@ -2078,6 +2130,23 @@ bitflags! {
         const INTEGRATED_BUTTONS = 16;
         const MACOS_FORCE_SQUARE_CORNERS = 32;
         const MACOS_USE_BACKGROUND_COLOR_AS_TITLEBAR_COLOR = 64;
+    }
+}
+
+impl FromDynamic for WindowDecorations {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        let text = String::from_dynamic(value, options)?;
+        Self::try_from(text).map_err(|err| frankenterm_dynamic::Error::Message(format!("{err:#}")))
+    }
+}
+
+impl ToDynamic for WindowDecorations {
+    fn to_dynamic(&self) -> Value {
+        let text: String = self.into();
+        text.to_dynamic()
     }
 }
 

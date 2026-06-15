@@ -1,7 +1,8 @@
 use config::{merge_dynamic_overrides, parse_toml_config_from_str};
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use frankenterm_dynamic::{ToDynamic, Value};
 use std::collections::BTreeMap;
+use std::hint::black_box;
 
 fn object(entries: &[(&str, Value)]) -> Value {
     Value::Object(

@@ -24,8 +24,7 @@ pub struct LauncherActionArgs {
 }
 
 bitflags::bitflags! {
-    #[derive(Default,  FromDynamic, ToDynamic)]
-    #[dynamic(try_from="String", into="String")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct LauncherFlags :u32 {
         const ZERO = 0;
         const FUZZY = 1;
@@ -35,6 +34,22 @@ bitflags::bitflags! {
         const KEY_ASSIGNMENTS = 16;
         const WORKSPACES = 32;
         const COMMANDS = 64;
+    }
+}
+
+impl FromDynamic for LauncherFlags {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        let text = String::from_dynamic(value, options)?;
+        Self::try_from(text).map_err(|err| frankenterm_dynamic::Error::Message(format!("{err:#}")))
+    }
+}
+
+impl ToDynamic for LauncherFlags {
+    fn to_dynamic(&self) -> Value {
+        self.to_string().to_dynamic()
     }
 }
 
@@ -86,6 +101,7 @@ impl TryFrom<String> for LauncherFlags {
         for ele in s.split('|') {
             let ele = ele.trim();
             match ele {
+                "" | "ZERO" => flags |= Self::ZERO,
                 "FUZZY" => flags |= Self::FUZZY,
                 "TABS" => flags |= Self::TABS,
                 "LAUNCH_MENU_ITEMS" => flags |= Self::LAUNCH_MENU_ITEMS,

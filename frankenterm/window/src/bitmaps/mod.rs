@@ -3,6 +3,7 @@ use crate::{Point, Rect, Size};
 use anyhow::{anyhow, ensure};
 use downcast_rs::{impl_downcast, Downcast};
 use glium::texture::SrgbTexture2d;
+use rgb::FromSlice;
 use std::cell::RefCell;
 
 pub mod atlas;
@@ -600,15 +601,20 @@ impl Image {
         } else {
             resize::Type::Mitchell
         };
-        resize::new(
+        let mut resizer = resize::new(
             self.width,
             self.height,
             width,
             height,
-            resize::Pixel::RGBA,
+            resize::Pixel::RGBA8,
             algo,
         )
-        .resize(&self.data, &mut dest.data);
+        .expect("valid RGBA resize dimensions");
+        let source_data = self.data.as_rgba();
+        let dest_data = dest.data.as_rgba_mut();
+        resizer
+            .resize(source_data, dest_data)
+            .expect("valid RGBA resize buffers");
         dest
     }
 

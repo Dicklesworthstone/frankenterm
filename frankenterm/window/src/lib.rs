@@ -97,7 +97,7 @@ impl std::fmt::Display for Appearance {
 }
 
 bitflags! {
-    #[derive(Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct WindowState: u8 {
         /// Occupies the whole screen; cannot be resized while in this state.
         const FULL_SCREEN = 1<<1;

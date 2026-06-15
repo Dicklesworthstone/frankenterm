@@ -1,10 +1,11 @@
 use anyhow::Result;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use frankenterm_dynamic::Value;
 use frankenterm_scripting::{
     Action, ConfigValue, EngineCapabilities, ExtensionId, ExtensionManifest, HookHandler, HookId,
     ScriptingDispatcher, ScriptingEngine,
 };
+use std::hint::black_box;
 use std::path::Path;
 use std::sync::Arc;
 

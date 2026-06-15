@@ -16,7 +16,7 @@ impl MuxTab {
 }
 
 impl UserData for MuxTab {
-    fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, _: ()| {
             Ok(format!("MuxTab(tab_id:{}, pid:{})", this.0, unsafe {
                 libc::getpid()

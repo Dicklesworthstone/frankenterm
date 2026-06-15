@@ -28,7 +28,8 @@ fn allocate_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-static USERNAME: LazyLock<String> = LazyLock::new(whoami::username);
+static USERNAME: LazyLock<String> =
+    LazyLock::new(|| whoami::username().expect("current username should be available"));
 
 pub struct SshKeygen;
 

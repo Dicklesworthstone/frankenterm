@@ -72,7 +72,7 @@ impl FileType {
             FileType::Other => FileTypeFlags::empty(),
         };
 
-        flags.bits
+        flags.bits()
     }
 }
 
@@ -148,7 +148,7 @@ impl FilePermissions {
             flags.insert(FilePermissionFlags::OTHER_EXEC);
         }
 
-        flags.bits
+        flags.bits()
     }
 }
 

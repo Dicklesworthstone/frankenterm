@@ -2,6 +2,7 @@ use crate::{default_one_point_oh, Config, Dimension, HsbTransform, PixelUnit, Rg
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 #[cfg(feature = "lua")]
 use luahelper::impl_lua_conversion_dynamic;
+use std::convert::TryFrom;
 use termwiz::color::SrgbaTuple;
 
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
@@ -386,46 +387,48 @@ pub enum GradientPreset {
 }
 
 impl GradientPreset {
-    fn build(self) -> colorgrad::Gradient {
+    fn build(self) -> Box<dyn colorgrad::Gradient> {
+        use colorgrad::Gradient as _;
+
         match self {
-            Self::Blues => colorgrad::blues(),
-            Self::BrBg => colorgrad::br_bg(),
-            Self::BuGn => colorgrad::bu_gn(),
-            Self::BuPu => colorgrad::bu_pu(),
-            Self::Cividis => colorgrad::cividis(),
-            Self::Cool => colorgrad::cool(),
-            Self::CubeHelixDefault => colorgrad::cubehelix_default(),
-            Self::GnBu => colorgrad::gn_bu(),
-            Self::Greens => colorgrad::greens(),
-            Self::Greys => colorgrad::greys(),
-            Self::Inferno => colorgrad::inferno(),
-            Self::Magma => colorgrad::magma(),
-            Self::OrRd => colorgrad::or_rd(),
-            Self::Oranges => colorgrad::oranges(),
-            Self::PiYg => colorgrad::pi_yg(),
-            Self::Plasma => colorgrad::plasma(),
-            Self::PrGn => colorgrad::pr_gn(),
-            Self::PuBu => colorgrad::pu_bu(),
-            Self::PuBuGn => colorgrad::pu_bu_gn(),
-            Self::PuOr => colorgrad::pu_or(),
-            Self::PuRd => colorgrad::pu_rd(),
-            Self::Purples => colorgrad::purples(),
-            Self::Rainbow => colorgrad::rainbow(),
-            Self::RdBu => colorgrad::rd_bu(),
-            Self::RdGy => colorgrad::rd_gy(),
-            Self::RdPu => colorgrad::rd_pu(),
-            Self::RdYlBu => colorgrad::rd_yl_bu(),
-            Self::RdYlGn => colorgrad::rd_yl_gn(),
-            Self::Reds => colorgrad::reds(),
-            Self::Sinebow => colorgrad::sinebow(),
-            Self::Spectral => colorgrad::spectral(),
-            Self::Turbo => colorgrad::turbo(),
-            Self::Viridis => colorgrad::viridis(),
-            Self::Warm => colorgrad::warm(),
-            Self::YlGn => colorgrad::yl_gn(),
-            Self::YlGnBu => colorgrad::yl_gn_bu(),
-            Self::YlOrBr => colorgrad::yl_or_br(),
-            Self::YlOrRd => colorgrad::yl_or_rd(),
+            Self::Blues => colorgrad::preset::blues().boxed(),
+            Self::BrBg => colorgrad::preset::br_bg().boxed(),
+            Self::BuGn => colorgrad::preset::bu_gn().boxed(),
+            Self::BuPu => colorgrad::preset::bu_pu().boxed(),
+            Self::Cividis => colorgrad::preset::cividis().boxed(),
+            Self::Cool => colorgrad::preset::cool().boxed(),
+            Self::CubeHelixDefault => colorgrad::preset::cubehelix_default().boxed(),
+            Self::GnBu => colorgrad::preset::gn_bu().boxed(),
+            Self::Greens => colorgrad::preset::greens().boxed(),
+            Self::Greys => colorgrad::preset::greys().boxed(),
+            Self::Inferno => colorgrad::preset::inferno().boxed(),
+            Self::Magma => colorgrad::preset::magma().boxed(),
+            Self::OrRd => colorgrad::preset::or_rd().boxed(),
+            Self::Oranges => colorgrad::preset::oranges().boxed(),
+            Self::PiYg => colorgrad::preset::pi_yg().boxed(),
+            Self::Plasma => colorgrad::preset::plasma().boxed(),
+            Self::PrGn => colorgrad::preset::pr_gn().boxed(),
+            Self::PuBu => colorgrad::preset::pu_bu().boxed(),
+            Self::PuBuGn => colorgrad::preset::pu_bu_gn().boxed(),
+            Self::PuOr => colorgrad::preset::pu_or().boxed(),
+            Self::PuRd => colorgrad::preset::pu_rd().boxed(),
+            Self::Purples => colorgrad::preset::purples().boxed(),
+            Self::Rainbow => colorgrad::preset::rainbow().boxed(),
+            Self::RdBu => colorgrad::preset::rd_bu().boxed(),
+            Self::RdGy => colorgrad::preset::rd_gy().boxed(),
+            Self::RdPu => colorgrad::preset::rd_pu().boxed(),
+            Self::RdYlBu => colorgrad::preset::rd_yl_bu().boxed(),
+            Self::RdYlGn => colorgrad::preset::rd_yl_gn().boxed(),
+            Self::Reds => colorgrad::preset::reds().boxed(),
+            Self::Sinebow => colorgrad::preset::sinebow().boxed(),
+            Self::Spectral => colorgrad::preset::spectral().boxed(),
+            Self::Turbo => colorgrad::preset::turbo().boxed(),
+            Self::Viridis => colorgrad::preset::viridis().boxed(),
+            Self::Warm => colorgrad::preset::warm().boxed(),
+            Self::YlGn => colorgrad::preset::yl_gn().boxed(),
+            Self::YlGnBu => colorgrad::preset::yl_gn_bu().boxed(),
+            Self::YlOrBr => colorgrad::preset::yl_or_br().boxed(),
+            Self::YlOrRd => colorgrad::preset::yl_or_rd().boxed(),
         }
     }
 }
@@ -460,30 +463,40 @@ pub struct Gradient {
 impl_lua_conversion_dynamic!(Gradient);
 
 impl Gradient {
-    pub fn build(&self) -> anyhow::Result<colorgrad::Gradient> {
-        use colorgrad::{BlendMode as CGMode, Interpolation as CGInterp};
+    pub fn build(&self) -> anyhow::Result<Box<dyn colorgrad::Gradient>> {
+        use colorgrad::{BlendMode as CGMode, Gradient as _};
+
         let g = match &self.preset {
             Some(p) => p.build(),
             None => {
                 let colors: Vec<&str> = self.colors.iter().map(|s| s.as_str()).collect();
-                let mut g = colorgrad::CustomGradient::new();
-                g.html_colors(&colors);
-                g.mode(match self.blend {
+                let mut builder = colorgrad::GradientBuilder::new();
+                builder.html_colors(&colors);
+                if self.blend == BlendMode::Hsv {
+                    anyhow::bail!("HSV gradient interpolation is not supported by colorgrad 0.8");
+                }
+                builder.mode(match self.blend {
                     BlendMode::Rgb => CGMode::Rgb,
                     BlendMode::LinearRgb => CGMode::LinearRgb,
-                    BlendMode::Hsv => CGMode::Hsv,
                     BlendMode::Oklab => CGMode::Oklab,
+                    BlendMode::Hsv => unreachable!("checked above"),
                 });
-                g.interpolation(match self.interpolation {
-                    Interpolation::Linear => CGInterp::Linear,
-                    Interpolation::Basis => CGInterp::Basis,
-                    Interpolation::CatmullRom => CGInterp::CatmullRom,
-                });
-                g.build()?
+                match self.interpolation {
+                    Interpolation::Linear => builder.build::<colorgrad::LinearGradient>()?.boxed(),
+                    Interpolation::Basis => builder.build::<colorgrad::BasisGradient>()?.boxed(),
+                    Interpolation::CatmullRom => {
+                        builder.build::<colorgrad::CatmullRomGradient>()?.boxed()
+                    }
+                }
             }
         };
         match (self.segment_size, self.segment_smoothness) {
-            (Some(size), Some(smoothness)) => Ok(g.sharp(size, smoothness)),
+            (Some(size), Some(smoothness)) => {
+                anyhow::ensure!(smoothness.is_finite(), "gradient smoothness must be finite");
+                let size = u16::try_from(size)
+                    .map_err(|_| anyhow::anyhow!("gradient segment_size exceeds u16 range"))?;
+                Ok(g.sharp(size, smoothness as f32).boxed())
+            }
             (None, None) => Ok(g),
             _ => anyhow::bail!(
                 "Gradient must either specify both segment_size and segment_smoothness, or neither"

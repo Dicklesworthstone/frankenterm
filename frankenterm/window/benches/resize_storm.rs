@@ -15,6 +15,7 @@
 //! and the version increment is a single `fetch_add`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 use std::rc::Rc;
 use window::bitmaps::atlas::Atlas;
 use window::bitmaps::ImageTexture;
@@ -51,7 +52,7 @@ fn allocate_one_per_frame(c: &mut Criterion) {
             let sprite = atlas
                 .allocate(&cell(8, 16, byte))
                 .expect("allocate (atlas large enough)");
-            criterion::black_box(sprite.version());
+            black_box(sprite.version());
         })
     });
     group.finish();
@@ -71,7 +72,7 @@ fn allocate_burst_per_frame(c: &mut Criterion) {
                 let sprite = atlas
                     .allocate(&cell(8, 16, byte))
                     .expect("allocate (atlas large enough)");
-                criterion::black_box(sprite.version());
+                black_box(sprite.version());
             }
         })
     });
@@ -89,7 +90,7 @@ fn version_bump_atomic_cost(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.bench_function("version_load", |b| {
         b.iter(|| {
-            criterion::black_box(atlas.version());
+            black_box(atlas.version());
         })
     });
     group.finish();

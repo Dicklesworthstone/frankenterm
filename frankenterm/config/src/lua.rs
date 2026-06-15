@@ -47,7 +47,7 @@ pub fn add_context_setup_func(func: SetupFunc) {
     setup_funcs_lock().push(func);
 }
 
-pub fn get_or_create_module<'lua>(lua: &'lua Lua, name: &str) -> anyhow::Result<mlua::Table<'lua>> {
+pub fn get_or_create_module(lua: &Lua, name: &str) -> anyhow::Result<mlua::Table> {
     let globals = lua.globals();
     let package: Table = globals.get("package")?;
     let loaded: Table = package.get("loaded")?;
@@ -69,10 +69,7 @@ pub fn get_or_create_module<'lua>(lua: &'lua Lua, name: &str) -> anyhow::Result<
     }
 }
 
-pub fn get_or_create_sub_module<'lua>(
-    lua: &'lua Lua,
-    name: &str,
-) -> anyhow::Result<mlua::Table<'lua>> {
+pub fn get_or_create_sub_module(lua: &Lua, name: &str) -> anyhow::Result<mlua::Table> {
     let wezterm_mod = get_or_create_module(lua, "wezterm")?;
     let sub = wezterm_mod.get(name)?;
     match sub {
@@ -89,22 +86,19 @@ pub fn get_or_create_sub_module<'lua>(
     }
 }
 
-fn config_builder_set_strict_mode<'lua>(
-    _lua: &'lua Lua,
-    (myself, strict): (Table, bool),
-) -> mlua::Result<()> {
+fn config_builder_set_strict_mode(_lua: &Lua, (myself, strict): (Table, bool)) -> mlua::Result<()> {
     let mt = myself
-        .get_metatable()
+        .metatable()
         .ok_or_else(|| mlua::Error::external("impossible that we have no metatable"))?;
     mt.set("__strict_mode", strict)
 }
 
-fn config_builder_index<'lua>(
-    _lua: &'lua Lua,
-    (myself, key): (Table<'lua>, mlua::Value<'lua>),
-) -> mlua::Result<mlua::Value<'lua>> {
+fn config_builder_index(
+    _lua: &Lua,
+    (myself, key): (Table, mlua::Value),
+) -> mlua::Result<mlua::Value> {
     let mt = myself
-        .get_metatable()
+        .metatable()
         .ok_or_else(|| mlua::Error::external("impossible that we have no metatable"))?;
     match mt.get(key.clone()) {
         Ok(value) => Ok(value),
@@ -112,8 +106,8 @@ fn config_builder_index<'lua>(
     }
 }
 
-fn config_builder_new_index<'lua>(
-    lua: &'lua Lua,
+fn config_builder_new_index(
+    lua: &Lua,
     (myself, key, value): (Table, String, Value),
 ) -> mlua::Result<()> {
     let stub_config = lua.create_table()?;
@@ -122,13 +116,13 @@ fn config_builder_new_index<'lua>(
     let dvalue = lua_value_to_dynamic(Value::Table(stub_config)).map_err(|e| {
         mlua::Error::FromLuaConversionError {
             from: "table",
-            to: "Config",
+            to: "Config".to_string(),
             message: Some(format!("lua_value_to_dynamic: {e}")),
         }
     })?;
 
     let mt = myself
-        .get_metatable()
+        .metatable()
         .ok_or_else(|| mlua::Error::external("impossible that we have no metatable"))?;
     let strict = match mt.get("__strict_mode") {
         Ok(Value::Boolean(b)) => b,
@@ -147,7 +141,7 @@ fn config_builder_new_index<'lua>(
     let config_object = Config::from_dynamic(&dvalue, options).map_err(|e| {
         mlua::Error::FromLuaConversionError {
             from: "table",
-            to: "Config",
+            to: "Config".to_string(),
             message: Some(format!("Config::from_dynamic: {e}")),
         }
     })?;
@@ -165,13 +159,13 @@ fn config_builder_new_index<'lua>(
                     // Start at frame 1, our caller, as the frame for invoking this
                     // metamethod is not interesting
                     for i in 1.. {
-                        if let Some(debug) = lua.inspect_stack(i) {
+                        if let Some((source, line, func_name)) = lua.inspect_stack(i, |debug| {
                             let names = debug.names();
                             let name = names.name;
                             let name_what = names.name_what;
 
                             let dbg_source = debug.source();
-                            let source = dbg_source.source.unwrap_or_default();
+                            let source = dbg_source.source.unwrap_or_default().to_string();
                             let func_name = match (name, name_what) {
                                 (Some(name), Some(name_what)) => {
                                     format!("{name_what} {name}")
@@ -180,7 +174,9 @@ fn config_builder_new_index<'lua>(
                                 _ => "".to_string(),
                             };
 
-                            let line = debug.curr_line();
+                            let line = debug.current_line().map_or(-1_i64, |line| line as i64);
+                            (source, line, func_name)
+                        }) {
                             message.push_str(&format!("    [{i}] {source}:{line} {func_name}\n"));
                         } else {
                             break;
@@ -309,7 +305,7 @@ end
                     lua.create_function(config_builder_set_strict_mode)?,
                 )?;
 
-                config.set_metatable(Some(mt));
+                config.set_metatable(Some(mt))?;
 
                 Ok(config)
             })?,
@@ -464,10 +460,7 @@ end
 /// accepts any number of args and stringifies each; without this, configs
 /// that do `wezterm.log_info("connected", host, "→", port)` would fail
 /// to type-check at the FFI boundary.
-fn format_lua_log_args<'lua>(
-    lua: &'lua Lua,
-    args: Variadic<mlua::Value<'lua>>,
-) -> mlua::Result<String> {
+fn format_lua_log_args(lua: &Lua, args: Variadic<mlua::Value>) -> mlua::Result<String> {
     let mut parts: Vec<String> = Vec::with_capacity(args.len());
     for arg in args {
         // Honor the value's `__tostring` metamethod when present (matches
@@ -483,31 +476,31 @@ fn format_lua_log_args<'lua>(
     Ok(parts.join(" "))
 }
 
-fn lua_log_error<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+fn lua_log_error(lua: &Lua, args: Variadic<mlua::Value>) -> mlua::Result<()> {
     let msg = format_lua_log_args(lua, args)?;
     log::error!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_warn<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+fn lua_log_warn(lua: &Lua, args: Variadic<mlua::Value>) -> mlua::Result<()> {
     let msg = format_lua_log_args(lua, args)?;
     log::warn!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_info<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+fn lua_log_info(lua: &Lua, args: Variadic<mlua::Value>) -> mlua::Result<()> {
     let msg = format_lua_log_args(lua, args)?;
     log::info!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_debug<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+fn lua_log_debug(lua: &Lua, args: Variadic<mlua::Value>) -> mlua::Result<()> {
     let msg = format_lua_log_args(lua, args)?;
     log::debug!(target: "lua_config", "{msg}");
     Ok(())
 }
 
-fn lua_log_trace<'lua>(lua: &'lua Lua, args: Variadic<mlua::Value<'lua>>) -> mlua::Result<()> {
+fn lua_log_trace(lua: &Lua, args: Variadic<mlua::Value>) -> mlua::Result<()> {
     let msg = format_lua_log_args(lua, args)?;
     log::trace!(target: "lua_config", "{msg}");
     Ok(())
@@ -550,10 +543,7 @@ fn lua_time_now(_: &Lua, _: ()) -> mlua::Result<f64> {
 ///      from the registry, invoke it via `call_async`, then unset the
 ///      registry slot. If the lua context has gone away (reload, shutdown)
 ///      we silently drop the callback.
-fn lua_time_call_after<'lua>(
-    lua: &'lua Lua,
-    (seconds, func): (f64, mlua::Function<'lua>),
-) -> mlua::Result<()> {
+fn lua_time_call_after(lua: &Lua, (seconds, func): (f64, mlua::Function)) -> mlua::Result<()> {
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(mlua::Error::external(format!(
             "time.call_after: seconds must be a finite, non-negative number; got {seconds}"
@@ -589,7 +579,7 @@ fn lua_time_call_after<'lua>(
                 let _ = lua.unset_named_registry_value(&key);
                 match result {
                     Ok(Value::Function(func)) => {
-                        if let Err(err) = func.call_async::<(), ()>(()).await {
+                        if let Err(err) = func.call_async::<()>(()).await {
                             log::warn!(
                                 target: "lua_config",
                                 "time.call_after callback raised: {err}"
@@ -622,7 +612,7 @@ fn lua_time_call_after<'lua>(
 /// Lean on CommandBuilder's ability to update to current values of certain
 /// environment variables that may be adjusted via the registry or implicitly
 /// via eg: chsh (SHELL).
-fn getenv<'lua>(_: &'lua Lua, env: String) -> mlua::Result<Option<String>> {
+fn getenv(_: &Lua, env: String) -> mlua::Result<Option<String>> {
     let cmd = CommandBuilder::new_default_prog();
     match cmd.get_env(&env) {
         Some(s) => match s.to_str() {
@@ -635,17 +625,17 @@ fn getenv<'lua>(_: &'lua Lua, env: String) -> mlua::Result<Option<String>> {
     }
 }
 
-fn shell_split<'lua>(_: &'lua Lua, line: String) -> mlua::Result<Vec<String>> {
+fn shell_split(_: &Lua, line: String) -> mlua::Result<Vec<String>> {
     shlex::split(&line).ok_or_else(|| {
         mlua::Error::external(format!("cannot tokenize `{line}` using posix shell rules"))
     })
 }
 
-fn shell_join_args<'lua>(_: &'lua Lua, args: Vec<String>) -> mlua::Result<String> {
+fn shell_join_args(_: &Lua, args: Vec<String>) -> mlua::Result<String> {
     Ok(shlex::try_join(args.iter().map(|arg| arg.as_ref())).map_err(mlua::Error::external)?)
 }
 
-fn shell_quote_arg<'lua>(_: &'lua Lua, arg: String) -> mlua::Result<String> {
+fn shell_quote_arg(_: &Lua, arg: String) -> mlua::Result<String> {
     Ok(shlex::try_quote(&arg)
         .map_err(mlua::Error::external)?
         .into_owned())
@@ -654,7 +644,7 @@ fn shell_quote_arg<'lua>(_: &'lua Lua, arg: String) -> mlua::Result<String> {
 /// Returns the system hostname.
 /// Errors may occur while retrieving the hostname from the system,
 /// or if the hostname isn't a UTF-8 string.
-fn hostname<'lua>(_: &'lua Lua, _: ()) -> mlua::Result<String> {
+fn hostname(_: &Lua, _: ()) -> mlua::Result<String> {
     let hostname = hostname::get().map_err(mlua::Error::external)?;
     match hostname.to_str() {
         Some(hostname) => Ok(hostname.to_owned()),
@@ -684,8 +674,8 @@ struct TextStyleAttributes {
     /// the text color for eg: bold text.
     pub foreground: Option<RgbaColor>,
 }
-impl<'lua> FromLua<'lua> for TextStyleAttributes {
-    fn from_lua(value: Value<'lua>, _lua: &'lua Lua) -> Result<Self, mlua::Error> {
+impl FromLua for TextStyleAttributes {
+    fn from_lua(value: Value, _lua: &Lua) -> Result<Self, mlua::Error> {
         let mut attr: TextStyleAttributes = from_lua_value_dynamic(value)?;
         if let Some(italic) = attr.italic.take() {
             attr.style = if italic {
@@ -729,8 +719,8 @@ struct LuaFontAttributes {
     #[dynamic(default)]
     pub assume_emoji_presentation: Option<bool>,
 }
-impl<'lua> FromLua<'lua> for LuaFontAttributes {
-    fn from_lua(value: Value<'lua>, _lua: &'lua Lua) -> Result<Self, mlua::Error> {
+impl FromLua for LuaFontAttributes {
+    fn from_lua(value: Value, _lua: &Lua) -> Result<Self, mlua::Error> {
         match value {
             Value::String(s) => {
                 let mut attr = LuaFontAttributes::default();
@@ -779,8 +769,8 @@ fn disable_ligatures_for_menlo_or_monaco(mut attrs: FontAttributes) -> FontAttri
 /// `wezterm.font("foo", {foreground="tomato"})`
 /// yields:
 /// `{ font = {{ family = "foo" }}, foreground="tomato"}`
-fn font<'lua>(
-    _lua: &'lua Lua,
+fn font(
+    _lua: &Lua,
     (mut attrs, map_defaults): (LuaFontAttributes, Option<TextStyleAttributes>),
 ) -> mlua::Result<TextStyle> {
     let mut text_style = TextStyle::default();
@@ -827,8 +817,8 @@ fn font<'lua>(
 ///
 /// The second optional argument is a list of other TextStyle fields,
 /// as described by the `wezterm.font` documentation.
-fn font_with_fallback<'lua>(
-    _lua: &'lua Lua,
+fn font_with_fallback(
+    _lua: &Lua,
     (fallback, map_defaults): (Vec<LuaFontAttributes>, Option<TextStyleAttributes>),
 ) -> mlua::Result<TextStyle> {
     let mut text_style = TextStyle::default();
@@ -870,7 +860,7 @@ fn font_with_fallback<'lua>(
     Ok(text_style)
 }
 
-pub fn wrap_callback<'lua>(lua: &'lua Lua, callback: mlua::Function) -> mlua::Result<String> {
+pub fn wrap_callback(lua: &Lua, callback: mlua::Function) -> mlua::Result<String> {
     let callback_count: i32 = lua.named_registry_value(LUA_REGISTRY_USER_CALLBACK_COUNT)?;
     let user_event_id = format!("user-defined-{}", callback_count);
     lua.set_named_registry_value(LUA_REGISTRY_USER_CALLBACK_COUNT, callback_count + 1)?;
@@ -878,13 +868,13 @@ pub fn wrap_callback<'lua>(lua: &'lua Lua, callback: mlua::Function) -> mlua::Re
     Ok(user_event_id)
 }
 
-fn action_callback<'lua>(lua: &'lua Lua, callback: mlua::Function) -> mlua::Result<KeyAssignment> {
+fn action_callback(lua: &Lua, callback: mlua::Function) -> mlua::Result<KeyAssignment> {
     let user_event_id = wrap_callback(lua, callback)?;
     Ok(KeyAssignment::EmitEvent(user_event_id))
 }
 
-fn exec_domain<'lua>(
-    lua: &'lua Lua,
+fn exec_domain(
+    lua: &Lua,
     (name, fixup_command, label): (String, mlua::Function, Option<mlua::Value>),
 ) -> mlua::Result<ExecDomain> {
     let fixup_command = {
@@ -916,7 +906,7 @@ fn exec_domain<'lua>(
     })
 }
 
-fn split_by_newlines<'lua>(_: &'lua Lua, text: String) -> mlua::Result<Vec<String>> {
+fn split_by_newlines(_: &Lua, text: String) -> mlua::Result<Vec<String>> {
     Ok(text
         .lines()
         .map(|s| {
@@ -949,10 +939,7 @@ fn split_by_newlines<'lua>(_: &'lua Lua, text: String) -> mlua::Result<Vec<Strin
 ///
 /// wezterm.emit("event-name", "foo", "bar");
 /// ```
-pub fn register_event<'lua>(
-    lua: &'lua Lua,
-    (name, func): (String, mlua::Function),
-) -> mlua::Result<()> {
+pub fn register_event(lua: &Lua, (name, func): (String, mlua::Function)) -> mlua::Result<()> {
     let decorated_name = format!("wezterm-event-{}", name);
     let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
     match tbl {
@@ -978,7 +965,7 @@ const IS_EVENT: &str = "wezterm-is-event-emission";
 
 /// Returns true if the current lua context is being called as part
 /// of an emit_event call.
-pub fn is_event_emission<'lua>(lua: &'lua Lua) -> mlua::Result<bool> {
+pub fn is_event_emission(lua: &Lua) -> mlua::Result<bool> {
     match lua.named_registry_value(IS_EVENT)? {
         Value::Nil => Ok(false),
         Value::Boolean(value) => Ok(value),
@@ -1002,11 +989,8 @@ pub fn is_event_emission<'lua>(lua: &'lua Lua) -> mlua::Result<bool> {
 /// `false`, `wezterm.emit` will return `true`.
 /// The return value indicates to the caller whether the default action
 /// should take place.
-pub async fn emit_event<'lua>(
-    lua: &'lua Lua,
-    (name, args): (String, mlua::MultiValue<'lua>),
-) -> mlua::Result<bool> {
-    let was_emitting = is_event_emission(lua)?;
+pub async fn emit_event(lua: Lua, (name, args): (String, mlua::MultiValue)) -> mlua::Result<bool> {
+    let was_emitting = is_event_emission(&lua)?;
     lua.set_named_registry_value(IS_EVENT, true)?;
 
     let decorated_name = format!("wezterm-event-{}", name);
@@ -1014,14 +998,14 @@ pub async fn emit_event<'lua>(
     let result = match tbl {
         mlua::Value::Table(tbl) => {
             let mut emit_result = Ok(true);
-            for func in tbl.sequence_values::<mlua::Function>() {
-                let func = match func {
-                    Ok(f) => f,
-                    Err(e) => {
-                        emit_result = Err(e);
-                        break;
-                    }
-                };
+            let handlers = tbl
+                .sequence_values::<mlua::Function>()
+                .collect::<mlua::Result<Vec<_>>>();
+            let handlers = match handlers {
+                Ok(handlers) => handlers,
+                Err(err) => return Err(err),
+            };
+            for func in handlers {
                 match func.call_async(args.clone()).await {
                     Ok(mlua::Value::Boolean(b)) if !b => {
                         // Default action prevented
@@ -1049,12 +1033,9 @@ pub async fn emit_event<'lua>(
     }
 }
 
-pub fn emit_sync_callback<'lua, A>(
-    lua: &'lua Lua,
-    (name, args): (String, A),
-) -> mlua::Result<mlua::Value<'lua>>
+pub fn emit_sync_callback<A>(lua: &Lua, (name, args): (String, A)) -> mlua::Result<mlua::Value>
 where
-    A: IntoLuaMulti<'lua>,
+    A: IntoLuaMulti,
 {
     let decorated_name = format!("wezterm-event-{}", name);
     let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
@@ -1070,12 +1051,12 @@ where
     }
 }
 
-pub async fn emit_async_callback<'lua, A>(
-    lua: &'lua Lua,
+pub async fn emit_async_callback<A>(
+    lua: &Lua,
     (name, args): (String, A),
-) -> mlua::Result<mlua::Value<'lua>>
+) -> mlua::Result<mlua::Value>
 where
-    A: IntoLuaMulti<'lua>,
+    A: IntoLuaMulti,
 {
     let decorated_name = format!("wezterm-event-{}", name);
     let tbl: mlua::Value = lua.named_registry_value(&decorated_name)?;
@@ -1092,7 +1073,7 @@ where
 }
 
 /// Ungh: https://github.com/microsoft/WSL/issues/4456
-fn utf16_to_utf8<'lua>(_: &'lua Lua, text: mlua::String) -> mlua::Result<String> {
+fn utf16_to_utf8(_: &Lua, text: mlua::String) -> mlua::Result<String> {
     let bytes = text.as_bytes();
 
     if bytes.len() % 2 != 0 {
@@ -1109,10 +1090,7 @@ fn utf16_to_utf8<'lua>(_: &'lua Lua, text: mlua::String) -> mlua::Result<String>
     String::from_utf16(wide).map_err(mlua::Error::external)
 }
 
-pub fn add_to_config_reload_watch_list<'lua>(
-    lua: &'lua Lua,
-    args: Variadic<String>,
-) -> mlua::Result<()> {
+pub fn add_to_config_reload_watch_list(lua: &Lua, args: Variadic<String>) -> mlua::Result<()> {
     let mut watch_paths: Vec<String> = lua.named_registry_value("wezterm-watch-paths")?;
     watch_paths.extend_from_slice(&args);
     lua.set_named_registry_value("wezterm-watch-paths", watch_paths)?;

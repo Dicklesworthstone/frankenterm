@@ -251,8 +251,7 @@ bitflags! {
     // Note that these are strongly coupled with deps/freetype/src/lib.rs,
     // but we can't directly reference that from here without making config
     // depend on freetype.
-    #[derive(FromDynamic, ToDynamic)]
-    #[dynamic(try_from="String", into="String")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct FreeTypeLoadFlags: u32 {
         /// FT_LOAD_DEFAULT
         const DEFAULT = 0;
@@ -269,6 +268,22 @@ bitflags! {
         const NO_AUTOHINT = 32768;
         const NO_SVG = 16777216;
         const SVG_ONLY = 8388608;
+    }
+}
+
+impl FromDynamic for FreeTypeLoadFlags {
+    fn from_dynamic(
+        value: &Value,
+        options: FromDynamicOptions,
+    ) -> Result<Self, frankenterm_dynamic::Error> {
+        let text = String::from_dynamic(value, options)?;
+        Self::try_from(text).map_err(|err| frankenterm_dynamic::Error::Message(format!("{err:#}")))
+    }
+}
+
+impl ToDynamic for FreeTypeLoadFlags {
+    fn to_dynamic(&self) -> Value {
+        self.to_string().to_dynamic()
     }
 }
 

@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use rangeset::RangeSet;
+use std::hint::black_box;
 
 fn build_contig_rangeset(size: usize) -> RangeSet<usize> {
     let mut set = RangeSet::new();

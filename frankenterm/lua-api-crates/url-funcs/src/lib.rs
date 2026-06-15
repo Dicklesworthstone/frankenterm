@@ -38,13 +38,13 @@ impl std::ops::DerefMut for Url {
 }
 
 impl UserData for Url {
-    fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(MetaMethod::ToString, |_, this, _: ()| {
             Ok(this.url.as_str().to_string())
         });
     }
 
-    fn add_fields<'lua, F: UserDataFields<'lua, Self>>(fields: &mut F) {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("scheme", |_, this| Ok(this.scheme().to_string()));
         fields.add_field_method_get("username", |_, this| Ok(this.username().to_string()));
         fields.add_field_method_get("password", |_, this| {

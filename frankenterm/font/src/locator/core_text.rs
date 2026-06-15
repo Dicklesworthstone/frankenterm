@@ -3,7 +3,6 @@
 
 use crate::locator::{FontDataSource, FontLocator, FontOrigin};
 use crate::parser::ParsedFont;
-use cocoa::base::id;
 use config::{FontAttributes, FontStretch, FontStyle, FontWeight};
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFRange, TCFType};
@@ -11,6 +10,7 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef};
 use core_text::font::*;
 use core_text::font_descriptor::*;
+use objc::runtime::Object;
 use objc::*;
 use rangeset::RangeSet;
 use std::cmp::Ordering;
@@ -253,7 +253,8 @@ fn build_fallback_list_impl() -> anyhow::Result<Vec<ParsedFont>> {
     let menlo =
         new_from_name("Menlo", 0.0).map_err(|_| anyhow::anyhow!("failed to get Menlo font"))?;
 
-    let user_defaults: id = unsafe { msg_send![class!(NSUserDefaults), standardUserDefaults] };
+    let user_defaults: *mut Object =
+        unsafe { msg_send![class!(NSUserDefaults), standardUserDefaults] };
 
     let apple_lang = "AppleLanguages"
         .parse::<CFString>()
