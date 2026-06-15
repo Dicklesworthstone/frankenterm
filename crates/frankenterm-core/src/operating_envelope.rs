@@ -1878,7 +1878,6 @@ pub fn build_operating_envelope_retained_run_artifact(
     })
 }
 
-#[must_use]
 pub fn operating_envelope_retained_run_jsonl_line(
     artifact: &OperatingEnvelopeRetainedRunArtifact,
 ) -> Result<String, serde_json::Error> {
@@ -1999,6 +1998,117 @@ pub fn operating_envelope_input_for_scenario(
     };
 
     OperatingEnvelopePlannerInput::new(generated_at_ms, envelope_id, objective_id, input_domains)
+}
+
+// ── ft-7h5da.10.4.4: production reader that flips `target_class_proof_state` ──
+// from the signed resource-cockpit target-class artifact.
+//
+// Before this, the envelope's target-class gate was inert: every setter to
+// `OperatingEnvelopeProofState::Measured` lived in test code and no production
+// path read the W9.4 signed artifact, so signing it (the campaign EXIT
+// criterion) did not flip the live envelope to admit high-scale windows.
+
+/// Repo-relative pointer artifact published into the release attestation bundle.
+pub const TARGET_CLASS_ARTIFACT_POINTER: &str =
+    "docs/attestations/proofs/resource-cockpit-target-class.json";
+
+/// Map a target-class cockpit `summary.json` payload to an envelope proof state.
+///
+/// Fail-closed: maps to [`OperatingEnvelopeProofState::Measured`] only when the
+/// run PASSED and is `ready_to_sign` with
+/// `hardware_predicate.proof_status == "proven_predicate_met"` and
+/// `hardware_predicate.high_scale_claim_allowed == true`. An explicit
+/// `skipped_not_proven` maps to `SkippedNotProven`; anything else (missing or
+/// garbled fields) is `Unavailable`, keeping the high-scale gate shut.
+#[must_use]
+pub fn target_class_proof_state_from_summary(
+    summary: &serde_json::Value,
+) -> OperatingEnvelopeProofState {
+    let ready_to_sign = summary
+        .get("ready_to_sign")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let high_scale_allowed = summary
+        .pointer("/hardware_predicate/high_scale_claim_allowed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match summary
+        .pointer("/hardware_predicate/proof_status")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("proven_predicate_met") if ready_to_sign && high_scale_allowed => {
+            OperatingEnvelopeProofState::Measured
+        }
+        Some("skipped_not_proven") => OperatingEnvelopeProofState::SkippedNotProven,
+        _ => OperatingEnvelopeProofState::Unavailable,
+    }
+}
+
+/// Map the committed pointer artifact's own `status` to a proof state, used when
+/// no per-run `summary.json` is present on disk (the common in-repo case).
+#[must_use]
+fn target_class_proof_state_from_pointer(
+    pointer: &serde_json::Value,
+) -> OperatingEnvelopeProofState {
+    match pointer
+        .pointer("/current_artifact/status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| pointer.get("status").and_then(serde_json::Value::as_str))
+    {
+        Some("proven_predicate_met") => OperatingEnvelopeProofState::Measured,
+        Some("skipped_not_proven") => OperatingEnvelopeProofState::SkippedNotProven,
+        _ => OperatingEnvelopeProofState::Unavailable,
+    }
+}
+
+/// Read the latest target-class proof state from the signed artifact rooted at
+/// `repo_root`. Prefers the per-run `summary.json` referenced by the pointer
+/// (authoritative; carries `ready_to_sign`), falling back to the committed
+/// pointer's own status when the run artifact is absent. Any I/O or parse
+/// failure is fail-closed to [`OperatingEnvelopeProofState::Unavailable`].
+#[must_use]
+pub fn read_target_class_proof_state(repo_root: &std::path::Path) -> OperatingEnvelopeProofState {
+    let Ok(pointer_text) = std::fs::read_to_string(repo_root.join(TARGET_CLASS_ARTIFACT_POINTER))
+    else {
+        return OperatingEnvelopeProofState::Unavailable;
+    };
+    let Ok(pointer) = serde_json::from_str::<serde_json::Value>(&pointer_text) else {
+        return OperatingEnvelopeProofState::Unavailable;
+    };
+    if let Some(rel) = pointer
+        .pointer("/current_artifact/path")
+        .and_then(serde_json::Value::as_str)
+    {
+        if let Ok(summary_text) = std::fs::read_to_string(repo_root.join(rel)) {
+            if let Ok(summary) = serde_json::from_str::<serde_json::Value>(&summary_text) {
+                return target_class_proof_state_from_summary(&summary);
+            }
+        }
+    }
+    target_class_proof_state_from_pointer(&pointer)
+}
+
+/// Resolve the production [`OperatingEnvelopeTargetClass`] from the signed
+/// artifact at `repo_root`.
+///
+/// Non-regressing by design: a high-scale `target_64_core_256g` profile is
+/// claimed ONLY when the artifact is signed + proven (`Measured`). When the
+/// artifact is `skipped_not_proven`, absent, or unreadable, the envelope falls
+/// back to the `developer_laptop` profile (`NotRequired`) — i.e. the default
+/// envelope is unchanged until the W9.4 artifact is actually signed, at which
+/// point the same production path flips the gate to admit high-scale windows.
+#[must_use]
+pub fn operating_envelope_target_class_from_artifact(
+    repo_root: &std::path::Path,
+) -> OperatingEnvelopeTargetClass {
+    match read_target_class_proof_state(repo_root) {
+        OperatingEnvelopeProofState::Measured => {
+            OperatingEnvelopeTargetClass::target_64_core_256g()
+                .proof_state(OperatingEnvelopeProofState::Measured)
+                .with_reason_code("target_hardware.proven_from_signed_artifact")
+        }
+        _ => OperatingEnvelopeTargetClass::developer_laptop(),
+    }
 }
 
 #[must_use]
@@ -3234,6 +3344,236 @@ mod tests {
     use super::*;
 
     const NOW_MS: u64 = 1_778_912_100_000;
+
+    // ── ft-7h5da.10.4.4: target-class artifact reader ──
+
+    #[test]
+    fn summary_proven_and_ready_maps_to_measured() {
+        let summary = serde_json::json!({
+            "status": "passed",
+            "ready_to_sign": true,
+            "hardware_predicate": {
+                "proof_status": "proven_predicate_met",
+                "high_scale_claim_allowed": true,
+            },
+        });
+        assert_eq!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn summary_proven_but_not_ready_to_sign_is_not_measured() {
+        // Fail-closed: proof_status proven but ready_to_sign=false must NOT flip.
+        let summary = serde_json::json!({
+            "ready_to_sign": false,
+            "hardware_predicate": {
+                "proof_status": "proven_predicate_met",
+                "high_scale_claim_allowed": true,
+            },
+        });
+        assert_ne!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn summary_proven_but_high_scale_not_allowed_is_not_measured() {
+        let summary = serde_json::json!({
+            "ready_to_sign": true,
+            "hardware_predicate": {
+                "proof_status": "proven_predicate_met",
+                "high_scale_claim_allowed": false,
+            },
+        });
+        assert_ne!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn summary_skipped_maps_to_skipped_not_proven() {
+        let summary = serde_json::json!({
+            "ready_to_sign": false,
+            "hardware_predicate": { "proof_status": "skipped_not_proven" },
+        });
+        assert_eq!(
+            target_class_proof_state_from_summary(&summary),
+            OperatingEnvelopeProofState::SkippedNotProven
+        );
+    }
+
+    #[test]
+    fn summary_missing_fields_is_unavailable() {
+        assert_eq!(
+            target_class_proof_state_from_summary(&serde_json::json!({})),
+            OperatingEnvelopeProofState::Unavailable
+        );
+    }
+
+    #[test]
+    fn pointer_status_maps_proof_state() {
+        let proven = serde_json::json!({ "status": "proven_predicate_met" });
+        let skipped = serde_json::json!({ "current_artifact": { "status": "skipped_not_proven" } });
+        let unknown = serde_json::json!({ "status": "weird" });
+        assert_eq!(
+            target_class_proof_state_from_pointer(&proven),
+            OperatingEnvelopeProofState::Measured
+        );
+        assert_eq!(
+            target_class_proof_state_from_pointer(&skipped),
+            OperatingEnvelopeProofState::SkippedNotProven
+        );
+        assert_eq!(
+            target_class_proof_state_from_pointer(&unknown),
+            OperatingEnvelopeProofState::Unavailable
+        );
+    }
+
+    #[test]
+    fn read_proof_state_missing_pointer_is_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_target_class_proof_state(dir.path()),
+            OperatingEnvelopeProofState::Unavailable
+        );
+    }
+
+    #[test]
+    fn read_proof_state_falls_back_to_pointer_status_when_summary_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pointer_path = dir.path().join(TARGET_CLASS_ARTIFACT_POINTER);
+        std::fs::create_dir_all(pointer_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "skipped_not_proven",
+                "current_artifact": {
+                    "path": "tests/e2e/artifacts/target-class/missing/summary.json",
+                    "status": "skipped_not_proven",
+                },
+            }))
+            .expect("ser"),
+        )
+        .expect("write pointer");
+        // summary.json referenced by the pointer is absent on disk → fall back.
+        assert_eq!(
+            read_target_class_proof_state(dir.path()),
+            OperatingEnvelopeProofState::SkippedNotProven
+        );
+    }
+
+    #[test]
+    fn read_proof_state_prefers_present_summary_over_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pointer_path = dir.path().join(TARGET_CLASS_ARTIFACT_POINTER);
+        std::fs::create_dir_all(pointer_path.parent().expect("parent")).expect("mkdir");
+        let summary_rel = "tests/e2e/artifacts/target-class/sku/run/summary.json";
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "skipped_not_proven",
+                "current_artifact": { "path": summary_rel, "status": "skipped_not_proven" },
+            }))
+            .expect("ser"),
+        )
+        .expect("write pointer");
+        let summary_path = dir.path().join(summary_rel);
+        std::fs::create_dir_all(summary_path.parent().expect("parent")).expect("mkdir summary");
+        std::fs::write(
+            &summary_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "passed",
+                "ready_to_sign": true,
+                "hardware_predicate": {
+                    "proof_status": "proven_predicate_met",
+                    "high_scale_claim_allowed": true,
+                },
+            }))
+            .expect("ser"),
+        )
+        .expect("write summary");
+        // A present, signed summary is authoritative over the stale pointer status.
+        assert_eq!(
+            read_target_class_proof_state(dir.path()),
+            OperatingEnvelopeProofState::Measured
+        );
+    }
+
+    #[test]
+    fn target_class_from_artifact_only_claims_high_scale_when_measured() {
+        // Unproven/absent → developer-laptop (NotRequired): default unchanged.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unproven = operating_envelope_target_class_from_artifact(dir.path());
+        assert_eq!(
+            unproven.profile,
+            OperatingEnvelopeTargetProfile::DeveloperLaptop
+        );
+        assert_eq!(
+            unproven.proof_state,
+            OperatingEnvelopeProofState::NotRequired
+        );
+
+        // Signed + proven → high-scale target class with Measured proof state.
+        let pointer_path = dir.path().join(TARGET_CLASS_ARTIFACT_POINTER);
+        std::fs::create_dir_all(pointer_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&serde_json::json!({ "status": "proven_predicate_met" }))
+                .expect("ser"),
+        )
+        .expect("write pointer");
+        let proven = operating_envelope_target_class_from_artifact(dir.path());
+        assert_eq!(
+            proven.profile,
+            OperatingEnvelopeTargetProfile::Target64Core256g
+        );
+        assert_eq!(proven.proof_state, OperatingEnvelopeProofState::Measured);
+    }
+
+    #[test]
+    fn signing_artifact_flips_target_class_unproven_gate() {
+        // End-to-end: feeding the artifact-derived target class into the planner
+        // clears the `capacity.target_class_unproven` reason once proven.
+        let unproven_plan = plan_operating_envelope(
+            OperatingEnvelopePlannerInput::new(NOW_MS, "env", "obj", base_domains())
+                .target_class(
+                    OperatingEnvelopeTargetClass::target_64_core_256g()
+                        .proof_state(OperatingEnvelopeProofState::SkippedNotProven),
+                )
+                .budgets(OperatingEnvelopeBudgets::target_class()),
+        );
+        assert!(
+            unproven_plan
+                .decision
+                .reason_codes
+                .iter()
+                .any(|r| r == "capacity.target_class_unproven"),
+            "unproven target class must surface the gate reason: {:?}",
+            unproven_plan.decision.reason_codes
+        );
+
+        let proven_plan = plan_operating_envelope(
+            OperatingEnvelopePlannerInput::new(NOW_MS, "env", "obj", base_domains())
+                .target_class(
+                    OperatingEnvelopeTargetClass::target_64_core_256g()
+                        .proof_state(OperatingEnvelopeProofState::Measured),
+                )
+                .budgets(OperatingEnvelopeBudgets::target_class()),
+        );
+        assert!(
+            !proven_plan
+                .decision
+                .reason_codes
+                .iter()
+                .any(|r| r == "capacity.target_class_unproven"),
+            "measured target class must clear the gate reason: {:?}",
+            proven_plan.decision.reason_codes
+        );
+    }
 
     fn source(
         source_id: &str,

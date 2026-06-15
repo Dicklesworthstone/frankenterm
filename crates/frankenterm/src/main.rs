@@ -41,7 +41,8 @@ use frankenterm_core::operating_envelope::OPERATING_ENVELOPE_CONTRACT_ID;
 use frankenterm_core::operating_envelope::{
     OPERATING_ENVELOPE_MCP_CURRENT_URI, OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
     OperatingEnvelopeScenario, OperatingEnvelopeSurface, build_operating_envelope_surface_data,
-    operating_envelope_input_for_scenario, plan_operating_envelope,
+    operating_envelope_input_for_scenario, operating_envelope_target_class_from_artifact,
+    plan_operating_envelope,
 };
 use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
@@ -22919,12 +22920,23 @@ fn build_operating_envelope_payload(
     source: &str,
     explain_reason: Option<&str>,
 ) -> serde_json::Value {
-    let input = operating_envelope_input_for_scenario(
+    let resolved_scenario = OperatingEnvelopeScenario::from(scenario);
+    let mut input = operating_envelope_input_for_scenario(
         generated_at_ms,
         envelope_id,
         objective_id,
-        OperatingEnvelopeScenario::from(scenario),
+        resolved_scenario,
     );
+    // ft-7h5da.10.4.4: for the real `current` envelope, resolve the target-class
+    // proof state from the signed W9.4 artifact instead of the hard-coded
+    // developer-laptop default, so signing the artifact actually flips the live
+    // high-scale gate. Non-`current` scenarios are synthetic fixtures and keep
+    // their fixed inputs. The resolver is fail-closed: unproven/absent artifact
+    // → developer-laptop (NotRequired), i.e. unchanged until the artifact signs.
+    if resolved_scenario == OperatingEnvelopeScenario::Current {
+        let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        input = input.target_class(operating_envelope_target_class_from_artifact(&repo_root));
+    }
     let plan = plan_operating_envelope(input);
     build_operating_envelope_surface_data(
         &plan,
@@ -45765,8 +45777,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             rch_admission_command,
         }) => {
             if rch_admission {
-                let repo_root = std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let repo_root =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let proof_command = rch_admission_command.unwrap_or_else(|| {
                     "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
                      cargo test -p frankenterm-core --lib"
@@ -45781,13 +45793,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     &proof_command,
                     generated_at_ms,
                 );
-                let report =
-                    frankenterm_core::rch_admission::build_rch_admission_report(&input);
+                let report = frankenterm_core::rch_admission::build_rch_admission_report(&input);
                 if json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&report)
-                            .unwrap_or_else(|_| "{}".to_string())
+                        serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
                     );
                 } else {
                     let surface = frankenterm_core::rch_admission_surface::RchAdmissionSurface::from_report(
