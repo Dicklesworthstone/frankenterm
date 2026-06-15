@@ -982,6 +982,14 @@ pub struct RuntimeMetrics {
     cursor_snapshot_recent_bytes: StdMutex<VecDeque<u64>>,
     /// Last observed capture pipeline queue depth.
     capture_queue_depth: AtomicUsize,
+    /// ft-u6zfw: crash-loop detector fed by observed agent/pane restarts so
+    /// `HealthSnapshot` surfaces real crash loops instead of hardcoded healthy
+    /// zeros. Fed from the discovery tick's `new_generations` (panes that
+    /// respawned with a new generation) — the runtime's available restart
+    /// signal — so managed-agent crash loops become visible to `ft status` /
+    /// robot health, which were previously invisible. A process-level
+    /// watcher-restart source would need cross-process persistence (follow-up).
+    crash_detector: StdMutex<crate::crash::CrashLoopDetector>,
     /// Total native pane output events received (pre-coalesce).
     native_output_input_events: ShardedCounter,
     /// Total native pane output batches emitted (post-coalesce).
@@ -1034,6 +1042,9 @@ impl Default for RuntimeMetrics {
                 TELEMETRY_PERCENTILE_WINDOW_CAPACITY,
             )),
             capture_queue_depth: AtomicUsize::new(0),
+            crash_detector: StdMutex::new(crate::crash::CrashLoopDetector::new(
+                crate::crash::CrashLoopConfig::default(),
+            )),
             native_output_input_events: ShardedCounter::new(),
             native_output_batches_emitted: ShardedCounter::new(),
             native_output_input_bytes: ShardedCounter::new(),
@@ -1046,6 +1057,47 @@ impl Default for RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
+    /// ft-u6zfw: feed observed agent/pane restarts (panes that gained a new
+    /// generation this discovery tick) into the crash-loop detector. `now_secs`
+    /// is wall-clock epoch seconds. Recording each restart lets the detector's
+    /// windowed `is_crash_loop` + `restart_count` reflect real respawn storms.
+    pub fn record_observed_restarts(&self, restarts: usize, now_secs: u64) {
+        if restarts == 0 {
+            return;
+        }
+        if let Ok(mut detector) = self.crash_detector.lock() {
+            for _ in 0..restarts {
+                detector.record_crash(now_secs);
+            }
+        }
+    }
+
+    /// ft-u6zfw: note a discovery tick with no restarts — a clean run that
+    /// resets the consecutive-crash counter (the windowed `restart_count` /
+    /// `in_crash_loop` still age out on their own).
+    pub fn note_clean_observation(&self) {
+        if let Ok(mut detector) = self.crash_detector.lock() {
+            detector.record_success();
+        }
+    }
+
+    /// ft-u6zfw: crash-loop diagnostics for `HealthSnapshot`. Falls back to a
+    /// healthy default if the detector lock is poisoned rather than panicking on
+    /// the snapshot publish path.
+    #[must_use]
+    pub fn crash_loop_diagnostics(&self) -> crate::crash::CrashLoopDiagnostics {
+        self.crash_detector.lock().map_or_else(
+            |_| crate::crash::CrashLoopDiagnostics {
+                restart_count: 0,
+                last_crash_at: None,
+                consecutive_crashes: 0,
+                current_backoff_ms: 0,
+                in_crash_loop: false,
+            },
+            |detector| detector.diagnostics(),
+        )
+    }
+
     /// Record an ingest lag sample.
     pub fn record_ingest_lag(&self, lag_ms: u64) {
         self.ingest_lag_sum_ms.add(lag_ms);
@@ -1930,12 +1982,14 @@ impl ObservationRuntime {
         let scheduler_snapshot = Arc::clone(&self.scheduler_snapshot);
 
         let initial_retention_days = self.config.retention_days;
+        let initial_retention_max_mb = self.config.retention_max_mb;
         let initial_checkpoint_secs = self.config.checkpoint_interval_secs;
         let initial_cache_gc_settings = self.config.gc;
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
             let mut retention_days = initial_retention_days;
+            let mut retention_max_mb = initial_retention_max_mb;
             let mut checkpoint_secs = initial_checkpoint_secs;
             let mut cache_gc_settings = initial_cache_gc_settings;
             let mut last_health_snapshot = Instant::now()
@@ -1991,6 +2045,14 @@ impl ObservationRuntime {
                         );
                         retention_days = new_config.retention_days;
                     }
+                    if new_config.retention_max_mb != retention_max_mb {
+                        info!(
+                            old = retention_max_mb,
+                            new = new_config.retention_max_mb,
+                            "Size-based retention cap updated"
+                        );
+                        retention_max_mb = new_config.retention_max_mb;
+                    }
                     if new_config.checkpoint_interval_secs != checkpoint_secs {
                         info!(
                             old = checkpoint_secs,
@@ -2030,6 +2092,38 @@ impl ObservationRuntime {
                             .await
                         {
                             error!(error = %e, "Audit purge failed");
+                        }
+                    }
+
+                    // Size-based retention (ft-rrqhm): evict oldest segments
+                    // until the live DB size is under storage.retention_max_mb.
+                    // Runs independently of retention_days so an operator who
+                    // sets only a size cap (retention_days=0, retention_max_mb>0)
+                    // still gets a bounded database instead of unbounded growth.
+                    if retention_max_mb > 0 {
+                        match storage
+                            .enforce_size_limit_with_cx(&loop_cx, retention_max_mb)
+                            .await
+                        {
+                            Ok(outcome) => {
+                                if outcome.deleted_segments > 0 {
+                                    info!(
+                                        deleted_segments = outcome.deleted_segments,
+                                        used_bytes_after = outcome.used_bytes_after,
+                                        cap_mb = retention_max_mb,
+                                        "Size-based retention evicted oldest segments"
+                                    );
+                                }
+                                if outcome.over_limit_after {
+                                    warn!(
+                                        cap_mb = retention_max_mb,
+                                        used_bytes_after = outcome.used_bytes_after,
+                                        "Database still over size cap after eviction \
+                                         (non-segment data dominates or per-pass budget exhausted)"
+                                    );
+                                }
+                            }
+                            Err(e) => error!(error = %e, "Size-based retention failed"),
                         }
                     }
                     last_retention_check = now;
@@ -2472,11 +2566,12 @@ impl ObservationRuntime {
                         },
                         backpressure_tier,
                         last_activity_by_pane,
-                        restart_count: 0,
-                        last_crash_at: None,
-                        consecutive_crashes: 0,
-                        current_backoff_ms: 0,
-                        in_crash_loop: false,
+                        // ft-u6zfw: real crash-loop diagnostics (was hardcoded zeros).
+                        restart_count: metrics.crash_loop_diagnostics().restart_count,
+                        last_crash_at: metrics.crash_loop_diagnostics().last_crash_at,
+                        consecutive_crashes: metrics.crash_loop_diagnostics().consecutive_crashes,
+                        current_backoff_ms: metrics.crash_loop_diagnostics().current_backoff_ms,
+                        in_crash_loop: metrics.crash_loop_diagnostics().in_crash_loop,
                         fleet_pressure_tier: Some(format!("{:?}", fleet_eval.compound_tier)),
                         swarm_capacity: Some(
                             crate::runtime_telemetry::live_swarm_capacity_operator_summary(
@@ -2505,6 +2600,9 @@ impl ObservationRuntime {
         let detection_contexts = Arc::clone(&self.detection_contexts);
         let pane_activity_tracker = Arc::clone(&self.pane_activity_tracker);
         let backpressure = Arc::clone(self.metrics.backpressure_metrics());
+        // ft-u6zfw: clone the metrics handle so the discovery loop can feed
+        // observed agent/pane restarts into the crash-loop detector.
+        let crash_metrics = Arc::clone(&self.metrics);
         let storage = self.storage.clone();
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let initial_interval = self.config.discovery_interval;
@@ -2761,6 +2859,20 @@ impl ObservationRuntime {
                                 closed = diff.closed_panes.len(),
                                 restarted = diff.new_generations.len(),
                                 "Pane discovery tick"
+                            );
+                        }
+                        // ft-u6zfw: feed observed agent/pane restarts into the
+                        // crash-loop detector so HealthSnapshot reflects real
+                        // crash loops; a tick with no respawns is a clean run.
+                        let crash_now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_secs());
+                        if diff.new_generations.is_empty() {
+                            crash_metrics.note_clean_observation();
+                        } else {
+                            crash_metrics.record_observed_restarts(
+                                diff.new_generations.len(),
+                                crash_now_secs,
                             );
                         }
                     }
@@ -5129,11 +5241,12 @@ impl RuntimeHandle {
             },
             backpressure_tier,
             last_activity_by_pane,
-            restart_count: 0,
-            last_crash_at: None,
-            consecutive_crashes: 0,
-            current_backoff_ms: 0,
-            in_crash_loop: false,
+            // ft-u6zfw: real crash-loop diagnostics (was hardcoded zeros).
+            restart_count: self.metrics.crash_loop_diagnostics().restart_count,
+            last_crash_at: self.metrics.crash_loop_diagnostics().last_crash_at,
+            consecutive_crashes: self.metrics.crash_loop_diagnostics().consecutive_crashes,
+            current_backoff_ms: self.metrics.crash_loop_diagnostics().current_backoff_ms,
+            in_crash_loop: self.metrics.crash_loop_diagnostics().in_crash_loop,
             fleet_pressure_tier: None,
             swarm_capacity: Some(
                 crate::runtime_telemetry::live_swarm_capacity_operator_summary(

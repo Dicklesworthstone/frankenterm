@@ -201,6 +201,23 @@ pub use migrations::{
 // re-export blocks below.
 pub use self::types::{CheckpointResult, DatabasePageStats, Segment};
 
+/// Outcome of a size-based retention (size-cap eviction) pass driven by
+/// `storage.retention_max_mb`. Reported by
+/// [`StorageHandle::enforce_size_limit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeEvictionOutcome {
+    /// Number of output segments deleted to enforce the cap.
+    pub deleted_segments: usize,
+    /// Estimated live (non-free) database size before eviction, in bytes.
+    pub used_bytes_before: u64,
+    /// Estimated live (non-free) database size after eviction, in bytes.
+    pub used_bytes_after: u64,
+    /// True if the database was still over the cap when the pass stopped — i.e.
+    /// non-segment data alone exceeds the limit, or the per-pass deletion budget
+    /// was exhausted (eviction continues on the next maintenance tick).
+    pub over_limit_after: bool,
+}
+
 // br-ft-8bvg0 slice 2: 10 search/index result types lifted to
 // `storage/types.rs`. All pure-data with serde derives, no
 // private-helper deps from this module.
@@ -667,6 +684,13 @@ enum WriteCommand {
         before_ts: i64,
         respond: oneshot::Sender<Result<usize>>,
     },
+    /// Enforce a size-based retention cap (`storage.retention_max_mb`) by
+    /// evicting the oldest output segments until the live database size is
+    /// under the limit. `max_mb == 0` disables the cap (no-op).
+    EnforceSizeLimit {
+        max_mb: u32,
+        respond: oneshot::Sender<Result<SizeEvictionOutcome>>,
+    },
     /// Vacuum the database (explicit)
     Vacuum {
         respond: oneshot::Sender<Result<()>>,
@@ -896,6 +920,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::SyncFts { .. } => "SyncFts",
             Self::RebuildFts { .. } => "RebuildFts",
             Self::PruneSegments { .. } => "PruneSegments",
+            Self::EnforceSizeLimit { .. } => "EnforceSizeLimit",
             Self::Vacuum { .. } => "Vacuum",
             Self::UpsertAccount { .. } => "UpsertAccount",
             Self::UpdateAccountLastUsed { .. } => "UpdateAccountLastUsed",
@@ -3082,6 +3107,45 @@ impl StorageHandle {
         };
         let _ = self.record_maintenance_with_cx(cx, record).await?;
         Ok(deleted)
+    }
+
+    /// Enforce the configured size-based retention cap
+    /// (`storage.retention_max_mb`) by evicting the oldest output segments
+    /// until the live database size is under the limit.
+    ///
+    /// "Live size" is `(page_count - free_pages) * page_size` — the non-free
+    /// pages actually holding data. Bounding it bounds unbounded growth even
+    /// without a `VACUUM`, because SQLite recycles freelist pages for
+    /// subsequent inserts, so the file plateaus rather than growing forever.
+    ///
+    /// `max_mb == 0` disables the cap and is a no-op. Returns a
+    /// [`SizeEvictionOutcome`] describing what was evicted.
+    pub async fn enforce_size_limit(&self, max_mb: u32) -> Result<SizeEvictionOutcome> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.enforce_size_limit_with_cx(&cx, max_mb).await
+    }
+
+    /// Cx-first sibling of [`enforce_size_limit`].
+    pub async fn enforce_size_limit_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        max_mb: u32,
+    ) -> Result<SizeEvictionOutcome> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("enforce_size_limit cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::EnforceSizeLimit {
+                    max_mb,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// Record a usage metric for analytics tracking.
@@ -8165,7 +8229,7 @@ fn flush_storage_io_pending_commands(
                 pending_append_segments.push(pending_append);
                 continue;
             }
-            Err(cmd) => cmd,
+            Err(cmd) => *cmd,
         };
 
         if let Some(message) = flush_append_segment_group_recovering(
@@ -8227,7 +8291,7 @@ impl PendingAppendSegmentWrite {
 
 fn pending_append_segment_from_command(
     cmd: WriteCommand,
-) -> std::result::Result<PendingAppendSegmentWrite, WriteCommand> {
+) -> std::result::Result<PendingAppendSegmentWrite, Box<WriteCommand>> {
     match cmd {
         WriteCommand::AppendSegment {
             pane_id,
@@ -8242,7 +8306,7 @@ fn pending_append_segment_from_command(
             zone_type,
             respond: WriterResultResponder::new(respond),
         }),
-        other => Err(other),
+        other => Err(Box::new(other)),
     }
 }
 
@@ -8420,6 +8484,9 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         WriteCommand::UpsertLimitWindow { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::EnforceSizeLimit { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
         WriteCommand::PurgeAuditActions { respond, .. }
@@ -9918,6 +9985,11 @@ fn dispatch_write_command_raw(
         WriteCommand::PruneSegments { before_ts, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = prune_segments_backend(backend, before_ts);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::EnforceSizeLimit { max_mb, respond } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = enforce_size_limit_backend(backend, max_mb);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Vacuum { respond } => {
@@ -13675,21 +13747,124 @@ fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Resul
     // `sync_fts_for_pane_backend` sees `had_prior_progress = false` and takes
     // the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
     if deleted > 0 {
-        backend
-            .query_map_typed(
-                "DELETE FROM fts_pane_progress
+        rewind_stranded_fts_progress_backend(backend)?;
+    }
+
+    Ok(deleted)
+}
+
+/// Drop any `fts_pane_progress` row whose `last_indexed_seq` no longer maps to a
+/// surviving segment for that pane, so a subsequent `sync_fts_for_pane_backend`
+/// re-picks-up the reset-chain rows. Shared by every path that deletes
+/// `output_segments` rows ([`prune_segments_backend`] time-cutoff prune and
+/// [`enforce_size_limit_backend`] size-cap eviction); see the detailed rationale
+/// in `prune_segments_backend` ([ft-znu6v]).
+fn rewind_stranded_fts_progress_backend(backend: &dyn StorageBackend) -> Result<()> {
+    backend
+        .query_map_typed(
+            "DELETE FROM fts_pane_progress
              WHERE last_indexed_seq > COALESCE(
                  (SELECT MAX(seq) FROM output_segments
                   WHERE output_segments.pane_id = fts_pane_progress.pane_id),
                  -1
              )
              RETURNING pane_id",
-                &[],
-            )
-            .map_err(|err| storage_backend_error("Failed to rewind stranded FTS progress", err))?;
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Failed to rewind stranded FTS progress", err))?;
+    Ok(())
+}
+
+/// Maximum output segments evicted per [`enforce_size_limit_backend`]
+/// invocation. A badly-over-cap database converges over several maintenance
+/// ticks instead of stalling the single writer thread with one unbounded
+/// delete.
+const SIZE_EVICTION_MAX_DELETE_PER_PASS: usize = 200_000;
+
+/// Oldest-segment delete batch per inner iteration of size eviction.
+const SIZE_EVICTION_BATCH: usize = 4_096;
+
+/// Estimated live (non-free) database size in bytes:
+/// `(page_count - freelist_count) * page_size`. This is the quantity a
+/// size-cap eviction must drive down — unlike the raw file size
+/// (`page_count * page_size`), it *decreases* as rows are deleted (freed pages
+/// move to the freelist), so the eviction loop terminates.
+fn database_used_bytes_backend(backend: &dyn StorageBackend) -> Result<u64> {
+    use crate::storage_backend_helpers::pragma_value;
+    let stats = database_page_stats_backend(backend)?;
+    let page_size = pragma_value(backend, "page_size")
+        .map_err(|err| storage_backend_error("PRAGMA page_size", err))?
+        .ok_or_else(|| StorageError::Database("PRAGMA page_size returned no row".to_string()))?
+        .parse::<i64>()
+        .map_err(|e| StorageError::Database(format!("PRAGMA page_size parse: {e}")))?;
+    let live_pages = stats.page_count.saturating_sub(stats.free_pages).max(0);
+    let live_pages = u64::try_from(live_pages).unwrap_or(0);
+    let page_size = u64::try_from(page_size).unwrap_or(0);
+    Ok(live_pages.saturating_mul(page_size))
+}
+
+/// Delete the `limit` oldest output segments (by `captured_at`, ties broken by
+/// `id` so eviction is deterministic) and rewind any stranded FTS progress.
+/// Returns the number of segments deleted.
+fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) -> Result<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let deleted_rows = backend
+        .query_map_typed(
+            "DELETE FROM output_segments WHERE id IN (
+                 SELECT id FROM output_segments ORDER BY captured_at ASC, id ASC LIMIT ?1
+             ) RETURNING id",
+            &[ToSqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX))],
+        )
+        .map_err(|err| storage_backend_error("Failed to evict oldest segments", err))?;
+    let deleted = deleted_rows.len();
+    if deleted > 0 {
+        rewind_stranded_fts_progress_backend(backend)?;
+    }
+    Ok(deleted)
+}
+
+/// Enforce a size-based retention cap by evicting the oldest output segments
+/// until the live database size is under `max_mb` (or no more segments remain,
+/// or the per-pass deletion budget is exhausted). `max_mb == 0` is a no-op.
+fn enforce_size_limit_backend(
+    backend: &dyn StorageBackend,
+    max_mb: u32,
+) -> Result<SizeEvictionOutcome> {
+    let used_before = database_used_bytes_backend(backend)?;
+    let cap_bytes = u64::from(max_mb).saturating_mul(1024 * 1024);
+
+    // max_mb == 0 means "no limit". Callers gate on > 0, but stay defensive.
+    if max_mb == 0 || used_before <= cap_bytes {
+        return Ok(SizeEvictionOutcome {
+            deleted_segments: 0,
+            used_bytes_before: used_before,
+            used_bytes_after: used_before,
+            over_limit_after: max_mb != 0 && used_before > cap_bytes,
+        });
     }
 
-    Ok(deleted)
+    let mut deleted_total = 0usize;
+    let mut used_now = used_before;
+    while used_now > cap_bytes && deleted_total < SIZE_EVICTION_MAX_DELETE_PER_PASS {
+        let budget = SIZE_EVICTION_MAX_DELETE_PER_PASS - deleted_total;
+        let batch = SIZE_EVICTION_BATCH.min(budget);
+        let deleted = delete_oldest_segments_backend(backend, batch)?;
+        deleted_total += deleted;
+        if deleted == 0 {
+            // No more segments to evict; non-segment data alone exceeds the cap.
+            break;
+        }
+        used_now = database_used_bytes_backend(backend)?;
+    }
+
+    Ok(SizeEvictionOutcome {
+        deleted_segments: deleted_total,
+        used_bytes_before: used_before,
+        used_bytes_after: used_now,
+        over_limit_after: used_now > cap_bytes,
+    })
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
@@ -20083,6 +20258,84 @@ fn storage_writer_queue_size_reaches_handle() {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{db_path_str}-wal"));
         let _ = std::fs::remove_file(format!("{db_path_str}-shm"));
+    });
+}
+
+/// ft-rrqhm: `storage.retention_max_mb` must actually enforce a size cap.
+/// Before this fix the value was parsed into config but no size-based eviction
+/// existed, so the database grew unbounded. This drives the real writer-thread
+/// `enforce_size_limit` path end-to-end: append data well past a 1 MiB cap,
+/// enforce it, and assert the oldest segments are evicted and the live size
+/// shrinks — while `max_mb == 0` and an over-cap value stay no-ops.
+#[test]
+fn enforce_size_limit_evicts_oldest_segments_under_cap() {
+    run_storage_async_test(async {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("ft_rrqhm_size_cap.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let cx = crate::cx::for_testing();
+        let storage =
+            StorageHandle::with_config_with_cx(&cx, &db_path_str, StorageConfig::default())
+                .await
+                .unwrap();
+
+        // Low-cardinality content (a single repeated char) keeps the FTS index
+        // tiny so the output_segments content dominates the live size, making
+        // the byte accounting deterministic. 256 x 16 KiB ~= 4 MiB of content.
+        let big = "x".repeat(16 * 1024);
+        for i in 0..256u64 {
+            storage
+                .append_segment(7, &format!("seg-{i}-{big}"), None)
+                .await
+                .unwrap();
+        }
+        // Move the WAL into the main file so PRAGMA page_count is stable.
+        storage.checkpoint().await.unwrap();
+
+        let total_before = storage.count_segments_before(i64::MAX).await.unwrap();
+        assert_eq!(total_before, 256, "all appended segments should be present");
+
+        // max_mb == 0 disables the cap: a no-op even when the DB is large.
+        let disabled = storage.enforce_size_limit(0).await.unwrap();
+        assert_eq!(disabled.deleted_segments, 0, "cap=0 must be a no-op");
+        assert_eq!(
+            storage.count_segments_before(i64::MAX).await.unwrap(),
+            256,
+            "cap=0 must not delete anything"
+        );
+
+        // Enforce a 1 MiB cap: must evict the oldest segments and shrink size.
+        let outcome = storage.enforce_size_limit(1).await.unwrap();
+        assert!(
+            outcome.deleted_segments > 0,
+            "expected size eviction, got {outcome:?}"
+        );
+        assert!(
+            outcome.used_bytes_after < outcome.used_bytes_before,
+            "live database size must shrink after eviction: {outcome:?}"
+        );
+
+        // Eviction is partial (some newest segments survive) and oldest-first.
+        let remaining = storage.count_segments_before(i64::MAX).await.unwrap();
+        assert!(
+            remaining > 0 && remaining < 256,
+            "expected partial oldest-first eviction, {remaining} remain"
+        );
+        let recent = storage.get_segments(7, 1).await.unwrap();
+        assert!(
+            !recent.is_empty(),
+            "the newest segment must survive size eviction"
+        );
+
+        // A pass with a cap above the current size is a no-op.
+        let noop = storage.enforce_size_limit(4096).await.unwrap();
+        assert_eq!(
+            noop.deleted_segments, 0,
+            "an under-cap enforcement must not evict, got {noop:?}"
+        );
+
+        storage.shutdown().await.unwrap();
     });
 }
 
