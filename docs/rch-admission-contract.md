@@ -213,3 +213,40 @@ The static verifier only proves that this harness, registration, corpus, and
 documentation are synchronized. Any compiled fuzz-target, Cargo, test, or clippy
 evidence for FrankenTerm still requires an RCH proof lane and must be reported
 separately from this static contract check.
+
+## Operator Surface (`ft-69gwh.5`)
+
+The doctor, robot, and MCP surfaces share one rendering layer,
+`crate::rch_admission_surface::RchAdmissionSurface`, so the advisory-vs-proof
+distinction is expressed identically everywhere the diagnosis is exposed.
+`RchAdmissionSurface::from_report` and `from_preflight` wrap a base
+`RchAdmissionReport` (or `RchAdmissionPreflightReport`) into a stable envelope;
+`doctor_lines` renders the human `ft doctor rch-admission` text block whose first
+line is always the not-proof banner.
+
+| Envelope field | Meaning |
+|---|---|
+| `ok` | The read-only diagnosis was produced successfully. It does **not** mean a proof command passed. |
+| `advisory_only` | Always `true`. The diagnosis is never compiled proof. |
+| `not_proof_banner` | `RCH_ADMISSION_NOT_PROOF_BANNER`, surfaced verbatim by every surface. |
+| `proof_blocked` | The field a caller gates a proof lane on: `true` when `proof_status` is `blocked` or any reason code `blocks_proof()` (or the preflight verdict is `blocked`). |
+| `verdict` | Present only for preflight envelopes (`admitted` / `deferred` / `invalid` / `blocked`). |
+| `reasons` | Per-reason rows carrying the stable recommendation plus `blocks_proof` and `operator_approval_required` flags. |
+
+### Operator workflow
+
+1. Produce the read-only diagnosis and render it through the chosen surface
+   (`doctor_lines` for `ft doctor`, the serialized envelope for robot/MCP).
+2. Read `proof_blocked`. If `true`, keep the proof bead blocked, retain the
+   advisory output as a citation, and follow each reason's recommendation. Never
+   cite the advisory envelope, a dry-run, a queue snapshot, or a worker-health
+   report as compiled proof.
+3. If `proof_blocked` is `false` (verdict `admitted`), attempt the
+   remote-required Cargo lane — that lane, not this diagnosis, is the proof.
+   Compiled tests run through RCH **only** when RCH can select a worker; a
+   `[RCH] local` / `no admissible workers` / `refusing local fallback` result is
+   a blocked lane, not permission to build locally.
+
+The envelope and rendering layer landed under `ft-69gwh.5`; wiring it to the
+`ft doctor rch-admission` CLI dispatch is the thin remaining consumer step and
+must not be documented as available until that dispatch exists.
