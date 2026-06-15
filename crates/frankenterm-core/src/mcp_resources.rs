@@ -27,14 +27,21 @@ use crate::attention_router::{
     build_attention_router_surface_payload,
 };
 use crate::context_horizon::predict_context_horizon_from_sqlite;
-use crate::mcp_error::{MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_STORAGE, MCP_ERR_WEZTERM};
+use crate::mcp_error::{
+    MCP_ERR_CONFIG, MCP_ERR_INTERNAL, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_WEZTERM,
+};
 use crate::operating_envelope::{
     OPERATING_ENVELOPE_MCP_CURRENT_URI, OPERATING_ENVELOPE_MCP_RUN_URI_TEMPLATE,
+};
+use crate::policy::{
+    ActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyInput, PolicySurface,
+    SharedRateLimiter,
 };
 use crate::proof_lane::{
     ProofHistoryArtifactInput, ProofHistoryIndex, ProofHistoryQuery, ProofReleaseScoreboard,
     ProofState,
 };
+use crate::redactor::Redactor;
 use crate::rehearsal_score::{
     REHEARSAL_SCORE_MCP_CURRENT_URI, REHEARSAL_SCORE_MCP_SURFACE_URI_TEMPLATE,
 };
@@ -50,7 +57,7 @@ use crate::runtime_telemetry::{
 use crate::swarm_scheduler::{
     HerdWaveEventKind, HerdWaveMcpResourceSurface, build_herd_wave_surface_report,
 };
-use crate::wezterm::default_wezterm_handle;
+use crate::wezterm::{PaneInfo, default_wezterm_handle};
 
 use super::mcp_missions::{
     mcp_load_mission_tx_contract_from_path, mcp_resolve_mission_tx_file_path,
@@ -60,6 +67,7 @@ use super::mcp_tools::{
     WaRehearsalScoreTool, WaReservationsTool, WaRulesListTool, WaStateTool,
 };
 use super::{McpEnvelope, McpWorkflowItem, McpWorkflowsData, builtin_workflows, elapsed_ms};
+use super::{build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter};
 use crate::config::{Config, PaneFilterConfig};
 
 const PROOF_HISTORY_RESOURCE_URI: &str = "wa://proof-history";
@@ -1030,6 +1038,7 @@ impl ResourceHandler for WaAgentMailOutboxResource {
 enum SwarmScentLoadError {
     Runtime(String),
     PaneDiscovery(String),
+    Policy { reason: String, hint: String },
 }
 
 impl SwarmScentLoadError {
@@ -1037,33 +1046,173 @@ impl SwarmScentLoadError {
         match self {
             Self::Runtime(_) => MCP_ERR_INTERNAL,
             Self::PaneDiscovery(_) => MCP_ERR_WEZTERM,
+            Self::Policy { .. } => MCP_ERR_POLICY,
         }
     }
 
     fn message(&self) -> &str {
         match self {
             Self::Runtime(message) | Self::PaneDiscovery(message) => message,
+            Self::Policy { reason, .. } => reason,
         }
     }
 
-    fn hint(&self) -> &'static str {
+    fn hint(&self) -> &str {
         match self {
             Self::Runtime(_) => "Could not initialize the runtime for swarm scent generation.",
             Self::PaneDiscovery(_) => {
                 "Check that the live mux is reachable; stale swarm scent is not emitted."
             }
+            Self::Policy { hint, .. } => hint,
         }
+    }
+}
+
+fn swarm_scent_read_policy_input(pane: &PaneInfo) -> PolicyInput {
+    let mut input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Mcp)
+        .with_surface(PolicySurface::Mux)
+        .with_pane(pane.pane_id)
+        .with_domain(pane.inferred_domain())
+        .with_capabilities(PaneCapabilities::unknown())
+        .with_text_summary(format!("wa://swarm/scent pane_id={}", pane.pane_id));
+
+    if let Some(title) = &pane.title {
+        input = input.with_pane_title(title.clone());
+    }
+    if let Some(cwd) = &pane.cwd {
+        input = input.with_pane_cwd(cwd.clone());
+    }
+
+    input
+}
+
+fn swarm_scent_policy_error(
+    pane_id: u64,
+    decision: &PolicyDecision,
+) -> Option<SwarmScentLoadError> {
+    if decision.is_denied() {
+        let reason = decision
+            .reason()
+            .unwrap_or("Swarm scent read denied by policy")
+            .to_string();
+        return Some(SwarmScentLoadError::Policy {
+            reason,
+            hint: "Hard policy deny: review config.safety.rules for MCP read_output access to wa://swarm/scent."
+                .to_string(),
+        });
+    }
+
+    if decision.requires_approval() {
+        let reason = decision
+            .reason()
+            .unwrap_or("Swarm scent read requires approval")
+            .to_string();
+        return Some(SwarmScentLoadError::Policy {
+            reason,
+            hint: format!(
+                "Policy returned RequireApproval for wa://swarm/scent pane_id={pane_id}; \
+                 resource reads fail closed and do not emit partial scent payloads."
+            ),
+        });
+    }
+
+    None
+}
+
+fn authorize_swarm_scent_panes(
+    config: &Config,
+    shared_rate_limiter: SharedRateLimiter,
+    panes: &[PaneInfo],
+) -> Result<(), SwarmScentLoadError> {
+    let mut engine =
+        build_policy_engine_with_shared_rate_limiter(config, false, shared_rate_limiter);
+
+    for pane in panes {
+        let input = swarm_scent_read_policy_input(pane);
+        let decision = engine.authorize(&input);
+        if let Some(error) = swarm_scent_policy_error(pane.pane_id, &decision) {
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+fn redact_optional_string(value: &mut Option<String>, redactor: &Redactor) {
+    if let Some(text) = value.as_mut() {
+        *text = redactor.redact(text.as_str());
+    }
+}
+
+fn redact_string(value: &mut String, redactor: &Redactor) {
+    *value = redactor.redact(value.as_str());
+}
+
+fn redact_swarm_scent_report(report: &mut SwarmScentReport, redactor: &Redactor) {
+    for agent in &mut report.agents {
+        redact_string(&mut agent.slug, redactor);
+        redact_string(&mut agent.agent_type, redactor);
+        redact_string(&mut agent.state, redactor);
+        redact_optional_string(&mut agent.cwd, redactor);
+        redact_optional_string(&mut agent.session_id, redactor);
+        redact_optional_string(&mut agent.last_rule_id, redactor);
+    }
+
+    for reservation in &mut report.reservations {
+        redact_string(&mut reservation.owner_kind, redactor);
+        redact_string(&mut reservation.owner_id, redactor);
+        redact_optional_string(&mut reservation.reason, redactor);
+    }
+
+    for claim in &mut report.work_claims {
+        redact_string(&mut claim.claim_id, redactor);
+        redact_string(&mut claim.owner, redactor);
+        for label in &mut claim.labels {
+            redact_string(label, redactor);
+        }
+        redact_optional_string(&mut claim.summary, redactor);
+    }
+
+    for intent in &mut report.tx_intents {
+        redact_string(&mut intent.tx_id, redactor);
+        redact_string(&mut intent.plan_id, redactor);
+        redact_string(&mut intent.requested_by, redactor);
+        redact_string(&mut intent.lifecycle_state, redactor);
+        redact_string(&mut intent.outcome, redactor);
+        redact_string(&mut intent.summary, redactor);
+        redact_string(&mut intent.correlation_id, redactor);
+        redact_string(&mut intent.contract_file, redactor);
+    }
+
+    for source in &mut report.sources {
+        redact_string(&mut source.source, redactor);
+        redact_string(&mut source.status, redactor);
+        redact_string(&mut source.detail, redactor);
     }
 }
 
 pub(super) struct WaSwarmScentResource {
     config: Arc<Config>,
     db_path: Option<Arc<PathBuf>>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaSwarmScentResource {
     pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -1094,12 +1243,17 @@ impl ResourceHandler for WaSwarmScentResource {
         match load_swarm_scent_report(
             Arc::clone(&self.config),
             self.db_path.as_ref().map(Arc::clone),
+            Arc::clone(&self.policy_rate_limiter),
             generated_at_ms,
         ) {
-            Ok(report) => envelope_as_resource(
-                SWARM_SCENT_RESOURCE_URI,
-                McpEnvelope::success(report, elapsed_ms(start)),
-            ),
+            Ok(mut report) => {
+                let redactor = Redactor::new();
+                redact_swarm_scent_report(&mut report, &redactor);
+                envelope_as_resource(
+                    SWARM_SCENT_RESOURCE_URI,
+                    McpEnvelope::success(report, elapsed_ms(start)),
+                )
+            }
             Err(error) => envelope_as_resource(
                 SWARM_SCENT_RESOURCE_URI,
                 McpEnvelope::<serde_json::Value>::error(
@@ -1116,6 +1270,7 @@ impl ResourceHandler for WaSwarmScentResource {
 fn load_swarm_scent_report(
     config: Arc<Config>,
     db_path: Option<Arc<PathBuf>>,
+    policy_rate_limiter: SharedRateLimiter,
     generated_at_ms: u64,
 ) -> Result<SwarmScentReport, SwarmScentLoadError> {
     let runtime = CompatRuntimeBuilder::current_thread()
@@ -1127,6 +1282,7 @@ fn load_swarm_scent_report(
             .list_panes()
             .await
             .map_err(|err| SwarmScentLoadError::PaneDiscovery(format!("List live panes: {err}")))?;
+        authorize_swarm_scent_panes(config.as_ref(), policy_rate_limiter, &panes)?;
         let mut correlator = AgentCorrelator::new();
         for pane in &panes {
             correlator.update_from_pane_info(pane);
@@ -2380,16 +2536,24 @@ mod tests {
         WaRendererSsimParityResource, WaReservationsByPaneTemplateResource, WaReservationsResource,
         WaRulesByAgentTemplateResource, WaRulesResource, WaSwarmCapacityCurrentResource,
         WaSwarmCapacityRunTemplateResource, WaSwarmScentResource, WaWorkflowsResource,
-        envelope_as_resource, load_proof_history_query_from_roots, tool_output_as_resource,
+        envelope_as_resource, load_proof_history_query_from_roots, redact_swarm_scent_report,
+        swarm_scent_policy_error, swarm_scent_read_policy_input, tool_output_as_resource,
+    };
+    use crate::agent_correlator::{
+        DetectionSource, SwarmScentAgent, SwarmScentReport, SwarmScentReservation,
+        SwarmScentSourceStatus, SwarmScentSummary, SwarmScentTxIntent, SwarmScentWorkClaim,
     };
     use crate::config::{Config, PaneFilterConfig};
     use crate::mcp_framework::{
         FrameworkContent as Content, FrameworkResourceHandler as ResourceHandler,
     };
+    use crate::policy::{ActionKind, ActorKind, PolicyDecision, PolicySurface};
     use crate::proof_lane::{
         ArtifactRetrievalStatus, ProofAttemptRecord, ProofBackend, ProofHistoryQuery,
         ProofRedactionStatus, ProofScope, ProofState,
     };
+    use crate::redactor::{REDACTED_MARKER, Redactor};
+    use crate::wezterm::PaneInfo;
     use proptest::prelude::*;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2684,6 +2848,134 @@ mod tests {
         assert!(def.tags.contains(&"swarm".to_string()));
         assert!(def.tags.contains(&"scent".to_string()));
         assert!(def.tags.contains(&"attention".to_string()));
+    }
+
+    #[test]
+    fn swarm_scent_redaction_scrubs_report_free_text() {
+        let secret_prefix = ["sk", "ant", "api03"].join("-");
+        let secret = format!("{secret_prefix}-{}", "a".repeat(80));
+        let mut report = SwarmScentReport {
+            schema_version: 1,
+            generated_at_ms: 1,
+            ttl_ms: 60_000,
+            agents: vec![SwarmScentAgent {
+                pane_id: 7,
+                slug: "codex".to_string(),
+                agent_type: "codex".to_string(),
+                state: "active".to_string(),
+                source: DetectionSource::PaneTitle,
+                cwd: Some(format!("file:///repo/{secret}")),
+                session_id: Some(format!("session-{secret}")),
+                last_rule_id: Some(format!("codex.{secret}")),
+                state_age_ms: 10,
+                ttl_remaining_ms: 59_990,
+            }],
+            reservations: vec![SwarmScentReservation {
+                id: 1,
+                pane_id: 7,
+                owner_kind: "agent".to_string(),
+                owner_id: format!("cod7-{secret}"),
+                reason: Some(format!("touching {secret}")),
+                created_at_ms: 1,
+                expires_at_ms: 2,
+                ttl_remaining_ms: 1,
+            }],
+            work_claims: vec![SwarmScentWorkClaim {
+                claim_id: format!("claim-{secret}"),
+                owner: format!("owner-{secret}"),
+                priority: 1,
+                labels: vec![format!("label-{secret}")],
+                claimed_at_ms: Some(1),
+                updated_at_ms: 2,
+                summary: Some(format!("summary {secret}")),
+            }],
+            tx_intents: vec![SwarmScentTxIntent {
+                tx_id: format!("tx-{secret}"),
+                plan_id: format!("plan-{secret}"),
+                requested_by: format!("operator-{secret}"),
+                lifecycle_state: "Prepared".to_string(),
+                outcome: "Pending".to_string(),
+                summary: format!("deploy {secret}"),
+                correlation_id: format!("corr-{secret}"),
+                created_at_ms: 1,
+                contract_file: format!("/tmp/{secret}/tx.json"),
+            }],
+            sources: vec![SwarmScentSourceStatus::unavailable(
+                "pane_cwd",
+                format!("source detail {secret}"),
+            )],
+            summary: SwarmScentSummary {
+                tracked_agents: 1,
+                fresh_agents: 1,
+                expired_agents: 0,
+                active_reservations: 1,
+                active_work_claims: 1,
+                active_tx_intents: 1,
+                unavailable_sources: 1,
+            },
+        };
+
+        redact_swarm_scent_report(&mut report, &Redactor::new());
+        let rendered = serde_json::to_string(&report).expect("serialize redacted scent report");
+
+        assert!(
+            !rendered.contains(&secret),
+            "wa://swarm/scent report leaked raw secret: {rendered}"
+        );
+        assert!(
+            rendered.contains(REDACTED_MARKER),
+            "wa://swarm/scent report should contain a redaction marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn swarm_scent_policy_input_is_mcp_read_output_with_pane_metadata() {
+        let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": 42,
+            "tab_id": 2,
+            "window_id": 3,
+            "domain_name": "local",
+            "title": "codex build",
+            "cwd": "file:///repo/secret"
+        }))
+        .expect("pane info");
+
+        let input = swarm_scent_read_policy_input(&pane);
+
+        assert_eq!(input.action, ActionKind::ReadOutput);
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Mux);
+        assert_eq!(input.pane_id, Some(42));
+        assert_eq!(input.domain.as_deref(), Some("local"));
+        assert_eq!(input.pane_title.as_deref(), Some("codex build"));
+        assert_eq!(input.pane_cwd.as_deref(), Some("file:///repo/secret"));
+        assert_eq!(
+            input.text_summary.as_deref(),
+            Some("wa://swarm/scent pane_id=42")
+        );
+    }
+
+    #[test]
+    fn swarm_scent_policy_error_fails_closed_for_denied_and_approval() {
+        let denied = swarm_scent_policy_error(7, &PolicyDecision::deny("blocked"))
+            .expect("deny must become resource error");
+        assert_eq!(denied.code(), crate::mcp_error::MCP_ERR_POLICY);
+        assert_eq!(denied.message(), "blocked");
+
+        let approval =
+            swarm_scent_policy_error(7, &PolicyDecision::require_approval("needs approval"))
+                .expect("approval must become resource error");
+        assert_eq!(approval.code(), crate::mcp_error::MCP_ERR_POLICY);
+        assert_eq!(approval.message(), "needs approval");
+        assert!(
+            approval.hint().contains("fail closed"),
+            "approval hint should explain no partial payload is emitted"
+        );
+
+        assert!(
+            swarm_scent_policy_error(7, &PolicyDecision::allow()).is_none(),
+            "allowed policy decision should not produce a resource error"
+        );
     }
 
     #[test]
