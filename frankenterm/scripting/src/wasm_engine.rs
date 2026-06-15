@@ -24,6 +24,9 @@ use std::time::Duration;
 use wasmtime::*;
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::WasiP1Ctx;
+use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+
+const MAX_STDOUT_CAPTURE_BYTES: usize = 1024 * 1024;
 
 /// Configuration for the WASM engine.
 #[derive(Clone, Debug)]
@@ -49,7 +52,7 @@ impl Default for WasmEngineConfig {
 /// WASM engine runtime state stored in each wasmtime `Store`.
 pub(crate) struct WasmState {
     wasi: WasiP1Ctx,
-    stdout_buf: Vec<u8>,
+    stdout: MemoryOutputPipe,
 }
 
 impl WasmState {
@@ -100,13 +103,14 @@ impl WasmEngine {
     }
 
     /// Build a fresh WASI context for a module invocation.
-    fn build_wasi_ctx(&self) -> Result<(WasiP1Ctx, Vec<u8>)> {
-        let stdout_buf = Vec::new();
+    fn build_wasi_ctx(&self) -> Result<(WasiP1Ctx, MemoryOutputPipe)> {
+        let stdout = MemoryOutputPipe::new(MAX_STDOUT_CAPTURE_BYTES);
         let wasi = WasiCtxBuilder::new()
             .inherit_env()
+            .stdout(stdout.clone())
             .inherit_stderr()
             .build_p1();
-        Ok((wasi, stdout_buf))
+        Ok((wasi, stdout))
     }
 
     /// Compile a WASM module from bytes.
@@ -116,8 +120,8 @@ impl WasmEngine {
     }
 
     /// Create a store with fuel and memory limits.
-    fn create_store(&self, wasi: WasiP1Ctx, stdout_buf: Vec<u8>) -> Store<WasmState> {
-        let mut store = Store::new(&self.engine, WasmState { wasi, stdout_buf });
+    fn create_store(&self, wasi: WasiP1Ctx, stdout: MemoryOutputPipe) -> Store<WasmState> {
+        let mut store = Store::new(&self.engine, WasmState { wasi, stdout });
         store.set_fuel(self.config.fuel_per_call).ok();
         store
     }
@@ -148,8 +152,8 @@ impl ScriptingEngine for WasmEngine {
             .with_context(|| format!("failed to read WASM config from {}", path.display()))?;
 
         let module = self.compile_module(&bytes)?;
-        let (wasi, stdout_buf) = self.build_wasi_ctx()?;
-        let mut store = self.create_store(wasi, stdout_buf);
+        let (wasi, stdout) = self.build_wasi_ctx()?;
+        let mut store = self.create_store(wasi, stdout);
 
         let mut linker = Linker::new(&self.engine);
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, WasmState::wasi_ctx)
@@ -213,11 +217,11 @@ impl ScriptingEngine for WasmEngine {
                 .map_err(|err| err.context("WASM _start() call failed"))?;
 
             // Read captured stdout
-            let stdout_data = &store.data().stdout_buf;
+            let stdout_data = store.data().stdout.contents();
             if stdout_data.is_empty() {
                 bail!("WASM module produced no output on stdout");
             }
-            let json_str = std::str::from_utf8(stdout_data)
+            let json_str = std::str::from_utf8(stdout_data.as_ref())
                 .context("WASM module stdout is not valid UTF-8")?;
             let value: serde_json::Value =
                 serde_json::from_str(json_str).context("WASM module stdout is not valid JSON")?;
@@ -315,7 +319,7 @@ impl ScriptingEngine for WasmEngine {
     }
 
     fn engine_name(&self) -> &str {
-        "wasmtime-44"
+        "wasmtime-45"
     }
 }
 
@@ -357,10 +361,131 @@ fn json_to_dynamic(json: &serde_json::Value) -> Result<frankenterm_dynamic::Valu
 mod tests {
     use super::*;
 
+    const WASI_SNAPSHOT_PREVIEW1: &str = "wasi_snapshot_preview1";
+    const FD_WRITE: &str = "fd_write";
+
+    fn push_uleb_u32(out: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = u8::try_from(value & 0x7f).expect("ULEB128 chunk fits in u8");
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                break;
+            }
+            byte |= 0x80;
+            out.push(byte);
+        }
+    }
+
+    fn push_len(out: &mut Vec<u8>, len: usize, what: &str) {
+        let len = u32::try_from(len).expect(what);
+        push_uleb_u32(out, len);
+    }
+
+    fn push_name(out: &mut Vec<u8>, name: &str) {
+        push_len(out, name.len(), "WASM name length fits in u32");
+        out.extend_from_slice(name.as_bytes());
+    }
+
+    fn push_section(module: &mut Vec<u8>, section_id: u8, payload: &[u8]) {
+        module.push(section_id);
+        push_len(module, payload.len(), "WASM section length fits in u32");
+        module.extend_from_slice(payload);
+    }
+
+    fn wasm_start_writes_stdout_json(json: &str) -> Vec<u8> {
+        let json_bytes = json.as_bytes();
+        let json_offset = 16u32;
+        let written_count_offset = 8u32;
+        let json_len = u32::try_from(json_bytes.len()).expect("test JSON length fits in u32");
+
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+
+        let mut types = Vec::new();
+        push_uleb_u32(&mut types, 2);
+        types.push(0x60);
+        push_uleb_u32(&mut types, 4);
+        types.extend_from_slice(&[0x7f, 0x7f, 0x7f, 0x7f]);
+        push_uleb_u32(&mut types, 1);
+        types.push(0x7f);
+        types.push(0x60);
+        push_uleb_u32(&mut types, 0);
+        push_uleb_u32(&mut types, 0);
+        push_section(&mut module, 1, &types);
+
+        let mut imports = Vec::new();
+        push_uleb_u32(&mut imports, 1);
+        push_name(&mut imports, WASI_SNAPSHOT_PREVIEW1);
+        push_name(&mut imports, FD_WRITE);
+        imports.push(0x00);
+        push_uleb_u32(&mut imports, 0);
+        push_section(&mut module, 2, &imports);
+
+        let mut functions = Vec::new();
+        push_uleb_u32(&mut functions, 1);
+        push_uleb_u32(&mut functions, 1);
+        push_section(&mut module, 3, &functions);
+
+        let mut memories = Vec::new();
+        push_uleb_u32(&mut memories, 1);
+        memories.push(0x00);
+        push_uleb_u32(&mut memories, 1);
+        push_section(&mut module, 5, &memories);
+
+        let mut exports = Vec::new();
+        push_uleb_u32(&mut exports, 2);
+        push_name(&mut exports, "memory");
+        exports.push(0x02);
+        push_uleb_u32(&mut exports, 0);
+        push_name(&mut exports, "_start");
+        exports.push(0x00);
+        push_uleb_u32(&mut exports, 1);
+        push_section(&mut module, 7, &exports);
+
+        let mut body = Vec::new();
+        push_uleb_u32(&mut body, 0);
+        for value in [1, 0, 1, written_count_offset] {
+            body.push(0x41);
+            push_uleb_u32(&mut body, value);
+        }
+        body.push(0x10);
+        push_uleb_u32(&mut body, 0);
+        body.push(0x1a);
+        body.push(0x0b);
+
+        let mut code = Vec::new();
+        push_uleb_u32(&mut code, 1);
+        push_len(&mut code, body.len(), "WASM body length fits in u32");
+        code.extend_from_slice(&body);
+        push_section(&mut module, 10, &code);
+
+        let mut iovec = Vec::new();
+        iovec.extend_from_slice(&json_offset.to_le_bytes());
+        iovec.extend_from_slice(&json_len.to_le_bytes());
+
+        let mut data = Vec::new();
+        push_uleb_u32(&mut data, 2);
+        data.push(0x00);
+        data.push(0x41);
+        push_uleb_u32(&mut data, 0);
+        data.push(0x0b);
+        push_len(&mut data, iovec.len(), "WASM iovec length fits in u32");
+        data.extend_from_slice(&iovec);
+        data.push(0x00);
+        data.push(0x41);
+        push_uleb_u32(&mut data, json_offset);
+        data.push(0x0b);
+        push_len(&mut data, json_bytes.len(), "WASM JSON length fits in u32");
+        data.extend_from_slice(json_bytes);
+        push_section(&mut module, 11, &data);
+
+        module
+    }
+
     #[test]
     fn engine_creates_successfully() {
         let engine = WasmEngine::with_defaults().unwrap();
-        assert_eq!(engine.engine_name(), "wasmtime-44");
+        assert_eq!(engine.engine_name(), "wasmtime-45");
     }
 
     #[test]
@@ -415,7 +540,7 @@ mod tests {
 
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = engine.hooks.lock().unwrap();
-            panic!("poison WASM hook registry");
+            std::panic::panic_any("poison WASM hook registry");
         }));
         assert!(poison_result.is_err());
         assert!(engine.hooks.is_poisoned());
@@ -529,7 +654,7 @@ mod tests {
 
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = engine.extensions.lock().unwrap();
-            panic!("poison WASM extension registry");
+            std::panic::panic_any("poison WASM extension registry");
         }));
         assert!(poison_result.is_err());
         assert!(engine.extensions.is_poisoned());
@@ -558,6 +683,34 @@ mod tests {
 
         let result = engine.eval_config(&wasm_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn eval_config_accepts_wasi_start_stdout_json() {
+        let engine = WasmEngine::with_defaults().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("stdout_config.wasm");
+        std::fs::write(
+            &wasm_path,
+            wasm_start_writes_stdout_json(r#"{"from":"stdout","answer":42}"#),
+        )
+        .unwrap();
+
+        let config = engine.eval_config(&wasm_path).unwrap();
+
+        match config {
+            frankenterm_dynamic::Value::Object(map) => {
+                assert_eq!(
+                    map.get(&frankenterm_dynamic::Value::String("from".to_string())),
+                    Some(&frankenterm_dynamic::Value::String("stdout".to_string()))
+                );
+                assert_eq!(
+                    map.get(&frankenterm_dynamic::Value::String("answer".to_string())),
+                    Some(&frankenterm_dynamic::Value::U64(42))
+                );
+            }
+            other => std::panic::panic_any(format!("expected object config, got {other:?}")),
+        }
     }
 
     #[test]
@@ -600,11 +753,11 @@ mod tests {
         // Low priority (-5) fires before high priority (10)
         match &actions[0] {
             Action::Custom { name, .. } => assert_eq!(name, "low"),
-            other => panic!("expected Custom, got {other:?}"),
+            other => std::panic::panic_any(format!("expected Custom, got {other:?}")),
         }
         match &actions[1] {
             Action::Custom { name, .. } => assert_eq!(name, "high"),
-            other => panic!("expected Custom, got {other:?}"),
+            other => std::panic::panic_any(format!("expected Custom, got {other:?}")),
         }
     }
 
@@ -653,10 +806,10 @@ mod tests {
                                 .is_some()
                         );
                     }
-                    other => panic!("expected Object, got {other:?}"),
+                    other => std::panic::panic_any(format!("expected Object, got {other:?}")),
                 }
             }
-            other => panic!("expected Object, got {other:?}"),
+            other => std::panic::panic_any(format!("expected Object, got {other:?}")),
         }
     }
 
@@ -681,13 +834,13 @@ mod tests {
         let arr = json_to_dynamic(&serde_json::json!([])).unwrap();
         match arr {
             frankenterm_dynamic::Value::Array(a) => assert!(a.is_empty()),
-            other => panic!("expected Array, got {other:?}"),
+            other => std::panic::panic_any(format!("expected Array, got {other:?}")),
         }
 
         let obj = json_to_dynamic(&serde_json::json!({})).unwrap();
         match obj {
             frankenterm_dynamic::Value::Object(m) => assert!(m.is_empty()),
-            other => panic!("expected Object, got {other:?}"),
+            other => std::panic::panic_any(format!("expected Object, got {other:?}")),
         }
     }
 
@@ -728,7 +881,7 @@ mod tests {
                     Some(&frankenterm_dynamic::Value::Null)
                 );
             }
-            other => panic!("expected Object, got {other:?}"),
+            other => std::panic::panic_any(format!("expected Object, got {other:?}")),
         }
     }
 }
