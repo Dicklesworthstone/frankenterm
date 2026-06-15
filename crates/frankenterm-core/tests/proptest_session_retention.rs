@@ -1574,3 +1574,213 @@ proptest! {
         prop_assert!(!result.vacuumed);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// 13. Storage-GC safety: never drop live-referenced data + atomic cleanup
+//     (ft-cng2g; locks in the ft-rt6ol orphan-cascade family).
+// ────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Under aggressive age/count/size retention, GC must NEVER drop
+    /// live-referenced data: open/active sessions and their full
+    /// checkpoint+pane_state subtree always survive. After the pass the DB must
+    /// be referentially CONSISTENT (cleanup leaves no orphan rows — neither
+    /// pre-existing ones nor any created by a partial cascade) and a second pass
+    /// must be a complete no-op (atomic + idempotent).
+    #[test]
+    fn gc_preserves_live_referenced_data_and_stays_consistent(
+        num_open in 1..5usize,
+        checkpoints_per_open in 1..4usize,
+        panes_per_checkpoint in 1..3usize,
+        num_old_closed in 0..6usize,
+        num_recent_closed in 0..4usize,
+        num_orphan_cp in 0..3usize,
+    ) {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+        let day_ms = 1000_i64 * 60 * 60 * 24;
+        let old = now - 400 * day_ms;
+
+        // Open (active) sessions with full subtrees — LIVE, must always survive.
+        let mut expected_open_cp = 0_i64;
+        let mut expected_open_ps = 0_i64;
+        for i in 0..num_open {
+            let sid = format!("open-{i}");
+            insert_session(&conn, &sid, old, false); // shutdown_clean = false (active)
+            for c in 0..checkpoints_per_open {
+                let cp = insert_checkpoint(&conn, &sid, old, 4096);
+                expected_open_cp += 1;
+                for p in 0..panes_per_checkpoint {
+                    insert_pane_state(&conn, cp, (i * 100 + c * 10 + p) as u64);
+                    expected_open_ps += 1;
+                }
+            }
+        }
+
+        // Closed sessions (eligible for age/count/size GC), with subtrees.
+        for i in 0..num_old_closed {
+            let sid = format!("old-closed-{i}");
+            insert_session(&conn, &sid, old, true);
+            let cp = insert_checkpoint(&conn, &sid, old, 2_000_000);
+            insert_pane_state(&conn, cp, (50_000 + i) as u64);
+        }
+        for i in 0..num_recent_closed {
+            let sid = format!("recent-closed-{i}");
+            insert_session(&conn, &sid, now, true);
+            insert_checkpoint(&conn, &sid, now, 1024);
+        }
+        // Pre-existing orphan checkpoints that still have children (the FK-off
+        // corruption shape the GC must collect, not propagate).
+        for i in 0..num_orphan_cp {
+            let cp = insert_orphaned_checkpoint(&conn, &format!("ghost-{i}"), old);
+            insert_pane_state(&conn, cp, (70_000 + i) as u64);
+        }
+
+        // Aggressive retention so GC removes as much as it is ALLOWED to.
+        let config = SessionRetentionConfig {
+            max_age_days: 1,
+            max_closed_sessions: 1,
+            max_total_size_mb: 1,
+            cleanup_interval_hours: 0,
+        };
+        cleanup_sessions(&conn, &config).unwrap();
+
+        // SAFETY: every open/active session survives, with its full subtree.
+        let surviving_open_sessions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_sessions WHERE shutdown_clean = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(
+            surviving_open_sessions, num_open as i64,
+            "GC must never drop active sessions"
+        );
+
+        let surviving_open_cp: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints c \
+                 JOIN mux_sessions s ON c.session_id = s.session_id \
+                 WHERE s.shutdown_clean = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(
+            surviving_open_cp, expected_open_cp,
+            "active sessions' checkpoints must all survive GC"
+        );
+
+        let surviving_open_ps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state ps \
+                 JOIN session_checkpoints c ON ps.checkpoint_id = c.id \
+                 JOIN mux_sessions s ON c.session_id = s.session_id \
+                 WHERE s.shutdown_clean = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(
+            surviving_open_ps, expected_open_ps,
+            "active sessions' pane_state must all survive GC"
+        );
+
+        // CONSISTENCY (atomic cleanup): no orphan rows remain.
+        let orphan_cp: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints \
+                 WHERE session_id NOT IN (SELECT session_id FROM mux_sessions)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(orphan_cp, 0_i64, "cleanup must leave no orphan checkpoints");
+        let orphan_ps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state \
+                 WHERE checkpoint_id NOT IN (SELECT id FROM session_checkpoints)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(orphan_ps, 0_i64, "cleanup must leave no orphan pane_state");
+
+        // IDEMPOTENCY: a second pass does no further work.
+        let second = cleanup_sessions(&conn, &config).unwrap();
+        prop_assert!(
+            !second.any_work_done(),
+            "second cleanup pass must be a complete no-op"
+        );
+    }
+}
+
+#[test]
+fn gc_golden_preserves_active_drops_old_closed_and_stays_consistent() {
+    let conn = make_test_db();
+    let now = epoch_ms() as i64;
+    let old = now - 400 * 1000_i64 * 60 * 60 * 24;
+
+    // 2 active sessions (one with a pane), 2 old-closed, 1 recent-closed, and an
+    // orphan checkpoint that still has a child.
+    insert_session(&conn, "active-1", old, false);
+    let a1 = insert_checkpoint(&conn, "active-1", old, 4096);
+    insert_pane_state(&conn, a1, 1);
+    insert_session(&conn, "active-2", old, false);
+    insert_checkpoint(&conn, "active-2", old, 4096);
+    insert_session(&conn, "closed-old-1", old, true);
+    insert_checkpoint(&conn, "closed-old-1", old, 4096);
+    insert_session(&conn, "closed-old-2", old, true);
+    insert_session(&conn, "closed-recent", now, true);
+    let orphan = insert_orphaned_checkpoint(&conn, "ghost", old);
+    insert_pane_state(&conn, orphan, 999);
+
+    // Age GC only (generous count + size budgets).
+    let config = SessionRetentionConfig {
+        max_age_days: 1,
+        max_closed_sessions: 100,
+        max_total_size_mb: 1024,
+        cleanup_interval_hours: 0,
+    };
+    cleanup_sessions(&conn, &config).unwrap();
+
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+    // Live data preserved: both active sessions + active-1's pane survive.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM mux_sessions WHERE shutdown_clean = 0"),
+        2
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM mux_pane_state WHERE pane_id = 1"), 1);
+    // Old closed dropped by age; recent closed kept.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'closed-old-1'"),
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'closed-old-2'"),
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'closed-recent'"),
+        1
+    );
+    // Orphan checkpoint + its child collected; DB referentially consistent.
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM session_checkpoints \
+             WHERE session_id NOT IN (SELECT session_id FROM mux_sessions)"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM mux_pane_state \
+             WHERE checkpoint_id NOT IN (SELECT id FROM session_checkpoints)"
+        ),
+        0
+    );
+}
