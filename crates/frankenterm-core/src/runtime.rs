@@ -3254,8 +3254,8 @@ impl ObservationRuntime {
                                     }
                                     emit_native_output_gap(
                                         pane_id,
-                                        &format!(
-                                            "native_output_truncated:dropped_bytes={dropped_bytes}"
+                                        &crate::native_events::native_output_truncation_gap_reason(
+                                            dropped_bytes,
                                         ),
                                         &capture_tx,
                                         &cursors,
@@ -3750,7 +3750,7 @@ async fn handle_native_event(
                 // an explicit capture gap so replay records the loss.
                 emit_native_output_gap(
                     pane_id,
-                    &format!("native_output_truncated:dropped_bytes={dropped_bytes}"),
+                    &crate::native_events::native_output_truncation_gap_reason(dropped_bytes),
                     capture_tx,
                     cursors,
                 )

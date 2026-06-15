@@ -30,6 +30,22 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(25);
 
+/// Capture-gap reason prefix emitted when a native pane-output frame is
+/// truncated at the [`MAX_OUTPUT_BYTES`] decode bound (ft-wtd5g). The
+/// recorder/replay layer parses this prefix to identify a native-output
+/// truncation gap and recover the dropped byte count, so the format is a
+/// contract — pinned by the `native_output_truncation_gap_reason` golden test.
+pub const NATIVE_OUTPUT_TRUNCATION_GAP_PREFIX: &str = "native_output_truncated:dropped_bytes=";
+
+/// Build the explicit capture-gap reason for a truncated native pane-output
+/// frame, carrying the count of tail bytes dropped at the decode bound. The
+/// consumer injects this as a [`crate::ingest::CapturedSegmentKind::Gap`] so
+/// replay records the loss instead of treating the holed stream as complete.
+#[must_use]
+pub fn native_output_truncation_gap_reason(dropped_bytes: u64) -> String {
+    format!("{NATIVE_OUTPUT_TRUNCATION_GAP_PREFIX}{dropped_bytes}")
+}
+
 #[cfg(any(unix, windows))]
 mod socket_transport {
     #[cfg(all(test, unix))]
@@ -856,6 +872,7 @@ mod tests {
     use super::*;
     use crate::runtime_async::task;
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
+    use proptest::prelude::*;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -920,6 +937,130 @@ mod tests {
                 );
             }
             _ => panic!("wrong event type"),
+        }
+    }
+
+    // ── ft-gaudf: golden + property tests for the gap-injection contract ──
+
+    /// Decode a synthetic `pane_output` frame carrying `n` filler bytes.
+    fn decode_output_of_len(n: usize) -> NativeEvent {
+        let raw = vec![b'a'; n];
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let payload =
+            format!(r#"{{"type":"pane_output","pane_id":5,"data_b64":"{data_b64}","ts":1}}"#);
+        decode_wire_event(&payload)
+            .expect("decode must not error")
+            .expect("pane_output event must be present")
+    }
+
+    #[test]
+    fn decode_output_accounts_every_byte_no_silent_drop() {
+        // PROPERTY (boundary table): no original byte is silently lost — it is
+        // either retained in `data` or counted in `dropped_bytes`, so
+        // data.len() + dropped_bytes == original_len for every size class around
+        // the decode bound.
+        for n in [
+            0usize,
+            1,
+            100,
+            MAX_OUTPUT_BYTES - 1,
+            MAX_OUTPUT_BYTES,
+            MAX_OUTPUT_BYTES + 1,
+            MAX_OUTPUT_BYTES + 4096,
+            MAX_OUTPUT_BYTES * 2 + 7,
+        ] {
+            match decode_output_of_len(n) {
+                NativeEvent::PaneOutput {
+                    data,
+                    dropped_bytes,
+                    ..
+                } => {
+                    assert_eq!(
+                        data.len() as u64 + dropped_bytes,
+                        n as u64,
+                        "byte accounting broke (silent loss) at n={n}"
+                    );
+                    assert!(
+                        data.len() <= MAX_OUTPUT_BYTES,
+                        "payload must stay within the decode bound at n={n}"
+                    );
+                    assert_eq!(
+                        dropped_bytes > 0,
+                        n > MAX_OUTPUT_BYTES,
+                        "dropped flag must fire iff the frame was truncated at n={n}"
+                    );
+                }
+                _ => panic!("expected PaneOutput at n={n}"),
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_decode_drives_recoverable_gap_marker() {
+        // End-to-end (unit): a truncated frame's dropped count feeds the explicit
+        // gap marker the consumer injects, and the recorder can recover the count.
+        let n = MAX_OUTPUT_BYTES + 1234;
+        let event = decode_output_of_len(n);
+        let NativeEvent::PaneOutput { dropped_bytes, .. } = event else {
+            panic!("expected PaneOutput");
+        };
+        assert_eq!(dropped_bytes, 1234);
+        let marker = native_output_truncation_gap_reason(dropped_bytes);
+        let recovered = marker
+            .strip_prefix(NATIVE_OUTPUT_TRUNCATION_GAP_PREFIX)
+            .and_then(|s| s.parse::<u64>().ok());
+        assert_eq!(
+            recovered,
+            Some(1234),
+            "gap marker must carry the exact dropped count for replay"
+        );
+    }
+
+    #[test]
+    fn native_output_truncation_gap_reason_golden_and_round_trips() {
+        // GOLDEN: the marker format is a recorder/replay contract — pin it
+        // exactly, and prove the dropped count round-trips back out.
+        assert_eq!(
+            native_output_truncation_gap_reason(4096),
+            "native_output_truncated:dropped_bytes=4096"
+        );
+        assert_eq!(
+            native_output_truncation_gap_reason(0),
+            "native_output_truncated:dropped_bytes=0"
+        );
+        for dropped in [0u64, 1, 4096, 65_536, u64::MAX] {
+            let reason = native_output_truncation_gap_reason(dropped);
+            assert!(
+                reason.starts_with(NATIVE_OUTPUT_TRUNCATION_GAP_PREFIX),
+                "marker must carry the contract prefix: {reason}"
+            );
+            let parsed = reason
+                .strip_prefix(NATIVE_OUTPUT_TRUNCATION_GAP_PREFIX)
+                .and_then(|s| s.parse::<u64>().ok());
+            assert_eq!(
+                parsed,
+                Some(dropped),
+                "marker must round-trip the dropped count"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+
+        /// PROPERTY (randomized): the no-silent-drop accounting invariant holds
+        /// for arbitrary payload sizes spanning the decode bound.
+        #[test]
+        fn decode_output_byte_accounting_holds_for_any_size(
+            n in 0usize..(MAX_OUTPUT_BYTES + 4096),
+        ) {
+            if let NativeEvent::PaneOutput { data, dropped_bytes, .. } = decode_output_of_len(n) {
+                prop_assert_eq!(data.len() as u64 + dropped_bytes, n as u64);
+                prop_assert!(data.len() <= MAX_OUTPUT_BYTES);
+                prop_assert_eq!(dropped_bytes > 0, n > MAX_OUTPUT_BYTES);
+            } else {
+                prop_assert!(false, "expected PaneOutput");
+            }
         }
     }
 
