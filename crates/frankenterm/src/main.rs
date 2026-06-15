@@ -1769,18 +1769,28 @@ SEE ALSO:
     /// Start the web server (requires --features web)
     #[cfg(feature = "web")]
     #[command(after_help = r#"EXAMPLES:
-    ft web                            Start web server on configured host/port
+    ft web                            Start the read-only web server on configured host/port
     ft web --port 0                   Bind to an ephemeral port (tests)
-    curl -N http://127.0.0.1:8000/stream/events
-                                     Subscribe to live EventBus traffic as SSE
-    curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
-                                     Detection-only stream for one pane
     curl -N "http://127.0.0.1:8000/stream/deltas?pane_id=7&max_hz=50"
-                                     Redacted output deltas and gaps for one pane
+                                     Redacted output deltas + gaps for one pane (DB-backed)
+    curl -N "http://127.0.0.1:8000/stream/events?channel=detections&pane_id=7&max_hz=25"
+                                     Detection event SSE (see the NOTE below)
 
 STREAMING ENDPOINTS:
-    GET /stream/events                Live EventBus SSE (`channel`, `pane_id`, `max_hz`)
-    GET /stream/deltas                Live delta SSE (`pane_id`, `max_hz`)
+    GET /stream/deltas                Output deltas + gaps SSE (`pane_id`, `max_hz`). Served
+                                      from periodic DB scans, so it works for a standalone
+                                      `ft web`.
+    GET /stream/events                EventBus SSE (`channel`, `pane_id`, `max_hz`). Carries
+                                      live events ONLY when an in-process producer shares the
+                                      bus. A standalone `ft web` runs no capture/watch
+                                      pipeline, so it emits the `ready` frame then keepalives.
+
+NOTE:
+    `ft web` is a read-only view over the capture DB; it does not run a watcher,
+    so the in-memory EventBus has no in-process publisher. An EventBus cannot be
+    shared across processes either, so a separate `ft watch` does NOT feed this
+    server's /stream/events. Use /stream/deltas (DB-backed) for standalone live
+    output, or run the web server inside a process that also captures. (ft-zeo5o)
 
 SEE ALSO:
     ft status     CLI status overview
@@ -54528,7 +54538,7 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
         });
     }
 
-    let result = frankenterm_core::tx_execution::TxExecutionEngine::new(
+    let engine = frankenterm_core::tx_execution::TxExecutionEngine::new(
         executor,
         frankenterm_core::tx_execution::TxExecutionConfig {
             kill_switch,
@@ -54536,9 +54546,27 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
             fail_step,
             ..Default::default()
         },
+    );
+    // ft-iz1ki: open the durable idempotency store and execute THROUGH it, so
+    // a crash-restart of this tx run reloads the committed-step ledger and
+    // dedups instead of re-dispatching already-committed pane side effects.
+    // The spool is rooted beside the contract file (`<contract_dir>/tx_ledgers/`)
+    // so re-running the same contract in place is restart-safe; open() appends
+    // the `tx_ledgers` subdir. Fail-closed: if the durable spool can't be opened
+    // we refuse the run rather than silently fall back to non-durable.
+    // (Rooting at the workspace `.ft` instead would require threading ft_dir
+    // through this fn's 6 production + 5 test call sites — deferred.)
+    let ledger_root = contract_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut idem_store = frankenterm_core::tx_idempotency::IdempotencyStore::open(
+        ledger_root,
+        frankenterm_core::tx_idempotency::IdempotencyPolicy::default(),
     )
-    .execute(contract, now_ms)
-    .map_err(|err| format!("tx execution failed: {err}"))?;
+    .map_err(|err| format!("tx idempotency store open failed: {err}"))?;
+    let result = engine
+        .execute_with_store(contract, &mut idem_store, now_ms)
+        .map_err(|err| format!("tx execution failed: {err}"))?;
 
     Ok(RobotTxRunData {
         contract_file: contract_path.display().to_string(),

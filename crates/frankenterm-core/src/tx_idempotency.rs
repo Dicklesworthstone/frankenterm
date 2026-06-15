@@ -18,6 +18,7 @@ use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use crate::tx_plan_compiler::{StepRisk, TxPlan};
 
@@ -1038,17 +1039,117 @@ pub struct IdempotencyStore {
     dedup: DeduplicationGuard,
     /// Policy configuration.
     policy: IdempotencyPolicy,
+    /// On-disk durability sink (ft-iz1ki). When `Some`, every ledger
+    /// mutation (create/record) is flushed to `<dir>/<execution_id>.json`
+    /// before the operation returns, so a crash-restart can reload the
+    /// committed ledgers and dedup already-dispatched steps. `None` keeps
+    /// the legacy in-memory, single-process behavior.
+    persist_dir: Option<PathBuf>,
 }
 
 impl IdempotencyStore {
-    /// Create a new store with the given policy.
+    /// Create a new in-memory store with the given policy (no durability).
     #[must_use]
     pub fn new(policy: IdempotencyPolicy) -> Self {
         Self {
             ledgers: HashMap::new(),
             dedup: DeduplicationGuard::new(policy.dedup_capacity),
             policy,
+            persist_dir: None,
         }
+    }
+
+    /// ft-iz1ki: open a *durable* idempotency store rooted at the workspace
+    /// `.ft` directory. Ledgers are persisted under `<ft_dir>/tx_ledgers/` and
+    /// the most-recent ones are reloaded so a restarted `tx run` dedups steps
+    /// that a prior (possibly crashed) run already committed — closing the
+    /// "crash re-dispatches committed side effects" gap.
+    ///
+    /// Reload is bounded to `max_active_ledgers - 1` files (most recent by
+    /// execution-id, which encodes the run timestamp) so a long-lived spool
+    /// can never starve `create_ledger` of its active-ledger budget. Files
+    /// that fail to parse are skipped (a single corrupt ledger must not block
+    /// startup); the durable spool is append-only audit history.
+    ///
+    /// # Errors
+    /// Returns [`IdempotencyError::LedgerPersist`] if the spool directory
+    /// cannot be created or listed.
+    pub fn open(ft_dir: &Path, policy: IdempotencyPolicy) -> Result<Self, IdempotencyError> {
+        let dir = ft_dir.join("tx_ledgers");
+        std::fs::create_dir_all(&dir).map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!("create tx_ledgers dir {}: {err}", dir.display()),
+        })?;
+
+        let mut store = Self {
+            ledgers: HashMap::new(),
+            dedup: DeduplicationGuard::new(policy.dedup_capacity),
+            persist_dir: Some(dir.clone()),
+            policy,
+        };
+
+        // Collect candidate ledger files, newest-first by file stem
+        // (execution_id `txe-<ms>` sorts chronologically within an era).
+        let mut stems: Vec<String> = Vec::new();
+        let entries = std::fs::read_dir(&dir).map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!("read tx_ledgers dir {}: {err}", dir.display()),
+        })?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && is_valid_execution_id(stem)
+            {
+                stems.push(stem.to_string());
+            }
+        }
+        stems.sort_unstable();
+        stems.reverse();
+        let budget = store.policy.max_active_ledgers.saturating_sub(1).max(1);
+
+        for stem in stems.into_iter().take(budget) {
+            let path = dir.join(format!("{stem}.json"));
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(ledger) = serde_json::from_str::<TxExecutionLedger>(&contents) else {
+                continue;
+            };
+            store
+                .ledgers
+                .insert(ledger.execution_id().to_string(), ledger);
+        }
+
+        Ok(store)
+    }
+
+    /// Flush a single ledger to the durable spool (no-op when in-memory).
+    fn persist_ledger(&self, execution_id: &str) -> Result<(), IdempotencyError> {
+        let Some(dir) = &self.persist_dir else {
+            return Ok(());
+        };
+        if !is_valid_execution_id(execution_id) {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!("unsafe execution_id for ledger filename: {execution_id:?}"),
+            });
+        }
+        let Some(ledger) = self.ledgers.get(execution_id) else {
+            return Ok(());
+        };
+        let json =
+            serde_json::to_string_pretty(ledger).map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!("serialize ledger {execution_id}: {err}"),
+            })?;
+        let final_path = dir.join(format!("{execution_id}.json"));
+        let tmp_path = dir.join(format!("{execution_id}.json.tmp"));
+        std::fs::write(&tmp_path, json.as_bytes()).map_err(|err| {
+            IdempotencyError::LedgerPersist {
+                reason: format!("write {}: {err}", tmp_path.display()),
+            }
+        })?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!("rename {} -> {}: {err}", tmp_path.display(), final_path.display()),
+        })?;
+        Ok(())
     }
 
     /// Create a new ledger for a tx execution. Returns error if execution ID already exists.
@@ -1069,6 +1170,9 @@ impl IdempotencyStore {
         }
         let ledger = TxExecutionLedger::new(execution_id, &plan.plan_id, plan.plan_hash);
         self.ledgers.insert(execution_id.to_string(), ledger);
+        // ft-iz1ki: durably record the freshly-created ledger so a crash
+        // before the first step still leaves a recoverable execution record.
+        self.persist_ledger(execution_id)?;
         Ok(())
     }
 
@@ -1137,6 +1241,13 @@ impl IdempotencyStore {
         self.dedup
             .record(&idem_key, execution_id, outcome, timestamp_ms);
 
+        // ft-iz1ki: flush the updated ledger BEFORE returning, so the
+        // committed step is durable. execute_with_store calls this per
+        // commit/compensation step; a fail-closed persist error aborts the tx
+        // (mapped to TxExecutionError::LedgerWrite) rather than letting a
+        // non-durable commit proceed.
+        self.persist_ledger(execution_id)?;
+
         Ok(hash)
     }
 
@@ -1168,7 +1279,17 @@ impl IdempotencyStore {
             });
         }
 
-        Ok(self.ledgers.remove(execution_id).expect("checked above"))
+        let removed = self.ledgers.remove(execution_id).expect("checked above");
+        // ft-iz1ki: drop the durable spool file for an archived (terminal)
+        // ledger. Best-effort — a failed unlink must not fail archival, since
+        // the in-memory removal already succeeded and the stale file is inert
+        // (its execution_id won't be recreated: txe-<ms> is monotonic).
+        if let Some(dir) = &self.persist_dir
+            && is_valid_execution_id(execution_id)
+        {
+            let _ = std::fs::remove_file(dir.join(format!("{execution_id}.json")));
+        }
+        Ok(removed)
     }
 
     /// Number of active ledgers.
@@ -1266,6 +1387,28 @@ pub enum IdempotencyError {
 
     #[error("active ledger limit exceeded: max_active_ledgers={max_active_ledgers}")]
     ActiveLedgerLimitExceeded { max_active_ledgers: usize },
+
+    /// ft-iz1ki: the durable ledger spool could not be opened or flushed.
+    /// Surfaced fail-closed so a tx never reports commit success on a step
+    /// whose execution record was not made durable.
+    #[error("ledger persistence failed: {reason}")]
+    LedgerPersist { reason: String },
+}
+
+/// ft-iz1ki: filename safety guard for durable ledger files. Execution IDs are
+/// `txe-<ms>` (engine-generated), but validate defensively before they reach
+/// the filesystem so a malformed/operator-influenced id can never traverse out
+/// of the `tx_ledgers/` spool. Mirrors `steer_receipt_store::is_valid_receipt_id`.
+#[must_use]
+pub fn is_valid_execution_id(execution_id: &str) -> bool {
+    !execution_id.is_empty()
+        && execution_id.len() <= 128
+        && execution_id != "."
+        && execution_id != ".."
+        && execution_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        && !execution_id.contains("..")
 }
 
 // ── FNV-1a Hash ──────────────────────────────────────────────────────────────
@@ -2672,6 +2815,87 @@ mod tests {
 
         // Dedup hit after recording.
         assert_eq!(store.check_dedup(&key), Some(&outcome));
+    }
+
+    // ── ft-iz1ki: durable store restart-safety ──────────────────────────
+
+    #[test]
+    fn open_persists_and_reloads_ledger_for_restart_dedup() {
+        let ft_dir =
+            std::env::temp_dir().join(format!("ft-iz1ki-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ft_dir);
+
+        let plan = make_plan(2);
+        let key = make_key("test-plan", "step-b0");
+        let outcome = StepOutcome::Success { result: None };
+
+        // First "run": durable store records a committed step.
+        {
+            let mut store =
+                IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+            store.create_ledger("txe-1000", &plan).expect("create ledger");
+            store
+                .record_execution(
+                    "txe-1000",
+                    key.clone(),
+                    outcome.clone(),
+                    StepRisk::Low,
+                    "agent",
+                    1000,
+                )
+                .expect("record execution");
+            // Spool file must exist on disk.
+            assert!(
+                ft_dir.join("tx_ledgers").join("txe-1000.json").is_file(),
+                "ledger must be persisted to the spool"
+            );
+        }
+
+        // Second "run" (process restart): a fresh store reloads the spool and
+        // dedups the already-committed step — the ft-iz1ki gap (re-dispatch
+        // after crash) is closed.
+        {
+            let reopened =
+                IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("reopen store");
+            assert_eq!(
+                reopened.check_dedup(&key),
+                Some(&outcome),
+                "reloaded ledger must satisfy dedup after restart"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[test]
+    fn in_memory_store_does_not_persist() {
+        // new() (no dir) keeps legacy behavior: persist_ledger is a no-op and
+        // never errors.
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let plan = make_plan(1);
+        store.create_ledger("txe-2000", &plan).expect("create ledger");
+        store
+            .record_execution(
+                "txe-2000",
+                make_key("test-plan", "step-b0"),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent",
+                2000,
+            )
+            .expect("record execution must not fail in-memory");
+    }
+
+    #[test]
+    fn execution_id_filename_guard_rejects_traversal() {
+        assert!(is_valid_execution_id("txe-1700000000000"));
+        assert!(is_valid_execution_id("txe-1_abc.def"));
+        assert!(!is_valid_execution_id(""));
+        assert!(!is_valid_execution_id("."));
+        assert!(!is_valid_execution_id(".."));
+        assert!(!is_valid_execution_id("../etc/passwd"));
+        assert!(!is_valid_execution_id("a/b"));
+        assert!(!is_valid_execution_id("txe-../x"));
     }
 
     #[test]
