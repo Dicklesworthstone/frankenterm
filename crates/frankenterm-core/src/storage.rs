@@ -6695,7 +6695,10 @@ impl StorageHandle {
             pooled_backend(db_path.as_str(), |backend| {
                 let row = backend
                     .query_row_typed(
-                        "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
+                        // ft-tkke8: the maintenance loop now records tier-aware
+                        // cleanups as 'tiered_cleanup'; count both so the search
+                        // explain "retention has run" diagnostic stays accurate.
+                        "SELECT COUNT(*) FROM maintenance_log WHERE event_type IN ('retention_cleanup', 'tiered_cleanup')",
                         &[],
                     )
                     .map_err(|err| storage_backend_error("Count retention cleanups", err))?

@@ -1459,6 +1459,10 @@ impl ObservationRuntime {
             retention_days: config.retention_days,
             retention_max_mb: config.retention_max_mb,
             checkpoint_interval_secs: config.checkpoint_interval_secs,
+            // ft-tkke8: RuntimeConfig does not carry tiers, so seed with the
+            // documented defaults (matching StorageConfig::default). Operator
+            // overrides arrive via the HotReloadableConfig reload channel.
+            retention_tiers: crate::config::default_retention_tiers(),
             gc: config.gc,
             patterns: config.patterns.clone(),
             workflows_enabled: vec![],
@@ -1992,6 +1996,11 @@ impl ObservationRuntime {
             let mut retention_max_mb = initial_retention_max_mb;
             let mut checkpoint_secs = initial_checkpoint_secs;
             let mut cache_gc_settings = initial_cache_gc_settings;
+            // ft-tkke8: tiered retention rules. RuntimeConfig carries no tiers,
+            // so seed with the documented defaults (matching the hot-reload
+            // channel seed in ObservationRuntime::new) and refresh from each
+            // hot-reload below.
+            let mut retention_tiers = crate::config::default_retention_tiers();
             let mut last_health_snapshot = Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(Instant::now);
@@ -2052,6 +2061,14 @@ impl ObservationRuntime {
                         );
                         retention_days = new_config.retention_days;
                     }
+                    if new_config.retention_tiers != retention_tiers {
+                        info!(
+                            old = retention_tiers.len(),
+                            new = new_config.retention_tiers.len(),
+                            "Retention tiers updated"
+                        );
+                        retention_tiers = new_config.retention_tiers.clone();
+                    }
                     if new_config.retention_max_mb != retention_max_mb {
                         info!(
                             old = retention_max_mb,
@@ -2082,23 +2099,38 @@ impl ObservationRuntime {
 
                 // Run retention cleanup every hour (or if just started/updated)
                 if now.duration_since(last_retention_check) >= Duration::from_secs(3600) {
-                    if retention_days > 0 {
-                        let cutoff_days = u64::from(retention_days);
-                        let cutoff_window_ms = cutoff_days.saturating_mul(24 * 60 * 60 * 1000);
-                        let cutoff_ms = epoch_ms()
-                            .saturating_sub(i64::try_from(cutoff_window_ms).unwrap_or(i64::MAX));
-                        if let Err(e) = storage.retention_cleanup(cutoff_ms).await {
-                            error!(error = %e, "Retention cleanup failed");
-                        } else {
-                            debug!("Retention cleanup completed");
-                        }
-                        // Also purge old audit actions
-                        // ft-xbnl0.2.3 tick 251: cx-first retention purge.
-                        if let Err(e) = storage
-                            .purge_audit_actions_before_with_cx(&loop_cx, cutoff_ms)
-                            .await
+                    // ft-tkke8: tier-aware cleanup. This previously called the
+                    // flat storage.retention_cleanup(cutoff) (output_segments
+                    // only) plus a separate audit purge, ignoring
+                    // config.retention_tiers entirely — so a configured tier
+                    // policy (e.g. keep critical 90d, info 7d) was silently
+                    // dropped and everything pruned at the flat retention_days.
+                    // cleanup_apply_with_cx evaluates per-tier event retention
+                    // AND prunes output_segments / audit_actions / usage_metrics
+                    // / notification_history at the global cutoff, threading the
+                    // loop Cx for cancellation. Run whenever a flat retention OR
+                    // any tier rule is active.
+                    if retention_days > 0 || !retention_tiers.is_empty() {
+                        let cleanup_config = crate::config::StorageConfig {
+                            retention_days,
+                            retention_tiers: retention_tiers.clone(),
+                            ..crate::config::StorageConfig::default()
+                        };
+                        match crate::cleanup::cleanup_apply_with_cx(
+                            &loop_cx,
+                            &storage,
+                            &cleanup_config,
+                        )
+                        .await
                         {
-                            error!(error = %e, "Audit purge failed");
+                            Ok(plan) => {
+                                debug!(
+                                    deleted = plan.total_deleted,
+                                    tables = plan.tables.len(),
+                                    "Tiered retention cleanup completed"
+                                );
+                            }
+                            Err(e) => error!(error = %e, "Retention cleanup failed"),
                         }
                     }
 

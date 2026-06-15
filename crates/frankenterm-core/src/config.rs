@@ -1559,7 +1559,10 @@ pub struct RetentionTier {
 }
 
 /// Default retention tiers: critical kept longest, info shortest.
-fn default_retention_tiers() -> Vec<RetentionTier> {
+///
+/// `pub(crate)` so the runtime maintenance loop can seed its initial
+/// hot-reloadable tier set before the first config reload arrives (ft-tkke8).
+pub(crate) fn default_retention_tiers() -> Vec<RetentionTier> {
     vec![
         RetentionTier {
             name: "critical".to_string(),
@@ -4238,6 +4241,11 @@ pub struct HotReloadableConfig {
     pub retention_max_mb: u32,
     /// Checkpoint interval in seconds
     pub checkpoint_interval_secs: u32,
+    /// Tiered retention rules (ft-tkke8). Carried through the hot-reload
+    /// channel so the maintenance loop can apply per-tier event retention via
+    /// `cleanup::cleanup_apply_with_cx` instead of a flat `retention_days`
+    /// cutoff. Empty = flat retention only.
+    pub retention_tiers: Vec<RetentionTier>,
     /// Periodic cache GC and vacuum policy.
     pub gc: crate::gc::CacheGcSettings,
 
@@ -4270,6 +4278,7 @@ impl HotReloadableConfig {
             retention_days: config.storage.retention_days,
             retention_max_mb: config.storage.retention_max_mb,
             checkpoint_interval_secs: config.storage.checkpoint_interval_secs,
+            retention_tiers: config.storage.retention_tiers.clone(),
             gc: config.gc,
             patterns: config.patterns.clone(),
             workflows_enabled: config.workflows.enabled.clone(),
@@ -7391,11 +7400,23 @@ max_bytes_per_sec = 1048576
         config.safety.trauma_guard.max_consecutive_failures = 5;
         config.safety.trauma_guard.similarity_threshold = 0.9;
         config.safety.trauma_guard.window_size = 222;
+        // ft-tkke8: a custom tier policy must flow through the hot-reload
+        // channel so the maintenance loop's cleanup_apply honours it.
+        config.storage.retention_tiers = vec![RetentionTier {
+            name: "audit-keep".to_string(),
+            retention_days: 365,
+            severities: vec!["critical".to_string()],
+            event_types: vec![],
+            handled: None,
+        }];
 
         let hot = config.hot_reloadable();
 
         assert_eq!(hot.log_level, "debug");
         assert_eq!(hot.poll_interval_ms, 500);
+        assert_eq!(hot.retention_tiers.len(), 1);
+        assert_eq!(hot.retention_tiers[0].name, "audit-keep");
+        assert_eq!(hot.retention_tiers[0].retention_days, 365);
         assert_eq!(hot.pane_priorities.default_priority, 42);
         assert_eq!(hot.capture_budgets.max_captures_per_sec, 25);
         assert_eq!(hot.retention_days, 45);
