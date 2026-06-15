@@ -2017,9 +2017,18 @@ pub const TARGET_CLASS_ARTIFACT_POINTER: &str =
 /// Fail-closed: maps to [`OperatingEnvelopeProofState::Measured`] only when the
 /// run PASSED and is `ready_to_sign` with
 /// `hardware_predicate.proof_status == "proven_predicate_met"` and
-/// `hardware_predicate.high_scale_claim_allowed == true`. An explicit
-/// `skipped_not_proven` maps to `SkippedNotProven`; anything else (missing or
-/// garbled fields) is `Unavailable`, keeping the high-scale gate shut.
+/// `high_scale_claim_allowed == true`. An explicit `skipped_not_proven` maps to
+/// `SkippedNotProven`; anything else (missing or garbled fields) is
+/// `Unavailable`, keeping the high-scale gate shut.
+///
+/// `high_scale_claim_allowed` is read from `/evidence/high_scale_claim_allowed`
+/// — the location the bench-lane signer (`scripts/run-target-class-cockpit.sh`,
+/// the only producer of a signable artifact) actually writes it. The legacy
+/// `/hardware_predicate/high_scale_claim_allowed` path is accepted as a fallback
+/// for fixtures written before the schema settled. Reading only the latter (the
+/// pre-ft-d7fow behaviour) meant a genuinely-signed artifact mapped to
+/// `Unavailable` — `unwrap_or(false)` on an absent field — so the gate could
+/// never flip via the real harness. See `tests/target_class_signing_flip_e2e.rs`.
 #[must_use]
 pub fn target_class_proof_state_from_summary(
     summary: &serde_json::Value,
@@ -2029,7 +2038,8 @@ pub fn target_class_proof_state_from_summary(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let high_scale_allowed = summary
-        .pointer("/hardware_predicate/high_scale_claim_allowed")
+        .pointer("/evidence/high_scale_claim_allowed")
+        .or_else(|| summary.pointer("/hardware_predicate/high_scale_claim_allowed"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     match summary
