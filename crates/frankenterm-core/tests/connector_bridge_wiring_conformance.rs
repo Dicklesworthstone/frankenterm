@@ -35,6 +35,22 @@ fn core_src(file: &str) -> TestResult<String> {
         .map_err(|err| io::Error::new(err.kind(), format!("read {}: {err}", path.display())).into())
 }
 
+fn crate_test_src(file: &str) -> TestResult<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(file);
+    std::fs::read_to_string(&path)
+        .map_err(|err| io::Error::new(err.kind(), format!("read {}: {err}", path.display())).into())
+}
+
+fn workspace_src(relative_path: &str) -> TestResult<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative_path);
+    std::fs::read_to_string(&path)
+        .map_err(|err| io::Error::new(err.kind(), format!("read {}: {err}", path.display())).into())
+}
+
 fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -99,6 +115,8 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
     let inbound = core_src("connector_inbound_bridge.rs")?;
     let outbound = core_src("connector_outbound_bridge.rs")?;
     let policy = core_src("policy.rs")?;
+    let conformance = crate_test_src("connector_bridge_wiring_conformance.rs")?;
+    let e2e = workspace_src("tests/e2e/test_connector_bridge_wiring_conformance.sh")?;
 
     Ok(serde_json::json!([
         {
@@ -185,14 +203,22 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
         },
         {
             "bead": "ft-7h5da.5.11",
-            "bridge": "lifecycle",
-            "contract": "operator lifecycle mutations pass through PolicyEngine boundary",
+            "bridge": "lifecycle_mesh",
+            "contract": "lifecycle mutations and connector actions route through PolicyEngine lifecycle/mesh boundaries",
             "production_caller_wired": contains_all(
                 &policy,
                 &[
                     "pub fn run_connector_lifecycle_intent",
                     "self.lifecycle_manager_mut().execute(intent, now_ms)",
                     "connector lifecycle intent executed via production boundary",
+                    "pub fn route_connector_operation_through_mesh",
+                    ".route(&routing_request, now_ms)",
+                ],
+            ) && contains_all(
+                &runtime,
+                &[
+                    ".route_connector_operation_through_mesh(",
+                    "dispatch_connector_outbound_action",
                 ],
             ),
             "fail_closed": contains_all(
@@ -200,8 +226,18 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
                 &[
                     "kill_switch().is_emergency()",
                     "connector lifecycle denied: emergency kill switch active",
+                    "ConnectorOperationDispatchError::Denied",
+                    "ConnectorOperationDispatchError::from_mesh_error",
+                    "ConnectorOperationDispatchError::from_host_runtime_error",
                     "return Err(",
                     "telemetry is not advanced on a denial",
+                ],
+            ) && contains_all(
+                &runtime,
+                &[
+                    "connector_operation_dispatch_error_kind",
+                    "ConnectorErrorKind::ServiceUnavailable",
+                    "ConnectorErrorKind::Permanent",
                 ],
             ),
             "no_silent_drop": contains_all(
@@ -209,7 +245,69 @@ fn connector_bridge_contract_matrix() -> TestResult<serde_json::Value> {
                 &[
                     "connector lifecycle intent executed via production boundary",
                     "connector lifecycle intent failed at production boundary",
+                    "connector operation routed through production mesh boundary",
+                    "record_failure(crate::connector_mesh::MeshFailureEvent",
+                    ".release_connector(&routing_decision.host_id)",
                     "Err(err.to_string())",
+                ],
+            ) && contains_all(
+                &runtime,
+                &[
+                    "record_action_success(action, now_ms)",
+                    "record_action_failure(action, err.to_string(), kind, now_ms)",
+                ],
+            ),
+        },
+        {
+            "bead": "ft-7h5da.5.13",
+            "bridge": "conformance",
+            "contract": "golden and zero-RCH e2e harness preserve connector bridge wiring contracts",
+            "production_caller_wired": contains_all(
+                &conformance,
+                &[
+                    "connector_bridge_contract_matrix_matches_golden",
+                    "inbound_bridge_has_runtime_production_ingress",
+                    "outbound_bridge_has_runtime_production_dispatch",
+                    "lifecycle_routes_through_policy_engine_boundary",
+                ],
+            ) && contains_all(
+                &e2e,
+                &[
+                    "ft-7h5da.5.9",
+                    "ft-7h5da.5.10",
+                    "ft-7h5da.5.11",
+                    "ft-7h5da.5.13",
+                ],
+            ),
+            "fail_closed": contains_all(
+                &conformance,
+                &[
+                    "assert_contract_matrix_all_true",
+                    "outbound_dispatch_consults_governor_and_fails_closed",
+                    "fail_closed",
+                    "actions_blocked_governor",
+                ],
+            ) && contains_all(
+                &e2e,
+                &[
+                    "forbidden Cargo/RCH invocation",
+                    "governor fail-closed",
+                    "exit 1",
+                ],
+            ),
+            "no_silent_drop": contains_all(
+                &conformance,
+                &[
+                    "no_silent_drop",
+                    "assert_golden_json",
+                    "conformance_matrix.json",
+                ],
+            ) && contains_all(
+                &e2e,
+                &[
+                    "golden matrix",
+                    "all_checks_passed",
+                    "test_connector_bridge_wiring_conformance.sh",
                 ],
             ),
         },
@@ -225,8 +323,8 @@ fn assert_contract_matrix_all_true(matrix: &serde_json::Value) -> TestResult {
     })?;
     assert_eq!(
         cases.len(),
-        3,
-        "matrix must cover inbound, outbound, and lifecycle bridges"
+        4,
+        "matrix must cover inbound, outbound, lifecycle/mesh, and conformance harness"
     );
     for case in cases {
         for field in ["production_caller_wired", "fail_closed", "no_silent_drop"] {
@@ -358,6 +456,22 @@ fn lifecycle_routes_through_policy_engine_boundary() -> TestResult {
             && src.contains("connector lifecycle intent failed at production boundary"),
         "the lifecycle boundary must log both success and failure outcomes instead of \
          silently dropping lifecycle results (ft-7h5da.5.11)"
+    );
+    assert!(
+        src.contains("pub fn route_connector_operation_through_mesh")
+            && src.contains(".route(&routing_request, now_ms)")
+            && src.contains("ConnectorOperationDispatchError::from_mesh_error")
+            && src.contains("ConnectorOperationDispatchError::from_host_runtime_error"),
+        "policy.rs must expose a fail-closed mesh route boundary that drives ConnectorMesh and \
+         ConnectorHostRuntime for connector actions (ft-7h5da.5.11)"
+    );
+    let runtime = core_src("runtime.rs")?;
+    assert!(
+        runtime.contains(".route_connector_operation_through_mesh(")
+            && runtime.contains("record_action_success(action, now_ms)")
+            && runtime.contains("record_action_failure(action, err.to_string(), kind, now_ms)"),
+        "runtime outbound dispatch must call the policy-owned mesh boundary and feed \
+         success/failure back into the connector bridge (ft-7h5da.5.11)"
     );
     Ok(())
 }

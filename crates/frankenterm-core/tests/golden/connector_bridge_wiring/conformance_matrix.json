@@ -17,8 +17,16 @@
   },
   {
     "bead": "ft-7h5da.5.11",
-    "bridge": "lifecycle",
-    "contract": "operator lifecycle mutations pass through PolicyEngine boundary",
+    "bridge": "lifecycle_mesh",
+    "contract": "lifecycle mutations and connector actions route through PolicyEngine lifecycle/mesh boundaries",
+    "fail_closed": true,
+    "no_silent_drop": true,
+    "production_caller_wired": true
+  },
+  {
+    "bead": "ft-7h5da.5.13",
+    "bridge": "conformance",
+    "contract": "golden and zero-RCH e2e harness preserve connector bridge wiring contracts",
     "fail_closed": true,
     "no_silent_drop": true,
     "production_caller_wired": true
