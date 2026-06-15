@@ -114,7 +114,7 @@ pub struct ParsedManifest {
 impl ParsedManifest {
     /// Parse an `extension.toml` file.
     pub fn from_toml_str(toml_str: &str) -> Result<Self> {
-        let doc: toml::Value = toml_str.parse().context("failed to parse extension.toml")?;
+        let doc: toml::Table = toml_str.parse().context("failed to parse extension.toml")?;
 
         let ext = doc.get("extension").context("missing [extension] table")?;
 

@@ -4,11 +4,14 @@
 //! These run without any feature flags (no Lua, no WASM) to verify the core
 //! infrastructure works independently.
 
+use frankenterm_scripting::audit::{AuditOutcome, AuditTrail};
 use frankenterm_scripting::events::{DispatchTier, EventBus};
 use frankenterm_scripting::extension::ExtensionManager;
 use frankenterm_scripting::keybindings::{KeyCombo, KeybindingRegistry};
 use frankenterm_scripting::lifecycle::{ExtensionLifecycle, ExtensionState};
-use frankenterm_scripting::package::FtxBuilder;
+use frankenterm_scripting::manifest::ExtensionPermissions;
+use frankenterm_scripting::package::{FtxBuilder, FtxPackage};
+use frankenterm_scripting::sandbox::{SandboxConfig, SandboxEnforcer};
 use frankenterm_scripting::storage::ExtensionStorage;
 use std::path::Path;
 use std::sync::Arc;
@@ -17,17 +20,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const WASM_MAGIC: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 
 fn test_manifest(name: &str) -> String {
+    test_manifest_with_engine(name, "wasm", "main.wasm")
+}
+
+fn test_manifest_with_engine(name: &str, engine_type: &str, entry: &str) -> String {
     format!(
-        r#"
-[extension]
+        r#"[extension]
 name = "{name}"
 version = "1.0.0"
 
 [engine]
-type = "wasm"
-entry = "main.wasm"
+type = "{engine_type}"
+entry = "{entry}"
 "#
     )
+}
+
+fn escaped_manifest_name(name: &str) -> String {
+    name.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn create_test_ftx(dir: &Path, name: &str) -> std::path::PathBuf {
@@ -38,6 +48,216 @@ fn create_test_ftx(dir: &Path, name: &str) -> std::path::PathBuf {
         .write_to(&ftx_path)
         .unwrap();
     ftx_path
+}
+
+fn write_ftx(dir: &Path, manifest: &str) -> std::path::PathBuf {
+    let ftx_path = dir.join("security-conformance.ftx");
+    FtxBuilder::new()
+        .add_manifest(manifest)
+        .add_file("main.wasm", WASM_MAGIC)
+        .write_to(&ftx_path)
+        .unwrap();
+    ftx_path
+}
+
+fn test_enforcer(permissions: ExtensionPermissions) -> SandboxEnforcer {
+    SandboxEnforcer::new(
+        SandboxConfig::from_permissions("security-conformance".to_string(), permissions),
+        Arc::new(AuditTrail::new(100)),
+    )
+}
+
+// --- Security conformance: extension path boundaries ---
+
+#[test]
+fn conformance_rejects_package_manifest_names_that_escape_extension_root() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for name in [
+        "",
+        ".",
+        "..",
+        "../outside",
+        "/absolute",
+        "nested/name",
+        r"nested\name",
+        "C:outside",
+        "two words",
+    ]
+    .iter()
+    {
+        let manifest = test_manifest(&escaped_manifest_name(name));
+        let ftx_path = write_ftx(dir.path(), &manifest);
+
+        let result = FtxPackage::open(&ftx_path);
+
+        assert!(
+            result.is_err(),
+            "manifest name should be rejected: {name:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid extension name"),
+            "unexpected error for {name:?}: {err:#}"
+        );
+    }
+}
+
+#[test]
+fn conformance_lua_extension_package_names_use_same_filesystem_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = test_manifest_with_engine("../outside", "lua", "main.lua");
+    let ftx_path = dir.path().join("bad-lua-name.ftx");
+    FtxBuilder::new()
+        .add_manifest(&manifest)
+        .add_file("main.lua", b"-- lua entry\n")
+        .write_to(&ftx_path)
+        .unwrap();
+
+    let result = FtxPackage::open(&ftx_path);
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("invalid extension name"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn conformance_manager_rejects_direct_traversal_names_without_touching_siblings() {
+    let dir = tempfile::tempdir().unwrap();
+    let extensions_dir = dir.path().join("extensions");
+    let outside_dir = dir.path().join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    std::fs::write(outside_dir.join("extension.toml"), test_manifest("outside")).unwrap();
+    let manager = ExtensionManager::new(extensions_dir).unwrap();
+
+    let remove_result = manager.remove("../outside");
+    let get_result = manager.get("../outside");
+
+    assert!(remove_result.is_err());
+    assert!(get_result.is_err());
+    assert!(outside_dir.join("extension.toml").exists());
+    assert!(
+        remove_result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid extension name")
+    );
+    assert!(
+        get_result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid extension name")
+    );
+}
+
+// --- Security conformance: filesystem permission containment ---
+
+#[test]
+fn conformance_filesystem_permissions_deny_prefix_and_dotdot_bypasses() {
+    let enforcer = test_enforcer(ExtensionPermissions {
+        filesystem_read: vec!["/tmp/ft-allowed".to_string()],
+        filesystem_write: vec!["/tmp/ft-out/".to_string()],
+        ..Default::default()
+    });
+
+    assert!(enforcer.check_read("/tmp/ft-allowed/file.txt").is_ok());
+    assert!(enforcer.check_write("/tmp/ft-out/new-file.txt").is_ok());
+    assert!(
+        enforcer
+            .check_read("/tmp/ft-allowed-secret/file.txt")
+            .is_err()
+    );
+    assert!(
+        enforcer
+            .check_read("/tmp/ft-allowed/../ft-allowed-secret/file.txt")
+            .is_err()
+    );
+    assert!(enforcer.check_write("/tmp/ft-outputside/file.txt").is_err());
+    assert!(
+        enforcer
+            .check_write("/tmp/ft-out/../ft-outputside/file.txt")
+            .is_err()
+    );
+
+    let recent = enforcer.audit_trail().recent(6);
+    assert_eq!(recent.len(), 6);
+    assert!(matches!(recent[0].outcome, AuditOutcome::Ok));
+    assert!(matches!(recent[1].outcome, AuditOutcome::Ok));
+    for denied in recent.iter().skip(2) {
+        assert!(
+            matches!(denied.outcome, AuditOutcome::Denied(_)),
+            "bypass attempt should audit Denied: {:?}",
+            denied.outcome
+        );
+    }
+}
+
+#[test]
+fn conformance_manifest_rejects_fail_open_permission_roots() {
+    for permission in [
+        "read:",
+        "write:",
+        "read:../escape",
+        "write:/tmp/frankenterm/../../..",
+        r"read:C:\Users\Public",
+    ] {
+        let escaped_permission = permission.replace('\\', "\\\\").replace('"', "\\\"");
+        let manifest = format!(
+            r#"[extension]
+name = "bad-permission"
+
+[permissions]
+filesystem = ["{escaped_permission}"]
+"#
+        );
+
+        let result = frankenterm_scripting::manifest::ParsedManifest::from_toml_str(&manifest);
+
+        assert!(
+            result.is_err(),
+            "permission root should be rejected: {permission:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid filesystem permission path"),
+            "unexpected error for {permission:?}: {err:#}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn conformance_filesystem_permissions_deny_existing_symlink_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("allowed");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, allowed.join("outside-link")).unwrap();
+
+    let enforcer = test_enforcer(ExtensionPermissions {
+        filesystem_read: vec![allowed.to_string_lossy().into_owned()],
+        ..Default::default()
+    });
+
+    assert!(
+        enforcer
+            .check_read(&allowed.join("inside.txt").to_string_lossy())
+            .is_ok()
+    );
+    assert!(
+        enforcer
+            .check_read(&allowed.join("outside-link/secret.txt").to_string_lossy())
+            .is_err()
+    );
+
+    let recent = enforcer.audit_trail().recent(2);
+    assert_eq!(recent.len(), 2);
+    assert!(matches!(recent[0].outcome, AuditOutcome::Ok));
+    assert!(matches!(recent[1].outcome, AuditOutcome::Denied(_)));
 }
 
 // --- Full lifecycle integration ---
