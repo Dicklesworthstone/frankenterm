@@ -1,0 +1,140 @@
+{
+  "schema_version": "1.0.0",
+  "kind": "robot-contract-doctor-attestation",
+  "category": "proofs/robot-contracts",
+  "produced_by_bead": "ft-7h5da.13.7",
+  "generated_at": "2026-06-15T04:00:00Z",
+  "overall_status": "pass_with_tracked_exceptions",
+  "proof_categories": [4],
+  "scope": "Release-bundle attestation for the unified Robot/MCP Contract Doctor verdict. The verdict joins ApiSurface::ALL, the API surface coverage ledger, the six-dimension Contract Doctor matrix, the MCP dispatch registry, and the tracked security ledgers so one CI job fails closed on contract drift while known gaps remain explicitly owned.",
+  "contract": {
+    "contract_id": "ft.robot_contract_doctor.v1",
+    "surface_registry": "crates/frankenterm-core/src/robot_api_contracts.rs::ApiSurface::ALL",
+    "api_surface_count": 38,
+    "matrix_surface_count": 38,
+    "dimensions": ["ENV", "PAR", "POL", "RED", "TOON", "ERR"],
+    "mcp_dispatch_registry": "crates/frankenterm-core/src/mcp.rs",
+    "unified_ci_verdict": true,
+    "local_cargo_counts_as_proof": false,
+    "tracked_exceptions_are_not_green_claims": true
+  },
+  "claim_boundaries": {
+    "does_not_claim_all_policy_audit_rows_complete": true,
+    "does_not_claim_dom_redaction_gap_closed": true,
+    "does_not_claim_mission_pause_resume_abort_in_api_surface_all": true,
+    "does_not_claim_local_cargo_as_remote_proof": true,
+    "does_not_mutate_panes_services_or_beads": true
+  },
+  "ci_verdict": {
+    "workflow": ".github/workflows/contract-families-matrix.yml",
+    "job": "matrix",
+    "job_name": "Cross-family + Robot/MCP Contract Doctor verdict",
+    "fail_closed_steps": [
+      {
+        "name": "Robot/MCP Contract Doctor static verdict",
+        "command": "bash scripts/check-contract-doctor-coverage.sh",
+        "drift_detected_by": [
+          "ApiSurface::ALL count differs from contract-doctor-matrix rows",
+          "api-surface-coverage ledger differs from contract-doctor-matrix rows",
+          "MCP mission pause/resume/abort dispatch tools stop being tracked as G4",
+          "G1/G3 tracked-gap bead references disappear"
+        ]
+      },
+      {
+        "name": "Robot/MCP Contract Doctor attestation slot",
+        "command": "jq -e ... docs/attestations/manifest.json && jq -e ... docs/attestations/proofs/robot-contract-doctor.json",
+        "drift_detected_by": [
+          "manifest slot missing or no longer points at this artifact",
+          "artifact no longer declares proofs/robot-contracts",
+          "artifact no longer declares ft-7h5da.13.7 as producer"
+        ]
+      },
+      {
+        "name": "Robot/MCP Contract Doctor cargo verdict",
+        "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture",
+        "drift_detected_by": [
+          "lib-level contract artifact regression",
+          "static oracle failure under the cargo proof lane",
+          "robot_api_contracts unit-test regression"
+        ]
+      }
+    ]
+  },
+  "static_verifiers": [
+    {
+      "command": "bash scripts/check-contract-doctor-coverage.sh",
+      "exit_code": 0,
+      "result": "OK: Robot/MCP contract coverage is complete and gaps are tracked (38 surfaces).",
+      "local_cargo_counted": false
+    },
+    {
+      "command": "jq -e '.slots[] | select(.category == \"proofs/robot-contracts\") | select(.path == \"docs/attestations/proofs/robot-contract-doctor.json\") | select(.produced_by_bead == \"ft-7h5da.13.7\") | select(.proof_categories | index(4))' docs/attestations/manifest.json",
+      "exit_code": 0,
+      "result": "manifest slot resolves to this robot-contracts attestation"
+    }
+  ],
+  "rch_proof": {
+    "remote_required": true,
+    "local_cargo_counted": false,
+    "required_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da137-cod10-target cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture",
+    "requested_target_dir": "/tmp/ft-7h5da137-cod10-target",
+    "proof_record_location": "ft-7h5da.13.7 closeout comment and commit message"
+  },
+  "tracked_exceptions": [
+    {
+      "gap_id": "G1",
+      "tracking_bead": "ft-6mmyp",
+      "status": "tracked_exception",
+      "scope": "Policy-denial audit-row wiring incomplete on several mutation surfaces.",
+      "source": "docs/security/policy-denial-audit-wiring-matrix.md"
+    },
+    {
+      "gap_id": "G3",
+      "tracking_bead": "ft-5puf0",
+      "status": "tracked_exception",
+      "scope": "dom redaction row absent from the read-path matrix until the handler/redaction path is confirmed or fixed.",
+      "source": "docs/security/read-path-redaction-matrix.md"
+    },
+    {
+      "gap_id": "G4",
+      "tracking_bead": "ft-7h5da.13.6",
+      "status": "tracked_exception",
+      "scope": "mission_pause, mission_resume, and mission_abort are dispatched MCP mutation tools outside ApiSurface::ALL and must stay called out by the Doctor until registry coverage is expanded.",
+      "source": "docs/robot-contracts/contract-doctor-matrix.md"
+    }
+  ],
+  "source_artifacts": [
+    {
+      "path": "scripts/check-contract-doctor-coverage.sh",
+      "role": "static fail-closed oracle"
+    },
+    {
+      "path": "docs/robot-contracts/contract-doctor-matrix.md",
+      "role": "six-dimension Robot/MCP Contract Doctor matrix"
+    },
+    {
+      "path": "docs/robot-contracts/api-surface-coverage.md",
+      "role": "registry-synced ApiSurface coverage ledger"
+    },
+    {
+      "path": "crates/frankenterm-core/src/robot_api_contracts.rs",
+      "role": "typed ApiSurface registry and lib-level contract tests"
+    },
+    {
+      "path": "crates/frankenterm-core/src/mcp.rs",
+      "role": "MCP dispatch registry"
+    },
+    {
+      "path": "docs/security/policy-denial-audit-wiring-matrix.md",
+      "role": "policy-audit tracked-gap ledger"
+    },
+    {
+      "path": "docs/security/read-path-redaction-matrix.md",
+      "role": "read-path redaction tracked-gap ledger"
+    },
+    {
+      "path": ".github/workflows/contract-families-matrix.yml",
+      "role": "single CI verdict wiring"
+    }
+  ]
+}

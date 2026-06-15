@@ -45,9 +45,9 @@
       "category": "perf/lindley-bounds",
       "path": "docs/attestations/perf/lindley-bounds.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-43x69",
+      "produced_by_bead": "ft-7h5da.10.2",
       "proof_categories": [8],
-      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Substrate-pass artifact via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69 substrate-pass; ft-syqcz.5 sibling); the wired-pass cont-bead swaps the hard-coded per-stage rates for live latency_stages.rs telemetry reads + bench-driven empirical_p99_ms + sigstore signing."
+      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Original substrate via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69); ft-7h5da.10.2 refreshes the published capture slice against the W9.1 append_segment group-commit storage service curve."
     },
     {
       "category": "tui/render-parity",
@@ -208,6 +208,14 @@
       "produced_by_bead": "ft-7h5da.5.5",
       "proof_categories": [4, 11],
       "description": "Decision-API deadwire wiring-status doctrine artifact for designated allow_operation/evaluate/execute/observe entry points. The artifact publishes the schema and analyzer surface that CI can invoke to reject unwired production APIs unless a bead-owned dormant exemption is present."
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "path": "docs/attestations/proofs/robot-contract-doctor.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-7h5da.13.7",
+      "proof_categories": [4],
+      "description": "Unified Robot/MCP Contract Doctor verdict for the ft.robot_contract_doctor.v1 release contract. The artifact ties ApiSurface::ALL, the API-surface ledger, the six-dimension Contract Doctor matrix, MCP dispatch registry checks, tracked gap beads, CI workflow wiring, and the narrow RCH cargo proof into the proofs/robot-contracts category without promoting tracked exceptions to green claims."
     },
     {
       "category": "proofs/rehearsal-score",

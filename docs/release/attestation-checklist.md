@@ -88,7 +88,7 @@ in [`docs/attestations/README.md`](../attestations/README.md)
 |-------------------------------------|--------------------|----------------|
 | `perf/headline-claims`              | `ft-syqcz.3`       | `br show ft-syqcz.3` reports closed |
 | `perf/competitor-matrix`            | `ft-e87u6.9`       | `br show ft-e87u6.9` reports closed |
-| `perf/lindley-bounds`               | `ft-43x69`         | `br show ft-43x69` reports closed |
+| `perf/lindley-bounds`               | `ft-7h5da.10.2`    | `br show ft-7h5da.10.2` reports closed |
 | `tui/render-parity`                 | `ft-35yac.1.2` + `ft-35yac.2` | both beads report closed |
 | `security/passive-watch`            | `ft-x0666.1`       | `br show ft-x0666.1` reports closed |
 | `security/redactor-coverage`        | `ft-x0666.2`       | `br show ft-x0666.2` reports closed |

@@ -27,7 +27,7 @@ The producing-bead column is the source of truth for which work item gates the a
 |----------|----------------|---------------------|
 | `perf/headline-claims` | `ft-syqcz.3` | G3 |
 | `perf/competitor-matrix` | `ft-e87u6.9` | G3 |
-| `perf/lindley-bounds` | `ft-43x69` | G3 |
+| `perf/lindley-bounds` | `ft-7h5da.10.2` | G3 |
 | `tui/render-parity` | `ft-35yac.1.2` (GPU visual adjunct) + `ft-35yac.2` (full ratatui<->ftui report) | G5 |
 | `security/passive-watch` | `ft-x0666.1` | G9 |
 | `security/redactor-coverage` | `ft-x0666.2` | G10 |

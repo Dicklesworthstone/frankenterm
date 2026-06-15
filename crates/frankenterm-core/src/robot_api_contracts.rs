@@ -1329,6 +1329,23 @@ pub fn standard_contract_matrix() -> ContractMatrix {
 mod tests {
     use super::*;
 
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root exists")
+            .to_path_buf()
+    }
+
+    fn read_workspace_json(path: &str) -> serde_json::Value {
+        let root = workspace_root();
+        let absolute = root.join(path);
+        let text = std::fs::read_to_string(&absolute)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", absolute.display()));
+        serde_json::from_str(&text)
+            .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", absolute.display()))
+    }
+
     // ---- ApiSurface ----
 
     #[test]
@@ -1941,6 +1958,68 @@ mod tests {
         assert!(reparsed.failures[0].suggested_fix.contains("pane_id"));
         assert!(reparsed.failures[0].suggested_fix.contains("text"));
         assert_eq!(reparsed.verdict, ContractVerdict::Incompatible);
+    }
+
+    #[test]
+    fn contract_doctor_attestation_slot_executes_static_oracle() {
+        let root = workspace_root();
+        let output = std::process::Command::new("bash")
+            .arg("scripts/check-contract-doctor-coverage.sh")
+            .current_dir(&root)
+            .output()
+            .expect("run Contract Doctor static oracle");
+        assert!(
+            output.status.success(),
+            "Contract Doctor static oracle failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let manifest = read_workspace_json("docs/attestations/manifest.json");
+        let artifact = read_workspace_json("docs/attestations/proofs/robot-contract-doctor.json");
+        assert_eq!(artifact["category"], "proofs/robot-contracts");
+        assert_eq!(artifact["produced_by_bead"], "ft-7h5da.13.7");
+        assert_eq!(artifact["overall_status"], "pass_with_tracked_exceptions");
+
+        let slots = manifest["slots"]
+            .as_array()
+            .expect("attestation manifest has slots array");
+        let slot = slots
+            .iter()
+            .find(|slot| {
+                slot["category"] == "proofs/robot-contracts"
+                    && slot["path"] == "docs/attestations/proofs/robot-contract-doctor.json"
+            })
+            .expect("robot-contract-doctor manifest slot exists");
+        assert_eq!(slot["produced_by_bead"], artifact["produced_by_bead"]);
+        assert!(
+            slot["proof_categories"]
+                .as_array()
+                .expect("slot has proof_categories")
+                .iter()
+                .any(|category| category.as_u64() == Some(4)),
+            "robot-contract-doctor slot must declare conformance proof category 4"
+        );
+
+        for source in artifact["source_artifacts"]
+            .as_array()
+            .expect("artifact has source_artifacts")
+        {
+            let path = source["path"]
+                .as_str()
+                .expect("source artifact has repo-relative path");
+            assert!(
+                root.join(path).exists(),
+                "source artifact listed by robot-contract-doctor is missing: {path}"
+            );
+        }
+
+        let workflow =
+            std::fs::read_to_string(root.join(".github/workflows/contract-families-matrix.yml"))
+                .expect("read Contract Doctor workflow");
+        assert!(workflow.contains("Robot/MCP Contract Doctor static verdict"));
+        assert!(workflow.contains("bash scripts/check-contract-doctor-coverage.sh"));
+        assert!(workflow.contains("docs/attestations/proofs/robot-contract-doctor.json"));
     }
 
     // ---- E2E lifecycle ----
