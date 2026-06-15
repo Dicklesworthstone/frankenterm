@@ -318,27 +318,24 @@ impl MockTargetStorage {
     }
 }
 
-// Mock trait impl: the async methods satisfy the `RecorderStorage` async-trait
-// contract but return canned values without `.await`. The workspace
-// `[lints.clippy] unused_async = "allow"` is defeated in test targets by the
-// CI lane's trailing `-- -D warnings` (a command-line group-deny that wins over
-// the inherited command-line allow), so the allow must be in-source here.
-#[allow(clippy::unused_async)]
+// Mock trait impl: these methods satisfy the `RecorderStorage` async contract
+// with ready futures because the test double has no async work to await.
 impl RecorderStorage for MockTargetStorage {
     fn backend_kind(&self) -> RecorderBackendKind {
         self.health.backend
     }
 
-    async fn append_batch(
+    fn append_batch(
         &self,
         req: AppendRequest,
-    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
+    ) -> impl std::future::Future<Output = std::result::Result<AppendResponse, RecorderStorageError>>
+    {
         if self.fail_append.load(Ordering::Relaxed) {
-            return Err(RecorderStorageError::QueueFull { capacity: 0 });
+            return std::future::ready(Err(RecorderStorageError::QueueFull { capacity: 0 }));
         }
         let count = req.events.len();
         self.appended.lock().unwrap().push(req);
-        Ok(AppendResponse {
+        std::future::ready(Ok(AppendResponse {
             backend: self.health.backend,
             accepted_count: count,
             first_offset: RecorderOffset {
@@ -353,47 +350,60 @@ impl RecorderStorage for MockTargetStorage {
             },
             committed_durability: DurabilityLevel::Appended,
             committed_at_ms: 0,
-        })
+        }))
     }
 
-    async fn flush(
+    fn flush(
         &self,
         _mode: FlushMode,
-    ) -> std::result::Result<FlushStats, RecorderStorageError> {
-        Ok(FlushStats {
+    ) -> impl std::future::Future<Output = std::result::Result<FlushStats, RecorderStorageError>>
+    {
+        std::future::ready(Ok(FlushStats {
             backend: self.health.backend,
             flushed_at_ms: 0,
             latest_offset: None,
-        })
+        }))
     }
 
-    async fn read_checkpoint(
+    fn read_checkpoint(
         &self,
         consumer: &CheckpointConsumerId,
-    ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
-        Ok(self.checkpoints.lock().unwrap().get(&consumer.0).cloned())
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError>,
+    > {
+        std::future::ready(Ok(self
+            .checkpoints
+            .lock()
+            .unwrap()
+            .get(&consumer.0)
+            .cloned()))
     }
 
-    async fn commit_checkpoint(
+    fn commit_checkpoint(
         &self,
         checkpoint: RecorderCheckpoint,
-    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
+    ) -> impl std::future::Future<
+        Output = std::result::Result<CheckpointCommitOutcome, RecorderStorageError>,
+    > {
         self.checkpoints
             .lock()
             .unwrap()
             .insert(checkpoint.consumer.0.clone(), checkpoint);
-        Ok(CheckpointCommitOutcome::Advanced)
+        std::future::ready(Ok(CheckpointCommitOutcome::Advanced))
     }
 
-    async fn health(&self) -> RecorderStorageHealth {
-        self.health.clone()
+    fn health(&self) -> impl std::future::Future<Output = RecorderStorageHealth> {
+        std::future::ready(self.health.clone())
     }
 
-    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
-        Ok(RecorderStorageLag {
+    fn lag_metrics(
+        &self,
+    ) -> impl std::future::Future<Output = std::result::Result<RecorderStorageLag, RecorderStorageError>>
+    {
+        std::future::ready(Ok(RecorderStorageLag {
             latest_offset: None,
             consumers: vec![],
-        })
+        }))
     }
 }
 

@@ -1105,17 +1105,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             } else {
                 TxPhase::Aborted
             };
-            transition_execution_ledger_pair(
-                &mut ledger,
-                store.as_deref_mut(),
-                &execution_id,
-                terminal_phase,
-            )
-            .map_err(|err| {
-                TxExecutionError::LedgerWrite(format!(
-                    "failed to transition ledger to terminal phase {terminal_phase:?}: {err}"
-                ))
-            })?;
+            transition_execution_ledger_pair(&mut ledger, store, &execution_id, terminal_phase)
+                .map_err(|err| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "failed to transition ledger to terminal phase {terminal_phase:?}: {err}"
+                    ))
+                })?;
         }
 
         // Emit completion event

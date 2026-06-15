@@ -2691,7 +2691,7 @@ pub struct AttentionRouterNextScore {
 }
 
 /// A single ranked entry in the `ft robot next` advisory view.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionRouterNextEntry {
     /// 1-based position in the full ranked list (assigned before any budget
     /// elision, so ranks remain stable across budgets).
@@ -2722,7 +2722,7 @@ pub struct AttentionRouterNextCursor {
 }
 
 /// The advisory "what deserves attention now" ranked view (W6.2).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionRouterNextView {
     pub schema: String,
     pub contract_id: String,
@@ -3306,9 +3306,10 @@ mod tests {
             pane.redaction_posture,
             AttentionRouterRedactionPosture::SummaryOnly
         );
-        assert!(pane
-            .reason_codes
-            .contains(&"pane_state.summary_only".to_string()));
+        assert!(
+            pane.reason_codes
+                .contains(&"pane_state.summary_only".to_string())
+        );
         assert_eq!(
             pane.reason_codes
                 .iter()
@@ -3317,10 +3318,11 @@ mod tests {
             1
         );
         assert!(pane.source_id.len() <= ATTENTION_ROUTER_SUMMARY_MAX_CHARS);
-        assert!(pane
-            .facts
-            .iter()
-            .all(|fact| { fact.summary.chars().count() <= ATTENTION_ROUTER_SUMMARY_MAX_CHARS }));
+        assert!(
+            pane.facts
+                .iter()
+                .all(|fact| { fact.summary.chars().count() <= ATTENTION_ROUTER_SUMMARY_MAX_CHARS })
+        );
     }
 
     #[test]
@@ -3361,9 +3363,10 @@ mod tests {
             3,
             "dedup keeps each collapsed observation as evidence"
         );
-        assert!(item
-            .reason_codes
-            .contains(&"attention_router.notification_deduplicated".to_string()));
+        assert!(
+            item.reason_codes
+                .contains(&"attention_router.notification_deduplicated".to_string())
+        );
         assert!(snapshot.warnings.iter().any(|warning| {
             warning.contains("notification dedup collapsed 2 duplicate attention observation")
         }));
@@ -3557,10 +3560,12 @@ mod tests {
         }));
         let rch = source(&bundle, AttentionRouterSourceKind::Rch);
         assert!(rch.reason_codes.contains(&"rch.proof_starved".to_string()));
-        assert!(bundle
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("rch")));
+        assert!(
+            bundle
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("rch"))
+        );
     }
 
     #[test]
@@ -3915,30 +3920,32 @@ mod tests {
 
     #[test]
     fn scoring_fails_closed_on_stale_bv_command_hints() {
-        let snapshot = score(vec![AttentionRouterSourceObservation::new(
-            "beads.ready",
-            AttentionRouterSourceKind::Beads,
-            AttentionRouterSourceHealth::Available,
-            "br ready --json + bv --robot-next",
-            "bv command hints conflict with br state",
-        )
-        .with_fact(
-            AttentionRouterSourceFact::new(
-                AttentionRouterSourceFactKind::BeadsReady,
-                "ready work exists",
+        let snapshot = score(vec![
+            AttentionRouterSourceObservation::new(
+                "beads.ready",
+                AttentionRouterSourceKind::Beads,
+                AttentionRouterSourceHealth::Available,
+                "br ready --json + bv --robot-next",
+                "bv command hints conflict with br state",
             )
-            .with_bead_id("ft-ready")
-            .with_reason_code("beads.ready_available"),
-        )
-        .with_fact(
-            AttentionRouterSourceFact::new(
-                AttentionRouterSourceFactKind::BvRecommendationConflict,
-                "bv emitted stale bd command hints",
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::BeadsReady,
+                    "ready work exists",
+                )
+                .with_bead_id("ft-ready")
+                .with_reason_code("beads.ready_available"),
             )
-            .with_bead_id("ft-blocked")
-            .with_reason_code("bv.stale_command_hints")
-            .with_reason_code("bv.uses_legacy_bd"),
-        )]);
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::BvRecommendationConflict,
+                    "bv emitted stale bd command hints",
+                )
+                .with_bead_id("ft-blocked")
+                .with_reason_code("bv.stale_command_hints")
+                .with_reason_code("bv.uses_legacy_bd"),
+            ),
+        ]);
 
         let next = snapshot
             .items
@@ -3952,28 +3959,32 @@ mod tests {
             next.recommended_action.action,
             AttentionRouterSafeAction::IgnoreBvCommandHintsUseBrJsonState
         );
-        assert!(snapshot
-            .items
-            .iter()
-            .all(|item| !item.recommended_action.mutates));
+        assert!(
+            snapshot
+                .items
+                .iter()
+                .all(|item| !item.recommended_action.mutates)
+        );
     }
 
     #[test]
     fn scoring_treats_rch_local_fallback_as_proof_starved() {
-        let snapshot = score(vec![AttentionRouterSourceObservation::new(
-            "rch.proof",
-            AttentionRouterSourceKind::Rch,
-            AttentionRouterSourceHealth::Degraded,
-            "rch --no-self-healing exec",
-            "[RCH] local fallback worker=null",
-        )
-        .with_fact(
-            AttentionRouterSourceFact::new(
-                AttentionRouterSourceFactKind::RchRemoteDryRun,
-                "remote-required proof did not reach a worker",
+        let snapshot = score(vec![
+            AttentionRouterSourceObservation::new(
+                "rch.proof",
+                AttentionRouterSourceKind::Rch,
+                AttentionRouterSourceHealth::Degraded,
+                "rch --no-self-healing exec",
+                "[RCH] local fallback worker=null",
             )
-            .with_reason_code("local_cargo_not_proof"),
-        )]);
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::RchRemoteDryRun,
+                    "remote-required proof did not reach a worker",
+                )
+                .with_reason_code("local_cargo_not_proof"),
+            ),
+        ]);
 
         let next = snapshot
             .items
@@ -3987,10 +3998,12 @@ mod tests {
             next.recommended_action.action,
             AttentionRouterSafeAction::KeepProofRequiredBeadOpenOrBlockedAndRecordRchReasonCode
         );
-        assert!(snapshot
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("local cargo")));
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("local cargo"))
+        );
     }
 
     #[test]
@@ -4149,11 +4162,13 @@ mod tests {
             reply.nudge_plan_receipt.recipient.as_deref(),
             Some("IvoryCreek")
         );
-        assert!(reply
-            .nudge_plan_receipt
-            .nudge
-            .safe_command_text
-            .contains("draft reply_message"));
+        assert!(
+            reply
+                .nudge_plan_receipt
+                .nudge
+                .safe_command_text
+                .contains("draft reply_message")
+        );
 
         let status = item_with_nudge(&snapshot, AttentionRouterNudgeKind::StatusCheck);
         assert_eq!(
@@ -4196,30 +4211,34 @@ mod tests {
                 .minimum_evidence_sources,
             4
         );
-        assert!(review
-            .nudge_plan_receipt
-            .nudge
-            .safe_command_text
-            .contains("do not reopen or release automatically"));
+        assert!(
+            review
+                .nudge_plan_receipt
+                .nudge
+                .safe_command_text
+                .contains("do not reopen or release automatically")
+        );
     }
 
     #[test]
     fn nudge_plan_receipts_handle_agent_mail_fallback_without_repair_or_mutation() {
-        let snapshot = score(vec![AttentionRouterSourceObservation::new(
-            "agent_mail.fallback",
-            AttentionRouterSourceKind::AgentMail,
-            AttentionRouterSourceHealth::Unavailable,
-            "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
-            "Agent Mail unavailable; using Beads/git fallback metadata",
-        )
-        .with_fact(
-            AttentionRouterSourceFact::new(
-                AttentionRouterSourceFactKind::AgentMailFallbackState,
-                "mail unavailable fallback is active",
+        let snapshot = score(vec![
+            AttentionRouterSourceObservation::new(
+                "agent_mail.fallback",
+                AttentionRouterSourceKind::AgentMail,
+                AttentionRouterSourceHealth::Unavailable,
+                "scripts/swarm-tick.sh --agent-mail-fallback frankenterm",
+                "Agent Mail unavailable; using Beads/git fallback metadata",
             )
-            .with_reason_code("agent_mail.unavailable")
-            .with_reason_code("agent_mail.fallback_state"),
-        )]);
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::AgentMailFallbackState,
+                    "mail unavailable fallback is active",
+                )
+                .with_reason_code("agent_mail.unavailable")
+                .with_reason_code("agent_mail.fallback_state"),
+            ),
+        ]);
 
         let item = item_with_nudge(&snapshot, AttentionRouterNudgeKind::NoAction);
         assert_eq!(
@@ -4230,39 +4249,45 @@ mod tests {
         assert!(!item.nudge_plan_receipt.live_mutation_allowed);
         assert!(!item.nudge_plan_receipt.side_effects_executed);
         assert!(!item.nudge_plan_receipt.nudge.mutates);
-        assert!(item
-            .nudge_plan_receipt
-            .forbidden_actions
-            .iter()
-            .any(|action| action == "agent_mail_repair"));
-        assert!(item
-            .nudge_plan_receipt
-            .forbidden_actions
-            .iter()
-            .any(|action| action == "agent_mail_restart"));
+        assert!(
+            item.nudge_plan_receipt
+                .forbidden_actions
+                .iter()
+                .any(|action| action == "agent_mail_repair")
+        );
+        assert!(
+            item.nudge_plan_receipt
+                .forbidden_actions
+                .iter()
+                .any(|action| action == "agent_mail_restart")
+        );
     }
 
     #[test]
     fn scoring_codex_placeholder_caveat_does_not_mark_stale() {
-        let snapshot = score(vec![AttentionRouterSourceObservation::new(
-            "pane_state.live",
-            AttentionRouterSourceKind::PaneState,
-            AttentionRouterSourceHealth::Available,
-            "ft robot state --format toon",
-            "Codex idle placeholder visible",
-        )
-        .with_fact(
-            AttentionRouterSourceFact::new(
-                AttentionRouterSourceFactKind::PaneCodexPlaceholderCaveat,
-                "Codex placeholder text is caveat evidence, not stuck evidence",
+        let snapshot = score(vec![
+            AttentionRouterSourceObservation::new(
+                "pane_state.live",
+                AttentionRouterSourceKind::PaneState,
+                AttentionRouterSourceHealth::Available,
+                "ft robot state --format toon",
+                "Codex idle placeholder visible",
             )
-            .with_reason_code("pane_state.codex_placeholder_caveat"),
-        )]);
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::PaneCodexPlaceholderCaveat,
+                    "Codex placeholder text is caveat evidence, not stuck evidence",
+                )
+                .with_reason_code("pane_state.codex_placeholder_caveat"),
+            ),
+        ]);
 
-        assert!(!snapshot
-            .items
-            .iter()
-            .any(|item| item.classification == AttentionRouterClassification::StaleClaim));
+        assert!(
+            !snapshot
+                .items
+                .iter()
+                .any(|item| item.classification == AttentionRouterClassification::StaleClaim)
+        );
     }
 
     #[test]
@@ -4342,21 +4367,23 @@ mod tests {
 
     #[test]
     fn scoring_snapshot_json_and_toon_preserve_semantics() {
-        let snapshot = score(vec![AttentionRouterSourceObservation::new(
-            "beads.ready",
-            AttentionRouterSourceKind::Beads,
-            AttentionRouterSourceHealth::Available,
-            "br ready --json",
-            "docs-only ready static slice",
-        )
-        .with_fact(
-            AttentionRouterSourceFact::new(
-                AttentionRouterSourceFactKind::BeadsReady,
+        let snapshot = score(vec![
+            AttentionRouterSourceObservation::new(
+                "beads.ready",
+                AttentionRouterSourceKind::Beads,
+                AttentionRouterSourceHealth::Available,
+                "br ready --json",
                 "docs-only ready static slice",
             )
-            .with_bead_id("ft-docs")
-            .with_reason_code("beads.ready_available"),
-        )]);
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::BeadsReady,
+                    "docs-only ready static slice",
+                )
+                .with_bead_id("ft-docs")
+                .with_reason_code("beads.ready_available"),
+            ),
+        ]);
         let json_value = serde_json::to_value(&snapshot).expect("snapshot serializes");
         let toon = toon_rust::encode(json_value.clone(), None);
         let decoded = toon_rust::try_decode(&toon, None).expect("snapshot TOON decodes");
@@ -4390,21 +4417,23 @@ mod tests {
 
     #[test]
     fn surface_payload_preserves_read_only_status_next_explain_contract() {
-        let input = complete_input(vec![AttentionRouterSourceObservation::new(
-            "beads.ready",
-            AttentionRouterSourceKind::Beads,
-            AttentionRouterSourceHealth::Available,
-            "br ready --json",
-            "docs-only ready static slice",
-        )
-        .with_fact(
-            AttentionRouterSourceFact::new(
-                AttentionRouterSourceFactKind::BeadsReady,
+        let input = complete_input(vec![
+            AttentionRouterSourceObservation::new(
+                "beads.ready",
+                AttentionRouterSourceKind::Beads,
+                AttentionRouterSourceHealth::Available,
+                "br ready --json",
                 "docs-only ready static slice",
             )
-            .with_bead_id("ft-docs")
-            .with_reason_code("beads.ready_available"),
-        )]);
+            .with_fact(
+                AttentionRouterSourceFact::new(
+                    AttentionRouterSourceFactKind::BeadsReady,
+                    "docs-only ready static slice",
+                )
+                .with_bead_id("ft-docs")
+                .with_reason_code("beads.ready_available"),
+            ),
+        ]);
 
         let status = build_attention_router_surface_payload(
             &input,
@@ -4475,11 +4504,13 @@ mod tests {
         );
 
         assert!(payload.degraded_mode.active);
-        assert!(payload
-            .degraded_mode
-            .reason_codes
-            .iter()
-            .any(|reason| reason == "source.beads.missing"));
+        assert!(
+            payload
+                .degraded_mode
+                .reason_codes
+                .iter()
+                .any(|reason| reason == "source.beads.missing")
+        );
         let json_value = serde_json::to_value(&payload).expect("payload serializes");
         let toon = toon_rust::encode(json_value.clone(), None);
         let decoded = toon_rust::try_decode(&toon, None).expect("surface TOON decodes");

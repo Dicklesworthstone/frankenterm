@@ -2019,11 +2019,8 @@ mod tests {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
 
         // Absolute path (would read an arbitrary host file).
-        let abs = load_agent_mail_outbox_surface(
-            &workspace_root,
-            None,
-            &[PathBuf::from("/etc/passwd")],
-        );
+        let abs =
+            load_agent_mail_outbox_surface(&workspace_root, None, &[PathBuf::from("/etc/passwd")]);
         assert!(
             matches!(
                 abs,

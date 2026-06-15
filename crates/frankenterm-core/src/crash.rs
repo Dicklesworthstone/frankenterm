@@ -2492,13 +2492,7 @@ fn nonnegative_i64_to_u64(value: i64, column: &str) -> Result<u64, String> {
 }
 
 fn non_empty_string(value: Option<String>) -> Option<String> {
-    value.and_then(|text| {
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    })
+    value.filter(|text| !text.trim().is_empty())
 }
 
 fn stored_incident_pane_to_robot_state(

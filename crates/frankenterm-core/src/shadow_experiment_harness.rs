@@ -47,7 +47,7 @@
 
 use std::time::Duration;
 
-use ft_perf_gate::{sprt, EvidenceSample, GateDecision, SprtConfig};
+use ft_perf_gate::{EvidenceSample, GateDecision, SprtConfig, sprt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -645,11 +645,7 @@ fn stable_partition_offset(experiment_id: &str) -> usize {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    if hash & 1 == 0 {
-        0
-    } else {
-        1
-    }
+    usize::from(hash & 1 != 0)
 }
 
 fn summarize_variant_outcomes(
@@ -1027,7 +1023,7 @@ fn hash_string(hasher: &mut Sha256, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_fixtures::synthetic_swarm::{synthetic_swarm_scenario, SyntheticSwarmScale};
+    use crate::test_fixtures::synthetic_swarm::{SyntheticSwarmScale, synthetic_swarm_scenario};
 
     use super::*;
 
@@ -1138,10 +1134,11 @@ mod tests {
             .filter(|assignment| assignment.variant == AgentExperimentVariant::Candidate)
             .count();
         assert!(baseline_count.abs_diff(candidate_count) <= 1);
-        assert!(plan
-            .assignments
-            .iter()
-            .all(|assignment| !assignment.assignment_reason.is_empty()));
+        assert!(
+            plan.assignments
+                .iter()
+                .all(|assignment| !assignment.assignment_reason.is_empty())
+        );
     }
 
     #[test]

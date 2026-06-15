@@ -305,7 +305,7 @@ fn run() -> anyhow::Result<()> {
 async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     if let Some(lua) = lua {
         let args = lua.pack_multi(())?;
-        config::lua::emit_event(&lua, ("mux-startup".to_string(), args)).await?;
+        config::lua::emit_event(lua.as_ref().clone(), ("mux-startup".to_string(), args)).await?;
     }
     Ok(())
 }

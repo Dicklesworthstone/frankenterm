@@ -243,9 +243,19 @@ fn arb_submit_receipt_state() -> impl Strategy<Value = SubmitReceiptState> {
     ]
 }
 
+fn arb_submit_guarantee_level() -> impl Strategy<Value = SubmitGuaranteeLevel> {
+    prop_oneof![
+        Just(SubmitGuaranteeLevel::Write),
+        Just(SubmitGuaranteeLevel::Composer),
+        Just(SubmitGuaranteeLevel::Submitted),
+        Just(SubmitGuaranteeLevel::Working),
+    ]
+}
+
 fn arb_submit_receipt() -> impl Strategy<Value = SubmitReceipt> {
     (
         arb_submit_receipt_state(),
+        arb_submit_guarantee_level(),
         proptest::option::of("[a-z_]{3,16}"),
         proptest::option::of("[a-z0-9_-]{3,24}"),
         proptest::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}"),
@@ -260,6 +270,7 @@ fn arb_submit_receipt() -> impl Strategy<Value = SubmitReceipt> {
         .prop_map(
             |(
                 state,
+                guarantee_level,
                 agent_type,
                 profile_id,
                 profile_version,
@@ -272,6 +283,8 @@ fn arb_submit_receipt() -> impl Strategy<Value = SubmitReceipt> {
                 idempotency_key,
             )| SubmitReceipt {
                 state,
+                guarantee_level,
+                guarantee_met: guarantee_level.is_met_by(state, &evidence_rule_ids),
                 agent_type,
                 profile_id,
                 profile_version,

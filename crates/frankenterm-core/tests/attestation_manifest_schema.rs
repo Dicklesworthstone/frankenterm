@@ -68,11 +68,13 @@ fn retraction_validator() -> Validator {
 }
 
 fn validate(schema: &Validator, instance: &Value) -> Vec<String> {
-    match schema.validate(instance) {
-        Ok(()) => Vec::new(),
-        Err(errors) => errors
-            .map(|err| format!("{} at {}", err, err.instance_path))
-            .collect(),
+    if schema.is_valid(instance) {
+        Vec::new()
+    } else {
+        schema
+            .iter_errors(instance)
+            .map(|err| format!("{} at {}", err, err.instance_path()))
+            .collect()
     }
 }
 

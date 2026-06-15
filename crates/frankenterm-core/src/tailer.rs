@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::runtime_async::mpsc;
 use crate::runtime_async::timeout;
 use crate::runtime_async::{RwLock, Semaphore};
-use futures::StreamExt;
+use futures::Stream;
 use futures::stream::FuturesUnordered;
 use tracing::{debug, trace, warn};
 
@@ -856,8 +856,41 @@ impl TailerPollTaskSet {
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::join_next`].
-    pub async fn join_next_with_cx(&mut self, _cx: &crate::cx::Cx) -> Option<(u64, PollOutcome)> {
-        self.inner.next().await
+    ///
+    /// ft-l8uk7: actually observes `Cx` cancellation. The previous body named a
+    /// `Cx` but discarded it (`_cx`), awaiting `inner.next()` directly, which
+    /// gave callers false cancel-safety — a cancelled caller could hang until a
+    /// poll task happened to complete. This now mirrors
+    /// [`crate::runtime_async`]'s `JoinSet::join_next_with_cx`: a pre-flight
+    /// `checkpoint()` gates entry and a per-poll `checkpoint()` inside the poll
+    /// loop surfaces a mid-flight cancel within the same tick instead of waiting
+    /// for the next task completion.
+    ///
+    /// # Cancellation semantics
+    ///
+    /// Cancellation (pre-flight or mid-poll) returns `None`: a cancelled caller
+    /// drains no outcome. `None` is therefore overloaded — it means either "task
+    /// set exhausted" or "cancelled"; a caller that must distinguish should
+    /// inspect the `Cx` itself. Returning `None` on cancel cleanly terminates
+    /// the production capture drain loop (`runtime.rs`), which only acts on
+    /// `Some(outcome)` and otherwise re-checks its shutdown/cancel state.
+    pub async fn join_next_with_cx(&mut self, cx: &crate::cx::Cx) -> Option<(u64, PollOutcome)> {
+        if self.inner.is_empty() {
+            return None;
+        }
+        // Pre-flight: a caller cancelled before we start drains no outcome.
+        if cx.checkpoint().is_err() {
+            return None;
+        }
+        std::future::poll_fn(|poll_cx| {
+            // Per-poll: observe a cancel that arrives while we await a pending
+            // poll task so it surfaces within the tick rather than hanging.
+            if cx.checkpoint().is_err() {
+                return std::task::Poll::Ready(None);
+            }
+            Pin::new(&mut self.inner).poll_next(poll_cx)
+        })
+        .await
     }
 
     #[must_use]
@@ -2057,6 +2090,48 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    /// ft-l8uk7: a pre-cancelled `Cx` must short-circuit
+    /// `TailerPollTaskSet::join_next_with_cx` (draining no outcome -> `None`)
+    /// instead of hanging on a never-completing poll task. The previous body
+    /// discarded the `Cx` and awaited `inner.next()` directly, so this test
+    /// would hit the outer 2s safety timeout. Mirrors
+    /// `runtime_async`'s `join_set_join_next_with_cx_observes_pre_cancel`.
+    #[test]
+    fn join_next_with_cx_observes_pre_cancel() {
+        run_async_test(async {
+            let mut set = TailerPollTaskSet::new();
+            // A poll task that never completes — only Cx observation can return.
+            set.spawn_poll_task(async { std::future::pending::<(u64, PollOutcome)>().await });
+
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("ft-l8uk7 pre-cancel TailerPollTaskSet::join_next_with_cx test"),
+            );
+
+            let started = std::time::Instant::now();
+            let result = crate::runtime_async::timeout_with_cx(
+                &crate::cx::for_request(),
+                std::time::Duration::from_secs(2),
+                set.join_next_with_cx(&cx),
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "pre-cancelled cx must short-circuit join_next_with_cx promptly; \
+                 took {elapsed:?} (outer 2s safety timeout likely fired)"
+            );
+            let inner =
+                result.expect("outer safety timeout must not fire with cx-cancel observation");
+            assert!(
+                inner.is_none(),
+                "a pre-cancelled cx drains no outcome (None), got {inner:?}"
+            );
+        });
     }
 
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {

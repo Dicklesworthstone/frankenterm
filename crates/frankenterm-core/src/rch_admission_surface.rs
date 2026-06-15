@@ -151,8 +151,12 @@ impl RchAdmissionSurface {
         envelope.proof_blocked =
             envelope.proof_blocked || verdict == RchAdmissionPreflightVerdict::Blocked;
         if summary.is_empty() {
-            envelope.headline =
-                surface_headline(envelope.proof_status, Some(verdict), envelope.proof_blocked, 0);
+            envelope.headline = surface_headline(
+                envelope.proof_status,
+                Some(verdict),
+                envelope.proof_blocked,
+                0,
+            );
         } else {
             envelope.headline = summary;
         }
@@ -255,7 +259,7 @@ mod tests {
     use super::*;
     use crate::rch_admission::{
         RCH_ADMISSION_CONTRACT_ID, RCH_ADMISSION_SCHEMA_VERSION, RchAdmissionAgentMailDiagnostic,
-        RchAdmissionBeadsDiagnostic, RchAdmissionCommandDiagnostic, RchAdmissionCollectorInput,
+        RchAdmissionBeadsDiagnostic, RchAdmissionCollectorInput, RchAdmissionCommandDiagnostic,
         RchAdmissionLocalDiskDiagnostic, RchAdmissionQueueDiagnostic, RchAdmissionRecommendation,
         analyze_rch_admission_proof_command, build_rch_admission_preflight_report,
     };
@@ -301,8 +305,10 @@ mod tests {
             RchAdmissionProofStatus::Unknown,
             RchAdmissionProofStatus::AdvisoryOnly,
         ] {
-            let surface =
-                RchAdmissionSurface::from_report(RchAdmissionSurfaceKind::Robot, report_with(status, Vec::new()));
+            let surface = RchAdmissionSurface::from_report(
+                RchAdmissionSurfaceKind::Robot,
+                report_with(status, Vec::new()),
+            );
             assert!(surface.ok, "ok means diagnosis produced, not proof passed");
             assert!(surface.advisory_only);
             assert_eq!(surface.not_proof_banner, RCH_ADMISSION_NOT_PROOF_BANNER);
@@ -320,14 +326,23 @@ mod tests {
                 vec![RchAdmissionReasonCode::CriticalPressure],
             ),
         );
-        assert!(surface.proof_blocked, "CriticalPressure blocks the proof lane");
+        assert!(
+            surface.proof_blocked,
+            "CriticalPressure blocks the proof lane"
+        );
         let reason = &surface.reasons[0];
         assert!(reason.blocks_proof);
         assert!(reason.operator_approval_required);
         assert!(!reason.recommendation.is_empty());
         let text = surface.doctor_lines().join("\n");
-        assert!(text.contains("BLOCKED"), "doctor text surfaces the block: {text}");
-        assert!(text.contains("critical_pressure"), "stable reason token rendered: {text}");
+        assert!(
+            text.contains("BLOCKED"),
+            "doctor text surfaces the block: {text}"
+        );
+        assert!(
+            text.contains("critical_pressure"),
+            "stable reason token rendered: {text}"
+        );
         assert!(text.contains("BLOCKS-PROOF"));
     }
 
@@ -350,7 +365,10 @@ mod tests {
         assert!(surface.reasons.is_empty());
         let text = surface.doctor_lines().join("\n");
         assert!(text.contains("runnable"), "{text}");
-        assert!(text.contains("not proof"), "advisory wording retained: {text}");
+        assert!(
+            text.contains("not proof"),
+            "advisory wording retained: {text}"
+        );
     }
 
     #[test]

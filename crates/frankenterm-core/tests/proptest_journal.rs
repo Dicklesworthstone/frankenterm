@@ -154,10 +154,7 @@ fn recovery_marker_kind(label: impl Into<String>) -> MissionJournalEntryKind {
 }
 
 fn usize_to_u64(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(converted) => converted,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn timestamp_for_index(index: usize) -> i64 {
@@ -643,12 +640,14 @@ proptest! {
         prop_assert_eq!(
             journal_entry_canonical_strings(&twice),
             journal_entry_canonical_strings(&once),
-            "repeating compact_before({compact_seq}) must not change retained entries"
+            "repeating compact_before({}) must not change retained entries",
+            compact_seq
         );
         prop_assert_eq!(
             twice.snapshot_state(),
             once.snapshot_state(),
-            "repeating compact_before({compact_seq}) must not change journal state"
+            "repeating compact_before({}) must not change journal state",
+            compact_seq
         );
         assert_all_compacted_correlation_ids_remain_known(&twice, total)?;
     }
@@ -677,13 +676,19 @@ proptest! {
         let expected_entries = journal_entry_canonical_strings(&direct);
         prop_assert_eq!(
             journal_entry_canonical_strings(&left),
-            expected_entries,
-            "compact_before({first_seq}) then compact_before({second_seq}) must equal compact_before({max_seq})"
+            expected_entries.clone(),
+            "compact_before({}) then compact_before({}) must equal compact_before({})",
+            first_seq,
+            second_seq,
+            max_seq
         );
         prop_assert_eq!(
             journal_entry_canonical_strings(&right),
             expected_entries,
-            "compact_before({second_seq}) then compact_before({first_seq}) must equal compact_before({max_seq})"
+            "compact_before({}) then compact_before({}) must equal compact_before({})",
+            second_seq,
+            first_seq,
+            max_seq
         );
         prop_assert_eq!(left.snapshot_state(), direct.snapshot_state());
         prop_assert_eq!(right.snapshot_state(), direct.snapshot_state());

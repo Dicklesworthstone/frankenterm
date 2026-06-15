@@ -44,7 +44,9 @@ pub fn receipt_path(ft_dir: &Path, receipt_id: &str) -> std::io::Result<PathBuf>
     if !is_valid_receipt_id(receipt_id) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("invalid steering receipt id {receipt_id:?} (expected steer:<32 lowercase hex>)"),
+            format!(
+                "invalid steering receipt id {receipt_id:?} (expected steer:<32 lowercase hex>)"
+            ),
         ));
     }
     let safe = receipt_id.replace(':', "_");
@@ -141,12 +143,12 @@ mod tests {
         let bad_ids = [
             "../../../etc/passwd",
             "steer:../../../../tmp/evil",
-            "steer:deadbeef",                                 // too short
-            "steer:deadbeefdeadbeefdeadbeefdeadbeefdd",       // too long
-            "steer:DEADBEEFDEADBEEFDEADBEEFDEADBEEF",         // uppercase alias
-            "steer:deadbeefdeadbeefdeadbeefdeadbeeg",         // non-hex
-            "steer:/eadbeefdeadbeefdeadbeefdeadbeef",         // separator
-            "plan:deadbeefdeadbeefdeadbeefdeadbeef",          // wrong prefix
+            "steer:deadbeef",                           // too short
+            "steer:deadbeefdeadbeefdeadbeefdeadbeefdd", // too long
+            "steer:DEADBEEFDEADBEEFDEADBEEFDEADBEEF",   // uppercase alias
+            "steer:deadbeefdeadbeefdeadbeefdeadbeeg",   // non-hex
+            "steer:/eadbeefdeadbeefdeadbeefdeadbeef",   // separator
+            "plan:deadbeefdeadbeefdeadbeefdeadbeef",    // wrong prefix
             "",
         ];
         for id in bad_ids {
@@ -159,7 +161,9 @@ mod tests {
             );
         }
         // The canonical shape stays valid.
-        assert!(is_valid_receipt_id("steer:0123456789abcdef0123456789abcdef"));
+        assert!(is_valid_receipt_id(
+            "steer:0123456789abcdef0123456789abcdef"
+        ));
     }
 
     #[test]

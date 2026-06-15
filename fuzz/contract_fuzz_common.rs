@@ -24,8 +24,9 @@ where
 }
 
 pub fn assert_schema_valid(schema: &Validator, value: &Value) {
-    if let Err(errors) = schema.validate(value) {
-        let failures = errors
+    if !schema.is_valid(value) {
+        let failures = schema
+            .iter_errors(value)
             .take(4)
             .map(|error| error.to_string())
             .collect::<Vec<_>>();

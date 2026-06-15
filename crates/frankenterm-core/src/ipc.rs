@@ -1799,7 +1799,8 @@ where
         }
 
         let record = if heartbeat_interval_ms > 0 {
-            match crate::runtime_async::timeout_with_cx(cx, heartbeat, stream.next_item_cx(cx)).await
+            match crate::runtime_async::timeout_with_cx(cx, heartbeat, stream.next_item_cx(cx))
+                .await
             {
                 // Idle heartbeat tick (or cx-cancel surfaced as a timeout
                 // error). Re-check cancellation before emitting so a cancelled

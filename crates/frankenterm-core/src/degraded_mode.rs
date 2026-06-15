@@ -291,11 +291,9 @@ fn apply_surface_defaults(contract: &mut DegradedModeContract) {
                     DegradedModeAction::StrictVerifiedSubmit,
                 ],
             );
-            contract
-                .notes
-                .push(
-                    "raw text is confidence-downgraded when semantic zones are unavailable".into(),
-                );
+            contract.notes.push(
+                "raw text is confidence-downgraded when semantic zones are unavailable".into(),
+            );
             restore(
                 contract,
                 "semantic.zone_available",

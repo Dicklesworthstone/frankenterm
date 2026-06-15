@@ -371,10 +371,10 @@ pub fn capture_cursor(pane_id: u64, text: &str) -> String {
 
 #[must_use]
 pub fn append_verification_canary(pane_id: u64, command_text: &str) -> String {
-    let marker = verification_canary(pane_id, command_text);
-    let mut marked = String::with_capacity(command_text.len() + marker.len());
+    let canary = verification_canary(pane_id, command_text);
+    let mut marked = String::with_capacity(command_text.len() + canary.len());
     marked.push_str(command_text);
-    marked.push_str(&marker);
+    marked.push_str(&canary);
     marked
 }
 
@@ -536,10 +536,7 @@ fn capture_tail(text: &str) -> &str {
     while !text.is_char_boundary(start) {
         start += 1;
     }
-    match text.get(start..) {
-        Some(tail) => tail,
-        None => "",
-    }
+    text.get(start..).unwrap_or_default()
 }
 
 fn extract_verification_canary(command_text: &str) -> Option<&str> {
@@ -866,17 +863,17 @@ mod tests {
     #[test]
     fn verification_canary_is_invisible_stable_and_discriminating() {
         let marked = append_verification_canary(7, "run tests");
-        let marker = verification_canary(7, "run tests");
+        let canary = verification_canary(7, "run tests");
 
         assert_eq!(
             marked,
-            format!("run tests{marker}"),
+            format!("run tests{canary}"),
             "marker must append at payload end"
         );
-        assert!(marker.starts_with("\u{2063}ft-vs:"));
-        assert_eq!(marker, verification_canary(7, "run tests"));
-        assert_ne!(marker, verification_canary(8, "run tests"));
-        assert_ne!(marker, verification_canary(7, "run something else"));
+        assert!(canary.starts_with("\u{2063}ft-vs:"));
+        assert_eq!(canary, verification_canary(7, "run tests"));
+        assert_ne!(canary, verification_canary(8, "run tests"));
+        assert_ne!(canary, verification_canary(7, "run something else"));
     }
 
     #[test]

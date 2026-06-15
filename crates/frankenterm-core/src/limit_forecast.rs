@@ -133,7 +133,9 @@ pub fn build_limits_forecast(
         recovered = recovered.saturating_add(u32::try_from(panes.len()).unwrap_or(u32::MAX));
         // Recovered panes can never exceed those counted limited now.
         let recovered_clamped = recovered.min(limited_now);
-        let usable_panes = usable_now.saturating_add(recovered_clamped).min(total_panes);
+        let usable_panes = usable_now
+            .saturating_add(recovered_clamped)
+            .min(total_panes);
         let limited_panes = total_panes.saturating_sub(usable_panes);
         timeline.push(LimitForecastPoint {
             at_ms,
@@ -354,7 +356,15 @@ mod tests {
 
     #[test]
     fn unknown_ttl_window_is_marked_not_known() {
-        let windows = [window(1, "google", "a", None, "unknown_ttl", 10_000, 300_000)];
+        let windows = [window(
+            1,
+            "google",
+            "a",
+            None,
+            "unknown_ttl",
+            10_000,
+            300_000,
+        )];
         let forecast = build_limits_forecast(10_000, 2, &windows);
         assert_eq!(forecast.limited_now, 1);
         assert_eq!(forecast.active.len(), 1);

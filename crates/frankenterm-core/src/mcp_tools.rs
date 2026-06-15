@@ -4885,11 +4885,11 @@ impl ToolHandler for WaSendTool {
 
             let mut injector =
                 PolicyGatedInjector::with_storage(engine, Arc::clone(&wezterm), storage.clone());
-            let mut submit_before_text = None;
-            if submit_profile.is_some() {
-                submit_before_text =
-                    mcp_capture_submit_text(&wezterm, &wezterm_cx, params.pane_id).await;
-            }
+            let submit_before_text = if submit_profile.is_some() {
+                mcp_capture_submit_text(&wezterm, &wezterm_cx, params.pane_id).await
+            } else {
+                None
+            };
             let mut injection = injector
                 .send_text(
                     params.pane_id,

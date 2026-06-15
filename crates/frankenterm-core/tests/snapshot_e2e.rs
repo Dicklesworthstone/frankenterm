@@ -214,7 +214,7 @@ fn add_phase(
 fn hash_text(payload: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(payload.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn normalize_cwd_str(raw: &str) -> String {

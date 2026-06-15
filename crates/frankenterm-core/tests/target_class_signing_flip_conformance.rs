@@ -82,13 +82,15 @@ fn unknown_or_missing_proof_status_is_unavailable_fail_closed() {
 /// the three required conditions must change the verdict away from `Measured`.
 #[test]
 fn breaking_any_single_required_condition_revokes_measured() {
+    type Mutation = (&'static str, Box<dyn Fn(&mut Value)>);
+
     // Sanity: the base really is Measured before each mutation.
     assert_eq!(
         target_class_proof_state_from_summary(&signed_summary()),
         OperatingEnvelopeProofState::Measured
     );
 
-    let mutations: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+    let mutations: Vec<Mutation> = vec![
         (
             "ready_to_sign=false",
             Box::new(|s: &mut Value| s["ready_to_sign"] = json!(false)),

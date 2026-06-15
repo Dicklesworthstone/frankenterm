@@ -2233,59 +2233,67 @@ mod tests {
             self.backend
         }
 
-        async fn append_batch(
+        fn append_batch(
             &self,
             _req: AppendRequest,
-        ) -> std::result::Result<AppendResponse, RecorderStorageError> {
-            Err(RecorderStorageError::BackendUnavailable {
+        ) -> impl std::future::Future<Output = std::result::Result<AppendResponse, RecorderStorageError>>
+        {
+            std::future::ready(Err(RecorderStorageError::BackendUnavailable {
                 backend: self.backend,
                 message: "append_batch unused in StubRecorderStorage".to_string(),
-            })
+            }))
         }
 
-        async fn flush(
+        fn flush(
             &self,
             _mode: FlushMode,
-        ) -> std::result::Result<FlushStats, RecorderStorageError> {
-            Ok(FlushStats {
+        ) -> impl std::future::Future<Output = std::result::Result<FlushStats, RecorderStorageError>>
+        {
+            std::future::ready(Ok(FlushStats {
                 backend: self.backend,
                 flushed_at_ms: 0,
                 latest_offset: None,
-            })
+            }))
         }
 
-        async fn read_checkpoint(
+        fn read_checkpoint(
             &self,
             _consumer: &CheckpointConsumerId,
-        ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
-            Ok(None)
+        ) -> impl std::future::Future<
+            Output = std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError>,
+        > {
+            std::future::ready(Ok(None))
         }
 
-        async fn commit_checkpoint(
+        fn commit_checkpoint(
             &self,
             _checkpoint: RecorderCheckpoint,
-        ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-            Ok(CheckpointCommitOutcome::NoopAlreadyAdvanced)
+        ) -> impl std::future::Future<
+            Output = std::result::Result<CheckpointCommitOutcome, RecorderStorageError>,
+        > {
+            std::future::ready(Ok(CheckpointCommitOutcome::NoopAlreadyAdvanced))
         }
 
-        async fn health(&self) -> RecorderStorageHealth {
-            RecorderStorageHealth {
+        fn health(&self) -> impl std::future::Future<Output = RecorderStorageHealth> {
+            std::future::ready(RecorderStorageHealth {
                 backend: self.backend,
                 degraded: false,
                 queue_depth: 0,
                 queue_capacity: 1,
                 latest_offset: None,
                 last_error: None,
-            }
+            })
         }
 
-        async fn lag_metrics(
+        fn lag_metrics(
             &self,
-        ) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
-            Ok(RecorderStorageLag {
+        ) -> impl std::future::Future<
+            Output = std::result::Result<RecorderStorageLag, RecorderStorageError>,
+        > {
+            std::future::ready(Ok(RecorderStorageLag {
                 latest_offset: None,
                 consumers: Vec::new(),
-            })
+            }))
         }
     }
 

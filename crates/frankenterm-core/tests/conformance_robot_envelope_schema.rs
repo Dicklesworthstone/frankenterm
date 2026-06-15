@@ -33,13 +33,7 @@
 //! validator actually fires (not a no-op) by feeding it a deliberately
 //! broken envelope and asserting validation fails.
 
-// jsonschema 0.21 deprecated `JSONSchema` → `Validator` and
-// `compile()` → `build()`, but the Draft::Draft202012 + builder/options
-// API path is not yet stable across the 0.18→0.22 series. Use the
-// stable typedef + #[allow] for now; ft will follow upstream stabilization
-// when jsonschema reaches 1.0.
-#[allow(deprecated)]
-use jsonschema::{Draft, JSONSchema as Validator};
+use jsonschema::{Draft, Validator};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,17 +69,14 @@ fn fixtures_dir() -> PathBuf {
         .join("golden_robot_envelope")
 }
 
-#[allow(deprecated)]
 fn load_envelope_schema() -> Validator {
     load_schema(&robot_envelope_schema_path())
 }
 
-#[allow(deprecated)]
 fn load_mcp_envelope_schema() -> Validator {
     load_schema(&mcp_envelope_schema_path())
 }
 
-#[allow(deprecated)]
 fn load_schema(path: &Path) -> Validator {
     let bytes = fs::read(path).unwrap_or_else(|err| {
         panic!(
@@ -101,7 +92,7 @@ fn load_schema(path: &Path) -> Validator {
     });
     Validator::options()
         .with_draft(Draft::Draft202012)
-        .compile(&schema_json)
+        .build(&schema_json)
         .unwrap_or_else(|err| panic!("envelope schema compile failed: {err}"))
 }
 
@@ -229,29 +220,26 @@ fn every_golden_envelope_validates_against_schema() {
             continue;
         };
 
-        let result = schema.validate(&envelope);
-        match result {
-            Ok(()) => {
-                validated += 1;
-                eprintln!(
-                    "{{\"phase\":\"pass\",\"fixture\":{name:?},\"path\":{:?}}}",
-                    path.to_string_lossy()
-                );
-            }
-            Err(errors) => {
-                let collected: Vec<String> = errors
-                    .map(|e| format!("    - {} (instance: {})", e, e.instance_path))
-                    .collect();
-                failures.push(format!(
-                    "{name}:\n{}",
-                    if collected.is_empty() {
-                        "    (validator returned Err with no items)".to_string()
-                    } else {
-                        collected.join("\n")
-                    }
-                ));
-                eprintln!("{{\"phase\":\"fail\",\"fixture\":{name:?}}}");
-            }
+        if schema.is_valid(&envelope) {
+            validated += 1;
+            eprintln!(
+                "{{\"phase\":\"pass\",\"fixture\":{name:?},\"path\":{:?}}}",
+                path.to_string_lossy()
+            );
+        } else {
+            let collected: Vec<String> = schema
+                .iter_errors(&envelope)
+                .map(|e| format!("    - {} (instance: {})", e, e.instance_path()))
+                .collect();
+            failures.push(format!(
+                "{name}:\n{}",
+                if collected.is_empty() {
+                    "    (validator returned invalid with no errors)".to_string()
+                } else {
+                    collected.join("\n")
+                }
+            ));
+            eprintln!("{{\"phase\":\"fail\",\"fixture\":{name:?}}}");
         }
     }
 
@@ -654,19 +642,9 @@ fn synthetic_robot_envelope_with_unknown_top_level_field_must_fail() {
     );
 }
 
-#[allow(deprecated)]
-fn panic_validation_errors(label: &str, errors: jsonschema::ErrorIterator<'_>) {
-    let collected: Vec<String> = errors
-        .map(|e| format!("    - {} (instance: {})", e, e.instance_path))
-        .collect();
-    panic!(
-        "{label} failed schema validation:\n{}",
-        if collected.is_empty() {
-            "    (validator returned Err with no items)".to_string()
-        } else {
-            collected.join("\n")
-        }
-    );
+fn panic_validation_errors(label: &str, error: jsonschema::ValidationError<'_>) {
+    let collected = format!("    - {} (instance: {})", error, error.instance_path());
+    panic!("{label} failed schema validation:\n{}", collected);
 }
 
 #[test]

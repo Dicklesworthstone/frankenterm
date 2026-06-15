@@ -483,7 +483,7 @@ fn corpus_pinned_hashes_match_files_on_disk() {
             fs::read(&path).unwrap_or_else(|e| panic!("fixture `{filename}` missing on disk: {e}"));
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
-        let actual_sha = format!("{:x}", hasher.finalize());
+        let actual_sha = hex::encode(hasher.finalize());
 
         assert_eq!(
             &actual_sha, expected_sha,

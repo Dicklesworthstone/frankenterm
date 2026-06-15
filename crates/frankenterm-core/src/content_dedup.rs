@@ -78,7 +78,7 @@ pub struct DedupTelemetrySnapshot {
 pub fn content_hash(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// A reference-counted content block in the store.

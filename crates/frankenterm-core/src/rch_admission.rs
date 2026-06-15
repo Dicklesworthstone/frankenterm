@@ -3015,7 +3015,10 @@ mod tests {
         assert_eq!(queue.workers_healthy, Some(7));
         assert_eq!(queue.worker_slots_available, Some(48));
         // Malformed JSON degrades to unknown(), never panics.
-        assert_eq!(parse_rch_status_queue("not json"), RchAdmissionQueueDiagnostic::unknown());
+        assert_eq!(
+            parse_rch_status_queue("not json"),
+            RchAdmissionQueueDiagnostic::unknown()
+        );
     }
 
     #[test]
@@ -3038,15 +3041,21 @@ mod tests {
     #[test]
     fn collect_live_input_populates_source_and_is_probe_safe() {
         let dir = std::env::temp_dir();
-        let input = collect_live_rch_admission_input(&dir, "cargo test -p frankenterm-core --lib", 1_700_000_000_000);
+        let input = collect_live_rch_admission_input(
+            &dir,
+            "cargo test -p frankenterm-core --lib",
+            1_700_000_000_000,
+        );
         assert_eq!(input.source, "ft doctor --rch-admission");
         // A real report can be built from the live input (the production gap).
         let report = build_rch_admission_report(&input);
         assert!(!report.source.is_empty());
         // Agent-mail is always recorded as a bounded skip rather than hanging.
-        assert!(input
-            .collector_observations
-            .iter()
-            .any(|obs| obs.source_id == "agent_mail"));
+        assert!(
+            input
+                .collector_observations
+                .iter()
+                .any(|obs| obs.source_id == "agent_mail")
+        );
     }
 }

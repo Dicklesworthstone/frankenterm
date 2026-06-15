@@ -30,14 +30,23 @@ fn steer_plan_clean_ready_json_receipt() {
     let out = stdout(
         ft(w.path())
             .args([
-                "steer", "plan", "--objective", "ship the W3 family", "--scenario",
-                "clean-ready", "--format", "json",
+                "steer",
+                "plan",
+                "--objective",
+                "ship the W3 family",
+                "--scenario",
+                "clean-ready",
+                "--format",
+                "json",
             ])
             .assert()
             .success(),
     );
     assert!(out.contains("\"receipt_id\""), "no receipt_id: {out}");
-    assert!(out.contains("steer:"), "receipt id not content-addressed: {out}");
+    assert!(
+        out.contains("steer:"),
+        "receipt id not content-addressed: {out}"
+    );
     assert!(out.contains("envelope.admit"), "wrong verdict: {out}");
     assert!(out.contains("950"), "missing rehearsal score: {out}");
 }
@@ -47,7 +56,14 @@ fn steer_plan_rch_blocked_plain() {
     let w = workspace();
     let out = stdout(
         ft(w.path())
-            .args(["steer", "plan", "--objective", "x", "--scenario", "rch-blocked"])
+            .args([
+                "steer",
+                "plan",
+                "--objective",
+                "x",
+                "--scenario",
+                "rch-blocked",
+            ])
             .assert()
             .success(),
     );
@@ -64,7 +80,12 @@ fn steer_plan_approval_required_lists_approval() {
     let out = stdout(
         ft(w.path())
             .args([
-                "steer", "plan", "--objective", "x", "--scenario", "approval-required",
+                "steer",
+                "plan",
+                "--objective",
+                "x",
+                "--scenario",
+                "approval-required",
             ])
             .assert()
             .success(),
@@ -80,8 +101,14 @@ fn steer_plan_deterministic_receipt_id() {
         stdout(
             ft(w.path())
                 .args([
-                    "steer", "plan", "--objective", "same", "--scenario", "clean-ready",
-                    "--format", "json",
+                    "steer",
+                    "plan",
+                    "--objective",
+                    "same",
+                    "--scenario",
+                    "clean-ready",
+                    "--format",
+                    "json",
                 ])
                 .assert()
                 .success(),
@@ -101,8 +128,14 @@ fn steer_plan_persists_receipt_artifact() {
     let out = stdout(
         ft(w.path())
             .args([
-                "steer", "plan", "--objective", "persist me", "--scenario", "clean-ready",
-                "--format", "json",
+                "steer",
+                "plan",
+                "--objective",
+                "persist me",
+                "--scenario",
+                "clean-ready",
+                "--format",
+                "json",
             ])
             .assert()
             .success(),
@@ -139,7 +172,14 @@ fn steer_plan_rejects_unknown_scenario() {
 /// Plan a clean-ready receipt and return its content-addressed id.
 fn plan_receipt_id(w: &Path, extra: &[&str]) -> String {
     let mut args = vec![
-        "steer", "plan", "--objective", "run me", "--scenario", "clean-ready", "--format", "json",
+        "steer",
+        "plan",
+        "--objective",
+        "run me",
+        "--scenario",
+        "clean-ready",
+        "--format",
+        "json",
     ];
     args.extend_from_slice(extra);
     let out = stdout(ft(w).args(args).assert().success());
@@ -187,7 +227,14 @@ fn steer_run_refuses_expired_receipt_typed() {
 fn steer_run_refuses_unknown_receipt() {
     let w = workspace();
     ft(w.path())
-        .args(["steer", "run", "--receipt", "steer:deadbeef", "--format", "json"])
+        .args([
+            "steer",
+            "run",
+            "--receipt",
+            "steer:deadbeef",
+            "--format",
+            "json",
+        ])
         .assert()
         .failure();
 }

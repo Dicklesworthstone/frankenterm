@@ -51,11 +51,7 @@ OPTIONS:
 
 Both capture modes are always exercised; --mode only narrows the human display.";
 
-fn next_value<'a>(
-    args: &'a [String],
-    index: &mut usize,
-    flag: &str,
-) -> Result<&'a str, String> {
+fn next_value<'a>(args: &'a [String], index: &mut usize, flag: &str) -> Result<&'a str, String> {
     *index += 1;
     args.get(*index)
         .map(String::as_str)
@@ -144,7 +140,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
 fn render_mode(result: &ReplayCorpusCaptureModeResult) {
     println!(
         "  [{}] {:<12} lag p50/p95/p99 = {:.1}/{:.1}/{:.1} ms | queue_depth_max = {}/pane | mem = {} MiB",
-        if result.threshold_passed { "PASS" } else { "FAIL" },
+        if result.threshold_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        },
         mode_token(result.mode),
         result.capture_lag_p50_ms,
         result.capture_lag_p95_ms,

@@ -642,7 +642,10 @@ mod tests {
         // bypass hide).
         let extracted = redacted.extracted.expect("extracted preserved");
         let key = extracted["key"].as_str().expect("key is a string");
-        assert!(key.contains("[REDACTED]"), "extracted secret not redacted: {key}");
+        assert!(
+            key.contains("[REDACTED]"),
+            "extracted secret not redacted: {key}"
+        );
         assert!(!key.contains("sk-abc123"), "extracted secret leaked: {key}");
     }
 
@@ -688,7 +691,12 @@ mod tests {
             "secret leaked through redaction: {serialized}"
         );
         // Redaction reached both the nested object and the array element.
-        assert!(redacted["nested"]["token"].as_str().unwrap().contains("[REDACTED]"));
+        assert!(
+            redacted["nested"]["token"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
         assert!(redacted["list"][0].as_str().unwrap().contains("[REDACTED]"));
         // Non-secret leaves are untouched, including non-string types.
         assert_eq!(redacted["list"][1], "clean");

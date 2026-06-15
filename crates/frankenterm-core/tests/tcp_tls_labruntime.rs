@@ -12,8 +12,8 @@ use frankenterm_core::config::{DistributedAuthMode, DistributedConfig, Distribut
 use frankenterm_core::distributed::build_tls_bundle;
 use frankenterm_core::runtime_async::task;
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
-use rcgen::{Certificate, CertificateParams, DnType, IsCa, KeyUsagePurpose};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rcgen::{Certificate, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rustls::pki_types::CertificateDer;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -28,53 +28,64 @@ fn write_pem(file: &mut NamedTempFile, bytes: &[u8]) -> String {
     file.path().display().to_string()
 }
 
-fn ca_cert() -> Certificate {
+struct GeneratedCert {
+    cert: Certificate,
+    key: KeyPair,
+}
+
+fn ca_cert() -> (CertificateParams, GeneratedCert) {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params
         .distinguished_name
         .push(DnType::CommonName, "wa-test-ca");
     params.key_usages.push(KeyUsagePurpose::KeyCertSign);
-    Certificate::from_params(params).expect("ca cert")
+    let key = KeyPair::generate().expect("ca key");
+    let cert = params.self_signed(&key).expect("ca cert");
+    (params, GeneratedCert { cert, key })
 }
 
-fn signed_cert(ca: &Certificate, cn: &str) -> (Certificate, CertificateDer<'static>) {
+fn signed_cert(
+    ca_params: &CertificateParams,
+    ca_key: &KeyPair,
+    cn: &str,
+) -> (GeneratedCert, CertificateDer<'static>) {
     let mut params = CertificateParams::default();
     params.distinguished_name.push(DnType::CommonName, cn);
     params.key_usages.push(KeyUsagePurpose::DigitalSignature);
     params.key_usages.push(KeyUsagePurpose::KeyEncipherment);
-    let cert = Certificate::from_params(params).expect("leaf cert");
-    let der = cert
-        .serialize_der_with_signer(ca)
-        .expect("sign leaf")
-        .into();
-    (cert, der)
+    let issuer = Issuer::from_params(ca_params, ca_key);
+    let key = KeyPair::generate().expect("leaf key");
+    let cert = params.signed_by(&key, &issuer).expect("sign leaf");
+    let der = cert.der().clone();
+    (GeneratedCert { cert, key }, der)
 }
 
 fn tls_bundle(mtls: bool) -> (TlsAcceptor, TlsConnector) {
-    let ca = ca_cert();
-    let ca_pem = ca.serialize_pem().expect("ca pem");
-    let (server_cert, server_der) = signed_cert(&ca, "localhost");
-    let server_key = PrivateKeyDer::try_from(server_cert.serialize_private_key_der()).unwrap();
+    let (ca_params, ca) = ca_cert();
+    let ca_pem = ca.cert.pem();
+    let (server_cert, _server_der) = signed_cert(&ca_params, &ca.key, "localhost");
 
     let mut ca_file = NamedTempFile::new().expect("ca temp");
     let ca_path = write_pem(&mut ca_file, ca_pem.as_bytes());
 
     let mut cert_file = NamedTempFile::new().expect("cert temp");
-    let cert_path = write_pem(&mut cert_file, server_der.as_ref());
+    let cert_path = write_pem(&mut cert_file, server_cert.cert.pem().as_bytes());
     let mut key_file = NamedTempFile::new().expect("key temp");
-    let key_path = write_pem(&mut key_file, server_key.secret_der());
+    let key_path = write_pem(&mut key_file, server_cert.key.serialize_pem().as_bytes());
 
     let mut _client_cert_path = None;
     let mut _client_key_path = None;
 
     if mtls {
-        let (client_cert, client_der) = signed_cert(&ca, "wa-client");
-        let client_key = PrivateKeyDer::try_from(client_cert.serialize_private_key_der()).unwrap();
+        let (client_cert, _client_der) = signed_cert(&ca_params, &ca.key, "wa-client");
         let mut cc = NamedTempFile::new().expect("client cert temp");
-        _client_cert_path = Some(write_pem(&mut cc, client_der.as_ref()));
+        _client_cert_path = Some(write_pem(&mut cc, client_cert.cert.pem().as_bytes()));
         let mut ck = NamedTempFile::new().expect("client key temp");
-        _client_key_path = Some(write_pem(&mut ck, client_key.secret_der()));
+        _client_key_path = Some(write_pem(
+            &mut ck,
+            client_cert.key.serialize_pem().as_bytes(),
+        ));
         // keep files alive until end of scope
         Box::leak(Box::new(cc));
         Box::leak(Box::new(ck));

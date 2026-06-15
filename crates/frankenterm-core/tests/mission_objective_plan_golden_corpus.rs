@@ -112,9 +112,10 @@ fn schema_validator() -> Validator {
 }
 
 fn assert_schema_accepts(case_id: &str, validator: &Validator, value: &Value) {
-    if let Err(errors) = validator.validate(value) {
-        let messages = errors
-            .map(|error| format!("{}: {}", error.instance_path, error))
+    if !validator.is_valid(value) {
+        let messages = validator
+            .iter_errors(value)
+            .map(|error| format!("{}: {}", error.instance_path(), error))
             .collect::<Vec<_>>()
             .join("\n");
         panic!("{case_id}: generated plan violates schema fields:\n{messages}");
@@ -124,8 +125,7 @@ fn assert_schema_accepts(case_id: &str, validator: &Validator, value: &Value) {
 fn sha256_file(path: &Path) -> String {
     let bytes = fs::read(path)
         .unwrap_or_else(|err| panic!("failed to read artifact {}: {err}", path.display()));
-    let digest = Sha256::digest(&bytes);
-    format!("{digest:x}")
+    hex::encode(Sha256::digest(&bytes))
 }
 
 fn string_field(value: &Value, pointer: &str) -> String {

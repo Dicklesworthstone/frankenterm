@@ -637,7 +637,10 @@ mod tests {
         // One pass must remove BOTH the orphan checkpoint and its child.
         let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
         assert_eq!(orphan_cp, 1, "orphan checkpoint removed");
-        assert_eq!(orphan_ps, 1, "its pane_state child collected in the same pass");
+        assert_eq!(
+            orphan_ps, 1,
+            "its pane_state child collected in the same pass"
+        );
         assert_eq!(count_checkpoints(&conn), 0);
         assert_eq!(
             count_pane_states(&conn),

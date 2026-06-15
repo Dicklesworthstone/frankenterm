@@ -8,7 +8,6 @@
 // Requires the `vc-export` feature flag because this matrix canonicalizes
 // robot envelopes through the vc export surface.
 #![cfg(feature = "vc-export")]
-#![allow(deprecated)]
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -19,7 +18,7 @@ use frankenterm_core::robot_family_contract::{
     checkpoint_family_contract, context_family_contract, fleet_family_contract,
     profile_family_contract, work_family_contract,
 };
-use jsonschema::{Draft, JSONSchema as Validator};
+use jsonschema::{Draft, Validator};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -105,16 +104,18 @@ fn load_schema(name: &str) -> Validator {
         .unwrap_or_else(|err| panic!("schema {} is not JSON: {err}", path.display()));
     Validator::options()
         .with_draft(Draft::Draft202012)
-        .compile(&schema_json)
+        .build(&schema_json)
         .unwrap_or_else(|err| panic!("schema {} failed to compile: {err}", path.display()))
 }
 
 fn validation_errors(schema: &Validator, envelope: &Value) -> Vec<String> {
-    match schema.validate(envelope) {
-        Ok(()) => Vec::new(),
-        Err(errors) => errors
-            .map(|err| format!("{} at {}", err, err.instance_path))
-            .collect(),
+    if schema.is_valid(envelope) {
+        Vec::new()
+    } else {
+        schema
+            .iter_errors(envelope)
+            .map(|err| format!("{} at {}", err, err.instance_path()))
+            .collect()
     }
 }
 

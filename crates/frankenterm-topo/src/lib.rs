@@ -818,15 +818,18 @@ fn push_cognitive_load_action(
         .iter_mut()
         .find(|existing| existing.action == action)
     {
-        let missing_reason_codes = reason_codes
-            .iter()
-            .filter(|reason_code| {
-                !existing
-                    .reason_codes
-                    .iter()
-                    .any(|existing| existing == **reason_code)
-            })
-            .map(|reason_code| (*reason_code).to_string());
+        let missing_reason_codes: Vec<String> = {
+            let existing_reason_codes = &existing.reason_codes;
+            reason_codes
+                .iter()
+                .filter(|reason_code| {
+                    !existing_reason_codes
+                        .iter()
+                        .any(|existing| existing == **reason_code)
+                })
+                .map(|reason_code| (*reason_code).to_string())
+                .collect()
+        };
         existing.reason_codes.extend(missing_reason_codes);
         return;
     }

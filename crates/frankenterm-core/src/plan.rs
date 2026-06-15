@@ -3129,7 +3129,7 @@ pub enum MissionEconomicBreakerDecision {
         state: MissionEconomicState,
     },
     HardStop {
-        envelope: MissionEconomicHardStopEnvelope,
+        envelope: Box<MissionEconomicHardStopEnvelope>,
         audit_row: MissionEconomicAuditRow,
     },
 }
@@ -3399,7 +3399,7 @@ impl MissionTxContract {
             observed_at_ms: sample.observed_at_ms,
         };
         MissionEconomicBreakerDecision::HardStop {
-            envelope,
+            envelope: Box::new(envelope),
             audit_row,
         }
     }

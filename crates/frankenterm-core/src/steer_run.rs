@@ -570,7 +570,7 @@ impl LiveSupervisor {
         let progress_anchor_ms = self.progress_anchor_ms(snapshot);
         let no_progress_ms = snapshot.now_ms.saturating_sub(progress_anchor_ms);
 
-        if let Some(stall_age_ms) = self.chaos_stall_age_ms(snapshot) {
+        if let Some(stall_age_ms) = Self::chaos_stall_age_ms(snapshot) {
             if stall_age_ms >= self.config.chaos_stall_grace_ms {
                 audit.push(LiveSupervisionAuditEntry::new(
                     snapshot.now_ms,
@@ -699,7 +699,7 @@ impl LiveSupervisor {
             || snapshot.events.iter().any(|event| event.kind.is_failure())
     }
 
-    fn chaos_stall_age_ms(&self, snapshot: &LiveSupervisionSnapshot) -> Option<u64> {
+    fn chaos_stall_age_ms(snapshot: &LiveSupervisionSnapshot) -> Option<u64> {
         snapshot
             .events
             .iter()
@@ -892,10 +892,12 @@ mod tests {
         assert_eq!(decision.action, LiveSupervisionAction::ObserveSlow);
         assert_eq!(decision.progress_anchor_ms, 0);
         assert_eq!(decision.no_progress_ms, 90_000);
-        assert!(decision
-            .audit
-            .iter()
-            .any(|entry| entry.reason_code == "mission.supervision.slow"));
+        assert!(
+            decision
+                .audit
+                .iter()
+                .any(|entry| entry.reason_code == "mission.supervision.slow")
+        );
     }
 
     #[test]
@@ -928,10 +930,12 @@ mod tests {
 
         assert_eq!(decision.verdict, LiveSupervisionVerdict::Complete);
         assert_eq!(decision.action, LiveSupervisionAction::MarkComplete);
-        assert!(decision
-            .audit
-            .iter()
-            .any(|entry| entry.reason_code == "mission.supervision.complete"));
+        assert!(
+            decision
+                .audit
+                .iter()
+                .any(|entry| entry.reason_code == "mission.supervision.complete")
+        );
     }
 
     #[test]
@@ -950,10 +954,12 @@ mod tests {
         assert_eq!(decision.verdict, LiveSupervisionVerdict::Stuck);
         assert_eq!(decision.action, LiveSupervisionAction::TriggerCompensation);
         assert_eq!(decision.no_progress_ms, 5_000);
-        assert!(decision
-            .audit
-            .iter()
-            .any(|entry| entry.reason_code == "mission.supervision.chaos_stall"));
+        assert!(
+            decision
+                .audit
+                .iter()
+                .any(|entry| entry.reason_code == "mission.supervision.chaos_stall")
+        );
     }
 
     #[test]

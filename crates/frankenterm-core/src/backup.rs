@@ -1675,7 +1675,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn sha256_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug, Clone)]
@@ -3845,8 +3845,7 @@ mod tests {
             yes: true,
             no_safety_backup: true,
         };
-        let import =
-            import_backup(&output_dir, &target_db, tmp.path(), &import_opts).unwrap();
+        let import = import_backup(&output_dir, &target_db, tmp.path(), &import_opts).unwrap();
         assert!(!import.dry_run);
 
         let restored = Connection::open(&target_db).unwrap();

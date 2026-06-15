@@ -78,7 +78,12 @@ fn gate_refuses_mission_hash_drift_typed() {
         SteerRunGate::Valid
     );
     let g = steer_run_gate(&receipt, Some(&drifted), None, NOW);
-    assert_eq!(g, SteerRunGate::HashMismatch { contract: "mission" });
+    assert_eq!(
+        g,
+        SteerRunGate::HashMismatch {
+            contract: "mission"
+        }
+    );
     assert_eq!(g.error_code(), Some("robot.steer_hash_mismatch"));
 }
 
@@ -101,7 +106,12 @@ fn gate_fails_closed_on_unverifiable_mission_binding() {
         Some(10_000),
     );
     let g = steer_run_gate(&receipt, None, None, NOW);
-    assert_eq!(g, SteerRunGate::UnverifiableBinding { contract: "mission" });
+    assert_eq!(
+        g,
+        SteerRunGate::UnverifiableBinding {
+            contract: "mission"
+        }
+    );
     assert_eq!(g.error_code(), Some("robot.steer_binding_unverifiable"));
 }
 
@@ -133,7 +143,9 @@ fn full_receipt_chain_gate_then_admission() {
     let tampered = mission("mission:chain", "Tampered");
     assert_eq!(
         steer_run_gate(&receipt, Some(&tampered), Some(plan_hash), NOW),
-        SteerRunGate::HashMismatch { contract: "mission" }
+        SteerRunGate::HashMismatch {
+            contract: "mission"
+        }
     );
 
     // Expired (ttl 10_000 from NOW) -> typed refusal.

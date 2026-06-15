@@ -1897,7 +1897,7 @@ fn stable_hash<T: Serialize>(value: &T) -> String {
     let json = serde_json::to_string(value).expect("resource digital twin hash payload serializes");
     let mut hasher = Sha256::new();
     hasher.update(json.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn stable_label<T: Serialize>(value: &T) -> String {

@@ -184,8 +184,8 @@ fn hash_material(scenario: &SimulationScenario) -> String {
 }
 
 fn content_hash(scenario: &SimulationScenario) -> String {
-    let digest = Sha256::digest(hash_material(scenario).as_bytes());
-    format!("sha256:{digest:x}")
+    let digest = hex::encode(Sha256::digest(hash_material(scenario).as_bytes()));
+    format!("sha256:{digest}")
 }
 
 #[test]

@@ -2852,7 +2852,10 @@ impl WorkflowRunner {
             // as the trigger path does. The source pane equals the acted-on pane
             // at trigger time (`source_pane_id = pane_id`), so `execution.pane_id`
             // is the correct re-check key.
-            if !workflow.trigger_policy().allows_source_pane(execution.pane_id) {
+            if !workflow
+                .trigger_policy()
+                .allows_source_pane(execution.pane_id)
+            {
                 tracing::warn!(
                     execution_id = %execution.id,
                     pane_id = execution.pane_id,

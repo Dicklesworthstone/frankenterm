@@ -1262,7 +1262,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(input);
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     fn assert_contains_all<T>(actual: &[T], required: &[T], scenario_id: &str, field: &str)

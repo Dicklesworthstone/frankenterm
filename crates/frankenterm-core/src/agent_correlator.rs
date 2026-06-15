@@ -316,7 +316,7 @@ impl AgentCorrelator {
     pub fn update_from_pane_info(&mut self, pane: &PaneInfo) {
         if let Some(state) = self.pane_agents.get_mut(&pane.pane_id) {
             if pane.cwd.is_some() {
-                state.cwd = pane.cwd.clone();
+                state.cwd.clone_from(&pane.cwd);
             }
             return; // Already detected via patterns — don't downgrade
         }
@@ -676,10 +676,7 @@ fn metadata_agent_type_for_provider(provider: &AgentProvider) -> String {
 }
 
 fn duration_ms_saturating(duration: Duration) -> u64 {
-    match u64::try_from(duration.as_millis()) {
-        Ok(ms) => ms,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Infer agent state from a detection rule_id.
@@ -1183,8 +1180,9 @@ mod tests {
         correlator.update_from_pane_info(&test_pane(9, "codex", Some("file:///old")));
         assert!(correlator.pane_agents.contains_key(&9));
         if let Some(state) = correlator.pane_agents.get_mut(&9) {
-            state.last_state_at =
-                Instant::now() - Duration::from_millis(DEFAULT_SWARM_SCENT_TTL_MS + 1);
+            state.last_state_at = Instant::now()
+                .checked_sub(Duration::from_millis(DEFAULT_SWARM_SCENT_TTL_MS + 1))
+                .expect("test TTL duration should fit before now");
         }
 
         let report = correlator.swarm_scent_report(1_700_000_000_000, DEFAULT_SWARM_SCENT_TTL_MS);

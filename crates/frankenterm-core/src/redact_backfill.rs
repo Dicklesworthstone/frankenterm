@@ -151,7 +151,10 @@ pub fn catalog_version() -> String {
     let names: Vec<&'static str> = secret_pattern_names().collect();
     let mut hasher = Sha256::new();
     hasher.update(names.join("\n").as_bytes());
-    format!("live-secret-patterns-sha256:{:x}", hasher.finalize())
+    format!(
+        "live-secret-patterns-sha256:{}",
+        hex::encode(hasher.finalize())
+    )
 }
 
 /// The active catalog fingerprint, computed once and cached. Hot paths — most
@@ -235,8 +238,10 @@ pub fn run_redact_backfill(
             receipt.embeddings_invalidated = invalidate_embeddings(conn, &rewritten_ids)?;
         }
         if config.rebuild_fts && table_exists(conn, "output_segments_fts")? {
-            conn.execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')")
-                .map_err(|e| db_err("rebuilding output_segments_fts", &e))?;
+            conn.execute_batch(
+                "INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')",
+            )
+            .map_err(|e| db_err("rebuilding output_segments_fts", &e))?;
             receipt.fts_rebuilt = true;
         }
         // The Tantivy index lives on disk and is owned by the search daemon; it
@@ -420,10 +425,7 @@ pub fn run_redact_purge(
                 };
                 if crate::secrets::hash_secret(matched) == secret_hash {
                     segment_occurrences += 1;
-                    *receipt
-                        .family_counts
-                        .entry(family.to_string())
-                        .or_insert(0) += 1;
+                    *receipt.family_counts.entry(family.to_string()).or_insert(0) += 1;
                 }
             }
             if segment_occurrences == 0 {
@@ -460,8 +462,10 @@ pub fn run_redact_purge(
             receipt.embeddings_invalidated = invalidate_embeddings(conn, &rewritten_ids)?;
         }
         if config.rebuild_fts && table_exists(conn, "output_segments_fts")? {
-            conn.execute_batch("INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')")
-                .map_err(|e| db_err("rebuilding output_segments_fts", &e))?;
+            conn.execute_batch(
+                "INSERT INTO output_segments_fts(output_segments_fts) VALUES('rebuild')",
+            )
+            .map_err(|e| db_err("rebuilding output_segments_fts", &e))?;
             receipt.fts_rebuilt = true;
         }
         receipt.tantivy_rebuild_requested = true;
@@ -559,10 +563,11 @@ fn persist_receipt(conn: &Connection, receipt: &RedactBackfillReceipt) -> Result
     if !table_exists(conn, "maintenance_log")? {
         return Ok(());
     }
-    let metadata = serde_json::to_string(receipt)
-        .map_err(|e| Error::Storage(crate::StorageError::Database(format!(
+    let metadata = serde_json::to_string(receipt).map_err(|e| {
+        Error::Storage(crate::StorageError::Database(format!(
             "serializing redact-backfill receipt: {e}"
-        ))))?;
+        )))
+    })?;
     conn.execute(
         "INSERT INTO maintenance_log (event_type, message, metadata, timestamp)
          VALUES (?1, ?2, ?3, ?4)",
@@ -694,7 +699,9 @@ mod tests {
         // Embeddings for the rewritten segment were invalidated; the clean one kept.
         assert_eq!(receipt.embeddings_invalidated, 1);
         let remaining: i64 = conn
-            .query_row("SELECT count(*) FROM segment_embeddings", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM segment_embeddings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(remaining, 1);
 
@@ -753,7 +760,11 @@ mod tests {
 
         // Nothing changed on disk.
         let content: String = conn
-            .query_row("SELECT content FROM output_segments WHERE id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT content FROM output_segments WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(content, original);
         let logged: i64 = conn
@@ -781,7 +792,11 @@ mod tests {
 
         // Segment 1 was skipped: still contains the secret.
         let one: String = conn
-            .query_row("SELECT content FROM output_segments WHERE id = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT content FROM output_segments WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(one.contains(SECRET));
     }
@@ -885,8 +900,14 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert!(!msg.contains(SECRET), "maintenance_log message leaked plaintext");
-        assert!(!meta.contains(SECRET), "maintenance_log metadata leaked plaintext");
+        assert!(
+            !msg.contains(SECRET),
+            "maintenance_log message leaked plaintext"
+        );
+        assert!(
+            !meta.contains(SECRET),
+            "maintenance_log metadata leaked plaintext"
+        );
         assert!(meta.contains(&hash));
     }
 
@@ -903,9 +924,11 @@ mod tests {
         assert!(!receipt.fts_rebuilt);
         // The real secret is untouched (this purge targeted a different hash).
         let content: String = conn
-            .query_row("SELECT content FROM output_segments WHERE id = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT content FROM output_segments WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(content.contains(SECRET));
         // No tombstone for a no-op.
@@ -935,9 +958,11 @@ mod tests {
         assert!(!receipt.fts_rebuilt, "dry-run must not rebuild");
         // At-rest content unchanged.
         let content: String = conn
-            .query_row("SELECT content FROM output_segments WHERE id = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT content FROM output_segments WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(content.contains(SECRET), "dry-run must not mutate content");
         // No tombstone on dry-run.

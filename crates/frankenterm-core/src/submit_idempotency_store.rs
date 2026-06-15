@@ -72,11 +72,7 @@ pub fn key_path(ft_dir: &Path, key: &str) -> std::io::Result<PathBuf> {
 /// # Errors
 /// `InvalidInput` if `key` is not canonically shaped, I/O errors creating the
 /// directory or writing the file, or serialization failure.
-pub fn record(
-    ft_dir: &Path,
-    key: &str,
-    report: &VerifiedSubmitReport,
-) -> std::io::Result<PathBuf> {
+pub fn record(ft_dir: &Path, key: &str, report: &VerifiedSubmitReport) -> std::io::Result<PathBuf> {
     let path = key_path(ft_dir, key)?;
     let dir = store_dir(ft_dir);
     std::fs::create_dir_all(&dir)?;
@@ -95,10 +91,9 @@ pub fn record(
 pub fn lookup(ft_dir: &Path, key: &str) -> std::io::Result<Option<VerifiedSubmitReport>> {
     let path = key_path(ft_dir, key)?;
     match std::fs::read_to_string(&path) {
-        Ok(s) => Ok(Some(
-            serde_json::from_str(&s)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-        )),
+        Ok(s) => Ok(Some(serde_json::from_str(&s).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -206,15 +201,15 @@ mod tests {
         let bad_keys = [
             "../../../etc/passwd",
             "idem:7:../../../tmp/evil",
-            "idem:7:abc",                  // digest too short
-            "idem:7:0123456789abcdef0",    // digest too long
-            "idem:7:0123456789ABCDEF",     // uppercase alias
-            "idem:7:0123456789abcdeg",     // non-hex
-            "idem:7:/123456789abcdef",     // separator
-            "idem::0123456789abcdef",      // empty pane
-            "idem:x7:0123456789abcdef",    // non-decimal pane
-            "idem:07:0123456789abcdef",    // leading-zero pane alias
-            "steer:7:0123456789abcdef",    // wrong prefix
+            "idem:7:abc",               // digest too short
+            "idem:7:0123456789abcdef0", // digest too long
+            "idem:7:0123456789ABCDEF",  // uppercase alias
+            "idem:7:0123456789abcdeg",  // non-hex
+            "idem:7:/123456789abcdef",  // separator
+            "idem::0123456789abcdef",   // empty pane
+            "idem:x7:0123456789abcdef", // non-decimal pane
+            "idem:07:0123456789abcdef", // leading-zero pane alias
+            "steer:7:0123456789abcdef", // wrong prefix
             "",
         ];
         for k in bad_keys {
@@ -228,7 +223,9 @@ mod tests {
         }
         // The canonical shape stays valid, including pane 0 and u64::MAX.
         assert!(is_valid_submit_key("idem:0:0123456789abcdef"));
-        assert!(is_valid_submit_key("idem:18446744073709551615:0123456789abcdef"));
+        assert!(is_valid_submit_key(
+            "idem:18446744073709551615:0123456789abcdef"
+        ));
         // Round-trip against the real generator.
         let generated = crate::verified_submit::idempotency_key(42, "deploy now", Some("nonce"));
         assert!(

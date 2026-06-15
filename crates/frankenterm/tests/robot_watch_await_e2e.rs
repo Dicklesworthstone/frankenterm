@@ -94,7 +94,13 @@ fn seed_workspace() -> TempDir {
                 .await
                 .expect("ev1");
             storage
-                .record_event(event("build.failed", "error", ts + 1, Some("build broke"), None))
+                .record_event(event(
+                    "build.failed",
+                    "error",
+                    ts + 1,
+                    Some("build broke"),
+                    None,
+                ))
                 .await
                 .expect("ev2");
             storage
@@ -120,11 +126,25 @@ fn stdout_of(assert: assert_cmd::assert::Assert) -> String {
 #[test]
 fn watch_events_emits_ndjson_with_cursor_and_redacts_canary() {
     let ws = seed_workspace();
-    let out = stdout_of(ft(ws.path()).args(["robot", "watch-events"]).assert().success());
+    let out = stdout_of(
+        ft(ws.path())
+            .args(["robot", "watch-events"])
+            .assert()
+            .success(),
+    );
 
-    assert!(out.contains("\"type\":\"event\""), "no event records: {out}");
-    assert!(out.contains("\"cursor\":"), "missing per-record cursor: {out}");
-    assert!(out.contains("codex.usage_reached"), "missing seeded rule: {out}");
+    assert!(
+        out.contains("\"type\":\"event\""),
+        "no event records: {out}"
+    );
+    assert!(
+        out.contains("\"cursor\":"),
+        "missing per-record cursor: {out}"
+    );
+    assert!(
+        out.contains("codex.usage_reached"),
+        "missing seeded rule: {out}"
+    );
     assert!(out.contains("build.failed"), "missing seeded rule: {out}");
 
     // Redaction-before-emission: the planted canary must NEVER stream (it was
@@ -165,14 +185,23 @@ fn await_satisfies_on_matching_all_rule() {
     let out = stdout_of(
         ft(ws.path())
             .args([
-                "robot", "await", "--all", "rule:codex.usage_reached", "--cursor", "0",
-                "--timeout-secs", "5",
+                "robot",
+                "await",
+                "--all",
+                "rule:codex.usage_reached",
+                "--cursor",
+                "0",
+                "--timeout-secs",
+                "5",
             ])
             .assert()
             .success(),
     );
     assert!(out.contains("\"type\":\"await_result\""), "{out}");
-    assert!(out.contains("\"satisfied\":true"), "should be satisfied: {out}");
+    assert!(
+        out.contains("\"satisfied\":true"),
+        "should be satisfied: {out}"
+    );
     assert!(!out.contains("\"timed_out\":true"), "{out}");
 }
 
@@ -182,8 +211,16 @@ fn await_any_satisfies_via_glob() {
     let out = stdout_of(
         ft(ws.path())
             .args([
-                "robot", "await", "--any", "rule:nope.nope", "--any", "rule:build.*", "--cursor",
-                "0", "--timeout-secs", "5",
+                "robot",
+                "await",
+                "--any",
+                "rule:nope.nope",
+                "--any",
+                "rule:build.*",
+                "--cursor",
+                "0",
+                "--timeout-secs",
+                "5",
             ])
             .assert()
             .success(),
@@ -200,8 +237,14 @@ fn await_times_out_when_no_condition_matches() {
     let out = stdout_of(
         ft(ws.path())
             .args([
-                "robot", "await", "--all", "rule:does.not.exist", "--cursor", "0",
-                "--timeout-secs", "1",
+                "robot",
+                "await",
+                "--all",
+                "rule:does.not.exist",
+                "--cursor",
+                "0",
+                "--timeout-secs",
+                "1",
             ])
             .assert()
             .success(),
@@ -217,7 +260,14 @@ fn await_rejects_unsupported_condition_sources() {
     // rejection, never a silent hang or mis-evaluation.
     ft(ws.path())
         .args([
-            "robot", "await", "--all", "state:1:stuck", "--cursor", "0", "--timeout-secs", "1",
+            "robot",
+            "await",
+            "--all",
+            "state:1:stuck",
+            "--cursor",
+            "0",
+            "--timeout-secs",
+            "1",
         ])
         .assert()
         .success()

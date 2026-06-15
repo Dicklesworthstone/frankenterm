@@ -127,9 +127,9 @@ impl AwaitPaneCondition {
         let spec = spec.trim();
         if let Some(rest) = spec.strip_prefix("state:") {
             // state:<pane>:<class>
-            let (pane_part, class_part) = rest.split_once(':').ok_or_else(|| {
-                format!("condition `{spec}`: expected `state:<pane>:<class>`")
-            })?;
+            let (pane_part, class_part) = rest
+                .split_once(':')
+                .ok_or_else(|| format!("condition `{spec}`: expected `state:<pane>:<class>`"))?;
             let pane_id = pane_part.trim().parse::<u64>().map_err(|_| {
                 format!("condition `{spec}`: invalid pane id `{}`", pane_part.trim())
             })?;
@@ -375,8 +375,14 @@ mod tests {
             assert_eq!(AgentPaneState::from_token(state.as_token()), Some(state));
         }
         // Case-insensitive + whitespace-tolerant.
-        assert_eq!(AgentPaneState::from_token("  STUCK "), Some(AgentPaneState::Stuck));
-        assert_eq!(AgentPaneState::from_token("Idle"), Some(AgentPaneState::Idle));
+        assert_eq!(
+            AgentPaneState::from_token("  STUCK "),
+            Some(AgentPaneState::Stuck)
+        );
+        assert_eq!(
+            AgentPaneState::from_token("Idle"),
+            Some(AgentPaneState::Idle)
+        );
         // Unknown token rejected.
         assert_eq!(AgentPaneState::from_token("bogus"), None);
         assert_eq!(AgentPaneState::from_token(""), None);
@@ -448,7 +454,9 @@ mod tests {
             }
         );
         assert_eq!(
-            AwaitPaneCondition::parse("quiescence:3:2500").unwrap().unwrap(),
+            AwaitPaneCondition::parse("quiescence:3:2500")
+                .unwrap()
+                .unwrap(),
             AwaitPaneCondition::Quiescence {
                 pane_id: 3,
                 idle_ms: Some(2500)

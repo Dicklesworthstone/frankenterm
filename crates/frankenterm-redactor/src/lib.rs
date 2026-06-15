@@ -14,6 +14,10 @@ pub(crate) mod hot_path_metrics {
 #[path = "../../frankenterm-core/src/redactor.rs"]
 pub mod redactor;
 
+#[cfg(test)]
+#[path = "../../frankenterm-core/src/redactor_coverage_matrix.rs"]
+pub mod redactor_coverage_matrix;
+
 pub use redactor::*;
 
 /// Redact any secret-looking text before it leaves a robot, CLI, MCP, or audit

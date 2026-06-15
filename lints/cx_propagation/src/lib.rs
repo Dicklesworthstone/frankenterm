@@ -251,7 +251,7 @@ impl<'ast> Visit<'ast> for AsyncFnVisitor {
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
         // Inherent impl methods with pub vis count too.
         for item in &node.items {
-            if let syn::ImplItem::Method(m) = item {
+            if let syn::ImplItem::Fn(m) = item {
                 if is_pub(&m.vis) && m.sig.asyncness.is_some() {
                     let name = m.sig.ident.to_string();
                     let line = lines_before(&m.sig.ident.span()) + 1;
@@ -385,9 +385,10 @@ fn path_last_is(path: &syn::Path, name: &str) -> bool {
 }
 
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path.is_ident("cfg") && a.tokens.to_string().contains("test"))
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg")
+            && matches!(&a.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test"))
+    })
 }
 
 #[allow(dead_code)]

@@ -628,9 +628,10 @@ mod tests {
     #[test]
     fn empty_stream_is_a_violation() {
         let v = check_invariants(AccessibilityScenario::SteadyTyping, &[]);
-        assert!(v
-            .iter()
-            .any(|x| matches!(x, InvariantViolation::EmptyStream)));
+        assert!(
+            v.iter()
+                .any(|x| matches!(x, InvariantViolation::EmptyStream))
+        );
     }
 
     #[test]

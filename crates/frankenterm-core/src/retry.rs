@@ -27,7 +27,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use tracing::{debug, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -227,8 +227,6 @@ impl RetryPolicy {
     #[allow(clippy::cast_precision_loss)]
     #[allow(clippy::cast_possible_wrap)]
     pub fn delay_for_attempt_with_mode(&self, attempt: u32, mode: JitterMode) -> Duration {
-        use rand::Rng;
-
         let initial_ms = u64::try_from(self.initial_delay.as_millis()).unwrap_or(u64::MAX);
         let max_ms = u64::try_from(self.max_delay.as_millis()).unwrap_or(u64::MAX);
 
@@ -550,14 +548,14 @@ pub fn is_retryable(error: &Error) -> bool {
         Error::Io(_) => true,
         // WezTerm CLI errors - some are retryable
         Error::Wezterm(e) => match e {
-            WeztermError::NotRunning => true,          // Might start up
-            WeztermError::Timeout(_) => true,          // Temporary slowdown
-            WeztermError::CommandFailed(_) => true,    // Might be transient
-            WeztermError::CircuitOpen { .. } => false, // Already rate-limited
-            WeztermError::CliNotFound => false,        // Need installation
-            WeztermError::PaneNotFound(_) => false,    // Won't magically appear
-            WeztermError::SocketNotFound(_) => true,   // Might be initializing
-            WeztermError::ParseError(_) => false,      // Structural issue
+            WeztermError::NotRunning => true,             // Might start up
+            WeztermError::Timeout(_) => true,             // Temporary slowdown
+            WeztermError::CommandFailed(_) => true,       // Might be transient
+            WeztermError::CircuitOpen { .. } => false,    // Already rate-limited
+            WeztermError::CliNotFound => false,           // Need installation
+            WeztermError::PaneNotFound(_) => false,       // Won't magically appear
+            WeztermError::SocketNotFound(_) => true,      // Might be initializing
+            WeztermError::ParseError(_) => false,         // Structural issue
             WeztermError::OutputTooLarge { .. } => false, // Output won't shrink on retry
         },
         // Storage errors - only generic database errors are retryable (lock conflicts)

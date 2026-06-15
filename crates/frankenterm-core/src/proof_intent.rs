@@ -697,15 +697,15 @@ fn proof_intent_release_readiness_row(
     entry: &ProofIntentQueueEntry,
     live_source_hash: &str,
 ) -> ProofIntentReleaseReadinessRow {
-    let stale = entry.is_stale(live_source_hash);
-    let closeout_receipt = (!stale)
+    let is_stale = entry.is_stale(live_source_hash);
+    let closeout_receipt = (!is_stale)
         .then(|| entry.closeout_eligible_receipt())
         .flatten();
     let latest_attempt_outcome = entry
         .replay_attempts
         .last()
         .map(|attempt| attempt.outcome.clone());
-    let (state, reason_code) = proof_intent_readiness_state(entry, stale, closeout_receipt);
+    let (state, reason_code) = proof_intent_readiness_state(entry, is_stale, closeout_receipt);
     let closeout_eligible = state == ProofIntentReleaseReadinessState::CloseoutReady;
 
     ProofIntentReleaseReadinessRow {
@@ -713,7 +713,7 @@ fn proof_intent_release_readiness_row(
         bead_id: entry.intent.bead_id.clone(),
         attestation_slot: entry.intent.attestation_slot.clone(),
         rch_admission_state: entry.rch_admission_state.clone(),
-        source_state: if stale { "stale" } else { "current" }.to_string(),
+        source_state: if is_stale { "stale" } else { "current" }.to_string(),
         state,
         reason_code: reason_code.to_string(),
         closeout_eligible,

@@ -695,8 +695,8 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "google_api_basic",
             "google",
             "AIza<35> exact-39-total format",
-            "GOOGLE_API_KEY=AIzaA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q-",
-            "AIzaA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q-",
+            "GOOGLE_API_KEY=AIzaA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7-",
+            "AIzaA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7-",
             "google_api_key",
         ),
         pos(

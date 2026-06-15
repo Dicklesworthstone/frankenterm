@@ -46,8 +46,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::a11y_tree::{
-    check_invariants, AccessibilityEvent, AccessibilityPlatform, AccessibilityScenario,
-    AnnouncePriority, InvariantViolation,
+    AccessibilityEvent, AccessibilityPlatform, AccessibilityScenario, AnnouncePriority,
+    InvariantViolation, check_invariants,
 };
 
 // ============================================================================
@@ -1176,9 +1176,11 @@ mod tests {
 
         assert_eq!(comparison.status, NativeScreenReaderComparisonStatus::Fail);
         assert_eq!(comparison.framework, "AT-SPI");
-        assert!(comparison
-            .violations
-            .contains(&ScreenReaderContractViolation::ActiveSessionMissingAnnouncement));
+        assert!(
+            comparison
+                .violations
+                .contains(&ScreenReaderContractViolation::ActiveSessionMissingAnnouncement)
+        );
     }
 
     #[test]

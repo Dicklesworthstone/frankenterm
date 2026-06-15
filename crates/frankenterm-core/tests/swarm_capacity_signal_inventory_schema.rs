@@ -62,11 +62,13 @@ fn inventory_validator() -> Validator {
 }
 
 fn validation_errors(validator: &Validator, value: &Value) -> Vec<String> {
-    match validator.validate(value) {
-        Ok(()) => Vec::new(),
-        Err(errors) => errors
-            .map(|err| format!("{} at {}", err, err.instance_path))
-            .collect(),
+    if validator.is_valid(value) {
+        Vec::new()
+    } else {
+        validator
+            .iter_errors(value)
+            .map(|err| format!("{} at {}", err, err.instance_path()))
+            .collect()
     }
 }
 

@@ -98,9 +98,10 @@ fn validators() -> BTreeMap<&'static str, Validator> {
 }
 
 fn assert_schema_accepts(label: &str, validator: &Validator, value: &Value) {
-    if let Err(errors) = validator.validate(value) {
-        let messages = errors
-            .map(|error| format!("{}: {}", error.instance_path, error))
+    if !validator.is_valid(value) {
+        let messages = validator
+            .iter_errors(value)
+            .map(|error| format!("{}: {}", error.instance_path(), error))
             .collect::<Vec<_>>()
             .join("\n");
         panic!("{label} failed schema validation:\n{messages}\n{value:#}");

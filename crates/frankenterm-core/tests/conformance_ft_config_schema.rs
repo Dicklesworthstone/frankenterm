@@ -28,9 +28,7 @@
 //! enforce the README-documented shape, not to gate every internal
 //! tuning knob.
 
-#![allow(deprecated)]
-
-use jsonschema::{Draft, JSONSchema};
+use jsonschema::{Draft, Validator};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -66,14 +64,14 @@ fn load_fixture_toml() -> String {
     fs::read_to_string(fixture_path()).unwrap_or_else(|err| panic!("failed to read fixture: {err}"))
 }
 
-fn compile_config_schema() -> JSONSchema {
+fn compile_config_schema() -> Validator {
     let bytes =
         fs::read(schema_path()).unwrap_or_else(|err| panic!("failed to read schema: {err}"));
     let v: Value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|err| panic!("schema is not valid JSON: {err}"));
-    JSONSchema::options()
+    Validator::options()
         .with_draft(Draft::Draft202012)
-        .compile(&v)
+        .build(&v)
         .unwrap_or_else(|err| panic!("schema compile failed: {err}"))
 }
 
@@ -244,10 +242,10 @@ fn fixture_matches_readme_canonical_toml_block() {
 fn schema_accepts_canonical_fixture() {
     let schema = compile_config_schema();
     let json = fixture_as_json();
-    let result = schema.validate(&json);
-    if let Err(errors) = result {
-        let lines: Vec<String> = errors
-            .map(|e| format!("    - {} (instance: {})", e, e.instance_path))
+    if !schema.is_valid(&json) {
+        let lines: Vec<String> = schema
+            .iter_errors(&json)
+            .map(|e| format!("    - {} (instance: {})", e, e.instance_path()))
             .collect();
         panic!(
             "schema rejected the README's canonical fixture:\n{}",

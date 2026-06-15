@@ -772,8 +772,7 @@ fn build_context_args(session_path: &Path) -> Vec<String> {
 fn cass_context_output_indicates_indexed(output: &str) -> bool {
     match serde_json::from_str::<Value>(output) {
         Ok(value) => {
-            value.get("error").is_none()
-                && value.get("source").is_some_and(Value::is_object)
+            value.get("error").is_none() && value.get("source").is_some_and(Value::is_object)
         }
         Err(_) => false,
     }
@@ -1992,7 +1991,9 @@ mod tests {
             r#"{"status":"error","kind":"argument_parsing","error":"unexpected argument"}"#
         ));
         // REJECT: `source` present but not an object (cannot be a hit).
-        assert!(!cass_context_output_indicates_indexed(r#"{"source":"/etc/passwd"}"#));
+        assert!(!cass_context_output_indicates_indexed(
+            r#"{"source":"/etc/passwd"}"#
+        ));
         assert!(!cass_context_output_indicates_indexed(r#"{"source":null}"#));
         // REJECT: `source` object BUT an `error` is also present (ambiguous).
         assert!(!cass_context_output_indicates_indexed(

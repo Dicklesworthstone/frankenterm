@@ -31,8 +31,8 @@ use frankenterm_core::error_codes::ErrorCategory;
 use frankenterm_core::fleet_memory_controller::{
     FleetMemoryTier, FleetMemoryTierReclamationAction, FleetPressureTier,
 };
-use frankenterm_core::robot_types::{ErrorCode, hint_for};
 use frankenterm_core::memory_pressure::MacosResidencyBucket;
+use frankenterm_core::robot_types::{ErrorCode, hint_for};
 use frankenterm_core::runtime_telemetry::{
     SWARM_RESOURCE_COCKPIT_CONTRACT_ID, SWARM_RESOURCE_COCKPIT_SCHEMA_VERSION,
     SwarmCapacityAdmissionAction, SwarmCapacityCertificateStatus,
@@ -107,19 +107,11 @@ fn load_all_schemas() -> Vec<(String, Value)> {
 fn load_schema(name: &str) -> Value {
     let path = schema_dir().join(name);
     let content = fs::read_to_string(&path).unwrap_or_else(|err| {
-        assert!(
-            false,
-            "failed to read schema {}: {err}",
-            path.display()
-        );
+        assert!(false, "failed to read schema {}: {err}", path.display());
         String::new()
     });
     serde_json::from_str(&content).unwrap_or_else(|err| {
-        assert!(
-            false,
-            "failed to parse schema {}: {err}",
-            path.display()
-        );
+        assert!(false, "failed to parse schema {}: {err}", path.display());
         Value::Null
     })
 }
@@ -131,9 +123,10 @@ fn compile_draft_2020_schema(schema: &Value) -> Validator {
 }
 
 fn assert_schema_accepts(label: &str, validator: &Validator, value: &Value) {
-    if let Err(errors) = validator.validate(value) {
-        let messages = errors
-            .map(|error| format!("{}: {}", error.instance_path, error))
+    if !validator.is_valid(value) {
+        let messages = validator
+            .iter_errors(value)
+            .map(|error| format!("{}: {}", error.instance_path(), error))
             .collect::<Vec<_>>()
             .join("\n");
         assert!(

@@ -32,7 +32,7 @@
 //!
 //! - **Compile**: feed an arbitrary byte slice as a candidate schema
 //!   through `Validator::options().with_draft(Draft::Draft202012)
-//!   .compile(&value)`. Hits the schema parser + state-machine
+//!   .build(&value)`. Hits the schema parser + state-machine
 //!   construction path.
 //! - **Validate**: validate an arbitrary byte slice (parsed as
 //!   `serde_json::Value`) against a TRUSTED pre-compiled schema
@@ -61,7 +61,7 @@
 //! Archetype 1 crash detector.
 
 use arbitrary::Arbitrary;
-use jsonschema::{Draft, JSONSchema as Validator};
+use jsonschema::{Draft, Validator};
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -84,7 +84,7 @@ fn trusted_schema() -> &'static Validator {
             serde_json::from_slice(bytes).expect("trusted envelope schema must be valid JSON");
         Validator::options()
             .with_draft(Draft::Draft202012)
-            .compile(&value)
+            .build(&value)
             .expect("trusted envelope schema must compile under Draft 2020-12")
     })
 }
@@ -114,7 +114,7 @@ fn try_compile(bytes: &[u8]) {
     // not the goal, surviving every input is.
     let _ = Validator::options()
         .with_draft(Draft::Draft202012)
-        .compile(&value);
+        .build(&value);
 }
 
 fn try_validate_against_trusted(bytes: &[u8]) {
@@ -124,12 +124,11 @@ fn try_validate_against_trusted(bytes: &[u8]) {
     let Ok(value): Result<Value, _> = serde_json::from_slice(bytes) else {
         return;
     };
-    // Validator::validate returns an iterator of errors; we drain it
-    // to materialize any work the validator deferred to lazy
-    // iteration. Contract 1: no panic.
+    // Drain iter_errors to materialize any work the validator deferred
+    // to lazy iteration. Contract 1: no panic.
     let validator = trusted_schema();
-    if let Err(errors) = validator.validate(&value) {
-        let _ = errors.count();
+    if !validator.is_valid(&value) {
+        let _ = validator.iter_errors(&value).count();
     }
 }
 
@@ -157,7 +156,7 @@ fuzz_target!(|input: FuzzInput| {
             };
             let validator = match Validator::options()
                 .with_draft(Draft::Draft202012)
-                .compile(&schema_value)
+                .build(&schema_value)
             {
                 Ok(v) => v,
                 Err(_) => return,
@@ -165,8 +164,8 @@ fuzz_target!(|input: FuzzInput| {
             let Ok(data_value): Result<Value, _> = serde_json::from_slice(data_bytes) else {
                 return;
             };
-            if let Err(errors) = validator.validate(&data_value) {
-                let _ = errors.count();
+            if !validator.is_valid(&data_value) {
+                let _ = validator.iter_errors(&data_value).count();
             }
         }
     }

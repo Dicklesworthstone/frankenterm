@@ -65,9 +65,10 @@ fn load_validator() -> Validator {
 }
 
 fn assert_valid(label: &str, validator: &Validator, value: &Value) {
-    if let Err(errors) = validator.validate(value) {
-        let messages = errors
-            .map(|error| format!("{}: {}", error.instance_path, error))
+    if !validator.is_valid(value) {
+        let messages = validator
+            .iter_errors(value)
+            .map(|error| format!("{}: {}", error.instance_path(), error))
             .collect::<Vec<_>>()
             .join("\n");
         panic!("{label} did not match operating-envelope schema:\n{messages}");

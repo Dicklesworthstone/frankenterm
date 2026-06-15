@@ -2551,7 +2551,10 @@ mod tests {
                 "https://app.example.com/cb#access_token=SECRETtok123456&token_type=bearer",
                 "SECRETtok123456",
             ),
-            ("https://app.example.com/cb#code=AUTHCODE7890", "AUTHCODE7890"),
+            (
+                "https://app.example.com/cb#code=AUTHCODE7890",
+                "AUTHCODE7890",
+            ),
         ] {
             let msg = format!("redirected to {raw}");
             let out = r.redact(&msg);

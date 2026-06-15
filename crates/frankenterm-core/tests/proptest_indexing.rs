@@ -179,7 +179,7 @@ proptest! {
                 let basis = d.text.split_whitespace().collect::<Vec<_>>().join(" ");
                 let mut hasher = Sha256::new();
                 hasher.update(basis.as_bytes());
-                format!("{:x}", hasher.finalize())
+                hex::encode(hasher.finalize())
             })
             .collect();
 

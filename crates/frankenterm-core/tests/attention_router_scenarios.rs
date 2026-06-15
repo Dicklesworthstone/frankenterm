@@ -21,14 +21,14 @@
 use std::collections::BTreeSet;
 
 use frankenterm_core::attention_router::{
-    build_attention_router_snapshot, AttentionRouterClassification, AttentionRouterConfidence,
-    AttentionRouterItem, AttentionRouterNudgeKind, AttentionRouterRedactionPosture,
-    AttentionRouterSafeAction, AttentionRouterSourceAdapterInput, AttentionRouterSourceFact,
-    AttentionRouterSourceFactKind, AttentionRouterSourceHealth, AttentionRouterSourceKind,
-    AttentionRouterSourceObservation,
+    AttentionRouterClassification, AttentionRouterConfidence, AttentionRouterItem,
+    AttentionRouterNudgeKind, AttentionRouterRedactionPosture, AttentionRouterSafeAction,
+    AttentionRouterSourceAdapterInput, AttentionRouterSourceFact, AttentionRouterSourceFactKind,
+    AttentionRouterSourceHealth, AttentionRouterSourceKind, AttentionRouterSourceObservation,
+    build_attention_router_snapshot,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 
 const INVENTORY_JSON: &str = include_str!("../../../fixtures/attention-router/scenarios.v1.json");
 
@@ -144,8 +144,12 @@ fn parse_expected<T>(scenario: &Scenario, field: &str, raw: &str) -> T
 where
     T: DeserializeOwned,
 {
-    serde_json::from_value(Value::String(raw.to_string()))
-        .expect("scenario expected value did not deserialize")
+    serde_json::from_value(Value::String(raw.to_string())).unwrap_or_else(|err| {
+        panic!(
+            "{} expected.{field} did not deserialize from {:?}: {err}",
+            scenario.scenario_id, raw
+        )
+    })
 }
 
 fn expected_classification(scenario: &Scenario) -> AttentionRouterClassification {
@@ -337,7 +341,12 @@ fn all_subjects(scenario: &Scenario) -> Vec<String> {
 fn apply_subject(mut fact: AttentionRouterSourceFact, subject: &str) -> AttentionRouterSourceFact {
     if subject.starts_with("ft-") || subject.contains("<bead>") {
         fact = fact.with_bead_id(subject);
-    } else if subject.contains('/') || subject.contains('*') || subject.ends_with(".rs") {
+    } else if subject.contains('/')
+        || subject.contains('*')
+        || std::path::Path::new(subject)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+    {
         fact = fact.with_affected_path(subject);
     } else if subject.starts_with('[') || subject.contains("AGENT") || subject.contains("OWNER") {
         fact = fact.with_agent_name(subject);

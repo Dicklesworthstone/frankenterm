@@ -2697,8 +2697,9 @@ fn render_deck_fleet_panel(frame: &mut ftui::Frame, area: UiRect, panes: &[PaneR
         ],
     );
 
-    let mut row = inner.y.saturating_add(1);
-    for pane in panes.iter().take(inner.height.saturating_sub(1) as usize) {
+    for (row, pane) in (inner.y.saturating_add(1)..)
+        .zip(panes.iter().take(inner.height.saturating_sub(1) as usize))
+    {
         if row >= inner.y.saturating_add(inner.height) {
             break;
         }
@@ -2711,7 +2712,6 @@ fn render_deck_fleet_panel(frame: &mut ftui::Frame, area: UiRect, panes: &[PaneR
             truncate_str(&pane.title, inner.width.saturating_sub(24) as usize),
         );
         write_styled_clipped(frame, inner.x, row, &line, bucket.style(), inner.width);
-        row += 1;
     }
 }
 
@@ -5887,30 +5887,33 @@ mod tests {
 
     #[test]
     fn deck_shortcuts_queue_existing_attention_actions() {
-        let mut model = make_model(MockQuery::with_deck_actions());
-        model.refresh_data();
-        model.view_state.current_view = View::Deck;
+        let mut deck_model = make_model(MockQuery::with_deck_actions());
+        deck_model.refresh_data();
+        deck_model.view_state.current_view = View::Deck;
 
         let approve_key = ftui::KeyEvent {
             code: ftui::KeyCode::Char('a'),
             modifiers: ftui::Modifiers::empty(),
             kind: ftui::KeyEventKind::Press,
         };
-        let _ = model.handle_view_key(&approve_key);
-        let modal = model.active_modal.as_ref().expect("approval modal");
-        assert_eq!(modal.title, "Approve Action");
-        assert!(modal.body.contains("ft approve ABCD1234"));
+        let _ = deck_model.handle_view_key(&approve_key);
+        let approval_dialog = deck_model.active_modal.as_ref().expect("approval modal");
+        assert_eq!(approval_dialog.title, "Approve Action");
+        assert!(approval_dialog.body.contains("ft approve ABCD1234"));
 
-        model.active_modal = None;
+        deck_model.active_modal = None;
         let intervene_key = ftui::KeyEvent {
             code: ftui::KeyCode::Char('i'),
             modifiers: ftui::Modifiers::empty(),
             kind: ftui::KeyEventKind::Press,
         };
-        let _ = model.handle_view_key(&intervene_key);
-        let modal = model.active_modal.as_ref().expect("intervention modal");
-        assert_eq!(modal.title, "Intervention Action");
-        assert!(modal.body.contains("ft intervene pause 7"));
+        let _ = deck_model.handle_view_key(&intervene_key);
+        let intervention_dialog = deck_model
+            .active_modal
+            .as_ref()
+            .expect("intervention modal");
+        assert_eq!(intervention_dialog.title, "Intervention Action");
+        assert!(intervention_dialog.body.contains("ft intervene pause 7"));
     }
 
     #[test]

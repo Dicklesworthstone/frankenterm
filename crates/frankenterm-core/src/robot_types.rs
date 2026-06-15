@@ -1987,7 +1987,7 @@ pub struct AgentSubspaceRpcDeliveryReceipt {
 }
 
 /// Response data for the terminal-bypass Agent Subspace RPC contract.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSubspaceRpcData {
     pub schema_version: u32,
     pub route: String,

@@ -199,11 +199,13 @@ fn load_schema() -> Validator {
 }
 
 fn validation_errors(schema: &Validator, report: &Value) -> Vec<String> {
-    match schema.validate(report) {
-        Ok(()) => Vec::new(),
-        Err(errors) => errors
-            .map(|err| format!("{} at {}", err, err.instance_path))
-            .collect(),
+    if schema.is_valid(report) {
+        Vec::new()
+    } else {
+        schema
+            .iter_errors(report)
+            .map(|err| format!("{} at {}", err, err.instance_path()))
+            .collect()
     }
 }
 

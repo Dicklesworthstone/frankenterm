@@ -832,7 +832,7 @@ fn resolve_index_dir(raw: &str) -> PathBuf {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn strip_ansi_sequences(input: &str) -> String {

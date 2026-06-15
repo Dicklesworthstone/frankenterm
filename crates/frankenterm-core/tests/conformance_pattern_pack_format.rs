@@ -22,12 +22,7 @@
 //! proves the schema validator actually fires (not a no-op) by feeding
 //! it a deliberately broken pack JSON.
 
-// Same jsonschema crate version as conformance_robot_envelope_schema.rs
-// (ft-5ikbd). The 0.21 deprecation typedef path is the stable workspace
-// import for now.
-#![allow(deprecated)]
-
-use jsonschema::{Draft, JSONSchema as Validator};
+use jsonschema::{Draft, Validator};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,7 +60,7 @@ fn load_schema() -> Validator {
         .unwrap_or_else(|err| panic!("schema {} is not valid JSON: {err}", path.display()));
     Validator::options()
         .with_draft(Draft::Draft202012)
-        .compile(&schema_json)
+        .build(&schema_json)
         .unwrap_or_else(|err| panic!("schema compile failed: {err}"))
 }
 
@@ -156,9 +151,11 @@ fn every_valid_fixture_validates_against_schema() {
     );
     for path in fixtures {
         let value = parse_to_json_value(&path);
-        let result = validator.validate(&value);
-        if let Err(errors) = result {
-            let messages: Vec<String> = errors.map(|e| e.to_string()).collect();
+        if !validator.is_valid(&value) {
+            let messages: Vec<String> = validator
+                .iter_errors(&value)
+                .map(|e| e.to_string())
+                .collect();
             panic!(
                 "fixture {} failed schema validation:\n{}",
                 path.display(),

@@ -930,12 +930,7 @@ mod tests {
     fn hash_indices_no_gcd_collapse() {
         // (data, m) pairs whose raw djb2 step shares a non-trivial factor
         // with m (verified to collapse to 2 distinct slots pre-fix).
-        let cases: &[(&[u8], usize)] = &[
-            (b"*", 10),
-            (b"#", 16),
-            (b"M", 100),
-            (b"[", 1024),
-        ];
+        let cases: &[(&[u8], usize)] = &[(b"*", 10), (b"#", 16), (b"M", 100), (b"[", 1024)];
         for &(data, m) in cases {
             let k = 4u32;
             let indices = hash_indices(data, k, m);

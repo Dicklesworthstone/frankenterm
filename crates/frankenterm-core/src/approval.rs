@@ -1,6 +1,6 @@
 //! Allow-once approval tokens for RequireApproval policy decisions.
 
-use rand::Rng;
+use rand::RngExt;
 use rand::distr::Alphanumeric;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

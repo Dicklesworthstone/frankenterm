@@ -23,8 +23,6 @@
 //!    `<family>_handler_passes_declared_invariants`,
 //!    `<family>_mcp_descriptors_unique`).
 
-#![allow(deprecated)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use frankenterm_core::robot_checkpoint_state_machine::{
@@ -48,7 +46,7 @@ use frankenterm_core::robot_work_state_machine::{
     DenialReason as WorkDenialReason, WorkAction, WorkOutcome, WorkWorld,
     apply_action as work_apply_action, check_invariants as work_check_invariants,
 };
-use jsonschema::{Draft, JSONSchema as Validator};
+use jsonschema::{Draft, Validator};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
@@ -171,8 +169,15 @@ fn family_request_strategy(contract: &FamilyContract) -> BoxedStrategy<Value> {
 fn compile_schema(schema: &Value) -> Validator {
     Validator::options()
         .with_draft(Draft::Draft202012)
-        .compile(schema)
+        .build(schema)
         .expect("contract JSON Schema compiles under Draft 2020-12")
+}
+
+fn collect_validation_errors(validator: &Validator, value: &Value) -> Vec<String> {
+    validator
+        .iter_errors(value)
+        .map(|error| error.to_string())
+        .collect()
 }
 
 // ============================================================================
@@ -207,8 +212,8 @@ fn profile_contract_json_schema_accepts_action_exemplars() {
         json!({ "action": "validate", "params": { "name": "release-pipeline" } }),
     ];
     for ex in &exemplars {
-        if let Err(errs) = validator.validate(ex) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(ex) {
+            let collected = collect_validation_errors(&validator, ex);
             panic!("exemplar {ex} failed validation: {collected:?}");
         }
     }
@@ -243,8 +248,8 @@ fn profile_contract_proptest_inputs_validate_against_schema() {
     let mut runner = TestRunner::default();
     for _ in 0..128 {
         let value = strategy.new_tree(&mut runner).unwrap().current();
-        if let Err(errs) = validator.validate(&value) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(&value) {
+            let collected = collect_validation_errors(&validator, &value);
             panic!("proptest-generated request {value} failed schema: {collected:?}");
         }
     }
@@ -412,8 +417,8 @@ fn run_invariant(
             // Compile the response_schema and check shape.
             let response_schema_value = action.response_schema.to_json_schema();
             let validator = compile_schema(&response_schema_value);
-            if let Err(errs) = validator.validate(&response) {
-                let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+            if !validator.is_valid(&response) {
+                let collected = collect_validation_errors(&validator, &response);
                 panic!(
                     "{}.{} {} failed: response {response} does not validate: {collected:?}",
                     contract.family_name, action.action, invariant.name
@@ -515,8 +520,8 @@ fn checkpoint_contract_json_schema_accepts_action_exemplars() {
         }),
     ];
     for ex in &exemplars {
-        if let Err(errs) = validator.validate(ex) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(ex) {
+            let collected = collect_validation_errors(&validator, ex);
             panic!("exemplar {ex} failed validation: {collected:?}");
         }
     }
@@ -545,8 +550,8 @@ fn checkpoint_contract_proptest_inputs_validate_against_schema() {
     let mut runner = TestRunner::default();
     for _ in 0..128 {
         let value = strategy.new_tree(&mut runner).unwrap().current();
-        if let Err(errs) = validator.validate(&value) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(&value) {
+            let collected = collect_validation_errors(&validator, &value);
             panic!("proptest-generated request {value} failed schema: {collected:?}");
         }
     }
@@ -798,8 +803,8 @@ fn work_contract_json_schema_accepts_action_exemplars() {
         json!({ "action": "list", "params": {} }),
     ];
     for ex in &exemplars {
-        if let Err(errs) = validator.validate(ex) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(ex) {
+            let collected = collect_validation_errors(&validator, ex);
             panic!("exemplar {ex} failed validation: {collected:?}");
         }
     }
@@ -824,8 +829,8 @@ fn work_contract_proptest_inputs_validate_against_schema() {
     let mut runner = TestRunner::default();
     for _ in 0..128 {
         let value = strategy.new_tree(&mut runner).unwrap().current();
-        if let Err(errs) = validator.validate(&value) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(&value) {
+            let collected = collect_validation_errors(&validator, &value);
             panic!("proptest-generated request {value} failed schema: {collected:?}");
         }
     }
@@ -1010,8 +1015,8 @@ fn fleet_contract_json_schema_accepts_action_exemplars() {
         json!({ "action": "describe", "params": { "fleet_id": "fl-42" } }),
     ];
     for ex in &exemplars {
-        if let Err(errs) = validator.validate(ex) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(ex) {
+            let collected = collect_validation_errors(&validator, ex);
             panic!("exemplar {ex} failed validation: {collected:?}");
         }
     }
@@ -1036,8 +1041,8 @@ fn fleet_contract_proptest_inputs_validate_against_schema() {
     let mut runner = TestRunner::default();
     for _ in 0..128 {
         let value = strategy.new_tree(&mut runner).unwrap().current();
-        if let Err(errs) = validator.validate(&value) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(&value) {
+            let collected = collect_validation_errors(&validator, &value);
             panic!("proptest-generated request {value} failed schema: {collected:?}");
         }
     }
@@ -1247,8 +1252,8 @@ fn context_contract_json_schema_accepts_action_exemplars() {
         json!({ "action": "history", "params": { "pane_id": "p-42" } }),
     ];
     for ex in &exemplars {
-        if let Err(errs) = validator.validate(ex) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(ex) {
+            let collected = collect_validation_errors(&validator, ex);
             panic!("exemplar {ex} failed validation: {collected:?}");
         }
     }
@@ -1273,8 +1278,8 @@ fn context_contract_proptest_inputs_validate_against_schema() {
     let mut runner = TestRunner::default();
     for _ in 0..128 {
         let value = strategy.new_tree(&mut runner).unwrap().current();
-        if let Err(errs) = validator.validate(&value) {
-            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+        if !validator.is_valid(&value) {
+            let collected = collect_validation_errors(&validator, &value);
             panic!("proptest-generated request {value} failed schema: {collected:?}");
         }
     }

@@ -388,7 +388,7 @@ fn proof_history_sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    hex::encode(digest)
 }
 
 fn proof_history_state_from_resource_param(value: &str) -> Option<ProofState> {
@@ -1356,10 +1356,7 @@ fn load_swarm_scent_reservations(
         );
     }
 
-    let now_ms = match i64::try_from(generated_at_ms) {
-        Ok(ms) => ms,
-        Err(_) => i64::MAX,
-    };
+    let now_ms = i64::try_from(generated_at_ms).unwrap_or(i64::MAX);
     let mut stmt = match conn.prepare(
         r"
         SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at

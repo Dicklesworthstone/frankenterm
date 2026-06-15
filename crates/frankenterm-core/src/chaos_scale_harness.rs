@@ -978,8 +978,11 @@ fn measure_replay_capture_mode(
     }
 
     lag_samples.sort_unstable();
-    let memory_bytes = retained_bytes
-        .saturating_add(summary.pane_count.saturating_mul(CAPTURE_BUFFER_OVERHEAD_BYTES));
+    let memory_bytes = retained_bytes.saturating_add(
+        summary
+            .pane_count
+            .saturating_mul(CAPTURE_BUFFER_OVERHEAD_BYTES),
+    );
     let p99 = percentile_ms(&lag_samples, 99);
     let threshold_passed = p99 <= config.max_capture_lag_ms
         && max_queue_depth <= queue_cap
@@ -1555,7 +1558,7 @@ mod tests {
 
         // native_push coalesces the tight per-pane bursts, so capture lag is ~0
         // (the old synthetic path returned dedup_window*2 here).
-        assert_eq!(native_push.capture_lag_p99_ms, 0.0);
+        assert!(native_push.capture_lag_p99_ms.abs() <= f64::EPSILON);
         // poll waits at most one poll interval; lag is positive and bounded by it
         // (the old synthetic path returned poll_interval*2 = 600).
         assert!(poll.capture_lag_p99_ms > 0.0);

@@ -806,9 +806,10 @@ fn generated_fixtures_match_expected_contract_states_and_privacy_invariants() {
             );
         }
 
-        if let Err(errors) = validator.validate(&report.projection) {
-            let messages = errors
-                .map(|error| format!("{}: {}", error.instance_path, error))
+        if !validator.is_valid(&report.projection) {
+            let messages = validator
+                .iter_errors(&report.projection)
+                .map(|error| format!("{}: {}", error.instance_path(), error))
                 .collect::<Vec<_>>()
                 .join("\n");
             panic!(

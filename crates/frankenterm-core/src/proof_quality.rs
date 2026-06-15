@@ -588,8 +588,8 @@ fn nibble_to_hex(nibble: u8) -> char {
 mod tests {
     use super::*;
     use crate::deferred_proof_replay::{
-        DeferredProofEnvVar, DEFERRED_PROOF_REPLAY_ATTEMPT_CONTRACT_ID,
-        DEFERRED_PROOF_REPLAY_SCHEMA_VERSION,
+        DEFERRED_PROOF_REPLAY_ATTEMPT_CONTRACT_ID, DEFERRED_PROOF_REPLAY_SCHEMA_VERSION,
+        DeferredProofEnvVar,
     };
     use crate::proof_intent::{ProofRedactionPolicy, ProofScope};
 

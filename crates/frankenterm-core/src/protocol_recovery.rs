@@ -306,7 +306,7 @@ impl RecoveryConfig {
         // pattern jitter is supposed to break. Draw from thread-rng so
         // each engine's retries desynchronize across the fleet.
         let jitter = if jitter_range > 0.0 {
-            use rand::Rng;
+            use rand::RngExt;
             rand::rng().random_range(-jitter_range..=jitter_range)
         } else {
             0.0
