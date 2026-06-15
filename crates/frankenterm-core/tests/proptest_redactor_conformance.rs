@@ -311,6 +311,169 @@ fn every_catalog_pattern_has_smoke_coverage() {
     );
 }
 
+#[test]
+fn catalog_pattern_names_match_ordered_golden() {
+    // ft-llko1 GOLDEN-ARTIFACT pin: the exact ordered SECRET_PATTERNS catalog.
+    //
+    // Priority order is load-bearing — `detect()`/`redact()` resolve overlaps
+    // by THIS order, so every specific provider pattern MUST precede the generic
+    // fallbacks (the invariant ft-uu4b8 / ft-b1p6x depend on: e.g. `anthropic_key`
+    // / `google_api_key` ahead of `generic_api_key`). The set-based
+    // `every_catalog_pattern_has_smoke_coverage` drift guard catches ADDITIONS
+    // but not REMOVALS or REORDERING; this golden catches all three. To change
+    // the catalog intentionally, update GOLDEN in the same commit.
+    const GOLDEN: &[&str] = &[
+        "anthropic_key",
+        "openai_key",
+        "github_token",
+        "github_fine_grained_pat",
+        "gitlab_token",
+        "xai_key",
+        "groq_key",
+        "google_api_key",
+        "google_oauth_token",
+        "huggingface_token",
+        "replicate_token",
+        "anyscale_key",
+        "perplexity_key",
+        "ai_provider_keyed_value",
+        "aws_access_key_id",
+        "aws_secret_key",
+        "bearer_token",
+        "slack_token",
+        "stripe_key",
+        "twilio_account_sid",
+        "sendgrid_key",
+        "datadog_api_key",
+        "database_url",
+        "ssh_private_key",
+        "pgp_block",
+        "jwt_token",
+        "device_code",
+        "oauth_url",
+        "generic_api_key",
+        "generic_token",
+        "generic_password",
+        "generic_secret",
+    ];
+    let live: Vec<&'static str> = frankenterm_core::redactor::secret_pattern_names().collect();
+    assert_eq!(
+        live.len(),
+        GOLDEN.len(),
+        "ft-llko1: catalog size drifted (golden={}, live={}): {live:?}",
+        GOLDEN.len(),
+        live.len()
+    );
+    assert_eq!(
+        live.as_slice(),
+        GOLDEN,
+        "ft-llko1: catalog name/order drift (add/remove/reorder) — update GOLDEN deliberately in the same commit"
+    );
+    // Concrete priority invariant the order encodes: the generic fallbacks form a
+    // contiguous lowest-priority tail, so no generic can pre-empt a specific
+    // provider pattern in detect()/redact() overlap resolution.
+    let first_generic = live
+        .iter()
+        .position(|name| name.starts_with("generic_"))
+        .expect("ft-llko1: at least one generic_* fallback must exist");
+    assert!(
+        live[first_generic..]
+            .iter()
+            .all(|name| name.starts_with("generic_")),
+        "ft-llko1: generic_* fallbacks must be a contiguous lowest-priority tail: {live:?}"
+    );
+}
+
+#[test]
+fn specific_provider_token_keeps_its_name_and_never_leaks_under_wrapping() {
+    // ft-llko1 metamorphic guard for the ft-uu4b8 / ft-b1p6x defect class:
+    // a provider's canonical token must be claimed by THAT provider's pattern
+    // (not a generic fallback) and must never leak, regardless of the benign
+    // context it is embedded in. Wrappings include multibyte-UTF-8 framing so
+    // the no-leak and valid-UTF-8 invariants are exercised together.
+    //
+    // (canonical_token, expected_pattern_name, secret_body_that_must_not_leak)
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "sk-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX1234567890",
+            "anthropic_key",
+            "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX1234567890",
+        ),
+        (
+            "sk-1234567890abcdefghij1234567890ABCD",
+            "openai_key",
+            "1234567890abcdefghij1234567890ABCD",
+        ),
+        (
+            "AIzaA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7-",
+            "google_api_key",
+            "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7",
+        ),
+        (
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "github_token",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
+        (
+            "xai-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "xai_key",
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        ),
+        // ft-b1p6x: provider-keyed value (azure_openai) — the specific anchor
+        // must win over generic_api_key for the same `..._api_key=VALUE` shape.
+        (
+            "azure_openai_api_key=ABCDEFGHIJKLMNOP1234567890",
+            "ai_provider_keyed_value",
+            "ABCDEFGHIJKLMNOP1234567890",
+        ),
+        // ft-b1p6x: device-flow codes (device_code + user_code aliases).
+        ("device_code=WXYZ123456", "device_code", "WXYZ123456"),
+        ("user_code=ABCD987654", "device_code", "ABCD987654"),
+    ];
+
+    let redactor = Redactor::new();
+    for &(token, expected_name, secret_body) in cases {
+        // Metamorphic transforms: each must preserve the named detection and the
+        // no-leak invariant.
+        let wrappings = [
+            token.to_string(),
+            format!("noise-prefix {token} noise-suffix"),
+            format!("线 {token} 日本語"),
+            format!("[2026-06-15T00:00:00Z] config {token}"),
+        ];
+        for wrapped in &wrappings {
+            let at = wrapped
+                .find(token)
+                .expect("ft-llko1: token must embed in wrapping");
+            let tstart = at as u32;
+            let tend = (at + token.len()) as u32;
+
+            let detections = redactor.detect(wrapped);
+            assert!(
+                detections.iter().any(|(name, s, e)| {
+                    *name == expected_name && (*s as u32) < tend && (*e as u32) > tstart
+                }),
+                "ft-llko1: expected `{expected_name}` to claim `{token}` in {wrapped:?}; got {detections:?}"
+            );
+
+            let redacted = redactor.redact(wrapped);
+            assert!(
+                !redacted.contains(secret_body),
+                "ft-llko1: secret body leaked for `{expected_name}` in {wrapped:?}: {redacted:?}"
+            );
+            // Redactor output is always a Rust String (valid UTF-8); assert the
+            // multibyte context survives intact so redaction never corrupts the
+            // surrounding bytes.
+            if wrapped.contains('线') {
+                assert!(
+                    redacted.contains('线') && redacted.contains("日本語"),
+                    "ft-llko1: multibyte context must survive redaction: {redacted:?}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Structural invariants — proptest
 // ---------------------------------------------------------------------------
