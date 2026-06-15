@@ -272,12 +272,21 @@ fn write_state_file(ext_dir: &Path, enabled: bool) -> Result<()> {
 }
 
 fn read_state_file(ext_dir: &Path) -> bool {
+    // The state file is a TOML *document* (`enabled = <bool>`), so it must be
+    // parsed as one — via `toml::Table`, exactly as `ParsedManifest::from_toml_str`
+    // does. toml 1.x's `str::parse::<toml::Value>()` parses a single bare VALUE,
+    // not a document, so it rejected `enabled = false` with "unexpected content"
+    // and silently fell through to the `true` default — re-enabling a disabled
+    // extension on the next `scan()` (ft-crsdl: a disable-as-killswitch bypass
+    // introduced by the toml 0.8 -> 1.x bump). A missing file, a missing key, or
+    // an unparseable file all default to enabled (never silently disabled),
+    // preserving the prior "default to enabled" semantics.
     let path = ext_dir.join(STATE_FILE);
     match std::fs::read_to_string(&path) {
         Ok(content) => content
-            .parse::<toml::Value>()
+            .parse::<toml::Table>()
             .ok()
-            .and_then(|v| v.get("enabled")?.as_bool())
+            .and_then(|table| table.get("enabled")?.as_bool())
             .unwrap_or(true),
         Err(_) => true, // Default to enabled if no state file
     }
@@ -465,6 +474,33 @@ entry = "main.wasm"
         assert_eq!(
             lifecycle.get_state("disabled-ext"),
             Some(ExtensionState::Disabled)
+        );
+    }
+
+    #[test]
+    fn state_file_disabled_round_trips_through_read_after_write() {
+        // ft-crsdl guard: the on-disk state file is a TOML document; read_state_file
+        // must parse it as one (toml 1.x's parse::<Value>() does not). A
+        // write(false) MUST read back as false — otherwise a disabled extension
+        // silently re-enables on the next scan(). Pinned at the file level so a
+        // future toml bump can't re-break the disable-as-killswitch path.
+        let dir = tempfile::tempdir().unwrap();
+        write_state_file(dir.path(), false).unwrap();
+        assert!(
+            !read_state_file(dir.path()),
+            "disabled state must round-trip through the state file"
+        );
+        write_state_file(dir.path(), true).unwrap();
+        assert!(
+            read_state_file(dir.path()),
+            "enabled state must round-trip through the state file"
+        );
+
+        // A missing state file defaults to enabled (no one disabled it).
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            read_state_file(empty.path()),
+            "a missing state file defaults to enabled"
         );
     }
 
