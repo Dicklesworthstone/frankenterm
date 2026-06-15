@@ -36997,20 +36997,40 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             now_ms,
                                         )
                                     } else {
+                                        // ft-4s5vj FAIL-CLOSED: `ft robot tx rollback` has no
+                                        // dry-run mode, so the synthetic allow-all executor
+                                        // here would ALWAYS fabricate rollback success —
+                                        // execute_compensations() returns synthetic inputs and
+                                        // execute_compensation_phase() reports the rollback
+                                        // SUCCEEDED while no real pane compensation ran. When the
+                                        // real tx runtime (storage + terminal backend) is
+                                        // unavailable, refuse instead: a real commit's effects
+                                        // must not silently persist behind a fabricated "rolled
+                                        // back" report. (Mirrors ft-pmbe1's run-path guard.)
                                         if let Some(reason) = fallback_reason.as_deref() {
                                             tracing::warn!(
                                                 %reason,
-                                                "falling back to synthetic robot tx rollback executor"
+                                                "refusing robot tx rollback: real tx runtime unavailable (synthetic executor would fabricate rollback success)"
                                             );
                                         }
-                                        execute_tx_rollback_with_executor(
-                                            frankenterm_core::tx_execution::SyntheticStepExecutor,
-                                            &contract_path,
-                                            &contract,
-                                            &commit_report,
-                                            fail_compensation_for_step.as_deref(),
-                                            now_ms,
-                                        )
+                                        let response =
+                                            RobotResponse::<RobotTxRollbackData>::error_with_code(
+                                                "robot.tx_real_runtime_unavailable",
+                                                format!(
+                                                    "real tx runtime unavailable{}; refusing to report rollback success through the synthetic executor — no real compensation would run, so the prior commit's effects would persist while the report claims they were undone. Restore the storage and terminal backend, then re-run the rollback.",
+                                                    fallback_reason
+                                                        .as_deref()
+                                                        .map(|reason| format!(" ({reason})"))
+                                                        .unwrap_or_default()
+                                                ),
+                                                Some(
+                                                    "The transaction was NOT rolled back; its committed effects are unchanged. Restore the storage/terminal backend and re-run `ft robot tx rollback`."
+                                                        .to_string(),
+                                                ),
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
                                     };
                                     let data = match data {
                                         Ok(data) => data,
@@ -56451,16 +56471,36 @@ async fn handle_tx_command(
                     now_ms,
                 )
             } else {
+                // ft-4s5vj FAIL-CLOSED: `ft tx rollback` has no dry-run mode, so the
+                // synthetic allow-all executor here would ALWAYS fabricate rollback
+                // success — no real pane compensation runs, yet the report claims the
+                // rollback SUCCEEDED. When the real tx runtime (storage + terminal
+                // backend) is unavailable, refuse instead so a real commit's effects
+                // cannot silently persist behind a fabricated "rolled back" report.
+                // (Mirrors ft-pmbe1's run-path guard.)
                 if let Some(reason) = fallback_reason.as_deref() {
-                    tracing::warn!(%reason, "falling back to synthetic tx rollback executor");
+                    tracing::warn!(
+                        %reason,
+                        "refusing tx rollback: real tx runtime unavailable (synthetic executor would fabricate rollback success)"
+                    );
                 }
-                execute_tx_rollback_with_executor(
-                    frankenterm_core::tx_execution::SyntheticStepExecutor,
-                    &contract_path,
-                    &contract,
-                    &commit_report,
-                    fail_compensation_for_step.as_deref(),
-                    now_ms,
+                emit_mission_error(
+                    output_format,
+                    MissionCommandError {
+                        exit_code: MISSION_EXIT_VALIDATION,
+                        error_code: "mission.tx.real_runtime_unavailable",
+                        message: format!(
+                            "real tx runtime unavailable{}; refusing to report rollback success through the synthetic executor — no real compensation would run, so the prior commit's effects would persist while the report claims they were undone. Restore the storage and terminal backend, then re-run the rollback.",
+                            fallback_reason
+                                .as_deref()
+                                .map(|reason| format!(" ({reason})"))
+                                .unwrap_or_default()
+                        ),
+                        hint: Some(
+                            "The transaction was NOT rolled back; its committed effects are unchanged. Restore the storage/terminal backend and re-run `ft tx rollback`."
+                                .to_string(),
+                        ),
+                    },
                 )
             }
             .map_err(|message| MissionCommandError {
