@@ -54194,6 +54194,43 @@ const MISSION_EXIT_VALIDATION: i32 = 5;
 const MISSION_EXIT_TRANSITION: i32 = 6;
 const MISSION_EXIT_INVALID_INPUT: i32 = 7;
 
+/// ft-99ybo: hostile-file DoS cap for caller-supplied mission/tx JSON, mirroring
+/// `mcp_missions::MAX_TX_CONTRACT_BYTES` (16 MiB). A robot caller pointing
+/// `--mission-file` / `--contract-file` at a multi-GiB file must not be able to
+/// OOM the process via an unbounded `read_to_string`.
+const MISSION_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// ft-99ybo: fail-closed size guard for a caller-supplied mission/tx file,
+/// rejecting an oversized file BEFORE the loader's unbounded `read_to_string`
+/// so a hostile `--mission-file` / `--contract-file` pointing at a multi-GiB
+/// file cannot OOM the process. Inserted ahead of (not replacing) each loader's
+/// read so the existing not-found / read-failed messages, hints, and tests are
+/// preserved. Stat-based: it rejects a pre-existing oversized file, which is the
+/// confused-deputy attack vector here; a `stat` failure falls through to the
+/// normal read (legitimate network/procfs paths are not hard-failed).
+fn enforce_mission_file_size_cap(
+    path: &Path,
+    too_large_code: &'static str,
+) -> Result<(), MissionCommandError> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MISSION_FILE_MAX_BYTES {
+            return Err(MissionCommandError {
+                exit_code: MISSION_EXIT_INVALID_INPUT,
+                error_code: too_large_code,
+                message: format!(
+                    "File {} is {} bytes; max allowed is {MISSION_FILE_MAX_BYTES} bytes",
+                    path.display(),
+                    meta.len()
+                ),
+                hint: Some(
+                    "16 MiB is the ft-99ybo mission/tx hostile-file DoS cap.".to_string(),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn mission_now_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as i64,
@@ -54215,6 +54252,7 @@ fn resolve_mission_file_path(
 fn load_mission_from_path(
     path: &Path,
 ) -> Result<frankenterm_core::plan::Mission, MissionCommandError> {
+    enforce_mission_file_size_cap(path, "mission.file_too_large")?;
     let raw = fs::read_to_string(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             MissionCommandError {
@@ -54272,6 +54310,7 @@ fn resolve_mission_tx_file_path(
 fn load_mission_tx_contract_from_path(
     path: &Path,
 ) -> Result<frankenterm_core::plan::MissionTxContract, MissionCommandError> {
+    enforce_mission_file_size_cap(path, "mission.tx.file_too_large")?;
     let raw = fs::read_to_string(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             MissionCommandError {
