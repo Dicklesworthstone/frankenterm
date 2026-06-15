@@ -4,6 +4,14 @@
 //! The index allows tail reads to seek directly to the relevant byte window.
 //! A later slice can swap the tail read path to true mmap once we expose a
 //! safe mapping wrapper that fits this crate's `unsafe_code = forbid` policy.
+//!
+//! Compaction (dropping a stale prefix once enough bytes age out) rewrites the
+//! log crash-safely: the retained suffix is written to a sibling temp file,
+//! fsync'd, and atomically renamed over the live log, so a crash mid-compaction
+//! leaves either the old or the compacted log intact — never a truncated one
+//! (ft-odrq7). Appends themselves are still buffered (no per-line fsync), so a
+//! crash can drop the most recent unsynced lines; durable append is tracked
+//! separately under ft-2okh0.5.1.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, create_dir_all};
@@ -254,14 +262,53 @@ impl PaneFile {
         source.seek(SeekFrom::Start(stale_bytes))?;
         source.read_to_end(&mut retained)?;
 
-        let mut compacted = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.log_path)?;
-        compacted.write_all(&retained)?;
-        compacted.flush()?;
-        drop(compacted);
+        // Crash-safe compaction (ft-odrq7): write the retained suffix to a
+        // sibling temp file, fsync it, then atomically rename it over the live
+        // log. The previous implementation reopened the live log with
+        // `truncate(true)` — zeroing it in place — and wrote the suffix back
+        // with only a buffered `flush()` (no fsync). A crash between the
+        // truncate and a durable write lost the ENTIRE retained scrollback for
+        // the pane, not just the stale prefix it was supposed to drop. With
+        // temp + fsync + rename, the live log is at every instant either the
+        // old (full) file or the new (compacted) file — never truncated.
+        let tmp_path = {
+            let mut path = self.log_path.clone();
+            let name = self
+                .log_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    MmapStoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "scrollback log path has no file name",
+                    ))
+                })?;
+            path.set_file_name(format!("{name}.compact.tmp"));
+            path
+        };
+        {
+            // `truncate(true)` here only clears any stale temp from a previously
+            // interrupted compaction; the live log is untouched until the rename.
+            let mut compacted = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            compacted.write_all(&retained)?;
+            // Persist the retained bytes before the rename so the swap can never
+            // expose a partially written compacted log.
+            compacted.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &self.log_path)?;
+        // Make the rename itself durable: without a directory fsync a crash
+        // after the rename but before the directory entry reaches disk could
+        // resurrect the pre-compaction file. Best-effort and portable — opening
+        // a directory as a `File` is not supported on every platform.
+        if let Some(dir) = self.log_path.parent() {
+            if let Ok(dir_handle) = File::open(dir) {
+                let _ = dir_handle.sync_all();
+            }
+        }
 
         self.file = OpenOptions::new()
             .read(true)
@@ -1029,6 +1076,71 @@ mod tests {
         assert_eq!(
             store.line_at(1, 6).unwrap().as_deref(),
             Some(expected_line_6.as_str())
+        );
+    }
+
+    #[test]
+    fn compaction_is_crash_safe_no_temp_leak_and_retained_intact() {
+        // ft-odrq7: compaction must rewrite the log via temp + fsync + atomic
+        // rename — never an in-place `truncate(true)`. After a successful
+        // compaction the live log holds exactly the retained suffix and no
+        // interrupted-compaction temp file survives.
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        for idx in 0..8 {
+            store.append_line(1, &format!("line-{idx}")).unwrap();
+        }
+        store.prune_before(1, 6).unwrap();
+        assert!(store.compact_pane_if_stale(1, 1).unwrap());
+
+        let tmp = dir.path().join("1.log.compact.tmp");
+        assert!(
+            !tmp.exists(),
+            "compaction temp must be renamed away, not leaked"
+        );
+
+        // Reading the raw file proves the retained bytes are the WHOLE file —
+        // i.e. produced by the rename, not re-grown from a zeroed-in-place log.
+        let raw = std::fs::read_to_string(dir.path().join("1.log")).unwrap();
+        assert_eq!(raw, "line-6\nline-7\n");
+        assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["line-6", "line-7"]);
+        assert_eq!(store.oldest_seq(1), Some(6));
+    }
+
+    #[test]
+    fn compaction_recovers_from_leftover_temp_of_interrupted_run() {
+        // A crash during a prior compaction can leave a stale
+        // `<pane>.log.compact.tmp`. The next compaction must overwrite
+        // (truncate) it, not append to or trip over it, so the retained data
+        // stays correct (ft-odrq7).
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        for idx in 0..8 {
+            store.append_line(1, &format!("row-{idx}")).unwrap();
+        }
+        store.prune_before(1, 6).unwrap();
+
+        // Simulate the crash-leftover temp of an interrupted compaction.
+        std::fs::write(
+            dir.path().join("1.log.compact.tmp"),
+            b"GARBAGE-FROM-INTERRUPTED-COMPACTION\n",
+        )
+        .unwrap();
+
+        assert!(store.compact_pane_if_stale(1, 1).unwrap());
+
+        let raw = std::fs::read_to_string(dir.path().join("1.log")).unwrap();
+        assert_eq!(
+            raw, "row-6\nrow-7\n",
+            "leftover temp must not corrupt the compacted log"
+        );
+        assert!(!raw.contains("GARBAGE"));
+        assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["row-6", "row-7"]);
+        assert!(
+            !dir.path().join("1.log.compact.tmp").exists(),
+            "temp consumed by rename"
         );
     }
 
