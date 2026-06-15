@@ -49,6 +49,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::events_dedup_cuckoo::{CuckooDedupVerdict, EventCuckooDedup, EventCuckooDedupSnapshot};
+#[cfg(feature = "subprocess-bridge")]
+use crate::mission_events::MissionEvent;
 use crate::patterns::Detection;
 use crate::policy::Redactor;
 use crate::runtime_async::broadcast;
@@ -210,6 +212,19 @@ pub enum Event {
         name: String,
         payload: UserVarPayload,
     },
+
+    /// Mission pipeline audit event (e.g. `AssignmentEmitted`) published so
+    /// signal subscribers can reconstruct the mission dispatch boundary.
+    /// Boxed because `MissionEvent` is substantially larger than the other
+    /// variants and we do not want to inflate every `Event` value.
+    ///
+    /// Gated on `subprocess-bridge` because `MissionEvent` lives in the
+    /// feature-gated `mission_events` module.
+    #[cfg(feature = "subprocess-bridge")]
+    MissionAudit {
+        /// The structured mission audit payload.
+        event: Box<MissionEvent>,
+    },
     // NOTE: StatusUpdateReceived was removed in v0.2.0 to eliminate Lua performance bottleneck.
     // Alt-screen detection is now handled via escape sequence parsing (see screen_state.rs).
     // Pane metadata (title, dimensions, cursor) is obtained via `wezterm cli list`.
@@ -229,6 +244,8 @@ impl Event {
             Self::WorkflowStep { .. } => "workflow_step",
             Self::WorkflowCompleted { .. } => "workflow_completed",
             Self::UserVarReceived { .. } => "user_var_received",
+            #[cfg(feature = "subprocess-bridge")]
+            Self::MissionAudit { .. } => "mission_audit",
         }
     }
 
@@ -244,6 +261,8 @@ impl Event {
             | Self::WorkflowStarted { pane_id, .. }
             | Self::UserVarReceived { pane_id, .. } => Some(*pane_id),
             Self::WorkflowStep { .. } | Self::WorkflowCompleted { .. } => None,
+            #[cfg(feature = "subprocess-bridge")]
+            Self::MissionAudit { .. } => None,
         }
     }
 }
@@ -1306,6 +1325,13 @@ impl EventBus {
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
             | Event::UserVarReceived { .. } => self.send_routed(
+                event,
+                &self.signal_sender,
+                &self.signal_times,
+                &self.signal_tracker,
+            ),
+            #[cfg(feature = "subprocess-bridge")]
+            Event::MissionAudit { .. } => self.send_routed(
                 event,
                 &self.signal_sender,
                 &self.signal_times,

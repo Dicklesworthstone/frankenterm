@@ -752,7 +752,7 @@ impl AllOfTracker {
 #[derive(Debug, Clone)]
 pub enum StreamItem {
     /// A live event that matched the filter.
-    Event(Event),
+    Event(Box<Event>),
     /// The subscriber fell behind; `missed_count` events were dropped.
     Gap {
         /// Number of events dropped from the broadcast buffer.
@@ -908,7 +908,7 @@ impl FilteredEventStream {
                         {
                             self.cursor.advance(*id);
                         }
-                        return Some(StreamItem::Event(event));
+                        return Some(StreamItem::Event(Box::new(event)));
                     }
                     self.filtered_out.fetch_add(1, Ordering::Relaxed);
                 }

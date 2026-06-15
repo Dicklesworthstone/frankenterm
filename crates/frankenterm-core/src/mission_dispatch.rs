@@ -170,23 +170,16 @@ impl MissionDispatcher {
 
         tracing::info!(assignment_id, target_agent, "dispatching mission contract");
 
-        // Emit AssignmentEmitted audit event.
-        if event_bus.is_some() {
-            let event = self.make_event(
+        // Emit the AssignmentEmitted audit event onto the bus so signal
+        // subscribers can reconstruct the mission dispatch boundary.
+        if let Some(bus) = event_bus {
+            self.publish_assignment_emitted_event(
+                bus,
                 cycle_id,
                 now_ms,
-                MissionEventKind::AssignmentEmitted,
-                "dispatch_started",
                 assignment_id,
-                vec![
-                    (
-                        "assignment_id".to_string(),
-                        serde_json::json!(assignment_id),
-                    ),
-                    ("target_agent".to_string(), serde_json::json!(target_agent)),
-                ],
+                target_agent,
             );
-            let _ = event; // MissionEvent persistence wiring lands separately.
         }
 
         // Build synthetic detection for the workflow runner.
@@ -370,6 +363,41 @@ impl MissionDispatcher {
             workspace: self.config.workspace.clone(),
             track: self.config.track.clone(),
         }
+    }
+
+    /// Build and publish the `AssignmentEmitted` mission audit event.
+    ///
+    /// Previously this event was constructed and then dropped (`let _ =
+    /// event`), which made the module-level contract false: dispatch attempts
+    /// claimed to emit the audit event but subscribers never saw it. The event
+    /// now rides the bus as [`crate::events::Event::MissionAudit`] and is
+    /// routed onto the signal channel alongside the other mission lifecycle
+    /// signals.
+    fn publish_assignment_emitted_event(
+        &self,
+        event_bus: &EventBus,
+        cycle_id: u64,
+        timestamp_ms: i64,
+        assignment_id: &str,
+        target_agent: &str,
+    ) {
+        let event = self.make_event(
+            cycle_id,
+            timestamp_ms,
+            MissionEventKind::AssignmentEmitted,
+            "dispatch_started",
+            assignment_id,
+            vec![
+                (
+                    "assignment_id".to_string(),
+                    serde_json::json!(assignment_id),
+                ),
+                ("target_agent".to_string(), serde_json::json!(target_agent)),
+            ],
+        );
+        let _ = event_bus.publish(crate::events::Event::MissionAudit {
+            event: Box::new(event),
+        });
     }
 
     /// Map a dispatch result to a workflow completion event.
@@ -686,6 +714,49 @@ mod tests {
         );
         assert_eq!(event.workspace, "ws-prod");
         assert_eq!(event.track, "fast-lane");
+    }
+
+    #[test]
+    fn assignment_emitted_event_is_published_to_signal_subscribers() {
+        use crate::events::{Event, EventBus};
+
+        run_async_test(async {
+            let config = MissionDispatcherConfig {
+                sequential: true,
+                workspace: "ws-audit".to_string(),
+                track: "audit-lane".to_string(),
+            };
+            let dispatcher = MissionDispatcher::new(config);
+            let bus = EventBus::new(64);
+            let mut subscriber = bus.subscribe_signals();
+
+            dispatcher.publish_assignment_emitted_event(
+                &bus,
+                7,
+                1_700_000_000_123,
+                "assign-7",
+                "agent-omega",
+            );
+
+            let received = subscriber
+                .recv()
+                .await
+                .expect("a mission audit signal event should be delivered");
+
+            let Event::MissionAudit { event } = received else {
+                panic!("expected a MissionAudit event, got {received:?}");
+            };
+            assert_eq!(event.kind, MissionEventKind::AssignmentEmitted);
+            assert_eq!(event.phase, MissionPhase::Dispatch);
+            assert_eq!(event.cycle_id, 7);
+            assert_eq!(event.timestamp_ms, 1_700_000_000_123);
+            assert_eq!(event.reason_code, "dispatch_started");
+            assert_eq!(event.correlation_id, "assign-7");
+            assert_eq!(event.workspace, "ws-audit");
+            assert_eq!(event.track, "audit-lane");
+            assert_eq!(event.details["assignment_id"], "assign-7");
+            assert_eq!(event.details["target_agent"], "agent-omega");
+        });
     }
 
     #[test]

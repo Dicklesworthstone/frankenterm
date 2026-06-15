@@ -455,6 +455,9 @@ impl AgentStreamer {
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
             | Event::UserVarReceived { .. } => None,
+            // Mission audit events are local-only; not streamed.
+            #[cfg(feature = "subprocess-bridge")]
+            Event::MissionAudit { .. } => None,
         };
 
         match payload {
