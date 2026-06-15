@@ -1,0 +1,127 @@
+[
+  {
+    "case": "green_overclaim",
+    "expected_failure": "overall_status",
+    "document": {
+      "schema_version": "1.0.0",
+      "kind": "robot-contract-doctor-attestation",
+      "category": "proofs/robot-contracts",
+      "produced_by_bead": "ft-7h5da.13.7",
+      "overall_status": "pass",
+      "proof_categories": [4],
+      "contract": {
+        "contract_id": "ft.robot_contract_doctor.v1",
+        "api_surface_count": 38,
+        "matrix_surface_count": 38,
+        "dimensions": ["ENV", "PAR", "POL", "RED", "TOON", "ERR"],
+        "unified_ci_verdict": true,
+        "local_cargo_counts_as_proof": false,
+        "tracked_exceptions_are_not_green_claims": true
+      },
+      "claim_boundaries": {
+        "does_not_claim_all_policy_audit_rows_complete": true,
+        "does_not_claim_dom_redaction_gap_closed": true,
+        "does_not_claim_mission_pause_resume_abort_in_api_surface_all": true,
+        "does_not_claim_local_cargo_as_remote_proof": true,
+        "does_not_mutate_panes_services_or_beads": true
+      },
+      "ci_verdict": {
+        "workflow": ".github/workflows/contract-families-matrix.yml",
+        "job": "matrix",
+        "fail_closed_steps": [
+          {"name": "Robot/MCP Contract Doctor static verdict", "command": "bash scripts/check-contract-doctor-coverage.sh"},
+          {"name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..."},
+          {"name": "Robot/MCP Contract Doctor cargo verdict", "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"}
+        ]
+      },
+      "tracked_exceptions": [
+        {"gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception"},
+        {"gap_id": "G3", "tracking_bead": "ft-5puf0", "status": "tracked_exception"},
+        {"gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception"}
+      ]
+    }
+  },
+  {
+    "case": "missing_dom_redaction_gap",
+    "expected_failure": "tracked_exceptions",
+    "document": {
+      "schema_version": "1.0.0",
+      "kind": "robot-contract-doctor-attestation",
+      "category": "proofs/robot-contracts",
+      "produced_by_bead": "ft-7h5da.13.7",
+      "overall_status": "pass_with_tracked_exceptions",
+      "proof_categories": [4],
+      "contract": {
+        "contract_id": "ft.robot_contract_doctor.v1",
+        "api_surface_count": 38,
+        "matrix_surface_count": 38,
+        "dimensions": ["ENV", "PAR", "POL", "RED", "TOON", "ERR"],
+        "unified_ci_verdict": true,
+        "local_cargo_counts_as_proof": false,
+        "tracked_exceptions_are_not_green_claims": true
+      },
+      "claim_boundaries": {
+        "does_not_claim_all_policy_audit_rows_complete": true,
+        "does_not_claim_dom_redaction_gap_closed": true,
+        "does_not_claim_mission_pause_resume_abort_in_api_surface_all": true,
+        "does_not_claim_local_cargo_as_remote_proof": true,
+        "does_not_mutate_panes_services_or_beads": true
+      },
+      "ci_verdict": {
+        "workflow": ".github/workflows/contract-families-matrix.yml",
+        "job": "matrix",
+        "fail_closed_steps": [
+          {"name": "Robot/MCP Contract Doctor static verdict", "command": "bash scripts/check-contract-doctor-coverage.sh"},
+          {"name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..."},
+          {"name": "Robot/MCP Contract Doctor cargo verdict", "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"}
+        ]
+      },
+      "tracked_exceptions": [
+        {"gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception"},
+        {"gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception"}
+      ]
+    }
+  },
+  {
+    "case": "local_cargo_counted",
+    "expected_failure": "local_cargo_counts_as_proof",
+    "document": {
+      "schema_version": "1.0.0",
+      "kind": "robot-contract-doctor-attestation",
+      "category": "proofs/robot-contracts",
+      "produced_by_bead": "ft-7h5da.13.7",
+      "overall_status": "pass_with_tracked_exceptions",
+      "proof_categories": [4],
+      "contract": {
+        "contract_id": "ft.robot_contract_doctor.v1",
+        "api_surface_count": 38,
+        "matrix_surface_count": 38,
+        "dimensions": ["ENV", "PAR", "POL", "RED", "TOON", "ERR"],
+        "unified_ci_verdict": true,
+        "local_cargo_counts_as_proof": true,
+        "tracked_exceptions_are_not_green_claims": true
+      },
+      "claim_boundaries": {
+        "does_not_claim_all_policy_audit_rows_complete": true,
+        "does_not_claim_dom_redaction_gap_closed": true,
+        "does_not_claim_mission_pause_resume_abort_in_api_surface_all": true,
+        "does_not_claim_local_cargo_as_remote_proof": true,
+        "does_not_mutate_panes_services_or_beads": true
+      },
+      "ci_verdict": {
+        "workflow": ".github/workflows/contract-families-matrix.yml",
+        "job": "matrix",
+        "fail_closed_steps": [
+          {"name": "Robot/MCP Contract Doctor static verdict", "command": "bash scripts/check-contract-doctor-coverage.sh"},
+          {"name": "Robot/MCP Contract Doctor attestation slot", "command": "jq -e ..."},
+          {"name": "Robot/MCP Contract Doctor cargo verdict", "command": "cargo test -p frankenterm-core --lib robot_api_contracts -- --nocapture"}
+        ]
+      },
+      "tracked_exceptions": [
+        {"gap_id": "G1", "tracking_bead": "ft-6mmyp", "status": "tracked_exception"},
+        {"gap_id": "G3", "tracking_bead": "ft-5puf0", "status": "tracked_exception"},
+        {"gap_id": "G4", "tracking_bead": "ft-7h5da.13.6", "status": "tracked_exception"}
+      ]
+    }
+  }
+]

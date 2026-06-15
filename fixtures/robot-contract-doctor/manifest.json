@@ -1,0 +1,17 @@
+{
+  "schema_version": "ft.robot_contract_doctor.fixtures.v1",
+  "contract_id": "ft.robot_contract_doctor.v1",
+  "description": "Fixture bundle for zero-RCH conformance/golden tests of the Robot/MCP Contract Doctor verdict surface.",
+  "golden_verdict": "fixtures/robot-contract-doctor/golden/verdict.v1.json",
+  "golden_projection": "fixtures/robot-contract-doctor/golden/verdict-projection.v1.json",
+  "invalid_fragments": "fixtures/robot-contract-doctor/invalid/fragments.v1.json",
+  "verifier": "tests/e2e/test_robot_contract_doctor_verdict_contract.sh",
+  "live_artifact": "docs/attestations/proofs/robot-contract-doctor.json",
+  "source_documents": [
+    "docs/robot-contracts/contract-doctor-matrix.md",
+    "docs/robot-contracts/api-surface-coverage.md",
+    "scripts/check-contract-doctor-coverage.sh",
+    ".github/workflows/contract-families-matrix.yml",
+    "docs/attestations/manifest.json"
+  ]
+}
