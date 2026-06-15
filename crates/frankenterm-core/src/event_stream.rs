@@ -456,6 +456,18 @@ pub enum WaitResult {
         /// Reason for cancellation.
         reason: String,
     },
+    /// The waiter fell behind the bounded broadcast buffer and `missed_count`
+    /// events were dropped before it drained them. The awaited event MAY have
+    /// been among the dropped events, so the outcome is indeterminate — callers
+    /// must re-baseline (re-query persisted state) rather than treat it as a
+    /// timeout. Surfaced explicitly per the no-silent-gaps doctrine (ft-dkxp4;
+    /// cf. the ft-ubuw2 `StreamItem::Gap` fix).
+    Lagged {
+        /// Number of events dropped from the broadcast buffer.
+        missed_count: u64,
+        /// How long the wait ran before it lagged (ms).
+        elapsed_ms: u64,
+    },
 }
 
 impl WaitResult {
@@ -469,6 +481,13 @@ impl WaitResult {
     #[must_use]
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout { .. })
+    }
+
+    /// Returns true if the waiter fell behind the broadcast buffer (the outcome
+    /// is indeterminate and the caller should re-baseline).
+    #[must_use]
+    pub fn is_lagged(&self) -> bool {
+        matches!(self, Self::Lagged { .. })
     }
 }
 
@@ -566,6 +585,17 @@ impl EventWaiter {
         // belt-and-suspenders per-recv cancel observation so a cancel
         // fired under LabRuntime virtual time lands at the recv boundary
         // rather than waiting on drop-cancel of the outer future.
+        // ft-dkxp4: surface a broadcast overflow explicitly instead of silently
+        // dropping it. A waiter that fell behind cannot be sure it didn't miss
+        // the awaited event, so it stops and reports the gap rather than looping
+        // on — looping on could time out forever on a one-shot condition whose
+        // event was in the dropped window. Mirrors the ft-ubuw2 StreamItem::Gap.
+        enum WaitRecvOutcome {
+            Matched(Event),
+            Lagged(u64),
+            Ended,
+        }
+
         let recv_loop = async move {
             match condition {
                 WaitCondition::AllOf { conditions } => {
@@ -574,12 +604,16 @@ impl EventWaiter {
                         match subscriber.recv_cx(cx).await {
                             Ok(event) => {
                                 if filter.matches_event(&event) && tracker.check(&event) {
-                                    return Some(event);
+                                    return WaitRecvOutcome::Matched(event);
                                 }
                             }
-                            Err(crate::events::RecvError::Lagged { .. }) => {}
-                            Err(crate::events::RecvError::Cancelled) => return None,
-                            Err(crate::events::RecvError::Closed) => return None,
+                            Err(crate::events::RecvError::Lagged { missed_count }) => {
+                                return WaitRecvOutcome::Lagged(missed_count);
+                            }
+                            Err(crate::events::RecvError::Cancelled)
+                            | Err(crate::events::RecvError::Closed) => {
+                                return WaitRecvOutcome::Ended;
+                            }
                         }
                     }
                 }
@@ -587,23 +621,33 @@ impl EventWaiter {
                     match subscriber.recv_cx(cx).await {
                         Ok(event) => {
                             if filter.matches_event(&event) && condition.matches(&event) {
-                                return Some(event);
+                                return WaitRecvOutcome::Matched(event);
                             }
                         }
-                        Err(crate::events::RecvError::Lagged { .. }) => {}
-                        Err(crate::events::RecvError::Cancelled) => return None,
-                        Err(crate::events::RecvError::Closed) => return None,
+                        Err(crate::events::RecvError::Lagged { missed_count }) => {
+                            return WaitRecvOutcome::Lagged(missed_count);
+                        }
+                        Err(crate::events::RecvError::Cancelled)
+                        | Err(crate::events::RecvError::Closed) => {
+                            return WaitRecvOutcome::Ended;
+                        }
                     }
                 },
             }
         };
 
         match crate::runtime_async::timeout_with_cx(cx, timeout, recv_loop).await {
-            Ok(Some(event)) => WaitResult::Matched {
+            Ok(WaitRecvOutcome::Matched(event)) => WaitResult::Matched {
                 event: Box::new(event),
                 elapsed_ms: start.elapsed().as_millis() as u64,
             },
-            Ok(None) => {
+            // No silent gaps: a lag means the awaited event may have been dropped,
+            // so report it as an indeterminate outcome for the caller to handle.
+            Ok(WaitRecvOutcome::Lagged(missed_count)) => WaitResult::Lagged {
+                missed_count,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            },
+            Ok(WaitRecvOutcome::Ended) => {
                 if cx.is_cancel_requested() {
                     WaitResult::Cancelled {
                         reason: "capability context cancelled during wait".to_string(),
@@ -1510,6 +1554,23 @@ mod tests {
         let result = WaitResult::Timeout { elapsed_ms: 5000 };
         assert!(!result.is_matched());
         assert!(result.is_timeout());
+    }
+
+    #[test]
+    fn wait_result_lagged_is_surfaced_explicitly() {
+        // ft-dkxp4: a lagged wait must be its own outcome, not silently collapsed
+        // into a timeout, so a caller can re-baseline instead of assuming the
+        // event never occurred.
+        let result = WaitResult::Lagged {
+            missed_count: 7,
+            elapsed_ms: 250,
+        };
+        assert!(result.is_lagged());
+        assert!(!result.is_matched());
+        assert!(!result.is_timeout());
+        let value = serde_json::to_value(&result).expect("WaitResult serializes");
+        assert_eq!(value["outcome"], serde_json::json!("lagged"));
+        assert_eq!(value["missed_count"], serde_json::json!(7));
     }
 
     // --- SubscriptionRegistry tests ---
