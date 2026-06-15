@@ -32,8 +32,6 @@
 //! - **Rules** — validates event structure and bounded text
 //! - **WorkflowTrace** — validates workflow step logs and timing
 
-use std::fmt::Write as _;
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -730,29 +728,35 @@ impl EvidenceLifecycleReceipt {
     /// Deterministic receipt id from stable decision fields.
     #[must_use]
     pub fn compute_receipt_id(&self) -> String {
-        let mut payload = String::new();
-        payload.push_str(&self.contract_id);
-        payload.push('\n');
-        let _ = write!(&mut payload, "{}", self.schema_version);
-        payload.push('\n');
-        let _ = write!(&mut payload, "{}", self.generated_at_ms);
+        let mut payload = Vec::new();
+        append_receipt_id_field(&mut payload, b"ft.evidence_lifecycle.receipt_id.v2");
+        append_receipt_id_field(&mut payload, self.contract_id.as_bytes());
+        append_receipt_id_field(&mut payload, self.schema_version.to_string().as_bytes());
+        append_receipt_id_field(&mut payload, self.generated_at_ms.to_string().as_bytes());
+        append_receipt_id_field(&mut payload, self.decisions.len().to_string().as_bytes());
         for decision in &self.decisions {
-            payload.push('\n');
-            payload.push_str(&decision.evidence_id);
-            payload.push('|');
-            payload.push_str(decision.kind.as_str());
-            payload.push('|');
-            payload.push_str(decision.action.as_str());
-            payload.push('|');
-            payload.push_str(decision.reason.as_str());
-            payload.push('|');
-            if let Some(expiry) = decision.effective_expires_at_ms {
-                let _ = write!(&mut payload, "{expiry}");
+            append_receipt_id_field(&mut payload, decision.evidence_id.as_bytes());
+            append_receipt_id_field(&mut payload, decision.kind.as_str().as_bytes());
+            append_receipt_id_field(&mut payload, decision.action.as_str().as_bytes());
+            append_receipt_id_field(&mut payload, decision.reason.as_str().as_bytes());
+            match decision.effective_expires_at_ms {
+                Some(expiry) => {
+                    append_receipt_id_field(&mut payload, b"some");
+                    append_receipt_id_field(&mut payload, expiry.to_string().as_bytes());
+                }
+                None => append_receipt_id_field(&mut payload, b"none"),
             }
         }
-        let digest = hex::encode(Sha256::digest(payload.as_bytes()));
+        let digest = hex::encode(Sha256::digest(&payload));
         format!("evidence:lifecycle:{}", &digest[..32])
     }
+}
+
+fn append_receipt_id_field(payload: &mut Vec<u8>, field: &[u8]) {
+    payload.extend_from_slice(field.len().to_string().as_bytes());
+    payload.push(b':');
+    payload.extend_from_slice(field);
+    payload.push(b';');
 }
 
 /// Plan evidence lifecycle actions for an inventory batch.
@@ -1615,6 +1619,49 @@ mod tests {
     }
 
     #[test]
+    fn evidence_lifecycle_receipt_id_frames_free_text_fields() {
+        fn decision(evidence_id: impl Into<String>) -> EvidenceLifecycleDecision {
+            EvidenceLifecycleDecision {
+                evidence_id: evidence_id.into(),
+                kind: EvidenceArtifactKind::Receipt,
+                action: EvidenceLifecycleAction::Retain,
+                reason: EvidenceLifecycleReason::WithinPolicy,
+                effective_expires_at_ms: None,
+            }
+        }
+
+        fn receipt(decisions: Vec<EvidenceLifecycleDecision>) -> EvidenceLifecycleReceipt {
+            EvidenceLifecycleReceipt {
+                contract_id: EVIDENCE_LIFECYCLE_CONTRACT_ID.to_string(),
+                schema_version: EVIDENCE_LIFECYCLE_SCHEMA_VERSION,
+                generated_at_ms: 10,
+                receipt_id: String::new(),
+                decisions,
+                minimize_count: 0,
+                promote_count: 0,
+                refused_promotion_count: 0,
+                hold_count: 0,
+                expire_count: 0,
+            }
+        }
+
+        let two_decisions = receipt(vec![decision("a"), decision("b")]);
+        let delimiter_injected_evidence_id = format!(
+            "a|{}|{}|{}|\nb",
+            EvidenceArtifactKind::Receipt.as_str(),
+            EvidenceLifecycleAction::Retain.as_str(),
+            EvidenceLifecycleReason::WithinPolicy.as_str()
+        );
+        let one_decision = receipt(vec![decision(delimiter_injected_evidence_id)]);
+
+        assert_ne!(two_decisions.decisions, one_decision.decisions);
+        assert_ne!(
+            two_decisions.compute_receipt_id(),
+            one_decision.compute_receipt_id()
+        );
+    }
+
+    #[test]
     fn evidence_lifecycle_receipt_roundtrips_json() {
         let policy = EvidenceLifecyclePolicy {
             now_ms: 42,
@@ -1850,10 +1897,11 @@ mod tests {
             max_total_bytes: 1_000_000,
             ..PrivacyBudget::default()
         };
-        match budget.validate() {
-            Err(PrivacyBudgetError::FileExceedsTotal { .. }) => {}
-            other => panic!("expected FileExceedsTotal, got {:?}", other),
-        }
+        let result = budget.validate();
+        assert!(
+            matches!(&result, Err(PrivacyBudgetError::FileExceedsTotal { .. })),
+            "expected FileExceedsTotal, got {result:?}"
+        );
     }
 
     #[test]
@@ -1863,11 +1911,13 @@ mod tests {
             max_bytes_per_file: 0,
             ..PrivacyBudget::default()
         };
-        match budget.validate() {
-            Err(PrivacyBudgetError::ZeroLimit { field }) => {
-                assert!(field.contains("total") || field.contains("file"));
-            }
-            other => panic!("expected ZeroLimit, got {:?}", other),
+        let result = budget.validate();
+        assert!(
+            matches!(&result, Err(PrivacyBudgetError::ZeroLimit { .. })),
+            "expected ZeroLimit, got {result:?}"
+        );
+        if let Err(PrivacyBudgetError::ZeroLimit { field }) = result {
+            assert!(field.contains("total") || field.contains("file"));
         }
     }
 
