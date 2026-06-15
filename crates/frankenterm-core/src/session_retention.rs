@@ -205,17 +205,20 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
 ///
 /// Returns (orphaned_checkpoints, orphaned_pane_states).
 fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::Error> {
-    // Orphaned pane_state rows (checkpoint_id references deleted checkpoint)
-    let orphan_ps = conn.execute(
-        "DELETE FROM mux_pane_state
-         WHERE checkpoint_id NOT IN (
-             SELECT id FROM session_checkpoints
-         )",
-        [],
-    )?;
+    // ft-rt6ol: delete orphan CHECKPOINTS first, then orphan pane_state, inside
+    // one transaction. Removing the orphan checkpoints first turns their child
+    // `mux_pane_state` rows into orphans that the second DELETE then collects in
+    // the SAME pass. The previous pane_state-first ordering missed the linked
+    // shape — a checkpoint orphaned from `mux_sessions` that still has
+    // `mux_pane_state` children — because at that point the child's checkpoint
+    // still existed, leaving the pane_state row behind once the checkpoint was
+    // deleted (a data leak when ON DELETE CASCADE is unavailable, e.g. older or
+    // corrupt DBs with `foreign_keys` disabled). The transaction makes both
+    // deletes commit atomically.
+    let tx = conn.unchecked_transaction()?;
 
-    // Orphaned checkpoint rows (session_id references deleted session)
-    let orphan_cp = conn.execute(
+    // Orphaned checkpoint rows (session_id references a deleted session).
+    let orphan_cp = tx.execute(
         "DELETE FROM session_checkpoints
          WHERE session_id NOT IN (
              SELECT session_id FROM mux_sessions
@@ -223,6 +226,18 @@ fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::
         [],
     )?;
 
+    // Orphaned pane_state rows (checkpoint_id references a deleted checkpoint).
+    // Runs AFTER the checkpoint delete, so it also collects the pane_state
+    // children of the checkpoints just removed above.
+    let orphan_ps = tx.execute(
+        "DELETE FROM mux_pane_state
+         WHERE checkpoint_id NOT IN (
+             SELECT id FROM session_checkpoints
+         )",
+        [],
+    )?;
+
+    tx.commit()?;
     Ok((orphan_cp, orphan_ps))
 }
 
@@ -585,6 +600,50 @@ mod tests {
         let (_, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
         assert_eq!(orphan_ps, 1);
         assert_eq!(count_pane_states(&conn), 1);
+    }
+
+    #[test]
+    fn cleanup_collects_pane_state_children_of_orphan_checkpoint() {
+        // ft-rt6ol: a checkpoint orphaned from mux_sessions that STILL has
+        // mux_pane_state children must be fully collected in ONE pass. The old
+        // pane_state-first ordering left the children behind (the child's
+        // checkpoint still existed at the first DELETE, then was removed by the
+        // second DELETE, orphaning the child).
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        // Orphan checkpoint (ghost session) WITH a pane_state child, inserted
+        // with FK enforcement off to simulate an older/corrupt DB.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO session_checkpoints
+             (session_id, checkpoint_at, checkpoint_type, state_hash, pane_count, total_bytes)
+             VALUES ('orphan-sess', ?1, 'periodic', 'hash', 1, 0)",
+            [now],
+        )
+        .unwrap();
+        let orphan_cp_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json)
+             VALUES (?1, 7, '{}')",
+            [orphan_cp_id],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        assert_eq!(count_checkpoints(&conn), 1);
+        assert_eq!(count_pane_states(&conn), 1);
+
+        // One pass must remove BOTH the orphan checkpoint and its child.
+        let (orphan_cp, orphan_ps) = cleanup_orphaned_data(&conn).unwrap();
+        assert_eq!(orphan_cp, 1, "orphan checkpoint removed");
+        assert_eq!(orphan_ps, 1, "its pane_state child collected in the same pass");
+        assert_eq!(count_checkpoints(&conn), 0);
+        assert_eq!(
+            count_pane_states(&conn),
+            0,
+            "no orphan pane_state may remain after one cleanup pass (ft-rt6ol)"
+        );
     }
 
     // ---- Full cleanup pipeline ----
