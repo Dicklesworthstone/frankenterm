@@ -28,6 +28,7 @@ Column meanings:
 | `wa.events` | `data.events[].matched_text`, `data.events[].extracted` | ✓ | Redacted at write time in `runtime.rs:detection_to_stored_event` (Redactor + `redact_json_leaves` on matched_text + extracted string leaves) before persisting `StoredEvent`. All consumers (MCP wa.events, robot events, web /events, replay, storage queries) now see clean rows. Matrix line numbers and "emission only" claim were stale; fixed under ft-xt93w redaction gap audit. |
 | `wa.events_annotate` / `_triage` / `_label` | echoes back the note/label the caller wrote | indirect ✓ | `storage::set_event_note_sync` at `:12603` redacts on write; wa.events_annotate re-reads the stored (already-redacted) value. |
 | `wa.send` (reflects `text` back to caller on dry-run) | `data.injection.summary` | ✓ | Goes through `PolicyGatedInjector` → `policy::Redactor` before audit + summary emission. |
+| `wa.dom` | `data.zones[].text`, `data.command.text`, `data.output.text`, `data.unavailable_reason` (OSC-133 semantic-zone free text) | ✓ | Built via the shared pure core builder `robot_dom::build_dom_data(&snapshot, &redactor)` at `mcp_tools.rs:2970` (`redactor = Redactor::new()` at `:2850`); zone text redacted in `robot_dom.rs:36` `dom_zone_from_mux` (`redactor.redact(&zone.text)`), and the `command` / `output` text fields are cloned from that already-redacted `zones` vector (`robot_dom.rs:201,257-308`); `unavailable_reason` redacted at `robot_dom.rs:56`. `exit_code` is numeric (`n/a`). Unit test: `robot_dom::tests::zone_text_is_redacted`. |
 
 ### Robot CLI surfaces (`crates/frankenterm/src/main.rs`)
 
@@ -37,6 +38,7 @@ Column meanings:
 | `ft robot state --include-text` | `data.pane_text[pane_id]` | ✓ | Text flows through `get_pane_text` → `REDACTOR.redact(text)` helper at `main.rs:6867-6869`. |
 | `ft robot get-text` | pane text payload | ✓ | Same static `REDACTOR` helper at `main.rs:6867-6869`. |
 | `ft robot search` | `results[].snippet`, `results[].content` | ✓ | Goes through the same `wa.search` code path via the shared handler. |
+| `ft robot dom` (`zones` / `last-command` / `output-of`) | `data.zones[].text`, `data.command.text`, `data.output.text` (OSC-133 semantic zones) | ✓ | Same shared pure core builder via `build_robot_dom_data` → `robot_dom::build_dom_data(&snapshot, &Redactor::new())` at `main.rs:23865-23871`; byte-equal with the `wa.dom` MCP envelope. The unavailable path uses `robot_dom::dom_unavailable(&Redactor::new())` at `main.rs:23847-23854`. |
 
 ### Web API (`crates/frankenterm-core/src/web/`)
 
@@ -64,6 +66,7 @@ Column meanings:
 ## Actionable findings from this audit
 
 - No open findings remain in the audited rows above as of `ft-yj375`; `wa.state` and `ft robot state` now redact pane `title` / `cwd` at the serving handler.
+- `ft-5puf0` (Contract-Doctor gap G3): audited the `wa.dom` / `ft robot dom` OSC-133 semantic-zone read path — it was missing from this matrix but NOT a leak. Both the MCP tool and robot CLI route through the single shared pure builder `frankenterm_core::robot_dom::build_dom_data` with a live `Redactor::new()`; zone/command/output text is redacted at `robot_dom.rs:36` and all command/output fields derive from the already-redacted `zones` vector. Added the two rows above. Code-resident proof: `robot_dom::tests::zone_text_is_redacted` (RCH re-run deferred while the lane is flaky).
 - Policy-denial audit wiring (ft-h90rh / ft-rsqap / ft-mw1zb): 11 of 12 deny paths now also persist to `policy_denied_audit`. Only `wa.send` is deliberately routed through `PolicyGatedInjector` (which already writes to `audit_actions`); adding a second audit stream would double-count. See `docs/security/policy-denial-audit-wiring-matrix.md`.
 
 ## Regression discipline
