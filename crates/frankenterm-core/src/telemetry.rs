@@ -1065,6 +1065,28 @@ pub struct TelemetryCollector {
     sample_count: AtomicU64,
 }
 
+/// Wait up to `total` between telemetry samples while staying responsive to a
+/// live Cx cancellation (ft-ati70).
+///
+/// [`crate::runtime_async::sleep_with_cx`] honours budget deadlines but does not
+/// observe a direct cancel request, so the interval is split into short ticks
+/// with a cancel check between each. Returns `false` if the Cx was cancelled
+/// during the wait (the caller should stop), `true` if the full duration
+/// elapsed without cancellation.
+async fn wait_interval_cancel_aware(cx: &crate::cx::Cx, total: Duration) -> bool {
+    const TICK: Duration = Duration::from_millis(250);
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+            return false;
+        }
+        let step = TICK.min(remaining);
+        let _ = crate::runtime_async::sleep_with_cx(cx, step).await;
+        remaining = remaining.saturating_sub(step);
+    }
+    cx.checkpoint().is_ok() && !cx.is_cancel_requested()
+}
+
 impl TelemetryCollector {
     /// Create a new telemetry collector.
     #[must_use]
@@ -1141,8 +1163,16 @@ impl TelemetryCollector {
         let mut first_tick = true;
 
         loop {
-            if !first_tick {
-                let _ = crate::runtime_async::sleep_with_cx(cx, interval).await;
+            // Cancellation-responsive inter-sample wait (ft-ati70). `sleep_with_cx`
+            // honours budget deadlines but does NOT observe a live cancel request,
+            // so a single long sleep would delay cancellation up to a full sample
+            // interval. Split the wait into short ticks and bail the moment the Cx
+            // is cancelled, recording a typed outcome rather than dropping it.
+            if !first_tick && !crate::telemetry::wait_interval_cancel_aware(cx, interval).await {
+                debug!("Telemetry collector exiting via Cx cancellation (inter-sample wait)");
+                self.registry
+                    .increment_counter("telemetry.collector.cancelled");
+                break;
             }
             first_tick = false;
 
@@ -1152,25 +1182,47 @@ impl TelemetryCollector {
             }
             if cx.checkpoint().is_err() {
                 debug!("Telemetry collector exiting via Cx cancellation");
+                self.registry
+                    .increment_counter("telemetry.collector.cancelled");
                 break;
             }
 
             let pid = self.config.mux_server_pid;
-            let snap_opt =
-                crate::runtime_async::spawn_blocking(move || ResourceSnapshot::collect(pid))
-                    .await
-                    .unwrap_or(None);
-
-            if let Some(snap) = snap_opt {
-                self.buffer.push(snap);
-                self.sample_count.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    pid,
-                    samples = self.sample_count.load(Ordering::Relaxed),
-                    "Telemetry sample collected"
-                );
-            } else {
-                warn!(pid, "Failed to collect telemetry sample");
+            // Cx-aware blocking collection (ft-ati70): observes pre- and mid-flight
+            // cancellation even if `ps`/`lsof` stalls, instead of the plain
+            // spawn_blocking that could only return after the probe finished and
+            // collapsed every join/cancel error into an ordinary missing sample.
+            match crate::runtime_async::spawn_blocking_with_cx(cx, move || {
+                ResourceSnapshot::collect(pid)
+            })
+            .await
+            {
+                Ok(Some(snap)) => {
+                    self.buffer.push(snap);
+                    self.sample_count.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        pid,
+                        samples = self.sample_count.load(Ordering::Relaxed),
+                        "Telemetry sample collected"
+                    );
+                }
+                Ok(None) => {
+                    warn!(pid, "Failed to collect telemetry sample");
+                    self.registry.increment_counter("telemetry.sample_failure");
+                }
+                Err(reason) => {
+                    // Pre/mid-flight Cx cancellation (or a join failure) from the
+                    // blocking probe — propagate by exiting the loop and record
+                    // the typed cancellation outcome.
+                    debug!(
+                        pid,
+                        %reason,
+                        "Telemetry collector exiting via Cx cancellation (blocking collection)"
+                    );
+                    self.registry
+                        .increment_counter("telemetry.collector.cancelled");
+                    break;
+                }
             }
         }
     }
