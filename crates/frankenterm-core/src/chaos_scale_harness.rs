@@ -40,10 +40,13 @@ use crate::connector_reliability::{
 use crate::context_budget::{
     CompactionTrigger, ContextBudgetConfig, ContextBudgetRegistry, ContextPressureTier,
 };
+use std::collections::BTreeMap;
+
 use crate::large_swarm_replay::{
-    LargeSwarmReplayError, LargeSwarmReplaySummary, LargeSwarmScenario,
+    LargeSwarmReplayCorpus, LargeSwarmReplayError, LargeSwarmReplaySummary, LargeSwarmScenario,
     generate_large_swarm_corpus, summarize_large_swarm_replay,
 };
+use crate::recording::RecorderEventPayload;
 
 /// Schema version for replay-corpus load-rig reports.
 pub const REPLAY_CORPUS_LOAD_RIG_SCHEMA_VERSION: &str = "ft.replay_corpus_load_rig.v1";
@@ -412,8 +415,8 @@ impl ChaosScaleHarness {
         let corpus = generate_large_swarm_corpus(&scenario)?;
         let summary = summarize_large_swarm_replay(&corpus)?;
         let capture_modes = vec![
-            simulate_replay_capture_mode(CaptureMode::Poll, &summary, &config),
-            simulate_replay_capture_mode(CaptureMode::NativePush, &summary, &config),
+            measure_replay_capture_mode(CaptureMode::Poll, &corpus, &summary, &config),
+            measure_replay_capture_mode(CaptureMode::NativePush, &corpus, &summary, &config),
         ];
         let overall_pass = capture_modes.iter().all(|mode| mode.threshold_passed);
 
@@ -427,8 +430,9 @@ impl ChaosScaleHarness {
             overall_pass,
             limitations: vec![
                 "deterministic replay corpus; no live mux panes are launched".to_string(),
-                "native_push mode models the bridge contract and dedup window; it is not live OS event proof".to_string(),
-                "poll and native_push modes share identical replay input so lag and queue metrics are comparable".to_string(),
+                "metrics are MEASURED over the replay-corpus egress timeline (per-event occurred_at_ms + byte sizes), not synthesized from config; native_push applies the real dedup-window coalescing".to_string(),
+                "this is replay-corpus measurement, not live-OS-event proof; it does not yet drive the production SQLite/FTS/detection write path (see ft-7h5da.10.3.2)".to_string(),
+                "poll and native_push modes share identical replay input so lag and queue metrics are directly comparable".to_string(),
             ],
         })
     }
@@ -818,41 +822,119 @@ fn default_slos() -> Vec<SloDefinition> {
     ]
 }
 
-fn simulate_replay_capture_mode(
+/// Fixed per-pane capture-buffer overhead used by the rig's memory model.
+const CAPTURE_BUFFER_OVERHEAD_BYTES: u64 = 4096;
+
+/// One captured pane-output frame from the replay corpus.
+#[derive(Clone, Copy)]
+struct CapturedFrame {
+    occurred_at_ms: u64,
+    bytes: u64,
+}
+
+/// Percentile (`pct` in 0..=100) of a pre-sorted ascending sample, in ms.
+fn percentile_ms(sorted_samples: &[u64], pct: usize) -> f64 {
+    if sorted_samples.is_empty() {
+        return 0.0;
+    }
+    let index = (sorted_samples.len() - 1) * pct / 100;
+    sorted_samples[index] as f64
+}
+
+/// Measure one capture mode over the REAL replay-corpus egress timeline.
+///
+/// Every metric is derived from the actual per-pane egress events (their
+/// `occurred_at_ms` timestamps and byte sizes), not a formula over config:
+///
+/// - `poll` captures each frame at the poll tick after it arrives, so lag is the
+///   real wait-to-next-tick and queue depth is the real number of frames that
+///   accumulate in one poll interval.
+/// - `native_push` emits at most one capture per dedup window per pane; frames
+///   arriving within the window of the last emit are coalesced (counted in
+///   `duplicate_events_suppressed`) and not retained, modelling the bridge's
+///   dedup-window contract over the real event stream.
+fn measure_replay_capture_mode(
     mode: CaptureMode,
+    corpus: &LargeSwarmReplayCorpus,
     summary: &LargeSwarmReplaySummary,
     config: &ReplayCorpusLoadRigConfig,
 ) -> ReplayCorpusCaptureModeResult {
-    let max_events_per_pane = summary.max_events_per_pane.max(1);
-    let (p50, p95, p99, queue_depth, duplicates, memory_overhead_per_pane) = match mode {
-        CaptureMode::Poll => {
-            let interval = config.poll_interval_ms as f64;
-            (
-                interval / 2.0,
-                interval,
-                interval * 2.0,
-                max_events_per_pane.saturating_add(summary.output_bursts_per_pane_hint()),
-                0,
-                32 * 1024,
-            )
+    let mut per_pane: BTreeMap<u64, Vec<CapturedFrame>> = BTreeMap::new();
+    for event in &corpus.events {
+        if let RecorderEventPayload::EgressOutput { text, .. } = &event.payload {
+            per_pane
+                .entry(event.pane_id)
+                .or_default()
+                .push(CapturedFrame {
+                    occurred_at_ms: event.occurred_at_ms,
+                    bytes: text.len() as u64,
+                });
         }
-        CaptureMode::NativePush => {
-            let window = config.native_push_dedup_window_ms.max(1);
-            (
-                4.0,
-                window as f64,
-                window.saturating_mul(2) as f64,
-                max_events_per_pane.div_ceil(4).max(1),
-                summary.event_count / 20,
-                16 * 1024,
-            )
+    }
+
+    let poll = config.poll_interval_ms.max(1);
+    let window = config.native_push_dedup_window_ms.max(1);
+    let queue_cap = config.queue_depth_limit_events_per_pane.max(1);
+
+    let mut lag_samples: Vec<u64> = Vec::new();
+    let mut max_queue_depth: u64 = 0;
+    let mut duplicate_events_suppressed: u64 = 0;
+    let mut dropped_events: u64 = 0;
+    let mut capture_gap_count: u64 = 0;
+    let mut retained_bytes: u64 = 0;
+
+    for frames in per_pane.values() {
+        let Some(first) = frames.first() else {
+            continue;
+        };
+        let anchor = first.occurred_at_ms;
+        match mode {
+            CaptureMode::Poll => {
+                let mut bucket_tick = u64::MAX;
+                let mut bucket_depth = 0_u64;
+                for frame in frames {
+                    let elapsed = frame.occurred_at_ms.saturating_sub(anchor);
+                    let tick = anchor.saturating_add((elapsed / poll + 1).saturating_mul(poll));
+                    lag_samples.push(tick.saturating_sub(frame.occurred_at_ms));
+                    if tick == bucket_tick {
+                        bucket_depth += 1;
+                    } else {
+                        bucket_tick = tick;
+                        bucket_depth = 1;
+                    }
+                    max_queue_depth = max_queue_depth.max(bucket_depth);
+                    if bucket_depth > queue_cap {
+                        dropped_events += 1;
+                        capture_gap_count += 1;
+                    } else {
+                        retained_bytes = retained_bytes.saturating_add(frame.bytes);
+                    }
+                }
+            }
+            CaptureMode::NativePush => {
+                let mut last_emit: Option<u64> = None;
+                for frame in frames {
+                    if let Some(emit) = last_emit
+                        && frame.occurred_at_ms.saturating_sub(emit) < window
+                    {
+                        duplicate_events_suppressed += 1;
+                        continue;
+                    }
+                    last_emit = Some(frame.occurred_at_ms);
+                    lag_samples.push(0);
+                    max_queue_depth = max_queue_depth.max(1);
+                    retained_bytes = retained_bytes.saturating_add(frame.bytes);
+                }
+            }
         }
-    };
-    let memory_bytes = summary
-        .output_bytes
-        .saturating_add(summary.pane_count.saturating_mul(memory_overhead_per_pane));
+    }
+
+    lag_samples.sort_unstable();
+    let memory_bytes = retained_bytes
+        .saturating_add(summary.pane_count.saturating_mul(CAPTURE_BUFFER_OVERHEAD_BYTES));
+    let p99 = percentile_ms(&lag_samples, 99);
     let threshold_passed = p99 <= config.max_capture_lag_ms
-        && queue_depth <= config.queue_depth_limit_events_per_pane
+        && max_queue_depth <= queue_cap
         && memory_bytes <= config.memory_limit_bytes;
 
     ReplayCorpusCaptureModeResult {
@@ -861,31 +943,15 @@ fn simulate_replay_capture_mode(
         replay_events: summary.event_count,
         replay_frames: summary.replay_frames,
         output_bytes: summary.output_bytes,
-        capture_lag_p50_ms: p50,
-        capture_lag_p95_ms: p95,
+        capture_lag_p50_ms: percentile_ms(&lag_samples, 50),
+        capture_lag_p95_ms: percentile_ms(&lag_samples, 95),
         capture_lag_p99_ms: p99,
-        max_queue_depth_events_per_pane: queue_depth,
+        max_queue_depth_events_per_pane: max_queue_depth,
         memory_bytes,
-        duplicate_events_suppressed: duplicates,
-        dropped_events: 0,
-        capture_gap_count: 0,
+        duplicate_events_suppressed,
+        dropped_events,
+        capture_gap_count,
         threshold_passed,
-    }
-}
-
-trait ReplaySummaryHints {
-    fn output_bursts_per_pane_hint(&self) -> u64;
-}
-
-impl ReplaySummaryHints for LargeSwarmReplaySummary {
-    fn output_bursts_per_pane_hint(&self) -> u64 {
-        self.replay_frames
-            .saturating_sub(self.compaction_waves)
-            .saturating_sub(self.search_queries)
-            .saturating_sub(self.mission_actions)
-            .checked_div(self.pane_count.max(1))
-            .unwrap_or(0)
-            .max(1)
     }
 }
 
@@ -1424,6 +1490,45 @@ mod tests {
         assert!(native_push.duplicate_events_suppressed > 0);
         assert_eq!(native_push.replay_events, poll.replay_events);
         assert_eq!(native_push.output_bytes, poll.output_bytes);
+    }
+
+    #[test]
+    fn capture_metrics_are_measured_from_the_corpus_timeline_not_constants() {
+        let report = ChaosScaleHarness::run_replay_corpus_load_rig(
+            ReplayCorpusLoadRigConfig::target_200_pane(),
+        )
+        .expect("200-pane replay-corpus rig should run");
+        let poll = report
+            .mode_result(CaptureMode::Poll)
+            .expect("poll mode is recorded");
+        let native_push = report
+            .mode_result(CaptureMode::NativePush)
+            .expect("native push mode is recorded");
+
+        // native_push coalesces the tight per-pane bursts, so capture lag is ~0
+        // (the old synthetic path returned dedup_window*2 here).
+        assert_eq!(native_push.capture_lag_p99_ms, 0.0);
+        // poll waits at most one poll interval; lag is positive and bounded by it
+        // (the old synthetic path returned poll_interval*2 = 600).
+        assert!(poll.capture_lag_p99_ms > 0.0);
+        assert!(poll.capture_lag_p99_ms <= 300.0);
+        // Suppressions are the real coalesced bursts: at least one per pane.
+        assert!(native_push.duplicate_events_suppressed >= native_push.pane_count);
+        // Poll retains every frame, so it holds at least as much memory as the
+        // dedup-coalescing push path.
+        assert!(poll.memory_bytes >= native_push.memory_bytes);
+
+        // Raising the poll interval raises the MEASURED poll lag — proof the
+        // metric tracks the real timeline rather than a fixed value.
+        let mut slow = ReplayCorpusLoadRigConfig::target_200_pane();
+        slow.poll_interval_ms = 600;
+        slow.max_capture_lag_ms = 2000.0;
+        let slow_poll_p99 = ChaosScaleHarness::run_replay_corpus_load_rig(slow)
+            .expect("rig runs")
+            .mode_result(CaptureMode::Poll)
+            .expect("poll recorded")
+            .capture_lag_p99_ms;
+        assert!(slow_poll_p99 > poll.capture_lag_p99_ms);
     }
 
     #[test]
