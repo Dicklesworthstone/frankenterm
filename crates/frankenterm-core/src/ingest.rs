@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankenterm_alloc::{PaneArena, PaneArenaRegistry, PaneArenaSnapshot, PaneArenaStats};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -1919,6 +1919,17 @@ struct PaneCacheState {
     last_updated: i64,
 }
 
+/// Global LRU entry: last-seen timestamp plus the recency generation that
+/// stamps this hash's current `lru_order` token (ft-zo4hw).
+#[derive(Debug, Clone, Copy)]
+struct GlobalHashEntry {
+    /// Last access timestamp (epoch ms) — used by `prune` for age eviction.
+    last_seen: i64,
+    /// Recency generation of this hash's live `lru_order` token. Older tokens
+    /// for the same hash carry smaller generations and are skipped as stale.
+    generation: u64,
+}
+
 /// Memory-efficient output cache for skipping redundant processing.
 ///
 /// Uses two complementary mechanisms:
@@ -1927,10 +1938,15 @@ struct PaneCacheState {
 #[derive(Debug)]
 pub struct OutputCache {
     config: OutputCacheConfig,
-    global_hashes: HashMap<u64, i64>,
-    /// LRU order tracking (front = least recently used). Eviction pops the
-    /// front in O(1); access moves the hash to the back in O(n) (ft-fesg7).
-    lru_order: VecDeque<u64>,
+    global_hashes: HashMap<u64, GlobalHashEntry>,
+    /// LRU order tracking as `(hash, generation)` tokens, front = least
+    /// recently used. Eviction pops the front in O(1). Access refreshes
+    /// recency in O(1) amortized by pushing a fresh token and lazily skipping
+    /// the superseded one on pop (ft-zo4hw); previously this was an O(n)
+    /// position-scan + `VecDeque::remove` per hit (ft-fesg7).
+    lru_order: VecDeque<(u64, u64)>,
+    /// Monotonic recency counter stamping `lru_order` tokens.
+    lru_generation: u64,
     pane_states: HashMap<u64, PaneCacheState>,
     hits: u64,
     misses: u64,
@@ -1944,6 +1960,7 @@ impl OutputCache {
             config,
             global_hashes: HashMap::new(),
             lru_order: VecDeque::new(),
+            lru_generation: 0,
             pane_states: HashMap::new(),
             hits: 0,
             misses: 0,
@@ -2002,28 +2019,73 @@ impl OutputCache {
 
     fn update_global_lru(&mut self, hash: u64, now: i64) {
         if let Entry::Occupied(mut entry) = self.global_hashes.entry(hash) {
-            entry.insert(now);
-            // ft-fesg7: refresh recency on access. Without moving the hash to
-            // the back of `lru_order`, the deque stays in INSERTION order and
-            // capacity eviction (`pop_front`) is FIFO, not LRU — a hot, early
-            // hash would be evicted ahead of colder, later-inserted ones. Move
-            // it to the back so eviction reflects access recency.
-            if let Some(pos) = self.lru_order.iter().position(|&h| h == hash) {
-                self.lru_order.remove(pos);
-            }
-            self.lru_order.push_back(hash);
+            // ft-zo4hw: refresh recency on access in O(1) amortized. Stamp a
+            // fresh generation and push a new ordering token to the back; the
+            // hash's previous token is now stale (older generation) and is
+            // skipped lazily during eviction/compaction. This replaces the
+            // ft-fesg7 O(n) position-scan + `VecDeque::remove`. Eviction
+            // (`pop_front`) still reflects access recency because a hash's
+            // *current-generation* token is always its most recently pushed
+            // one, so the frontmost live token is the true LRU entry.
+            // Inline the counter bump (a disjoint field access) so the live
+            // `entry` borrow of `global_hashes` doesn't collide with a
+            // whole-`self` method borrow.
+            self.lru_generation = self.lru_generation.wrapping_add(1);
+            let generation = self.lru_generation;
+            *entry.get_mut() = GlobalHashEntry {
+                last_seen: now,
+                generation,
+            };
+            self.lru_order.push_back((hash, generation));
+            self.compact_lru_order_if_needed();
             return;
         }
 
-        // Evict least-recently-used entries if at capacity - O(1) pop from front
-        while self.lru_order.len() >= self.config.global_lru_capacity {
-            if let Some(oldest_hash) = self.lru_order.pop_front() {
-                self.global_hashes.remove(&oldest_hash);
+        // Evict least-recently-used live entries if at capacity. Gate on the
+        // live hash count (not `lru_order.len()`, which may hold stale tokens),
+        // popping from the front and skipping superseded tokens in O(1) each.
+        while self.global_hashes.len() >= self.config.global_lru_capacity {
+            let Some((old_hash, generation)) = self.lru_order.pop_front() else {
+                break;
+            };
+            if let Entry::Occupied(slot) = self.global_hashes.entry(old_hash)
+                && slot.get().generation == generation
+            {
+                slot.remove();
             }
         }
 
-        self.global_hashes.insert(hash, now);
-        self.lru_order.push_back(hash);
+        let generation = self.next_lru_generation();
+        self.global_hashes.insert(
+            hash,
+            GlobalHashEntry {
+                last_seen: now,
+                generation,
+            },
+        );
+        self.lru_order.push_back((hash, generation));
+    }
+
+    /// Next monotonic recency generation. Wraps defensively; a u64 counter is
+    /// not reachable in practice, and the lazy-token check only relies on a
+    /// hash's stored generation differing from its superseded tokens.
+    fn next_lru_generation(&mut self) -> u64 {
+        self.lru_generation = self.lru_generation.wrapping_add(1);
+        self.lru_generation
+    }
+
+    /// Drop superseded `lru_order` tokens when stale entries have accumulated
+    /// past ~capacity. Amortized O(1) per access: a refresh adds at most one
+    /// stale token, so this O(n) retain runs at most once per `capacity`
+    /// refreshes, bounding `lru_order` to <= 2x capacity even on all-hit loads.
+    fn compact_lru_order_if_needed(&mut self) {
+        let cap = self.config.global_lru_capacity.saturating_mul(2);
+        if self.lru_order.len() <= cap {
+            return;
+        }
+        let live = &self.global_hashes;
+        self.lru_order
+            .retain(|&(hash, generation)| live.get(&hash).is_some_and(|e| e.generation == generation));
     }
 
     /// Prune stale per-pane entries older than max_age.
@@ -2038,15 +2100,18 @@ impl OutputCache {
         let hashes_to_remove: std::collections::HashSet<u64> = self
             .global_hashes
             .iter()
-            .filter(|(_, ts)| **ts < cutoff)
+            .filter(|(_, entry)| entry.last_seen < cutoff)
             .map(|(hash, _)| *hash)
             .collect();
 
         for hash in &hashes_to_remove {
             self.global_hashes.remove(hash);
         }
-        // Single O(n) pass instead of O(n*m) per-hash retain calls
-        self.lru_order.retain(|h| !hashes_to_remove.contains(h));
+        // Single O(n) pass instead of O(n*m) per-hash retain calls. Drops
+        // tokens for pruned hashes; superseded tokens for surviving hashes are
+        // cleaned by later eviction/compaction (ft-zo4hw lazy invalidation).
+        self.lru_order
+            .retain(|&(hash, _)| !hashes_to_remove.contains(&hash));
     }
 
     /// Prune stale entries using the configured max_age.
@@ -5098,6 +5163,36 @@ mod tests {
         assert!(!cache.is_new(4, "content A\n"));
         // B was evicted as the genuine least-recently-used entry.
         assert!(cache.is_new(5, "content B\n"));
+    }
+
+    #[test]
+    fn output_cache_lru_order_stays_bounded_under_repeated_hits() {
+        // ft-zo4hw: refreshing recency on a cache HIT is O(1) amortized via
+        // lazy token invalidation + periodic compaction. The order deque must
+        // not grow without bound when the same hot content is seen repeatedly
+        // (the old code paid an O(n) position-scan + remove per hit instead).
+        let capacity = 8usize;
+        let config = OutputCacheConfig {
+            global_lru_capacity: capacity,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+
+        // Prime one hot hash, then hammer it from a fresh pane each iteration so
+        // the per-pane fast path is bypassed and the global-LRU refresh runs.
+        assert!(cache.is_new(0, "hot\n"));
+        for pane in 1..10_000u64 {
+            assert!(!cache.is_new(pane, "hot\n"));
+        }
+
+        // Exactly one live global entry, and the order deque stayed bounded to
+        // <= 2x capacity instead of accumulating a permanent token per hit.
+        assert_eq!(cache.stats().global_entries, 1);
+        assert!(
+            cache.lru_order.len() <= capacity * 2,
+            "lru_order must stay bounded by lazy compaction, got {}",
+            cache.lru_order.len()
+        );
     }
 
     #[test]

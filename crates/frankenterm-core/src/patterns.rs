@@ -415,14 +415,27 @@ pub struct DetectionContext {
     pub pane_id: Option<u64>,
     /// Inferred agent type for this pane (if known)
     pub agent_type: Option<AgentType>,
-    /// Previously seen dedup keys with timestamp to avoid re-emitting
-    seen_keys: HashMap<String, Instant>,
-    /// Order of seen keys for eviction (FIFO)
-    seen_order: VecDeque<String>,
+    /// Previously seen dedup keys with last-seen timestamp and recency
+    /// generation, used to avoid re-emitting (ft-zo4hw).
+    seen_keys: HashMap<String, SeenEntry>,
+    /// Order of seen keys as `(key, generation)` tokens for LRU eviction.
+    /// Refresh is O(1): a new token is pushed and the superseded one is skipped
+    /// lazily, replacing the prior O(n) string position-scan + remove.
+    seen_order: VecDeque<(String, u64)>,
+    /// Monotonic recency counter stamping `seen_order` tokens.
+    seen_generation: u64,
     /// Time-to-live for deduplication (default: 5 minutes)
     pub ttl: Duration,
     /// Tail buffer from previous detection (for cross-segment matching)
     pub tail_buffer: String,
+}
+
+/// Dedup entry: last-seen timestamp plus the recency generation that stamps
+/// this key's live `seen_order` token (ft-zo4hw).
+#[derive(Debug, Clone, Copy)]
+struct SeenEntry {
+    last_seen: Instant,
+    generation: u64,
 }
 
 impl Default for DetectionContext {
@@ -447,6 +460,7 @@ impl DetectionContext {
             agent_type: None,
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
+            seen_generation: 0,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
         }
@@ -460,6 +474,7 @@ impl DetectionContext {
             agent_type: Some(agent_type),
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
+            seen_generation: 0,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
         }
@@ -473,6 +488,7 @@ impl DetectionContext {
             agent_type,
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
+            seen_generation: 0,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
         }
@@ -492,32 +508,74 @@ impl DetectionContext {
         let now = Instant::now();
 
         // Check if seen and valid (not expired)
-        if let Some(timestamp) = self.seen_keys.get(&key) {
-            if now.duration_since(*timestamp) < self.ttl {
+        if let Some(entry) = self.seen_keys.get(&key) {
+            if now.duration_since(entry.last_seen) < self.ttl {
                 return false;
             }
         }
 
-        // Keep the order queue unique to avoid unbounded growth when a key
-        // reappears after TTL expiry.
-        if let Some(pos) = self.seen_order.iter().position(|item| item == &key) {
-            self.seen_order.remove(pos);
+        // New or expired key: (re)insert with a fresh recency generation. The
+        // key's prior `seen_order` token (if any) becomes stale and is dropped
+        // lazily on eviction/compaction — no O(n) string position-scan per mark
+        // (ft-zo4hw). The HASH map still holds at most one entry per key, so
+        // re-marking an expired key never inflates `seen_count`.
+        let is_new_key = !self.seen_keys.contains_key(&key);
+
+        // Enforce capacity only when adding a genuinely new key.
+        if is_new_key && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
+            self.evict_oldest_seen();
         }
 
-        // Enforce capacity if adding a new key (or updating expired one that was pruned?)
-        // If we update an existing key, we don't increase count.
-        // But if we insert new, we might overflow.
-        // Simple strategy: Always remove if at capacity, then insert.
-        if !self.seen_keys.contains_key(&key) && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
-            if let Some(oldest) = self.seen_order.pop_front() {
-                self.seen_keys.remove(&oldest);
+        let generation = self.next_seen_generation();
+        self.seen_keys.insert(
+            key.clone(),
+            SeenEntry {
+                last_seen: now,
+                generation,
+            },
+        );
+        // Push to back of order for LRU-style eviction.
+        self.seen_order.push_back((key, generation));
+        self.compact_seen_order_if_needed();
+        true
+    }
+
+    /// Next monotonic recency generation (wraps defensively; unreachable in
+    /// practice).
+    fn next_seen_generation(&mut self) -> u64 {
+        self.seen_generation = self.seen_generation.wrapping_add(1);
+        self.seen_generation
+    }
+
+    /// Evict the least-recently-seen live key, skipping superseded tokens in
+    /// O(1) each (ft-zo4hw). The frontmost live token is the true LRU key
+    /// because a key's current-generation token is its most recently pushed.
+    fn evict_oldest_seen(&mut self) {
+        while let Some((key, generation)) = self.seen_order.pop_front() {
+            match self.seen_keys.get(&key) {
+                Some(entry) if entry.generation == generation => {
+                    self.seen_keys.remove(&key);
+                    return;
+                }
+                // Stale (superseded) or already-removed token: skip it.
+                _ => {}
             }
         }
+    }
 
-        self.seen_keys.insert(key.clone(), now);
-        // Push to back of order for LRU-style eviction.
-        self.seen_order.push_back(key);
-        true
+    /// Drop superseded `seen_order` tokens once stale entries exceed ~capacity.
+    /// Amortized O(1) per mark: at most one stale token is added per refresh, so
+    /// this O(n) retain runs at most once per `MAX_SEEN_KEYS` refreshes,
+    /// bounding `seen_order` to <= 2x capacity even under repeated re-marks.
+    fn compact_seen_order_if_needed(&mut self) {
+        if self.seen_order.len() <= Self::MAX_SEEN_KEYS.saturating_mul(2) {
+            return;
+        }
+        let seen_keys = &self.seen_keys;
+        self.seen_order
+            .retain(|(key, generation)| {
+                seen_keys.get(key).is_some_and(|e| e.generation == *generation)
+            });
     }
 
     /// Check if a detection has been seen before and is unexpired
@@ -528,8 +586,8 @@ impl DetectionContext {
 
     #[must_use]
     fn is_seen_key(&self, key: &str) -> bool {
-        if let Some(timestamp) = self.seen_keys.get(key) {
-            Instant::now().duration_since(*timestamp) < self.ttl
+        if let Some(entry) = self.seen_keys.get(key) {
+            Instant::now().duration_since(entry.last_seen) < self.ttl
         } else {
             false
         }
@@ -6789,19 +6847,28 @@ rules:
     }
 
     #[test]
-    fn mark_seen_key_refreshes_expired_key_without_duplicate_order_entry() {
+    fn mark_seen_key_refreshes_expired_key_without_unbounded_order_growth() {
+        // ft-zo4hw: refresh is now O(1) (lazy token invalidation) rather than
+        // an O(n) position-scan + remove. Re-marking an expired key must still
+        // keep at most one entry in the key map, and `seen_order` must stay
+        // bounded (<= 2x capacity) via lazy compaction rather than growing
+        // without limit.
         let mut ctx = DetectionContext::new();
         ctx.set_ttl(Duration::ZERO);
 
-        assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
-        assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
+        for _ in 0..(DetectionContext::MAX_SEEN_KEYS * 4) {
+            assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
+        }
 
         assert_eq!(ctx.seen_count(), 1);
-        assert_eq!(ctx.seen_order.len(), 1);
-        assert_eq!(
-            ctx.seen_order.front().map(String::as_str),
-            Some("codex.test:repeat")
+        assert!(
+            ctx.seen_order.len() <= DetectionContext::MAX_SEEN_KEYS * 2,
+            "seen_order must stay bounded by lazy compaction, got {}",
+            ctx.seen_order.len()
         );
+        // The single live key is still resolvable and unexpired-checks aside,
+        // remains the one tracked key.
+        assert!(ctx.seen_keys.contains_key("codex.test:repeat"));
     }
 
     #[test]
