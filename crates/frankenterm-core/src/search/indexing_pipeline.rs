@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use super::indexing::{
     CommandBlockExtractionConfig, IndexableDocument, IndexingIngestReport, ScrollbackLine,
-    SearchIndex, SearchIndexStats, chunk_scrollback_lines, extract_agent_artifacts,
-    extract_command_output_blocks,
+    SearchIndex, SearchIndexError, SearchIndexStats, chunk_scrollback_lines,
+    extract_agent_artifacts, extract_command_output_blocks,
 };
 
 /// Per-pane watermark tracking what content has already been indexed.
@@ -107,6 +107,41 @@ pub struct PipelineTickReport {
     pub skipped_reason: Option<PipelineSkipReason>,
 }
 
+/// Stable category for a pipeline ingest failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineIngestErrorKind {
+    Io,
+    Serde,
+    InvalidConfig,
+    UnsupportedStateVersion,
+}
+
+/// Structured details for the most recent failed ingest attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineIngestError {
+    pub kind: PipelineIngestErrorKind,
+    pub message: String,
+}
+
+impl PipelineIngestError {
+    fn from_search_index_error(error: &SearchIndexError) -> Self {
+        let kind = match error {
+            SearchIndexError::Io(_) => PipelineIngestErrorKind::Io,
+            SearchIndexError::Serde(_) => PipelineIngestErrorKind::Serde,
+            SearchIndexError::InvalidConfig(_) => PipelineIngestErrorKind::InvalidConfig,
+            SearchIndexError::UnsupportedStateVersion(_) => {
+                PipelineIngestErrorKind::UnsupportedStateVersion
+            }
+        };
+
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Reason a pipeline tick was skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +150,7 @@ pub enum PipelineSkipReason {
     ResizeStorm,
     Stopped,
     NoPanes,
+    IngestError,
 }
 
 /// Pipeline status snapshot for diagnostics.
@@ -125,6 +161,9 @@ pub struct PipelineStatus {
     pub total_ticks: u64,
     pub total_docs_indexed: u64,
     pub total_lines_consumed: u64,
+    pub total_ingest_failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_ingest_error: Option<PipelineIngestError>,
     pub index_stats: SearchIndexStats,
 }
 
@@ -139,6 +178,8 @@ pub struct ContentIndexingPipeline {
     total_ticks: u64,
     total_docs_indexed: u64,
     total_lines_consumed: u64,
+    total_ingest_failures: u64,
+    last_ingest_error: Option<PipelineIngestError>,
     index: SearchIndex,
 }
 
@@ -153,6 +194,8 @@ impl ContentIndexingPipeline {
             total_ticks: 0,
             total_docs_indexed: 0,
             total_lines_consumed: 0,
+            total_ingest_failures: 0,
+            last_ingest_error: None,
             index,
         }
     }
@@ -210,6 +253,8 @@ impl ContentIndexingPipeline {
             total_ticks: self.total_ticks,
             total_docs_indexed: self.total_docs_indexed,
             total_lines_consumed: self.total_lines_consumed,
+            total_ingest_failures: self.total_ingest_failures,
+            last_ingest_error: self.last_ingest_error.clone(),
             index_stats: self.index.stats(now_ms),
         }
     }
@@ -223,6 +268,18 @@ impl ContentIndexingPipeline {
     /// Mutable access to the underlying search index.
     pub fn index_mut(&mut self) -> &mut SearchIndex {
         &mut self.index
+    }
+
+    /// Most recent ingest failure, if the latest ingest attempt failed.
+    #[must_use]
+    pub fn last_ingest_error(&self) -> Option<&PipelineIngestError> {
+        self.last_ingest_error.as_ref()
+    }
+
+    /// Total number of ingest attempts that failed inside this pipeline.
+    #[must_use]
+    pub fn total_ingest_failures(&self) -> u64 {
+        self.total_ingest_failures
     }
 
     fn apply_watermark_updates(&mut self, updates: &[(u64, Option<String>, i64)]) {
@@ -414,6 +471,7 @@ impl ContentIndexingPipeline {
             return report;
         }
 
+        self.last_ingest_error = None;
         let ingest_outcome = match self.index.ingest_documents_detailed(
             &all_docs,
             now_ms,
@@ -421,8 +479,16 @@ impl ContentIndexingPipeline {
             cass_hashes,
         ) {
             Ok(outcome) => outcome,
-            Err(_) => {
-                // On ingest error, return partial report with what we have so far.
+            Err(error) => {
+                let ingest_error = PipelineIngestError::from_search_index_error(&error);
+                tracing::warn!(
+                    kind = ?ingest_error.kind,
+                    error = %ingest_error.message,
+                    "search indexing pipeline ingest failed"
+                );
+                self.total_ingest_failures = self.total_ingest_failures.saturating_add(1);
+                self.last_ingest_error = Some(ingest_error);
+                report.skipped_reason = Some(PipelineSkipReason::IngestError);
                 return report;
             }
         };
@@ -1030,7 +1096,24 @@ mod tests {
         let report = pipeline.tick(&panes, 2000, false, None);
 
         assert_eq!(report.panes_processed, 1);
+        assert_eq!(report.skipped_reason, Some(PipelineSkipReason::IngestError));
         assert_eq!(pipeline.watermark(1), None);
+        assert_eq!(pipeline.total_ingest_failures(), 1);
+
+        let error = pipeline
+            .last_ingest_error()
+            .expect("ingest failure should be visible to callers")
+            .clone();
+        assert_eq!(error.kind, PipelineIngestErrorKind::Io);
+        assert!(
+            error.message.contains("I/O error"),
+            "unexpected error message: {}",
+            error.message
+        );
+
+        let status = pipeline.status(3000);
+        assert_eq!(status.total_ingest_failures, 1);
+        assert_eq!(status.last_ingest_error, Some(error));
     }
 
     #[test]
@@ -1247,6 +1330,14 @@ mod tests {
         let json = serde_json::to_string(&reason).unwrap();
         let reason2: PipelineSkipReason = serde_json::from_str(&json).unwrap();
         assert_eq!(reason, reason2);
+
+        let ingest_error = PipelineIngestError {
+            kind: PipelineIngestErrorKind::Io,
+            message: "I/O error: disk full".to_string(),
+        };
+        let json = serde_json::to_string(&ingest_error).unwrap();
+        let ingest_error2: PipelineIngestError = serde_json::from_str(&json).unwrap();
+        assert_eq!(ingest_error, ingest_error2);
     }
 
     #[test]
