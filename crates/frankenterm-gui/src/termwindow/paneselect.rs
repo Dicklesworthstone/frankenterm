@@ -12,16 +12,40 @@ use config::Dimension;
 use config::keyassignment::{KeyAssignment, PaneSelectArguments, PaneSelectMode};
 use mux::Mux;
 use std::cell::{Ref, RefCell};
+use std::fmt::Display;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
 
 pub struct PaneSelector {
     element: RefCell<Option<Vec<ComputedElement>>>,
-    labels: RefCell<Vec<String>>,
+    labels: RefCell<Vec<PaneSelectLabel>>,
     selection: RefCell<String>,
     alphabet: String,
     mode: PaneSelectMode,
     was_zoomed: bool,
     show_pane_ids: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PaneSelectLabel {
+    label: String,
+    pane_index: usize,
+}
+
+impl PaneSelectLabel {
+    fn caption(&self, pane_id: impl Display, show_pane_ids: bool) -> String {
+        if show_pane_ids {
+            format!("{}: {pane_id}", self.label)
+        } else {
+            self.label.clone()
+        }
+    }
+}
+
+fn pane_select_label_for_pane(labels: &[String], pane_index: usize) -> Option<PaneSelectLabel> {
+    labels.get(pane_index).map(|label| PaneSelectLabel {
+        label: label.clone(),
+        pane_index,
+    })
 }
 
 impl PaneSelector {
@@ -55,7 +79,7 @@ impl PaneSelector {
         term_window: &mut TermWindow,
         alphabet: &str,
         show_pane_ids: bool,
-    ) -> anyhow::Result<(Vec<ComputedElement>, Vec<String>)> {
+    ) -> anyhow::Result<(Vec<ComputedElement>, Vec<PaneSelectLabel>)> {
         let font = term_window
             .fonts
             .pane_select_font()
@@ -78,12 +102,17 @@ impl PaneSelector {
             crate::overlay::quickselect::compute_labels_for_alphabet(alphabet, panes.len());
 
         let mut elements = vec![];
+        let mut pane_labels = vec![];
         for pos in panes {
-            let caption = if show_pane_ids {
-                format!("{}: {}", labels[pos.index], pos.pane.pane_id())
-            } else {
-                labels[pos.index].clone()
+            let Some(label) = pane_select_label_for_pane(&labels, pos.index) else {
+                log::warn!(
+                    "pane select skipped pane index {} because quick-select alphabet produced only {} labels",
+                    pos.index,
+                    labels.len()
+                );
+                continue;
             };
+            let caption = label.caption(pos.pane.pane_id(), show_pane_ids);
             let element = Element::new(&font, ElementContent::Text(caption))
                 .colors(ElementColors {
                     border: BorderColor::new(
@@ -158,9 +187,10 @@ impl PaneSelector {
                 &element,
             )?;
             elements.push(computed);
+            pane_labels.push(label);
         }
 
-        Ok((elements, labels))
+        Ok((elements, pane_labels))
     }
 
     fn perform_selection(
@@ -262,8 +292,13 @@ impl Modal for PaneSelector {
                 selection.push(c);
 
                 // and if we have a complete match, activate that pane
-                if let Some(pane_index) = self.labels.borrow().iter().position(|s| s == &*selection)
-                {
+                let pane_index = self
+                    .labels
+                    .borrow()
+                    .iter()
+                    .find(|label| label.label == *selection)
+                    .map(|label| label.pane_index);
+                if let Some(pane_index) = pane_index {
                     self.perform_selection(pane_index, term_window)?;
                     return Ok(true);
                 }
@@ -293,11 +328,52 @@ impl Modal for PaneSelector {
             *self.labels.borrow_mut() = labels;
         }
         Ok(Ref::map(self.element.borrow(), |v| {
-            v.as_ref().unwrap().as_slice()
+            v.as_ref().map_or(&[], Vec::as_slice)
         }))
     }
 
     fn reconfigure(&self, _term_window: &mut TermWindow) {
         self.element.borrow_mut().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlay::quickselect::compute_labels_for_alphabet;
+
+    #[test]
+    fn pane_select_empty_alphabet_has_no_selectable_labels() {
+        let labels = compute_labels_for_alphabet("", 2);
+
+        assert!(labels.is_empty());
+        assert!(pane_select_label_for_pane(&labels, 0).is_none());
+        assert!(pane_select_label_for_pane(&labels, 1).is_none());
+    }
+
+    #[test]
+    fn pane_select_short_alphabet_skips_panes_without_labels() {
+        let labels = compute_labels_for_alphabet("ab", 5);
+
+        assert_eq!(labels, vec!["aa", "ab", "ba", "bb"]);
+        assert_eq!(
+            pane_select_label_for_pane(&labels, 3),
+            Some(PaneSelectLabel {
+                label: "bb".to_string(),
+                pane_index: 3,
+            })
+        );
+        assert!(pane_select_label_for_pane(&labels, 4).is_none());
+    }
+
+    #[test]
+    fn pane_select_caption_optionally_includes_pane_id() {
+        let label = PaneSelectLabel {
+            label: "aa".to_string(),
+            pane_index: 0,
+        };
+
+        assert_eq!(label.caption(42, false), "aa");
+        assert_eq!(label.caption(42, true), "aa: 42");
     }
 }
