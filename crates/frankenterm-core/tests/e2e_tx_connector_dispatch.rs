@@ -277,3 +277,60 @@ fn connector_dispatch_deduplicates_replayed_event_no_double_effect() {
         bridge.pending_action_count()
     );
 }
+
+// ── ft-pmbe1 harm model: durable ledger honors a committed step blindly ───────
+// Standalone, public-API counterpart to the (RCH-lane-blocked) ft-pmbe1 behavioral
+// e2e. The durable idempotency ledger records a committed step with NO provenance
+// or trust marker, and check_dedup keys on (plan, step, action) — NOT the
+// execution id. So a step committed by a BYPASSED run (e.g. the synthetic
+// allow-all executor that `ft (robot) tx run` used to fall back to when the real
+// runtime was unavailable) is, after restart, indistinguishable from a real gated
+// commit and SUPPRESSES re-execution of that step by a later legitimate run
+// ("ledger poisoning"). This locks in WHY ft-pmbe1's fix (refuse the synthetic
+// commit) matters: once a forged commit reaches the ledger, dedup honors it.
+#[test]
+fn tx_committed_step_is_honored_across_runs_regardless_of_provenance() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ft_dir = tmp.path();
+    let plan_id = "plan-poison";
+    let key = IdempotencyKey::new(plan_id, "step-0", "commit");
+
+    // A bypassed/synthetic run commits the step (distinct execution id + a marker
+    // result that screams "synthetic").
+    {
+        let mut store = IdempotencyStore::open(ft_dir, IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger("txe-synthetic-1000", &minimal_plan(plan_id))
+            .expect("create ledger");
+        store
+            .record_execution(
+                "txe-synthetic-1000",
+                key.clone(),
+                StepOutcome::Success {
+                    result: Some("committed-by-bypassed-run".to_string()),
+                },
+                StepRisk::High,
+                "synthetic-fallback",
+                1000,
+            )
+            .expect("record committed step");
+    }
+
+    // RESTART: a later legitimate run opens the same durable store under a fresh
+    // execution id. check_dedup is keyed on (plan, step, action), so the prior
+    // commit is found and the step would be skipped — with no way to tell it was
+    // produced by a bypassed run.
+    let later = IdempotencyStore::open(ft_dir, IdempotencyPolicy::default())
+        .expect("reopen durable store");
+    let recovered = later.check_dedup(&key);
+    assert!(
+        matches!(
+            recovered,
+            Some(StepOutcome::Success { result }) if result.as_deref() == Some("committed-by-bypassed-run")
+        ),
+        "ft-pmbe1: a committed step survives restart and is honored verbatim by any \
+         later run regardless of which execution recorded it — the ledger has no \
+         provenance check, so a bypassed commit poisons later runs; got {recovered:?}"
+    );
+}
