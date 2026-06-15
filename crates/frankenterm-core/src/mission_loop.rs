@@ -1,5 +1,17 @@
 //! Mission control-loop engine (ft-1i2ge.3.1).
 //!
+//! # Wiring status (ft-majms) — NOT YET DRIVEN
+//!
+//! This engine is implemented and unit-tested but has **no production driver**
+//! today: nothing outside tests constructs a `MissionLoop` or calls `tick()` /
+//! `trigger()` / `evaluate()`. The shipped `ft` binary compiles it (the
+//! `subprocess-bridge` feature is on by default) yet is read-only and does not
+//! own a live mission loop — `ft doctor`'s `shadow_mode_doctor_report` honestly
+//! reports `NoLiveSamples`. The present-tense descriptions below (and the
+//! "the caller drives the loop" note) describe the *intended* behavior once a
+//! driver is wired; real wiring is gated on the mission lifecycle becoming
+//! live (see ft-ok02z, tracked by ft-majms).
+//!
 //! Implements the mission loop cadence and event-triggered reevaluation.
 //! Orchestrates the full planner pipeline:
 //!   readiness → features → scoring → solving → decisions

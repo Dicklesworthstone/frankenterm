@@ -1,8 +1,18 @@
 //! Shadow-mode evaluator: compare mission recommendations vs actual execution.
 //!
-//! Runs in non-invasive mode alongside the mission loop, capturing each cycle's
-//! recommendations and comparing them against the events that were actually
-//! emitted during dispatch.
+//! # Wiring status (ft-majms) — NOT YET DRIVEN
+//!
+//! `evaluate_cycle` has **no production caller** today (every call site is a
+//! test); the mission loop never invokes it. The shipped `ft` binary compiles
+//! this module (`subprocess-bridge` is a default feature) but is read-only —
+//! `ft doctor`'s `shadow_mode_doctor_report` is the only live entry point and
+//! it honestly reports `NoLiveSamples` / "no live MissionLoop sample stream
+//! yet". The summary and integration diagram below describe the *intended*
+//! flow once the mission loop is wired (gated on ft-ok02z; tracked by ft-majms).
+//!
+//! Designed to run in non-invasive mode alongside the mission loop, capturing
+//! each cycle's recommendations and comparing them against the events that were
+//! actually emitted during dispatch.
 //!
 //! # Integration
 //!

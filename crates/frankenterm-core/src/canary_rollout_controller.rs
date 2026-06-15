@@ -1,5 +1,18 @@
 //! Canary rollout controller for mission dispatch (ft-1i2ge.6.4).
 //!
+//! # Wiring status (ft-majms) — NOT YET DRIVEN
+//!
+//! This controller is implemented and unit-tested but has **no production
+//! caller**: every construction and every call of `evaluate_health` /
+//! `filter_assignments` / `force_transition` is inside this module's own test
+//! block. The `# Integration` diagram below describes the *intended*
+//! `MissionLoop → ShadowModeEvaluator → CanaryRolloutController` flow — that
+//! chain does **not** exist in code yet (the mission loop never references this
+//! controller, and the mission loop itself is unwired). Likewise "rollback
+//! occurs automatically" describes intended behavior once a driver is wired,
+//! not anything the running product does today. Real wiring is gated on the
+//! mission lifecycle becoming live (see ft-ok02z; tracked by ft-majms).
+//!
 //! Manages staged rollout of mission dispatch through three phases:
 //!
 //! ```text

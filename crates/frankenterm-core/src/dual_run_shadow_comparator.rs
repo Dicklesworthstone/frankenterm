@@ -1,5 +1,17 @@
 //! Dual-run shadow comparator for NTM↔FrankenTerm migration (ft-3681t.8.2).
 //!
+//! # Wiring status (ft-majms) — NOT YET DRIVEN
+//!
+//! The comparator + drift-triage workflow are implemented and unit-tested but
+//! have **no production caller** today: `DualRunResult` / `DriftTriageWorkflow`
+//! / `CutoverGateEvaluation` are referenced only from tests, and the
+//! `NtmParityCorpus → DualRunResult → DriftTriageWorkflow` pipeline in the
+//! diagram below is **not** connected (the `ft` parity-corpus path never emits
+//! a `DualRunResult`). So the cutover gate gates nothing in production yet. The
+//! descriptions below — including "before irreversible cutover" — describe the
+//! *intended* flow once the parity runner feeds this surface; tracked by
+//! ft-majms.
+//!
 //! Provides side-by-side comparison of command outputs, semantic outcomes,
 //! and latency between NTM and FrankenTerm runs of the same scenarios.
 //! Includes a structured drift triage workflow for classifying, tracking,
