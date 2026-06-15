@@ -1,0 +1,32 @@
+{
+  "schema": "ft.cx_error_propagation.v1",
+  "bead": "ft-npkn6",
+  "cases": [
+    {
+      "case": "telemetry_precancel",
+      "surface": "TelemetryCollector::run_cx",
+      "cancel_observed": true,
+      "outcome": "collector_cancelled",
+      "sample_failure_count": 0,
+      "collector_cancelled_count": 1,
+      "samples_collected": 0,
+      "buffer_samples": 0
+    },
+    {
+      "case": "tailer_midflight_cancel",
+      "surface": "TailerPollTaskSet::join_next_with_cx",
+      "cancel_observed": true,
+      "outcome": "none_with_cancelled_cx",
+      "pending_task_completed": false
+    },
+    {
+      "case": "tailer_live_cx",
+      "surface": "TailerPollTaskSet::join_next_with_cx",
+      "cancel_observed": false,
+      "outcome": "poll_outcome_changed",
+      "pending_task_completed": true,
+      "pane_id": 7,
+      "bytes": 19
+    }
+  ]
+}
