@@ -54381,35 +54381,74 @@ const MISSION_EXIT_INVALID_INPUT: i32 = 7;
 /// OOM the process via an unbounded `read_to_string`.
 const MISSION_FILE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// ft-99ybo: fail-closed size guard for a caller-supplied mission/tx file,
-/// rejecting an oversized file BEFORE the loader's unbounded `read_to_string`
-/// so a hostile `--mission-file` / `--contract-file` pointing at a multi-GiB
-/// file cannot OOM the process. Inserted ahead of (not replacing) each loader's
-/// read so the existing not-found / read-failed messages, hints, and tests are
-/// preserved. Stat-based: it rejects a pre-existing oversized file, which is the
-/// confused-deputy attack vector here; a `stat` failure falls through to the
-/// normal read (legitimate network/procfs paths are not hard-failed).
-fn enforce_mission_file_size_cap(
-    path: &Path,
-    too_large_code: &'static str,
-) -> Result<(), MissionCommandError> {
+/// Internal failure reason from [`read_mission_file_capped`], mapped by each
+/// loader to its specific not-found / read-failed / too-large error envelope.
+enum MissionFileReadFailure {
+    NotFound,
+    Io(std::io::Error),
+    /// File exceeded [`MISSION_FILE_MAX_BYTES`]; `observed` is the byte count
+    /// seen (>= cap + 1 for the streaming path).
+    TooLarge {
+        observed: u64,
+    },
+}
+
+/// ft-sdwhp / ft-99ybo: read a caller-supplied mission/tx file with a HARD
+/// memory cap that holds even when `stat` is unreliable. The previous guard was
+/// stat-only and then fell through to an unbounded `read_to_string`, so a
+/// hostile `--mission-file` / `--contract-file` could still OOM the process via
+/// (1) a special file where `stat.len()` != readable bytes (`/dev/zero`, a FIFO
+/// reporting `len()==0`), (2) a path where `metadata()` errors (the documented
+/// stat-failure fall-through), or (3) TOCTOU growth after the stat. Mirrors
+/// `mcp_missions::read_capped_file`: a cheap stat early-reject, then a streaming
+/// `Read::take(MAX+1)` read that bounds allocation at the I/O layer regardless
+/// of what stat reported, plus a post-read length check.
+fn read_mission_file_capped(path: &Path) -> Result<String, MissionFileReadFailure> {
+    use std::io::Read;
+
+    // Stage 1: cheap stat early-reject on reliable filesystems (the common
+    // hostile-repo case: a pre-existing multi-GiB active.json), avoiding any
+    // allocation.
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MISSION_FILE_MAX_BYTES {
-            return Err(MissionCommandError {
-                exit_code: MISSION_EXIT_INVALID_INPUT,
-                error_code: too_large_code,
-                message: format!(
-                    "File {} is {} bytes; max allowed is {MISSION_FILE_MAX_BYTES} bytes",
-                    path.display(),
-                    meta.len()
-                ),
-                hint: Some(
-                    "16 MiB is the ft-99ybo mission/tx hostile-file DoS cap.".to_string(),
-                ),
+            return Err(MissionFileReadFailure::TooLarge {
+                observed: meta.len(),
             });
         }
     }
-    Ok(())
+
+    // Stage 2: streaming bounded read — the real DoS defense. `take(MAX+1)`
+    // caps the I/O layer itself, so a file that misreports size via stat
+    // (procfs-like pseudo files, FIFOs, untrusted network FS) or a TOCTOU swap
+    // between stat and open cannot cause an unbounded allocation.
+    let file = std::fs::File::open(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            MissionFileReadFailure::NotFound
+        } else {
+            MissionFileReadFailure::Io(err)
+        }
+    })?;
+    let mut buf = Vec::with_capacity(MISSION_FILE_MAX_BYTES.min(1 << 20) as usize);
+    file.take(MISSION_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(MissionFileReadFailure::Io)?;
+    if buf.len() as u64 > MISSION_FILE_MAX_BYTES {
+        // Read at least cap + 1 bytes: the file is over the cap regardless of
+        // what stat said. Reject without ever allocating the full content.
+        return Err(MissionFileReadFailure::TooLarge {
+            observed: buf.len() as u64,
+        });
+    }
+
+    // UTF-8 validation mirrors what `read_to_string` previously provided;
+    // invalid UTF-8 surfaces as an I/O InvalidData error so callers keep their
+    // read-failed envelope.
+    String::from_utf8(buf).map_err(|err| {
+        MissionFileReadFailure::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            err.utf8_error(),
+        ))
+    })
 }
 
 fn mission_now_ms() -> i64 {
@@ -54433,25 +54472,30 @@ fn resolve_mission_file_path(
 fn load_mission_from_path(
     path: &Path,
 ) -> Result<frankenterm_core::plan::Mission, MissionCommandError> {
-    enforce_mission_file_size_cap(path, "mission.file_too_large")?;
-    let raw = fs::read_to_string(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            MissionCommandError {
-                exit_code: MISSION_EXIT_NOT_FOUND,
-                error_code: "mission.file_not_found",
-                message: format!("Mission file not found: {}", path.display()),
-                hint: Some(
-                    "Pass --mission-file <path> or create .ft/mission/active.json.".to_string(),
-                ),
-            }
-        } else {
-            MissionCommandError {
-                exit_code: MISSION_EXIT_IO,
-                error_code: "mission.file_read_failed",
-                message: format!("Failed to read mission file {}: {err}", path.display()),
-                hint: None,
-            }
-        }
+    let raw = read_mission_file_capped(path).map_err(|reason| match reason {
+        MissionFileReadFailure::NotFound => MissionCommandError {
+            exit_code: MISSION_EXIT_NOT_FOUND,
+            error_code: "mission.file_not_found",
+            message: format!("Mission file not found: {}", path.display()),
+            hint: Some(
+                "Pass --mission-file <path> or create .ft/mission/active.json.".to_string(),
+            ),
+        },
+        MissionFileReadFailure::Io(err) => MissionCommandError {
+            exit_code: MISSION_EXIT_IO,
+            error_code: "mission.file_read_failed",
+            message: format!("Failed to read mission file {}: {err}", path.display()),
+            hint: None,
+        },
+        MissionFileReadFailure::TooLarge { observed } => MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.file_too_large",
+            message: format!(
+                "File {} is {observed} bytes; max allowed is {MISSION_FILE_MAX_BYTES} bytes",
+                path.display()
+            ),
+            hint: Some("16 MiB is the ft-99ybo mission/tx hostile-file DoS cap.".to_string()),
+        },
     })?;
 
     let mission: frankenterm_core::plan::Mission =
@@ -54491,25 +54535,30 @@ fn resolve_mission_tx_file_path(
 fn load_mission_tx_contract_from_path(
     path: &Path,
 ) -> Result<frankenterm_core::plan::MissionTxContract, MissionCommandError> {
-    enforce_mission_file_size_cap(path, "mission.tx.file_too_large")?;
-    let raw = fs::read_to_string(path).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::NotFound {
-            MissionCommandError {
-                exit_code: MISSION_EXIT_NOT_FOUND,
-                error_code: "mission.tx.file_not_found",
-                message: format!("Tx contract file not found: {}", path.display()),
-                hint: Some(
-                    "Pass --contract-file <path> or create .ft/mission/tx-active.json.".to_string(),
-                ),
-            }
-        } else {
-            MissionCommandError {
-                exit_code: MISSION_EXIT_IO,
-                error_code: "mission.tx.file_read_failed",
-                message: format!("Failed to read tx contract file {}: {err}", path.display()),
-                hint: None,
-            }
-        }
+    let raw = read_mission_file_capped(path).map_err(|reason| match reason {
+        MissionFileReadFailure::NotFound => MissionCommandError {
+            exit_code: MISSION_EXIT_NOT_FOUND,
+            error_code: "mission.tx.file_not_found",
+            message: format!("Tx contract file not found: {}", path.display()),
+            hint: Some(
+                "Pass --contract-file <path> or create .ft/mission/tx-active.json.".to_string(),
+            ),
+        },
+        MissionFileReadFailure::Io(err) => MissionCommandError {
+            exit_code: MISSION_EXIT_IO,
+            error_code: "mission.tx.file_read_failed",
+            message: format!("Failed to read tx contract file {}: {err}", path.display()),
+            hint: None,
+        },
+        MissionFileReadFailure::TooLarge { observed } => MissionCommandError {
+            exit_code: MISSION_EXIT_INVALID_INPUT,
+            error_code: "mission.tx.file_too_large",
+            message: format!(
+                "File {} is {observed} bytes; max allowed is {MISSION_FILE_MAX_BYTES} bytes",
+                path.display()
+            ),
+            hint: Some("16 MiB is the ft-99ybo mission/tx hostile-file DoS cap.".to_string()),
+        },
     })?;
 
     let contract: frankenterm_core::plan::MissionTxContract =
