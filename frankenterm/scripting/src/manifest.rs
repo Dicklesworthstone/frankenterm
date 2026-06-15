@@ -677,6 +677,76 @@ filesystem = ["{escaped_permission}"]
 
     use proptest::prelude::*;
 
+    fn toml_escaped(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    fn fuzz_component() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-z][a-z0-9_.-]{0,12}")
+            .expect("static fuzz component regex is valid")
+    }
+
+    fn fuzz_windows_drive() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[A-Za-z]").expect("static drive regex is valid")
+    }
+
+    fn malicious_extension_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            Just(".".to_string()),
+            Just("..".to_string()),
+            fuzz_component().prop_map(|part| format!("../{part}")),
+            fuzz_component().prop_map(|part| format!("/{part}")),
+            (fuzz_component(), fuzz_component())
+                .prop_map(|(left, right)| format!("{left}/{right}")),
+            (fuzz_component(), fuzz_component())
+                .prop_map(|(left, right)| format!(r"{left}\{right}")),
+            (fuzz_windows_drive(), fuzz_component())
+                .prop_map(|(drive, tail)| format!("{drive}:{tail}")),
+            fuzz_component().prop_map(|part| format!(" {part}")),
+            fuzz_component().prop_map(|part| format!("{part} ")),
+            fuzz_component().prop_map(|part| format!("{part};evil")),
+        ]
+    }
+
+    fn invalid_filesystem_permission_path() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            fuzz_component().prop_map(|part| format!("../{part}")),
+            fuzz_component().prop_map(|part| format!("{part}/../../escape")),
+            fuzz_component().prop_map(|part| format!("/tmp/{part}/../../../escape")),
+            (fuzz_component(), fuzz_component())
+                .prop_map(|(left, right)| format!(r"{left}\{right}")),
+            (fuzz_windows_drive(), fuzz_component())
+                .prop_map(|(drive, tail)| format!(r"{drive}:\{tail}")),
+        ]
+    }
+
+    fn filesystem_bypass_path() -> impl Strategy<Value = (String, String)> {
+        prop_oneof![
+            (fuzz_component(), fuzz_component()).prop_map(|(root, suffix)| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!("/tmp/{root}-{suffix}/payload.txt");
+                (allowed_root, bypass)
+            }),
+            (fuzz_component(), fuzz_component()).prop_map(|(root, suffix)| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!("/tmp/{root}/../{root}-{suffix}/payload.txt");
+                (allowed_root, bypass)
+            }),
+            fuzz_component().prop_map(|root| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!(r"/tmp/{root}\payload.txt");
+                (allowed_root, bypass)
+            }),
+            fuzz_component().prop_map(|root| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!("../tmp/{root}/payload.txt");
+                (allowed_root, bypass)
+            }),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(50))]
 
@@ -833,6 +903,71 @@ filesystem = ["{escaped_permission}"]
             if key != "extension" {
                 prop_assert!(ParsedManifest::from_toml_str(&toml_str).is_err());
             }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Fuzz malicious manifest names: every generated path-like name must fail closed.
+        #[test]
+        fn prop_fuzz_malicious_manifest_names_fail_closed(name in malicious_extension_name()) {
+            prop_assert!(
+                validate_extension_name(&name).is_err(),
+                "validator accepted malicious extension name: {name:?}"
+            );
+
+            let toml_str = format!("[extension]\nname = \"{}\"\n", toml_escaped(&name));
+            let result = ParsedManifest::from_toml_str(&toml_str);
+
+            prop_assert!(
+                result.is_err(),
+                "manifest parser accepted malicious extension name: {name:?}"
+            );
+            let err = result.unwrap_err();
+            prop_assert!(
+                format!("{err:#}").contains("invalid extension name"),
+                "unexpected manifest error for {name:?}: {err:#}"
+            );
+        }
+
+        /// Fuzz fail-open permission roots: malformed declared roots must reject at parse time.
+        #[test]
+        fn prop_fuzz_invalid_filesystem_permission_roots_fail_closed(path in invalid_filesystem_permission_path()) {
+            let escaped_path = toml_escaped(&path);
+            let toml_str = format!(
+                "[extension]\nname = \"fuzz-permissions\"\n\n[permissions]\nfilesystem = [\"read:{escaped_path}\"]\n"
+            );
+            let result = ParsedManifest::from_toml_str(&toml_str);
+
+            prop_assert!(
+                result.is_err(),
+                "manifest parser accepted invalid filesystem permission root: {path:?}"
+            );
+            let err = result.unwrap_err();
+            prop_assert!(
+                format!("{err:#}").contains("invalid filesystem permission path"),
+                "unexpected permission error for {path:?}: {err:#}"
+            );
+        }
+
+        /// Fuzz request paths that previously bypassed raw-prefix checks.
+        #[test]
+        fn prop_fuzz_filesystem_bypass_paths_are_denied((allowed_root, bypass_path) in filesystem_bypass_path()) {
+            let perms = ExtensionPermissions {
+                filesystem_read: vec![allowed_root.clone()],
+                filesystem_write: vec![allowed_root],
+                ..Default::default()
+            };
+
+            prop_assert!(
+                !perms.allows_read(&bypass_path),
+                "read bypass should be denied: {bypass_path:?}"
+            );
+            prop_assert!(
+                !perms.allows_write(&bypass_path),
+                "write bypass should be denied: {bypass_path:?}"
+            );
         }
     }
 }

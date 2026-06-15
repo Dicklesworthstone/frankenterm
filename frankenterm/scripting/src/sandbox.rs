@@ -328,6 +328,71 @@ mod tests {
 
     use proptest::prelude::*;
 
+    fn fuzz_component() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-z][a-z0-9_.-]{0,12}")
+            .expect("static fuzz component regex is valid")
+    }
+
+    fn filesystem_bypass_path() -> impl Strategy<Value = (String, String)> {
+        prop_oneof![
+            (fuzz_component(), fuzz_component()).prop_map(|(root, suffix)| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!("/tmp/{root}-{suffix}/payload.txt");
+                (allowed_root, bypass)
+            }),
+            (fuzz_component(), fuzz_component()).prop_map(|(root, suffix)| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!("/tmp/{root}/../{root}-{suffix}/payload.txt");
+                (allowed_root, bypass)
+            }),
+            fuzz_component().prop_map(|root| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!(r"/tmp/{root}\payload.txt");
+                (allowed_root, bypass)
+            }),
+            fuzz_component().prop_map(|root| {
+                let allowed_root = format!("/tmp/{root}");
+                let bypass = format!("../tmp/{root}/payload.txt");
+                (allowed_root, bypass)
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Fuzz bypass-shaped paths through the enforcement boundary.
+        #[test]
+        fn prop_fuzz_filesystem_bypass_checks_fail_closed_and_audit_denied(
+            (read_root, read_path) in filesystem_bypass_path(),
+            (write_root, write_path) in filesystem_bypass_path(),
+        ) {
+            let enforcer = test_enforcer(ExtensionPermissions {
+                filesystem_read: vec![read_root],
+                filesystem_write: vec![write_root],
+                ..Default::default()
+            });
+
+            prop_assert!(
+                enforcer.check_read(&read_path).is_err(),
+                "read bypass should return an error: {read_path:?}"
+            );
+            prop_assert!(
+                enforcer.check_write(&write_path).is_err(),
+                "write bypass should return an error: {write_path:?}"
+            );
+
+            let recent = enforcer.audit_trail().recent(2);
+            prop_assert_eq!(recent.len(), 2);
+            prop_assert!(
+                recent
+                    .iter()
+                    .all(|entry| matches!(entry.outcome, AuditOutcome::Denied(_))),
+                "bypass checks must audit as denied: {recent:?}"
+            );
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(50))]
 
