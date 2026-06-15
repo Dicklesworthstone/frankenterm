@@ -29,9 +29,20 @@
 //!       older than every inserted segment must not change search results.
 //!       A prune that touches zero rows must leave the FTS5 index — and
 //!       therefore every search score — bit-identical.
+//!
+//!   MR5 (FTS exact-token consistency): for generated corpora using a safe
+//!       token, FTS results for that token must match the inserted segments
+//!       that contain the token. This cross-checks the FTS lane against the
+//!       append corpus without relying on a specific BM25 score.
+//!
+//!   MR6 (malformed-query robustness): syntactically corrupt FTS queries must
+//!       return a `Result` without panicking. Accepted queries must still return
+//!       finite scores; rejected queries must carry a non-empty diagnostic.
 
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, SearchResult, StorageHandle};
+use proptest::prelude::*;
+use std::fmt::Write as _;
 use tempfile::TempDir;
 
 fn runtime() -> frankenterm_core::runtime_async::Runtime {
@@ -113,6 +124,33 @@ fn opts_no_snippets() -> SearchOptions {
         include_snippets: Some(false),
         ..SearchOptions::default()
     }
+}
+
+async fn seed_generated_token_corpus(
+    storage: &StorageHandle,
+    pane_id: u64,
+    contains_needle: &[bool],
+) -> usize {
+    let ts = now_ms();
+    storage
+        .upsert_pane(pane(pane_id, ts))
+        .await
+        .expect("upsert generated pane");
+
+    let mut expected = 0usize;
+    for contains in contains_needle.iter().copied() {
+        let content = if contains {
+            expected += 1;
+            "doc needle alpha"
+        } else {
+            "doc haystack alpha"
+        };
+        storage
+            .append_segment(pane_id, content, None)
+            .await
+            .expect("append generated segment");
+    }
+    expected
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -258,5 +296,97 @@ fn mr_noop_prune_preserves_lexical_scores() {
             canon(&after),
             "no-op prune must leave lexical scores untouched"
         );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MR5: generated exact-token FTS consistency
+// ─────────────────────────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn prop_fts_exact_token_matches_inserted_corpus(
+        contains_needle in proptest::collection::vec(any::<bool>(), 1..=10),
+    ) {
+        let rt = runtime();
+        let (expected, contents) = rt.block_on(async {
+            let (_dir, path) = temp_db();
+            let storage = StorageHandle::new(&path).await.expect("create storage");
+            let expected = seed_generated_token_corpus(&storage, 7, &contains_needle).await;
+
+            let results = storage
+                .search_with_results("needle", opts_no_snippets())
+                .await
+                .expect("search generated corpus");
+            let contents = results
+                .into_iter()
+                .map(|result| result.segment.content)
+                .collect::<Vec<_>>();
+            (expected, contents)
+        });
+
+        prop_assert_eq!(
+            contents.len(),
+            expected,
+            "FTS result count must match inserted token-bearing segment count"
+        );
+        for content in contents {
+            prop_assert!(
+                content
+                    .split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("needle")),
+                "FTS returned segment without exact needle token: {content:?}"
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MR6: malformed-query robustness
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn malformed_fts_queries_return_results_or_errors_without_panicking() {
+    let rt = runtime();
+    rt.block_on(async {
+        let (_dir, path) = temp_db();
+        let storage = StorageHandle::new(&path).await.expect("create storage");
+        seed_corpus(&storage, 1).await;
+
+        let mut diagnostic = String::new();
+        for query in [
+            "\"",
+            "apple OR",
+            "NEAR(",
+            "(",
+            ")",
+            "apple \0 cherry",
+            "apple \"unterminated",
+        ] {
+            match storage.search_with_results(query, opts_no_snippets()).await {
+                Ok(results) => {
+                    for result in results {
+                        assert!(
+                            result.score.is_finite(),
+                            "accepted malformed-ish query {query:?} returned non-finite score {}",
+                            result.score
+                        );
+                    }
+                }
+                Err(err) => {
+                    diagnostic.clear();
+                    assert!(
+                        write!(&mut diagnostic, "{err}").is_ok(),
+                        "failed to render diagnostic for malformed query {query:?}"
+                    );
+                    assert!(
+                        !diagnostic.is_empty(),
+                        "rejected malformed query {query:?} must include a diagnostic"
+                    );
+                }
+            }
+        }
     });
 }

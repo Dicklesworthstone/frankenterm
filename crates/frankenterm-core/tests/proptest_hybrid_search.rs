@@ -287,6 +287,40 @@ proptest! {
             }
         }
     }
+
+    /// Corrupt source scores are outside the RRF contract: RRF consumes ranks,
+    /// not source scores. Duplicate IDs and non-finite source scores must not
+    /// panic, leak duplicate output rows, or produce non-finite fused scores.
+    #[test]
+    fn rrf_fuse_dedupes_corrupt_ranked_inputs(
+        id in 1u64..=100,
+        other in 101u64..=200,
+        bad_score in prop_oneof![
+            Just(f32::NAN),
+            Just(f32::INFINITY),
+            Just(f32::NEG_INFINITY),
+        ],
+        k in 0u32..=120,
+    ) {
+        let lexical = vec![(id, bad_score), (id, 10.0), (other, f32::NAN)];
+        let semantic = vec![(other, f32::INFINITY), (id, f32::NEG_INFINITY)];
+
+        let fused = rrf_fuse(&lexical, &semantic, k);
+        let ids: HashSet<u64> = fused.iter().map(|r| r.id).collect();
+
+        prop_assert_eq!(fused.len(), 2, "duplicate input ids must collapse");
+        prop_assert_eq!(ids.len(), 2, "fused output ids must be unique");
+        prop_assert!(ids.contains(&id), "primary id missing after corrupt fusion");
+        prop_assert!(ids.contains(&other), "secondary id missing after corrupt fusion");
+        for item in fused {
+            prop_assert!(
+                item.score.is_finite(),
+                "RRF score for id {} must stay finite, got {}",
+                item.id,
+                item.score
+            );
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -633,6 +667,57 @@ proptest! {
             tau_bare, tau_extended
         );
     }
+
+    /// Duplicate-heavy rankings are tolerated as corrupt input by using each
+    /// item's first occurrence. Expanding every item into adjacent duplicates
+    /// therefore must produce the same tau as the first-occurrence projection.
+    #[test]
+    fn kendall_tau_duplicate_heavy_inputs_match_first_occurrences(
+        ranking in proptest::collection::hash_set(1u64..=50, 2..=12)
+            .prop_map(|s| s.into_iter().collect::<Vec<u64>>()),
+    ) {
+        let mut reversed = ranking.clone();
+        reversed.reverse();
+
+        let mut duplicated_a = Vec::with_capacity(ranking.len() * 2);
+        for id in &ranking {
+            duplicated_a.push(*id);
+            duplicated_a.push(*id);
+        }
+
+        let mut duplicated_b = Vec::with_capacity(reversed.len() * 3);
+        for id in &reversed {
+            duplicated_b.push(*id);
+            duplicated_b.push(*id);
+            duplicated_b.push(*id);
+        }
+
+        let projected = kendall_tau(&ranking, &reversed);
+        let duplicate_heavy = kendall_tau(&duplicated_a, &duplicated_b);
+        prop_assert!(
+            (projected - duplicate_heavy).abs() < 1e-6,
+            "duplicate-heavy tau should match first-occurrence projection: projected={}, duplicate_heavy={}",
+            projected,
+            duplicate_heavy
+        );
+    }
+}
+
+#[test]
+fn kendall_tau_extreme_duplicate_values_are_bounded() {
+    let a = [u64::MAX, 0, u64::MAX, 1, 0, 2, 2];
+    let b = [2, 2, 1, 0, u64::MAX, 0, u64::MAX];
+
+    let tau = kendall_tau(&a, &b);
+
+    assert!(
+        tau.is_finite(),
+        "tau must be finite for duplicate-heavy input"
+    );
+    assert!(
+        (-1.0..=1.0).contains(&tau),
+        "tau must stay bounded for duplicate-heavy input: {tau}"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────
