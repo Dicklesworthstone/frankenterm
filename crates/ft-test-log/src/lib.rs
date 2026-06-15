@@ -298,6 +298,54 @@ impl TestLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    const W12_CROSS_CUTTING_HARNESS: &str =
+        include_str!("../../../tests/e2e/fixtures/duel-program/w12_cross_cutting_harness.v1.json");
+
+    type FixtureResult<T = ()> = Result<T, String>;
+
+    fn json_fixture() -> FixtureResult<Value> {
+        serde_json::from_str(W12_CROSS_CUTTING_HARNESS)
+            .map_err(|err| format!("W12.2 cross-cutting harness fixture must be valid JSON: {err}"))
+    }
+
+    fn string_field<'a>(value: &'a Value, key: &str) -> FixtureResult<&'a str> {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("expected string field {key}"))
+    }
+
+    fn array_field<'a>(value: &'a Value, key: &str) -> FixtureResult<&'a Vec<Value>> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("expected array field {key}"))
+    }
+
+    fn object_array_ids(value: &Value, key: &str) -> FixtureResult<BTreeSet<String>> {
+        array_field(value, key)?
+            .iter()
+            .map(|entry| string_field(entry, "id").map(str::to_owned))
+            .collect()
+    }
+
+    fn string_array(value: &Value, key: &str) -> FixtureResult<Vec<String>> {
+        array_field(value, key)?
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("expected string entry in {key}"))
+            })
+            .collect()
+    }
+
+    fn emit_test_row<T>(result: Result<T, TestLogError>) -> FixtureResult<T> {
+        result.map_err(|err| format!("emit test log row: {err}"))
+    }
 
     #[test]
     fn row_carries_schema_version() {
@@ -340,7 +388,7 @@ mod tests {
 
         let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = logger.sink.lock().unwrap();
-            panic!("poison ft-test-log sink");
+            std::panic::panic_any("poison ft-test-log sink");
         }));
         assert!(poison.is_err());
 
@@ -382,5 +430,278 @@ mod tests {
         let row = logger.assertion("x", Value::Null).unwrap();
         // Parses cleanly as RFC3339.
         chrono::DateTime::parse_from_rfc3339(&row.ts).expect("ts is rfc3339");
+    }
+
+    #[test]
+    fn duel_program_cross_cutting_harness_contract_pins_w12_requirements() -> FixtureResult {
+        let fixture = json_fixture()?;
+        assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(
+            string_field(&fixture, "contract_id")?,
+            "ft.duel.cross_cutting_e2e_harness.v1"
+        );
+        assert_eq!(string_field(&fixture, "producing_bead")?, "ft-7h5da.13.2");
+        assert_eq!(
+            string_field(&fixture, "status")?,
+            "contract_ready_live_swarm_not_yet_proven"
+        );
+
+        let claim_boundaries = fixture
+            .get("claim_boundaries")
+            .ok_or_else(|| "claim boundaries are present".to_string())?;
+        for key in [
+            "live_ntm_swarm_proof_claimed",
+            "remote_cargo_passed",
+            "local_cargo_counts_as_proof",
+            "side_effects_executed_by_contract_fixture",
+            "eligible_for_release_attestation",
+        ] {
+            assert_eq!(
+                claim_boundaries.get(key).and_then(Value::as_bool),
+                Some(false),
+                "{key} must be false until the live W12.2 proof exists"
+            );
+        }
+
+        let artifact_contract = fixture
+            .get("artifact_contract")
+            .ok_or_else(|| "artifact contract is present".to_string())?;
+        assert_eq!(
+            string_array(artifact_contract, "required_files")?,
+            [
+                "commands.txt",
+                "env.txt",
+                "manifest.json",
+                "structured.log",
+                "stdout.txt",
+                "stderr.txt",
+                "summary.json"
+            ]
+        );
+        assert_eq!(
+            artifact_contract["structured_log"]["schema_version"],
+            ROW_SCHEMA_VERSION
+        );
+        assert_eq!(
+            string_array(&artifact_contract["structured_log"], "required_phases")?,
+            ["SETUP", "ACT", "ASSERT", "TEARDOWN"]
+        );
+        assert_eq!(
+            string_array(&artifact_contract["structured_log"], "required_kinds")?,
+            [
+                RowKind::Assertion.as_str(),
+                RowKind::StageEnter.as_str(),
+                RowKind::StageExit.as_str(),
+                RowKind::Measurement.as_str(),
+                RowKind::Error.as_str(),
+                RowKind::Decision.as_str(),
+                RowKind::EvidenceEmit.as_str()
+            ]
+        );
+
+        let phase_names: Vec<String> = array_field(&fixture, "phases")?
+            .iter()
+            .map(|phase| string_field(phase, "name").map(str::to_owned))
+            .collect::<FixtureResult<Vec<String>>>()?;
+        assert_eq!(phase_names, ["SETUP", "ACT", "ASSERT", "TEARDOWN"]);
+        for phase in array_field(&fixture, "phases")? {
+            assert!(
+                !array_field(phase, "must_record_commands")?.is_empty(),
+                "{} phase must pin exact commands",
+                string_field(phase, "name")?
+            );
+            assert!(
+                !array_field(phase, "assertions")?.is_empty(),
+                "{} phase must pin assertions",
+                string_field(phase, "name")?
+            );
+        }
+
+        let surface_ids = object_array_ids(&fixture, "surfaces")?;
+        for required_surface in [
+            "W0.redaction_canary",
+            "W1.semantic_api",
+            "W2.verified_submit",
+            "W3.watch_events",
+            "W5.steer_receipt",
+            "W6.robot_next_policy_cockpit",
+        ] {
+            assert!(
+                surface_ids.contains(required_surface),
+                "missing surface {required_surface}"
+            );
+        }
+        for surface in array_field(&fixture, "surfaces")? {
+            assert!(
+                ["SETUP", "ACT", "ASSERT", "TEARDOWN"].contains(&string_field(surface, "phase")?),
+                "{} has an invalid phase",
+                string_field(surface, "id")?
+            );
+            assert!(
+                !array_field(surface, "commands")?.is_empty(),
+                "{} must record live command shape",
+                string_field(surface, "id")?
+            );
+            assert!(
+                !array_field(surface, "required_artifacts")?.is_empty(),
+                "{} must retain artifacts",
+                string_field(surface, "id")?
+            );
+            assert!(
+                !array_field(surface, "positive_assertions")?.is_empty()
+                    || !array_field(surface, "negative_assertions")?.is_empty(),
+                "{} must declare at least one assertion",
+                string_field(surface, "id")?
+            );
+        }
+
+        let negative_case_ids = object_array_ids(&fixture, "negative_cases")?;
+        for required_case in [
+            "typed_semantic_data_unavailable",
+            "stuck_composer",
+            "cursor_unavailable",
+            "tampered_hash",
+            "policy_denial",
+            "planted_canary",
+            "rch_fail_closed",
+        ] {
+            assert!(
+                negative_case_ids.contains(required_case),
+                "missing negative case {required_case}"
+            );
+        }
+        for negative in array_field(&fixture, "negative_cases")? {
+            assert!(
+                negative.get("expected_error_code").is_some()
+                    || negative.get("expected_state").is_some()
+                    || negative.get("expected_redaction").is_some(),
+                "{} must pin a typed expected outcome",
+                string_field(negative, "id")?
+            );
+            assert!(
+                string_field(negative, "must_not")?.len() > 8,
+                "{} must pin the forbidden false-positive outcome",
+                string_field(negative, "id")?
+            );
+        }
+
+        let proof_lane = fixture
+            .get("proof_lane")
+            .ok_or_else(|| "proof lane is present".to_string())?;
+        assert_eq!(proof_lane["remote_required"], true);
+        assert_eq!(
+            string_field(proof_lane, "cargo_target_dir")?,
+            "/tmp/ft-7h5da132-cod5-target"
+        );
+        let narrow_command = string_field(proof_lane, "narrow_command")?;
+        for required in [
+            "RCH_REQUIRE_REMOTE=1",
+            "RCH_NO_SELF_HEALING=1",
+            "rch --no-self-healing exec",
+            "CARGO_TARGET_DIR=/tmp/ft-7h5da132-cod5-target",
+            "cargo test -p ft-test-log --lib duel_program_cross_cutting_harness_contract",
+        ] {
+            assert!(
+                narrow_command.contains(required),
+                "proof command must contain {required}"
+            );
+        }
+        assert!(
+            string_array(proof_lane, "forbidden_outputs")?
+                .iter()
+                .any(|output| output == "[RCH] local"),
+            "fail-closed RCH local fallback marker must be forbidden"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duel_program_cross_cutting_harness_contract_emits_canonical_rows() -> FixtureResult {
+        let fixture = json_fixture()?;
+        let logger = TestLogger::in_memory("duel-program", "w12_cross_cutting_contract");
+        let artifact_root = string_field(
+            fixture
+                .get("artifact_contract")
+                .ok_or_else(|| "artifact contract is present".to_string())?,
+            "root_template",
+        )?;
+        let structured_log_artifact = format!("{artifact_root}/structured.log");
+
+        for phase in array_field(&fixture, "phases")? {
+            let phase_name = string_field(phase, "name")?;
+            let phase_commands = array_field(phase, "must_record_commands")?;
+            let phase_assertions = array_field(phase, "assertions")?;
+            let first_command = phase_commands
+                .first()
+                .ok_or("phase must record at least one command")?;
+            let enter = emit_test_row(logger.stage_enter(
+                phase_name,
+                serde_json::json!({
+                    "bead_id": "ft-7h5da.13.2",
+                    "artifact_root": artifact_root,
+                    "command_count": phase_commands.len()
+                }),
+            ))?;
+            assert_eq!(enter.kind, RowKind::StageEnter);
+            assert_eq!(enter.payload["stage"], phase_name);
+
+            let assertion = emit_test_row(logger.assertion(
+                "contract assertions pinned",
+                serde_json::json!({
+                    "status": "pass",
+                    "phase": phase_name,
+                    "command": first_command,
+                    "artifact": structured_log_artifact.as_str(),
+                    "assertion_count": phase_assertions.len()
+                }),
+            ))?;
+            assert_eq!(assertion.kind, RowKind::Assertion);
+            assert_eq!(assertion.payload["detail"]["status"], "pass");
+            assert_eq!(assertion.payload["detail"]["phase"], phase_name);
+            assert_eq!(
+                assertion.payload["detail"]["artifact"]
+                    .as_str()
+                    .map(|artifact| artifact.ends_with("structured.log")),
+                Some(true)
+            );
+
+            let exit = emit_test_row(logger.stage_exit(
+                phase_name,
+                serde_json::json!({
+                    "status": "pass",
+                    "artifact_root": artifact_root
+                }),
+            ))?;
+            assert_eq!(exit.kind, RowKind::StageExit);
+            assert_eq!(exit.payload["stage"], phase_name);
+        }
+
+        let decision = emit_test_row(logger.decision(
+            "blocked_until_live_swarm_and_remote_rch_pass",
+            serde_json::json!({
+                "status": string_field(&fixture, "status")?,
+                "local_cargo_counts_as_proof": false,
+                "remote_required": true
+            }),
+        ))?;
+        assert_eq!(decision.kind, RowKind::Decision);
+        assert_eq!(
+            decision.payload["verdict"],
+            "blocked_until_live_swarm_and_remote_rch_pass"
+        );
+
+        let evidence = emit_test_row(logger.evidence_emit(
+            "ft-7h5da.13.2.cross_cutting_contract",
+            serde_json::json!({
+                "path": "tests/e2e/fixtures/duel-program/w12_cross_cutting_harness.v1.json",
+                "schema_version": 1
+            }),
+        ))?;
+        assert_eq!(evidence.kind, RowKind::EvidenceEmit);
+        assert_eq!(
+            evidence.payload["claim_id"],
+            "ft-7h5da.13.2.cross_cutting_contract"
+        );
+        Ok(())
     }
 }

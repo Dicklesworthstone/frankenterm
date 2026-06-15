@@ -1,0 +1,312 @@
+{
+  "schema_version": 1,
+  "contract_id": "ft.duel.cross_cutting_e2e_harness.v1",
+  "producing_bead": "ft-7h5da.13.2",
+  "parent_bead": "ft-7h5da.13",
+  "purpose": "Deterministic retained contract for the W12.2 observe->dispatch->steer->cockpit e2e harness.",
+  "status": "contract_ready_live_swarm_not_yet_proven",
+  "claim_boundaries": {
+    "live_ntm_swarm_proof_claimed": false,
+    "remote_cargo_passed": false,
+    "local_cargo_counts_as_proof": false,
+    "side_effects_executed_by_contract_fixture": false,
+    "eligible_for_release_attestation": false
+  },
+  "artifact_contract": {
+    "root_template": "tests/e2e/artifacts/ft-7h5da.13.2/<UTC-timestamp>/",
+    "required_files": [
+      "commands.txt",
+      "env.txt",
+      "manifest.json",
+      "structured.log",
+      "stdout.txt",
+      "stderr.txt",
+      "summary.json"
+    ],
+    "structured_log": {
+      "schema_version": "ft.test-log.row.v1",
+      "required_kinds": [
+        "assertion",
+        "stage_enter",
+        "stage_exit",
+        "measurement",
+        "error",
+        "decision",
+        "evidence_emit"
+      ],
+      "required_phases": [
+        "SETUP",
+        "ACT",
+        "ASSERT",
+        "TEARDOWN"
+      ],
+      "assertion_payload_fields": [
+        "label",
+        "detail.status",
+        "detail.phase",
+        "detail.command",
+        "detail.artifact"
+      ]
+    }
+  },
+  "proof_lane": {
+    "remote_required": true,
+    "cargo_target_dir": "/tmp/ft-7h5da132-cod5-target",
+    "narrow_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-7h5da132-cod5-target cargo test -p ft-test-log --lib duel_program_cross_cutting_harness_contract -- --nocapture",
+    "forbidden_outputs": [
+      "[RCH] local",
+      "running locally",
+      "no admissible workers",
+      "worker=null",
+      "local fallback"
+    ]
+  },
+  "determinism": {
+    "rng_seed": "ft-7h5da.13.2-w12-cross-cutting-v1",
+    "clock": "VirtualClock pinned by harness before live commands",
+    "replay_corpus_required": true,
+    "fixture_sources": [
+      "semantic_api_shell_pane",
+      "semantic_data_unavailable_alt_screen_agent",
+      "verified_submit_submitted",
+      "verified_submit_stuck_composer",
+      "watch_events_cursor_detection",
+      "steer_receipt_hash_binding",
+      "robot_next_policy_denial",
+      "redaction_canary_surfaces"
+    ]
+  },
+  "phases": [
+    {
+      "name": "SETUP",
+      "must_record_commands": [
+        "mkdir -p tests/e2e/artifacts/ft-7h5da.13.2/<UTC-timestamp>",
+        "capture env.txt",
+        "spawn small real NTM swarm",
+        "plant unique canary secret in controlled pane output"
+      ],
+      "assertions": [
+        "artifact directory exists",
+        "commands.txt records every command before execution",
+        "live swarm panes are discoverable",
+        "canary token is present only in the controlled fixture source"
+      ]
+    },
+    {
+      "name": "ACT",
+      "must_record_commands": [
+        "ft robot dom zones --format json",
+        "ft robot send --verify-submit",
+        "ft robot watch-events --follow --format ndjson",
+        "ft steer plan --format json",
+        "ft steer run --receipt",
+        "ft robot next --format json",
+        "ft intervene pause --dry-run"
+      ],
+      "assertions": [
+        "every command has stdout and stderr artifacts",
+        "watch-events cursor is retained",
+        "steer receipt artifact is retained",
+        "policy decision audit extract is retained"
+      ]
+    },
+    {
+      "name": "ASSERT",
+      "must_record_commands": [
+        "verify semantic API positive and typed-unavailable cases",
+        "verify submitted and stuck_in_composer submit states",
+        "verify watch-events cursor resume and composite await",
+        "verify steering receipt hash binding and tamper refusal",
+        "verify robot next reasons and policy-denied audit row",
+        "verify canary absence across robot, search, event, and backup surfaces"
+      ],
+      "assertions": [
+        "all surface assertions pass",
+        "all negative cases produce typed failures",
+        "all canary surfaces are redacted",
+        "summary.json records pass/fail for every assertion"
+      ]
+    },
+    {
+      "name": "TEARDOWN",
+      "must_record_commands": [
+        "stop only panes spawned by this run",
+        "write manifest.json",
+        "write summary.json",
+        "record RCH proof command or fail-closed blocker"
+      ],
+      "assertions": [
+        "no unrelated pane is mutated",
+        "manifest paths exist",
+        "summary does not claim live proof unless RCH reached a remote worker"
+      ]
+    }
+  ],
+  "surfaces": [
+    {
+      "id": "W0.redaction_canary",
+      "phase": "ASSERT",
+      "commands": [
+        "ft robot get-text <pane>",
+        "ft robot search <canary>",
+        "ft robot events --limit 50",
+        "ft backup export --dry-run"
+      ],
+      "positive_assertions": [
+        "redaction pipeline returns ok envelopes"
+      ],
+      "negative_assertions": [
+        "FT_W12_CANARY_SECRET_0001 is absent from every retained public surface"
+      ],
+      "required_artifacts": [
+        "redaction-surfaces.json",
+        "canary-scan.json"
+      ]
+    },
+    {
+      "id": "W1.semantic_api",
+      "phase": "ASSERT",
+      "commands": [
+        "ft robot dom zones <shell-pane> --format json",
+        "ft robot dom zones <alt-screen-agent-pane> --format json"
+      ],
+      "positive_assertions": [
+        "shell pane returns structured zones, last-command, and exit-code"
+      ],
+      "negative_assertions": [
+        "alt-screen agent pane returns typed semantic_data_unavailable"
+      ],
+      "required_artifacts": [
+        "semantic-shell.json",
+        "semantic-alt-screen.json"
+      ]
+    },
+    {
+      "id": "W2.verified_submit",
+      "phase": "ASSERT",
+      "commands": [
+        "ft robot send <agent-pane> '<prompt>' --verify-submit --format json",
+        "ft robot send <stuck-composer-pane> '<prompt>' --verify-submit --format json"
+      ],
+      "positive_assertions": [
+        "SubmitReceipt state is submitted with guarantee_met true"
+      ],
+      "negative_assertions": [
+        "stuck composer returns stuck_in_composer instead of submitted"
+      ],
+      "required_artifacts": [
+        "submit-submitted.json",
+        "submit-stuck-composer.json"
+      ]
+    },
+    {
+      "id": "W3.watch_events",
+      "phase": "ASSERT",
+      "commands": [
+        "ft robot watch-events --follow --format ndjson --cursor-out",
+        "ft robot await --all detection submit_receipt --cursor <cursor>"
+      ],
+      "positive_assertions": [
+        "detection streams over NDJSON",
+        "cursor resume is monotonic",
+        "composite await unblocks on the detection"
+      ],
+      "negative_assertions": [
+        "missing cursor returns typed cursor_unavailable without hanging"
+      ],
+      "required_artifacts": [
+        "watch-events.ndjson",
+        "watch-events-cursor.json",
+        "composite-await.json"
+      ]
+    },
+    {
+      "id": "W5.steer_receipt",
+      "phase": "ASSERT",
+      "commands": [
+        "ft steer plan --mission-contract mission.json --tx-contract tx.json --format json",
+        "ft steer run --receipt steering-receipt.json --format json",
+        "ft steer run --receipt tampered-steering-receipt.json --format json"
+      ],
+      "positive_assertions": [
+        "SteeringReceipt hash binds the mission and tx contracts"
+      ],
+      "negative_assertions": [
+        "tampered receipt is refused with receipt_hash_mismatch"
+      ],
+      "required_artifacts": [
+        "mission.json",
+        "tx.json",
+        "steering-receipt.json",
+        "tampered-steering-receipt.json"
+      ]
+    },
+    {
+      "id": "W6.robot_next_policy_cockpit",
+      "phase": "ASSERT",
+      "commands": [
+        "ft robot next --format json",
+        "ft intervene pause <pane> --dry-run --format json",
+        "ft audit --decision deny --format json",
+        "ft status --health --format json"
+      ],
+      "positive_assertions": [
+        "robot next ranks attention items with non-empty reasons",
+        "resource cockpit snapshot is retained"
+      ],
+      "negative_assertions": [
+        "policy-gated intervention returns a denied or require_approval envelope with an audit row"
+      ],
+      "required_artifacts": [
+        "robot-next.json",
+        "policy-intervention.json",
+        "policy-audit.json",
+        "resource-cockpit.json"
+      ]
+    }
+  ],
+  "negative_cases": [
+    {
+      "id": "typed_semantic_data_unavailable",
+      "surface": "W1.semantic_api",
+      "expected_error_code": "robot.semantic_data_unavailable",
+      "must_not": "fall back to untyped empty zones"
+    },
+    {
+      "id": "stuck_composer",
+      "surface": "W2.verified_submit",
+      "expected_state": "stuck_in_composer",
+      "must_not": "report submitted"
+    },
+    {
+      "id": "cursor_unavailable",
+      "surface": "W3.watch_events",
+      "expected_error_code": "robot.watch.cursor_unavailable",
+      "must_not": "sleep until timeout without a typed error"
+    },
+    {
+      "id": "tampered_hash",
+      "surface": "W5.steer_receipt",
+      "expected_error_code": "steer.receipt_hash_mismatch",
+      "must_not": "execute the tampered receipt"
+    },
+    {
+      "id": "policy_denial",
+      "surface": "W6.robot_next_policy_cockpit",
+      "expected_error_code": "policy.require_approval",
+      "must_not": "mutate the target pane without an audit row"
+    },
+    {
+      "id": "planted_canary",
+      "surface": "W0.redaction_canary",
+      "expected_redaction": "canary_absent",
+      "must_not": "retain FT_W12_CANARY_SECRET_0001 in public artifacts"
+    },
+    {
+      "id": "rch_fail_closed",
+      "surface": "proof_lane",
+      "expected_error_code": "rch.remote_required_unavailable",
+      "must_not": "count local Cargo output as proof"
+    }
+  ]
+}
