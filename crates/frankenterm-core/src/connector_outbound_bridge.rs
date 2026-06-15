@@ -21,6 +21,8 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::connector_credential_broker::{CredentialScope, CredentialSensitivity};
+use crate::connector_data_classification::IngestionDecision;
+use crate::connector_event_model::{CanonicalConnectorEvent, EventDirection};
 use crate::connector_governor::GovernorVerdict;
 use crate::connector_host_runtime::{ConnectorCapability, ConnectorSandboxZone};
 use crate::connector_reliability::ConnectorErrorKind;
@@ -966,7 +968,14 @@ pub struct OutboundBridgeTelemetry {
     pub actions_blocked_policy: u64,
     pub actions_blocked_sandbox: u64,
     pub actions_blocked_governor: u64,
+    /// Actions the governor returned `Throttle` for (allowed-after-delay).
+    /// Kept distinct from `actions_blocked_governor` (hard rejections) so
+    /// pacing is not conflated with denials (ft-7h5da.5.15).
+    pub actions_throttled: u64,
     pub actions_blocked_reliability: u64,
+    /// Actions dropped by the data-classification gate (Reject/Quarantine
+    /// ingestion decisions on the operator-configured classifier; ft-cdxrr).
+    pub actions_blocked_classification: u64,
     pub dispatch_queue_overflows: u64,
 }
 
@@ -981,7 +990,16 @@ pub struct OutboundBridgeTelemetrySnapshot {
     pub actions_blocked_policy: u64,
     pub actions_blocked_sandbox: u64,
     pub actions_blocked_governor: u64,
+    /// `Throttle` verdicts (allowed-after-delay), distinct from hard
+    /// rejections (ft-7h5da.5.15). `#[serde(default)]` keeps older persisted
+    /// snapshots (without this field) loadable.
+    #[serde(default)]
+    pub actions_throttled: u64,
     pub actions_blocked_reliability: u64,
+    /// Actions dropped by the data-classification gate (ft-cdxrr).
+    /// `#[serde(default)]` keeps older persisted snapshots loadable.
+    #[serde(default)]
+    pub actions_blocked_classification: u64,
     pub dispatch_queue_overflows: u64,
 }
 
@@ -998,7 +1016,9 @@ impl OutboundBridgeTelemetry {
             actions_blocked_policy: self.actions_blocked_policy,
             actions_blocked_sandbox: self.actions_blocked_sandbox,
             actions_blocked_governor: self.actions_blocked_governor,
+            actions_throttled: self.actions_throttled,
             actions_blocked_reliability: self.actions_blocked_reliability,
+            actions_blocked_classification: self.actions_blocked_classification,
             dispatch_queue_overflows: self.dispatch_queue_overflows,
         }
     }
@@ -1588,13 +1608,116 @@ impl ConnectorOutboundBridge {
             } else {
                 event.payload.clone()
             };
-            let action = ConnectorAction {
+            let mut action = ConnectorAction {
                 target_connector: rule.target_connector.clone(),
                 action_kind: rule.action_kind,
                 correlation_id: correlation_id.clone(),
                 params,
                 created_at_ms: now_ms,
             };
+
+            // 3c.5 Data-classification gate (ft-cdxrr).
+            //
+            // The operator-configured data classifier (`PolicyEngine.data_classifier`,
+            // built from `[...].data_classifier` TOML) was built but never consulted
+            // on the dispatch path, so classification policies — drop prohibited
+            // data, redact sensitive fields — were silent no-ops outbound. Enforce
+            // them here, before the action reaches the dispatch queue: classify the
+            // action payload, then drop on Reject/Quarantine and redact the params
+            // in place on AcceptRedacted. Connectors with no matching classification
+            // policy are unaffected (the classifier has nothing configured for them),
+            // so this only takes effect where an operator actually configured one —
+            // and any classification error falls through unchanged rather than
+            // fabricating a denial.
+            let classification: Option<(IngestionDecision, Option<serde_json::Value>)> = {
+                let classifier = self.policy.data_classifier_mut();
+                if classifier.find_policy(&action.target_connector).is_some() {
+                    let canonical = CanonicalConnectorEvent::new(
+                        EventDirection::Outbound,
+                        action.target_connector.clone(),
+                        event.event_type.clone(),
+                        action.params.clone(),
+                    )
+                    .with_correlation_id(correlation_id.clone())
+                    .with_timestamp_ms(now_ms)
+                    .with_action(event.source, action.action_kind);
+                    match classifier.classify_event(&canonical) {
+                        Ok(classified) => {
+                            let decision = match classifier.find_policy(&action.target_connector) {
+                                Some(policy) => classifier.ingestion_decision(&classified, policy),
+                                None => IngestionDecision::Accept,
+                            };
+                            if matches!(decision, IngestionDecision::AcceptRedacted) {
+                                let redacted = classifier.redact_event_with_decision(
+                                    &canonical,
+                                    &classified,
+                                    decision.clone(),
+                                );
+                                Some((decision, Some(redacted.event.payload)))
+                            } else {
+                                Some((decision, None))
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            match classification {
+                None
+                | Some((IngestionDecision::Accept, _))
+                | Some((IngestionDecision::AcceptRedacted, None)) => {}
+                Some((IngestionDecision::AcceptRedacted, Some(redacted_payload))) => {
+                    action.params = redacted_payload;
+                }
+                Some((
+                    decision @ (IngestionDecision::Reject { .. }
+                    | IngestionDecision::Quarantine { .. }),
+                    _,
+                )) => {
+                    let (reason_code, reason_text) = match &decision {
+                        IngestionDecision::Reject { reason } => {
+                            ("classification_rejected", reason.clone())
+                        }
+                        IngestionDecision::Quarantine { reason } => {
+                            ("classification_quarantined", reason.clone())
+                        }
+                        _ => unreachable!("guarded by the match arm pattern"),
+                    };
+                    self.telemetry.actions_blocked_classification = self
+                        .telemetry
+                        .actions_blocked_classification
+                        .saturating_add(1);
+                    warn!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        decision = %decision,
+                        "outbound action blocked by data-classification gate"
+                    );
+                    blocked.push(BlockedAction {
+                        rule_id: rule.rule_id.clone(),
+                        target_connector: rule.target_connector.clone(),
+                        action_kind: rule.action_kind,
+                        reason: format!("classification({decision})"),
+                        denial: Some(
+                            ConnectorDispatchDenialEnvelope::new(
+                                "connector.classification_denied",
+                                reason_code,
+                                &rule.rule_id,
+                                &rule.target_connector,
+                                rule.action_kind,
+                                now_ms,
+                            )
+                            .with_detail(reason_text),
+                        ),
+                        policy_decision: Some(policy_decision.clone()),
+                    });
+                    continue;
+                }
+            }
+
             let admission_enforced = self.connector_admission_enforced(&action.target_connector);
 
             // 3d. Reliability + governor admission checks. These must run
@@ -1665,54 +1788,79 @@ impl ConnectorOutboundBridge {
                 governor.evaluate(&action, now_ms)
             };
             if !matches!(&governor_decision.verdict, GovernorVerdict::Allow) {
-                warn!(
-                    rule_id = %rule.rule_id,
-                    connector = %rule.target_connector,
-                    action = %rule.action_kind,
-                    verdict = %governor_decision.verdict,
-                    reason = %governor_decision.reason,
-                    delay_ms = governor_decision.delay_ms,
-                    enforced = admission_enforced,
-                    "outbound action denied by connector governor"
-                );
-                if !admission_enforced {
-                    debug!(
+                // ft-7h5da.5.15: a `Throttle` verdict is "allowed after a
+                // recommended delay", NOT a rejection — it must not be dropped
+                // the way the previous `!= Allow` gate did. Only `Reject` blocks;
+                // `Throttle` is counted distinctly (`actions_throttled`, so pacing
+                // is not conflated with hard denials in `actions_blocked_governor`)
+                // and falls through to the dispatch queue. The governor's
+                // `delay_ms` is advisory here: the dispatch queue is FIFO with no
+                // scheduler, so honoring it as a scheduled re-dispatch is a tracked
+                // follow-up; immediate enqueue still beats dropping the action, and
+                // the governor's queue-depth/rate tracking escalates to `Reject`
+                // under sustained pressure.
+                if matches!(&governor_decision.verdict, GovernorVerdict::Throttle) {
+                    self.telemetry.actions_throttled =
+                        self.telemetry.actions_throttled.saturating_add(1);
+                    warn!(
+                        rule_id = %rule.rule_id,
+                        connector = %rule.target_connector,
+                        action = %rule.action_kind,
+                        reason = %governor_decision.reason,
+                        delay_ms = governor_decision.delay_ms,
+                        enforced = admission_enforced,
+                        "outbound action throttled by connector governor; proceeding (delay advisory)"
+                    );
+                } else {
+                    warn!(
                         rule_id = %rule.rule_id,
                         connector = %rule.target_connector,
                         action = %rule.action_kind,
                         verdict = %governor_decision.verdict,
                         reason = %governor_decision.reason,
                         delay_ms = governor_decision.delay_ms,
-                        "connector governor denial observed in log-only mode"
+                        enforced = admission_enforced,
+                        "outbound action denied by connector governor"
                     );
-                } else {
-                    self.telemetry.actions_blocked_governor =
-                        self.telemetry.actions_blocked_governor.saturating_add(1);
-                    blocked.push(BlockedAction {
-                        rule_id: rule.rule_id.clone(),
-                        target_connector: rule.target_connector.clone(),
-                        action_kind: rule.action_kind,
-                        reason: format!(
-                            "governor({}: {}, delay_ms={})",
-                            governor_decision.verdict,
-                            governor_decision.reason,
-                            governor_decision.delay_ms
-                        ),
-                        denial: Some(
-                            ConnectorDispatchDenialEnvelope::new(
-                                "connector.governor_denied",
-                                governor_decision.reason.to_string(),
-                                &rule.rule_id,
-                                &rule.target_connector,
-                                rule.action_kind,
-                                now_ms,
-                            )
-                            .with_verdict(governor_decision.verdict.to_string())
-                            .with_delay_ms(governor_decision.delay_ms),
-                        ),
-                        policy_decision: Some(policy_decision.clone()),
-                    });
-                    continue;
+                    if !admission_enforced {
+                        debug!(
+                            rule_id = %rule.rule_id,
+                            connector = %rule.target_connector,
+                            action = %rule.action_kind,
+                            verdict = %governor_decision.verdict,
+                            reason = %governor_decision.reason,
+                            delay_ms = governor_decision.delay_ms,
+                            "connector governor denial observed in log-only mode"
+                        );
+                    } else {
+                        self.telemetry.actions_blocked_governor =
+                            self.telemetry.actions_blocked_governor.saturating_add(1);
+                        blocked.push(BlockedAction {
+                            rule_id: rule.rule_id.clone(),
+                            target_connector: rule.target_connector.clone(),
+                            action_kind: rule.action_kind,
+                            reason: format!(
+                                "governor({}: {}, delay_ms={})",
+                                governor_decision.verdict,
+                                governor_decision.reason,
+                                governor_decision.delay_ms
+                            ),
+                            denial: Some(
+                                ConnectorDispatchDenialEnvelope::new(
+                                    "connector.governor_denied",
+                                    governor_decision.reason.to_string(),
+                                    &rule.rule_id,
+                                    &rule.target_connector,
+                                    rule.action_kind,
+                                    now_ms,
+                                )
+                                .with_verdict(governor_decision.verdict.to_string())
+                                .with_delay_ms(governor_decision.delay_ms),
+                            ),
+                            policy_decision: Some(policy_decision.clone()),
+                        });
+                        continue;
+                    }
                 }
             }
 
@@ -2595,6 +2743,135 @@ mod tests {
     }
 
     #[test]
+    fn connector_outbound_bridge_classification_rejects_prohibited_ft_cdxrr() {
+        use crate::connector_data_classification::{
+            ClassificationPolicy, ClassificationRule, DataSensitivity,
+        };
+
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // Operator configures a classification policy for "slack" marking the
+        // `ssn` field prohibited and forbidding prohibited data. Before ft-cdxrr
+        // this classifier was never consulted on dispatch (silent no-op).
+        let policy = ClassificationPolicy {
+            policy_id: "slack-pii".to_string(),
+            connector_pattern: "slack".to_string(),
+            rules: vec![ClassificationRule::new(
+                "ssn-prohibited",
+                DataSensitivity::Prohibited,
+                vec!["ssn".to_string()],
+            )],
+            default_sensitivity: DataSensitivity::Internal,
+            scan_for_secrets: false,
+            max_payload_bytes: 1_048_576,
+            allow_prohibited: false,
+        };
+        bridge
+            .policy_engine_mut()
+            .data_classifier_mut()
+            .register_policy(policy);
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"ssn": "123-45-6789", "note": "hi"}),
+        )
+        .with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(
+            result.actions_dispatched.is_empty(),
+            "prohibited payload must not dispatch"
+        );
+        assert_eq!(result.actions_blocked.len(), 1);
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("classification block should emit a typed denial envelope");
+        assert_eq!(denial.error_code, "connector.classification_denied");
+        assert_eq!(denial.reason_code, "classification_rejected");
+        assert_eq!(denial.connector_id, "slack");
+        assert_eq!(bridge.telemetry().actions_blocked_classification, 1);
+        assert_eq!(bridge.pending_action_count(), 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_classification_redacts_restricted_ft_cdxrr() {
+        use crate::connector_data_classification::{
+            ClassificationPolicy, ClassificationRule, DataSensitivity,
+        };
+
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // Restricted field -> AcceptRedacted: the action still dispatches but the
+        // sensitive field is masked in the enqueued params.
+        let policy = ClassificationPolicy {
+            policy_id: "slack-redact".to_string(),
+            connector_pattern: "slack".to_string(),
+            rules: vec![ClassificationRule::new(
+                "token-restricted",
+                DataSensitivity::Restricted,
+                vec!["api_token".to_string()],
+            )],
+            default_sensitivity: DataSensitivity::Internal,
+            scan_for_secrets: false,
+            max_payload_bytes: 1_048_576,
+            allow_prohibited: false,
+        };
+        bridge
+            .policy_engine_mut()
+            .data_classifier_mut()
+            .register_policy(policy);
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "test",
+            serde_json::json!({"api_token": "super-secret-value", "msg": "hello"}),
+        )
+        .with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(
+            result.actions_blocked.is_empty(),
+            "redacted action should still dispatch, not block"
+        );
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert_eq!(bridge.telemetry().actions_blocked_classification, 0);
+
+        let action = bridge.peek_action().expect("redacted action enqueued");
+        let token = action
+            .params
+            .get("api_token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_ne!(
+            token, "super-secret-value",
+            "restricted field must be redacted in the dispatched params"
+        );
+        assert_eq!(
+            action.params.get("msg").and_then(serde_json::Value::as_str),
+            Some("hello"),
+            "non-sensitive field passes through unchanged"
+        );
+    }
+
+    #[test]
     fn connector_outbound_bridge_governor_blocks_dispatch_ft_x3211() {
         let mut safety = crate::config::SafetyConfig::default();
         safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
@@ -2646,6 +2923,207 @@ mod tests {
         assert_eq!(tel.actions_dispatched, 1);
         assert_eq!(tel.actions_blocked_governor, 1);
         assert_eq!(tel.actions_blocked_reliability, 0);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_governor_throttle_proceeds_not_dropped_ft_7h5da_5_15() {
+        // ft-7h5da.5.15: a governor `Throttle` verdict must DISPATCH the action
+        // (allowed-after-delay) and bump `actions_throttled`, NOT drop it as a
+        // hard rejection under `actions_blocked_governor`.
+        let mut safety = crate::config::SafetyConfig::default();
+        // Generous quota so only queue backpressure can fire a verdict.
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1000,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        // Tiny backpressure window: with max_queue_depth=2, a queue depth of 1
+        // is fraction 0.5 -> above the 0.4 throttle threshold but below the 0.95
+        // reject threshold -> Throttle.
+        safety.connector_governor.queue_backpressure =
+            crate::connector_governor::QueueBackpressureConfig {
+                max_queue_depth: 2,
+                throttle_threshold: 0.4,
+                reject_threshold: 0.95,
+            };
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        bridge.set_connector_admission_enforced("slack", true);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        // Event 1: empty queue (depth 0) -> Allow -> dispatched (queue depth 1).
+        let first = make_event("event.first", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let first_result = bridge.process_event(&first).unwrap();
+        assert_eq!(first_result.actions_dispatched.len(), 1);
+
+        // Event 2: queue depth 1 -> Throttle. Must still DISPATCH (proceed), not
+        // block, and must be counted under actions_throttled.
+        let second =
+            make_event("event.second", OutboundEventSource::Custom).with_timestamp_ms(1001);
+        let second_result = bridge.process_event(&second).unwrap();
+        assert_eq!(
+            second_result.actions_dispatched.len(),
+            1,
+            "a throttled action must still be dispatched (allowed-after-delay), not dropped"
+        );
+        assert!(
+            second_result.actions_blocked.is_empty(),
+            "a throttle must not be recorded as a blocked/denied action"
+        );
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 2, "both actions proceeded to dispatch");
+        assert!(
+            tel.actions_throttled >= 1,
+            "the throttled action must increment actions_throttled"
+        );
+        assert_eq!(
+            tel.actions_blocked_governor, 0,
+            "throttle must not be conflated with hard governor rejections"
+        );
+    }
+
+    #[test]
+    fn outbound_telemetry_snapshot_round_trips_actions_throttled_ft_7h5da_5_15() {
+        let mut tel = OutboundBridgeTelemetry::default();
+        tel.actions_throttled = 3;
+        let snap = tel.snapshot();
+        assert_eq!(snap.actions_throttled, 3);
+        let json = serde_json::to_string(&snap).expect("serialize outbound telemetry snapshot");
+        let back: OutboundBridgeTelemetrySnapshot =
+            serde_json::from_str(&json).expect("deserialize outbound telemetry snapshot");
+        assert_eq!(back.actions_throttled, 3);
+    }
+
+    /// ft-7h5da.5.17: perfect e2e across the whole connector dispatch flow —
+    /// inbound bridge -> EventBus -> outbound-event conversion -> outbound bridge
+    /// -> governor consultation -> dispatch. Asserts a message traverses every
+    /// stage, that the governor IS consulted (it Allows the first action and
+    /// Throttles the second), and that a Throttle verdict is NOT silently dropped
+    /// (the action still dispatches and is counted under actions_throttled, never
+    /// actions_blocked_governor).
+    #[test]
+    fn connector_dispatch_e2e_inbound_governor_outbound_throttle_not_dropped_ft_7h5da_5_17() {
+        use crate::connector_inbound_bridge::{
+            ConnectorInboundBridge, ConnectorInboundBridgeConfig, ConnectorSignal,
+            ConnectorSignalKind,
+        };
+        use crate::events::{Event, EventBus};
+        use std::sync::Arc;
+
+        // ---- Stage 1: inbound bridge routes two connector signals onto the bus.
+        let bus = Arc::new(EventBus::new(64));
+        let mut detections = bus.subscribe_detections();
+        let mut inbound =
+            ConnectorInboundBridge::new(Arc::clone(&bus), ConnectorInboundBridgeConfig::default());
+
+        let sig1 = ConnectorSignal::new("github", ConnectorSignalKind::Webhook, serde_json::json!({}))
+            .with_pane_id(7)
+            .with_sub_type("push")
+            .with_correlation_id("evt-1")
+            .with_timestamp_ms(1000);
+        let sig2 = ConnectorSignal::new("github", ConnectorSignalKind::Webhook, serde_json::json!({}))
+            .with_pane_id(7)
+            .with_sub_type("push")
+            .with_correlation_id("evt-2")
+            .with_timestamp_ms(1001);
+
+        let r1 = inbound.route_signal(&sig1).expect("inbound routes signal 1");
+        let r2 = inbound.route_signal(&sig2).expect("inbound routes signal 2");
+        assert!(
+            r1.delivered_count > 0 && !r1.deduplicated,
+            "stage 1: signal 1 must be delivered to the bus"
+        );
+        assert!(
+            r2.delivered_count > 0 && !r2.deduplicated,
+            "stage 1: signal 2 must be delivered to the bus"
+        );
+
+        // ---- Stage 2: both publish Event::PatternDetected; read them off the bus.
+        let ev1 = match detections.try_recv() {
+            Some(Ok(e)) => e,
+            other => panic!("stage 2: expected detection event 1 on the bus, got {other:?}"),
+        };
+        let ev2 = match detections.try_recv() {
+            Some(Ok(e)) => e,
+            other => panic!("stage 2: expected detection event 2 on the bus, got {other:?}"),
+        };
+        assert!(matches!(ev1, Event::PatternDetected { .. }));
+        assert!(matches!(ev2, Event::PatternDetected { .. }));
+
+        // ---- Stage 2b: convert each runtime event into an outbound event.
+        // Different now_ms (plus the distinct inbound correlations) guarantee
+        // distinct outbound correlation ids, so the outbound bridge does not
+        // dedup the second action.
+        let out_ev1 = OutboundEvent::from_runtime_event(&ev1, 1000)
+            .expect("stage 2b: PatternDetected -> OutboundEvent (1)");
+        let out_ev2 = OutboundEvent::from_runtime_event(&ev2, 1001)
+            .expect("stage 2b: PatternDetected -> OutboundEvent (2)");
+
+        // ---- Stage 3: outbound bridge consults the governor on every dispatch.
+        let mut safety = crate::config::SafetyConfig::default();
+        // Generous quota so only queue backpressure produces a verdict.
+        safety.connector_governor.default_quota = crate::connector_governor::QuotaConfig {
+            max_actions: 1000,
+            window_ms: 60_000,
+            warning_threshold: 0.8,
+        };
+        // Tiny backpressure window: a queue depth of 1 is fraction 0.5 -> above
+        // the 0.4 throttle threshold but below the 0.95 reject threshold.
+        safety.connector_governor.queue_backpressure =
+            crate::connector_governor::QueueBackpressureConfig {
+                max_queue_depth: 2,
+                throttle_threshold: 0.4,
+                reject_threshold: 0.95,
+            };
+        let mut outbound = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        outbound.set_policy_engine(PolicyEngine::from_safety_config(&safety));
+        outbound.set_connector_admission_enforced("slack", true);
+        outbound.register_sandbox_zone("slack", permissive_zone());
+        // None/None filters: the rule matches the PatternDetected-derived event.
+        outbound.add_rule(make_rule("r1", None, None, "slack", ConnectorActionKind::Notify));
+
+        // First event: governor Allow -> dispatched. Proves the message traversed
+        // inbound -> bus -> outbound AND that the governor was consulted and
+        // admitted it.
+        let d1 = outbound.process_event(&out_ev1).expect("stage 3: dispatch 1");
+        assert_eq!(
+            d1.actions_dispatched.len(),
+            1,
+            "stage 3: inbound-originated action must traverse to dispatch (governor Allow)"
+        );
+
+        // Second event (queue depth 1): governor Throttle. The action must NOT be
+        // silently dropped — it still dispatches (allowed-after-delay) and is
+        // counted as a throttle, never as a hard rejection.
+        let d2 = outbound.process_event(&out_ev2).expect("stage 3: dispatch 2");
+        assert_eq!(
+            d2.actions_dispatched.len(),
+            1,
+            "a throttled action must still be dispatched (no silent drop)"
+        );
+        assert!(
+            d2.actions_blocked.is_empty(),
+            "a throttle must not be recorded as a blocked/denied action"
+        );
+
+        let tel = outbound.telemetry();
+        assert_eq!(tel.actions_dispatched, 2, "both messages reached dispatch");
+        assert!(
+            tel.actions_throttled >= 1,
+            "the governor's Throttle verdict was consulted and honored (not dropped)"
+        );
+        assert_eq!(
+            tel.actions_blocked_governor, 0,
+            "a throttle must not be conflated with a hard governor rejection"
+        );
     }
 
     #[test]
@@ -3401,6 +3879,8 @@ mod tests {
             actions_blocked_sandbox: u64::MAX,
             actions_blocked_governor: u64::MAX,
             actions_blocked_reliability: u64::MAX,
+            actions_throttled: u64::MAX,
+            actions_blocked_classification: u64::MAX,
             dispatch_queue_overflows: u64::MAX,
         };
 
@@ -3442,6 +3922,8 @@ mod tests {
             actions_blocked_sandbox: 1,
             actions_blocked_governor: 2,
             actions_blocked_reliability: 3,
+            actions_throttled: 4,
+            actions_blocked_classification: 5,
             dispatch_queue_overflows: 0,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
