@@ -1,323 +1,63 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-01-26
-**Project:** FrankenTerm (ft)
-**Language:** Rust
-**Manifest:** Cargo.toml (workspace), crates/frankenterm/Cargo.toml, crates/frankenterm-core/Cargo.toml, fuzz/Cargo.toml
-
----
+**Started:** 2026-06-14  |  **Updated:** 2026-06-15  |  **Project:** frankenterm  |  **Language:** Rust + GitHub Actions
 
 ## Summary
 
-| Metric | Count |
-|--------|-------|
-| **Total dependencies** | 29 |
-| **Updated** | 27 |
-| **Skipped** | 2 |
-| **Failed (rolled back)** | 0 |
-| **Requires attention** | 27 |
-
----
-
-## Successfully Updated
-
-## Skipped
-
-### fancy-regex: 0.14
-**Reason:** Already at latest stable (0.14.0)
-
-### base64: 0.22.1
-**Reason:** Already at latest stable (0.22.1)
-
-## Failed Updates (Rolled Back)
-
-## Requires Attention
-
-### clap: 4.5 → 4.5.54
-
-**Changelog:** crates.io / release notes (latest patch series)
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` ran but was interrupted due to prolonged global cargo lock contention; will rerun in finalize stage.
-
-### serde: 1.0 → 1.0.228
-
-**Changelog:** crates.io / release notes (latest patch series)
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on cargo artifact lock; will rerun in finalize stage.
-
-### serde_json: 1.0 → 1.0.149
-
-**Changelog:** crates.io / release notes (latest patch series)
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on cargo artifact lock; will rerun in finalize stage.
-
-### tokio: 1.43 → 1.49.0
-
-**Changelog:** docs.rs / crates.io (latest stable tag)
-
-**Breaking changes:** Possible behavioral changes across minor versions; no specific API removals noted in patch notes.
-
-**Tests:** ⏳ `cargo test` blocked on cargo artifact lock; will rerun in finalize stage.
-
-### anyhow: 1.0 → 1.0.100
-
-**Changelog:** docs.rs / crates.io (latest stable tag)
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on cargo artifact lock; will rerun in finalize stage.
-
-### tracing: 0.1 → 0.1.44
-
-**Changelog:** cargo-run / crates.io release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on package cache lock; will rerun in finalize stage.
-
-### tracing-subscriber: 0.3 → 0.3.22
-
-**Changelog:** crates.io / release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### toml: 0.8 → 0.8.23
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on package cache/artifact locks; will rerun in finalize stage.
-
-### toml_edit: 0.22 → 0.24.0
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** Minor feature updates; no API removals noted.
-
-**Notes:** Cargo warned about semver metadata; pinned to `0.24.0` to avoid metadata warnings.
-
-**Tests:** ⏳ `cargo test` blocked on cache/artifact locks after downloading; will rerun in finalize stage.
-
-### toon_rust: git main (4df74c0a → 788589d7)
-
-**Changelog:** git commit update (no tagged release)
-
-**Breaking changes:** Unknown; requires downstream tests.
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### dirs: 5.0 → 6.0.0
-
-**Changelog:** crates.io / release notes
-
-**Breaking changes:** Major version bump; verify API compatibility during final test run.
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### assert_cmd: 2.0 → 2.1.2
-
-**Changelog:** crates.io / release notes
-
-**Breaking changes:** Minor updates; no major API removals noted.
-
-**Tests:** ⏳ `cargo test` blocked on cache/artifact locks; will rerun in finalize stage.
-
-### predicates: 3.1 → 3.1.3
-
-**Changelog:** crates.io / release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### thiserror: 2.0 → 2.0.18
-
-**Changelog:** crates.io / release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### aho-corasick: 1.1 → 1.1.4
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### memchr: 2.7 → 2.7.6
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### regex: 1.10 → 1.12.2
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (minor updates; no removals noted in changelog)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### rand: 0.8 → 0.9.2
-
-**Changelog:** rust-random upgrade guide / crates.io release notes
-
-**Breaking changes:** API rename in 0.9 (e.g., `Rng::gen` → `Rng::random`, `Distribution::sample` → `Distribution::random`). Code may need updates if these APIs are used.
-
-**Tests:** ⏳ `cargo test` blocked on package cache lock; will rerun in finalize stage.
-
-### sha2: 0.10 → 0.10.9
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on package cache/artifact locks; will rerun in finalize stage.
-
-### rusqlite: 0.32 → 0.38.0
-
-**Changelog:** GitHub releases / crates.io release notes
-
-**Breaking changes:** Minor/patch updates across multiple releases; review release notes for API/feature changes (e.g., updated libsqlite3-sys, hashlink).
-
-**Tests:** ⏳ `cargo test` blocked on package cache lock; will rerun in finalize stage.
-
-### fs2: 0.4 → 0.4.3
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### ratatui: 0.29 → 0.30.0
-
-**Changelog:** ratatui 0.30.0 release notes
-
-**Breaking changes:** 0.30 introduces modularization (new `ratatui-*` crates) and updated dependency surface; review API changes for any imports/paths.
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### crossterm: 0.28 → 0.29.0
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (minor update), but verify any terminal backend changes after ratatui upgrade.
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### proptest: 1.5 → 1.8.0
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (minor update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### tempfile: 3.10 → 3.23.0
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (minor update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### criterion: 0.5 → 0.7.0 (latest compatible)
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** Minor updates; note latest 0.8.1 requires newer Rust (MSRV 1.86+), so pinned to 0.7.0 to respect workspace rust-version 1.85.
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-### libfuzzer-sys: 0.4 → 0.4.10
-
-**Changelog:** docs.rs / crates.io release notes
-
-**Breaking changes:** None expected (patch update)
-
-**Tests:** ⏳ `cargo test` blocked on artifact lock; will rerun in finalize stage.
-
-## Deprecation Warnings Fixed
-
-| Package | Warning | Fix Applied |
-|---------|---------|-------------|
-
-## Security Notes
-
-**Vulnerabilities resolved:** None detected (cargo audit exit 0)
-
-**New advisories:** None reported
-
-**Audit command:** `cargo audit` (ran)
-
----
-
-## Post-Upgrade Checklist
-
-- [ ] All tests passing
-- [ ] No deprecation warnings
-- [ ] Manual smoke test performed
-- [ ] Documentation updated (if needed)
-- [ ] Changes committed
-
----
-
-## Commands Used
-
-```bash
-# Update commands
-cargo update -p clap
-cargo update -p serde
-cargo update -p serde_json
-cargo update -p tokio
-cargo update -p anyhow
-cargo update -p tracing
-cargo update -p tracing-subscriber
-cargo update -p toml
-cargo update -p toml_edit@0.23.10+spec-1.0.0 --precise 0.24.0+spec-1.1.0
-cargo update -p toon_rust
-cargo update -p dirs
-cargo update -p assert_cmd
-cargo update -p predicates
-cargo update -p thiserror
-cargo update -p aho-corasick
-cargo update -p memchr
-cargo update -p regex
-cargo update -p rand@0.9.2
-cargo update -p sha2
-cargo update -p rusqlite
-cargo update -p fs2
-cargo update -p ratatui
-cargo update -p crossterm@0.29.0
-cargo update -p proptest
-cargo update -p tempfile
-cargo update -p criterion
-cargo update -p libfuzzer-sys
-
-# Test commands
-timeout 600 cargo test
-
-# Audit commands
-cargo audit
-```
-
----
-
-## Notes
-
-- Process follows library-updater skill: research each dependency before update; update one at a time; test after each.
-- Cleanup steps that would delete files are skipped due to repo safety rules.
+- **Updated:** GitHub Actions, direct Cargo registry dependencies, and `Cargo.lock`
+- **Skipped:** no direct dependency update intentionally skipped
+- **Failed:** no code migration currently known failed
+- **Needs attention:** final remote `rch` workspace proof is blocked; see Proof
+
+## Discovery
+
+- Read `AGENTS.md` and `README.md` before editing.
+- Investigated the workspace architecture and dependency surfaces before changing manifests.
+- Checked open Dependabot issues and PRs. One open Dependabot PR existed: `#62`, the GitHub Actions group update.
+- Closed PR `#62` after applying the workflow action updates locally with current stable patch tags.
+- Rechecked Dependabot after the update: no open Dependabot PRs or issues remained.
+- Enumerated direct Cargo registry dependencies from `cargo metadata --no-deps --format-version 1`.
+- Queried crates.io for latest stable direct registry versions and refreshed `Cargo.lock`.
+
+## Updates
+
+### GitHub Actions group
+
+- **Updated:**
+  - `actions/checkout`: `v4` / `v6.0.2` -> `v6.0.3`
+  - `actions/upload-artifact`: `v4` -> `v7.0.1`
+  - `actions/download-artifact`: `v4` -> `v8.0.1`
+  - `actions/setup-python`: `v5` -> `v6.2.0`
+  - `dependabot/fetch-metadata`: `v2` -> `v3.1.0`
+  - `peter-evans/repository-dispatch`: `v3` -> `v4.0.1`
+  - `softprops/action-gh-release`: `v2` -> `v3.0.0`
+  - `codecov/codecov-action`: `v4` -> `v7.0.0`
+- **Breaking:** no workflow syntax migration required by the changed call sites.
+
+### Cargo registry dependencies
+
+- Updated direct registry dependency requirements across the workspace and refreshed `Cargo.lock`.
+- Migrated API changes for the major touched libraries, including `bitflags`, `csscolorparser`, `ordered-float`, `mlua`, `colorgrad`, `criterion`, `governor`, `intrusive-collections`, `bloomfilter`, `rand`, `sha2`, `syn`, `rcgen`, `wgpu`, `resize`, and `jsonschema`.
+- Resolved follow-on compile/clippy issues discovered during local and remote proof attempts.
+
+### Remaining non-direct holdouts
+
+The remaining crates known to be behind latest are transitive-only in this lockfile:
+
+- `generic-array` `0.14.7` (latest `0.14.9`)
+- `lua-src` `550.0.0` (latest `550.1.1`)
+- `luajit-src` `210.6.6+707c12b` (latest `210.7.2+b925b3e`)
+
+## Proof
+
+- **Local format:** `cargo fmt --check` passed after final formatting fixes.
+- **Local scoped clippy diagnostic:** `RUSTFLAGS='-A deprecated' cargo clippy -p frankenterm-core -p frankenterm-core-replay --lib --tests -- -D warnings` passed. This is local diagnosis only, not remote proof.
+- **Audit:** `cargo audit --no-fetch` completed with only the already tolerated unmaintained warnings for `paste` and `rustls-pemfile`.
+- **Remote workspace check:** `j-29884604911452538` passed earlier on `vmi1149989`, but it predates later lint/format fixes and is not final proof for the current tree.
+- **Remote workspace clippy:** current final proof is unavailable. Runs exposed and drove fixes, but the latest full retry was cancelled by RCH stuck detection (`j-29884604911452568`, exit `130`) and the following retry failed closed before running with `no admissible workers: health_below_fallback=1,hard_preflight=3,active_project_exclusion=1`.
+- **Remote fmt:** unavailable because RCH classifies `cargo fmt --check` as a non-compilation command and refuses local fallback under `RCH_REQUIRE_REMOTE=1`.
+
+## Needs Attention
+
+- Re-run remote `rch` workspace `cargo check --workspace --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings` after RCH admission clears.
+- Current RCH status during this update showed another active FrankenTerm build (`29884604911452571`) on `vmi1149989`; do not count local Cargo output as proof.

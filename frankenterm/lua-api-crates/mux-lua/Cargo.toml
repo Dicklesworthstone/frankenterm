@@ -16,6 +16,7 @@ mlua.workspace = true
 mux.workspace = true
 parking_lot.workspace = true
 portable-pty.workspace = true
+promise.workspace = true
 smol.workspace = true
 termwiz-funcs.workspace = true
 termwiz.workspace = true

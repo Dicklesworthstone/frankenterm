@@ -256,41 +256,41 @@ implicit_clone = "allow"
 [workspace.dependencies]
 # Core dependencies
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 tantivy = "0.26.1"
 thiserror = "2.0.18"
-tokio = { version = "1.49.0", features = ["full"] }
-anyhow = "1.0.100"
+tokio = { version = "1.52.3", features = ["full"] }
+anyhow = "1.0.102"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
-dhat = "0.3"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+dhat = "0.3.3"
 
 # CLI
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 
 # Database
-rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "backup", "functions"] }
 
 # Allocator (optional)
-tikv-jemallocator = "0.6.1"
-tikv-jemalloc-ctl = { version = "0.6.1", features = ["stats"] }
+tikv-jemallocator = "0.7.0"
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
 
 # Pattern matching
 aho-corasick = "1.1.4"
-memchr = "2.7.6"
-fancy-regex = { version = "0.14", default-features = false }
-regex = "1.12.2"
-bloomfilter = "1.0"
+memchr = "2.8.2"
+fancy-regex = { version = "0.18.0", default-features = false }
+regex = "1.12.4"
+bloomfilter = "3.0.1"
 
 # Crypto / randomness
 chacha20poly1305 = "0.10.1"
-rand = "0.9.2"
-sha2 = "0.10.9"
-x509-parser = "0.18.0"
+rand = "0.10.1"
+sha2 = "0.11.0"
+x509-parser = "0.18.1"
 
 # Config
-toml = "0.8.23"
-toml_edit = "0.24.0"
+toml = "1.1.2"
+toml_edit = "0.25.12"
 serde_yaml = "0.9.34"
 
 # Serialization
@@ -350,169 +350,169 @@ wezterm-ssh = { path = "frankenterm/ssh", package = "frankenterm-ssh" }
 wezterm-uds = { path = "frankenterm/uds", package = "frankenterm-uds", default-features = false }
 
 # External deps needed by FrankenTerm crates
-assert_fs = "1.0.4"
-async-executor = "1.11"
-async-io = "2.3"
-async-task = "4.7"
-async-trait = "0.1"
-base64 = { version = "0.22", default-features = false }
-bitflags = "1.3"
-bstr = "1.0"
-camino = "1.0"
+assert_fs = "1.1.4"
+async-executor = "1.14.0"
+async-io = "2.6.0"
+async-task = "4.7.1"
+async-trait = "0.1.89"
+base64 = { version = "0.22.1", default-features = false }
+bitflags = { version = "2.13.0", features = ["serde"] }
+bstr = "1.12.1"
+camino = "1.2.2"
 cassowary = "0.3"
-colorgrad = "0.6"
-crossbeam = "0.8"
-csscolorparser = "0.6"
-deltae = "0.3"
+colorgrad = { version = "0.8.0", features = ["named-colors", "preset"] }
+crossbeam = "0.8.4"
+csscolorparser = "0.8.3"
+deltae = "0.3.2"
 dirs-next = "2.0"
-downcast-rs = "1.0"
+downcast-rs = "2.0.2"
 enum-display-derive = "0.1"
-env_logger = "0.11"
+env_logger = "0.11.10"
 euclid = { version = "0.22", default-features = false }
-filenamegen = "0.2.6"
+filenamegen = "0.2.7"
 finl_unicode = { version = "1.3", git = "https://github.com/wez/finl_unicode.git", branch = "no_std", default-features = false, features = ["categories", "grapheme_clusters"] }
-fixedbitset = { version = "0.4", default-features = false }
-flume = "0.11"
-fnv = "1.0"
-futures = "0.3"
-gethostname = "0.5"
-heapless = "0.8"
-hex = { version = "0.4", default-features = false }
-hostname = "0.4"
-humansize = "2.1"
-image = "0.25"
+fixedbitset = { version = "0.5.7", default-features = false }
+flume = "0.12.0"
+fnv = "1.0.7"
+futures = "0.3.32"
+gethostname = "1.1.0"
+heapless = "0.9.3"
+hex = { version = "0.4.3", default-features = false }
+hostname = "0.4.2"
+humansize = "2.1.3"
+image = "0.25.10"
 k9 = "0.12.0"
-lazy_static = "1.4"
-leb128 = "0.2"
-libc = "0.2"
+lazy_static = "1.5.0"
+leb128 = "0.2.6"
+libc = "0.2.186"
 libssh-rs = "0.3.6"
-lru = "0.16"
-maplit = "1.0"
-memmem = "0.1"
-metrics = "0.23"
-miniz_oxide = "0.7"
-mlua = "0.9"
-names = { version = "0.12", default-features = false }
-nix = "0.29"
-ntapi = "0.4"
-num = "0.4"
-num-derive = "0.4"
+lru = "0.18.0"
+maplit = "1.0.2"
+memmem = "0.1.1"
+metrics = "0.24.6"
+miniz_oxide = "0.9.1"
+mlua = "0.11.6"
+names = { version = "0.14.0", default-features = false }
+nix = "0.31.3"
+ntapi = "0.4.3"
+num = "0.4.3"
+num-derive = "0.4.2"
 num-traits = { version = "0.2", default-features = false }
-openssl = "0.10.57"
-ordered-float = { version = "4.1", default-features = false }
+openssl = "0.10.81"
+ordered-float = { version = "5.3.0", default-features = false }
 parking_lot = "0.12"
 passfd = "0.1.6"
-percent-encoding = "2.3"
-pest = "2.7"
-pest_derive = "2.7"
-phf = { version = "0.11", default-features = false }
-predicates = "3.0"
-proc-macro2 = "1.0"
-quote = "1.0.2"
+percent-encoding = "2.3.2"
+pest = "2.8.6"
+pest_derive = "2.8.6"
+phf = { version = "0.13.1", default-features = false }
+predicates = "3.1.4"
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
 roaring = "0.11.4"
-rstest = "0.21"
-serial2 = "0.2"
-shared_library = "0.1"
-shell-words = "1.1"
-shlex = "1.1"
-signal-hook = "0.3"
-siphasher = "1.0.1"
-smol = "2.0"
-socket2 = "0.5"
-ssh2 = "0.9.3"
-strsim = "0.11"
-syn = "1.0"
-tempfile = "3.20"
+rstest = "0.26.1"
+serial2 = "0.2.37"
+shared_library = "0.1.9"
+shell-words = "1.1.1"
+shlex = "2.0.1"
+signal-hook = "0.4.4"
+siphasher = "1.0.3"
+smol = "2.0.2"
+socket2 = "0.6.4"
+ssh2 = "0.9.5"
+strsim = "0.11.1"
+syn = "2.0.117"
+tempfile = "3.27.0"
 terminfo = "0.9"
-termios = "0.3"
-textwrap = "0.16"
-tar = "0.4"
+termios = "0.3.3"
+textwrap = "0.16.2"
+tar = "0.4.46"
 ucd-trie = { version = "0.1", default-features = false }
-uds_windows = "1.1"
-unicode-normalization = "0.1.24"
-unicode-segmentation = "1.12"
-url = "2"
+uds_windows = "1.2.1"
+unicode-normalization = "0.1.25"
+unicode-segmentation = "1.13.3"
+url = "2.5.8"
 utf8parse = "0.2"
-uuid = "1.13"
+uuid = "1.23.3"
 varbincode = "0.1"
-whoami = "1.5"
+whoami = "2.1.2"
 winapi = "0.3.9"
-winreg = "0.10"
-zstd = "0.11"
+winreg = "0.56.0"
+zstd = "0.13.3"
 
 # GUI-layer dependencies (vendored from legacy_wezterm, ft-1memj.2)
-serde_with = { version = "2.0", features = ["chrono_0_4"] }
-ahash = "0.8"
-intrusive-collections = "0.9"
-governor = { version = "0.5", default-features = false, features = ["std"] }
-async-channel = "2.3"
-bytes = "1.0"
-bytemuck = { version = "1.4", features = ["derive"] }
-cairo-rs = { version = "0.18", default-features = false }
-encoding_rs = "0.8"
+serde_with = { version = "3.21.0", features = ["chrono_0_4"] }
+ahash = "0.8.12"
+intrusive-collections = "0.10.2"
+governor = { version = "0.10.4", default-features = false, features = ["std"] }
+async-channel = "2.5.0"
+bytes = "1.11.1"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+cairo-rs = { version = "0.22.0", default-features = false }
+encoding_rs = "0.8.35"
 gl_generator = "0.14"
-glium = { version = "0.35", default-features = false }
-guillotiere = "0.6"
-libloading = "0.8"
-line_drawing = "0.8"
-memmap2 = "0.9"
+glium = { version = "0.36.0", default-features = false }
+guillotiere = "0.7.0"
+libloading = "0.9.0"
+line_drawing = "1.0.1"
+memmap2 = "0.9.10"
 raw-window-handle = "0.6"
-resize = "0.5"
+resize = "0.8.9"
 rgb = "0.8.53"
-tiny-skia = "0.11"
+tiny-skia = "0.12.0"
 walkdir = "2"
 # Vendored native deps (freetype, harfbuzz, fontconfig) and their build deps
 freetype = { path = "frankenterm/deps-freetype" }
 harfbuzz = { path = "frankenterm/deps-harfbuzz" }
 fontconfig = { path = "frankenterm/deps-fontconfig" }
-fixed = "1.23"
-cc = { version = "1.0", features = ["parallel"] }
+fixed = "1.31.0"
+cc = { version = "1.2.64", features = ["parallel"] }
 pkg-config = "0.3"
 # macOS GUI deps
 cgl = "0.3"
-cocoa = "=0.25.0"
-core-foundation = "=0.10.0"
-core-graphics = "=0.24.0"
-core-text = "=21.0.0"
+cocoa = "=0.26.1"
+core-foundation = "=0.10.1"
+core-graphics = "=0.25.0"
+core-text = "=22.0.0"
 objc = "0.2"
-objc2 = "0.6"
-objc2-core-graphics = "0.3"
-objc2-foundation = "0.3"
-objc2-user-notifications = "0.3"
-block2 = "0.6"
-plist = "1.7"
+objc2 = "0.6.4"
+objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-user-notifications = "0.3.2"
+block2 = "0.6.2"
+plist = "1.9.0"
 # Linux/X11/Wayland deps (for window crate)
-futures-lite = "2.3"
-futures-util = "0.3"
-mio = "0.8"
+futures-lite = "2.6.1"
+futures-util = "0.3.32"
+mio = "1.2.1"
 x11 = "2.21"
-xcb = "1.3"
+xcb = "1.7.0"
 xcb-imdkit = { version = "0.3", git = "https://github.com/wezterm/xcb-imdkit-rs.git", rev = "212330f7c6c37794d78061a773e8f4f9e4785bbb" }
-xkbcommon = "0.7.0"
-zbus = "4.2"
-zvariant = "4.0"
-smithay-client-toolkit = { version = "0.19", default-features = false }
-wayland-backend = "0.3.5"
-wayland-protocols = "0.32"
-wayland-protocols-plasma = { version = "0.3.6", features = ["client"] }
-wayland-client = "0.31"
-wayland-egl = "0.32"
+xkbcommon = "0.9.0"
+zbus = "5.16.0"
+zvariant = "5.12.0"
+smithay-client-toolkit = { version = "0.20.0", default-features = false }
+wayland-backend = "0.3.15"
+wayland-protocols = "0.32.12"
+wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
+wayland-client = "0.31.14"
+wayland-egl = "0.32.11"
 # Windows GUI deps
-clipboard-win = "2.2"
-windows = "0.33.0"
-dwrote = "0.11"
+clipboard-win = "5.4.1"
+windows = "0.62.2"
+dwrote = "0.11.5"
 # Other GUI-layer deps
-xml-rs = "0.8"
-dns-lookup = "2.0"
-rcgen = "0.12"
+xml-rs = "1.0.0"
+dns-lookup = "3.0.1"
+rcgen = "0.14.8"
 # GUI binary deps (wezterm-gui, ft-1memj.3)
-emojis = "0.6"
-fastrand = "2.0"
-hdrhistogram = "7.1"
-http_req = "0.11"
+emojis = "0.8.2"
+fastrand = "2.4.1"
+hdrhistogram = "7.5.4"
+http_req = "0.14.6"
 nucleo-matcher = "0.3"
-rayon = "1.10"
-wgpu = "25.0.2"
+rayon = "1.12.0"
+wgpu = "29.0.3"
 # Additional GUI-layer workspace aliases
 wezterm-gui-subcommands = { path = "frankenterm/gui-subcommands", package = "frankenterm-gui-subcommands" }
 wezterm-escape-parser = { path = "frankenterm/escape-parser", package = "frankenterm-escape-parser" }
@@ -523,16 +523,15 @@ mux-lua = { path = "frankenterm/lua-api-crates/mux-lua" }
 url-funcs = { path = "frankenterm/lua-api-crates/url-funcs" }
 frankenterm-mux-server-impl = { path = "crates/frankenterm-mux-server-impl" }
 
-# Notify: upstream uses 5.0, we use 8.x for frankenterm crates.
-# FrankenTerm config crate pins to 5.0 until migrated.
-notify = "5.0.0"
+# Notify: upstream used 5.0; FrankenTerm now targets the latest stable API.
+notify = "8.2.0"
 
 # File locking
 fs2 = "0.4.3"
-flate2 = "1.1.0"
+flate2 = "1.1.9"
 
 # TUI (optional)
-ratatui = "0.30.0"
+ratatui = "0.30.1"
 crossterm = "0.29.0"
 
 # FrankenTUI (optional, migration target for TUI — see docs/adr/0001-adopt-frankentui-for-tui-migration.md)
@@ -540,27 +539,27 @@ crossterm = "0.29.0"
 ftui = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/frankentui", rev = "18facd3f2a2c51b8b06ff589e6b905e6a63f5a96", default-features = false, features = ["runtime"] }
 
 # ZIP archives (for .ftx extension packages)
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # WASM runtime (optional, for scripting/extensions)
-wasmtime = { version = "44.0.2", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
-wasmtime-wasi = { version = "44.0.2", default-features = false, features = ["p1"] }
+wasmtime = { version = "45.0.1", default-features = false, features = ["anyhow", "cranelift", "async", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "45.0.1", default-features = false, features = ["p1"] }
 
 # Benchmarking
-criterion = "0.5"
+criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
 asupersync = { version = "0.3.4" }
 asupersync-macros = { version = "0.3.4" }
 rich_rust = { version = "0.2.0" }
-log = "0.4"
+log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
-glob = "0.3"
-console = "0.15"
-getrandom = "0.3"
-trybuild = { version = "1", default-features = false }
-rustls = "0.23"
-rustls-pemfile = "2"
+glob = "0.3.3"
+console = "0.16.3"
+getrandom = "0.4.2"
+trybuild = { version = "1.0.116", default-features = false }
+rustls = "0.23.40"
+rustls-pemfile = "2.2.0"
 fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "09de04d147927b048aa054116c90f7647427416a", package = "fastmcp-rust" }
 fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "39ff887fca40763a62233d2e7b83b5b62725b286", package = "fastapi-rust" }
 
@@ -568,7 +567,7 @@ fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fasta
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
 frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
-franken-agent-detection = "0.1.0"
+franken-agent-detection = "0.1.8"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core", default-features = false }

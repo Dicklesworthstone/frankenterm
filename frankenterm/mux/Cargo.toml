@@ -73,7 +73,7 @@ winapi = { workspace=true, features = [
 ]}
 
 [dev-dependencies]
-criterion = "0.7.0"
+criterion = "0.8.2"
 k9.workspace = true
 proptest = "1.8.0"
 serde_json.workspace = true

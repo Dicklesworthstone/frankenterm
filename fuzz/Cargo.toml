@@ -30,7 +30,7 @@ scripting-fuzz-targets = ["dep:frankenterm-scripting"]
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 leb128.workspace = true
-libfuzzer-sys = "0.4.10"
+libfuzzer-sys = "0.4.13"
 frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
 frankenterm-core-replay = { path = "../crates/frankenterm-core-replay", optional = true }
 frankenterm-scripting = { workspace = true, optional = true }
@@ -41,20 +41,20 @@ termwiz = { workspace = true }
 codec = { path = "../frankenterm/codec", optional = true, features = ["fuzzing"] }
 mux = { workspace = true, optional = true }
 promise = { workspace = true, optional = true }
-toml = "0.8.23"
+toml = "1.1.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml = "0.9.34"
-rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "backup", "functions"] }
 toon_rust.workspace = true
 tempfile = "3.27.0"
 # ft-ul4vi: jsonschema fuzz target. Same version pinned in
 # crates/frankenterm-core dev-deps so the harness exercises the
 # crate the conformance gates use.
-jsonschema = { version = "0.21", default-features = false }
+jsonschema = { version = "0.46.5", default-features = false }
 # ft-s96ej: ft argv fuzz target. Same version pinned in the workspace
 # so the parser surface matches what `ft` itself uses at runtime.
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 
 [[bin]]
 name = "fts_query"

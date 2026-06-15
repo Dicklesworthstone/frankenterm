@@ -86,4 +86,4 @@ frankenterm-core-replay-types = { path = "../frankenterm-core-replay-types" }
 
 [dev-dependencies]
 proptest = "1.8.0"
-tempfile = "3.23.0"
+tempfile = "3.27.0"

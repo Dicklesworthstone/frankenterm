@@ -11,5 +11,5 @@ unsafe_code = "forbid"
 
 [dependencies]
 frankenterm-core = { path = "../../crates/frankenterm-core", default-features = false }
-serde_json = "1.0.145"
+serde_json = "1.0.150"
 stateright = "0.31.0"

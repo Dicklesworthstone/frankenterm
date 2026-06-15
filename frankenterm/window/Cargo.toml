@@ -48,6 +48,7 @@ metrics.workspace = true
 promise.workspace = true
 raw-window-handle.workspace = true
 resize.workspace = true
+rgb.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 tiny-skia.workspace = true
 glium.workspace = true

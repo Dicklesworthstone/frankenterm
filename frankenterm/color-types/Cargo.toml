@@ -10,7 +10,7 @@ publish = false
 
 [features]
 use_serde = ["serde"]
-std = ["serde/std", "dep:deltae", "csscolorparser/lab"]
+std = ["serde/std", "dep:deltae", "csscolorparser/std"]
 
 [dependencies]
 csscolorparser = {workspace=true, optional=true}

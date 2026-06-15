@@ -26,5 +26,5 @@ frankenterm-core = { path = "../frankenterm-core", default-features = false }
 frankenterm-core-resource-types = { path = "../frankenterm-core-resource-types" }
 
 [dev-dependencies]
-tempfile = "3.23.0"
+tempfile = "3.27.0"
 proptest = "1.8.0"

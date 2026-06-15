@@ -49,5 +49,5 @@ tantivy = { workspace = true }
 frankenterm-core = { path = "../frankenterm-core", default-features = false }
 
 [dev-dependencies]
-tempfile = "3.23.0"
+tempfile = "3.27.0"
 proptest = "1.8.0"
