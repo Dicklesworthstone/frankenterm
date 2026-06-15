@@ -10310,6 +10310,52 @@ fn next_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
+/// Per-thread scan-byte accounting for [`redact_segment_for_persistence`].
+///
+/// The ft-gkh4p perf-regression tests use these to assert that the
+/// straddle-detection scan never re-reads the chunk past the span budget (the
+/// redundant second full scan that motivated the bead). Compiled out — and
+/// reduced to inlined no-ops at the call sites — in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static SEGMENT_REDACT_DETECT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEGMENT_REDACT_REDACT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_segment_detect_scan(len: usize) {
+    SEGMENT_REDACT_DETECT_BYTES.with(|cell| cell.set(cell.get() + len));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_segment_detect_scan(_len: usize) {}
+
+#[cfg(test)]
+fn record_segment_redact_scan(len: usize) {
+    SEGMENT_REDACT_REDACT_BYTES.with(|cell| cell.set(cell.get() + len));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn record_segment_redact_scan(_len: usize) {}
+
+#[cfg(test)]
+fn reset_segment_scan_accounting() {
+    SEGMENT_REDACT_DETECT_BYTES.with(|cell| cell.set(0));
+    SEGMENT_REDACT_REDACT_BYTES.with(|cell| cell.set(0));
+}
+
+/// Returns `(detect_scan_bytes, redact_scan_bytes)` accumulated since the last
+/// [`reset_segment_scan_accounting`] on this thread.
+#[cfg(test)]
+fn segment_scan_accounting() -> (usize, usize) {
+    (
+        SEGMENT_REDACT_DETECT_BYTES.with(std::cell::Cell::get),
+        SEGMENT_REDACT_REDACT_BYTES.with(std::cell::Cell::get),
+    )
+}
+
 /// Redact a segment for at-rest persistence, returning the redacted content and
 /// whether a prior segment was retroactively edited (which invalidates the mmap
 /// mirror). See [`SegmentPersistRedactor`] for the design.
@@ -10329,30 +10375,64 @@ fn redact_segment_for_persistence(
     let redactor = Redactor::new();
     let state = segment_redactors.entry(pane_id).or_default();
     let boundary = state.lookback.len();
-    // Raw stream window = retained lookback ++ this chunk. Used for both
-    // straddle detection and the next window; never withheld from persistence.
-    let combined = format!("{}{content}", state.lookback);
+
+    // Fast path: an empty lookback means there is no append boundary, so no
+    // secret can straddle one. Redact the chunk directly (the only scan it ever
+    // needs) and seed the next lookback from its tail — no `lookback ++ content`
+    // copy is materialized. This is the first append of a pane and the first
+    // append after every gap/shutdown flush (ft-gkh4p).
+    if boundary == 0 {
+        record_segment_redact_scan(content.len());
+        let persisted = redactor.redact(content);
+        let keep_from = if content.len() > SEGMENT_REDACTION_LOOKBACK_BYTES {
+            next_char_boundary(content, content.len() - SEGMENT_REDACTION_LOOKBACK_BYTES)
+        } else {
+            0
+        };
+        state.lookback = content[keep_from..].to_string();
+        return Ok((persisted, false));
+    }
+
+    // Straddle detection only needs the *boundary region*, not the whole chunk.
+    // A credential split across the append boundary is, by design, only caught
+    // within the span budget `SEGMENT_REDACTION_LOOKBACK_BYTES` (it matches the
+    // streaming redactor's retained-tail bound — see the field doc). A straddle
+    // within that budget spans the boundary, so it has at least one byte in the
+    // lookback and therefore fewer than `SEGMENT_REDACTION_LOOKBACK_BYTES` bytes
+    // in `content`; capping the forward scan at the budget catches every such
+    // straddle (the backward half is the full lookback, itself ≤ the budget) yet
+    // never re-scans `content` past the point `redact(content)` already covers.
+    // Before this cap, `detect(&combined)` regex-scanned the entire chunk a
+    // second time on the hottest write path (ft-gkh4p). The window is a *prefix*
+    // of the raw `lookback ++ content` stream, so detection offsets map onto it
+    // and the full chunk directly.
+    let fwd = if content.len() > SEGMENT_REDACTION_LOOKBACK_BYTES {
+        next_char_boundary(content, SEGMENT_REDACTION_LOOKBACK_BYTES)
+    } else {
+        content.len()
+    };
+    let mut window = String::with_capacity(boundary + fwd);
+    window.push_str(&state.lookback);
+    window.push_str(&content[..fwd]);
 
     let persisted;
     let mut edited_prior = false;
     // At most one detected secret can contain the single boundary point, so the
     // first crossing span is the only straddle.
-    let straddle = if boundary == 0 {
-        None
-    } else {
-        redactor
-            .detect(&combined)
-            .into_iter()
-            .find(|&(_, start, end)| start < boundary && boundary < end)
-    };
+    record_segment_detect_scan(window.len());
+    let straddle = redactor
+        .detect(&window)
+        .into_iter()
+        .find(|&(_, start, end)| start < boundary && boundary < end);
 
     if let Some((_, start, end)) = straddle {
         // Bytes of the straddling secret that live in `content`
-        // (`combined[boundary..] == content`, and `end` is char-aligned).
+        // (`window[boundary..] == content[..fwd]`, and `end` is char-aligned).
         let head_len = end - boundary;
         // One canonical marker for the whole straddled secret, then the
         // remainder of the segment redacted normally.
-        let marker = redactor.redact(&combined[start..end]);
+        record_segment_redact_scan((end - start) + (content.len() - head_len));
+        let marker = redactor.redact(&window[start..end]);
         persisted = format!("{marker}{}", redactor.redact(&content[head_len..]));
         // Strip the secret's raw prior-segment bytes from already-persisted
         // segments. They are an incomplete prefix that only completes with
@@ -10360,19 +10440,38 @@ fn redact_segment_for_persistence(
         edited_prior = mask_split_secret_in_prior_segments_backend(
             backend,
             pane_id,
-            &combined[start..boundary],
+            &window[start..boundary],
         )?;
     } else {
+        record_segment_redact_scan(content.len());
         persisted = redactor.redact(content);
     }
 
-    // Advance the raw lookback window to the tail of `combined`.
-    let keep_from = if combined.len() > SEGMENT_REDACTION_LOOKBACK_BYTES {
-        next_char_boundary(&combined, combined.len() - SEGMENT_REDACTION_LOOKBACK_BYTES)
+    // Advance the raw lookback to the last `SEGMENT_REDACTION_LOOKBACK_BYTES` of
+    // the full `lookback ++ content` stream, derived from slices so the chunk
+    // tail beyond the (possibly capped) detect window is still retained verbatim.
+    if content.len() >= SEGMENT_REDACTION_LOOKBACK_BYTES {
+        // The retained tail lies wholly inside `content`; the prior lookback
+        // ages out entirely. `window` (the detect prefix) is dropped here.
+        let keep_from =
+            next_char_boundary(content, content.len() - SEGMENT_REDACTION_LOOKBACK_BYTES);
+        state.lookback = content[keep_from..].to_string();
     } else {
-        0
-    };
-    state.lookback = combined[keep_from..].to_string();
+        // `content` is shorter than the budget, so `fwd == content.len()` and
+        // `window` is the *entire* `lookback ++ content` stream. Trim its head
+        // in place and move the buffer into the lookback — no second allocation.
+        debug_assert_eq!(fwd, content.len());
+        let total = boundary + content.len();
+        let keep_from = if total > SEGMENT_REDACTION_LOOKBACK_BYTES {
+            next_char_boundary(&window, total - SEGMENT_REDACTION_LOOKBACK_BYTES)
+        } else {
+            0
+        };
+        if keep_from > 0 {
+            window.drain(..keep_from);
+        }
+        state.lookback = window;
+    }
 
     Ok((persisted, edited_prior))
 }
@@ -24236,6 +24335,176 @@ fn e8hd7_gap_clears_cross_append_lookback() {
         );
         storage.shutdown().await.unwrap();
     });
+}
+
+// ft-gkh4p: the persist redactor now caps the straddle-detection window at the
+// `SEGMENT_REDACTION_LOOKBACK_BYTES` span budget instead of regex-scanning the
+// whole chunk twice. These two cases exercise the large-chunk branches that a
+// single full `lookback ++ content` scan never distinguished: a straddle whose
+// completing bytes sit at the head of a chunk far larger than the budget, and
+// the lookback retention that must keep the chunk's *tail* (not its head) so the
+// next append's straddle is still caught.
+
+#[test]
+fn gkh4p_straddle_head_caught_when_chunk_exceeds_budget() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp
+            .path()
+            .join("gkh4p_bighead.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        // Open a secret right before the append boundary...
+        storage.append_segment(1, "prefix sk-", None).await.unwrap();
+        // ...then complete it at the head of a chunk whose benign tail dwarfs the
+        // 64 KiB span budget. The straddle's completing bytes are well within the
+        // forward cap, and the multi-KiB benign tail must persist verbatim.
+        let big_tail = "z".repeat(SEGMENT_REDACTION_LOOKBACK_BYTES + 4_096);
+        let chunk = format!("abcdefghijklmnopqrstuvwxyz {big_tail}");
+        storage.append_segment(1, &chunk, None).await.unwrap();
+
+        let persisted = e8hd7_persisted_concat(&storage, 1).await;
+        assert!(
+            !persisted.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "split key must not survive even when the completing chunk is huge"
+        );
+        assert!(
+            persisted.contains(crate::redactor::REDACTED_MARKER),
+            "straddle masked"
+        );
+        assert!(
+            persisted.contains(&big_tail),
+            "benign tail past the span budget must persist verbatim"
+        );
+        storage.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn gkh4p_oversized_chunk_retains_tail_not_head_for_next_straddle() {
+    run_storage_async_test(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db = temp
+            .path()
+            .join("gkh4p_tail.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = StorageHandle::new(&db).await.unwrap();
+        storage.upsert_pane(e8hd7_pane(1)).await.unwrap();
+
+        // A chunk larger than the budget whose TAIL opens a secret. The retained
+        // lookback must be the chunk's tail (ending in "sk-"), not its head, or
+        // the next append's straddle would be missed.
+        let lead = "a".repeat(SEGMENT_REDACTION_LOOKBACK_BYTES + 1_024);
+        storage
+            .append_segment(1, &format!("{lead}sk-"), None)
+            .await
+            .unwrap();
+        storage
+            .append_segment(1, "abcdefghijklmnopqrstuvwxyz body", None)
+            .await
+            .unwrap();
+
+        let persisted = e8hd7_persisted_concat(&storage, 1).await;
+        assert!(
+            !persisted.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            "tail-opened key split across the next append must not survive: {}",
+            persisted.len()
+        );
+        assert!(
+            persisted.contains(crate::redactor::REDACTED_MARKER),
+            "straddle masked across the oversized-chunk boundary"
+        );
+        assert!(
+            persisted.contains(" body"),
+            "benign suffix after the straddle preserved"
+        );
+        storage.shutdown().await.unwrap();
+    });
+}
+
+// ── ft-gkh4p perf-regression: prove the redundant scan is gone ───────────────
+// These call `redact_segment_for_persistence` directly (synchronously, on the
+// test thread) so the per-thread scan-byte accounting is race-free without RCH.
+
+#[test]
+fn gkh4p_fresh_pane_scans_chunk_exactly_once() {
+    // A fresh pane has an empty lookback, so there is no append boundary and no
+    // secret can straddle one. The straddle detector must not run at all: the
+    // chunk is fed to the catalog exactly once, by `redact(content)`.
+    let backend = crate::storage_backend_trait::MockBackend::new();
+    let mut redactors: HashMap<u64, SegmentPersistRedactor> = HashMap::new();
+    let content = "plain terminal output with no secrets, scanned exactly once";
+
+    reset_segment_scan_accounting();
+    let (persisted, edited_prior) =
+        redact_segment_for_persistence(&backend, 1, content, &mut redactors).unwrap();
+    let (detect_bytes, redact_bytes) = segment_scan_accounting();
+
+    assert!(!edited_prior, "fresh pane never edits prior segments");
+    assert_eq!(persisted, content, "no secrets present -> verbatim persistence");
+    assert_eq!(
+        detect_bytes, 0,
+        "boundary-free first append must run no straddle-detection scan"
+    );
+    assert_eq!(
+        redact_bytes,
+        content.len(),
+        "the chunk is scanned exactly once (by redact), never twice"
+    );
+}
+
+#[test]
+fn gkh4p_straddle_scan_never_rereads_chunk_past_span_budget() {
+    // Perf property: across a wide range of chunk sizes, the straddle-detection
+    // scan reads at most `lookback + min(chunk, BUDGET)` bytes — it never
+    // re-scans the whole chunk that `redact(content)` already covers. Before
+    // ft-gkh4p the detect pass scanned `lookback + chunk` in full (the redundant
+    // second scan on the hottest write path).
+    let backend = crate::storage_backend_trait::MockBackend::new();
+    let budget = SEGMENT_REDACTION_LOOKBACK_BYTES;
+
+    for &chunk_len in &[
+        0_usize,
+        1,
+        4_096,
+        budget - 1,
+        budget,
+        budget + 1,
+        budget + 4_096,
+        budget * 3,
+    ] {
+        let mut redactors: HashMap<u64, SegmentPersistRedactor> = HashMap::new();
+        // Seed a full (anchor-free, benign) lookback so a real boundary exists.
+        let seed = "x".repeat(budget + 1_000);
+        redact_segment_for_persistence(&backend, 7, &seed, &mut redactors).unwrap();
+        let lookback_len = redactors.get(&7).unwrap().lookback.len();
+        assert_eq!(lookback_len, budget, "lookback fills to the span budget");
+
+        let chunk = "y".repeat(chunk_len);
+        reset_segment_scan_accounting();
+        redact_segment_for_persistence(&backend, 7, &chunk, &mut redactors).unwrap();
+        let (detect_bytes, _redact_bytes) = segment_scan_accounting();
+
+        // +4 slack: the forward cap rounds up to the next char boundary.
+        let bound = lookback_len + chunk_len.min(budget) + 4;
+        assert!(
+            detect_bytes <= bound,
+            "chunk_len={chunk_len}: straddle scan read {detect_bytes} bytes, expected <= {bound} \
+             (lookback {lookback_len} + min(chunk, budget))"
+        );
+        if chunk_len > budget {
+            assert!(
+                detect_bytes < lookback_len + chunk_len,
+                "chunk_len={chunk_len}: detect must not re-scan the entire oversized chunk \
+                 ({detect_bytes} should be < {})",
+                lookback_len + chunk_len
+            );
+        }
+    }
 }
 
 #[test]
