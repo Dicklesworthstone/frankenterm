@@ -1004,3 +1004,117 @@ fn redact_adjacency_known_limitation() {
          got: {out:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ft-emvxz: raw-byte + boundary adversarial coverage across every catalog
+// format (no-leak + no-panic + UTF-8 safety on the dedicated byte path).
+// ---------------------------------------------------------------------------
+
+/// Wrap a catalog sample in adversarial RAW BYTES that stress the byte-path's
+/// lossy decode + UTF-8-boundary handling: a lone continuation byte (`0x80`),
+/// a truncated 3-byte sequence (`0xE4 0xB8`), NUL framing, invalid `0xFF 0xFE`,
+/// and valid multibyte (`界`) framing. The secret itself stays contiguous (only
+/// the surrounding context is corrupted), so a clean redactor must still catch
+/// it — this exercises decode robustness, not the documented pure-adjacency
+/// limitation.
+fn raw_byte_boundary_wrappings(sample: &str) -> Vec<Vec<u8>> {
+    let s = sample.as_bytes();
+    let cjk = "界".as_bytes(); // valid 3-byte scalar
+    vec![
+        s.to_vec(),
+        [&[0x80u8][..], s].concat(),
+        [s, &[0x80u8][..]].concat(),
+        [&[0xE4u8, 0xB8][..], s].concat(),
+        [s, &[0xE4u8, 0xB8][..]].concat(),
+        [&[0x00u8][..], s, &[0x00u8][..]].concat(),
+        [&[0xFFu8, 0xFEu8][..], s, &[0xFFu8, 0xFEu8][..]].concat(),
+        [cjk, s, cjk].concat(),
+    ]
+}
+
+#[test]
+fn catalog_secrets_redact_clean_under_raw_byte_boundary_torture() {
+    // Every catalog format, wrapped in adversarial raw bytes, must on BOTH the
+    // raw-byte path (`redact_bytes_with_evidence`) and the lossy string path:
+    // (1) not panic, (2) leave output a fresh Redactor reports residue-free
+    // (no-leak), and (3) emit valid UTF-8.
+    let r = Redactor::new();
+    for (label, sample) in ALL_KNOWN_FORMATS {
+        for raw in raw_byte_boundary_wrappings(sample) {
+            // Raw-byte path: never panics; output is always valid UTF-8.
+            let out_bytes = r.redact_bytes_with_evidence(&raw).bytes;
+            let out = String::from_utf8(out_bytes)
+                .unwrap_or_else(|e| panic!("ft-emvxz: byte-path non-UTF8 for `{label}`: {e}"));
+            assert!(
+                !r.contains_secrets(&out),
+                "ft-emvxz: byte-path left residue for `{label}` raw={raw:?} out={out:?}"
+            );
+            // Lossy string path must be at least as strong.
+            let red = r.redact(&String::from_utf8_lossy(&raw));
+            assert!(
+                !r.contains_secrets(&red),
+                "ft-emvxz: string-path left residue for `{label}`: {red:?}"
+            );
+        }
+    }
+}
+
+proptest! {
+    /// ft-emvxz fuzz property: a high-entropy catalog secret injected into
+    /// ARBITRARY raw-byte noise (possibly invalid UTF-8) at an arbitrary offset
+    /// must never leak its body through the raw-byte path or the string path,
+    /// and both paths stay panic-free and valid-UTF-8. (Prefix-anchored samples
+    /// are used so surrounding noise cannot break the anchor; probes are >= 24
+    /// chars so an accidental collision with the random noise is negligible.)
+    #[test]
+    fn redact_byte_path_never_leaks_injected_secret_in_arbitrary_noise(
+        noise in prop::collection::vec(any::<u8>(), 0..256),
+        offset in 0usize..512,
+        pick in 0usize..5,
+    ) {
+        let cases: [(&str, &str); 5] = [
+            (ANTHROPIC_KEY, "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs"),
+            (GITHUB_TOKEN, "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab"),
+            (XAI_KEY, "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH"),
+            (SLACK_TOKEN, "aBcDeFgHiJkLmNoPqRsTuVwX"),
+            (SENDGRID_KEY, "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCD"),
+        ];
+        let (sample, probe) = cases[pick];
+        let at = offset % (noise.len() + 1);
+        let mut data = noise.clone();
+        data.splice(at..at, sample.bytes());
+
+        let r = Redactor::new();
+        let out_bytes = r.redact_bytes_with_evidence(&data).bytes;
+        prop_assert!(
+            String::from_utf8(out_bytes.clone()).is_ok(),
+            "ft-emvxz: byte path non-UTF8 for sample={sample:?}"
+        );
+        let out = String::from_utf8_lossy(&out_bytes);
+        prop_assert!(!out.contains(probe), "ft-emvxz: byte path leaked `{probe}`: {out:?}");
+        let red = r.redact(&String::from_utf8_lossy(&data));
+        prop_assert!(!red.contains(probe), "ft-emvxz: string path leaked `{probe}`: {red:?}");
+    }
+
+    /// ft-emvxz: all public entry points are panic-free and UTF-8-safe on fully
+    /// arbitrary bytes (no injected secret); detect() spans stay on char
+    /// boundaries within range.
+    #[test]
+    fn all_entry_points_panic_free_and_utf8_safe_on_arbitrary_bytes(
+        bytes in prop::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let r = Redactor::new();
+        let lossy = String::from_utf8_lossy(&bytes).into_owned();
+        let red = r.redact(&lossy);
+        prop_assert!(String::from_utf8(red.into_bytes()).is_ok(), "ft-emvxz: redact non-UTF8");
+        let _ = r.contains_secrets(&lossy);
+        for (name, start, end) in r.detect(&lossy) {
+            prop_assert!(start <= end, "ft-emvxz: span `{name}` start>end");
+            prop_assert!(end <= lossy.len(), "ft-emvxz: span `{name}` past len");
+            prop_assert!(lossy.is_char_boundary(start), "ft-emvxz: span `{name}` start off boundary");
+            prop_assert!(lossy.is_char_boundary(end), "ft-emvxz: span `{name}` end off boundary");
+        }
+        let out = r.redact_bytes_with_evidence(&bytes).bytes;
+        prop_assert!(String::from_utf8(out).is_ok(), "ft-emvxz: byte path non-UTF8");
+    }
+}

@@ -44,6 +44,36 @@ const INJECTED_SECRETS: &[&str] = &[
     "usercodeABCD1234EFGH5678",
     // Long high-entropy bare token.
     "Zx9Qw7Lm2Kp5Rt8Nv1Cd4Gh6Jf0Bs3Yw5Tn8Mr2Vk7",
+    // ft-emvxz: broaden the corpus to the rest of the single-line catalog
+    // families (proven shape-conformant + caught by the conformance smoke
+    // suite). Each is fully redacted, so the substring leak check is exact.
+    "sk-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHi",
+    "github_pat_11ABCDEFG0aBcDeFg_HiJkLmNoPqRsTuVwXyZ1234567890ABCDE",
+    "glpat-aBcDeFgHiJkLmNoPqRsTuVwX1234567890",
+    "xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH",
+    "gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH",
+    "AIzaaBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
+    "ya29.aBcDeFgHiJkLmNoPqRsTuVwXyZ",
+    "hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345",
+    "r8_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345",
+    "esecret_aBcDeFgHiJkLmNoPqRsTuVwXyZ12345",
+    "pplx-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCDEFGH",
+    "AC0123456789abcdef0123456789abcdef",
+    "SG.aBcDeFgHiJkLmNoPqRsTuV.aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ABCD",
+    "xoxb-1234567890-aBcDeFgHiJkLmNoPqRsTuVwX",
+    "sk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+    "rk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+    "whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LXN1YmplY3QifQ.abc123_test-XYZ",
+    "Bearer aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+    "aws_secret_access_key=aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcd",
+    "DATADOG_API_KEY=0123456789abcdef0123456789abcdef",
+    "cohere_api_key=aBcDeFgHiJkLmNoPq1234",
+    "api_key=aBcDeFgHiJkLmNoPq1234",
+    "token=aBcDeFgHiJkLmNoPq1234",
+    "password=sekretPw99",
+    "secret=aBcDeFgH12",
+    "device_code=ABC123XYZ",
 ];
 
 #[derive(Arbitrary, Debug)]
@@ -166,6 +196,28 @@ fuzz_target!(|case: FuzzCase| {
         assert!(
             !once.contains(secret),
             "one-shot output leaked injected secret"
+        );
+    }
+
+    // Oracle 6 (ft-emvxz): the dedicated raw-byte API (`redact_bytes_with_evidence`)
+    // must be panic-free, always emit valid UTF-8, leave no residue the batch
+    // redactor still detects, and never leak an injected secret. This exercises
+    // the byte API's lossy-decode + evidence path explicitly, not just the
+    // string `redact()` surface.
+    let byte_path = scanner.redact_bytes_with_evidence(&data).bytes;
+    assert!(
+        String::from_utf8(byte_path.clone()).is_ok(),
+        "redact_bytes_with_evidence emitted invalid UTF-8"
+    );
+    let byte_path_str = String::from_utf8_lossy(&byte_path);
+    assert!(
+        !scanner.contains_secrets(&byte_path_str),
+        "raw-byte path left a residue the batch redactor still detects"
+    );
+    if let Some(secret) = injected {
+        assert!(
+            !byte_path_str.contains(secret),
+            "raw-byte path leaked injected secret"
         );
     }
 });
