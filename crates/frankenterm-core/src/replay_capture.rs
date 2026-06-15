@@ -718,12 +718,35 @@ pub type SharedCaptureAdapter = Arc<CaptureAdapter>;
 
 // ---------------------------------------------------------------------------
 // Sensitivity / Redaction types for capture policy
+//
+// ⚠️ FORWARD-DECLARED / NOT YET WIRED (ft-pfton). The types below describe an
+// intended per-tier capture redaction + retention policy, but NOTHING in
+// production currently constructs, reads, or enforces them: capture paths
+// (`capture_egress`/`capture_ingress`) tag segments `RecorderRedactionLevel::
+// None`, no tier classifier assigns a `CaptureSensitivityTier`, and
+// `custom_patterns`/`t*_retention_days` are never consulted. Do NOT treat these
+// as an active security control.
+//
+// What actually protects captured content today:
+//   • Redaction — the at-rest persistence chokepoint in `ingest.rs`
+//     (`redact_segment_for_persistence` → `crate::policy::Redactor`), which
+//     scans every persisted segment against the fixed secret-pattern catalog.
+//     It does NOT honor `custom_patterns`.
+//   • Retention — `cleanup.rs` (`retention_days`, plus event tier retention),
+//     NOT this policy's `t1/t2/t3_retention_days`.
+//
+// Until these types are wired (classify → tier → mode + custom_patterns →
+// redactor + per-tier retention) AND a fail-closed `Config::validate` rejects
+// an unhonored policy, they remain inert scaffolding. See ft-pfton.
 // ---------------------------------------------------------------------------
 
 /// Sensitivity tier for captured content.
 ///
 /// T1 (lowest) is routine terminal output; T3 (highest) is sensitive
 /// data like credentials or tokens.
+///
+/// NOT YET WIRED (ft-pfton): no production classifier assigns a tier, so
+/// per-tier policy never fires. Forward-declared only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureSensitivityTier {
@@ -748,6 +771,10 @@ impl CaptureSensitivityTier {
 }
 
 /// How captured sensitive content is redacted.
+///
+/// NOT YET WIRED (ft-pfton): no capture path selects a mode; production
+/// redaction always uses the `ingest.rs` chokepoint's masking, regardless of
+/// this enum. Forward-declared only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureRedactionMode {
@@ -759,25 +786,46 @@ pub enum CaptureRedactionMode {
     Drop,
 }
 
-/// Policy governing what gets captured and how long it is retained.
+/// Intended policy for what gets captured and how long it is retained.
+///
+/// ⚠️ NOT YET WIRED / NOT ENFORCED (ft-pfton). This struct is forward-declared
+/// scaffolding: no production code constructs it, reads its fields, or consults
+/// it on any capture path. Setting `mode`, `custom_patterns`, or the
+/// `t*_retention_days` here has **no effect**. In particular `custom_patterns`
+/// is never fed to a redactor, so configuring it would be a silent no-op.
+///
+/// Production redaction happens at the `ingest.rs` persistence chokepoint
+/// (`redact_segment_for_persistence` → [`crate::policy::Redactor`]); retention
+/// is enforced by `cleanup.rs` (`retention_days`). Enforcing this policy would
+/// require: a tier classifier (`classify` → [`CaptureSensitivityTier`]), mode
+/// dispatch, `custom_patterns` plumbed into the redactor, per-tier retention in
+/// `cleanup.rs`, AND a fail-closed `Config::validate` that rejects an unhonored
+/// policy rather than silently ignoring it. Until then, do not rely on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureRedactionPolicy {
-    /// Whether redaction is active.
+    /// Whether redaction is active. NOT YET ENFORCED (ft-pfton).
     pub enabled: bool,
-    /// Default redaction mode for sensitive spans.
+    /// Default redaction mode for sensitive spans. NOT YET ENFORCED (ft-pfton).
     pub mode: CaptureRedactionMode,
-    /// T1 content retention in days.
+    /// T1 content retention in days. NOT YET ENFORCED — `cleanup.rs` uses the
+    /// global `retention_days` instead (ft-pfton).
     pub t1_retention_days: u64,
-    /// T2 content retention in days.
+    /// T2 content retention in days. NOT YET ENFORCED (ft-pfton).
     pub t2_retention_days: u64,
-    /// T3 content retention in days.
+    /// T3 content retention in days. NOT YET ENFORCED (ft-pfton).
     pub t3_retention_days: u64,
-    /// Custom regex patterns that trigger T3 redaction.
+    /// Custom regex patterns intended to trigger T3 redaction. NOT YET WIRED:
+    /// never passed to any redactor; the production [`crate::policy::Redactor`]
+    /// only matches its fixed secret-pattern catalog (ft-pfton).
     #[serde(default)]
     pub custom_patterns: Vec<String>,
 }
 
 impl Default for CaptureRedactionPolicy {
+    /// Intended secure defaults *for when enforcement lands*. These values are
+    /// currently inert (ft-pfton); `enabled: true` is kept as the
+    /// secure-by-default target so wiring the policy doesn't accidentally ship
+    /// redaction-off, but today it governs nothing.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -816,7 +864,7 @@ pub fn sha256_hex(text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Truncate a decision input to at most 256 bytes on a valid UTF-8 boundary.
@@ -1830,5 +1878,52 @@ mod tests {
 
         reset_replay_capture_policy_decision_drop_count_for_test();
         assert_eq!(replay_capture_policy_decision_drop_count(), 0);
+    }
+
+    // ft-pfton: CaptureRedactionPolicy is forward-declared scaffolding that is
+    // NOT yet wired/enforced on any capture path. These guards pin the intended
+    // secure-by-default target values so that whoever eventually wires the
+    // policy (classify -> tier -> mode + custom_patterns + per-tier retention,
+    // with a fail-closed Config::validate) does not accidentally ship it with
+    // redaction disabled or weakened defaults. The docstrings on the types make
+    // the not-yet-enforced status explicit; do not delete these without also
+    // either wiring or removing the policy.
+    #[test]
+    fn capture_redaction_policy_default_is_secure_target() {
+        let policy = CaptureRedactionPolicy::default();
+        // Secure-by-default target for when enforcement lands.
+        assert!(policy.enabled, "default policy must target redaction ON");
+        assert_eq!(policy.mode, CaptureRedactionMode::Mask);
+        assert_eq!(policy.t1_retention_days, 90);
+        assert_eq!(policy.t2_retention_days, 30);
+        assert_eq!(policy.t3_retention_days, 7);
+        // T3 (most sensitive) must not be retained longer than T1 (routine).
+        assert!(
+            policy.t3_retention_days <= policy.t1_retention_days,
+            "sensitive T3 retention must not exceed routine T1 retention"
+        );
+        assert!(policy.custom_patterns.is_empty());
+    }
+
+    #[test]
+    fn capture_redaction_policy_serde_roundtrip() {
+        let policy = CaptureRedactionPolicy {
+            enabled: true,
+            mode: CaptureRedactionMode::Drop,
+            t1_retention_days: 10,
+            t2_retention_days: 5,
+            t3_retention_days: 1,
+            custom_patterns: vec!["sk-[A-Za-z0-9]+".to_string()],
+        };
+        let json = serde_json::to_string(&policy).expect("serialize policy");
+        let back: CaptureRedactionPolicy =
+            serde_json::from_str(&json).expect("deserialize policy");
+        assert_eq!(policy, back);
+        // custom_patterns is #[serde(default)] — absent input must not error.
+        let minimal = r#"{"enabled":false,"mode":"hash","t1_retention_days":1,"t2_retention_days":1,"t3_retention_days":1}"#;
+        let parsed: CaptureRedactionPolicy =
+            serde_json::from_str(minimal).expect("deserialize without custom_patterns");
+        assert!(parsed.custom_patterns.is_empty());
+        assert_eq!(parsed.mode, CaptureRedactionMode::Hash);
     }
 }
