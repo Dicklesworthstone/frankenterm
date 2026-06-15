@@ -2316,18 +2316,22 @@ fn redact_cass_search_result(result: &mut CassSearchResult) {
         if let Some(content) = hit.content.as_mut() {
             *content = redact_mcp_output_secrets(content);
         }
+        // ft-7lh4k: the typed `content` walk above misses the `#[serde(flatten)]
+        // extra` passthrough map, which round-trips verbatim into the envelope.
+        redact_cass_extra_map(&mut hit.extra);
     }
+    redact_cass_extra_map(&mut result.extra);
 }
 
 /// Redact secret material in a cass view (match line + surrounding context)
 /// before it leaves the MCP surface. See [`redact_cass_search_result`].
 fn redact_cass_view_result(result: &mut CassViewResult) {
-    if let Some(content) = result
-        .match_line
-        .as_mut()
-        .and_then(|line| line.content.as_mut())
-    {
-        *content = redact_mcp_output_secrets(content);
+    if let Some(line) = result.match_line.as_mut() {
+        if let Some(content) = line.content.as_mut() {
+            *content = redact_mcp_output_secrets(content);
+        }
+        // ft-7lh4k: scrub the line's `#[serde(flatten)] extra` passthrough too.
+        redact_cass_extra_map(&mut line.extra);
     }
     for lines in [
         result.context_before.as_mut(),
@@ -2338,8 +2342,10 @@ fn redact_cass_view_result(result: &mut CassViewResult) {
             if let Some(content) = line.content.as_mut() {
                 *content = redact_mcp_output_secrets(content);
             }
+            redact_cass_extra_map(&mut line.extra);
         }
     }
+    redact_cass_extra_map(&mut result.extra);
 }
 
 /// Redact secret-shaped tokens from any text that will appear in an MCP
@@ -2347,13 +2353,56 @@ fn redact_cass_view_result(result: &mut CassViewResult) {
 /// echo caller-supplied input: the `wait_for` pattern in particular is
 /// reflected verbatim by `fancy_regex`/`regex` into compile-error strings
 /// (e.g. `regex parse error:\n    sk-ant-…\n    ^`), so a secret embedded in
-/// an invalid pattern would otherwise leak through the error envelope. Every
-/// operator-visible string is funnelled through the shared redactor before it
-/// leaves the process. See ft-qde8p for the remote-error precedent.
+/// an invalid pattern would otherwise leak through the error envelope. See
+/// ft-qde8p for the remote-error precedent.
+///
+/// This is the shared redaction chokepoint for MCP output: coverage is only as
+/// complete as the call sites that route through it. Each tool must funnel its
+/// operator-visible strings here before they leave the process — directly for
+/// typed string fields, or via [`redact_json_value_in_place`] for structured
+/// `#[serde(flatten)]` passthrough maps (ft-7lh4k). It is NOT an automatic
+/// whole-response filter.
 fn redact_mcp_output_secrets(text: &str) -> String {
     static REDACTOR: LazyLock<crate::redactor::Redactor> =
         LazyLock::new(crate::redactor::Redactor::new);
     REDACTOR.redact(text)
+}
+
+/// Recursively redact every JSON string in `value` in place, routing each
+/// through [`redact_mcp_output_secrets`]. This scrubs the
+/// `#[serde(flatten)] extra` passthrough maps on the cass DTOs (ft-7lh4k): the
+/// cass redactors walk only the typed `content` fields, but `flatten`
+/// round-trips any unmodeled key verbatim, so a secret-shaped string arriving in
+/// (or nested under) an `extra` entry — e.g. a future `text`/`snippet`/`raw`
+/// field, or a value nested in an object/array — would otherwise reach the
+/// caller unredacted.
+fn redact_json_value_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            let redacted = redact_mcp_output_secrets(text);
+            if redacted != *text {
+                *text = redacted;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_json_value_in_place(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for nested in map.values_mut() {
+                redact_json_value_in_place(nested);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+/// Redact every string in a `#[serde(flatten)] extra` passthrough map.
+fn redact_cass_extra_map(extra: &mut std::collections::HashMap<String, serde_json::Value>) {
+    for value in extra.values_mut() {
+        redact_json_value_in_place(value);
+    }
 }
 
 fn redact_mcp_wait_pattern_for_output(pattern: &str) -> String {
@@ -11705,6 +11754,71 @@ exit 17",
                 .as_str()
                 .expect("error string")
                 .contains("[REDACTED]")
+        );
+    }
+
+    /// ft-7lh4k: a secret that arrives in an UNMODELED cass field (captured by
+    /// `#[serde(flatten)] extra`) must be redacted before the result leaves the
+    /// MCP surface. Models the real exfil path: cass renames/adds a content field,
+    /// or nests content, so it bypasses the typed `content` walk. Deserialize →
+    /// redact → re-serialize and assert the secret does not survive any extra slot
+    /// (hit-level, result-level, or nested in an object/array).
+    #[test]
+    fn redact_cass_search_result_scrubs_secrets_in_flattened_extra() {
+        use super::{CassSearchResult, redact_cass_search_result};
+
+        let secret = redaction_test_token();
+        let prefix = redaction_test_prefix();
+        let mut result: CassSearchResult = serde_json::from_value(serde_json::json!({
+            "hits": [{
+                "content": format!("typed content with {secret}"),
+                "renamed_text": secret,
+                "nested": { "deep": [secret] },
+            }],
+            "result_level_leak": secret,
+        }))
+        .expect("cass search fixture deserializes");
+
+        redact_cass_search_result(&mut result);
+
+        let serialized = serde_json::to_string(&result).expect("serialize redacted result");
+        assert!(
+            !serialized.contains(prefix.as_str()),
+            "secret survived redaction via a flattened extra field: {serialized}"
+        );
+        assert!(
+            serialized.contains("[REDACTED"),
+            "expected a redaction marker in the scrubbed output: {serialized}"
+        );
+    }
+
+    /// ft-7lh4k: same forward-compat invariant for `wa.cass_view` — match line,
+    /// surrounding context lines, and the view-level result all scrub their
+    /// `#[serde(flatten)] extra` passthrough.
+    #[test]
+    fn redact_cass_view_result_scrubs_secrets_in_flattened_extra() {
+        use super::{CassViewResult, redact_cass_view_result};
+
+        let secret = redaction_test_token();
+        let prefix = redaction_test_prefix();
+        let mut result: CassViewResult = serde_json::from_value(serde_json::json!({
+            "match_line": { "content": "match", "raw_line": secret },
+            "context_before": [{ "content": "before", "snippet": secret }],
+            "context_after": [{ "content": "after", "meta": { "blob": secret } }],
+            "view_level_leak": secret,
+        }))
+        .expect("cass view fixture deserializes");
+
+        redact_cass_view_result(&mut result);
+
+        let serialized = serde_json::to_string(&result).expect("serialize redacted view");
+        assert!(
+            !serialized.contains(prefix.as_str()),
+            "secret survived redaction via a flattened extra field: {serialized}"
+        );
+        assert!(
+            serialized.contains("[REDACTED"),
+            "expected a redaction marker in the scrubbed output: {serialized}"
         );
     }
 
