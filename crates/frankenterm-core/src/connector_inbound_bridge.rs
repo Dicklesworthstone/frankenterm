@@ -293,6 +293,8 @@ pub enum ConnectorBridgeError {
     MissingPaneId,
     #[error("signal mapping failed: {0}")]
     MappingFailed(String),
+    #[error("connector inbound bridge unavailable: {reason}")]
+    BridgeUnavailable { reason: String },
     #[error("connector signal rejected by privacy policy: {reason}")]
     PrivacyRejected { reason: String },
     #[error("connector signal quarantined by privacy policy: {reason}")]
@@ -1240,6 +1242,10 @@ mod tests {
         bridge.route_signal(&sig).unwrap();
 
         let event = sub.try_recv().unwrap();
+        assert!(
+            matches!(&event, Ok(Event::PatternDetected { .. })),
+            "expected PatternDetected event, got {event:?}"
+        );
         if let Ok(Event::PatternDetected { detection, .. }) = event {
             assert_eq!(detection.rule_id, "connector.slack:stream.message");
             assert!((detection.confidence - 1.0).abs() < f64::EPSILON);
@@ -1271,8 +1277,6 @@ mod tests {
                     .and_then(|v| v.as_str()),
                 Some("accept")
             );
-        } else {
-            panic!("expected PatternDetected event");
         }
     }
 
@@ -1297,6 +1301,10 @@ mod tests {
         bridge.route_signal(&sig).unwrap();
 
         let event = sub.try_recv().unwrap();
+        assert!(
+            matches!(&event, Ok(Event::PatternDetected { .. })),
+            "expected PatternDetected event, got {event:?}"
+        );
         if let Ok(Event::PatternDetected { detection, .. }) = event {
             let map = detection.extracted.as_object().unwrap();
             assert_eq!(
@@ -1322,8 +1330,6 @@ mod tests {
                     .and_then(|v| v.as_str()),
                 Some("accept_redacted")
             );
-        } else {
-            panic!("expected PatternDetected event");
         }
 
         let audit = bridge.classification_audit_log().back().unwrap();
@@ -1389,6 +1395,10 @@ mod tests {
         bridge.route_signal(&sig).unwrap();
 
         let event = sub.try_recv().unwrap();
+        assert!(
+            matches!(&event, Ok(Event::PatternDetected { .. })),
+            "expected PatternDetected event, got {event:?}"
+        );
         if let Ok(Event::PatternDetected { detection, .. }) = event {
             let map = detection.extracted.as_object().unwrap();
             assert!(map.get("password").is_none());
@@ -1403,8 +1413,6 @@ mod tests {
                     .and_then(|v| v.as_str()),
                 Some("accept_redacted")
             );
-        } else {
-            panic!("expected PatternDetected event");
         }
 
         let audit = bridge.classification_audit_log().back().unwrap();
@@ -1425,14 +1433,16 @@ mod tests {
         bridge.route_signal(&sig).unwrap();
 
         let event = sub.try_recv().unwrap();
+        assert!(
+            matches!(&event, Ok(Event::PatternDetected { .. })),
+            "expected PatternDetected event, got {event:?}"
+        );
         if let Ok(Event::PatternDetected { detection, .. }) = event {
             let map = detection.extracted.as_object().unwrap();
             assert_eq!(
                 map.get("lifecycle_phase").and_then(|v| v.as_str()),
                 Some("degraded")
             );
-        } else {
-            panic!("expected PatternDetected");
         }
     }
 
@@ -1449,6 +1459,10 @@ mod tests {
         bridge.route_signal(&sig).unwrap();
 
         let event = sub.try_recv().unwrap();
+        assert!(
+            matches!(&event, Ok(Event::PatternDetected { .. })),
+            "expected PatternDetected event, got {event:?}"
+        );
         if let Ok(Event::PatternDetected { detection, .. }) = event {
             assert_eq!(detection.severity, Severity::Critical);
             let map = detection.extracted.as_object().unwrap();
@@ -1456,8 +1470,6 @@ mod tests {
                 map.get("failure_class").and_then(|v| v.as_str()),
                 Some("auth")
             );
-        } else {
-            panic!("expected PatternDetected");
         }
     }
 
