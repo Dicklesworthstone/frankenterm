@@ -21,8 +21,8 @@
 
 use frankenterm_core::plan::{
     AssignmentId, Mission, MissionId, MissionJournal, MissionJournalEntry, MissionJournalEntryKind,
-    MissionJournalReplayReport, MissionJournalState, MissionKillSwitchLevel, MissionLifecycleState,
-    MissionLifecycleTransitionKind, MissionOwnership,
+    MissionJournalError, MissionJournalReplayReport, MissionJournalState, MissionKillSwitchLevel,
+    MissionLifecycleState, MissionLifecycleTransitionKind, MissionOwnership,
 };
 use proptest::prelude::*;
 
@@ -197,6 +197,42 @@ fn compacting_away_latest_checkpoint_repairs_snapshot_checkpoint_state() {
     assert_eq!(replay.start_seq, checkpoint_seq + 1);
     assert_eq!(replay.entries_scanned, 1);
     assert_eq!(replay.checkpoints_found, 0);
+}
+
+#[test]
+fn compacting_entries_does_not_reopen_correlation_ids() {
+    let mut journal = MissionJournal::new(MissionId("m-journal-compact-correlation".into()));
+    let kind = MissionJournalEntryKind::RecoveryMarker {
+        recovered_through_seq: 0,
+        recovery_reason: "first".into(),
+    };
+
+    let compacted_seq = journal
+        .append(kind.clone(), "stable-cid", "op", "first", None, 1_000)
+        .unwrap();
+    journal
+        .append(
+            MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: compacted_seq,
+                recovery_reason: "retained".into(),
+            },
+            "retained-cid",
+            "op",
+            "second",
+            None,
+            2_000,
+        )
+        .unwrap();
+
+    journal.compact_before(compacted_seq + 1);
+
+    assert_eq!(journal.entries().len(), 1);
+    assert!(journal.has_correlation("stable-cid"));
+    let duplicate = journal.append(kind, "stable-cid", "op", "retry", None, 3_000);
+    assert!(matches!(
+        duplicate,
+        Err(MissionJournalError::DuplicateCorrelation(cid)) if cid == "stable-cid"
+    ));
 }
 
 proptest! {
@@ -471,17 +507,27 @@ proptest! {
         let compact_at = (total / 2 + 1) as u64;
         journal.compact_before(compact_at);
 
-        // Compacted entries should no longer be in correlation index
+        // Correlation IDs are journal-level idempotency keys, so compaction
+        // must not make previously accepted IDs available for reuse.
         for i in 0..total {
             let cid = format!("c-{i}");
-            let expected_in_index = (i as u64 + 1) >= compact_at;
-            prop_assert_eq!(
+            prop_assert!(
                 journal.has_correlation(&cid),
-                expected_in_index,
-                "c-{} (seq={}) should be in_index={}, compact_at={}",
-                i, i + 1, expected_in_index, compact_at
+                "c-{i} should remain known after compact_at={compact_at}"
             );
         }
+
+        let duplicate = journal.append(
+            MissionJournalEntryKind::RecoveryMarker {
+                recovered_through_seq: 0,
+                recovery_reason: "retry".into(),
+            },
+            "c-0", "op", "retry", None, 100_000,
+        );
+        prop_assert!(matches!(
+            duplicate,
+            Err(MissionJournalError::DuplicateCorrelation(cid)) if cid == "c-0"
+        ));
     }
 
     #[test]

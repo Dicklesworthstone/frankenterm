@@ -5653,6 +5653,7 @@ pub struct MissionJournal {
     mission_id: MissionId,
     entries: Vec<MissionJournalEntry>,
     next_seq: u64,
+    // Historical idempotency set. Entry compaction must not reopen correlation IDs.
     correlation_index: std::collections::HashSet<String>,
     last_checkpoint_seq: Option<u64>,
     max_entries: Option<usize>,
@@ -5787,7 +5788,7 @@ impl MissionJournal {
         &self.entries[start..]
     }
 
-    /// Whether a correlation ID exists in the journal.
+    /// Whether a correlation ID has ever been accepted by the journal.
     #[must_use]
     pub fn has_correlation(&self, cid: &str) -> bool {
         self.correlation_index.contains(cid)
@@ -5802,16 +5803,6 @@ impl MissionJournal {
 
     /// Remove entries with seq < compact_seq.
     pub fn compact_before(&mut self, compact_seq: u64) {
-        // Remove correlation IDs for compacted entries
-        let to_remove: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|e| e.seq < compact_seq)
-            .map(|e| e.correlation_id.clone())
-            .collect();
-        for cid in &to_remove {
-            self.correlation_index.remove(cid);
-        }
         self.entries.retain(|e| e.seq >= compact_seq);
         // Re-derive the checkpoint anchor from retained entries so compaction
         // cannot leave stale checkpoint metadata behind.
@@ -7227,14 +7218,13 @@ mod tests {
         let v = Verification::pane_idle(3000);
         assert!(v.description.is_none());
         assert!(v.timeout_ms.is_none());
-        if let VerificationStrategy::PaneIdle {
-            idle_threshold_ms, ..
-        } = v.strategy
-        {
-            assert_eq!(idle_threshold_ms, 3000);
-        } else {
-            panic!("Expected PaneIdle strategy");
-        }
+        assert!(matches!(
+            v.strategy,
+            VerificationStrategy::PaneIdle {
+                idle_threshold_ms: 3000,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -7278,40 +7268,30 @@ mod tests {
     #[test]
     fn on_failure_abort_message() {
         let f = OnFailure::abort_with_message("oops");
-        if let OnFailure::Abort { message } = &f {
-            assert_eq!(message.as_deref(), Some("oops"));
-        } else {
-            panic!("Expected Abort variant");
-        }
+        assert!(matches!(
+            &f,
+            OnFailure::Abort { message } if message.as_deref() == Some("oops")
+        ));
     }
 
     #[test]
     fn on_failure_retry_defaults() {
         let f = OnFailure::retry(5, 2000);
-        if let OnFailure::Retry {
-            max_attempts,
-            initial_delay_ms,
-            max_delay_ms,
-            backoff_multiplier,
-        } = &f
-        {
-            assert_eq!(*max_attempts, 5);
-            assert_eq!(*initial_delay_ms, 2000);
-            assert!(max_delay_ms.is_none());
-            assert!(backoff_multiplier.is_none());
-        } else {
-            panic!("Expected Retry variant");
-        }
+        assert!(matches!(
+            &f,
+            OnFailure::Retry {
+                max_attempts: 5,
+                initial_delay_ms: 2000,
+                max_delay_ms,
+                backoff_multiplier,
+            } if max_delay_ms.is_none() && backoff_multiplier.is_none()
+        ));
     }
 
     #[test]
     fn on_failure_skip_defaults() {
         let f = OnFailure::skip();
-        if let OnFailure::Skip { warn } = &f {
-            assert_eq!(*warn, Some(true));
-        } else {
-            panic!("Expected Skip variant");
-        }
+        assert!(matches!(&f, OnFailure::Skip { warn: Some(true) }));
     }
 
     #[test]
@@ -8673,10 +8653,12 @@ mod tests {
         cases.push(("compensation step_id", path_like_compensation));
 
         for (field, contract) in cases {
-            let err = match contract.validate() {
-                Ok(()) => panic!("{field} should reject invalid tx identifier"),
-                Err(err) => err,
-            };
+            let validation = contract.validate();
+            assert!(
+                validation.is_err(),
+                "{field} should reject invalid tx identifier"
+            );
+            let err = validation.err().unwrap_or_default();
             assert!(
                 err.contains(field),
                 "{field} should be named in validation error: {err}"
