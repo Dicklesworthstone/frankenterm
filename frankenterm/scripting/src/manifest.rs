@@ -3,8 +3,9 @@
 //! Defines the [`ExtensionPermissions`] and [`ParsedManifest`] types
 //! that govern what a WASM extension is allowed to do.
 
-use anyhow::{Context, Result};
-use std::path::Path;
+use anyhow::{Context, Result, bail};
+use std::ffi::OsStr;
+use std::path::{Component, Path};
 
 /// Permissions declared by a WASM extension in its manifest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -120,8 +121,9 @@ impl ParsedManifest {
         let name = ext
             .get("name")
             .and_then(|v| v.as_str())
-            .context("[extension].name is required")?
-            .to_string();
+            .context("[extension].name is required")?;
+        validate_extension_name(name)?;
+        let name = name.to_string();
 
         let version = ext
             .get("version")
@@ -213,6 +215,54 @@ impl ParsedManifest {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         Self::from_toml_str(&content)
+    }
+
+    /// Return the manifest name after re-validating it as a safe directory name.
+    ///
+    /// `ParsedManifest::from_toml_str` validates parsed manifests, but this
+    /// method protects call sites from manually constructed or mutated values.
+    pub fn validated_name(&self) -> Result<&str> {
+        validate_extension_name(&self.name)?;
+        Ok(&self.name)
+    }
+}
+
+/// Validate an extension name before it is used as a filesystem path component.
+pub fn validate_extension_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("invalid extension name: name must not be empty");
+    }
+
+    if name != name.trim() {
+        bail!("invalid extension name '{name}': surrounding whitespace is not allowed");
+    }
+
+    if name == "." || name == ".." {
+        bail!("invalid extension name '{name}': dot path components are not allowed");
+    }
+
+    if name.starts_with('/') || name.starts_with('\\') || name.contains('/') || name.contains('\\')
+    {
+        bail!("invalid extension name '{name}': path separators are not allowed");
+    }
+
+    if matches!(name.as_bytes(), [first, b':', ..] if first.is_ascii_alphabetic()) {
+        bail!("invalid extension name '{name}': Windows drive prefixes are not allowed");
+    }
+
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        bail!(
+            "invalid extension name '{name}': only ASCII letters, digits, '.', '-', and '_' are allowed"
+        );
+    }
+
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(component)), None) if component == OsStr::new(name) => Ok(()),
+        _ => bail!("invalid extension name '{name}': name must be one path component"),
     }
 }
 
@@ -396,6 +446,43 @@ key = "value"
 "#;
         let result = ParsedManifest::from_toml_str(toml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_extension_names_are_rejected() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "/absolute",
+            "nested/name",
+            r"nested\name",
+            "C:outside",
+            "two words",
+            " leading",
+            "trailing ",
+            "semi;colon",
+        ] {
+            let escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+            let toml = format!("[extension]\nname = \"{escaped_name}\"\n");
+
+            let result = ParsedManifest::from_toml_str(&toml);
+
+            assert!(result.is_err(), "name should be rejected: {name:?}");
+            let err = result.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("invalid extension name"),
+                "unexpected error for {name:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_name_validator_accepts_single_safe_components() {
+        for name in ["minimal", "my-theme", "lua_ext", "com.example.theme"] {
+            validate_extension_name(name).unwrap();
+        }
     }
 
     #[test]

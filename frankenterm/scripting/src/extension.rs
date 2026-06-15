@@ -3,7 +3,7 @@
 //! Extensions are stored in a platform-specific directory and loaded
 //! from their extracted contents on the filesystem.
 
-use crate::manifest::ParsedManifest;
+use crate::manifest::{ParsedManifest, validate_extension_name};
 use crate::package::FtxPackage;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -52,10 +52,10 @@ impl ExtensionManager {
         let pkg = FtxPackage::open(ftx_path)
             .with_context(|| format!("failed to open package {}", ftx_path.display()))?;
 
-        let name = &pkg.manifest.name;
+        let name = pkg.manifest.validated_name()?.to_string();
 
         // Remove existing installation if present
-        let ext_dir = self.extensions_dir.join(name);
+        let ext_dir = self.extension_dir_for_name(&name)?;
         if ext_dir.exists() {
             std::fs::remove_dir_all(&ext_dir).with_context(|| {
                 format!("failed to remove existing extension {}", ext_dir.display())
@@ -65,7 +65,7 @@ impl ExtensionManager {
         let installed_dir = pkg.extract_to(&self.extensions_dir)?;
 
         Ok(InstalledExtension {
-            name: name.clone(),
+            name,
             version: pkg.manifest.version.clone(),
             path: installed_dir,
             manifest: pkg.manifest,
@@ -121,7 +121,7 @@ impl ExtensionManager {
 
     /// Remove an installed extension by name.
     pub fn remove(&self, name: &str) -> Result<()> {
-        let ext_dir = self.extensions_dir.join(name);
+        let ext_dir = self.extension_dir_for_name(name)?;
         if !ext_dir.exists() {
             bail!("extension '{name}' is not installed");
         }
@@ -143,7 +143,7 @@ impl ExtensionManager {
 
     /// Get metadata for a specific installed extension.
     pub fn get(&self, name: &str) -> Result<Option<InstalledExtension>> {
-        let ext_dir = self.extensions_dir.join(name);
+        let ext_dir = self.extension_dir_for_name(name)?;
         if !ext_dir.exists() {
             return Ok(None);
         }
@@ -165,6 +165,11 @@ impl ExtensionManager {
     /// The base directory for extensions.
     pub fn extensions_dir(&self) -> &Path {
         &self.extensions_dir
+    }
+
+    fn extension_dir_for_name(&self, name: &str) -> Result<PathBuf> {
+        validate_extension_name(name)?;
+        Ok(self.extensions_dir.join(name))
     }
 }
 
@@ -286,6 +291,27 @@ entry = "main.wasm"
     }
 
     #[test]
+    fn remove_rejects_unsafe_name_without_touching_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("extensions");
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("extension.toml"), test_manifest("outside")).unwrap();
+        let manager = ExtensionManager::new(ext_dir).unwrap();
+
+        let result = manager.remove("../outside");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid extension name")
+        );
+        assert!(outside_dir.join("extension.toml").exists());
+    }
+
+    #[test]
     fn get_installed_extension() {
         let dir = tempfile::tempdir().unwrap();
         let ext_dir = dir.path().join("extensions");
@@ -300,6 +326,26 @@ entry = "main.wasm"
 
         let missing = manager.get("missing").unwrap();
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn get_rejects_unsafe_name_without_reading_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("extensions");
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("extension.toml"), test_manifest("outside")).unwrap();
+        let manager = ExtensionManager::new(ext_dir).unwrap();
+
+        let result = manager.get("../outside");
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid extension name")
+        );
     }
 
     #[test]

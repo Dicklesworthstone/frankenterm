@@ -123,7 +123,7 @@ impl FtxPackage {
     /// Creates a subdirectory named after the extension. Returns the path
     /// to the extracted extension directory.
     pub fn extract_to(&self, base_dir: &Path) -> Result<PathBuf> {
-        let ext_dir = base_dir.join(&self.manifest.name);
+        let ext_dir = base_dir.join(self.manifest.validated_name()?);
         std::fs::create_dir_all(&ext_dir)
             .with_context(|| format!("failed to create extension dir {}", ext_dir.display()))?;
 
@@ -275,7 +275,7 @@ fn validate_archive_entry_name(name: &str) -> Result<()> {
         bail!("rejecting unsafe archive entry path: {name}");
     }
 
-    if name.len() >= 2 && name.as_bytes()[1] == b':' && name.as_bytes()[0].is_ascii_alphabetic() {
+    if matches!(name.as_bytes(), [first, b':', ..] if first.is_ascii_alphabetic()) {
         bail!("rejecting unsafe archive entry path: {name}");
     }
 
@@ -509,6 +509,33 @@ themes = ["assets/theme.toml"]
         let result = FtxPackage::open(&ftx_path);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unsafe archive"));
+    }
+
+    #[test]
+    fn open_rejects_unsafe_manifest_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let ftx_path = dir.path().join("manifest-traversal.ftx");
+
+        let manifest = r#"
+[extension]
+name = "../outside"
+version = "1.0.0"
+
+[engine]
+type = "wasm"
+entry = "main.wasm"
+"#;
+
+        let bytes = build_test_ftx(manifest, "main.wasm", WASM_MAGIC);
+        std::fs::write(&ftx_path, &bytes).unwrap();
+
+        let result = FtxPackage::open(&ftx_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid extension name"),
+            "error: {err:#}"
+        );
     }
 
     #[test]
