@@ -1,0 +1,23 @@
+[package]
+name = "frankenterm-redactor"
+description = "Secret redaction primitives for FrankenTerm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "redaction", "security"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.8.0"

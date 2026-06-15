@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/frankenterm",
     "crates/frankenterm-core",
+    "crates/frankenterm-redactor",
     "crates/frankenterm-core-ars",
     "crates/frankenterm-core-tantivy",
     "crates/frankenterm-core-fleet",
@@ -570,6 +571,7 @@ franken-agent-detection = "0.1.0"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core", default-features = false }
+frankenterm-redactor = { path = "crates/frankenterm-redactor", default-features = false }
 # Replay sub-crate extracted from frankenterm-core under ft-y0loj.4 / ft-j1qjt.2.
 # `frankenterm-core` carries this only as a dev-dep (cycle reason: tests in
 # crates/frankenterm-core/tests/proptest_replay*.rs); production consumers

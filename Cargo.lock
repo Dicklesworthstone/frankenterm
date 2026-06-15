@@ -4219,6 +4219,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-redactor"
+version = "0.5.0"
+dependencies = [
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "frankenterm-scripting"
 version = "0.1.0"
 dependencies = [
