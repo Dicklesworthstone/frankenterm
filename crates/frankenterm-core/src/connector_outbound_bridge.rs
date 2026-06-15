@@ -302,6 +302,201 @@ impl OutboundEvent {
         self.severity = severity;
         self
     }
+
+    /// Convert a runtime [`crate::events::Event`] into an outbound connector
+    /// event when that runtime event is meaningful for external dispatch.
+    ///
+    /// High-volume segment-capture events intentionally return `None`; routing
+    /// every captured chunk through connector rules would make the outbound
+    /// bridge part of the hot ingest path. Pattern, lifecycle, workflow,
+    /// user-var, gap, and mission audit events retain enough structure for
+    /// connector routing while preserving the existing EventBus redaction
+    /// boundary.
+    #[must_use]
+    pub fn from_runtime_event(event: &crate::events::Event, now_ms: u64) -> Option<Self> {
+        match event {
+            crate::events::Event::SegmentCaptured { .. } => None,
+            crate::events::Event::GapDetected {
+                pane_id,
+                seq_before,
+                seq_after,
+                reason,
+                detected_at_ms,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::HealthAlert,
+                    "capture.gap_detected",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "seq_before": seq_before,
+                        "seq_after": seq_after,
+                        "reason": reason,
+                        "detected_at_ms": detected_at_ms,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("gap:{pane_id}:{seq_before}:{seq_after}"))
+                .with_severity(OutboundSeverity::Warning),
+            ),
+            crate::events::Event::PatternDetected {
+                pane_id,
+                pane_uuid,
+                detection,
+                event_id,
+            } => {
+                let correlation_id = event_id.map_or_else(
+                    || format!("pattern:{pane_id}:{}:{now_ms}", detection.rule_id),
+                    |id| format!("event:{id}"),
+                );
+                Some(
+                    Self::new(
+                        OutboundEventSource::PatternDetected,
+                        format!("pattern.{}", detection.event_type),
+                        serde_json::json!({
+                            "pane_id": pane_id,
+                            "pane_uuid": pane_uuid,
+                            "event_id": event_id,
+                            "rule_id": detection.rule_id,
+                            "agent_type": detection.agent_type.to_string(),
+                            "event_type": detection.event_type,
+                            "confidence": detection.confidence,
+                            "extracted": detection.extracted,
+                            "matched_text": detection.matched_text,
+                        }),
+                    )
+                    .with_timestamp_ms(now_ms)
+                    .with_pane_id(*pane_id)
+                    .with_correlation_id(correlation_id)
+                    .with_severity(outbound_severity_from_detection(detection.severity)),
+                )
+            }
+            crate::events::Event::PaneDiscovered {
+                pane_id,
+                domain,
+                title,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::PaneLifecycle,
+                    "pane.discovered",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "domain": domain,
+                        "title": title,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("pane:{pane_id}:discovered:{now_ms}")),
+            ),
+            crate::events::Event::PaneDisappeared { pane_id } => Some(
+                Self::new(
+                    OutboundEventSource::PaneLifecycle,
+                    "pane.disappeared",
+                    serde_json::json!({ "pane_id": pane_id }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("pane:{pane_id}:disappeared:{now_ms}")),
+            ),
+            crate::events::Event::WorkflowStarted {
+                workflow_id,
+                workflow_name,
+                pane_id,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "workflow.started",
+                    serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "workflow_name": workflow_name,
+                        "pane_id": pane_id,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_workflow_id(workflow_id.clone())
+                .with_correlation_id(format!("workflow:{workflow_id}:started:{now_ms}")),
+            ),
+            crate::events::Event::WorkflowStep {
+                workflow_id,
+                step_name,
+                result,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "workflow.step",
+                    serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "step_name": step_name,
+                        "result": result,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_workflow_id(workflow_id.clone())
+                .with_correlation_id(format!("workflow:{workflow_id}:step:{step_name}:{now_ms}")),
+            ),
+            crate::events::Event::WorkflowCompleted {
+                workflow_id,
+                success,
+                reason,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "workflow.completed",
+                    serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "success": success,
+                        "reason": reason,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_workflow_id(workflow_id.clone())
+                .with_correlation_id(format!("workflow:{workflow_id}:completed:{now_ms}"))
+                .with_severity(if *success {
+                    OutboundSeverity::Info
+                } else {
+                    OutboundSeverity::Warning
+                }),
+            ),
+            crate::events::Event::UserVarReceived {
+                pane_id,
+                name,
+                payload,
+            } => Some(
+                Self::new(
+                    OutboundEventSource::UserAction,
+                    "user_var.received",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "name": name,
+                        "payload": payload,
+                    }),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_pane_id(*pane_id)
+                .with_correlation_id(format!("user_var:{pane_id}:{name}:{now_ms}")),
+            ),
+            #[cfg(feature = "subprocess-bridge")]
+            crate::events::Event::MissionAudit { event } => Some(
+                Self::new(
+                    OutboundEventSource::WorkflowLifecycle,
+                    "mission.audit",
+                    serde_json::to_value(event).unwrap_or_else(|_| serde_json::Value::Null),
+                )
+                .with_timestamp_ms(now_ms)
+                .with_correlation_id(format!("mission:audit:{now_ms}")),
+            ),
+        }
+    }
+}
+
+fn outbound_severity_from_detection(severity: crate::patterns::Severity) -> OutboundSeverity {
+    match severity {
+        crate::patterns::Severity::Info => OutboundSeverity::Info,
+        crate::patterns::Severity::Warning => OutboundSeverity::Warning,
+        crate::patterns::Severity::Critical => OutboundSeverity::Critical,
+    }
 }
 
 // =============================================================================
@@ -2105,6 +2300,39 @@ mod tests {
         // But denies capabilities not in default set
         let result = checker.check_capability("unknown", ConnectorCapability::SecretBroker);
         assert!(matches!(result, SandboxCheckResult::Denied { .. }));
+    }
+
+    #[test]
+    fn outbound_event_from_runtime_pattern_detection_preserves_routing_fields() {
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "usage.reached".to_string(),
+            severity: crate::patterns::Severity::Critical,
+            confidence: 0.99,
+            extracted: serde_json::json!({"kind": "usage"}),
+            matched_text: "[redacted]".to_string(),
+            span: (4, 13),
+        };
+        let event = crate::events::Event::PatternDetected {
+            pane_id: 42,
+            pane_uuid: Some("pane-uuid".to_string()),
+            detection,
+            event_id: Some(77),
+        };
+
+        let outbound = OutboundEvent::from_runtime_event(&event, 12_345)
+            .expect("pattern detections should be eligible for outbound routing");
+
+        assert_eq!(outbound.source, OutboundEventSource::PatternDetected);
+        assert_eq!(outbound.event_type, "pattern.usage.reached");
+        assert_eq!(outbound.correlation_id.as_deref(), Some("event:77"));
+        assert_eq!(outbound.timestamp_ms, 12_345);
+        assert_eq!(outbound.pane_id, Some(42));
+        assert_eq!(outbound.severity, OutboundSeverity::Critical);
+        assert_eq!(outbound.payload["rule_id"], "codex.usage.reached");
+        assert_eq!(outbound.payload["agent_type"], "codex");
+        assert_eq!(outbound.payload["matched_text"], "[redacted]");
     }
 
     // ---- Bridge integration ----

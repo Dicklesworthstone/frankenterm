@@ -41,6 +41,11 @@ use crate::connector_inbound_bridge::{
     BridgeRouteResult, ConnectorBridgeError, ConnectorInboundBridge, ConnectorInboundBridgeConfig,
     ConnectorSignal,
 };
+use crate::connector_outbound_bridge::{
+    ConnectorAction, ConnectorOutboundBridge, ConnectorOutboundBridgeConfig, OutboundEvent,
+    OutboundRoutingRule,
+};
+use crate::connector_reliability::ConnectorErrorKind;
 use crate::crash::{
     HealthSnapshot, LeakRiskInventorySnapshot, LeakRiskWatchdogComponentSnapshot,
     LeakRiskWatchdogSnapshot, ShutdownSummary,
@@ -1358,6 +1363,8 @@ pub struct ObservationRuntime {
     event_bus: Option<Arc<EventBus>>,
     /// Runtime-owned inbound connector bridge feeding the live event bus.
     connector_inbound_bridge: Option<Arc<StdMutex<ConnectorInboundBridge>>>,
+    /// Runtime-owned outbound connector bridge draining live EventBus traffic.
+    connector_outbound_bridge: Option<Arc<StdMutex<ConnectorOutboundBridge>>>,
     /// Optional recording manager for capturing session recordings
     recording: Option<Arc<RecordingManager>>,
     /// Optional replay capture adapter for `.ftreplay` recorder events.
@@ -1423,6 +1430,7 @@ impl ObservationRuntime {
             config_rx,
             event_bus: None,
             connector_inbound_bridge: None,
+            connector_outbound_bridge: None,
             recording: None,
             replay_capture: None,
             snapshot_config: None,
@@ -1467,8 +1475,49 @@ impl ObservationRuntime {
             Arc::clone(&event_bus),
             ConnectorInboundBridgeConfig::default(),
         ))));
+        self.connector_outbound_bridge.get_or_insert_with(|| {
+            Arc::new(StdMutex::new(ConnectorOutboundBridge::new(
+                ConnectorOutboundBridgeConfig::default(),
+            )))
+        });
         self.event_bus = Some(event_bus);
         self
+    }
+
+    /// Configure the runtime-owned outbound connector bridge.
+    ///
+    /// Call before [`Self::start`] so the spawned production subscriber uses
+    /// this bridge config from its first EventBus receive.
+    #[must_use]
+    pub fn with_connector_outbound_bridge_config(
+        mut self,
+        config: ConnectorOutboundBridgeConfig,
+    ) -> Self {
+        self.connector_outbound_bridge =
+            Some(Arc::new(StdMutex::new(ConnectorOutboundBridge::new(config))));
+        self
+    }
+
+    /// Register an outbound connector routing rule on the runtime-owned bridge.
+    ///
+    /// If no bridge was configured yet, a default bridge is created. The rule is
+    /// then consumed by the production EventBus subscriber spawned by
+    /// [`Self::start`] when this runtime also has an event bus.
+    #[must_use]
+    pub fn with_connector_outbound_rule(self, rule: OutboundRoutingRule) -> Self {
+        let mut runtime = self;
+        let bridge = runtime.connector_outbound_bridge.get_or_insert_with(|| {
+            Arc::new(StdMutex::new(ConnectorOutboundBridge::new(
+                ConnectorOutboundBridgeConfig::default(),
+            )))
+        });
+        match bridge.lock() {
+            Ok(mut guard) => guard.add_rule(rule),
+            Err(_) => warn!(
+                "connector outbound bridge lock poisoned while registering routing rule"
+            ),
+        }
+        runtime
     }
 
     /// Route an inbound connector signal into the runtime's live event bus.
@@ -1594,6 +1643,10 @@ impl ObservationRuntime {
         // Spawn maintenance task
         let maintenance_handle = self.spawn_maintenance_task(capture_queue_capacity);
 
+        // Spawn outbound connector bridge task. It is dormant unless both an
+        // EventBus and runtime-owned bridge exist.
+        let connector_outbound = self.spawn_connector_outbound_task();
+
         // Spawn snapshot engine task (session persistence) if configured
         let (snapshot_handle, snapshot_shutdown_tx, snapshot_triggers) =
             if let Some(ref snap_config) = self.snapshot_config {
@@ -1654,6 +1707,7 @@ impl ObservationRuntime {
             relay: Some(relay_handle),
             persistence: Some(persistence_handle),
             maintenance: Some(maintenance_handle),
+            connector_outbound,
             snapshot: snapshot_handle,
             snapshot_triggers,
             snapshot_shutdown: snapshot_shutdown_tx,
@@ -1799,6 +1853,65 @@ impl ObservationRuntime {
                 }
             }
         })
+    }
+
+    /// Spawn the production outbound connector bridge subscriber.
+    ///
+    /// The task is intentionally separated from capture/persistence: it listens
+    /// to already-redacted EventBus traffic, routes eligible events through
+    /// `ConnectorOutboundBridge`, drains queued connector actions into the
+    /// connector host runtime, and feeds completion status back into the
+    /// bridge's governor/reliability controllers.
+    fn spawn_connector_outbound_task(&self) -> Option<JoinHandle<()>> {
+        let event_bus = self.event_bus.clone()?;
+        let bridge = self.connector_outbound_bridge.clone()?;
+        let shutdown_flag = Arc::clone(&self.shutdown_flag);
+
+        let loop_cx = runtime_loop_cx();
+        Some(spawn_runtime_task(&loop_cx, move |loop_cx| async move {
+            let mut subscriber = event_bus.subscribe();
+
+            loop {
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                match runtime_timeout(
+                    &loop_cx,
+                    Duration::from_millis(CONNECTOR_OUTBOUND_BRIDGE_TICK_MS),
+                    subscriber.recv(),
+                )
+                .await
+                {
+                    Ok(Ok(event)) => {
+                        let now_ms = epoch_ms_u64();
+                        match bridge.lock() {
+                            Ok(mut guard) => {
+                                process_connector_outbound_runtime_event(
+                                    &mut guard, &event, now_ms,
+                                );
+                            }
+                            Err(_) => warn!(
+                                event_type = event.type_name(),
+                                "connector outbound bridge lock poisoned; dropping runtime event"
+                            ),
+                        }
+                    }
+                    Ok(Err(crate::events::RecvError::Lagged { missed_count })) => {
+                        warn!(
+                            missed = missed_count,
+                            "connector outbound bridge lagged on event bus"
+                        );
+                    }
+                    Ok(Err(crate::events::RecvError::Cancelled)) => {
+                        debug!("connector outbound bridge subscriber cancelled");
+                        break;
+                    }
+                    Ok(Err(crate::events::RecvError::Closed)) => break,
+                    Err(_elapsed) => {}
+                }
+            }
+        }))
     }
 
     /// Spawn the maintenance task.
@@ -3859,6 +3972,8 @@ pub struct RuntimeHandle {
     pub persistence: Option<JoinHandle<()>>,
     /// Maintenance task handle (retention, checkpointing)
     pub maintenance: Option<JoinHandle<()>>,
+    /// Connector outbound bridge task handle (EventBus → host runtime dispatch).
+    pub connector_outbound: Option<JoinHandle<()>>,
     /// Snapshot engine task handle (session persistence)
     pub snapshot: Option<JoinHandle<()>>,
     /// Snapshot trigger bridge task handle (event/health → snapshot trigger)
@@ -3926,6 +4041,7 @@ const SNAPSHOT_IDLE_WINDOW_SECS: u64 =
     crate::tuning_config::SnapshotTuning::DEFAULT_IDLE_WINDOW_SECS;
 const SNAPSHOT_MEMORY_TRIGGER_COOLDOWN_SECS: u64 =
     crate::tuning_config::SnapshotTuning::DEFAULT_MEMORY_TRIGGER_COOLDOWN_SECS;
+const CONNECTOR_OUTBOUND_BRIDGE_TICK_MS: u64 = 250;
 const DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneActivityState {
@@ -3975,6 +4091,106 @@ fn route_connector_signal_through_bridge(
             reason: "connector inbound bridge lock poisoned".to_string(),
         })?;
     guard.route_signal(signal)
+}
+
+fn process_connector_outbound_runtime_event(
+    bridge: &mut ConnectorOutboundBridge,
+    event: &Event,
+    now_ms: u64,
+) {
+    let Some(outbound_event) = OutboundEvent::from_runtime_event(event, now_ms) else {
+        return;
+    };
+
+    match bridge.process_event(&outbound_event) {
+        Ok(result) => {
+            if result.deduplicated {
+                debug!(
+                    correlation_id = %result.correlation_id,
+                    event_type = %outbound_event.event_type,
+                    "connector outbound event deduplicated"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                event_type = %outbound_event.event_type,
+                source = %outbound_event.source,
+                error = %err,
+                "connector outbound bridge rejected runtime event"
+            );
+            return;
+        }
+    }
+
+    for action in bridge.drain_actions() {
+        dispatch_connector_outbound_action(bridge, &action, now_ms);
+    }
+}
+
+fn dispatch_connector_outbound_action(
+    bridge: &mut ConnectorOutboundBridge,
+    action: &ConnectorAction,
+    now_ms: u64,
+) {
+    let operation_name = format!(
+        "connector.{}.{}",
+        action.target_connector,
+        action.action_kind.as_str()
+    );
+    let request = crate::connector_host_runtime::ConnectorOperationRequest::new(
+        operation_name,
+        action.correlation_id.clone(),
+        action.action_kind.required_capability(),
+    );
+    let result = {
+        let host = bridge.policy_engine_mut().connector_host_runtime_mut();
+        host.authorize_operation(now_ms, request)
+    };
+
+    match result {
+        Ok(envelope) => {
+            bridge.record_action_success(action, now_ms);
+            info!(
+                connector = %action.target_connector,
+                action = %action.action_kind,
+                correlation_id = %action.correlation_id,
+                operation_id = %envelope.operation_id,
+                "connector outbound action accepted by host runtime"
+            );
+        }
+        Err(err) => {
+            let kind = connector_host_runtime_error_kind(&err);
+            let dlq_entry_id = bridge.record_action_failure(action, err.to_string(), kind, now_ms);
+            warn!(
+                connector = %action.target_connector,
+                action = %action.action_kind,
+                correlation_id = %action.correlation_id,
+                error = %err,
+                error_kind = %kind,
+                dlq_entry_id = ?dlq_entry_id,
+                "connector outbound action rejected by host runtime"
+            );
+        }
+    }
+}
+
+fn connector_host_runtime_error_kind(
+    err: &crate::connector_host_runtime::ConnectorHostRuntimeError,
+) -> ConnectorErrorKind {
+    match err {
+        crate::connector_host_runtime::ConnectorHostRuntimeError::StartupProbeFailed { .. }
+        | crate::connector_host_runtime::ConnectorHostRuntimeError::BudgetExceeded { .. }
+        | crate::connector_host_runtime::ConnectorHostRuntimeError::HostNotRunnable { .. } => {
+            ConnectorErrorKind::ServiceUnavailable
+        }
+        crate::connector_host_runtime::ConnectorHostRuntimeError::InvalidConfig { .. }
+        | crate::connector_host_runtime::ConnectorHostRuntimeError::InvalidTransition { .. }
+        | crate::connector_host_runtime::ConnectorHostRuntimeError::SandboxViolation { .. }
+        | crate::connector_host_runtime::ConnectorHostRuntimeError::ProtocolUpgradeRejected {
+            ..
+        } => ConnectorErrorKind::Permanent,
+    }
 }
 
 async fn remove_runtime_pane_state_for_pane(
@@ -4483,6 +4699,9 @@ impl RuntimeHandle {
         if let Some(maintenance) = self.maintenance.take() {
             let _ = maintenance.await;
         }
+        if let Some(connector_outbound) = self.connector_outbound.take() {
+            let _ = connector_outbound.await;
+        }
         if let Some(snapshot) = self.snapshot.take() {
             let _ = snapshot.await;
         }
@@ -4561,6 +4780,7 @@ impl RuntimeHandle {
         let native_events = self.native_events.take();
         let persistence = self.persistence.take();
         let maintenance = self.maintenance.take();
+        let connector_outbound = self.connector_outbound.take();
         let snapshot = self.snapshot.take();
         let snapshot_triggers = self.snapshot_triggers.take();
         let shutdown_cx = runtime_loop_cx();
@@ -4581,6 +4801,9 @@ impl RuntimeHandle {
                 let _ = h.await;
             }
             if let Some(h) = maintenance {
+                let _ = h.await;
+            }
+            if let Some(h) = connector_outbound {
                 let _ = h.await;
             }
             if let Some(h) = snapshot {
@@ -4931,6 +5154,7 @@ impl Drop for RuntimeHandle {
             self.persistence.as_ref(),
             self.native_events.as_ref(),
             self.maintenance.as_ref(),
+            self.connector_outbound.as_ref(),
             self.snapshot.as_ref(),
             self.snapshot_triggers.as_ref(),
         ]
@@ -5115,6 +5339,8 @@ fn snapshot_trigger_from_event(event: &Event) -> Option<crate::snapshot_engine::
         | Event::GapDetected { .. }
         | Event::WorkflowStarted { .. }
         | Event::WorkflowStep { .. } => None,
+        #[cfg(feature = "subprocess-bridge")]
+        Event::MissionAudit { .. } => None,
     }
 }
 
@@ -5393,6 +5619,54 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn connector_outbound_runtime_event_dispatches_and_records_host_failure() {
+        let mut bridge = crate::connector_outbound_bridge::ConnectorOutboundBridge::new(
+            crate::connector_outbound_bridge::ConnectorOutboundBridgeConfig::default(),
+        );
+        bridge.add_rule(crate::connector_outbound_bridge::OutboundRoutingRule {
+            rule_id: "notify-usage".to_string(),
+            source_filter: Some(
+                crate::connector_outbound_bridge::OutboundEventSource::PatternDetected,
+            ),
+            event_type_prefix: Some("pattern.".to_string()),
+            min_severity: None,
+            target_connector: "worker".to_string(),
+            action_kind: crate::connector_outbound_bridge::ConnectorActionKind::Invoke,
+            enabled: true,
+            priority: 0,
+        });
+        let detection = crate::patterns::Detection {
+            rule_id: "codex.usage.reached".to_string(),
+            agent_type: crate::patterns::AgentType::Codex,
+            event_type: "usage.reached".to_string(),
+            severity: crate::patterns::Severity::Warning,
+            confidence: 0.95,
+            extracted: serde_json::json!({}),
+            matched_text: "[redacted]".to_string(),
+            span: (0, 10),
+        };
+        let event = Event::PatternDetected {
+            pane_id: 7,
+            pane_uuid: None,
+            detection,
+            event_id: Some(123),
+        };
+
+        process_connector_outbound_runtime_event(&mut bridge, &event, 5_000);
+
+        assert_eq!(bridge.pending_action_count(), 0);
+        assert_eq!(bridge.telemetry().actions_dispatched, 1);
+        assert_eq!(
+            bridge
+                .policy_engine()
+                .reliability_registry()
+                .total_dlq_depth(),
+            1,
+            "stopped connector host runtime must fail closed and feed reliability feedback"
+        );
     }
 
     #[test]
@@ -5764,6 +6038,7 @@ mod tests {
             native_events: None,
             persistence: Some(stubborn_runtime_task(duration)),
             maintenance: None,
+            connector_outbound: None,
             snapshot: None,
             snapshot_triggers: None,
             snapshot_shutdown: None,
