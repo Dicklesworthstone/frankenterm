@@ -722,6 +722,46 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
         tracking_bead: "ft-7h5da.5.7",
         validation: "Config::validate rejects non-default values as parsed but no-effect",
     },
+    ConfigKeyWiringRecord {
+        key: "search.daemon.enabled",
+        status: ConfigKeyWiringStatus::Consumed,
+        consumer: "crate::ipc::build_search_status_payload",
+        evidence: "ipc.rs reads search.daemon.enabled to flip background_job_status between idle and paused",
+        tracking_bead: "ft-v46vj",
+        validation: "accepted for both true and false",
+    },
+    ConfigKeyWiringRecord {
+        key: "search.daemon.socket_path",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "no production code binds or connects this UDS path; EmbedServer/EmbedClient are foundation types exercised only by tests",
+        tracking_bead: "ft-v46vj",
+        validation: "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
+        key: "search.daemon.auto_spawn",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "no client-connect path spawns a search daemon, so the toggle has no production effect",
+        tracking_bead: "ft-v46vj",
+        validation: "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
+        key: "search.daemon.worker_scan_interval_secs",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "no daemon worker loop scans for embedding work; the frankensearch coalescer uses its own batch-wait config",
+        tracking_bead: "ft-v46vj",
+        validation: "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
+        key: "search.daemon.worker_batch_size",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "no daemon worker batches embedding jobs; frankensearch batching uses its own independently-defaulted max/min_batch_size",
+        tracking_bead: "ft-v46vj",
+        validation: "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect",
+    },
 ];
 
 #[must_use]
@@ -811,18 +851,48 @@ impl Default for SearchDaemonConfig {
 }
 
 impl SearchDaemonConfig {
-    /// Validate daemon configuration bounds.
+    /// Validate daemon configuration.
+    ///
+    /// `enabled` is the only consumed field: `ipc.rs` reads it to flip the
+    /// search background-job status between `idle` and `paused`. The four
+    /// sibling fields are parsed into the config but have **no production
+    /// consumer** — there is no running search daemon that binds `socket_path`,
+    /// honors `auto_spawn`, or drives a worker loop at
+    /// `worker_scan_interval_secs` / `worker_batch_size`. `EmbedServer`,
+    /// `EmbedClient`, and the `daemon_bridge` coalescer are foundation types
+    /// exercised only by tests; the frankensearch batch path uses its own
+    /// independently-defaulted batch config.
+    ///
+    /// Mirroring the `search.mode` honesty gate (ft-7h5da.5.7), reject any
+    /// non-default value for these dead keys so a malformed or operator-supplied
+    /// config fails closed instead of being silently ignored. Wiring an actual
+    /// daemon service (UDS bind, auto-spawn, scan loop) is a separate feature;
+    /// until it lands, leave these keys at their defaults. (ft-v46vj)
     pub fn validate(&self) -> Result<(), String> {
-        if self.enabled && self.worker_scan_interval_secs == 0 {
-            return Err(
-                "search.daemon.worker_scan_interval_secs must be >= 1 when daemon is enabled"
-                    .to_string(),
-            );
+        let defaults = Self::default();
+        if self.socket_path != defaults.socket_path {
+            return Err(parsed_but_unconsumed_config_key_message(
+                "search.daemon.socket_path",
+                "no production code path binds or connects this socket — there is no running search daemon",
+            ));
         }
-        if self.enabled && self.worker_batch_size == 0 {
-            return Err(
-                "search.daemon.worker_batch_size must be >= 1 when daemon is enabled".to_string(),
-            );
+        if self.auto_spawn != defaults.auto_spawn {
+            return Err(parsed_but_unconsumed_config_key_message(
+                "search.daemon.auto_spawn",
+                "no client-connect path spawns a search daemon, so toggling auto_spawn has no effect",
+            ));
+        }
+        if self.worker_scan_interval_secs != defaults.worker_scan_interval_secs {
+            return Err(parsed_but_unconsumed_config_key_message(
+                "search.daemon.worker_scan_interval_secs",
+                "no daemon worker loop scans for embedding work; the frankensearch coalescer uses its own batch-wait config",
+            ));
+        }
+        if self.worker_batch_size != defaults.worker_batch_size {
+            return Err(parsed_but_unconsumed_config_key_message(
+                "search.daemon.worker_batch_size",
+                "no daemon worker batches embedding jobs; frankensearch batching uses its own independently-defaulted max/min_batch_size",
+            ));
         }
         Ok(())
     }
@@ -5020,6 +5090,57 @@ impl Config {
             .into());
         }
 
+        // ft-ta5as [reality-check][ingest]: these [ingest] fields are parsed,
+        // defaulted, and documented but have ZERO production consumers (verified):
+        // backpressure_threshold (overflow backpressure uses the hardcoded
+        // OVERFLOW_BACKPRESSURE_THRESHOLD consecutive-event const in tailer.rs,
+        // not this queue-depth value), gap_detection (capture-gap recording in
+        // ingest.rs is UNCONDITIONAL — disabling it would be a fail-open replay-
+        // fidelity regression, so it is intentionally not honorable),
+        // gap_detection_threshold_percent (no overlap/percentage heuristic reads
+        // it), and max_segment_bytes (the persistence ceiling comes from
+        // tuning.ingest.max_persist_segment_bytes, not this field). Fail closed:
+        // reject a customized value so the operator gets a clear error instead of
+        // silently-ignored ingest tuning. Defaults are honored (no rejection).
+        let ingest_default = IngestConfig::default();
+        let mut unhonored_ingest: Vec<&'static str> = Vec::new();
+        if self.ingest.backpressure_threshold != ingest_default.backpressure_threshold {
+            unhonored_ingest.push(
+                "ingest.backpressure_threshold (ignored — overflow backpressure uses a fixed \
+                 consecutive-event threshold in the tailer, not this queue-depth value)",
+            );
+        }
+        if self.ingest.gap_detection != ingest_default.gap_detection {
+            unhonored_ingest.push(
+                "ingest.gap_detection (ignored — capture-gap recording is unconditional; disabling \
+                 it is intentionally not honored to avoid silent replay-fidelity holes)",
+            );
+        }
+        if self.ingest.gap_detection_threshold_percent
+            != ingest_default.gap_detection_threshold_percent
+        {
+            unhonored_ingest.push(
+                "ingest.gap_detection_threshold_percent (ignored — no overlap/percentage heuristic \
+                 consumes it)",
+            );
+        }
+        if self.ingest.max_segment_bytes != ingest_default.max_segment_bytes {
+            unhonored_ingest.push(
+                "ingest.max_segment_bytes (ignored — the persistence segment ceiling comes from \
+                 tuning.ingest.max_persist_segment_bytes)",
+            );
+        }
+        if !unhonored_ingest.is_empty() {
+            return Err(crate::error::ConfigError::ValidationError(format!(
+                "ft-ta5as: the following [ingest] settings are configured but NOT honored by any \
+                 production consumer, so they would silently take no effect; rejecting fail-closed \
+                 to avoid misleading tuning: {}. Revert these to their defaults until they are \
+                 wired to their runtime consumers.",
+                unhonored_ingest.join("; ")
+            ))
+            .into());
+        }
+
         Ok(())
     }
 
@@ -5636,6 +5757,91 @@ models_dir = "/tmp/ft-jl09u-operator-models"
             mode.validation,
             "Config::validate rejects non-default values as parsed but no-effect"
         );
+    }
+
+    #[test]
+    fn search_daemon_default_config_validates() {
+        // The default daemon config must always pass: every dead key sits at
+        // its default, and the only consumed key (`enabled`) is free.
+        SearchDaemonConfig::default()
+            .validate()
+            .expect("default daemon config must validate");
+    }
+
+    #[test]
+    fn search_daemon_enabled_toggle_is_accepted() {
+        // `enabled` is consumed (ipc.rs flips background_job_status), so both
+        // values must validate as long as the dead keys stay at default.
+        for enabled in [false, true] {
+            let cfg = SearchDaemonConfig {
+                enabled,
+                ..SearchDaemonConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "search.daemon.enabled={enabled} must validate when dead keys are default",
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_rejects_non_default_dead_search_daemon_keys() {
+        // ft-v46vj: each parsed-but-unconsumed daemon key must fail closed when
+        // set to a non-default value, naming the offending key.
+        let cases = [
+            (
+                "socket_path = \"/tmp/ft-v46vj.sock\"",
+                "search.daemon.socket_path",
+            ),
+            ("auto_spawn = false", "search.daemon.auto_spawn"),
+            (
+                "worker_scan_interval_secs = 15",
+                "search.daemon.worker_scan_interval_secs",
+            ),
+            ("worker_batch_size = 128", "search.daemon.worker_batch_size"),
+        ];
+        for (line, expected_key) in cases {
+            let toml = format!("[search.daemon]\n{line}\n");
+            let err = Config::from_toml(&toml)
+                .err()
+                .map_or_else(String::new, |err| err.to_string());
+            assert!(
+                err.contains(expected_key),
+                "dead-key diagnostic must name {expected_key}, got: {err}",
+            );
+            assert!(
+                err.contains("parsed but has no effect"),
+                "dead-key diagnostic must explain no-effect config for {expected_key}, got: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn config_key_wiring_inventory_records_search_daemon_keys() {
+        let inventory = config_key_wiring_inventory();
+        let enabled = inventory
+            .iter()
+            .find(|record| record.key == "search.daemon.enabled")
+            .expect("inventory must include search.daemon.enabled");
+        assert_eq!(enabled.status, ConfigKeyWiringStatus::Consumed);
+
+        for key in [
+            "search.daemon.socket_path",
+            "search.daemon.auto_spawn",
+            "search.daemon.worker_scan_interval_secs",
+            "search.daemon.worker_batch_size",
+        ] {
+            let record = inventory
+                .iter()
+                .find(|record| record.key == key)
+                .unwrap_or_else(|| panic!("inventory must include {key}"));
+            assert_eq!(
+                record.status,
+                ConfigKeyWiringStatus::ParsedButUnconsumed,
+                "{key} must be recorded as parsed-but-unconsumed",
+            );
+            assert_eq!(record.tracking_bead, "ft-v46vj");
+        }
     }
 
     #[test]
@@ -6362,6 +6568,57 @@ max_sender_id_len = 0
         let err = config.validate().unwrap_err().to_string();
         assert!(
             err.contains("ft-1t4o4") && err.contains("require_reapproval_on_failure"),
+            "{err}"
+        );
+    }
+
+    // ── ft-ta5as: fail-closed rejection of unhonored [ingest] customizations ──
+
+    #[test]
+    fn validate_rejects_customized_ingest_backpressure_threshold() {
+        let mut config = Config::default();
+        config.ingest.backpressure_threshold = config.ingest.backpressure_threshold.wrapping_add(1);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-ta5as") && err.contains("backpressure_threshold"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_disabled_ingest_gap_detection() {
+        // Disabling gap detection is unhonored (recording is unconditional);
+        // fail closed rather than let the operator believe gaps are off.
+        let mut config = Config::default();
+        config.ingest.gap_detection = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-ta5as") && err.contains("gap_detection"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_customized_ingest_gap_detection_threshold_percent() {
+        let mut config = Config::default();
+        config.ingest.gap_detection_threshold_percent = config
+            .ingest
+            .gap_detection_threshold_percent
+            .wrapping_add(1);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-ta5as") && err.contains("gap_detection_threshold_percent"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_customized_ingest_max_segment_bytes() {
+        let mut config = Config::default();
+        config.ingest.max_segment_bytes = config.ingest.max_segment_bytes.wrapping_add(1);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-ta5as") && err.contains("max_segment_bytes"),
             "{err}"
         );
     }
