@@ -51,7 +51,10 @@
 /// from epoch seconds to epoch milliseconds (schema-wide ms convention).
 /// Per ft-7h5da.2.3: bumped 30 → 31 to stamp best-effort semantic zone type
 /// metadata on new output segments for zone-scoped historical search.
-pub const SCHEMA_VERSION: i32 = 31;
+/// Per ft-wi24o: bumped 31 → 32 to repair the `segment_embeddings.embedded_at`
+/// column DEFAULT (still epoch seconds on DBs upgraded through v22/v23) to the
+/// schema-wide epoch-ms convention; v30 only fixed existing row values.
+pub const SCHEMA_VERSION: i32 = 32;
 
 /// [ft-ih4tm] Idempotent re-creation of the three `output_segments` FTS
 /// triggers. Called when a database is opened with

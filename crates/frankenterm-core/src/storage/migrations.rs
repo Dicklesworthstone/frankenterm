@@ -1374,7 +1374,9 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
                 embedder_id TEXT NOT NULL,
                 dimension INTEGER NOT NULL,
                 vector BLOB NOT NULL,
-                embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                -- epoch MILLISECONDS (ft-ayy9x / ft-wi24o); kept in sync with
+                -- create_segment_embeddings_table and schema_ddl.rs.
+                embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
                 PRIMARY KEY (segment_id, embedder_id)
             );
 
@@ -1629,6 +1631,31 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
             "DROP INDEX IF EXISTS idx_segments_zone_type;
              ALTER TABLE output_segments DROP COLUMN zone_type;",
         ),
+    },
+    Migration {
+        version: 32,
+        description: "Repair segment_embeddings.embedded_at column DEFAULT on \
+                      upgraded DBs (ft-wi24o). Migration v30 normalized existing \
+                      embedded_at VALUES from epoch seconds to ms but left the \
+                      column DEFAULT as the v22/v23 seconds expression \
+                      strftime('%s','now'), so an INSERT omitting embedded_at \
+                      still stored seconds — reintroducing the 1000x unit trap \
+                      v30 closes and diverging from a fresh DB's ms default. The \
+                      real work runs in apply_migration_step \
+                      (ensure_segment_embeddings_embedded_at_default_ms): a \
+                      conditional table rebuild that swaps the seconds default \
+                      for strftime('%s','now')*1000 ONLY when the current default \
+                      is still seconds, preserving rows (already-ms after v30) \
+                      and the embedder index. Idempotent / no-op on fresh and \
+                      already-ms databases.",
+        // Repair is applied by the Rust step in `apply_migration_step` (the
+        // default change requires a table rebuild that cannot be expressed as a
+        // single guarded SQL statement); this string is reference-only and never
+        // executed (apply_raw_up_sql is set false for v32).
+        up_sql: "-- ft-wi24o: see ensure_segment_embeddings_embedded_at_default_ms",
+        // Forward-only: the seconds default was a latent unit bug, not a state
+        // worth restoring.
+        down_sql: None,
     },
 ];
 
@@ -2130,7 +2157,9 @@ fn create_segment_embeddings_table(conn: &Connection) -> Result<()> {
             embedder_id TEXT NOT NULL,
             dimension INTEGER NOT NULL,
             vector BLOB NOT NULL,
-            embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            -- epoch MILLISECONDS (schema-wide convention, ft-ayy9x / ft-wi24o):
+            -- strftime('%s') is seconds, so scale by 1000 to match schema_ddl.
+            embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
             PRIMARY KEY (segment_id, embedder_id)
         );
 
@@ -2294,6 +2323,101 @@ fn ensure_segment_embeddings_schema(conn: &Connection) -> Result<()> {
         })?;
 
     Ok(())
+}
+
+/// ft-wi24o (migration v32): repair `segment_embeddings.embedded_at`'s column
+/// DEFAULT to epoch milliseconds on databases upgraded through v22/v23.
+///
+/// Migration v30 normalized existing row *values* (seconds → ms) but left the
+/// column DEFAULT as the v22/v23 seconds expression `strftime('%s','now')`, so
+/// an INSERT that omits `embedded_at` still stored seconds — reintroducing the
+/// 1000× unit trap v30 closes and diverging from a fresh DB's ms default.
+///
+/// SQLite cannot `ALTER COLUMN ... SET DEFAULT`, so the table is rebuilt when
+/// (and only when) the current default is still the seconds expression. Rows
+/// (already ms after v30) and the embedder index are preserved; the
+/// `INNER JOIN output_segments` drops any FK-orphan rows. No-op on fresh and
+/// already-ms databases, so it is safe to replay on the `run_migrations(0)`
+/// fresh-init path.
+fn ensure_segment_embeddings_embedded_at_default_ms(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "segment_embeddings")? {
+        return Ok(());
+    }
+    if segment_embeddings_embedded_at_default_is_ms(conn)? {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r"
+        DROP TABLE IF EXISTS segment_embeddings_legacy;
+        ALTER TABLE segment_embeddings RENAME TO segment_embeddings_legacy;
+        ",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "v32: failed to stage legacy segment_embeddings for default rebuild: {e}"
+        ))
+    })?;
+
+    create_segment_embeddings_table(conn)?;
+
+    conn.execute(
+        r"
+        INSERT OR REPLACE INTO segment_embeddings
+            (segment_id, embedder_id, dimension, vector, embedded_at)
+        SELECT legacy.segment_id,
+               legacy.embedder_id,
+               legacy.dimension,
+               legacy.vector,
+               legacy.embedded_at
+        FROM segment_embeddings_legacy legacy
+        INNER JOIN output_segments seg ON seg.id = legacy.segment_id
+        WHERE legacy.embedder_id IS NOT NULL
+        ",
+        [],
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "v32: failed to copy segment_embeddings rows during default rebuild: {e}"
+        ))
+    })?;
+
+    conn.execute_batch("DROP TABLE IF EXISTS segment_embeddings_legacy;")
+        .map_err(|e| {
+            StorageError::MigrationFailed(format!(
+                "v32: failed to drop legacy segment_embeddings after default rebuild: {e}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+/// Whether `segment_embeddings.embedded_at` currently defaults to epoch ms
+/// (`strftime('%s','now') * 1000`) rather than the legacy seconds expression.
+/// Reads `PRAGMA table_info`'s `dflt_value` (column index 4); the seconds
+/// default has no `1000` literal, the ms default does.
+fn segment_embeddings_embedded_at_default_is_ms(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(segment_embeddings)")
+        .map_err(|e| StorageError::MigrationFailed(format!("PRAGMA table_info failed: {e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| StorageError::MigrationFailed(format!("table_info query failed: {e}")))?;
+    while let Some(row) = rows.next().map_err(|e| {
+        StorageError::MigrationFailed(format!("table_info row read failed: {e}"))
+    })? {
+        let name: String = row.get(1).map_err(|e| {
+            StorageError::MigrationFailed(format!("table_info name read failed: {e}"))
+        })?;
+        if name == "embedded_at" {
+            let dflt: Option<String> = row.get(4).map_err(|e| {
+                StorageError::MigrationFailed(format!("table_info dflt read failed: {e}"))
+            })?;
+            return Ok(dflt.as_deref().is_some_and(|d| d.contains("1000")));
+        }
+    }
+    // `embedded_at` column absent — treat as not-ms so the caller can rebuild.
+    Ok(false)
 }
 
 /// Steps inside `run_v0_init_in_transaction`, exposed for fault-injection
@@ -2612,6 +2736,10 @@ pub(crate) fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> R
                 }
                 31 => {
                     ensure_output_segments_zone_type(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                32 => {
+                    ensure_segment_embeddings_embedded_at_default_ms(conn)?;
                     apply_raw_up_sql = false;
                 }
                 _ => {}
@@ -3324,6 +3452,107 @@ mod tests {
         conn.execute_batch(m30.up_sql).expect("re-apply v30");
         assert_eq!(read(1), 1_700_000_000_000, "re-run is a no-op for seg 1");
         assert_eq!(read(2), 1_700_000_000_000, "re-run is a no-op for seg 2");
+    }
+
+    #[test]
+    fn segment_embeddings_default_repair_migration_entry_present_at_version_32() {
+        let m32 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 32)
+            .expect("version 32 migration must be registered");
+        assert!(
+            m32.description.contains("embedded_at") && m32.description.contains("DEFAULT"),
+            "description must reference the embedded_at default repair, got: {:?}",
+            m32.description,
+        );
+        assert!(
+            m32.down_sql.is_none(),
+            "v32 is a forward-only default repair",
+        );
+        assert_eq!(SCHEMA_VERSION, 32, "SCHEMA_VERSION must move with v32");
+    }
+
+    /// ft-wi24o: on a DB upgraded through v22/v23 the segment_embeddings
+    /// `embedded_at` DEFAULT is still epoch seconds (v30 only fixed values).
+    /// v32 rebuilds the table to the ms default, preserving rows, and a
+    /// default-omitting insert then stores ms. Idempotent on already-ms tables.
+    #[test]
+    fn segment_embeddings_v32_rebuilds_seconds_default_to_ms() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        // FK target for the rebuild's INNER JOIN.
+        conn.execute_batch(
+            "CREATE TABLE output_segments (id INTEGER PRIMARY KEY);
+             INSERT INTO output_segments (id) VALUES (1);",
+        )
+        .expect("output_segments");
+
+        // Upgraded-DB shape: LEGACY seconds default (what v22/v23 created), with
+        // a value already normalized to ms by v30.
+        conn.execute_batch(
+            "CREATE TABLE segment_embeddings (
+                segment_id INTEGER NOT NULL REFERENCES output_segments(id) ON DELETE CASCADE,
+                embedder_id TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector BLOB NOT NULL,
+                embedded_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (segment_id, embedder_id)
+            );
+            INSERT INTO segment_embeddings
+                (segment_id, embedder_id, dimension, vector, embedded_at)
+                VALUES (1, 'e', 4, X'00', 1700000000000);",
+        )
+        .expect("seed legacy-default segment_embeddings");
+
+        assert!(
+            !segment_embeddings_embedded_at_default_is_ms(&conn).unwrap(),
+            "fixture must start on the legacy seconds default",
+        );
+
+        ensure_segment_embeddings_embedded_at_default_ms(&conn).expect("v32 repair");
+
+        assert!(
+            segment_embeddings_embedded_at_default_is_ms(&conn).unwrap(),
+            "default must be repaired to epoch ms",
+        );
+        let kept: i64 = conn
+            .query_row(
+                "SELECT embedded_at FROM segment_embeddings WHERE segment_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1_700_000_000_000, "existing ms row preserved");
+
+        // A default-omitting insert now stores epoch ms (>= 1e11), not seconds.
+        conn.execute(
+            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector)
+             VALUES (1, 'e2', 4, X'00')",
+            [],
+        )
+        .expect("insert omitting embedded_at");
+        let defaulted: i64 = conn
+            .query_row(
+                "SELECT embedded_at FROM segment_embeddings WHERE embedder_id = 'e2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            defaulted >= 100_000_000_000,
+            "default insert must store epoch ms, got {defaulted}",
+        );
+
+        // Idempotent: re-running on an already-ms table is a no-op.
+        ensure_segment_embeddings_embedded_at_default_ms(&conn).expect("v32 repair re-run");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM segment_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2, "re-run must not lose or duplicate rows");
+        assert!(segment_embeddings_embedded_at_default_is_ms(&conn).unwrap());
     }
 
     #[test]
