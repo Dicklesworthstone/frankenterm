@@ -15682,7 +15682,7 @@ mod tests {
         action: ActionKind,
         pane: Option<u64>,
     ) -> bool {
-        let engine = killswitch_engine(level);
+        let mut engine = killswitch_engine(level);
         let mut input = PolicyInput::new(action, ActorKind::Robot);
         if let Some(p) = pane {
             input = input.with_pane(p);
@@ -15718,7 +15718,7 @@ mod tests {
             ActionKind::ConnectorNotify,
             ActionKind::ExecCommand,
         ] {
-            let engine = killswitch_engine(SoftStop);
+            let mut engine = killswitch_engine(SoftStop);
             let input = PolicyInput::new(action, ActorKind::Robot);
             let decision = engine.authorize(&input);
             assert_ne!(
@@ -15755,7 +15755,7 @@ mod tests {
         // HardStop blocks new actions but reads stay open so an operator can
         // watch the system drain; only EmergencyHalt blocks reads too.
         for action in [ActionKind::ReadOutput, ActionKind::SearchOutput] {
-            let engine = killswitch_engine(HardStop);
+            let mut engine = killswitch_engine(HardStop);
             let input = PolicyInput::new(action, ActorKind::Robot);
             let decision = engine.authorize(&input);
             assert!(
@@ -15780,7 +15780,7 @@ mod tests {
             ActionKind::ExecCommand,
             ActionKind::ReadOutput,
         ] {
-            let engine = killswitch_engine(Disarmed);
+            let mut engine = killswitch_engine(Disarmed);
             let input = PolicyInput::new(action, ActorKind::Robot);
             let decision = engine.authorize(&input);
             assert_ne!(decision.rule_id(), Some("policy.kill_switch"));
