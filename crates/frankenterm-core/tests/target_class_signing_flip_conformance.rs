@@ -290,7 +290,12 @@ fn unproven_inputs_all_fall_back_to_developer_laptop() {
         "hardware_predicate": { "proof_status": "skipped_not_proven" }
     });
 
-    for summary in [None, Some(broken_ready), Some(broken_predicate), Some(skipped)] {
+    for summary in [
+        None,
+        Some(broken_ready),
+        Some(broken_predicate),
+        Some(skipped),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         write_pointer_and_summary(dir.path(), summary.as_ref());
         let class = operating_envelope_target_class_from_artifact(dir.path());
