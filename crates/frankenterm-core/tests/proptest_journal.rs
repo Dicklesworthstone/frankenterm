@@ -146,6 +146,77 @@ fn arb_journal_entry() -> impl Strategy<Value = MissionJournalEntry> {
         )
 }
 
+fn recovery_marker_kind(label: impl Into<String>) -> MissionJournalEntryKind {
+    MissionJournalEntryKind::RecoveryMarker {
+        recovered_through_seq: 0,
+        recovery_reason: label.into(),
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    match u64::try_from(value) {
+        Ok(converted) => converted,
+        Err(_) => u64::MAX,
+    }
+}
+
+fn timestamp_for_index(index: usize) -> i64 {
+    match i64::try_from(index) {
+        Ok(converted) => converted.saturating_add(1).saturating_mul(1000),
+        Err(_) => i64::MAX,
+    }
+}
+
+fn build_recovery_journal(
+    mission_suffix: &str,
+    total: usize,
+) -> Result<MissionJournal, TestCaseError> {
+    let mut journal = MissionJournal::new(MissionId(format!("m-prop-compact-{mission_suffix}")));
+    for i in 0..total {
+        journal
+            .append(
+                recovery_marker_kind(format!("marker-{i}")),
+                format!("cid-{i}"),
+                "op",
+                "test",
+                None,
+                timestamp_for_index(i),
+            )
+            .map_err(|err| TestCaseError::fail(err.to_string()))?;
+    }
+    Ok(journal)
+}
+
+fn journal_entry_correlation_ids(journal: &MissionJournal) -> Vec<String> {
+    journal
+        .entries()
+        .iter()
+        .map(|entry| entry.correlation_id.clone())
+        .collect()
+}
+
+fn journal_entry_canonical_strings(journal: &MissionJournal) -> Vec<String> {
+    journal
+        .entries()
+        .iter()
+        .map(MissionJournalEntry::canonical_string)
+        .collect()
+}
+
+fn assert_all_compacted_correlation_ids_remain_known(
+    journal: &MissionJournal,
+    total: usize,
+) -> Result<(), TestCaseError> {
+    for i in 0..total {
+        let cid = format!("cid-{i}");
+        prop_assert!(
+            journal.has_correlation(&cid),
+            "{cid} should remain a known idempotency key after compaction"
+        );
+    }
+    Ok(())
+}
+
 // ── Properties ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -528,6 +599,96 @@ proptest! {
             duplicate,
             Err(MissionJournalError::DuplicateCorrelation(cid)) if cid == "c-0"
         ));
+    }
+
+    #[test]
+    fn compact_preserves_retained_entry_correlation_ids(
+        total in 3usize..18,
+        compact_at in 1usize..18,
+    ) {
+        prop_assume!(compact_at <= total);
+        let compact_seq = usize_to_u64(compact_at);
+        let mut journal = build_recovery_journal("preserve-cid", total)?;
+        let expected_correlation_ids = journal
+            .entries()
+            .iter()
+            .filter(|entry| entry.seq >= compact_seq)
+            .map(|entry| entry.correlation_id.clone())
+            .collect::<Vec<_>>();
+
+        journal.compact_before(compact_seq);
+
+        prop_assert_eq!(
+            journal_entry_correlation_ids(&journal),
+            expected_correlation_ids,
+            "compaction must not rewrite retained entry correlation_id values"
+        );
+        assert_all_compacted_correlation_ids_remain_known(&journal, total)?;
+    }
+
+    #[test]
+    fn compact_before_is_idempotent(
+        total in 3usize..18,
+        compact_at in 1usize..18,
+    ) {
+        prop_assume!(compact_at <= total);
+        let compact_seq = usize_to_u64(compact_at);
+        let mut once = build_recovery_journal("idem", total)?;
+        let mut twice = build_recovery_journal("idem", total)?;
+
+        once.compact_before(compact_seq);
+        twice.compact_before(compact_seq);
+        twice.compact_before(compact_seq);
+
+        prop_assert_eq!(
+            journal_entry_canonical_strings(&twice),
+            journal_entry_canonical_strings(&once),
+            "repeating compact_before({compact_seq}) must not change retained entries"
+        );
+        prop_assert_eq!(
+            twice.snapshot_state(),
+            once.snapshot_state(),
+            "repeating compact_before({compact_seq}) must not change journal state"
+        );
+        assert_all_compacted_correlation_ids_remain_known(&twice, total)?;
+    }
+
+    #[test]
+    fn compact_before_threshold_order_is_independent(
+        total in 4usize..20,
+        first_compact_at in 1usize..20,
+        second_compact_at in 1usize..20,
+    ) {
+        prop_assume!(first_compact_at <= total);
+        prop_assume!(second_compact_at <= total);
+        let first_seq = usize_to_u64(first_compact_at);
+        let second_seq = usize_to_u64(second_compact_at);
+        let max_seq = first_seq.max(second_seq);
+        let mut left = build_recovery_journal("order", total)?;
+        let mut right = build_recovery_journal("order", total)?;
+        let mut direct = build_recovery_journal("order", total)?;
+
+        left.compact_before(first_seq);
+        left.compact_before(second_seq);
+        right.compact_before(second_seq);
+        right.compact_before(first_seq);
+        direct.compact_before(max_seq);
+
+        let expected_entries = journal_entry_canonical_strings(&direct);
+        prop_assert_eq!(
+            journal_entry_canonical_strings(&left),
+            expected_entries,
+            "compact_before({first_seq}) then compact_before({second_seq}) must equal compact_before({max_seq})"
+        );
+        prop_assert_eq!(
+            journal_entry_canonical_strings(&right),
+            expected_entries,
+            "compact_before({second_seq}) then compact_before({first_seq}) must equal compact_before({max_seq})"
+        );
+        prop_assert_eq!(left.snapshot_state(), direct.snapshot_state());
+        prop_assert_eq!(right.snapshot_state(), direct.snapshot_state());
+        assert_all_compacted_correlation_ids_remain_known(&left, total)?;
+        assert_all_compacted_correlation_ids_remain_known(&right, total)?;
     }
 
     #[test]
