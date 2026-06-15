@@ -2,7 +2,15 @@
 //!
 //! Provides a minimal `ft web` HTTP server with /health and read-only
 //! data endpoints (/panes, /events, /search, /bookmarks, /ruleset-profile, /saved-searches)
-//! backed by shared query helpers, plus SSE subscriptions for live event/delta streams.
+//! backed by shared query helpers.
+//!
+//! SSE streams: `/stream/deltas` serves output deltas + gaps from periodic DB
+//! scans, so it works for a standalone `ft web`. `/stream/events` is an EventBus
+//! SSE that carries live events only when an in-process producer publishes to the
+//! shared bus; a standalone `ft web` runs no capture/watch pipeline (and an
+//! in-memory `EventBus` cannot span processes), so its `/stream/events` emits the
+//! `ready` frame then keepalives. Wiring a producer (an in-process capture
+//! pipeline or a storage-tail → `EventBus` bridge) is tracked under ft-zeo5o.
 
 use crate::Result;
 use crate::events::EventBus;
