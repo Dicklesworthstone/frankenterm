@@ -208,6 +208,31 @@ impl ActionKind {
         )
     }
 
+    /// Returns true if this action launches a *new* workflow — either the
+    /// internal workflow engine (`WorkflowRun`) or an external workflow via a
+    /// connector (`ConnectorTriggerWorkflow`).
+    ///
+    /// This is the action class paused by the kill switch `SoftStop` tier
+    /// ("pause new workflow launches, allow in-flight to complete"). See the
+    /// graduated kill-switch gate in [`PolicyEngine::evaluate_authorization`]
+    /// (ft-l59nq).
+    #[must_use]
+    pub const fn is_workflow_launch(&self) -> bool {
+        matches!(self, Self::WorkflowRun | Self::ConnectorTriggerWorkflow)
+    }
+
+    /// Returns true if this action only observes pane/output state without
+    /// initiating new work or mutating anything.
+    ///
+    /// Read-only actions remain permitted under the kill switch `HardStop`
+    /// tier (which otherwise blocks every new action) so an operator can keep
+    /// watching the system drain; only `EmergencyHalt` blocks reads too
+    /// (ft-l59nq).
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOutput | Self::SearchOutput | Self::Activate)
+    }
+
     /// Returns a stable string identifier for this action kind
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
@@ -6509,6 +6534,54 @@ impl PolicyEngine {
                 "policy.kill_switch",
             )
             .with_context(context);
+        }
+
+        // ---- Graduated kill-switch tiers (global, pane-independent) ----
+        // EmergencyHalt is handled above. The intermediate tiers must also be
+        // enforced HERE, independent of pane_id. Previously they were only
+        // reachable via the pane-scoped `is_blocked_for_writes` path below,
+        // which is gated on `pane_id.is_some() && action.is_mutating()` —
+        // silently letting WorkflowRun / connector / file / exec actions (none
+        // of which are `is_mutating`) sail through under SoftStop/HardStop, and
+        // missing pane-less actions entirely. The graduated stop collapsed to
+        // EmergencyHalt-or-nothing (ft-l59nq).
+        //
+        // HardStop is checked first because it is the stricter superset: it
+        // blocks every new non-read action, so a workflow launch at HardStop is
+        // caught here. At SoftStop (`allows_inflight()` is still true) only new
+        // workflow launches are paused, letting in-flight work drain.
+        {
+            let kill_switch = self.quarantine_registry.kill_switch();
+            if !kill_switch.allows_inflight() && !input.action.is_read_only() {
+                let level = kill_switch.level;
+                context.record_rule(
+                    "policy.kill_switch",
+                    true,
+                    Some("deny"),
+                    Some(format!("kill switch {level} — new actions blocked")),
+                );
+                context.set_determining_rule("policy.kill_switch");
+                return PolicyDecision::deny_with_rule(
+                    format!("System kill switch ({level}) blocks all new actions"),
+                    "policy.kill_switch",
+                )
+                .with_context(context);
+            }
+            if !kill_switch.allows_new_workflows() && input.action.is_workflow_launch() {
+                let level = kill_switch.level;
+                context.record_rule(
+                    "policy.kill_switch",
+                    true,
+                    Some("deny"),
+                    Some(format!("kill switch {level} — new workflow launches paused")),
+                );
+                context.set_determining_rule("policy.kill_switch");
+                return PolicyDecision::deny_with_rule(
+                    format!("System kill switch ({level}) pauses new workflow launches"),
+                    "policy.kill_switch",
+                )
+                .with_context(context);
+            }
         }
 
         // If the target pane is quarantined, check blocking semantics.
@@ -15564,6 +15637,154 @@ mod tests {
                 .kill_switch()
                 .allows_new_workflows()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ft-l59nq: graduated kill-switch tier enforcement (global, pane-
+    // independent). Regression guard for the SoftStop/HardStop fail-open
+    // where only EmergencyHalt was enforced and the intermediate tiers
+    // were reachable only via the pane-scoped `is_mutating` path — so
+    // WorkflowRun / connector / file / exec and ALL pane-less actions
+    // slipped through SoftStop/HardStop.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn action_kind_workflow_launch_and_read_only_classification() {
+        // Pure-predicate proof of the action classes the kill-switch tiers
+        // key on. Robust regardless of engine wiring.
+        assert!(ActionKind::WorkflowRun.is_workflow_launch());
+        assert!(ActionKind::ConnectorTriggerWorkflow.is_workflow_launch());
+        assert!(!ActionKind::ConnectorNotify.is_workflow_launch());
+        assert!(!ActionKind::SendText.is_workflow_launch());
+        assert!(!ActionKind::ReadOutput.is_workflow_launch());
+
+        assert!(ActionKind::ReadOutput.is_read_only());
+        assert!(ActionKind::SearchOutput.is_read_only());
+        assert!(ActionKind::Activate.is_read_only());
+        assert!(!ActionKind::WorkflowRun.is_read_only());
+        assert!(!ActionKind::ExecCommand.is_read_only());
+        assert!(!ActionKind::WriteFile.is_read_only());
+        assert!(!ActionKind::SendText.is_read_only());
+        assert!(!ActionKind::ConnectorInvoke.is_read_only());
+    }
+
+    fn killswitch_engine(level: crate::policy_quarantine::KillSwitchLevel) -> PolicyEngine {
+        let mut engine = PolicyEngine::permissive();
+        engine
+            .quarantine_registry_mut()
+            .trip_kill_switch(level, "operator", "drill", 1000);
+        engine
+    }
+
+    /// True iff the kill-switch gate (not some other rule) denied the action.
+    fn killswitch_blocked(
+        level: crate::policy_quarantine::KillSwitchLevel,
+        action: ActionKind,
+        pane: Option<u64>,
+    ) -> bool {
+        let engine = killswitch_engine(level);
+        let mut input = PolicyInput::new(action, ActorKind::Robot);
+        if let Some(p) = pane {
+            input = input.with_pane(p);
+        }
+        let decision = engine.authorize(&input);
+        decision.is_denied() && decision.rule_id() == Some("policy.kill_switch")
+    }
+
+    #[test]
+    fn killswitch_softstop_pauses_workflow_launches_even_without_pane() {
+        use crate::policy_quarantine::KillSwitchLevel::SoftStop;
+        // The core ft-l59nq repro: a pane-less WorkflowRun used to slip
+        // through SoftStop entirely (is_blocked_for_writes was only reached
+        // for pane-ful is_mutating actions, and WorkflowRun is neither).
+        assert!(killswitch_blocked(SoftStop, ActionKind::WorkflowRun, None));
+        assert!(killswitch_blocked(SoftStop, ActionKind::WorkflowRun, Some(1)));
+        assert!(killswitch_blocked(
+            SoftStop,
+            ActionKind::ConnectorTriggerWorkflow,
+            None
+        ));
+    }
+
+    #[test]
+    fn killswitch_softstop_allows_non_workflow_and_reads() {
+        use crate::policy_quarantine::KillSwitchLevel::SoftStop;
+        // SoftStop pauses ONLY new workflow launches; observational and
+        // in-flight-supporting actions must not be kill-switch-blocked so
+        // in-flight work can drain.
+        for action in [
+            ActionKind::ReadOutput,
+            ActionKind::SearchOutput,
+            ActionKind::ConnectorNotify,
+            ActionKind::ExecCommand,
+        ] {
+            let engine = killswitch_engine(SoftStop);
+            let input = PolicyInput::new(action, ActorKind::Robot);
+            let decision = engine.authorize(&input);
+            assert_ne!(
+                decision.rule_id(),
+                Some("policy.kill_switch"),
+                "SoftStop must not kill-switch-block {action:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn killswitch_hardstop_blocks_all_new_non_read_actions_even_without_pane() {
+        use crate::policy_quarantine::KillSwitchLevel::HardStop;
+        for action in [
+            ActionKind::WorkflowRun,
+            ActionKind::ConnectorInvoke,
+            ActionKind::ConnectorTriggerWorkflow,
+            ActionKind::ExecCommand,
+            ActionKind::WriteFile,
+            ActionKind::DeleteFile,
+            ActionKind::Spawn,
+            ActionKind::SendText,
+        ] {
+            assert!(
+                killswitch_blocked(HardStop, action, None),
+                "HardStop must block pane-less {action:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn killswitch_hardstop_still_allows_reads() {
+        use crate::policy_quarantine::KillSwitchLevel::HardStop;
+        // HardStop blocks new actions but reads stay open so an operator can
+        // watch the system drain; only EmergencyHalt blocks reads too.
+        for action in [ActionKind::ReadOutput, ActionKind::SearchOutput] {
+            let engine = killswitch_engine(HardStop);
+            let input = PolicyInput::new(action, ActorKind::Robot);
+            let decision = engine.authorize(&input);
+            assert!(
+                decision.is_allowed(),
+                "HardStop must still allow read-only {action:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn killswitch_emergency_halt_blocks_even_reads() {
+        use crate::policy_quarantine::KillSwitchLevel::EmergencyHalt;
+        assert!(killswitch_blocked(EmergencyHalt, ActionKind::ReadOutput, None));
+        assert!(killswitch_blocked(EmergencyHalt, ActionKind::WorkflowRun, None));
+    }
+
+    #[test]
+    fn killswitch_disarmed_does_not_block() {
+        use crate::policy_quarantine::KillSwitchLevel::Disarmed;
+        for action in [
+            ActionKind::WorkflowRun,
+            ActionKind::ExecCommand,
+            ActionKind::ReadOutput,
+        ] {
+            let engine = killswitch_engine(Disarmed);
+            let input = PolicyInput::new(action, ActorKind::Robot);
+            let decision = engine.authorize(&input);
+            assert_ne!(decision.rule_id(), Some("policy.kill_switch"));
+        }
     }
 
     #[test]
