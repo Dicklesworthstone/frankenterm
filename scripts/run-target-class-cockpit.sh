@@ -5,6 +5,26 @@
 # If the selected SKU predicate is absent, it writes a retained
 # skipped_not_proven summary and exits successfully only when
 # FT_TARGET_CLASS_ALLOW_SKIP=1.
+#
+# Modes (W9.4b):
+#   dry-run (default on the dev host): FT_TARGET_CLASS_ALLOW_SKIP=1. Exercises
+#     host detection, the predicate preflight, and the artifact shape; retains
+#     skipped_not_proven and exits 0. Safe to run anywhere; produces no proof.
+#   preflight-only: FT_TARGET_CLASS_PREFLIGHT_ONLY=1. Prints the predicate
+#     report, writes a skipped artifact, and exits 0 only when the host is
+#     target-class eligible (non-zero otherwise). Use to confirm a rented box
+#     BEFORE paying for the full run.
+#   run (rented target-class box): FT_TARGET_CLASS_ALLOW_SKIP=0. Fails fast with
+#     a clear message if the host misses the SKU floor; on a conforming host it
+#     runs the cockpit conformance suite and emits a NON-skipped, signable
+#     summary.json (ready_to_sign=true on pass).
+#
+# Operator command for the rented 64-CPU/256-GiB box (see
+# docs/perf/target-class-hardware.md):
+#   FT_TARGET_CLASS_SKU=linux-x86_64-high-core FT_TARGET_CLASS_PREFLIGHT_ONLY=1 \
+#     scripts/run-target-class-cockpit.sh   # confirm eligibility, then:
+#   FT_TARGET_CLASS_SKU=linux-x86_64-high-core FT_TARGET_CLASS_ALLOW_SKIP=0 \
+#     scripts/run-target-class-cockpit.sh   # run + emit the signable artifact
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -256,6 +276,7 @@ write_summary() {
       run_id: $run_id,
       status: $status,
       exit_code: $exit_code,
+      ready_to_sign: ($status == "passed" and $proof_status == "proven_predicate_met"),
       artifact_dir: $artifact_dir,
       sku: {
         id: $sku_id,
@@ -341,12 +362,57 @@ write_summary() {
 
 record_command "scripts/run-target-class-cockpit.sh FT_TARGET_CLASS_SKU=${SKU_ID}"
 
+# Human-readable preflight: observed vs required predicate and per-check verdict.
+# Printed to stderr so the machine-readable `summary=` line on stdout stays clean.
+print_preflight_report() {
+  {
+    printf '== target-class preflight: SKU=%s ==\n' "${SKU_ID}"
+    printf '  observed: %s/%s, %s logical CPU, %s GiB RAM, %s GiB free, kernel %s\n' \
+      "${OS_FAMILY}" "${ARCH}" "${OBSERVED_LOGICAL_CPUS}" "${OBSERVED_MEMORY_GIB}" \
+      "${OBSERVED_DISK_FREE_GIB}" "${KERNEL_RELEASE}"
+    printf '  required: %s/%s, >=%s logical CPU, >=%s GiB RAM, >=%s GiB free, kernel >=%s\n' \
+      "${REQUIRED_OS_FAMILY}" "${REQUIRED_ARCH}" "${REQUIRED_LOGICAL_CPUS}" \
+      "${REQUIRED_MEMORY_GIB}" "${REQUIRED_DISK_FREE_GIB}" "${REQUIRED_KERNEL_MAJOR}"
+    printf '  checks: os_family=%s arch=%s cpu=%s memory=%s disk=%s kernel=%s os_version=%s\n' \
+      "${OS_FAMILY_OK}" "${ARCH_OK}" "${CPU_OK}" "${MEMORY_OK}" "${DISK_OK}" \
+      "${KERNEL_OK}" "${OS_VERSION_OK}"
+    if [[ "${HIGH_SCALE_PREDICATE_MET}" == "true" ]]; then
+      printf '  verdict: CONFORMING — eligible to emit a signable target-class artifact\n'
+    elif [[ "${TARGET_SKU_MATCHED}" == "true" ]]; then
+      printf '  verdict: SKU matched but not a high-scale SKU — no target-class claim\n'
+    else
+      printf '  verdict: NOT CONFORMING — would retain skipped_not_proven (NOT target-class proof)\n'
+    fi
+  } >&2
+}
+
+print_preflight_report
+
+# Preflight-only gate: let the operator confirm a rented box BEFORE the long run.
+# Writes a complete (skipped) artifact, then exits 0 when eligible, non-zero when not.
+if [[ "${FT_TARGET_CLASS_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  write_summary "skipped_not_proven" "not_run_preflight_only" "" 0
+  printf 'summary=%s\n' "${SUMMARY_FILE}"
+  if [[ "${HIGH_SCALE_PREDICATE_MET}" == "true" ]]; then
+    printf 'preflight: host is target-class eligible; rerun without FT_TARGET_CLASS_PREFLIGHT_ONLY to run the suite and emit the signable artifact\n' >&2
+    exit 0
+  fi
+  printf 'preflight: host is NOT target-class eligible; see checks above\n' >&2
+  exit 3
+fi
+
 if [[ "${TARGET_SKU_MATCHED}" != "true" ]]; then
   write_summary "skipped_not_proven" "not_run_predicate_absent" "" 0
   printf 'summary=%s\n' "${SUMMARY_FILE}"
   if [[ "${ALLOW_SKIP}" == "1" ]]; then
+    printf 'dry-run: predicate absent on this host; retained skipped_not_proven (NOT target-class proof).\n' >&2
+    printf 'dry-run: to produce a signable artifact, run on a conforming %s host (>=%s logical CPU, >=%s GiB RAM) with FT_TARGET_CLASS_ALLOW_SKIP=0.\n' \
+      "${REQUIRED_OS_FAMILY}" "${REQUIRED_LOGICAL_CPUS}" "${REQUIRED_MEMORY_GIB}" >&2
     exit 0
   fi
+  printf 'error: target-class predicate not met and FT_TARGET_CLASS_ALLOW_SKIP=0 — refusing to emit a non-proven artifact.\n' >&2
+  printf 'error: this host does not meet the %s SKU floor (>=%s logical CPU, >=%s GiB RAM, >=%s GiB free); see preflight checks above.\n' \
+    "${SKU_ID}" "${REQUIRED_LOGICAL_CPUS}" "${REQUIRED_MEMORY_GIB}" "${REQUIRED_DISK_FREE_GIB}" >&2
   exit 3
 fi
 

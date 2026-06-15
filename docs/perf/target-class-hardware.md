@@ -19,18 +19,40 @@ Target-class resource cockpit artifacts live at:
 tests/e2e/artifacts/target-class/<sku>/<run_id>/summary.json
 ```
 
-The gate harness is:
+The gate harness is `scripts/run-target-class-cockpit.sh`. It runs in three
+modes (W9.4b):
 
 ```bash
+# 1. Dry-run (default; safe on any host, e.g. the dev workstation). Exercises
+#    host detection, the predicate preflight, and the artifact shape; retains
+#    skipped_not_proven and exits 0. Produces no proof.
 FT_TARGET_CLASS_SKU=linux-x86_64-high-core scripts/run-target-class-cockpit.sh
-FT_TARGET_CLASS_SKU=macos-apple-silicon-dev scripts/run-target-class-cockpit.sh
+
+# 2. Preflight-only. Confirms a rented box meets the SKU floor BEFORE the long
+#    paid run. Exits 0 only when the host is target-class eligible.
+FT_TARGET_CLASS_SKU=linux-x86_64-high-core FT_TARGET_CLASS_PREFLIGHT_ONLY=1 \
+  scripts/run-target-class-cockpit.sh
+
+# 3. Run on the rented 64-CPU/256-GiB box. Fails fast with a clear message if
+#    the host misses the floor; on a conforming host it runs the cockpit
+#    conformance lane and emits a NON-skipped, signable summary.json.
+FT_TARGET_CLASS_SKU=linux-x86_64-high-core FT_TARGET_CLASS_ALLOW_SKIP=0 \
+  scripts/run-target-class-cockpit.sh
 ```
 
-The wrapper records host facts first. If the selected SKU predicate is absent,
-it writes a `skipped_not_proven` summary and does not run the reduced
-conformance suite. If the predicate is present, it drives the existing
-RCH-backed cockpit conformance lane in
+The wrapper records host facts first and always prints a human-readable
+predicate preflight (observed vs required, per-check pass/fail, conforming
+verdict). If the selected SKU predicate is absent it writes a
+`skipped_not_proven` summary; with `FT_TARGET_CLASS_ALLOW_SKIP=0` it instead
+fails fast and refuses to emit a non-proven artifact. If the predicate is
+present it drives the existing RCH-backed cockpit conformance lane in
 `tests/e2e/test_ft_rz0eb_4_resource_cockpit_conformance.sh`.
+
+On a conforming run the emitted `summary.json` carries `ready_to_sign: true`
+(set only when `status == "passed"` and
+`hardware_predicate.proof_status == "proven_predicate_met"`), so the signing
+step is push-button. A skipped or failed artifact always reports
+`ready_to_sign: false`.
 
 ## Major SKUs
 
