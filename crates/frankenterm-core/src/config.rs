@@ -710,8 +710,7 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
         key: "search.models_dir",
         status: ConfigKeyWiringStatus::Consumed,
         consumer: "crate::search::daemon::worker::EmbedWorker::with_search_config",
-        evidence:
-            "search_config_models_dir_reaches_fastembed_loader_config_ft_jl09u covers FastEmbed cache_dir propagation",
+        evidence: "search_config_models_dir_reaches_fastembed_loader_config_ft_jl09u covers FastEmbed cache_dir propagation",
         tracking_bead: "ft-7h5da.5.7",
         validation: "accepted by Config::validate, including non-default operator paths",
     },
@@ -719,8 +718,7 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
         key: "search.mode",
         status: ConfigKeyWiringStatus::ParsedButUnconsumed,
         consumer: "none",
-        evidence:
-            "source audit found no production reads of config.search.mode; dispatch reads concrete search tuning fields directly",
+        evidence: "source audit found no production reads of config.search.mode; dispatch reads concrete search tuning fields directly",
         tracking_bead: "ft-7h5da.5.7",
         validation: "Config::validate rejects non-default values as parsed but no-effect",
     },
@@ -4957,6 +4955,71 @@ impl Config {
             }
         }
 
+        // ft-1t4o4 [reality-check][safety]: these [safety.*] blocks are parsed
+        // but have ZERO behavior-affecting production consumers (verified: the
+        // runtime uses a fixed Redactor catalog, runtime PaneCapabilities, the
+        // storage PaneReservationConfig, and no SemanticShockResponder; and
+        // approval.require_reapproval_on_failure is read nowhere). Silently
+        // accepting a CUSTOMIZED value gives operators a false sense of safety —
+        // e.g. custom redaction patterns are dropped, which can leak secrets.
+        // Fail closed: reject a config that customizes one of these until it is
+        // wired to its runtime consumer, so the operator gets a clear error
+        // instead of a silent no-op. Default values are honored (no rejection)
+        // so existing default deployments are unaffected. Compared via
+        // serialization to avoid depending on PartialEq for every config type.
+        let mut unhonored_safety: Vec<&'static str> = Vec::new();
+        if serde_json::to_value(&self.safety.redaction).ok()
+            != serde_json::to_value(RedactionConfig::default()).ok()
+        {
+            unhonored_safety.push(
+                "safety.redaction (custom patterns/placeholder/enabled/redact_audit/redact_segments \
+                 are dropped — the runtime Redactor uses a fixed built-in catalog)",
+            );
+        }
+        if serde_json::to_value(&self.safety.capabilities).ok()
+            != serde_json::to_value(CapabilityConfig::default()).ok()
+        {
+            unhonored_safety.push(
+                "safety.capabilities (allow_control_chars/allow_non_agent_panes/allow_arbitrary_text/\
+                 confirm_dangerous_patterns are ignored — gating uses runtime PaneCapabilities)",
+            );
+        }
+        if serde_json::to_value(&self.safety.reservations).ok()
+            != serde_json::to_value(ReservationConfig::default()).ok()
+        {
+            unhonored_safety.push(
+                "safety.reservations (default_ttl_secs/max_ttl_secs/conflict_behavior/\
+                 auto_release_on_complete are ignored — TTL clamping uses the storage \
+                 PaneReservationConfig)",
+            );
+        }
+        if serde_json::to_value(&self.safety.semantic_shock).ok()
+            != serde_json::to_value(SemanticShockSafetyConfig::default()).ok()
+        {
+            unhonored_safety.push(
+                "safety.semantic_shock (no runtime SemanticShockResponder is wired — anomalies are \
+                 never surfaced or paused)",
+            );
+        }
+        if self.safety.approval.require_reapproval_on_failure
+            != ApprovalConfig::default().require_reapproval_on_failure
+        {
+            unhonored_safety.push(
+                "safety.approval.require_reapproval_on_failure (read nowhere — no effect on the \
+                 approval path)",
+            );
+        }
+        if !unhonored_safety.is_empty() {
+            return Err(crate::error::ConfigError::ValidationError(format!(
+                "ft-1t4o4: the following [safety.*] settings are configured but NOT honored by any \
+                 production consumer, so they would silently take no effect; rejecting fail-closed \
+                 to avoid a false sense of safety: {}. Revert these to their defaults until they \
+                 are wired to their runtime consumers.",
+                unhonored_safety.join("; ")
+            ))
+            .into());
+        }
+
         Ok(())
     }
 
@@ -6228,6 +6291,79 @@ max_sender_id_len = 0
                 "Invalid regex pattern: {pattern}"
             );
         }
+    }
+
+    // ── ft-1t4o4: fail-closed rejection of unhonored [safety.*] customizations ──
+
+    #[test]
+    fn validate_accepts_default_safety_blocks() {
+        // Defaults must NOT be rejected — existing default deployments unaffected.
+        assert!(
+            Config::default().validate().is_ok(),
+            "default config must validate cleanly"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_customized_safety_redaction_patterns() {
+        let mut config = Config::default();
+        config
+            .safety
+            .redaction
+            .patterns
+            .push("custom-secret-[0-9]+".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ft-1t4o4"), "{err}");
+        assert!(err.contains("safety.redaction"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_disabled_safety_redaction() {
+        // Disabling redaction is unhonored (it always runs); fail closed rather
+        // than let the operator believe redaction is off when it is not.
+        let mut config = Config::default();
+        config.safety.redaction.enabled = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-1t4o4") && err.contains("safety.redaction"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_customized_safety_capabilities() {
+        let mut config = Config::default();
+        config.safety.capabilities.allow_arbitrary_text =
+            !config.safety.capabilities.allow_arbitrary_text;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-1t4o4") && err.contains("safety.capabilities"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_customized_safety_reservations() {
+        let mut config = Config::default();
+        config.safety.reservations.default_ttl_secs =
+            config.safety.reservations.default_ttl_secs.wrapping_add(1);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-1t4o4") && err.contains("safety.reservations"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_require_reapproval_on_failure_override() {
+        let mut config = Config::default();
+        config.safety.approval.require_reapproval_on_failure =
+            !config.safety.approval.require_reapproval_on_failure;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ft-1t4o4") && err.contains("require_reapproval_on_failure"),
+            "{err}"
+        );
     }
 
     #[test]
