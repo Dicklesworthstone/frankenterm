@@ -5161,6 +5161,15 @@ enum RobotContextCommands {
         #[arg(long, default_value = "50")]
         limit: usize,
     },
+    /// Report current context token consumption for a pane (updates pressure tracking)
+    Report {
+        /// Pane ID
+        pane_id: u64,
+
+        /// Current tokens consumed in the active context window
+        #[arg(long)]
+        tokens_consumed: u64,
+    },
 }
 
 /// Native work-queue robot subcommands, graduated from ft-3681t.4.1.
@@ -17907,6 +17916,25 @@ fn robot_context_utilization(tokens_consumed: i64, token_budget: i64) -> f64 {
     ((tokens_consumed.max(0) as f64) / (token_budget as f64)).min(1.0)
 }
 
+/// Classify context-window pressure from utilization (ft-mhq10).
+///
+/// `pressure_tier` is *derived* from real utilization here rather than read
+/// from a stored column that the rotate seed hardcoded to `green`. Combined
+/// with the `report` writer (which records real `tokens_consumed`), this makes
+/// the surfaced tier track actual usage instead of being permanently green.
+fn robot_context_pressure_tier(utilization: f64) -> &'static str {
+    // Half-open bands: green < 0.6 <= yellow < 0.8 <= red < 0.95 <= black.
+    if utilization >= 0.95 {
+        "black"
+    } else if utilization >= 0.8 {
+        "red"
+    } else if utilization >= 0.6 {
+        "yellow"
+    } else {
+        "green"
+    }
+}
+
 fn robot_context_status_for_pane(
     conn: &rusqlite::Connection,
     pane_id: u64,
@@ -17931,28 +17959,28 @@ fn robot_context_status_for_pane(
         )
         .optional()?;
 
-    let (active_context_id, token_budget, tokens_consumed, pressure_tier, active_depth) = active
-        .map_or_else(
-            || {
-                (
-                    String::new(),
-                    ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET,
-                    0,
-                    "green".to_string(),
-                    depth,
-                )
-            },
-            |row| {
-                (
-                    row.context_id,
-                    row.token_budget,
-                    row.tokens_consumed,
-                    row.pressure_tier,
-                    row.depth,
-                )
-            },
-        );
+    let (active_context_id, token_budget, tokens_consumed, active_depth) = active.map_or_else(
+        || {
+            (
+                String::new(),
+                ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET,
+                0,
+                depth,
+            )
+        },
+        |row| {
+            (
+                row.context_id,
+                row.token_budget,
+                row.tokens_consumed,
+                row.depth,
+            )
+        },
+    );
     let utilization = robot_context_utilization(tokens_consumed, token_budget);
+    // Derive the tier from live utilization (ft-mhq10): the stored column was
+    // a permanent `green` seed, so trusting it made fleet pressure always green.
+    let pressure_tier = robot_context_pressure_tier(utilization);
     let ms_since_last_compaction =
         last_rotated_at_ms.map(|last| now_ms.saturating_sub(last).max(0) as u64);
     let active_context_present = !active_context_id.is_empty();
@@ -18239,6 +18267,85 @@ fn robot_context_rotate_data(
     Ok(robot_context_rotation_response(&row, false))
 }
 
+/// Record real per-pane context token consumption (ft-mhq10).
+///
+/// This is the production writer that was missing: the only prior writer of
+/// `pane_contexts` was the rotate seed, which hardcoded `tokens_consumed=0` /
+/// `pressure_tier='green'` and never updated them, so `context status` reported
+/// permanently-green canned data. `report` UPDATEs the active context's
+/// `tokens_consumed` and recomputes `pressure_tier` from utilization. If the
+/// pane has no active context yet, a depth-0 active context is seeded so a pane
+/// can report pressure without an explicit rotate first.
+fn robot_context_report_data(
+    db_path: &str,
+    pane_id: u64,
+    tokens_consumed: u64,
+    elapsed_ms: u64,
+) -> RobotJsonResult<serde_json::Value> {
+    let mut conn = robot_context_open_conn(db_path)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    let now_ms = now_ms_i64();
+    let tokens_i64 = i64::try_from(tokens_consumed).unwrap_or(i64::MAX);
+
+    let active = robot_context_fetch_active_tx(&tx, pane_id)
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+    let (context_id, token_budget, depth) = if let Some(row) = active {
+        (row.context_id, row.token_budget, row.depth)
+    } else {
+        let pane_s = pane_id.to_string();
+        let now_string = now_ms.to_string();
+        let context_id =
+            robot_context_make_id("ctx", &[&pane_s, &now_string, "0", "", "report"]);
+        tx.execute(
+            "INSERT INTO pane_contexts
+             (context_id, pane_id, state, depth, created_at_ms, token_budget, tokens_consumed,
+              pressure_tier, source)
+             VALUES (?1, ?2, 'active', 0, ?3, ?4, 0, 'green', 'robot_context_report')",
+            rusqlite::params![
+                &context_id,
+                pane_id as i64,
+                now_ms,
+                ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET,
+            ],
+        )
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+        (context_id, ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET, 0)
+    };
+
+    let utilization = robot_context_utilization(tokens_i64, token_budget);
+    let pressure_tier = robot_context_pressure_tier(utilization);
+
+    tx.execute(
+        "UPDATE pane_contexts
+         SET tokens_consumed = ?2, pressure_tier = ?3
+         WHERE context_id = ?1 AND state = 'active'",
+        rusqlite::params![&context_id, tokens_i64, pressure_tier],
+    )
+    .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    tx.commit()
+        .map_err(|err| robot_context_backend_error(err, elapsed_ms))?;
+
+    Ok(serde_json::json!({
+        "family": "context",
+        "action": "report",
+        "backend": "native_sqlite_context",
+        "storage_tables": ["pane_contexts"],
+        "pane_id": pane_id,
+        "active_context_id": context_id,
+        "depth": depth.max(0) as u64,
+        "tokens_consumed": tokens_consumed,
+        "token_budget": token_budget.max(0) as u64,
+        "utilization": utilization,
+        "pressure_tier": pressure_tier,
+        "raw_context_content_stored": false,
+    }))
+}
+
 fn robot_context_history_data(
     db_path: &str,
     pane_id: u64,
@@ -18345,6 +18452,10 @@ fn robot_context_command_response(
         RobotContextCommands::History { pane_id, limit } => {
             robot_context_history_data(db_path, *pane_id, *limit, elapsed_ms)
         }
+        RobotContextCommands::Report {
+            pane_id,
+            tokens_consumed,
+        } => robot_context_report_data(db_path, *pane_id, *tokens_consumed, elapsed_ms),
     };
 
     match result {
@@ -18449,6 +18560,79 @@ mod robot_context_backend_tests {
         assert_eq!(history["truncated"].as_bool(), Some(false));
         assert_eq!(history["rotations"][0]["strategy"].as_str(), Some("gentle"));
         assert_eq!(history["events"][0]["trigger"].as_str(), Some("gentle"));
+    }
+
+    #[test]
+    fn robot_context_pressure_tier_classifies_utilization_bands() {
+        // ft-mhq10: tier is derived from utilization, not a stored constant.
+        assert_eq!(robot_context_pressure_tier(0.0), "green");
+        assert_eq!(robot_context_pressure_tier(0.59), "green");
+        assert_eq!(robot_context_pressure_tier(0.6), "yellow");
+        assert_eq!(robot_context_pressure_tier(0.79), "yellow");
+        assert_eq!(robot_context_pressure_tier(0.8), "red");
+        assert_eq!(robot_context_pressure_tier(0.94), "red");
+        assert_eq!(robot_context_pressure_tier(0.95), "black");
+        assert_eq!(robot_context_pressure_tier(1.0), "black");
+    }
+
+    #[test]
+    fn robot_context_report_updates_tokens_and_drives_pressure_tier() {
+        // ft-mhq10: before this fix the only writer seeded tokens_consumed=0 /
+        // pressure_tier='green' and never updated them, so status was always
+        // green. `report` is the missing UPDATE path; status must now reflect
+        // the reported usage and a derived (non-green) tier.
+        let (_dir, db_path) = setup_robot_context_test_db();
+
+        // No active context yet: report seeds one and records usage.
+        let budget = ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET as u64; // 200_000
+        let report = expect_context_ok(robot_context_report_data(
+            &db_path,
+            7,
+            (budget * 85 / 100), // 85% -> red
+            5,
+        ));
+        assert_eq!(report["action"].as_str(), Some("report"));
+        assert_eq!(report["pane_id"].as_u64(), Some(7));
+        assert_eq!(report["pressure_tier"].as_str(), Some("red"));
+        assert!((report["utilization"].as_f64().unwrap() - 0.85).abs() < 1e-9);
+
+        // Status now surfaces the real, non-green signal (the bug was that it
+        // was permanently 0/green).
+        let status = expect_context_ok(robot_context_status_data(&db_path, Some(7), 5));
+        let pane = &status["panes"][0];
+        assert_eq!(pane["tokens_consumed"].as_u64(), Some(budget * 85 / 100));
+        assert_eq!(pane["pressure_tier"].as_str(), Some("red"));
+        assert!((pane["utilization"].as_f64().unwrap() - 0.85).abs() < 1e-9);
+        // Fleet pressure reflects the red pane rather than counting it green.
+        assert_eq!(status["fleet_pressure"]["red_count"].as_u64(), Some(1));
+        assert_eq!(status["fleet_pressure"]["green_count"].as_u64(), Some(0));
+
+        // A subsequent report UPDATEs the same active context in place.
+        let lower = expect_context_ok(robot_context_report_data(&db_path, 7, budget / 2, 5));
+        assert_eq!(lower["pressure_tier"].as_str(), Some("green")); // 50% -> green
+        let status2 = expect_context_ok(robot_context_status_data(&db_path, Some(7), 5));
+        assert_eq!(status2["panes"][0]["tokens_consumed"].as_u64(), Some(budget / 2));
+        assert_eq!(status2["panes"][0]["pressure_tier"].as_str(), Some("green"));
+        // depth unchanged: report does not rotate.
+        assert_eq!(status2["panes"][0]["depth"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn robot_context_report_after_rotate_updates_active_context() {
+        // report must target the active (post-rotate) context and survive a
+        // status read with the derived tier.
+        let (_dir, db_path) = setup_robot_context_test_db();
+        expect_context_ok(robot_context_rotate_data(
+            &db_path, 3, "agent_default", None, None, 5,
+        ));
+        let budget = ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET as u64;
+        expect_context_ok(robot_context_report_data(&db_path, 3, budget, 5)); // 100% -> black
+
+        let status = expect_context_ok(robot_context_status_data(&db_path, Some(3), 5));
+        let pane = &status["panes"][0];
+        assert_eq!(pane["depth"].as_u64(), Some(1)); // the rotation is intact
+        assert_eq!(pane["pressure_tier"].as_str(), Some("black"));
+        assert!((pane["utilization"].as_f64().unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -78312,6 +78496,37 @@ log_level = "debug"
                     assert_eq!(horizon_window_ms, Some(60_000));
                 }
                 _ => panic!("expected RobotCommands::Context::Horizon"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_context_report_parses() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "context",
+            "report",
+            "12",
+            "--tokens-consumed",
+            "150000",
+        ])
+        .expect("robot context report should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Context {
+                    command:
+                        RobotContextCommands::Report {
+                            pane_id,
+                            tokens_consumed,
+                        },
+                }) => {
+                    assert_eq!(pane_id, 12);
+                    assert_eq!(tokens_consumed, 150_000);
+                }
+                _ => panic!("expected RobotCommands::Context::Report"),
             },
             _ => panic!("expected Robot command"),
         }
