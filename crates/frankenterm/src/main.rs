@@ -5228,9 +5228,10 @@ enum RobotWorkCommands {
         #[arg(long, default_value = "50")]
         limit: usize,
     },
-    /// Show the ready set (items available for claiming)
+    /// Show the ready set (unclaimed items with no open blockers, priority-ordered)
     Ready {
-        /// Agent ID for capability-filtered ready set
+        /// Agent ID to record on the query (capability-based filtering is not yet
+        /// modeled; the ready set is dependency- and priority-ordered only)
         #[arg(long)]
         agent_id: Option<String>,
 
@@ -5254,6 +5255,24 @@ enum RobotWorkCommands {
         /// Assignment strategy override
         #[arg(long)]
         strategy: Option<String>,
+    },
+    /// Define or update a work item's priority, labels, and dependency edges
+    /// (without claiming it), so the dependency-aware queue surface has real data
+    Define {
+        /// Work item ID to define
+        item_id: String,
+
+        /// Priority (lower = higher priority; ordered first in list/ready)
+        #[arg(long)]
+        priority: Option<i64>,
+
+        /// Labels (comma-separated); enables `work list --label`
+        #[arg(long, value_delimiter = ',')]
+        label: Option<Vec<String>>,
+
+        /// Item IDs that must complete before this item is ready (comma-separated)
+        #[arg(long = "blocked-by", value_delimiter = ',')]
+        blocked_by: Option<Vec<String>>,
     },
 }
 
@@ -17050,6 +17069,45 @@ fn robot_work_ensure_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_work_claims_pane_id ON work_claims(pane_id);",
     )?;
+    // ft-tnew9: dependency edges so the work queue's "dependency-aware" fields
+    // (blocked_by_count / unblocks_count) carry real data instead of seeded
+    // zeros. An edge (claim_id, blocked_by_claim_id) means `claim_id` cannot be
+    // worked until `blocked_by_claim_id` completes. Counts are recomputed from
+    // this table by `robot_work_recompute_dep_counts`.
+    conn.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS work_claim_deps (
+            claim_id TEXT NOT NULL,
+            blocked_by_claim_id TEXT NOT NULL,
+            PRIMARY KEY (claim_id, blocked_by_claim_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_claim_deps_blocker
+            ON work_claim_deps(blocked_by_claim_id);
+        ",
+    )?;
+    Ok(())
+}
+
+/// ft-tnew9: recompute the dependency-aware counts on every `work_claims` row
+/// from the `work_claim_deps` edge table and the current item states. An item is
+/// "blocked" by each not-yet-`completed` blocker; it "unblocks" each not-yet-
+/// `completed` item that lists it as a blocker. Cheap full-table refresh — the
+/// robot work queue is small (operator/agent scale, clamped reads at 200).
+fn robot_work_recompute_dep_counts(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute_batch(
+        r"
+        UPDATE work_claims SET blocked_by_count = (
+            SELECT COUNT(*) FROM work_claim_deps d
+            JOIN work_claims b ON b.claim_id = d.blocked_by_claim_id
+            WHERE d.claim_id = work_claims.claim_id AND b.state != 'completed'
+        );
+        UPDATE work_claims SET unblocks_count = (
+            SELECT COUNT(*) FROM work_claim_deps d
+            JOIN work_claims c ON c.claim_id = d.claim_id
+            WHERE d.blocked_by_claim_id = work_claims.claim_id AND c.state != 'completed'
+        );
+        ",
+    )?;
     Ok(())
 }
 
@@ -17324,6 +17382,27 @@ fn robot_work_release_data(
     }))
 }
 
+/// ft-tnew9: items that are now ready (unclaimed, no remaining open blockers)
+/// specifically because `item_id` is one of their blockers. Call after
+/// `robot_work_recompute_dep_counts` so `blocked_by_count` is current.
+fn robot_work_unblocked_by_tx(
+    tx: &rusqlite::Transaction<'_>,
+    item_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT d.claim_id FROM work_claim_deps d
+         JOIN work_claims c ON c.claim_id = d.claim_id
+         WHERE d.blocked_by_claim_id = ?1 AND c.state = 'unclaimed' AND c.blocked_by_count = 0
+         ORDER BY d.claim_id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![item_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn robot_work_complete_data(
     db_path: &str,
     item_id: &str,
@@ -17357,6 +17436,13 @@ fn robot_work_complete_data(
         )
         .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
     }
+    // ft-tnew9: completing an item clears it as a blocker — recompute the
+    // dependency counts and surface the items that became ready as a result
+    // (previously this was a hardcoded empty list).
+    robot_work_recompute_dep_counts(&tx)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let unblocked = robot_work_unblocked_by_tx(&tx, item_id)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
     tx.commit()
         .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
 
@@ -17369,7 +17455,7 @@ fn robot_work_complete_data(
         "claim_id": item_id,
         "completed_at_ms": now_ms,
         "idempotent_replay": already_completed,
-        "unblocked": [],
+        "unblocked": unblocked,
         "summary": summary,
         "evidence": evidence,
         "audit": {
@@ -17465,6 +17551,108 @@ fn robot_work_assign_data(
         "strategy_used": strategy_used,
         "audit": {
             "event": "work.assigned",
+            "serializable_key": item_id,
+        },
+    }))
+}
+
+/// ft-tnew9: define (or update) a work item's priority, labels, and dependency
+/// edges WITHOUT claiming it, so the queue's dependency-aware surface
+/// (`list --label`, priority ordering, `ready` blocked/ready split,
+/// `complete` unblocking) operates on real data instead of seeded zeros.
+///
+/// `blocked_by` replaces the item's edge set (set-semantics): each blocker is
+/// seeded if missing, self-edges are skipped, and the counts are recomputed.
+/// `priority`/`label` are only written when provided, so a metadata-only update
+/// can adjust one facet without clobbering the others.
+fn robot_work_define_data(
+    db_path: &str,
+    item_id: &str,
+    priority: Option<i64>,
+    labels: Option<&[String]>,
+    blocked_by: Option<&[String]>,
+    elapsed_ms: u64,
+) -> RobotJsonResult<serde_json::Value> {
+    robot_work_validate_id("item_id", item_id, elapsed_ms)?;
+    if let Some(blockers) = blocked_by {
+        for blocker in blockers {
+            robot_work_validate_id("blocked_by", blocker, elapsed_ms)?;
+        }
+    }
+
+    let mut conn =
+        robot_work_open_conn(db_path).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    let now_ms = now_ms_i64();
+    robot_work_seed_unclaimed_if_missing(&tx, item_id, now_ms)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    if let Some(priority) = priority {
+        tx.execute(
+            "UPDATE work_claims SET priority = ?2, updated_at_ms = ?3 WHERE claim_id = ?1",
+            rusqlite::params![item_id, priority, now_ms],
+        )
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    }
+
+    if let Some(labels) = labels {
+        let labels_json =
+            serde_json::to_string(labels).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+        tx.execute(
+            "UPDATE work_claims SET labels_json = ?2, updated_at_ms = ?3 WHERE claim_id = ?1",
+            rusqlite::params![item_id, labels_json, now_ms],
+        )
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+    }
+
+    if let Some(blockers) = blocked_by {
+        // Set-semantics: replace the item's edge set.
+        tx.execute(
+            "DELETE FROM work_claim_deps WHERE claim_id = ?1",
+            rusqlite::params![item_id],
+        )
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+        for blocker in blockers {
+            // A self-edge would block an item on itself forever; skip it.
+            if blocker == item_id {
+                continue;
+            }
+            robot_work_seed_unclaimed_if_missing(&tx, blocker, now_ms)
+                .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO work_claim_deps (claim_id, blocked_by_claim_id)
+                 VALUES (?1, ?2)",
+                rusqlite::params![item_id, blocker],
+            )
+            .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+        }
+    }
+
+    robot_work_recompute_dep_counts(&tx)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    let row = robot_work_fetch_row_tx(&tx, item_id)
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?
+        .ok_or_else(|| robot_work_not_found(item_id, elapsed_ms))?;
+    tx.commit()
+        .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+
+    Ok(serde_json::json!({
+        "family": "work",
+        "action": "define",
+        "backend": "native_sqlite_work_claims",
+        "storage_table": "work_claims",
+        "item_id": item_id,
+        "claim_id": item_id,
+        "priority": robot_work_priority(row.priority),
+        "labels": robot_work_parse_string_array(&row.labels_json),
+        "blocked_by_count": robot_work_count(row.blocked_by_count),
+        "unblocks_count": robot_work_count(row.unblocks_count),
+        "audit": {
+            "event": "work.defined",
             "serializable_key": item_id,
         },
     }))
@@ -17643,6 +17831,19 @@ fn robot_work_command_response(
             agent_id,
             *pane_id,
             strategy.as_deref(),
+            elapsed_ms,
+        ),
+        RobotWorkCommands::Define {
+            item_id,
+            priority,
+            label,
+            blocked_by,
+        } => robot_work_define_data(
+            db_path,
+            item_id,
+            *priority,
+            label.as_deref(),
+            blocked_by.as_deref(),
             elapsed_ms,
         ),
     };
@@ -75143,6 +75344,65 @@ log_level = "debug"
         let workflows = enabled_builtin_workflows(&config);
         let names: Vec<&str> = workflows.iter().map(|workflow| workflow.name()).collect();
         assert_eq!(names, vec!["handle_compaction", "handle_usage_limits"]);
+    }
+
+    // ft-tnew9: the work queue's dependency-aware fields must carry real data:
+    // `define --blocked-by` records edges, `ready` splits blocked vs ready from
+    // them, `--label` filters, and `complete` reports the items it unblocks
+    // (previously all four were seeded zeros / a hardcoded empty list).
+    #[test]
+    fn robot_work_dependency_define_blocks_then_complete_unblocks_ft_tnew9() {
+        let db = std::env::temp_dir().join(format!("ft_tnew9_work_{}.db", std::process::id()));
+        let db_path = db.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&db);
+
+        // Define B blocked by A, with a priority and a label.
+        let labels = vec!["urgent".to_string()];
+        let blockers = vec!["A".to_string()];
+        let defined_b =
+            robot_work_define_data(&db_path, "B", Some(1), Some(&labels), Some(&blockers), 0)
+                .ok()
+                .expect("define B");
+        assert_eq!(defined_b["blocked_by_count"], 1, "B is blocked by A");
+        assert_eq!(defined_b["priority"], 1);
+        assert_eq!(defined_b["labels"][0], "urgent");
+
+        // A reports that it unblocks one item (B).
+        let defined_a = robot_work_define_data(&db_path, "A", None, None, None, 0)
+            .ok()
+            .expect("define A");
+        assert_eq!(defined_a["unblocks_count"], 1, "A unblocks B");
+
+        // Ready set: B is blocked while A is open.
+        let ready = robot_work_ready_data(&db_path, None, 50, 0).ok().expect("ready");
+        assert_eq!(ready["total_blocked"], 1, "B blocked while A open");
+
+        // The --label filter now finds B (was always 0 items before ft-tnew9).
+        let listed = robot_work_list_data(&db_path, None, None, Some("urgent"), 50, 0)
+            .ok()
+            .expect("list");
+        assert_eq!(listed["total"], 1, "label filter finds the defined item");
+
+        // Completing A unblocks B (was a hardcoded empty list before ft-tnew9).
+        let completed = robot_work_complete_data(&db_path, "A", None, &[], 0)
+            .ok()
+            .expect("complete A");
+        let unblocked: Vec<String> = completed["unblocked"]
+            .as_array()
+            .expect("unblocked array")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert!(
+            unblocked.contains(&"B".to_string()),
+            "completing A unblocks B: {completed:?}"
+        );
+
+        // Ready set: nothing blocked now that A is complete.
+        let ready2 = robot_work_ready_data(&db_path, None, 50, 0).ok().expect("ready2");
+        assert_eq!(ready2["total_blocked"], 0, "B ready after A completes");
+
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]
