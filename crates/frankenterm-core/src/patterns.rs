@@ -1785,7 +1785,10 @@ where
     } else {
         // Size the filter for the actual number of anchors, minimum 100 to avoid edge cases
         let num_items = anchor_list.len().max(100);
-        let mut bloom = Bloom::new_for_fp_rate(num_items, BLOOM_FALSE_POSITIVE_RATE);
+        let mut bloom =
+            Bloom::new_for_fp_rate(num_items, BLOOM_FALSE_POSITIVE_RATE).map_err(|err| {
+                PatternError::InvalidRule(format!("failed to build anchor bloom filter: {err}"))
+            })?;
         for anchor in &anchor_list {
             bloom.set(anchor.as_str());
         }
@@ -1952,8 +1955,30 @@ fn load_packs_from_config(config: &PatternsConfig, root: Option<&Path>) -> Resul
         }
     }
 
+    // ft-yjfke (security): user/workspace packs — config `file:` ids and the
+    // auto-discovered `.ft/patterns` / config-dir packs, i.e. everything in
+    // `user_pack_names` — are attacker-reachable in a cloned repo or a shared
+    // dotfile. Verify each against the supply-chain policy and downgrade it to
+    // observe-only (strip `workflow`/`preview_command` action triggers) unless
+    // it carries a verified, signed manifest. Built-in packs are NOT in
+    // `user_pack_names`, are loaded in-binary via `builtin_pack_by_name`, and
+    // keep their triggers. The gate primitives
+    // (`verify_pattern_pack_supply_chain` / `enforce_verification_report`)
+    // existed but were never called on the production load path, so unsigned
+    // packs previously ran at full action-triggering mode.
+    let verification_policy = PatternPackVerificationPolicy::default();
+    let mut gated_packs = Vec::with_capacity(packs.len());
+    for pack in packs {
+        gated_packs.push(if user_pack_names.contains(&pack.name) {
+            let report = verify_pattern_pack_supply_chain(&pack, &verification_policy);
+            pack.enforce_verification_report(&report)
+        } else {
+            pack
+        });
+    }
+
     Ok(LoadedPacks {
-        packs,
+        packs: gated_packs,
         user_pack_names,
     })
 }
@@ -7571,6 +7596,64 @@ description = "normal"
         assert!(
             loaded.packs.iter().any(|p| p.name == "user:normal"),
             "[ft-qhyfh] user:normal pack must be present in loaded packs"
+        );
+    }
+
+    /// ft-yjfke: an UNSIGNED user pack (no supply-chain manifest) loaded via the
+    /// production path must be downgraded to observe-only — its action triggers
+    /// (workflow / preview_command) are stripped — rather than running at full
+    /// action mode. The pack is still loaded (gated, not rejected) so detection
+    /// keeps working; only the action surface is removed.
+    #[test]
+    fn load_packs_from_config_downgrades_unsigned_user_pack_to_observe_only() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("evil.toml"),
+            r#"
+name = "user:evil"
+version = "1.0.0"
+[[rules]]
+id = "myorg.attack"
+agent_type = "codex"
+event_type = "attack.event"
+severity = "info"
+anchors = ["[ATTACK-ANCHOR]"]
+description = "unsigned pack carrying an action trigger"
+workflow = "attacker_workflow"
+preview_command = "do_something_dangerous"
+"#,
+        )
+        .unwrap();
+
+        let config = PatternsConfig {
+            user_packs_enabled: true,
+            user_packs_dir: Some(dir.path().to_str().unwrap().to_string()),
+            ..PatternsConfig::default()
+        };
+
+        let loaded =
+            load_packs_from_config(&config, None).expect("unsigned pack loads (gated, not rejected)");
+        assert!(
+            loaded.user_pack_names.contains("user:evil"),
+            "the unsigned pack must be classified as a user pack"
+        );
+        let pack = loaded
+            .packs
+            .iter()
+            .find(|p| p.name == "user:evil")
+            .expect("unsigned user pack must still load");
+
+        // ft-yjfke: the action triggers must be stripped to observe-only.
+        let rule = &pack.rules[0];
+        assert!(
+            rule.workflow.is_none(),
+            "unsigned user-pack workflow trigger must be stripped (ft-yjfke), got {:?}",
+            rule.workflow
+        );
+        assert!(
+            rule.preview_command.is_none(),
+            "unsigned user-pack preview_command must be stripped (ft-yjfke), got {:?}",
+            rule.preview_command
         );
     }
 
