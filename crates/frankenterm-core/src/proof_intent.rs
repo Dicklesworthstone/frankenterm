@@ -39,6 +39,11 @@ pub const PROOF_INTENT_QUEUE_ENTRY_CONTRACT_ID: &str = "ft.proof_intent_queue_en
 /// Current proof-intent queue schema version.
 pub const PROOF_INTENT_QUEUE_SCHEMA_VERSION: u32 = 1;
 
+/// Stable contract id for release-readiness summaries over queued proof intents.
+pub const PROOF_INTENT_RELEASE_READINESS_CONTRACT_ID: &str = "ft.proof_intent.release_readiness.v1";
+
+const REMOTE_PROOF_PASSED_OUTCOME: &str = "remote_proof_passed";
+
 /// Build/proof scope. Package-scoped proofs are cheaper and preferred under
 /// pressure; workspace-wide proofs are stronger but heavier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +354,129 @@ pub struct ProofIntentQueueEntry {
     pub attached_receipts: Vec<ProofIntentAttachedReceipt>,
 }
 
+/// Why an explicit receipt attachment was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofIntentReceiptError {
+    /// No retained replay attempt used the requested receipt path.
+    MissingReplayAttempt {
+        /// Requested attempt record or receipt path.
+        receipt_path: String,
+    },
+    /// The matching replay attempt cannot support source bead closeout.
+    AttemptNotCloseoutEligible {
+        /// Requested attempt record or receipt path.
+        receipt_path: String,
+        /// Recorded attempt outcome.
+        outcome: String,
+    },
+}
+
+impl fmt::Display for ProofIntentReceiptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingReplayAttempt { receipt_path } => {
+                write!(
+                    formatter,
+                    "no retained proof replay attempt matches receipt path {receipt_path}"
+                )
+            }
+            Self::AttemptNotCloseoutEligible {
+                receipt_path,
+                outcome,
+            } => {
+                write!(
+                    formatter,
+                    "proof replay attempt {receipt_path} is not closeout eligible: {outcome}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProofIntentReceiptError {}
+
+/// Release-readiness state for one queued proof intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofIntentReleaseReadinessState {
+    /// A terminal remote proof receipt has been explicitly attached.
+    CloseoutReady,
+    /// The intent still needs a terminal proof receipt.
+    Outstanding,
+    /// The source tree moved since the intent was captured.
+    StaleSource,
+}
+
+impl ProofIntentReleaseReadinessState {
+    /// Stable string key for summaries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CloseoutReady => "closeout_ready",
+            Self::Outstanding => "outstanding",
+            Self::StaleSource => "stale_source",
+        }
+    }
+}
+
+/// Release-readiness row for one queued proof intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofIntentReleaseReadinessRow {
+    /// Content-addressed proof intent id.
+    pub intent_id: String,
+    /// Owning Beads issue id, when known.
+    pub bead_id: Option<String>,
+    /// Attestation slot this proof feeds, when known.
+    pub attestation_slot: Option<String>,
+    /// Latest queue/admission state.
+    pub rch_admission_state: String,
+    /// Whether the intent source hash still matches the live source hash.
+    pub source_state: String,
+    /// Release-readiness state for this intent.
+    pub state: ProofIntentReleaseReadinessState,
+    /// Stable reason code for the state.
+    pub reason_code: String,
+    /// True only when explicit terminal remote proof receipt is attached.
+    pub closeout_eligible: bool,
+    /// True when release-readiness must continue to show this proof gap.
+    pub release_blocking: bool,
+    /// Number of retained replay attempts.
+    pub replay_attempt_count: usize,
+    /// Number of explicitly attached receipts.
+    pub attached_receipt_count: usize,
+    /// Latest retained replay-attempt outcome, when present.
+    pub latest_attempt_outcome: Option<String>,
+    /// Latest closeout-eligible attached receipt path, when present.
+    pub closeout_receipt_path: Option<String>,
+}
+
+/// Release-readiness summary over the deferred proof-intent queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofIntentReleaseReadinessReport {
+    /// Report schema version.
+    pub schema_version: u32,
+    /// Stable report contract id.
+    pub contract_id: String,
+    /// Live source hash used for staleness checks.
+    pub live_source_hash: String,
+    /// Total queued proof intents.
+    pub total_intents: usize,
+    /// Intents with explicit terminal remote proof receipts.
+    pub closeout_ready_count: usize,
+    /// Intents still blocking release-readiness.
+    pub outstanding_count: usize,
+    /// Intents whose source hash no longer matches the live tree.
+    pub stale_count: usize,
+    /// True when any queued intent is not closeout-ready.
+    pub release_blocking: bool,
+    /// Outstanding intent ids, including stale intents.
+    pub outstanding_intent_ids: Vec<String>,
+    /// Per-intent readiness rows.
+    pub rows: Vec<ProofIntentReleaseReadinessRow>,
+    /// Operator-facing summary.
+    pub operator_summary: String,
+}
+
 impl ProofIntentQueueEntry {
     /// Build a durable queue entry around a validated [`ProofIntent`].
     #[must_use]
@@ -439,6 +567,251 @@ impl ProofIntentQueueEntry {
         self.attached_receipts.push(receipt);
         self.updated_at_ms = updated_at_ms;
     }
+
+    /// Attach a retained replay attempt as a closeout receipt only when the
+    /// attempt proves a terminal remote pass. This is intentionally separate
+    /// from [`Self::record_replay_attempt`]: replay records evidence, while this
+    /// method is the explicit receipt-producing step.
+    ///
+    /// # Errors
+    /// Returns [`ProofIntentReceiptError`] if `receipt_path` does not identify a
+    /// retained attempt for this intent, or if the matching attempt is not a
+    /// terminal remote pass.
+    pub fn attach_proven_replay_receipt(
+        &mut self,
+        receipt_path: &str,
+        updated_at_ms: i64,
+    ) -> Result<(), ProofIntentReceiptError> {
+        let Some(attempt) = self
+            .replay_attempts
+            .iter()
+            .find(|attempt| attempt.attempt_record_path.as_deref() == Some(receipt_path))
+        else {
+            return Err(ProofIntentReceiptError::MissingReplayAttempt {
+                receipt_path: receipt_path.to_string(),
+            });
+        };
+
+        if !proof_replay_attempt_supports_closeout(attempt) {
+            return Err(ProofIntentReceiptError::AttemptNotCloseoutEligible {
+                receipt_path: receipt_path.to_string(),
+                outcome: attempt.outcome.clone(),
+            });
+        }
+
+        if !self
+            .attached_receipts
+            .iter()
+            .any(|receipt| receipt.receipt_path == receipt_path)
+        {
+            self.attached_receipts.push(ProofIntentAttachedReceipt {
+                receipt_path: receipt_path.to_string(),
+                attached_at_ms: updated_at_ms,
+            });
+        }
+        self.updated_at_ms = updated_at_ms;
+        Ok(())
+    }
+
+    /// Return the latest explicitly attached receipt that matches a terminal
+    /// remote-passing replay attempt.
+    #[must_use]
+    pub fn closeout_eligible_receipt(&self) -> Option<&ProofIntentAttachedReceipt> {
+        self.attached_receipts
+            .iter()
+            .rev()
+            .find(|receipt| self.receipt_path_supports_closeout(&receipt.receipt_path))
+    }
+
+    /// Whether this queued intent has an explicit terminal remote proof receipt.
+    #[must_use]
+    pub fn has_closeout_eligible_receipt(&self) -> bool {
+        self.closeout_eligible_receipt().is_some()
+    }
+
+    fn receipt_path_supports_closeout(&self, receipt_path: &str) -> bool {
+        self.replay_attempts.iter().any(|attempt| {
+            attempt.attempt_record_path.as_deref() == Some(receipt_path)
+                && proof_replay_attempt_supports_closeout(attempt)
+        })
+    }
+}
+
+/// Build a machine-readable release-readiness summary from queued proof intents.
+///
+/// The report is intentionally conservative: attached receipt paths do not
+/// become closeout evidence unless they match a retained replay attempt that
+/// reached remote Cargo, avoided local fallback, and passed.
+#[must_use]
+pub fn build_proof_intent_release_readiness_report(
+    entries: &[ProofIntentQueueEntry],
+    live_source_hash: impl Into<String>,
+) -> ProofIntentReleaseReadinessReport {
+    let live_source_hash = live_source_hash.into();
+    let mut rows = entries
+        .iter()
+        .map(|entry| proof_intent_release_readiness_row(entry, &live_source_hash))
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+
+    let closeout_ready_count = rows
+        .iter()
+        .filter(|row| row.state == ProofIntentReleaseReadinessState::CloseoutReady)
+        .count();
+    let stale_count = rows
+        .iter()
+        .filter(|row| row.state == ProofIntentReleaseReadinessState::StaleSource)
+        .count();
+    let outstanding_intent_ids = rows
+        .iter()
+        .filter(|row| row.release_blocking)
+        .map(|row| row.intent_id.clone())
+        .collect::<Vec<_>>();
+    let outstanding_count = outstanding_intent_ids.len();
+    let release_blocking = outstanding_count > 0;
+    let total_intents = rows.len();
+    let operator_summary = if release_blocking {
+        format!(
+            "{outstanding_count}/{total_intents} queued proof intent(s) still block release-readiness; {closeout_ready_count} have explicit terminal remote receipts"
+        )
+    } else {
+        format!("all {total_intents} queued proof intent(s) have explicit terminal remote receipts")
+    };
+
+    ProofIntentReleaseReadinessReport {
+        schema_version: PROOF_INTENT_QUEUE_SCHEMA_VERSION,
+        contract_id: PROOF_INTENT_RELEASE_READINESS_CONTRACT_ID.to_string(),
+        live_source_hash,
+        total_intents,
+        closeout_ready_count,
+        outstanding_count,
+        stale_count,
+        release_blocking,
+        outstanding_intent_ids,
+        rows,
+        operator_summary,
+    }
+}
+
+fn proof_intent_release_readiness_row(
+    entry: &ProofIntentQueueEntry,
+    live_source_hash: &str,
+) -> ProofIntentReleaseReadinessRow {
+    let stale = entry.is_stale(live_source_hash);
+    let closeout_receipt = (!stale)
+        .then(|| entry.closeout_eligible_receipt())
+        .flatten();
+    let latest_attempt_outcome = entry
+        .replay_attempts
+        .last()
+        .map(|attempt| attempt.outcome.clone());
+    let (state, reason_code) = proof_intent_readiness_state(entry, stale, closeout_receipt);
+    let closeout_eligible = state == ProofIntentReleaseReadinessState::CloseoutReady;
+
+    ProofIntentReleaseReadinessRow {
+        intent_id: entry.intent.intent_id.clone(),
+        bead_id: entry.intent.bead_id.clone(),
+        attestation_slot: entry.intent.attestation_slot.clone(),
+        rch_admission_state: entry.rch_admission_state.clone(),
+        source_state: if stale { "stale" } else { "current" }.to_string(),
+        state,
+        reason_code: reason_code.to_string(),
+        closeout_eligible,
+        release_blocking: !closeout_eligible,
+        replay_attempt_count: entry.replay_attempts.len(),
+        attached_receipt_count: entry.attached_receipts.len(),
+        latest_attempt_outcome,
+        closeout_receipt_path: closeout_receipt.map(|receipt| receipt.receipt_path.clone()),
+    }
+}
+
+fn proof_intent_readiness_state(
+    entry: &ProofIntentQueueEntry,
+    stale: bool,
+    closeout_receipt: Option<&ProofIntentAttachedReceipt>,
+) -> (ProofIntentReleaseReadinessState, &'static str) {
+    if stale {
+        return (
+            ProofIntentReleaseReadinessState::StaleSource,
+            "proof_intent.source_stale",
+        );
+    }
+    if closeout_receipt.is_some() {
+        return (
+            ProofIntentReleaseReadinessState::CloseoutReady,
+            "proof_intent.receipt.remote_proof_passed",
+        );
+    }
+    if entry
+        .replay_attempts
+        .iter()
+        .any(|attempt| attempt.local_fallback_detected)
+    {
+        return (
+            ProofIntentReleaseReadinessState::Outstanding,
+            "proof_intent.local_fallback_not_proof",
+        );
+    }
+    if let Some(attempt) = entry.replay_attempts.last() {
+        return (
+            ProofIntentReleaseReadinessState::Outstanding,
+            proof_intent_attempt_reason_code(attempt),
+        );
+    }
+    if !entry.attached_receipts.is_empty() {
+        return (
+            ProofIntentReleaseReadinessState::Outstanding,
+            "proof_intent.attached_receipt_unproven",
+        );
+    }
+    if matches!(
+        entry.rch_admission_state.as_str(),
+        "wait_rch"
+            | "no_admissible_workers"
+            | "critical_pressure"
+            | "blocked_worker_pressure"
+            | "insufficient_slots"
+            | "telemetry_gap"
+            | "active_project_exclusion"
+    ) {
+        return (
+            ProofIntentReleaseReadinessState::Outstanding,
+            "proof_intent.deferred_remote_admission",
+        );
+    }
+    (
+        ProofIntentReleaseReadinessState::Outstanding,
+        "proof_intent.receipt_missing",
+    )
+}
+
+fn proof_intent_attempt_reason_code(attempt: &ProofIntentReplayAttemptRef) -> &'static str {
+    match attempt.outcome.as_str() {
+        REMOTE_PROOF_PASSED_OUTCOME if proof_replay_attempt_supports_closeout(attempt) => {
+            "proof_intent.receipt_missing"
+        }
+        REMOTE_PROOF_PASSED_OUTCOME => "proof_intent.remote_pass_unattachable",
+        "remote_proof_failed" => "proof_intent.remote_proof_failed",
+        "blocked_local_fallback" => "proof_intent.local_fallback_not_proof",
+        "blocked_no_admissible_workers"
+        | "blocked_worker_null"
+        | "blocked_exit_143"
+        | "blocked_remote_timeout"
+        | "blocked_stuck_detector_cancelled"
+        | "blocked_topology_preflight"
+        | "blocked_remote_not_confirmed" => "proof_intent.infra_blocked",
+        _ => "proof_intent.attempt_not_closeout_eligible",
+    }
+}
+
+fn proof_replay_attempt_supports_closeout(attempt: &ProofIntentReplayAttemptRef) -> bool {
+    attempt.outcome == REMOTE_PROOF_PASSED_OUTCOME
+        && attempt.remote_cargo_reached
+        && !attempt.local_fallback_detected
+        && attempt
+            .attempt_record_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
 }
 
 /// Result of an idempotent queue operation.
@@ -672,7 +1045,7 @@ fn sha256_hex(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
@@ -963,5 +1336,148 @@ mod tests {
         assert_eq!(updated.replay_attempts.len(), 1);
         assert_eq!(updated.attached_receipts.len(), 1);
         assert_eq!(updated.updated_at_ms, 1_704_000_000_200);
+    }
+
+    #[test]
+    fn release_readiness_blocks_unproven_attached_receipts() {
+        let mut entry = sample_queue_entry("sha256:tree-readiness");
+        entry.attach_receipt(
+            ProofIntentAttachedReceipt {
+                receipt_path: "artifacts/unclassified.attempt.json".to_string(),
+                attached_at_ms: 1_704_000_000_200,
+            },
+            1_704_000_000_200,
+        );
+
+        let report = build_proof_intent_release_readiness_report(
+            std::slice::from_ref(&entry),
+            "sha256:tree-readiness",
+        );
+
+        assert!(report.release_blocking);
+        assert_eq!(report.outstanding_count, 1);
+        assert_eq!(
+            report.rows[0].state,
+            ProofIntentReleaseReadinessState::Outstanding
+        );
+        assert_eq!(
+            report.rows[0].reason_code,
+            "proof_intent.attached_receipt_unproven"
+        );
+        assert!(!entry.has_closeout_eligible_receipt());
+    }
+
+    #[test]
+    fn proven_replay_receipt_is_explicit_and_idempotent() {
+        let mut entry = sample_queue_entry("sha256:tree-proven");
+        entry.record_replay_attempt(
+            ProofIntentReplayAttemptRef {
+                attempt_record_path: Some("artifacts/pass.attempt.json".to_string()),
+                outcome: REMOTE_PROOF_PASSED_OUTCOME.to_string(),
+                remote_cargo_reached: true,
+                local_fallback_detected: false,
+                recorded_at_ms: 1_704_000_000_100,
+            },
+            1_704_000_000_100,
+        );
+
+        assert!(
+            entry
+                .attach_proven_replay_receipt("artifacts/pass.attempt.json", 1_704_000_000_200)
+                .is_ok()
+        );
+        assert!(
+            entry
+                .attach_proven_replay_receipt("artifacts/pass.attempt.json", 1_704_000_000_300)
+                .is_ok()
+        );
+        assert_eq!(entry.attached_receipts.len(), 1);
+        assert!(entry.has_closeout_eligible_receipt());
+
+        let report = build_proof_intent_release_readiness_report(
+            std::slice::from_ref(&entry),
+            "sha256:tree-proven",
+        );
+        assert!(!report.release_blocking);
+        assert_eq!(report.closeout_ready_count, 1);
+        assert_eq!(
+            report.rows[0].state,
+            ProofIntentReleaseReadinessState::CloseoutReady
+        );
+        assert_eq!(
+            report.rows[0].reason_code,
+            "proof_intent.receipt.remote_proof_passed"
+        );
+        assert_eq!(
+            report.rows[0].closeout_receipt_path.as_deref(),
+            Some("artifacts/pass.attempt.json")
+        );
+    }
+
+    #[test]
+    fn local_fallback_attempt_cannot_attach_as_proven_receipt() {
+        let mut entry = sample_queue_entry("sha256:tree-local");
+        entry.record_replay_attempt(
+            ProofIntentReplayAttemptRef {
+                attempt_record_path: Some("artifacts/local.attempt.json".to_string()),
+                outcome: "blocked_local_fallback".to_string(),
+                remote_cargo_reached: false,
+                local_fallback_detected: true,
+                recorded_at_ms: 1_704_000_000_100,
+            },
+            1_704_000_000_100,
+        );
+
+        let error = entry
+            .attach_proven_replay_receipt("artifacts/local.attempt.json", 1_704_000_000_200)
+            .err();
+        assert!(matches!(
+            error,
+            Some(ProofIntentReceiptError::AttemptNotCloseoutEligible { .. })
+        ));
+        assert!(entry.attached_receipts.is_empty());
+
+        let report = build_proof_intent_release_readiness_report(
+            std::slice::from_ref(&entry),
+            "sha256:tree-local",
+        );
+        assert!(report.release_blocking);
+        assert_eq!(
+            report.rows[0].reason_code,
+            "proof_intent.local_fallback_not_proof"
+        );
+    }
+
+    #[test]
+    fn stale_source_blocks_even_with_proven_receipt() {
+        let mut entry = sample_queue_entry("sha256:tree-old");
+        entry.record_replay_attempt(
+            ProofIntentReplayAttemptRef {
+                attempt_record_path: Some("artifacts/pass.attempt.json".to_string()),
+                outcome: REMOTE_PROOF_PASSED_OUTCOME.to_string(),
+                remote_cargo_reached: true,
+                local_fallback_detected: false,
+                recorded_at_ms: 1_704_000_000_100,
+            },
+            1_704_000_000_100,
+        );
+        assert!(
+            entry
+                .attach_proven_replay_receipt("artifacts/pass.attempt.json", 1_704_000_000_200)
+                .is_ok()
+        );
+
+        let report = build_proof_intent_release_readiness_report(
+            std::slice::from_ref(&entry),
+            "sha256:tree-new",
+        );
+
+        assert!(report.release_blocking);
+        assert_eq!(report.stale_count, 1);
+        assert_eq!(
+            report.rows[0].state,
+            ProofIntentReleaseReadinessState::StaleSource
+        );
+        assert_eq!(report.rows[0].reason_code, "proof_intent.source_stale");
     }
 }
