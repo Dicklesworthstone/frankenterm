@@ -874,7 +874,10 @@ pub struct IndexerRunResult {
     pub events_read: u64,
     /// Events successfully indexed.
     pub events_indexed: u64,
-    /// Events skipped (schema mismatch, rejection, etc.).
+    /// Events explicitly skipped by recoverable policy.
+    ///
+    /// Schema mismatches and writer rejections fail closed before checkpointing,
+    /// so they surface as [`IndexerError`] instead of incrementing this counter.
     pub events_skipped: u64,
     /// Batches processed.
     pub batches_committed: u64,
@@ -893,6 +896,13 @@ pub enum IndexerError {
     Storage(RecorderStorageError),
     /// Index write/commit failed.
     IndexWrite(IndexWriteError),
+    /// Recorder event schema did not match this indexer's configured schema.
+    SchemaMismatch {
+        event_id: String,
+        ordinal: u64,
+        expected: String,
+        actual: String,
+    },
     /// Configuration error.
     Config(String),
 }
@@ -903,6 +913,15 @@ impl std::fmt::Display for IndexerError {
             Self::LogRead(e) => write!(f, "log read: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::IndexWrite(e) => write!(f, "index write: {e}"),
+            Self::SchemaMismatch {
+                event_id,
+                ordinal,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "schema mismatch for event {event_id} at ordinal {ordinal}: expected {expected}, got {actual}"
+            ),
             Self::Config(msg) => write!(f, "config: {msg}"),
         }
     }
@@ -953,6 +972,33 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             self.writer.delete_by_event_id(event_id)?;
         }
         Ok(())
+    }
+
+    fn index_record(
+        &mut self,
+        event: &RecorderEvent,
+        offset: &RecorderOffset,
+        result: &mut IndexerRunResult,
+    ) -> Result<RecorderOffset, IndexerError> {
+        result.events_read += 1;
+
+        if event.schema_version != self.config.expected_event_schema {
+            return Err(IndexerError::SchemaMismatch {
+                event_id: event.event_id.clone(),
+                ordinal: offset.ordinal,
+                expected: self.config.expected_event_schema.clone(),
+                actual: event.schema_version.clone(),
+            });
+        }
+
+        let doc = map_event_to_document(event, offset.ordinal);
+
+        self.delete_existing_event_for_replay(&doc.event_id)?;
+
+        self.writer.add_document(&doc)?;
+        result.events_indexed += 1;
+
+        Ok(offset.clone())
     }
 
     /// Run the indexer: read checkpoint, scan log, index events, commit checkpoints.
@@ -1025,28 +1071,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             let mut last_offset: Option<RecorderOffset> = None;
 
             for record in &batch {
-                result.events_read += 1;
-
-                // Schema version check
-                if record.event.schema_version != self.config.expected_event_schema {
-                    result.events_skipped += 1;
-                    last_offset = Some(record.offset.clone());
-                    continue;
-                }
-
-                // Map event to document
-                let doc = map_event_to_document(&record.event, record.offset.ordinal);
-
-                // Dedup: delete existing doc with same event_id before re-adding.
-                self.delete_existing_event_for_replay(&doc.event_id)?;
-
-                match self.writer.add_document(&doc) {
-                    Ok(()) => result.events_indexed += 1,
-                    Err(IndexWriteError::Rejected { .. }) => result.events_skipped += 1,
-                    Err(e) => return Err(e.into()),
-                }
-
-                last_offset = Some(record.offset.clone());
+                last_offset =
+                    Some(self.index_record(&record.event, &record.offset, &mut result)?);
             }
 
             // Commit the index batch
@@ -1155,25 +1181,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             let mut last_offset: Option<RecorderOffset> = None;
 
             for record in &batch {
-                result.events_read += 1;
-
-                if record.event.schema_version != self.config.expected_event_schema {
-                    result.events_skipped += 1;
-                    last_offset = Some(record.offset.clone());
-                    continue;
-                }
-
-                let doc = map_event_to_document(&record.event, record.offset.ordinal);
-
-                self.delete_existing_event_for_replay(&doc.event_id)?;
-
-                match self.writer.add_document(&doc) {
-                    Ok(()) => result.events_indexed += 1,
-                    Err(IndexWriteError::Rejected { .. }) => result.events_skipped += 1,
-                    Err(e) => return Err(e.into()),
-                }
-
-                last_offset = Some(record.offset.clone());
+                last_offset =
+                    Some(self.index_record(&record.event, &record.offset, &mut result)?);
             }
 
             self.writer.commit()?;
@@ -1275,25 +1284,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             let mut last_offset: Option<RecorderOffset> = None;
 
             for record in &batch {
-                result.events_read += 1;
-
-                if record.event.schema_version != self.config.expected_event_schema {
-                    result.events_skipped += 1;
-                    last_offset = Some(record.offset.clone());
-                    continue;
-                }
-
-                let doc = map_event_to_document(&record.event, record.offset.ordinal);
-
-                self.delete_existing_event_for_replay(&doc.event_id)?;
-
-                match self.writer.add_document(&doc) {
-                    Ok(()) => result.events_indexed += 1,
-                    Err(IndexWriteError::Rejected { .. }) => result.events_skipped += 1,
-                    Err(e) => return Err(e.into()),
-                }
-
-                last_offset = Some(record.offset.clone());
+                last_offset =
+                    Some(self.index_record(&record.event, &record.offset, &mut result)?);
             }
 
             self.writer.commit()?;
@@ -1416,25 +1408,8 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
             let mut last_offset: Option<RecorderOffset> = None;
 
             for record in &batch {
-                result.events_read += 1;
-
-                if record.event.schema_version != self.config.expected_event_schema {
-                    result.events_skipped += 1;
-                    last_offset = Some(record.offset.clone());
-                    continue;
-                }
-
-                let doc = map_event_to_document(&record.event, record.offset.ordinal);
-
-                self.delete_existing_event_for_replay(&doc.event_id)?;
-
-                match self.writer.add_document(&doc) {
-                    Ok(()) => result.events_indexed += 1,
-                    Err(IndexWriteError::Rejected { .. }) => result.events_skipped += 1,
-                    Err(e) => return Err(e.into()),
-                }
-
-                last_offset = Some(record.offset.clone());
+                last_offset =
+                    Some(self.index_record(&record.event, &record.offset, &mut result)?);
             }
 
             self.writer.commit()?;
@@ -1853,6 +1828,50 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    async fn checkpoint_ordinal(
+        storage: &AppendLogRecorderStorage,
+        consumer_id: &str,
+    ) -> Option<u64> {
+        storage
+            .read_checkpoint(&CheckpointConsumerId(consumer_id.to_string()))
+            .await
+            .unwrap()
+            .map(|cp| cp.upto_offset.ordinal)
+    }
+
+    fn assert_schema_mismatch_error(error: IndexerError, event_id: &str, ordinal: u64) {
+        match error {
+            IndexerError::SchemaMismatch {
+                event_id: actual_id,
+                ordinal: actual_ordinal,
+                expected,
+                actual,
+            } => {
+                assert_eq!(actual_id, event_id);
+                assert_eq!(actual_ordinal, ordinal);
+                assert_eq!(expected, RECORDER_EVENT_SCHEMA_VERSION_V1);
+                assert_ne!(actual, RECORDER_EVENT_SCHEMA_VERSION_V1);
+            }
+            other => assert!(false, "expected schema mismatch, got {other:?}"),
+        }
+    }
+
+    fn assert_rejected_error(error: IndexerError) {
+        assert!(
+            matches!(
+                error,
+                IndexerError::IndexWrite(IndexWriteError::Rejected { .. })
+            ),
+            "expected writer rejection, got {error:?}"
+        );
+    }
+
+    fn rejecting_writer(event_id: &str) -> MockIndexWriter {
+        let mut writer = MockIndexWriter::new();
+        writer.reject_event_ids = vec![event_id.to_string()];
+        writer
     }
 
     fn test_sqlite_config(path: &Path) -> FrankenSqliteStorageConfig {
@@ -2339,7 +2358,7 @@ mod tests {
     }
 
     #[test]
-    fn indexer_skips_wrong_schema_version() {
+    fn indexer_schema_mismatch_fails_without_checkpoint() {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
@@ -2353,12 +2372,25 @@ mod tests {
 
             let icfg = test_indexer_config(dir.path());
             let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
-            let result = indexer.run(&storage).await.unwrap();
+            let err = indexer.run(&storage).await.unwrap_err();
 
-            assert_eq!(result.events_read, 2);
-            assert_eq!(result.events_indexed, 1);
-            assert_eq!(result.events_skipped, 1);
-            assert_eq!(indexer.writer().docs[0].event_id, "good-1");
+            assert!(matches!(
+                err,
+                IndexerError::SchemaMismatch {
+                    ref event_id,
+                    ordinal: 0,
+                    ..
+                } if event_id == "bad-1"
+            ));
+            assert!(indexer.writer().docs.is_empty());
+            assert_eq!(indexer.writer().commits, 0);
+            assert!(
+                storage
+                    .read_checkpoint(&CheckpointConsumerId("test-indexer".to_string()))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -2440,7 +2472,7 @@ mod tests {
     }
 
     #[test]
-    fn indexer_rejected_docs_are_skipped() {
+    fn indexer_rejected_doc_fails_without_checkpoint() {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
@@ -2461,11 +2493,178 @@ mod tests {
             writer.reject_event_ids = vec!["reject-me".to_string()];
             let mut indexer = IncrementalIndexer::new(icfg, writer);
 
-            let result = indexer.run(&storage).await.unwrap();
-            assert_eq!(result.events_indexed, 2);
-            assert_eq!(result.events_skipped, 1);
-            // Checkpoint still advances past the rejected event
-            assert_eq!(result.final_ordinal, Some(2));
+            let err = indexer.run(&storage).await.unwrap_err();
+            assert!(matches!(
+                err,
+                IndexerError::IndexWrite(IndexWriteError::Rejected { .. })
+            ));
+            assert_eq!(
+                indexer.writer().docs.len(),
+                1,
+                "the accepted prefix is pending in the writer but must not be committed"
+            );
+            assert_eq!(indexer.writer().commits, 0);
+            assert!(
+                storage
+                    .read_checkpoint(&CheckpointConsumerId("test-indexer".to_string()))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn indexer_schema_mismatch_fails_closed_in_all_run_variants() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+            let mut bad_event = sample_event("bad-schema", 1, 1, "bad");
+            bad_event.schema_version = "ft.recorder.event.v99".to_string();
+            populate_log(
+                &storage,
+                vec![
+                    sample_event("ok-prefix", 1, 0, "prefix"),
+                    bad_event,
+                    sample_event("ok-suffix", 1, 2, "suffix"),
+                ],
+            )
+            .await;
+
+            let source = AppendLogEventSource::from_storage(&storage);
+            let cx = frankenterm_core::cx::for_request();
+
+            let mut run_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "schema-run".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                MockIndexWriter::new(),
+            );
+            let err = run_indexer.run(&storage).await.unwrap_err();
+            assert_schema_mismatch_error(err, "bad-schema", 1);
+            assert_eq!(run_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "schema-run").await, None);
+
+            let mut cx_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "schema-run-cx".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                MockIndexWriter::new(),
+            );
+            let err = cx_indexer.run_with_cx(&cx, &storage).await.unwrap_err();
+            assert_schema_mismatch_error(err, "bad-schema", 1);
+            assert_eq!(cx_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "schema-run-cx").await, None);
+
+            let mut reader_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "schema-reader".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                MockIndexWriter::new(),
+            );
+            let err = reader_indexer
+                .run_with_reader(&storage, &source)
+                .await
+                .unwrap_err();
+            assert_schema_mismatch_error(err, "bad-schema", 1);
+            assert_eq!(reader_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "schema-reader").await, None);
+
+            let mut reader_cx_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "schema-reader-cx".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                MockIndexWriter::new(),
+            );
+            let err = reader_cx_indexer
+                .run_with_reader_with_cx(&cx, &storage, &source)
+                .await
+                .unwrap_err();
+            assert_schema_mismatch_error(err, "bad-schema", 1);
+            assert_eq!(reader_cx_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "schema-reader-cx").await, None);
+        });
+    }
+
+    #[test]
+    fn indexer_writer_rejection_fails_closed_in_all_run_variants() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+            populate_log(
+                &storage,
+                vec![
+                    sample_event("ok-prefix", 1, 0, "prefix"),
+                    sample_event("reject-me", 1, 1, "reject"),
+                    sample_event("ok-suffix", 1, 2, "suffix"),
+                ],
+            )
+            .await;
+
+            let source = AppendLogEventSource::from_storage(&storage);
+            let cx = frankenterm_core::cx::for_request();
+
+            let mut run_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "reject-run".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                rejecting_writer("reject-me"),
+            );
+            let err = run_indexer.run(&storage).await.unwrap_err();
+            assert_rejected_error(err);
+            assert_eq!(run_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "reject-run").await, None);
+
+            let mut cx_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "reject-run-cx".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                rejecting_writer("reject-me"),
+            );
+            let err = cx_indexer.run_with_cx(&cx, &storage).await.unwrap_err();
+            assert_rejected_error(err);
+            assert_eq!(cx_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "reject-run-cx").await, None);
+
+            let mut reader_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "reject-reader".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                rejecting_writer("reject-me"),
+            );
+            let err = reader_indexer
+                .run_with_reader(&storage, &source)
+                .await
+                .unwrap_err();
+            assert_rejected_error(err);
+            assert_eq!(reader_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "reject-reader").await, None);
+
+            let mut reader_cx_indexer = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "reject-reader-cx".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                rejecting_writer("reject-me"),
+            );
+            let err = reader_cx_indexer
+                .run_with_reader_with_cx(&cx, &storage, &source)
+                .await
+                .unwrap_err();
+            assert_rejected_error(err);
+            assert_eq!(reader_cx_indexer.writer().commits, 0);
+            assert_eq!(checkpoint_ordinal(&storage, "reject-reader-cx").await, None);
         });
     }
 
@@ -3669,7 +3868,7 @@ mod tests {
         assert!(matches!(err, LogReadError::Deserialize { .. }));
         match err {
             LogReadError::Deserialize { byte_offset, .. } => assert_eq!(byte_offset, 0),
-            _ => panic!("expected Deserialize"),
+            other => assert!(false, "expected Deserialize, got {other:?}"),
         }
     }
 
@@ -3727,7 +3926,7 @@ mod tests {
                 assert_eq!(byte_offset, 0);
                 assert!(reason.contains("record payload too large"));
             }
-            other => panic!("expected Corrupt error, got {other:?}"),
+            other => assert!(false, "expected Corrupt error, got {other:?}"),
         }
     }
 
@@ -3783,7 +3982,7 @@ mod tests {
             if let Err(LogReadError::Corrupt { reason, .. }) = result {
                 assert!(reason.contains("EOF before reaching ordinal"));
             } else {
-                panic!("expected Corrupt error");
+                assert!(false, "expected Corrupt error");
             }
         });
     }
@@ -3874,11 +4073,11 @@ mod tests {
     }
 
     // =========================================================================
-    // NEW: All-skipped batch still advances checkpoint
+    // NEW: All-invalid batch fails closed without checkpointing
     // =========================================================================
 
     #[test]
-    fn indexer_all_events_wrong_schema_still_commits_checkpoint() {
+    fn indexer_all_events_wrong_schema_fails_without_checkpoint() {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
@@ -3896,15 +4095,24 @@ mod tests {
                 ..test_indexer_config(dir.path())
             };
             let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
-            let result = indexer.run(&storage).await.unwrap();
+            let err = indexer.run(&storage).await.unwrap_err();
 
-            assert_eq!(result.events_read, 2);
-            assert_eq!(result.events_indexed, 0);
-            assert_eq!(result.events_skipped, 2);
-            assert_eq!(result.batches_committed, 1);
-            assert!(result.caught_up);
-            // Checkpoint should still advance
-            assert!(result.final_ordinal.is_some());
+            assert!(matches!(
+                err,
+                IndexerError::SchemaMismatch {
+                    ref event_id,
+                    ordinal: 0,
+                    ..
+                } if event_id == "bad-1"
+            ));
+            assert_eq!(indexer.writer().commits, 0);
+            assert!(
+                storage
+                    .read_checkpoint(&CheckpointConsumerId("all-skip-test".to_string()))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -4564,7 +4772,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_dedup_skips_identical_schema_mismatch() {
+    fn parity_schema_mismatch_fails_closed_in_legacy_and_reader_paths() {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
@@ -4584,15 +4792,27 @@ mod tests {
             populate_log(&storage, events).await;
 
             let source = AppendLogEventSource::from_storage(&storage);
-            let icfg = test_indexer_config(dir.path());
-            let (r1, r2) = run_both_paths(&storage, &source, icfg).await;
+            let mut legacy = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "schema-parity-legacy".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                MockIndexWriter::new(),
+            );
+            let legacy_err = legacy.run(&storage).await.unwrap_err();
+            assert_schema_mismatch_error(legacy_err, "e3", 2);
+            assert_eq!(legacy.writer().commits, 0);
 
-            assert_eq!(r1.events_read, 4);
-            assert_eq!(r1.events_indexed, 3); // e3 skipped
-            assert_eq!(r1.events_skipped, 1);
-            assert_eq!(r1.events_read, r2.events_read);
-            assert_eq!(r1.events_indexed, r2.events_indexed);
-            assert_eq!(r1.events_skipped, r2.events_skipped);
+            let mut reader = IncrementalIndexer::new(
+                IndexerConfig {
+                    consumer_id: "schema-parity-reader".to_string(),
+                    ..test_indexer_config(dir.path())
+                },
+                MockIndexWriter::new(),
+            );
+            let reader_err = reader.run_with_reader(&storage, &source).await.unwrap_err();
+            assert_schema_mismatch_error(reader_err, "e3", 2);
+            assert_eq!(reader.writer().commits, 0);
         });
     }
 
