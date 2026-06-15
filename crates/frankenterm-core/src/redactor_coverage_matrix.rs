@@ -435,7 +435,7 @@ fn pos(
 ) -> RedactorTestVector {
     let start = input
         .find(secret)
-        .unwrap_or_else(|| panic!("secret {secret:?} not in input {input:?}"));
+        .expect("positive redactor fixture secret must be embedded in input");
     let end = start + secret.len();
     RedactorTestVector {
         name: name.to_string(),
@@ -476,30 +476,30 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "anthropic_basic",
             "anthropic",
             "canonical sk-ant- prefix; ensures the Anthropic regex runs before the OpenAI sk- alternation",
-            "API_KEY=sk-ant-api03-XXXXXXXXXXXXXXXXXXXX1234567890",
-            "sk-ant-api03-XXXXXXXXXXXXXXXXXXXX1234567890",
+            "API_KEY=sk-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX1234567890",
+            "sk-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX1234567890",
             "anthropic_key",
         ),
         pos(
             "anthropic_admin",
             "anthropic",
             "admin variant — sk-ant-admin01-",
-            "secret: sk-ant-admin01-aaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "sk-ant-admin01-aaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "secret: sk-ant-admin01-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sk-ant-admin01-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "anthropic_key",
         ),
         pos(
             "anthropic_in_log",
             "anthropic",
             "embedded in a log line; ensures regex doesn't require boundary",
-            "[2026-05-01T07:00:00Z] auth=sk-ant-api03-FGHIJKLMNOPQRSTUVWXYZ1234567890 status=ok",
-            "sk-ant-api03-FGHIJKLMNOPQRSTUVWXYZ1234567890",
+            "[2026-05-01T07:00:00Z] auth=sk-ant-api03-FGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH status=ok",
+            "sk-ant-api03-FGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGH",
             "anthropic_key",
         ),
         neg(
             "anthropic_too_short",
             "anthropic",
-            "below the {20,} threshold; must NOT match",
+            "below the {40,} post-sk-ant- threshold; must NOT match",
             "broken: sk-ant-shortie",
         ),
         // -----------------------------------------------------
@@ -1540,8 +1540,8 @@ mod tests {
             "smoke_anthropic",
             "anthropic",
             "smoke",
-            "key=sk-ant-api03-1234567890123456789012345",
-            "sk-ant-api03-1234567890123456789012345",
+            "key=sk-ant-api03-1234567890123456789012345678901234567890",
+            "sk-ant-api03-1234567890123456789012345678901234567890",
             "anthropic_key",
         );
         let eval = evaluate_vector(&v);
