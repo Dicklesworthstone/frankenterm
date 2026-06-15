@@ -1078,6 +1078,12 @@ SEE ALSO:
         /// Output as JSON (for automation)
         #[arg(long)]
         json: bool,
+        /// Explain RCH proof-lane admission using a live host/disk/queue probe
+        #[arg(long = "rch-admission")]
+        rch_admission: bool,
+        /// Proof command to analyze for --rch-admission (defaults to a core test)
+        #[arg(long = "rch-admission-command")]
+        rch_admission_command: Option<String>,
     },
 
     /// Explain proof-lane command intent before running expensive RCH proof
@@ -3579,6 +3585,14 @@ enum RobotCommands {
         #[arg(long)]
         approval_code: Option<String>,
 
+        /// Return a SubmitReceipt using submitted-level verification
+        #[arg(long)]
+        verify_submit: bool,
+
+        /// SubmitReceipt guarantee level; setting this enables verified-submit receipts
+        #[arg(long, value_enum)]
+        submit_level: Option<SubmitGuaranteeLevelArg>,
+
         /// Verify by waiting for a pattern after sending
         #[arg(long)]
         wait_for: Option<String>,
@@ -3865,6 +3879,10 @@ enum RobotCommands {
 
     /// Get watcher health snapshot and resize control-plane lifecycle/stall introspection
     Health,
+
+    /// Get current rate/usage limits with per-window reset times and a fleet
+    /// capacity forecast timeline (ft-7h5da.8.2)
+    Limits,
 
     /// Get current swarm capacity certificate/controller summary
     Capacity {
@@ -8480,7 +8498,7 @@ fn proof_history_sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    hex::encode(digest)
 }
 
 #[derive(Debug, Clone)]
@@ -10477,7 +10495,7 @@ fn resource_what_if_sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    hex::encode(digest)
 }
 
 fn resource_what_if_label<T: serde::Serialize>(value: &T) -> String {
@@ -17841,7 +17859,7 @@ fn robot_context_hash(parts: &[&str]) -> String {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn robot_context_make_id(prefix: &str, parts: &[&str]) -> String {
@@ -21846,14 +21864,17 @@ mod watch_events_tests {
 
     #[test]
     fn envelope_cursor_equals_id_and_redacts_matched_text_and_extracted() {
-        let mut e = ev(42, "codex.secret_leak", "error", Some("token=AKIAIOSFODNN7EXAMPLE"));
+        let mut e = ev(
+            42,
+            "codex.secret_leak",
+            "error",
+            Some("token=AKIAIOSFODNN7EXAMPLE"),
+        );
         // A nested secret inside the structured `extracted` payload, plus a
         // non-secret field that must survive redaction.
         e.extracted = Some(serde_json::json!({"key": "AKIAIOSFODNN7EXAMPLE", "count": 3}));
-        let redacted = frankenterm_core::export::redact_event(
-            e,
-            &frankenterm_core::redactor::Redactor::new(),
-        );
+        let redacted =
+            frankenterm_core::export::redact_event(e, &frankenterm_core::redactor::Redactor::new());
         let v = watch_event_ndjson(&redacted);
         assert_eq!(v["type"], "event");
         assert_eq!(v["cursor"], 42);
@@ -25858,17 +25879,10 @@ async fn distributed_persist_payload(
         }
         WirePayload::Gap(gap) => {
             let remote_pane_id = distributed_remote_pane_id(&canonical_sender, gap.pane_id);
-            let seq_key = (sequence_scope.clone(), gap.pane_id);
-            let previous_seq;
-            {
-                let mut seq_guard = pane_seq_by_sender.lock().await;
-                previous_seq = seq_guard.get(&seq_key).copied();
-                let next_expected_seq = gap.seq_after.saturating_sub(1);
-                seq_guard
-                    .entry(seq_key.clone())
-                    .and_modify(|current| *current = (*current).max(next_expected_seq))
-                    .or_insert(next_expected_seq);
-            }
+            // A GapNotice is forensic evidence from the sender, not proof that
+            // all intermediate pane deltas were observed by the aggregator. Keep
+            // the delta acceptance frontier driven only by accepted PaneDelta
+            // payloads; otherwise a forged high seq_after can silence the pane.
 
             let persist_result: anyhow::Result<()> = async {
                 let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -25910,18 +25924,6 @@ async fn distributed_persist_payload(
                 Ok(())
             }
             .await;
-
-            if persist_result.is_err() {
-                let mut seq_guard = pane_seq_by_sender.lock().await;
-                match previous_seq {
-                    Some(previous_seq) => {
-                        seq_guard.insert(seq_key, previous_seq);
-                    }
-                    None => {
-                        seq_guard.remove(&seq_key);
-                    }
-                }
-            }
 
             persist_result?;
         }
@@ -27457,6 +27459,8 @@ async fn distributed_agent_stream_event(
         | Event::WorkflowStep { .. }
         | Event::WorkflowCompleted { .. }
         | Event::UserVarReceived { .. } => Ok(()),
+        #[cfg(feature = "subprocess-bridge")]
+        Event::MissionAudit { .. } => Ok(()),
     }
 }
 
@@ -31494,6 +31498,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             text,
                             dry_run,
                             approval_code,
+                            verify_submit,
+                            submit_level,
                             wait_for,
                             timeout_secs,
                             wait_for_regex,
@@ -31502,8 +31508,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             let no_paste = false;
                             let no_newline = false;
-                            let verify_submit = false;
-                            let submit_level: Option<SubmitGuaranteeLevelArg> = None;
                             let redacted_text = redact_for_output(&text);
                             let redacted_wait_for = wait_for
                                 .as_ref()
@@ -34116,8 +34120,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         }
                                                         IpcRelayAction::Emitted
                                                         | IpcRelayAction::Skipped => {
-                                                            last_emit =
-                                                                std::time::Instant::now();
+                                                            last_emit = std::time::Instant::now();
                                                         }
                                                     }
                                                 }
@@ -34170,10 +34173,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                                 // See above: blocking-pool delay (async timer
                                 // sleep hangs without a timer-capable cx).
-                                let _ = frankenterm_core::runtime_async::spawn_blocking(
-                                    move || std::thread::sleep(poll),
-                                )
-                                .await;
+                                let _ =
+                                    frankenterm_core::runtime_async::spawn_blocking(move || {
+                                        std::thread::sleep(poll)
+                                    })
+                                    .await;
                             }
 
                             storage.shutdown().await.ok();
@@ -34203,28 +34207,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 }
                             }
                             for spec in &any {
-                                any_conds.push(
-                                    parse_await_condition(spec).expect("validated above"),
-                                );
+                                any_conds
+                                    .push(parse_await_condition(spec).expect("validated above"));
                             }
                             for spec in &all {
-                                all_conds.push(
-                                    parse_await_condition(spec).expect("validated above"),
-                                );
+                                all_conds
+                                    .push(parse_await_condition(spec).expect("validated above"));
                             }
                             if any_conds.is_empty() && all_conds.is_empty() {
-                                let response =
-                                    RobotResponse::<serde_json::Value>::error_with_code(
-                                        ROBOT_ERR_INVALID_ARGS,
-                                        "await requires at least one --any or --all condition"
-                                            .to_string(),
-                                        Some(
-                                            "Example: ft robot await --all 'rule:build.done' \
+                                let response = RobotResponse::<serde_json::Value>::error_with_code(
+                                    ROBOT_ERR_INVALID_ARGS,
+                                    "await requires at least one --any or --all condition"
+                                        .to_string(),
+                                    Some(
+                                        "Example: ft robot await --all 'rule:build.done' \
                                              --timeout-secs 60"
-                                                .to_string(),
-                                        ),
-                                        elapsed_ms(start),
-                                    );
+                                            .to_string(),
+                                    ),
+                                    elapsed_ms(start),
+                                );
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
@@ -34283,18 +34284,23 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     unhandled_only: false,
                                     // Default (no --cursor): only events that
                                     // arrive after the await starts.
-                                    since: if after_id.is_some() { None } else { Some(start_ms) },
+                                    since: if after_id.is_some() {
+                                        None
+                                    } else {
+                                        Some(start_ms)
+                                    },
                                     until: None,
                                 };
                                 let events = match storage.get_events_stream(query).await {
                                     Ok(e) => e,
                                     Err(e) => {
-                                        let response = RobotResponse::<serde_json::Value>::error_with_code(
-                                            ROBOT_ERR_STORAGE,
-                                            format!("Failed to query events: {e}"),
-                                            None,
-                                            elapsed_ms(start),
-                                        );
+                                        let response =
+                                            RobotResponse::<serde_json::Value>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!("Failed to query events: {e}"),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
                                         print_robot_response(&response, format, stats)?;
                                         storage.shutdown().await.ok();
                                         return Ok(());
@@ -34369,10 +34375,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 // Inter-poll delay. The robot dispatch has no
                                 // ambient timer-capable cx, so an async timer
                                 // sleep hangs; offload to the blocking pool.
-                                let _ = frankenterm_core::runtime_async::spawn_blocking(
-                                    move || std::thread::sleep(poll),
-                                )
-                                .await;
+                                let _ =
+                                    frankenterm_core::runtime_async::spawn_blocking(move || {
+                                        std::thread::sleep(poll)
+                                    })
+                                    .await;
                             };
 
                             let any_status: Vec<(String, bool)> =
@@ -37434,6 +37441,81 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             if let Err(e) = storage.shutdown().await {
                                 tracing::warn!("Failed to shutdown storage cleanly: {e}");
                             }
+                        }
+                        RobotCommands::Limits => {
+                            // ft-7h5da.8.2 (W7.2): current rate/usage limits +
+                            // deterministic fleet capacity forecast from the
+                            // durable limit_windows ledger.
+                            type LimitsData = frankenterm_core::limit_forecast::LimitsForecast;
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response = RobotResponse::<LimitsData>::error_with_code(
+                                        ROBOT_ERR_CONFIG,
+                                        format!("Failed to get workspace layout: {e}"),
+                                        Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let db_path = layout.db_path.to_string_lossy();
+                            let storage =
+                                match frankenterm_core::storage::StorageHandle::new(&db_path).await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        let response = RobotResponse::<LimitsData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to open storage: {e}"),
+                                            Some(
+                                                "Is the database initialized? Run 'ft watch' first."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+                            let cx = frankenterm_core::cx::Cx::current()
+                                .unwrap_or_else(frankenterm_core::cx::for_request);
+                            let now = now_ms_i64();
+                            let total_panes = match storage.get_panes_with_cx(&cx).await {
+                                Ok(panes) => u32::try_from(panes.len()).unwrap_or(u32::MAX),
+                                Err(e) => {
+                                    let response = RobotResponse::<LimitsData>::error_with_code(
+                                        ROBOT_ERR_STORAGE,
+                                        format!("Failed to count panes: {e}"),
+                                        None,
+                                        elapsed_ms(start),
+                                    );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let windows =
+                                match storage.list_active_limit_windows_with_cx(&cx, now).await {
+                                    Ok(w) => w,
+                                    Err(e) => {
+                                        let response = RobotResponse::<LimitsData>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!("Failed to read limit windows: {e}"),
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+                            let forecast = frankenterm_core::limit_forecast::build_limits_forecast(
+                                now,
+                                total_panes,
+                                &windows,
+                            );
+                            let response = RobotResponse::success(forecast, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Health => {
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
@@ -41870,7 +41952,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 ttl_ms,
                 format,
             } => {
-                use frankenterm_core::steer_plan::{SteerPlanScenario, plan_status_label, steer_plan};
+                use frankenterm_core::steer_plan::{
+                    SteerPlanScenario, plan_status_label, steer_plan,
+                };
                 let as_json = format.eq_ignore_ascii_case("json");
                 let scenario = match SteerPlanScenario::parse(&scenario) {
                     Ok(s) => s,
@@ -41927,7 +42011,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let db_path = layout.db_path.to_string_lossy();
                 let open_cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
-                match frankenterm_core::storage::StorageHandle::new_with_cx(&open_cx, &db_path).await
+                match frankenterm_core::storage::StorageHandle::new_with_cx(&open_cx, &db_path)
+                    .await
                 {
                     Ok(storage) => {
                         let policy_decision = if result.policy_verdict.starts_with("envelope.admit")
@@ -44250,9 +44335,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 } => (
                     InterventionVerb::Takeover,
                     pane_id,
-                    reason.unwrap_or_else(|| {
-                        InterventionVerb::Takeover.default_reason().to_string()
-                    }),
+                    reason
+                        .unwrap_or_else(|| InterventionVerb::Takeover.default_reason().to_string()),
                     ttl,
                     approval_code,
                     dry_run,
@@ -44306,16 +44390,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 reason
             );
             let summary = engine.redact_secrets(&raw_summary);
-            let mut input =
-                frankenterm_core::policy::PolicyInput::new(
-                    verb.policy_action(),
-                    frankenterm_core::policy::ActorKind::Human,
-                )
-                .with_surface(frankenterm_core::policy::PolicySurface::Mux)
-                .with_pane(pane_id)
-                .with_capabilities(capabilities)
-                .with_text_summary(&summary)
-                .with_command_text(format!("ft intervene {} {pane_id}", verb.as_str()));
+            let mut input = frankenterm_core::policy::PolicyInput::new(
+                verb.policy_action(),
+                frankenterm_core::policy::ActorKind::Human,
+            )
+            .with_surface(frankenterm_core::policy::PolicySurface::Mux)
+            .with_pane(pane_id)
+            .with_capabilities(capabilities)
+            .with_text_summary(&summary)
+            .with_command_text(format!("ft intervene {} {pane_id}", verb.as_str()));
             if let Some(domain) = domain.clone() {
                 input = input.with_domain(domain);
             }
@@ -44358,8 +44441,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         InterventionVerb::Pause
                         | InterventionVerb::Quarantine
                         | InterventionVerb::Takeover => {
-                            let ttl_ms = i64::try_from(ttl.saturating_mul(1000))
-                                .unwrap_or(i64::MAX);
+                            let ttl_ms =
+                                i64::try_from(ttl.saturating_mul(1000)).unwrap_or(i64::MAX);
                             match storage
                                 .create_reservation_with_cx(
                                     &storage_cx,
@@ -44375,25 +44458,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     reservation = Some(reservation_info_from_record(record));
                                     console.execute("cli", verb.action(pane_id, &reason))
                                 }
-                                Err(e) => frankenterm_core::intervention_console::InterventionResult {
-                                    success: false,
-                                    message: format!("failed to reserve pane {pane_id}: {e}"),
-                                    previous_state: None,
-                                    new_state: None,
-                                },
-                            }
-                        }
-                        InterventionVerb::Resume => {
-                            match storage
-                                .list_active_reservations_with_cx(&storage_cx)
-                                .await
-                            {
                                 Err(e) => {
                                     frankenterm_core::intervention_console::InterventionResult {
                                         success: false,
-                                        message: format!(
-                                            "failed to list active reservations: {e}"
-                                        ),
+                                        message: format!("failed to reserve pane {pane_id}: {e}"),
+                                        previous_state: None,
+                                        new_state: None,
+                                    }
+                                }
+                            }
+                        }
+                        InterventionVerb::Resume => {
+                            match storage.list_active_reservations_with_cx(&storage_cx).await {
+                                Err(e) => {
+                                    frankenterm_core::intervention_console::InterventionResult {
+                                        success: false,
+                                        message: format!("failed to list active reservations: {e}"),
                                         previous_state: None,
                                         new_state: None,
                                     }
@@ -44420,10 +44500,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         if let Some(first) = intervention_reservations.first() {
                                             let first_owner_id = first.owner_id.clone();
                                             let replay_action = match first_owner_id.as_str() {
-                                                "intervene:takeover" => {
-                                                    InterventionVerb::Takeover
-                                                        .action(pane_id, &reason)
-                                                }
+                                                "intervene:takeover" => InterventionVerb::Takeover
+                                                    .action(pane_id, &reason),
                                                 "intervene:quarantine" => {
                                                     InterventionVerb::Quarantine
                                                         .action(pane_id, &reason)
@@ -44432,7 +44510,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     InterventionVerb::Pause.action(pane_id, &reason)
                                                 }
                                             };
-                                            let _ = console.execute("storage:replay", replay_action);
+                                            let _ =
+                                                console.execute("storage:replay", replay_action);
                                             for record in intervention_reservations {
                                                 match storage
                                                     .release_reservation_with_cx(
@@ -45679,7 +45758,48 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             }
         }
 
-        Some(Commands::Doctor { circuits, json }) => {
+        Some(Commands::Doctor {
+            circuits,
+            json,
+            rch_admission,
+            rch_admission_command,
+        }) => {
+            if rch_admission {
+                let repo_root = std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let proof_command = rch_admission_command.unwrap_or_else(|| {
+                    "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- \
+                     cargo test -p frankenterm-core --lib"
+                        .to_string()
+                });
+                let generated_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                    .unwrap_or(0);
+                let input = frankenterm_core::rch_admission::collect_live_rch_admission_input(
+                    &repo_root,
+                    &proof_command,
+                    generated_at_ms,
+                );
+                let report =
+                    frankenterm_core::rch_admission::build_rch_admission_report(&input);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    );
+                } else {
+                    let surface = frankenterm_core::rch_admission_surface::RchAdmissionSurface::from_report(
+                        frankenterm_core::rch_admission_surface::RchAdmissionSurfaceKind::Doctor,
+                        report,
+                    );
+                    for line in surface.doctor_lines() {
+                        println!("{line}");
+                    }
+                }
+                return Ok(());
+            }
             let checks = run_diagnostics(&permission_warnings, &config, &layout);
             let mut all_checks: Vec<DiagnosticCheck> = checks;
             let session_report = layout
@@ -58800,7 +58920,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    hex::encode(digest)
 }
 
 fn decode_bundled_pragmasevka_archive() -> anyhow::Result<Vec<u8>> {
@@ -67209,10 +67329,10 @@ recorder_backend = "frankensqlite"
 
     #[cfg(feature = "distributed")]
     #[test]
-    fn distributed_persist_payload_explicit_gap_advances_sender_sequence_tracker() {
+    fn distributed_persist_payload_explicit_gap_does_not_advance_sender_sequence_tracker() {
         run_async_test(async {
             let (storage_handle, db_path) =
-                setup_storage("distributed_explicit_gap_advances_sender_tracker").await;
+                setup_storage("distributed_explicit_gap_does_not_advance_sender_tracker").await;
             let storage =
                 std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
             let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
@@ -67252,8 +67372,8 @@ recorder_backend = "frankensqlite"
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
                         seq_before: 0,
-                        seq_after: 4,
-                        reason: "timeout".to_string(),
+                        seq_after: u64::MAX,
+                        reason: "forged-high-gap".to_string(),
                         detected_at_ms: now_ms_i64(),
                     },
                 ),
@@ -67270,7 +67390,7 @@ recorder_backend = "frankensqlite"
                 frankenterm_core::wire_protocol::WirePayload::PaneDelta(
                     frankenterm_core::wire_protocol::PaneDelta {
                         pane_id: source_pane_id,
-                        seq: 4,
+                        seq: 1,
                         content: "after-gap".to_string(),
                         content_len: "after-gap".len(),
                         captured_at_ms: now_ms(),
@@ -67291,15 +67411,33 @@ recorder_backend = "frankensqlite"
                     .filter(|gap| gap.pane_id == remote_pane_id)
                     .collect();
                 assert_eq!(pane_gaps.len(), 1);
-                assert_eq!(pane_gaps[0].reason, "distributed_gap:timeout:0:4");
+                assert_eq!(
+                    pane_gaps.first().map(|gap| gap.reason.as_str()),
+                    Some("distributed_gap:forged-high-gap:0:18446744073709551615")
+                );
 
                 let segments = storage_handle
                     .get_segments(remote_pane_id, 10)
                     .await
                     .unwrap();
                 assert_eq!(segments.len(), 2);
-                assert_eq!(segments[0].content, "after-gap");
-                assert_eq!(segments[1].content, "before-gap");
+                assert_eq!(
+                    segments.first().map(|segment| segment.content.as_str()),
+                    Some("after-gap")
+                );
+                assert_eq!(
+                    segments.get(1).map(|segment| segment.content.as_str()),
+                    Some("before-gap")
+                );
+            }
+
+            {
+                let pane_seq_guard = pane_seq_by_sender.lock().await;
+                assert_eq!(
+                    pane_seq_guard.get(&(sender.to_string(), source_pane_id)),
+                    Some(&1),
+                    "accepted PaneDelta payloads, not explicit gaps, advance the sequence tracker"
+                );
             }
 
             {

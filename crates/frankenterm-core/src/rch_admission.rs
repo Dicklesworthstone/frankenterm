@@ -1725,11 +1725,13 @@ fn proof_command_analysis_from_cargo(
             )
         });
     let explanation = proof_command_explanation(
-        remote_required,
-        no_self_healing,
-        rch_exec_wrapped,
+        ProofCommandExplanationFlags {
+            remote_required,
+            no_self_healing,
+            rch_exec_wrapped,
+            proof_intent_compatible,
+        },
         target_dir_hygiene,
-        proof_intent_compatible,
         cargo,
     );
 
@@ -1887,14 +1889,24 @@ fn rch_no_self_healing_flag(words: &[String]) -> bool {
         .any(|word| word == "--no-self-healing")
 }
 
-fn proof_command_explanation(
+struct ProofCommandExplanationFlags {
     remote_required: bool,
     no_self_healing: bool,
     rch_exec_wrapped: bool,
-    target_dir_hygiene: RchAdmissionTargetDirHygiene,
     proof_intent_compatible: bool,
+}
+
+fn proof_command_explanation(
+    flags: ProofCommandExplanationFlags,
+    target_dir_hygiene: RchAdmissionTargetDirHygiene,
     cargo: &RchAdmissionCargoCommandAnalysis,
 ) -> String {
+    let ProofCommandExplanationFlags {
+        remote_required,
+        no_self_healing,
+        rch_exec_wrapped,
+        proof_intent_compatible,
+    } = flags;
     format!(
         "remote_required={remote_required}; no_self_healing={no_self_healing}; rch_exec_wrapped={rch_exec_wrapped}; target_dir_hygiene={target_dir_hygiene:?}; proof_intent_compatible={proof_intent_compatible}; {}",
         cargo.explanation
@@ -1926,8 +1938,288 @@ fn deferred_preflight_summary(
     let reason = admission_report
         .reason_codes
         .first()
-        .map_or("unknown".to_string(), |reason| format!("{reason:?}"));
+        .map_or_else(|| "unknown".to_string(), |reason| format!("{reason:?}"));
     format!("deferred: {reason}; queue intent; predicted_at_ms={predicted_at_ms}")
+}
+
+// ── Live admission collector (ft-69gwh.9) ──────────────────────────────────
+//
+// `build_rch_admission_report` requires an `RchAdmissionCollectorInput`. Before
+// this collector existed that input was only ever constructed in tests, so the
+// whole admission analyzer/report path was inert in production. These
+// read-only probes (`df` / `git status` / `rch -F json status` / filesystem
+// writeability) gather live host state into a populated input behind
+// `ft doctor --rch-admission`. Parsing is split into pure, unit-tested helpers;
+// `collect_live_rch_admission_input` is the thin process-spawning orchestrator.
+
+/// Parse the `Available` column (1024-byte blocks) from `df -k <path>` output
+/// into a byte count. Locates the column by its header (`Avail`…) so it works
+/// across the macOS and Linux `df` header layouts.
+#[must_use]
+pub fn parse_df_available_bytes(df_output: &str) -> Option<u64> {
+    let mut lines = df_output.lines().filter(|line| !line.trim().is_empty());
+    let header = lines.next()?;
+    let avail_idx = header
+        .split_whitespace()
+        .position(|field| field.to_ascii_lowercase().starts_with("avail"))?;
+    let data = lines.find(|line| line.split_whitespace().count() > avail_idx)?;
+    let blocks: u64 = data.split_whitespace().nth(avail_idx)?.parse().ok()?;
+    Some(blocks.saturating_mul(1024))
+}
+
+fn porcelain_category(status: &str) -> &'static str {
+    if status == "??" {
+        "untracked"
+    } else if status.contains('D') {
+        "deleted"
+    } else if status.contains('A') {
+        "added"
+    } else if status.contains('R') {
+        "renamed"
+    } else if status.contains('M') {
+        "modified"
+    } else {
+        "dirty_tree"
+    }
+}
+
+/// Parse `git status --porcelain` into dirty-path diagnostics (status code +
+/// derived category). Lines shorter than `XY path` are ignored.
+#[must_use]
+pub fn parse_git_porcelain_dirty(porcelain: &str) -> Vec<RchAdmissionGitDirtyPath> {
+    porcelain
+        .lines()
+        .filter(|line| line.len() >= 4)
+        .filter_map(|line| {
+            let status = line.get(0..2).unwrap_or("  ").trim();
+            let path = line.get(3..).unwrap_or("").trim();
+            if path.is_empty() {
+                return None;
+            }
+            let category = porcelain_category(status);
+            let status_label = if status.is_empty() { "dirty" } else { status };
+            Some(RchAdmissionGitDirtyPath::new(path, status_label, category))
+        })
+        .collect()
+}
+
+fn rch_status_data(value: &serde_json::Value) -> &serde_json::Value {
+    value.get("data").unwrap_or(value)
+}
+
+/// Parse `rch -F json status` into a queue diagnostic (posture + worker/slot
+/// counts). Returns `unknown()` if the JSON is malformed or missing fields.
+#[must_use]
+pub fn parse_rch_status_queue(json: &str) -> RchAdmissionQueueDiagnostic {
+    let mut queue = RchAdmissionQueueDiagnostic::unknown();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return queue;
+    };
+    let data = rch_status_data(&value);
+    if let Some(posture) = data.get("posture").and_then(serde_json::Value::as_str) {
+        queue.posture = Some(posture.to_string());
+    }
+    let daemon = data
+        .get("daemon")
+        .and_then(|outer| outer.get("daemon"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let as_u32 = |node: &serde_json::Value, key: &str| -> Option<u32> {
+        node.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
+    queue.workers_total = as_u32(&daemon, "workers_total");
+    queue.workers_healthy = as_u32(&daemon, "workers_healthy");
+    queue.worker_slots_available = as_u32(&daemon, "slots_available");
+    queue
+}
+
+/// Derive worker-rejection diagnostics from any non-healthy workers in the
+/// `rch -F json status` worker list.
+#[must_use]
+pub fn parse_rch_status_worker_rejections(json: &str) -> Vec<RchAdmissionWorkerRejection> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let data = rch_status_data(&value);
+    let Some(workers) = data
+        .get("daemon")
+        .and_then(|outer| outer.get("workers"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    workers
+        .iter()
+        .filter_map(|worker| {
+            let status = worker
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            if status == "healthy" {
+                return None;
+            }
+            let id = worker
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let (reason_code, severity) = match status {
+                "unhealthy" | "critical" | "offline" => (
+                    RchAdmissionReasonCode::NoAdmissibleWorkers,
+                    RchAdmissionSeverity::Blocked,
+                ),
+                _ => (
+                    RchAdmissionReasonCode::TelemetryGap,
+                    RchAdmissionSeverity::Warning,
+                ),
+            };
+            Some(RchAdmissionWorkerRejection::new(
+                id,
+                reason_code,
+                format!("worker status={status}"),
+                severity,
+            ))
+        })
+        .collect()
+}
+
+fn run_probe(cmd: &str, args: &[&str], cwd: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new(cmd)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).ok()
+    } else {
+        None
+    }
+}
+
+fn write_probe(dir: &std::path::Path, label: &str) -> RchAdmissionProbeDiagnostic {
+    let probe_path = dir.join(".ft-rch-admission-write-probe");
+    match std::fs::write(&probe_path, b"ft") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe_path);
+            RchAdmissionProbeDiagnostic::ok(format!("{label} writeable"))
+        }
+        Err(err) => {
+            let code = err
+                .raw_os_error()
+                .filter(|c| *c == 28)
+                .map_or_else(|| format!("{label}.write_failed"), |_| "ENOSPC".to_string());
+            RchAdmissionProbeDiagnostic::failed(code, format!("{label} write failed: {err}"))
+        }
+    }
+}
+
+fn path_writeable(path: &std::path::Path) -> Option<bool> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| !meta.permissions().readonly())
+}
+
+/// Gather live host/disk/beads/rch-queue/git state into a populated
+/// `RchAdmissionCollectorInput` for `proof_command`. Read-only: every probe is
+/// a status query or a self-cleaning write probe; failures are recorded as
+/// collector observations rather than aborting the report.
+#[must_use]
+pub fn collect_live_rch_admission_input(
+    repo_root: &std::path::Path,
+    proof_command: &str,
+    generated_at_ms: u64,
+) -> RchAdmissionCollectorInput {
+    let mut input = RchAdmissionCollectorInput::new(
+        generated_at_ms,
+        "ft doctor --rch-admission",
+        RchAdmissionCommandDiagnostic::new(proof_command),
+    );
+
+    // Local disk: repo volume + /private/tmp free space, plus write probes.
+    let system_data_free_bytes = run_probe("df", &["-k", "."], repo_root)
+        .as_deref()
+        .and_then(parse_df_available_bytes);
+    let private_tmp_free_bytes = run_probe("df", &["-k", "/private/tmp"], repo_root)
+        .as_deref()
+        .and_then(parse_df_available_bytes)
+        .or_else(|| {
+            run_probe("df", &["-k", "/tmp"], repo_root)
+                .as_deref()
+                .and_then(parse_df_available_bytes)
+        });
+    input.local_disk = RchAdmissionLocalDiskDiagnostic {
+        system_data_free_bytes,
+        private_tmp_free_bytes,
+        repo_write_probe: write_probe(repo_root, "repo"),
+        rch_cache_write_probe: write_probe(&std::env::temp_dir(), "cargo target tmp"),
+    };
+
+    // Beads writeability (DB + JSONL) under .beads/.
+    let beads_dir = repo_root.join(".beads");
+    let db_writeable = std::fs::read_dir(&beads_dir).ok().and_then(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+            })
+            .and_then(|entry| path_writeable(&entry.path()))
+    });
+    input.beads = RchAdmissionBeadsDiagnostic {
+        db_writeable,
+        jsonl_writeable: path_writeable(&beads_dir.join("issues.jsonl")),
+        active_bead: None,
+        blocking_beads: Vec::new(),
+    };
+
+    // RCH queue posture + worker rejections (status query, never a build).
+    match run_probe("rch", &["-F", "json", "status"], repo_root) {
+        Some(json) => {
+            input.rch_queue = parse_rch_status_queue(&json);
+            input.worker_rejections = parse_rch_status_worker_rejections(&json);
+        }
+        None => input.collector_observations.push(
+            RchAdmissionCollectorObservation::new(
+                "rch.status",
+                "rch -F json status",
+                "rch status unavailable; queue posture unknown",
+            )
+            .error_category("probe_unavailable"),
+        ),
+    }
+
+    // Git dirty tree (RCH syncs the working tree, so dirty paths matter).
+    match run_probe("git", &["status", "--porcelain"], repo_root) {
+        Some(porcelain) => {
+            for dirty in parse_git_porcelain_dirty(&porcelain) {
+                input = input.with_git_dirty_path(dirty);
+            }
+        }
+        None => input.collector_observations.push(
+            RchAdmissionCollectorObservation::new(
+                "git.status",
+                "git status --porcelain",
+                "git status unavailable; dirty-tree state unknown",
+            )
+            .error_category("probe_unavailable"),
+        ),
+    }
+
+    // Agent Mail is a chronically-slow shared singleton; do not block the
+    // collector on it (AGENTS.md: proceed without agent-mail on failure).
+    input.collector_observations.push(
+        RchAdmissionCollectorObservation::new(
+            "agent_mail",
+            "skipped",
+            "agent-mail probe skipped (bounded best-effort; shared singleton, chronic timeouts)",
+        )
+        .error_category("probe_skipped"),
+    );
+
+    input
 }
 
 #[cfg(test)]
@@ -1966,9 +2258,11 @@ mod tests {
         );
         assert!(analysis.slot_estimate_mismatch);
         assert!(analysis.explanation.contains("explicit cargo job count 1"));
-        assert!(analysis
-            .explanation
-            .contains("installed_selector_estimated_slots=4"));
+        assert!(
+            analysis
+                .explanation
+                .contains("installed_selector_estimated_slots=4")
+        );
         assert!(analysis.explanation.contains("slot_estimate_mismatch=true"));
     }
 
@@ -2010,9 +2304,11 @@ mod tests {
         assert_eq!(analysis.estimated_slots, 2);
         assert!(!analysis.slot_estimate_mismatch);
         assert!(analysis.explanation.contains("explicit cargo job count 2"));
-        assert!(analysis
-            .explanation
-            .contains("target_triple=x86_64-pc-windows-gnu"));
+        assert!(
+            analysis
+                .explanation
+                .contains("target_triple=x86_64-pc-windows-gnu")
+        );
     }
 
     #[test]
@@ -2099,12 +2395,16 @@ mod tests {
             ]
         );
         assert!(report.advisory_only);
-        assert!(report
-            .forbidden_actions
-            .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof));
-        assert!(report
-            .forbidden_actions
-            .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval));
+        assert!(
+            report
+                .forbidden_actions
+                .contains(&RchAdmissionForbiddenAction::RunLocalCargoAsProof)
+        );
+        assert!(
+            report
+                .forbidden_actions
+                .contains(&RchAdmissionForbiddenAction::DeleteFilesWithoutApproval)
+        );
         assert!(report.recommendations[0].operator_approval_required);
     }
 
@@ -2129,9 +2429,11 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::LocalEnoSpace));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::LocalEnoSpace)
+        );
         assert_eq!(report.citations.len(), 1);
         let citation = report.citations.first();
         assert!(citation.is_some(), "expected local disk citation");
@@ -2164,12 +2466,16 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
     }
 
     #[test]
@@ -2197,15 +2503,21 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::TelemetryGap));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::TelemetryGap)
+        );
     }
 
     #[test]
@@ -2235,16 +2547,21 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::WorkerToolchainMissingTarget));
-        assert!(report
-            .recommendations
-            .iter()
-            .find(|recommendation| {
-                recommendation.reason_code == RchAdmissionReasonCode::WorkerToolchainMissingTarget
-            })
-            .is_some_and(|recommendation| recommendation.operator_approval_required));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::WorkerToolchainMissingTarget)
+        );
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .find(|recommendation| {
+                    recommendation.reason_code
+                        == RchAdmissionReasonCode::WorkerToolchainMissingTarget
+                })
+                .is_some_and(|recommendation| recommendation.operator_approval_required)
+        );
     }
 
     #[test]
@@ -2275,15 +2592,21 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::ActiveProjectExclusion));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::ActiveProjectExclusion)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
         assert_eq!(
             report.worker_rejections[0].worker.as_deref(),
             Some("vmi1149989")
@@ -2362,12 +2685,16 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Runnable);
-        assert!(!report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::InsufficientSlots));
-        assert!(!report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::CriticalPressure));
+        assert!(
+            !report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::InsufficientSlots)
+        );
+        assert!(
+            !report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::CriticalPressure)
+        );
         assert_eq!(
             report.rch_queue.selected_worker.as_deref(),
             Some("vmi1264463")
@@ -2397,9 +2724,11 @@ mod tests {
         let report = build_rch_admission_report(&input);
 
         assert_eq!(report.proof_status, RchAdmissionProofStatus::Blocked);
-        assert!(report
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::InsufficientSlots));
+        assert!(
+            report
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::InsufficientSlots)
+        );
     }
 
     #[test]
@@ -2427,18 +2756,24 @@ mod tests {
 
         assert_eq!(report.beads.active_bead.as_deref(), Some("ft-69gwh.2"));
         assert_eq!(report.beads.blocking_beads, vec!["ft-4tp7g"]);
-        assert!(report
-            .citations
-            .iter()
-            .any(|citation| citation.summary.contains("ready bead ft-69gwh.3")));
-        assert!(report
-            .citations
-            .iter()
-            .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1")));
-        assert!(report
-            .citations
-            .iter()
-            .any(|citation| citation.summary.contains("git status reported M")));
+        assert!(
+            report
+                .citations
+                .iter()
+                .any(|citation| citation.summary.contains("ready bead ft-69gwh.3"))
+        );
+        assert!(
+            report
+                .citations
+                .iter()
+                .any(|citation| citation.summary.contains("in-progress bead ft-fyk4x.1"))
+        );
+        assert!(
+            report
+                .citations
+                .iter()
+                .any(|citation| citation.summary.contains("git status reported M"))
+        );
     }
 
     #[test]
@@ -2518,9 +2853,11 @@ mod tests {
         assert_eq!(preflight.verdict, RchAdmissionPreflightVerdict::Deferred);
         assert_eq!(preflight.rch_admission_state, "wait_rch");
         assert!(preflight.queue_intent_recommended);
-        assert!(preflight
-            .reason_codes
-            .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers));
+        assert!(
+            preflight
+                .reason_codes
+                .contains(&RchAdmissionReasonCode::NoAdmissibleWorkers)
+        );
         assert!(preflight.summary.contains("queue intent"));
 
         let Some(entry) = preflight.to_deferred_proof_intent_queue_entry(
@@ -2542,10 +2879,12 @@ mod tests {
         assert_eq!(entry.intent.kind, ProofKind::Test);
         assert_eq!(entry.intent.bead_id.as_deref(), Some("ft-7h5da.9.4"));
         assert!(entry.intent.required_remote);
-        assert!(entry
-            .command_env
-            .iter()
-            .any(|env| { env.name == "RCH_REQUIRE_REMOTE" && env.value == "1" }));
+        assert!(
+            entry
+                .command_env
+                .iter()
+                .any(|env| { env.name == "RCH_REQUIRE_REMOTE" && env.value == "1" })
+        );
         assert_eq!(entry.command_argv.first().map(String::as_str), Some("rch"));
         Ok(())
     }
@@ -2583,14 +2922,18 @@ mod tests {
         assert_eq!(preflight.verdict, RchAdmissionPreflightVerdict::Invalid);
         assert_eq!(preflight.rch_admission_state, "invalid");
         assert!(!preflight.queue_intent_recommended);
-        assert!(preflight
-            .proof_command
-            .risks
-            .contains(&RchAdmissionProofCommandRisk::MissingRchExecWrapper));
-        assert!(preflight
-            .proof_command
-            .risks
-            .contains(&RchAdmissionProofCommandRisk::SharedWorkspaceTargetDir));
+        assert!(
+            preflight
+                .proof_command
+                .risks
+                .contains(&RchAdmissionProofCommandRisk::MissingRchExecWrapper)
+        );
+        assert!(
+            preflight
+                .proof_command
+                .risks
+                .contains(&RchAdmissionProofCommandRisk::SharedWorkspaceTargetDir)
+        );
     }
 
     #[test]
@@ -2626,10 +2969,84 @@ mod tests {
         assert_eq!(preflight.verdict, RchAdmissionPreflightVerdict::Blocked);
         assert_eq!(preflight.rch_admission_state, "blocked_command");
         assert!(!preflight.queue_intent_recommended);
-        assert!(preflight
-            .proof_command
-            .risks
-            .contains(&RchAdmissionProofCommandRisk::LocalFallbackRequested));
+        assert!(
+            preflight
+                .proof_command
+                .risks
+                .contains(&RchAdmissionProofCommandRisk::LocalFallbackRequested)
+        );
         assert!(preflight.summary.contains("permits local fallback"));
+    }
+
+    // ── Live collector tests (ft-69gwh.9) ──
+
+    #[test]
+    fn parse_df_available_handles_macos_and_linux_headers() {
+        let macos = "Filesystem   1024-blocks       Used Available Capacity iused      ifree %iused  Mounted on\n/dev/disk3s5  1948455240 1192741220 719410028    63% 6577842 7194100280    0%   /System/Volumes/Data\n";
+        assert_eq!(
+            parse_df_available_bytes(macos),
+            Some(719_410_028_u64 * 1024)
+        );
+        let linux = "Filesystem     1K-blocks      Used Available Use% Mounted on\n/dev/sda1      102400000  20000000  82400000  20% /\n";
+        assert_eq!(parse_df_available_bytes(linux), Some(82_400_000_u64 * 1024));
+        assert_eq!(parse_df_available_bytes("garbage"), None);
+        assert_eq!(parse_df_available_bytes(""), None);
+    }
+
+    #[test]
+    fn parse_git_porcelain_categorizes_statuses() {
+        let porcelain = " M src/lib.rs\n?? scratch/new.rs\nD  removed.rs\nA  added.rs\n";
+        let dirty = parse_git_porcelain_dirty(porcelain);
+        assert_eq!(dirty.len(), 4);
+        assert_eq!(dirty[0].path, "src/lib.rs");
+        assert_eq!(dirty[0].category, "modified");
+        assert_eq!(dirty[1].category, "untracked");
+        assert_eq!(dirty[2].category, "deleted");
+        assert_eq!(dirty[3].category, "added");
+        assert!(parse_git_porcelain_dirty("").is_empty());
+    }
+
+    #[test]
+    fn parse_rch_status_queue_extracts_posture_and_counts() {
+        let json = r#"{"data":{"posture":"degraded","daemon":{"daemon":{"workers_total":12,"workers_healthy":7,"slots_available":48}}}}"#;
+        let queue = parse_rch_status_queue(json);
+        assert_eq!(queue.posture.as_deref(), Some("degraded"));
+        assert_eq!(queue.workers_total, Some(12));
+        assert_eq!(queue.workers_healthy, Some(7));
+        assert_eq!(queue.worker_slots_available, Some(48));
+        // Malformed JSON degrades to unknown(), never panics.
+        assert_eq!(parse_rch_status_queue("not json"), RchAdmissionQueueDiagnostic::unknown());
+    }
+
+    #[test]
+    fn parse_rch_status_worker_rejections_flags_unhealthy() {
+        let json = r#"{"data":{"daemon":{"workers":[
+            {"id":"vmi1","status":"healthy"},
+            {"id":"vmi2","status":"unhealthy"},
+            {"id":"vmi3","status":"offline"}
+        ]}}}"#;
+        let rejections = parse_rch_status_worker_rejections(json);
+        assert_eq!(rejections.len(), 2);
+        assert_eq!(rejections[0].worker.as_deref(), Some("vmi2"));
+        assert_eq!(
+            rejections[0].reason_code,
+            RchAdmissionReasonCode::NoAdmissibleWorkers
+        );
+        assert!(parse_rch_status_worker_rejections("{}").is_empty());
+    }
+
+    #[test]
+    fn collect_live_input_populates_source_and_is_probe_safe() {
+        let dir = std::env::temp_dir();
+        let input = collect_live_rch_admission_input(&dir, "cargo test -p frankenterm-core --lib", 1_700_000_000_000);
+        assert_eq!(input.source, "ft doctor --rch-admission");
+        // A real report can be built from the live input (the production gap).
+        let report = build_rch_admission_report(&input);
+        assert!(!report.source.is_empty());
+        // Agent-mail is always recorded as a bounded skip rather than hanging.
+        assert!(input
+            .collector_observations
+            .iter()
+            .any(|obs| obs.source_id == "agent_mail"));
     }
 }
