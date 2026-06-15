@@ -5,8 +5,8 @@ use frankenterm_core::config::{
 };
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
-    framework_create_memory_transport_pair,
+    FrameworkContent, FrameworkMcpError, FrameworkResourceContent, FrameworkTestClient,
+    FrameworkTool, framework_create_memory_transport_pair,
 };
 use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{FtsSyncConfig, PaneRecord, SearchOptions, StorageHandle};
@@ -44,6 +44,7 @@ struct PolicyDeniedAuditRow {
 const INCIDENT_SECRET: &str = "sk-abc123456789012345678901234567890123456789012345678901";
 const INCIDENT_GET_TEXT_PANE_ID: u64 = 7_373;
 const INCIDENT_SEARCH_PANE_ID: u64 = 8_484;
+const INCIDENT_SCENT_PANE_ID: u64 = 9_595;
 
 #[derive(Serialize)]
 struct ToolGoldenCapture {
@@ -190,6 +191,14 @@ fn fake_panes() -> Value {
             "domain_name": "local",
             "title": "incident-search",
             "cwd": "file:///tmp/ft-incident-search"
+        },
+        {
+            "pane_id": INCIDENT_SCENT_PANE_ID,
+            "tab_id": 1,
+            "window_id": 1,
+            "domain_name": "local",
+            "title": format!("codex-scent {INCIDENT_SECRET}"),
+            "cwd": format!("file:///tmp/ft-incident-scent/{INCIDENT_SECRET}")
         }
     ])
 }
@@ -522,6 +531,21 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
+fn parse_resource_envelope(contents: &[FrameworkResourceContent], expected_uri: &str) -> Value {
+    let content = contents.first().expect("expected one MCP resource content");
+    assert_eq!(content.uri, expected_uri);
+    assert_eq!(content.mime_type.as_deref(), Some("application/json"));
+    let text = content
+        .text
+        .as_deref()
+        .expect("expected text resource content");
+    assert!(
+        content.blob.is_none(),
+        "JSON resource should not include a blob"
+    );
+    serde_json::from_str(text).expect("parse JSON resource envelope")
+}
+
 fn parse_toon_value(text: &str) -> Value {
     let decoded = toon_rust::try_decode(text, None).expect("decode TOON payload");
     let json_text = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
@@ -795,6 +819,45 @@ fn mcp_policy_redaction_incident_drill_matrix_covers_core_read_surfaces() {
         "audit_row_id": Value::Null,
         "normalized_response": canonical_value(&search_envelope),
     }));
+
+    let scent_envelope = parse_resource_envelope(
+        &harness
+            .client
+            .read_resource("wa://swarm/scent")
+            .expect("read wa://swarm/scent incident redaction case"),
+        "wa://swarm/scent",
+    );
+    assert_success_envelope_shape(&scent_envelope);
+    assert_response_does_not_leak_secret("mcp.wa_swarm_scent.redaction", &scent_envelope);
+    let scent_agents = scent_envelope["data"]["agents"]
+        .as_array()
+        .expect("wa://swarm/scent agents array");
+    let scent_cwd = scent_agents.iter().find_map(|agent| {
+        let pane_id = agent.get("pane_id").and_then(Value::as_u64)?;
+        (pane_id == INCIDENT_SCENT_PANE_ID)
+            .then(|| agent.get("cwd").and_then(Value::as_str))
+            .flatten()
+    });
+    assert!(
+        scent_agents.iter().any(|agent| {
+            agent.get("pane_id").and_then(Value::as_u64) == Some(INCIDENT_SCENT_PANE_ID)
+        }),
+        "wa://swarm/scent should include incident scent pane {INCIDENT_SCENT_PANE_ID}: \
+         {scent_envelope}"
+    );
+    let scent_cwd = scent_cwd.unwrap_or("");
+    assert_contains_redaction_marker("mcp.wa_swarm_scent.redaction", scent_cwd);
+    log_incident_drill_case(json!({
+        "id": "mcp.wa_swarm_scent.redaction",
+        "resource": "wa://swarm/scent",
+        "input": {
+            "pane_id": INCIDENT_SCENT_PANE_ID,
+        },
+        "redaction_tier": "secret-redactor",
+        "policy_decision": "allow",
+        "audit_row_id": Value::Null,
+        "normalized_response": canonical_value(&scent_envelope),
+    }));
 }
 
 #[test]
@@ -899,6 +962,36 @@ fn mcp_policy_redaction_incident_drill_matrix_records_typed_policy_audits() {
         "policy_decision": "require_approval",
         "audit_row_id": approval_row.id,
         "normalized_response": canonical_value(&approval_envelope),
+    }));
+    drop(approval_harness);
+
+    let scent_deny_message = "ft-ps9fu denied swarm scent drill";
+    let mut scent_deny_harness = TestHarness::new_with_config(mcp_policy_test_config(
+        "ft_ps9fu_deny_swarm_scent",
+        "read_output",
+        Some(INCIDENT_SCENT_PANE_ID),
+        PolicyRuleDecision::Deny,
+        scent_deny_message,
+    ));
+    let scent_deny_envelope = parse_resource_envelope(
+        &scent_deny_harness
+            .client
+            .read_resource("wa://swarm/scent")
+            .expect("read wa://swarm/scent denied incident case"),
+        "wa://swarm/scent",
+    );
+    assert_mcp_policy_error(&scent_deny_envelope, scent_deny_message);
+    assert_response_does_not_leak_secret("mcp.wa_swarm_scent.policy_denied", &scent_deny_envelope);
+    log_incident_drill_case(json!({
+        "id": "mcp.wa_swarm_scent.policy_denied",
+        "resource": "wa://swarm/scent",
+        "input": {
+            "pane_id": INCIDENT_SCENT_PANE_ID,
+        },
+        "redaction_tier": "not-applicable-policy-denied-before-resource-read",
+        "policy_decision": "denied",
+        "audit_row_id": Value::Null,
+        "normalized_response": canonical_value(&scent_deny_envelope),
     }));
 }
 
