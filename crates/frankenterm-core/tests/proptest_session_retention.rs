@@ -596,6 +596,96 @@ proptest! {
             .unwrap();
         prop_assert_eq!(remaining_orphan_ps, 0i64, "no orphaned pane states should remain");
     }
+
+    /// ft-rt6ol: the LINKED orphan shape — an orphan checkpoint that still has
+    /// `mux_pane_state` CHILDREN. A single cleanup pass must remove the orphan
+    /// checkpoint AND its now-orphaned pane_state children. The old
+    /// pane_state-first delete ordering left the children behind when
+    /// `ON DELETE CASCADE` was unavailable (FK-off / corrupt DBs), because the
+    /// children's checkpoint still existed during the pane_state delete.
+    #[test]
+    fn orphan_checkpoint_with_children_collected_in_one_pass(
+        num_linked_orphans in 0..6usize,
+        children_per_orphan in 0..5usize,
+        num_independent_orphan_cp in 0..4usize,
+        num_independent_orphan_ps in 0..4usize,
+        num_valid_sessions in 0..4usize,
+    ) {
+        let conn = make_test_db();
+        let now = epoch_ms() as i64;
+
+        // Valid sessions + checkpoints + pane_state — must SURVIVE cleanup.
+        let mut valid_cp_ids = Vec::new();
+        for i in 0..num_valid_sessions {
+            let sid = format!("valid-{i}");
+            insert_session(&conn, &sid, now, true);
+            let cp_id = insert_checkpoint(&conn, &sid, now, 1024);
+            insert_pane_state(&conn, cp_id, i as u64);
+            valid_cp_ids.push(cp_id);
+        }
+
+        // Orphan checkpoints that STILL HAVE pane_state children (the linked shape).
+        for i in 0..num_linked_orphans {
+            let cp_id = insert_orphaned_checkpoint(&conn, &format!("ghost-link-{i}"), now);
+            for c in 0..children_per_orphan {
+                insert_pane_state(&conn, cp_id, (10_000 + i * 100 + c) as u64);
+            }
+        }
+
+        // Independent orphans of each kind — also collected in the same pass.
+        for i in 0..num_independent_orphan_cp {
+            insert_orphaned_checkpoint(&conn, &format!("ghost-cp-{i}"), now);
+        }
+        for i in 0..num_independent_orphan_ps {
+            insert_orphaned_pane_state(&conn, 900_000 + i as i64, (20_000 + i) as u64);
+        }
+
+        // Disable age/count/size policies so ONLY orphan cleanup runs.
+        let config = SessionRetentionConfig {
+            max_age_days: 0,
+            max_closed_sessions: 0,
+            max_total_size_mb: 0,
+            cleanup_interval_hours: 0,
+        };
+        cleanup_sessions(&conn, &config).unwrap();
+
+        // INVARIANT: one pass leaves ZERO orphan checkpoints and ZERO orphan
+        // pane_state rows — including children of removed orphan checkpoints.
+        let remaining_orphan_cp: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_checkpoints
+                 WHERE session_id NOT IN (SELECT session_id FROM mux_sessions)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(remaining_orphan_cp, 0i64, "orphan checkpoints must be gone");
+
+        let remaining_orphan_ps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state
+                 WHERE checkpoint_id NOT IN (SELECT id FROM session_checkpoints)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        prop_assert_eq!(
+            remaining_orphan_ps, 0i64,
+            "orphan pane_state (incl. children of removed orphan checkpoints) must be gone"
+        );
+
+        // Valid sessions' pane_state must NOT be collected.
+        for cp_id in valid_cp_ids {
+            let kept: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
+                    [cp_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            prop_assert!(kept >= 1, "valid session pane_state must survive cleanup");
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
