@@ -1952,6 +1952,38 @@ pub struct OutputCache {
     misses: u64,
 }
 
+/// Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
+/// `lru_order` tokens *examined* during LRU maintenance (eviction skip-loop +
+/// compaction retain). The amortized-O(1) refresh contract is that this total
+/// grows linearly with the number of cache operations, not as
+/// `operations * capacity` (the cost of the old O(n) position-scan refresh).
+/// A pure refresh below the compaction threshold examines zero tokens.
+///
+/// Thread-local + `cfg(test)`: zero production overhead, and each test (its own
+/// thread) sees only its own counts despite parallel test execution.
+#[cfg(test)]
+thread_local! {
+    static OUTPUT_CACHE_LRU_MAINTENANCE_STEPS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Record `steps` examined LRU-maintenance tokens (no-op outside tests).
+#[inline]
+fn record_output_cache_lru_steps(_steps: u64) {
+    #[cfg(test)]
+    OUTPUT_CACHE_LRU_MAINTENANCE_STEPS.with(|c| c.set(c.get().saturating_add(_steps)));
+}
+
+#[cfg(test)]
+fn output_cache_lru_maintenance_steps() -> u64 {
+    OUTPUT_CACHE_LRU_MAINTENANCE_STEPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_output_cache_lru_maintenance_steps() {
+    OUTPUT_CACHE_LRU_MAINTENANCE_STEPS.with(|c| c.set(0));
+}
+
 impl OutputCache {
     /// Create a new output cache with the given configuration.
     #[must_use]
@@ -2048,6 +2080,8 @@ impl OutputCache {
             let Some((old_hash, generation)) = self.lru_order.pop_front() else {
                 break;
             };
+            // Count each examined token (ft-wo323 amortized-O(1) guard).
+            record_output_cache_lru_steps(1);
             if let Entry::Occupied(slot) = self.global_hashes.entry(old_hash)
                 && slot.get().generation == generation
             {
@@ -2083,6 +2117,9 @@ impl OutputCache {
         if self.lru_order.len() <= cap {
             return;
         }
+        // The retain pass visits every token once (ft-wo323 amortized-O(1)
+        // guard); fires at most once per ~capacity refreshes.
+        record_output_cache_lru_steps(self.lru_order.len() as u64);
         let live = &self.global_hashes;
         self.lru_order
             .retain(|&(hash, generation)| live.get(&hash).is_some_and(|e| e.generation == generation));
@@ -5193,6 +5230,142 @@ mod tests {
             "lru_order must stay bounded by lazy compaction, got {}",
             cache.lru_order.len()
         );
+    }
+
+    // ft-wo323: perf-regression guards for the ft-zo4hw amortized-O(1) refresh.
+
+    #[test]
+    fn output_cache_lru_refresh_does_no_scan_below_compaction_threshold() {
+        // A correct O(1) refresh examines ZERO lru_order tokens — no position
+        // scan, no remove. Under the old code each hit scanned the deque.
+        reset_output_cache_lru_maintenance_steps();
+        let capacity = 64usize;
+        let config = OutputCacheConfig {
+            global_lru_capacity: capacity,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+
+        // One miss to seed, then refreshes that stay below the 2x-capacity
+        // compaction threshold and never evict (live count stays 1).
+        assert!(cache.is_new(0, "hot\n"));
+        for pane in 1..capacity as u64 {
+            assert!(!cache.is_new(pane, "hot\n"));
+        }
+        assert_eq!(
+            output_cache_lru_maintenance_steps(),
+            0,
+            "refresh below the compaction threshold must scan zero tokens"
+        );
+    }
+
+    #[test]
+    fn output_cache_lru_refresh_is_amortized_o1_under_repeated_hits() {
+        // Total maintenance work over N refreshes of one hot hash must be
+        // linear in N (compaction amortizes to ~O(1) per access). The old O(n)
+        // refresh would cost ~N * deque_len.
+        reset_output_cache_lru_maintenance_steps();
+        let capacity = 16usize;
+        let config = OutputCacheConfig {
+            global_lru_capacity: capacity,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+
+        let n = 10_000u64;
+        assert!(cache.is_new(0, "hot\n"));
+        for pane in 1..n {
+            assert!(!cache.is_new(pane, "hot\n"));
+        }
+        let steps = output_cache_lru_maintenance_steps();
+        assert!(
+            steps <= 4 * n,
+            "maintenance steps {steps} must be linear in {n} (amortized O(1))"
+        );
+        assert_eq!(cache.stats().global_entries, 1);
+    }
+
+    #[test]
+    fn output_cache_lru_eviction_churn_is_amortized_o1() {
+        // Inserting N distinct new hashes into a full cache forces N evictions;
+        // total work must stay linear (each eviction pops O(1) live tokens).
+        let capacity = 16usize;
+        let config = OutputCacheConfig {
+            global_lru_capacity: capacity,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+        for i in 0..capacity as u64 {
+            assert!(cache.is_new(i, &format!("fill-{i}\n")));
+        }
+
+        reset_output_cache_lru_maintenance_steps();
+        let n = 10_000u64;
+        for i in 0..n {
+            assert!(cache.is_new(1_000_000 + i, &format!("churn-{i}\n")));
+        }
+        let steps = output_cache_lru_maintenance_steps();
+        assert!(
+            steps <= 6 * n,
+            "eviction-churn steps {steps} must be linear in {n} (amortized O(1))"
+        );
+        assert_eq!(cache.stats().global_entries, capacity);
+    }
+
+    #[test]
+    fn output_cache_lru_matches_reference_model_under_random_access() {
+        // Property test: against a deterministic pseudo-random access stream
+        // (fresh pane per access to bypass the per-pane fast path), the cache's
+        // hit/miss decisions and live-entry count must match a straightforward
+        // reference LRU model, and the order deque must stay bounded.
+        let capacity = 8usize;
+        let config = OutputCacheConfig {
+            global_lru_capacity: capacity,
+            per_pane_max_age_ms: 60_000,
+        };
+        let mut cache = OutputCache::new(config);
+
+        let key_space = 20u64; // > capacity so evictions happen
+        let mut order: Vec<u64> = Vec::new(); // front = least-recently-used
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+
+        for step in 0..5_000u64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let idx = seed % key_space;
+            let content = format!("ref-key-{idx}\n");
+            let pane = 1_000_000 + step;
+
+            // Reference LRU: hit refreshes recency; miss evicts the front.
+            let ref_hit = if let Some(pos) = order.iter().position(|&x| x == idx) {
+                order.remove(pos);
+                order.push(idx);
+                true
+            } else {
+                if order.len() >= capacity {
+                    order.remove(0);
+                }
+                order.push(idx);
+                false
+            };
+
+            let is_new = cache.is_new(pane, &content);
+            assert_eq!(
+                is_new, !ref_hit,
+                "step {step} idx {idx}: hit/miss disagrees with reference LRU"
+            );
+            assert_eq!(
+                cache.stats().global_entries,
+                order.len(),
+                "step {step}: live-entry count diverged from reference LRU"
+            );
+            assert!(
+                cache.lru_order.len() <= capacity * 2,
+                "step {step}: lru_order exceeded 2x capacity ({})",
+                cache.lru_order.len()
+            );
+        }
     }
 
     #[test]

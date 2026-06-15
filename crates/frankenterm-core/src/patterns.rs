@@ -405,6 +405,37 @@ fn detect_with_context_materialization_count() -> u64 {
     DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.load(Ordering::Relaxed)
 }
 
+/// Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
+/// `seen_order` tokens examined during dedup LRU maintenance (eviction
+/// skip-loop + compaction retain). The amortized-O(1) contract is that this
+/// grows linearly with the number of marks, not as `marks * MAX_SEEN_KEYS`
+/// (the old O(n) string position-scan per mark).
+///
+/// Thread-local + `cfg(test)`: zero production overhead, and each test (its own
+/// thread) sees only its own counts despite parallel test execution.
+#[cfg(test)]
+thread_local! {
+    static DETECTION_DEDUP_MAINTENANCE_STEPS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Record `steps` examined dedup-maintenance tokens (no-op outside tests).
+#[inline]
+fn record_detection_dedup_steps(_steps: u64) {
+    #[cfg(test)]
+    DETECTION_DEDUP_MAINTENANCE_STEPS.with(|c| c.set(c.get().saturating_add(_steps)));
+}
+
+#[cfg(test)]
+fn detection_dedup_maintenance_steps() -> u64 {
+    DETECTION_DEDUP_MAINTENANCE_STEPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_detection_dedup_maintenance_steps() {
+    DETECTION_DEDUP_MAINTENANCE_STEPS.with(|c| c.set(0));
+}
+
 /// Context for detection with agent filtering and deduplication.
 ///
 /// Use this to prevent false positives in non-agent panes and avoid
@@ -552,6 +583,8 @@ impl DetectionContext {
     /// because a key's current-generation token is its most recently pushed.
     fn evict_oldest_seen(&mut self) {
         while let Some((key, generation)) = self.seen_order.pop_front() {
+            // Count each examined token (ft-wo323 amortized-O(1) guard).
+            record_detection_dedup_steps(1);
             match self.seen_keys.get(&key) {
                 Some(entry) if entry.generation == generation => {
                     self.seen_keys.remove(&key);
@@ -571,6 +604,9 @@ impl DetectionContext {
         if self.seen_order.len() <= Self::MAX_SEEN_KEYS.saturating_mul(2) {
             return;
         }
+        // The retain pass visits every token once (ft-wo323 amortized-O(1)
+        // guard); fires at most once per ~MAX_SEEN_KEYS refreshes.
+        record_detection_dedup_steps(self.seen_order.len() as u64);
         let seen_keys = &self.seen_keys;
         self.seen_order
             .retain(|(key, generation)| {
@@ -6869,6 +6905,121 @@ rules:
         // The single live key is still resolvable and unexpired-checks aside,
         // remains the one tracked key.
         assert!(ctx.seen_keys.contains_key("codex.test:repeat"));
+    }
+
+    // ft-wo323: perf-regression guards for the ft-zo4hw amortized-O(1) dedup.
+
+    #[test]
+    fn mark_seen_key_does_no_scan_below_compaction_threshold() {
+        // Marking distinct new keys below the eviction/compaction thresholds
+        // must examine ZERO seen_order tokens — no string position scan (the
+        // old code scanned the whole deque on every mark, even new ones).
+        reset_detection_dedup_maintenance_steps();
+        let mut ctx = DetectionContext::new();
+
+        let n = DetectionContext::MAX_SEEN_KEYS / 2;
+        for i in 0..n {
+            assert!(ctx.mark_seen_key(format!("codex.test:{i}")));
+        }
+        assert_eq!(
+            detection_dedup_maintenance_steps(),
+            0,
+            "marking below capacity/compaction thresholds must scan zero tokens"
+        );
+    }
+
+    #[test]
+    fn mark_seen_key_is_amortized_o1_under_repeated_expired_marks() {
+        // Re-marking one expired key N times: total maintenance work must be
+        // linear in N (compaction amortizes the stale-token cleanup). The old
+        // code paid an O(deque) position scan per mark.
+        reset_detection_dedup_maintenance_steps();
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::ZERO);
+
+        let n = (DetectionContext::MAX_SEEN_KEYS * 8) as u64;
+        for _ in 0..n {
+            assert!(ctx.mark_seen_key("codex.test:repeat".to_string()));
+        }
+        let steps = detection_dedup_maintenance_steps();
+        assert!(
+            steps <= 4 * n,
+            "maintenance steps {steps} must be linear in {n} (amortized O(1))"
+        );
+        assert_eq!(ctx.seen_count(), 1);
+    }
+
+    #[test]
+    fn mark_seen_key_eviction_churn_is_amortized_o1() {
+        // Marking N distinct new keys into a full dedup set forces N evictions;
+        // total work must stay linear (each eviction pops O(1) live tokens).
+        let mut ctx = DetectionContext::new();
+        for i in 0..DetectionContext::MAX_SEEN_KEYS {
+            assert!(ctx.mark_seen_key(format!("fill:{i}")));
+        }
+
+        reset_detection_dedup_maintenance_steps();
+        let n = (DetectionContext::MAX_SEEN_KEYS * 8) as u64;
+        for i in 0..n {
+            assert!(ctx.mark_seen_key(format!("churn:{i}")));
+        }
+        let steps = detection_dedup_maintenance_steps();
+        assert!(
+            steps <= 6 * n,
+            "eviction-churn steps {steps} must be linear in {n} (amortized O(1))"
+        );
+        assert_eq!(ctx.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+    }
+
+    #[test]
+    fn mark_seen_key_matches_reference_model_under_random_marks() {
+        // Property test: with a TTL long enough that nothing expires, dedup is
+        // an insert-only LRU (a valid re-mark returns false and does NOT refresh
+        // recency). Against a deterministic pseudo-random mark stream the
+        // new/seen decision and live count must match a reference model, and
+        // seen_order must stay bounded.
+        let mut ctx = DetectionContext::new();
+        ctx.set_ttl(Duration::from_secs(3600));
+        let cap = DetectionContext::MAX_SEEN_KEYS;
+
+        let key_space = (cap as u64) * 3 / 2; // > cap so evictions happen
+        let mut order: Vec<u64> = Vec::new(); // front = oldest-inserted (FIFO)
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+
+        for step in 0..5_000u64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let idx = seed % key_space;
+
+            // Reference: insert-only LRU. Seen -> false (no recency change);
+            // new -> insert at MRU, evicting the oldest if full.
+            let ref_new = if order.contains(&idx) {
+                false
+            } else {
+                if order.len() >= cap {
+                    order.remove(0);
+                }
+                order.push(idx);
+                true
+            };
+
+            let is_new = ctx.mark_seen_key(format!("k:{idx}"));
+            assert_eq!(
+                is_new, ref_new,
+                "step {step} idx {idx}: new/seen disagrees with reference model"
+            );
+            assert_eq!(
+                ctx.seen_count(),
+                order.len(),
+                "step {step}: live key count diverged from reference model"
+            );
+            assert!(
+                ctx.seen_order.len() <= cap * 2,
+                "step {step}: seen_order exceeded 2x capacity ({})",
+                ctx.seen_order.len()
+            );
+        }
     }
 
     #[test]
