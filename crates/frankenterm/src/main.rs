@@ -42164,6 +42164,29 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             );
                         }
 
+                        let input_summary = if clear {
+                            format!("ft events annotate {event_id} --clear")
+                        } else {
+                            format!("ft events annotate {event_id} --note <redacted>")
+                        };
+
+                        // ft-40hax: fail-closed policy gate BEFORE mutating, mirroring the
+                        // robot path (ft-56m1h). The human `ft events` CLI is a third
+                        // entrypoint to the same storage mutation the MCP + robot siblings
+                        // gate; the caller's humanity is unverifiable, so it must not bypass
+                        // the gate and must record the REAL decision (not a fabricated "allow").
+                        let decision = match authorize_robot_event_mutation(
+                            &config,
+                            &storage,
+                            "event.annotate",
+                            &input_summary,
+                        )
+                        .await
+                        {
+                            Ok(decision) => decision,
+                            Err((_code, reason, hint)) => die(&reason, hint.as_deref()),
+                        };
+
                         if let Err(e) = {
                             // ft-xbnl0.2.3 tick 271: cx-first event note set.
                             let note_cx = frankenterm_core::cx::Cx::current()
@@ -42175,11 +42198,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             die(&format!("Failed to update note: {e}"), None);
                         }
 
-                        let input_summary = if clear {
-                            format!("ft events annotate {event_id} --clear")
-                        } else {
-                            format!("ft events annotate {event_id} --note <redacted>")
-                        };
                         let decision_context = build_event_mutation_decision_context(
                             "human",
                             "ft.events",
@@ -42202,9 +42220,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             pane_id: None,
                             domain: None,
                             action_kind: "event.annotate".to_string(),
-                            policy_decision: "allow".to_string(),
+                            policy_decision: decision.as_str().to_string(),
                             decision_reason: Some("Human updated event note".to_string()),
-                            rule_id: None,
+                            rule_id: decision.rule_id().map(str::to_string),
                             input_summary: Some(input_summary),
                             verification_summary: None,
                             decision_context,
@@ -42235,14 +42253,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             );
                         }
 
-                        let changed = match storage
-                            .set_event_triage_state(event_id, state.clone(), by.clone())
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(e) => die(&format!("Failed to update triage state: {e}"), None),
-                        };
-
                         let input_summary = if clear {
                             format!("ft events triage {event_id} --clear")
                         } else {
@@ -42251,6 +42261,28 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 state.as_deref().unwrap_or_default()
                             )
                         };
+
+                        // ft-40hax: fail-closed policy gate BEFORE mutating (mirror ft-56m1h).
+                        let decision = match authorize_robot_event_mutation(
+                            &config,
+                            &storage,
+                            "event.triage",
+                            &input_summary,
+                        )
+                        .await
+                        {
+                            Ok(decision) => decision,
+                            Err((_code, reason, hint)) => die(&reason, hint.as_deref()),
+                        };
+
+                        let changed = match storage
+                            .set_event_triage_state(event_id, state.clone(), by.clone())
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => die(&format!("Failed to update triage state: {e}"), None),
+                        };
+
                         let decision_context = build_event_mutation_decision_context(
                             "human",
                             "ft.events",
@@ -42277,9 +42309,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             pane_id: None,
                             domain: None,
                             action_kind: "event.triage".to_string(),
-                            policy_decision: "allow".to_string(),
+                            policy_decision: decision.as_str().to_string(),
                             decision_reason: Some("Human updated event triage state".to_string()),
-                            rule_id: None,
+                            rule_id: decision.rule_id().map(str::to_string),
                             input_summary: Some(input_summary),
                             verification_summary: None,
                             decision_context,
@@ -42326,6 +42358,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
 
                         let changed = if let Some(label) = add.clone() {
+                            let input_summary = format!("ft events label {event_id} --add {label}");
+
+                            // ft-40hax: fail-closed policy gate BEFORE mutating (mirror ft-56m1h).
+                            let decision = match authorize_robot_event_mutation(
+                                &config,
+                                &storage,
+                                "event.label.add",
+                                &input_summary,
+                            )
+                            .await
+                            {
+                                Ok(decision) => decision,
+                                Err((_code, reason, hint)) => die(&reason, hint.as_deref()),
+                            };
+
                             let inserted = match storage
                                 .add_event_label(event_id, label.clone(), by.clone())
                                 .await
@@ -42334,7 +42381,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Err(e) => die(&format!("Failed to add label: {e}"), None),
                             };
 
-                            let input_summary = format!("ft events label {event_id} --add {label}");
                             let decision_context = build_event_mutation_decision_context(
                                 "human",
                                 "ft.events",
@@ -42357,9 +42403,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 pane_id: None,
                                 domain: None,
                                 action_kind: "event.label.add".to_string(),
-                                policy_decision: "allow".to_string(),
+                                policy_decision: decision.as_str().to_string(),
                                 decision_reason: Some("Human added event label".to_string()),
-                                rule_id: None,
+                                rule_id: decision.rule_id().map(str::to_string),
                                 input_summary: Some(input_summary),
                                 verification_summary: None,
                                 decision_context,
@@ -42381,6 +42427,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                             Some(inserted)
                         } else if let Some(label) = remove.clone() {
+                            let input_summary =
+                                format!("ft events label {event_id} --remove {label}");
+
+                            // ft-40hax: fail-closed policy gate BEFORE mutating (mirror ft-56m1h).
+                            let decision = match authorize_robot_event_mutation(
+                                &config,
+                                &storage,
+                                "event.label.remove",
+                                &input_summary,
+                            )
+                            .await
+                            {
+                                Ok(decision) => decision,
+                                Err((_code, reason, hint)) => die(&reason, hint.as_deref()),
+                            };
+
                             // ft-xbnl0.2.3 tick 271: cx-first remove event label.
                             let rm_label_cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -42392,8 +42454,6 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Err(e) => die(&format!("Failed to remove label: {e}"), None),
                             };
 
-                            let input_summary =
-                                format!("ft events label {event_id} --remove {label}");
                             let decision_context = build_event_mutation_decision_context(
                                 "human",
                                 "ft.events",
@@ -42416,9 +42476,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 pane_id: None,
                                 domain: None,
                                 action_kind: "event.label.remove".to_string(),
-                                policy_decision: "allow".to_string(),
+                                policy_decision: decision.as_str().to_string(),
                                 decision_reason: Some("Human removed event label".to_string()),
-                                rule_id: None,
+                                rule_id: decision.rule_id().map(str::to_string),
                                 input_summary: Some(input_summary),
                                 verification_summary: None,
                                 decision_context,
