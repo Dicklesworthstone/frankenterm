@@ -1,0 +1,26 @@
+[
+  {
+    "bead": "ft-7h5da.5.9",
+    "bridge": "inbound",
+    "contract": "runtime-owned ingress routes ConnectorSignal into EventBus",
+    "fail_closed": true,
+    "no_silent_drop": true,
+    "production_caller_wired": true
+  },
+  {
+    "bead": "ft-7h5da.5.10",
+    "bridge": "outbound",
+    "contract": "runtime EventBus subscriber feeds ConnectorOutboundBridge and host-runtime feedback",
+    "fail_closed": true,
+    "no_silent_drop": true,
+    "production_caller_wired": true
+  },
+  {
+    "bead": "ft-7h5da.5.11",
+    "bridge": "lifecycle",
+    "contract": "operator lifecycle mutations pass through PolicyEngine boundary",
+    "fail_closed": true,
+    "no_silent_drop": true,
+    "production_caller_wired": true
+  }
+]
