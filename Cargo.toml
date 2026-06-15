@@ -458,6 +458,7 @@ line_drawing = "0.8"
 memmap2 = "0.9"
 raw-window-handle = "0.6"
 resize = "0.5"
+rgb = "0.8.53"
 tiny-skia = "0.11"
 walkdir = "2"
 # Vendored native deps (freetype, harfbuzz, fontconfig) and their build deps

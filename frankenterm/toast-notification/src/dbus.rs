@@ -92,7 +92,7 @@ impl Reason {
 }
 
 async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
-    let connection = zbus::ConnectionBuilder::session()?.build().await?;
+    let connection = zbus::Connection::session().await?;
 
     let proxy = NotificationsProxy::new(&connection).await?;
     let caps = proxy.get_capabilities().await?;
