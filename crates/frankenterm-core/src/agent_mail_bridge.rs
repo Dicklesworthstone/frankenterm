@@ -6,7 +6,19 @@
 //! fail-open for read/reservation paths and explicit `Result` errors
 //! for send/release paths.
 //!
-//! Feature-gated behind `agent-mail`.
+//! Feature-gated behind `agent-mail` (currently a *default* feature, so this
+//! compiles into standard `ft` builds).
+//!
+//! # Integration status (ft-ok02z) — NOT WIRED
+//!
+//! [`AgentMailBridge`] is fully implemented (it genuinely shells out to the
+//! `agent_mail` binary with timeout/redaction/typed-JSON parsing) but has **no
+//! production caller** — every constructor is in tests. The only agent-mail code
+//! reachable from the `ft` CLI is the read-only outbox surface viewer
+//! (`load_agent_mail_outbox_surface`); this live send/fetch/reserve bridge is
+//! not invoked by the running product. Treat the API docs as describing an
+//! available-but-unwired transport, not active coordination. Wiring (and/or
+//! demoting `agent-mail` out of the default feature set) is tracked by ft-ok02z.
 
 use std::collections::HashMap;
 

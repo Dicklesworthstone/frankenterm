@@ -1,12 +1,27 @@
 //! Mission-level Agent Mail coordination kernel.
 //!
-//! This module bridges mission-orchestration coordination events into an
-//! Agent-Mail-compatible transport surface:
+//! This module provides the transport surface for bridging mission-orchestration
+//! coordination events into an Agent-Mail-compatible envelope flow. Its capabilities:
 //!
 //! - Emit structured lifecycle notices (`start`, `progress`, `handoff`)
 //! - Convert mission conflict/deconfliction output into contention signals
 //! - Consume inbox events and enforce ack-required coordination flows
 //! - Carry deterministic mission/fleet/task metadata in every envelope
+//!
+//! # Integration status (ft-ok02z) — NOT WIRED
+//!
+//! As of this writing [`MissionAgentMailKernel`] has **no production caller**:
+//! every constructor and `emit_*` / `consume_inbox` call site is in tests. Its
+//! natural integration points — [`crate::mission_loop::MissionLoop`] conflict
+//! detection and [`crate::fleet_launcher`] launch lifecycle — are themselves
+//! unwired scaffolding with no live driver (the CLI process is read-only and
+//! does not own a live `MissionLoop`; see `shadow_mode_evaluator`). So there is
+//! currently no live mission/fleet coordination lifecycle to hook this kernel
+//! into. The capability list above describes what this surface *would* do once
+//! that lifecycle is driven in production — it does not describe behavior the
+//! running product exercises today. Do not read the present-tense API docs as
+//! an active multi-agent-coordination guarantee. Wiring is gated on the mission
+//! coordination lifecycle itself becoming live; tracked by ft-ok02z.
 
 use std::collections::{BTreeSet, HashMap};
 
