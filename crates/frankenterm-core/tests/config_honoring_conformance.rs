@@ -153,6 +153,17 @@ fn search_daemon_unconsumed_fields_are_not_silently_ignored() {
 }
 
 #[test]
+fn search_reranker_enabled_is_not_silently_ignored() {
+    // ft-vyg9y: search.reranker_enabled is parsed but its only reader appends a
+    // "cross-encoder" status-tier string — no production dispatch reranks (the
+    // reranker subsystem is a test-only scaffold with an ONNX stub). Setting it
+    // must fail closed, not silently enable nothing.
+    assert_rejects("search.reranker", "search.reranker_enabled", |c| {
+        c.search.reranker_enabled = true;
+    });
+}
+
+#[test]
 fn wired_retention_and_snapshot_fields_are_accepted_not_fail_closed() {
     // retention_max_mb (ft-rrqhm) and session_retention (ft-0yuxe) are genuinely
     // wired, so validate must NOT fail-close a custom value — they are honored,

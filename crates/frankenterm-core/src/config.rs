@@ -666,6 +666,25 @@ impl SearchConfig {
                 "Config carries SearchConfig::mode, but production search dispatch reads the concrete tuning fields (rrf_k, quality_weight, quality_timeout_ms, fast_only, fusion_backend) and never consults mode",
             ));
         }
+        // ft-vyg9y: search.reranker_enabled has no production reranking consumer.
+        // Its only reader, `advertised_embedder_tiers`, just appends a
+        // "cross-encoder" string to the status-tier list. No production search
+        // dispatch reranks: the storage hybrid path (the live wa.search/ft search
+        // backend) has no rerank step, `rerank_fused_results` is reached only from
+        // the test-only orchestrator scaffold, and the only `Reranker` impls are
+        // `PassthroughReranker` (no-op) and `CrossEncoderReranker` (an ONNX stub
+        // whose `rerank` returns candidates unchanged). Toggling it on therefore
+        // reranks nothing. Fail closed so the operator gets a clear error instead
+        // of a silent no-op (and a false sense that results are being reranked),
+        // mirroring the search.mode / search.daemon honesty gates. Wiring a real
+        // cross-encoder (ONNX runtime) is a separate feature; until it lands, leave
+        // this at its default.
+        if self.reranker_enabled != defaults.reranker_enabled {
+            return Err(parsed_but_unconsumed_config_key_message(
+                "search.reranker_enabled",
+                "no production search dispatch reranks results — the only reader appends a 'cross-encoder' status-tier string, the storage hybrid path has no rerank step, and the reranker subsystem (rerank_fused_results / CrossEncoderReranker) is a test-only scaffold with an unimplemented ONNX stub",
+            ));
+        }
         Ok(())
     }
 }
@@ -761,6 +780,14 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
         evidence: "no daemon worker batches embedding jobs; frankensearch batching uses its own independently-defaulted max/min_batch_size",
         tracking_bead: "ft-v46vj",
         validation: "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
+        key: "search.reranker_enabled",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "only advertised_embedder_tiers reads it (appends a 'cross-encoder' status-tier string); no production search dispatch reranks — the storage hybrid path has no rerank step, and rerank_fused_results/CrossEncoderReranker are a test-only orchestrator scaffold with an unimplemented ONNX stub",
+        tracking_bead: "ft-vyg9y",
+        validation: "SearchConfig::validate_key_wiring rejects reranker_enabled=true as parsed but no-effect",
     },
 ];
 
