@@ -3209,6 +3209,106 @@ mod tests {
         assert!(build_migration_plan(future, SCHEMA_VERSION - 1).is_err());
     }
 
+    #[test]
+    fn build_migration_plan_fuzz_matrix_is_fail_closed_and_sound() {
+        // Exhaustive sweep over a wide (from, to) version matrix — a fuzz of every
+        // user_version/target pairing. Future source/target and sub-1 targets must
+        // FAIL CLOSED (ft-men4p); valid pairs must yield a structurally-sound,
+        // monotonic plan and never a misleading empty "already current" result.
+        for from in -3..=(SCHEMA_VERSION + 8) {
+            for to in -3..=(SCHEMA_VERSION + 8) {
+                let result = build_migration_plan(from, to);
+
+                if from > SCHEMA_VERSION {
+                    assert!(result.is_err(), "future from_version {from} must fail closed");
+                    continue;
+                }
+                if to > SCHEMA_VERSION || to < 1 {
+                    assert!(result.is_err(), "out-of-range to_version {to} must be rejected");
+                    continue;
+                }
+
+                // Valid target range (1..=SCHEMA_VERSION) with a non-future source.
+                if from <= to {
+                    let plan = result.expect("forward/no-op plan in valid range must succeed");
+                    assert_eq!(plan.from_version, from);
+                    assert_eq!(plan.to_version, to);
+                    if from == to {
+                        assert!(plan.steps.is_empty(), "no-op plan must have no steps");
+                    } else {
+                        assert_eq!(plan.direction, MigrationDirection::Up);
+                        let mut prev = from;
+                        for step in &plan.steps {
+                            assert!(
+                                step.migration_version > prev && step.migration_version <= to,
+                                "up step {} must lie in (from {from}, to {to}]",
+                                step.migration_version
+                            );
+                            prev = step.migration_version;
+                        }
+                    }
+                } else if let Ok(plan) = result {
+                    // Downgrade within range: a valid Down plan, or an explicit
+                    // error when a migration lacks down_sql — never a wrong/empty
+                    // result.
+                    assert_eq!(plan.direction, MigrationDirection::Down);
+                    assert_eq!(plan.from_version, from);
+                    assert_eq!(plan.to_version, to);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn initialized_schema_segment_embeddings_default_is_ms() {
+        // ft-wi24o: after the full init sequence (SCHEMA_SQL + run_migrations(0),
+        // which replays the v32 default repair), segment_embeddings.embedded_at
+        // must default to epoch MILLISECONDS — not the legacy epoch-seconds
+        // strftime that reintroduced the 1000x timestamp-unit bug.
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        initialize_schema(&conn).expect("initialize schema");
+
+        // Golden on the schema shape: the default scales strftime seconds to ms.
+        let create_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='segment_embeddings'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read segment_embeddings DDL");
+        assert!(
+            create_sql.contains("embedded_at"),
+            "segment_embeddings must define embedded_at: {create_sql}"
+        );
+        assert!(
+            create_sql.contains("* 1000"),
+            "embedded_at default must be epoch ms (ft-wi24o), got: {create_sql}"
+        );
+
+        // Behavioural check: an insert omitting embedded_at stores ms. Epoch ms
+        // (~1.7e12) is far above the 100_000_000_000 threshold the v30 normalizer
+        // uses; epoch seconds (~1.7e9) would fall below it.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("disable fk for orphan insert");
+        conn.execute(
+            "INSERT INTO segment_embeddings (segment_id, embedder_id, dimension, vector) \
+             VALUES (1, 'embedder-x', 8, X'0102030405060708')",
+            [],
+        )
+        .expect("insert omitting embedded_at");
+        let embedded_at: i64 = conn
+            .query_row(
+                "SELECT embedded_at FROM segment_embeddings WHERE segment_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read embedded_at");
+        assert!(
+            embedded_at > 100_000_000_000,
+            "embedded_at default must be epoch ms (ft-wi24o); got {embedded_at} (looks like seconds)"
+        );
+    }
+
     /// br-ft-4yr9i: SCHEMA_VERSION is in lockstep with the
     /// MIGRATIONS array. Pinned at the migration boundary so a
     /// future migration entry that doesn't bump SCHEMA_VERSION
