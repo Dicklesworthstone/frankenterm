@@ -4,8 +4,8 @@
 //! that govern what a WASM extension is allowed to do.
 
 use anyhow::{Context, Result, bail};
-use std::ffi::OsStr;
-use std::path::{Component, Path};
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 
 /// Permissions declared by a WASM extension in its manifest.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,16 +37,16 @@ impl ExtensionPermissions {
 
     /// Check whether the given path is permitted for reading.
     pub fn allows_read(&self, path: &str) -> bool {
-        self.filesystem_read
-            .iter()
-            .any(|allowed| path.starts_with(allowed.as_str()))
+        path_allowed_by_roots(path, &self.filesystem_read)
     }
 
     /// Check whether the given path is permitted for writing.
+    ///
+    /// Non-existent write targets are allowed when their normalized path stays
+    /// under an allowed root. Existing absolute path prefixes are resolved to
+    /// catch symlink escapes before the containment check.
     pub fn allows_write(&self, path: &str) -> bool {
-        self.filesystem_write
-            .iter()
-            .any(|allowed| path.starts_with(allowed.as_str()))
+        path_allowed_by_roots(path, &self.filesystem_write)
     }
 }
 
@@ -167,7 +167,7 @@ impl ParsedManifest {
 
         // Parse permissions
         let perms = doc.get("permissions");
-        let permissions = parse_permissions(perms);
+        let permissions = parse_permissions(perms)?;
 
         // Parse hooks
         let hooks = doc
@@ -291,9 +291,9 @@ fn parse_engine_config(engine: Option<&toml::Value>) -> EngineConfig {
     EngineConfig { engine_type, entry }
 }
 
-fn parse_permissions(perms: Option<&toml::Value>) -> ExtensionPermissions {
+fn parse_permissions(perms: Option<&toml::Value>) -> Result<ExtensionPermissions> {
     let Some(perms) = perms else {
-        return ExtensionPermissions::default();
+        return Ok(ExtensionPermissions::default());
     };
 
     let string_array = |key: &str| -> Vec<String> {
@@ -312,16 +312,16 @@ fn parse_permissions(perms: Option<&toml::Value>) -> ExtensionPermissions {
     let (mut filesystem_read, mut filesystem_write) = (vec![], vec![]);
     for entry in &filesystem {
         if let Some(path) = entry.strip_prefix("read:") {
-            filesystem_read.push(path.to_string());
+            filesystem_read.push(validated_filesystem_permission_path(path)?);
         } else if let Some(path) = entry.strip_prefix("write:") {
-            filesystem_write.push(path.to_string());
+            filesystem_write.push(validated_filesystem_permission_path(path)?);
         } else {
             // Bare path = read-only
-            filesystem_read.push(entry.clone());
+            filesystem_read.push(validated_filesystem_permission_path(entry)?);
         }
     }
 
-    ExtensionPermissions {
+    Ok(ExtensionPermissions {
         filesystem_read,
         filesystem_write,
         environment: string_array("environment"),
@@ -333,6 +333,87 @@ fn parse_permissions(perms: Option<&toml::Value>) -> ExtensionPermissions {
             .get("pane_access")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+    })
+}
+
+fn path_allowed_by_roots(path: &str, allowed_roots: &[String]) -> bool {
+    let Some(requested) = normalize_filesystem_path(path) else {
+        return false;
+    };
+
+    allowed_roots.iter().any(|allowed| {
+        let Some(allowed_root) = normalize_filesystem_path(allowed) else {
+            return false;
+        };
+
+        requested.starts_with(&allowed_root)
+            && canonical_containment_matches(&requested, &allowed_root)
+    })
+}
+
+fn validated_filesystem_permission_path(path: &str) -> Result<String> {
+    let Some(normalized) = normalize_filesystem_path(path) else {
+        bail!("invalid filesystem permission path '{path}'");
+    };
+    Ok(normalized.to_string_lossy().into_owned())
+}
+
+fn normalize_filesystem_path(path: &str) -> Option<PathBuf> {
+    if path.is_empty() || path.contains('\0') || path.contains('\\') {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Prefix(_) => return None,
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+fn canonical_containment_matches(requested: &Path, allowed_root: &Path) -> bool {
+    if !requested.is_absolute() || !allowed_root.is_absolute() {
+        return true;
+    }
+
+    let Some(requested) = canonicalize_existing_prefix(requested) else {
+        return false;
+    };
+    let Some(allowed_root) = canonicalize_existing_prefix(allowed_root) else {
+        return false;
+    };
+
+    requested.starts_with(allowed_root)
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut probe = path.to_path_buf();
+    let mut missing_components: Vec<OsString> = Vec::new();
+
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(&probe) {
+            for component in missing_components.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(canonical);
+        }
+
+        let component = probe.file_name()?.to_os_string();
+        missing_components.push(component);
+
+        if !probe.pop() {
+            return None;
+        }
     }
 }
 
@@ -506,9 +587,88 @@ key = "value"
             ..Default::default()
         };
         assert!(perms.allows_read("~/.config/frankenterm/theme.toml"));
+        assert!(perms.allows_read("~/.config/frankenterm"));
+        assert!(perms.allows_read("~/.config/frankenterm/../frankenterm/theme.toml"));
+        assert!(!perms.allows_read("~/.config/frankenterm-secret/theme.toml"));
+        assert!(!perms.allows_read("~/.config/frankenterm/../../.ssh/id_rsa"));
         assert!(!perms.allows_read("~/.ssh/id_rsa"));
         assert!(perms.allows_write("~/.local/share/frankenterm/cache.db"));
+        assert!(!perms.allows_write("~/.local/share/frankenterm-backup/cache.db"));
         assert!(!perms.allows_write("~/.config/frankenterm/theme.toml"));
+    }
+
+    #[test]
+    fn filesystem_permission_checks_are_component_aware() {
+        let perms = ExtensionPermissions {
+            filesystem_read: vec!["/tmp/ft-allowed".to_string()],
+            filesystem_write: vec!["/tmp/ft-out/".to_string()],
+            ..Default::default()
+        };
+
+        assert!(perms.allows_read("/tmp/ft-allowed"));
+        assert!(perms.allows_read("/tmp/ft-allowed/file.txt"));
+        assert!(perms.allows_read("/tmp/ft-allowed/./nested/file.txt"));
+        assert!(perms.allows_read("/tmp/ft-allowed/nested/../file.txt"));
+        assert!(!perms.allows_read("/tmp/ft-allowed-secret/file.txt"));
+        assert!(!perms.allows_read("/tmp/ft-allowed/../ft-allowed-secret/file.txt"));
+        assert!(!perms.allows_read("../tmp/ft-allowed/file.txt"));
+
+        assert!(perms.allows_write("/tmp/ft-out/new-file.txt"));
+        assert!(!perms.allows_write("/tmp/ft-outputside/new-file.txt"));
+        assert!(!perms.allows_write("/tmp/ft-out/../ft-outputside/new-file.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_permission_checks_reject_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("outside-link")).unwrap();
+
+        let perms = ExtensionPermissions {
+            filesystem_read: vec![allowed.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+
+        assert!(perms.allows_read(&allowed.join("file.txt").to_string_lossy()));
+        assert!(!perms.allows_read(&allowed.join("outside-link/secret.txt").to_string_lossy()));
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_filesystem_permission_paths() {
+        for permission in [
+            "read:",
+            "write:",
+            "read:../escape",
+            "write:/tmp/frankenterm/../../..",
+            r"read:C:\Users\Public",
+        ] {
+            let escaped_permission = permission.replace('\\', "\\\\").replace('"', "\\\"");
+            let toml = format!(
+                r#"
+[extension]
+name = "bad-permission"
+
+[permissions]
+filesystem = ["{escaped_permission}"]
+"#
+            );
+
+            let result = ParsedManifest::from_toml_str(&toml);
+
+            assert!(
+                result.is_err(),
+                "permission should be rejected: {permission:?}"
+            );
+            let err = result.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("invalid filesystem permission path"),
+                "unexpected error for {permission:?}: {err:#}"
+            );
+        }
     }
 
     // ===================================================================

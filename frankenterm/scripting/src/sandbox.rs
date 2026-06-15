@@ -270,6 +270,37 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_prefix_bypass_attempts_are_denied_and_audited() {
+        let enforcer = test_enforcer(ExtensionPermissions {
+            filesystem_read: vec!["/tmp/ft-allowed".to_string()],
+            filesystem_write: vec!["/tmp/ft-out".to_string()],
+            ..Default::default()
+        });
+
+        assert!(enforcer.check_read("/tmp/ft-allowed/file.txt").is_ok());
+        assert!(
+            enforcer
+                .check_read("/tmp/ft-allowed-secret/file.txt")
+                .is_err()
+        );
+        assert!(enforcer.check_write("/tmp/ft-outputside/file.txt").is_err());
+        assert!(
+            enforcer
+                .check_write("/tmp/ft-out/../ft-outputside/file.txt")
+                .is_err()
+        );
+
+        let trail = enforcer.audit_trail();
+        assert_eq!(trail.len(), 4);
+        assert_eq!(trail.denied_count(), 3);
+        let recent = trail.recent(4);
+        assert!(matches!(recent[0].outcome, AuditOutcome::Ok));
+        assert!(matches!(recent[1].outcome, AuditOutcome::Denied(_)));
+        assert!(matches!(recent[2].outcome, AuditOutcome::Denied(_)));
+        assert!(matches!(recent[3].outcome, AuditOutcome::Denied(_)));
+    }
+
+    #[test]
     fn resource_limits_default() {
         let limits = ResourceLimits::default();
         assert_eq!(limits.max_memory_bytes, 64 * 1024 * 1024);
