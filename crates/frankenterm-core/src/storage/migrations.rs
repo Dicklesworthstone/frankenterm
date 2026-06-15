@@ -2453,6 +2453,21 @@ pub(crate) fn previous_migration_version(version: i32) -> i32 {
 }
 
 pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result<MigrationPlan> {
+    // Fail closed on a future source DB (ft-men4p). Without this guard a DB whose
+    // user_version exceeds SCHEMA_VERSION falls into the rollback branch below,
+    // finds no known migrations above SCHEMA_VERSION, and returns an EMPTY plan —
+    // which tooling reports as "already current", a false-safe result for an
+    // incompatible/newer database. Mirror initialize_schema's SchemaTooNew stop
+    // so every planning/migrate entry point (migration_plan_for_path,
+    // migrate_database_to_version, `ft db migrate --dry-run`/status) refuses.
+    if from_version > SCHEMA_VERSION {
+        return Err(StorageError::SchemaTooNew {
+            current: from_version,
+            supported: SCHEMA_VERSION,
+        }
+        .into());
+    }
+
     if to_version > SCHEMA_VERSION {
         return Err(StorageError::MigrationFailed(format!(
             "Target schema version ({to_version}) is newer than supported ({SCHEMA_VERSION}). \
@@ -3047,6 +3062,23 @@ mod tests {
         assert_eq!(plan.to_version, SCHEMA_VERSION);
         assert_eq!(plan.direction, MigrationDirection::Up);
         assert!(plan.steps.is_empty());
+    }
+
+    #[test]
+    fn build_migration_plan_rejects_future_from_version() {
+        // ft-men4p: a DB whose user_version exceeds SCHEMA_VERSION must fail
+        // closed (SchemaTooNew), not fall into the rollback branch and return an
+        // empty "already current" plan that tooling reports as safe.
+        let future = SCHEMA_VERSION + 1;
+        let err = build_migration_plan(future, SCHEMA_VERSION)
+            .expect_err("a future source schema version must be rejected, not planned as empty");
+        let message = err.to_string();
+        assert!(
+            message.contains(&future.to_string()),
+            "fail-closed error should cite the future version {future}: {message}"
+        );
+        // Rolling a future DB down to an older target is likewise refused.
+        assert!(build_migration_plan(future, SCHEMA_VERSION - 1).is_err());
     }
 
     /// br-ft-4yr9i: SCHEMA_VERSION is in lockstep with the
