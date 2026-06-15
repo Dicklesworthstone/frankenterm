@@ -1702,6 +1702,15 @@ fn subscribe_event_record(
             if severity.is_some() || rule_glob.is_some() {
                 return None;
             }
+            // ft-d3x5y: redact domain + title before emission, mirroring the
+            // PatternDetected branch (redact_detection). These pane-lifecycle
+            // records are live-only (cursor = null, never persisted) so this IPC
+            // stream is the ONLY surface they reach — they are NOT reads of
+            // already-redacted storage. A pane title routinely echoes secrets
+            // (a shell putting the last command / env in the title), and the
+            // same field is redacted on wa.state and the web SSE path; without
+            // this the watch-events stream leaks it raw at IpcScope::Read.
+            let redactor = crate::policy::Redactor::new();
             Some(serde_json::json!({
                 "type": "event",
                 "cursor": serde_json::Value::Null,
@@ -1715,8 +1724,8 @@ fn subscribe_event_record(
                 "detected_at": now_ms_i64(),
                 "matched_text": serde_json::Value::Null,
                 "extracted": serde_json::json!({
-                    "domain": domain,
-                    "title": title,
+                    "domain": redactor.redact(domain),
+                    "title": redactor.redact(title),
                 }),
                 "handled": false,
                 "handled_status": serde_json::Value::Null,
@@ -3079,6 +3088,41 @@ mod tests {
         assert_eq!(rec["extracted"]["domain"], "local");
         assert_eq!(rec["extracted"]["title"], "shell");
         assert_eq!(rec["handled"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subscribe_event_record_redacts_pane_discovered_title_and_domain() {
+        // ft-d3x5y: PaneDiscovered is live-only (this IPC stream is its sole
+        // surface), so a secret echoed into the pane title/domain must be
+        // redacted here too — not just on the PatternDetected branch.
+        let fixture = "ghp_0123456789012345678901234567890123456789"; // ubs:ignore - synthetic redaction fixture, not a live credential.
+        let event = Event::PaneDiscovered {
+            pane_id: 5,
+            domain: format!("local:{fixture}"),
+            title: format!("$ echo {fixture}"),
+        };
+        let rec = subscribe_event_record(&event, None, None, None).expect("record");
+        let domain = rec["extracted"]["domain"].as_str().unwrap_or_default();
+        let title = rec["extracted"]["title"].as_str().unwrap_or_default();
+        assert!(!domain.contains(fixture), "domain leaked secret: {domain}");
+        assert!(!title.contains(fixture), "title leaked secret: {title}");
+
+        // Non-secret titles still pass through (redaction is targeted, not
+        // destructive) — keeps the live signal useful.
+        let plain = subscribe_event_record(
+            &Event::PaneDiscovered {
+                pane_id: 5,
+                domain: "local".to_string(),
+                title: "shell".to_string(),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("record");
+        assert_eq!(plain["extracted"]["domain"], "local");
+        assert_eq!(plain["extracted"]["title"], "shell");
     }
 
     #[cfg(unix)]
