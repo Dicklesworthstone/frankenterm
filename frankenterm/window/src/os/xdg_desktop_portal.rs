@@ -152,7 +152,7 @@ pub fn refresh_appearance_in_background() {
 }
 
 pub async fn read_setting(namespace: &str, key: &str) -> anyhow::Result<OwnedValue> {
-    let connection = zbus::ConnectionBuilder::session()?.build().await?;
+    let connection = zbus::Connection::session().await?;
     let proxy = PortalSettingsProxy::new(&connection)
         .await
         .context("make proxy")?;
@@ -212,7 +212,7 @@ pub async fn get_appearance() -> anyhow::Result<Option<Appearance>> {
     }
 }
 
-pub async fn run_signal_loop(stream: &mut SettingChangedStream<'_>) -> Result<(), anyhow::Error> {
+async fn run_signal_loop(stream: &mut SettingChangedStream) -> Result<(), anyhow::Error> {
     // query appearance again as it might have changed without us knowing
     if let Ok(value) =
         value_to_appearance(read_setting("org.freedesktop.appearance", "color-scheme").await?)
@@ -246,7 +246,7 @@ pub async fn run_signal_loop(stream: &mut SettingChangedStream<'_>) -> Result<()
 
 pub fn subscribe() {
     promise::spawn::spawn(async move {
-        let connection = zbus::ConnectionBuilder::session()?.build().await?;
+        let connection = zbus::Connection::session().await?;
         let proxy = PortalSettingsProxy::new(&connection)
             .await
             .context("make proxy")?;
@@ -316,8 +316,10 @@ mod tests {
         let poisoned_state = Arc::clone(&state);
 
         let handle = std::thread::spawn(move || {
-            let _guard = poisoned_state.lock().unwrap();
-            panic!("simulate xdg portal state poison");
+            let _guard = poisoned_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::panic::resume_unwind(Box::new("simulate xdg portal state poison"));
         });
 
         assert!(handle.join().is_err());
