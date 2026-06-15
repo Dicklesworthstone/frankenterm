@@ -244,7 +244,20 @@ impl MappedVertexBuffer {
         match self {
             Self::Glium(g) => &mut g.mapping[range],
             Self::WebGpu(g) => {
-                let mapping: &mut [Vertex] = bytemuck::cast_slice_mut(g.parts.mapping_mut());
+                let mapping = g.parts.mapping_mut();
+                let byte_len = mapping.len();
+                debug_assert_eq!(byte_len % std::mem::size_of::<Vertex>(), 0);
+                let mut bytes = mapping.slice(..);
+                let vertex_len = byte_len / std::mem::size_of::<Vertex>();
+                // wgpu 29 exposes mapped write memory as WriteOnly. The render
+                // path writes complete Vertex values through Quad; the mapping
+                // guard below still owns the underlying buffer until unmap.
+                let mapping: &mut [Vertex] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        bytes.as_raw_ptr().as_ptr().cast::<Vertex>(),
+                        vertex_len,
+                    )
+                };
                 &mut mapping[range]
             }
         }
@@ -261,7 +274,7 @@ pub struct WebGpuMappedVertexBuffer {
     // The mapped range and slice borrow from the vertex-buffer owner. Keep the
     // owner alive until both derived WebGPU views are dropped.
     parts: OwnerLastGuardedMapping<
-        wgpu::BufferViewMut<'static>,
+        wgpu::BufferViewMut,
         wgpu::BufferSlice<'static>,
         RefMut<'static, VertexBuffer>,
     >,

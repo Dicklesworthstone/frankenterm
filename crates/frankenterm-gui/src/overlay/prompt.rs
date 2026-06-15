@@ -98,7 +98,8 @@ async fn do_event(
     if let Some(lua) = lua {
         let args = lua.pack_multi((window, pane, line))?;
 
-        if let Err(err) = config::lua::emit_event(&lua, (name.clone(), args)).await {
+        if let Err(err) = config::lua::emit_event(lua.as_ref().clone(), (name.clone(), args)).await
+        {
             log::error!("while processing {} event: {:#}", name, err);
         }
     }

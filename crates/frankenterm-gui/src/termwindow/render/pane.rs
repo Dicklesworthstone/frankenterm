@@ -679,9 +679,12 @@ impl crate::TermWindow {
                         selection: selrange.clone(),
                         cursor,
                         shape_hash,
-                        top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
-                            + (line_idx + self.pos.top) as f32
-                                * self.term_window.render_metrics.cell_size.height as f32,
+                        top_pixel_y: NotNan::new(
+                            self.top_pixel_y
+                                + (line_idx + self.pos.top) as f32
+                                    * self.term_window.render_metrics.cell_size.height as f32,
+                        )
+                        .unwrap(),
                         left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
                         phys_line_idx: line_idx,
                         reverse_video: self.dims.reverse_video,

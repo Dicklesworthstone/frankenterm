@@ -21,16 +21,18 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
 
     window_mod.set(
         "gui_window_for_mux_window",
-        lua.create_async_function(|_, mux_window_id: MuxWindowId| async move {
-            let fe =
-                try_front_end().ok_or_else(|| mlua::Error::external("not called on gui thread"))?;
-            let _ = fe.reconcile_workspace().await;
-            let win = fe.gui_window_for_mux_window(mux_window_id).ok_or_else(|| {
-                mlua::Error::external(format!(
-                    "mux window id {mux_window_id} is not currently associated with a gui window"
-                ))
-            })?;
-            Ok(win)
+        lua.create_function(|_, mux_window_id: MuxWindowId| {
+            promise::spawn::block_on(async move {
+                let fe = try_front_end()
+                    .ok_or_else(|| mlua::Error::external("not called on gui thread"))?;
+                let _ = fe.reconcile_workspace().await;
+                let win = fe.gui_window_for_mux_window(mux_window_id).ok_or_else(|| {
+                    mlua::Error::external(format!(
+                        "mux window id {mux_window_id} is not currently associated with a gui window"
+                    ))
+                })?;
+                Ok(win)
+            })
         })?,
     )?;
 
@@ -83,18 +85,17 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         "enumerate_gpus",
         lua.create_function(|_, _: ()| {
             let backends = wgpu::Backends::all();
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-                backends,
-                ..Default::default()
-            });
-            let gpus: Vec<GpuInfo> = instance
-                .enumerate_adapters(backends)
-                .into_iter()
-                .map(|adapter| {
-                    let info = adapter.get_info();
-                    crate::termwindow::webgpu::adapter_info_to_gpu_info(info)
-                })
-                .collect();
+            let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+            descriptor.backends = backends;
+            let instance = wgpu::Instance::new(descriptor);
+            let gpus: Vec<GpuInfo> =
+                promise::spawn::block_on(instance.enumerate_adapters(backends))
+                    .into_iter()
+                    .map(|adapter| {
+                        let info = adapter.get_info();
+                        crate::termwindow::webgpu::adapter_info_to_gpu_info(info)
+                    })
+                    .collect();
             Ok(gpus)
         })?,
     )?;

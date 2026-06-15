@@ -1,6 +1,6 @@
 use crate::colorease::ColorEaseUniform;
 use crate::termwindow::RenderFrame;
-use crate::termwindow::webgpu::ShaderUniform;
+use crate::termwindow::webgpu::{ShaderUniform, WebGpuSurfaceTextureError};
 use crate::uniforms::UniformBuilder;
 use ::window::glium;
 use ::window::glium::uniforms::{
@@ -30,7 +30,28 @@ impl crate::TermWindow {
             .as_ref()
             .context("render state is not initialized")?;
 
-        let output = webgpu.surface.get_current_texture()?;
+        let output = match webgpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(output) => output,
+            wgpu::CurrentSurfaceTexture::Suboptimal(output) => {
+                log::warn!("webgpu surface texture is suboptimal; continuing with current frame");
+                output
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Err(WebGpuSurfaceTextureError::Timeout.into());
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return Err(WebGpuSurfaceTextureError::Occluded.into());
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                return Err(WebGpuSurfaceTextureError::Outdated.into());
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(WebGpuSurfaceTextureError::Lost.into());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(WebGpuSurfaceTextureError::Validation.into());
+            }
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -104,6 +125,7 @@ impl crate::TermWindow {
             label: Some("Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -118,6 +140,7 @@ impl crate::TermWindow {
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None,
         });
         render_pass.set_pipeline(&webgpu.render_pipeline);
         render_pass.set_bind_group(0, webgpu.shader_uniform_bind_group(), &[]);

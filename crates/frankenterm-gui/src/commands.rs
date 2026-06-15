@@ -98,6 +98,7 @@ fn domain_display_label(name: &str, label: &str) -> String {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn collect_domain_command_entries_sync(mux: &Mux) -> Vec<DomainCommandEntry> {
     let mut domains = mux.iter_domains();
     domains.sort_by(|a, b| {
@@ -338,6 +339,7 @@ impl CommandDef {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn actions_for_palette_and_menubar(config: &ConfigHandle) -> Vec<ExpandedCommand> {
         match Mux::try_get() {
             Some(mux) => {

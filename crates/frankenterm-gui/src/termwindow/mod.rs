@@ -252,7 +252,7 @@ pub struct TabInformation {
 }
 
 impl UserData for TabInformation {
-    fn add_fields<'lua, F: UserDataFields<'lua, Self>>(fields: &mut F) {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("tab_id", |_, this| Ok(this.tab_id));
         fields.add_field_method_get("tab_index", |_, this| Ok(this.tab_index));
         fields.add_field_method_get("is_active", |_, this| Ok(this.is_active));
@@ -312,7 +312,7 @@ pub struct PaneInformation {
 }
 
 impl UserData for PaneInformation {
-    fn add_fields<'lua, F: UserDataFields<'lua, Self>>(fields: &mut F) {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("pane_id", |_, this| Ok(this.pane_id));
         fields.add_field_method_get("pane_index", |_, this| Ok(this.pane_index));
         fields.add_field_method_get("is_active", |_, this| Ok(this.is_active));
@@ -2118,13 +2118,16 @@ enum WebGpuSurfaceErrorAction {
     Fail,
 }
 
-fn classify_webgpu_surface_error(err: &wgpu::SurfaceError) -> WebGpuSurfaceErrorAction {
+fn classify_webgpu_surface_error(
+    err: &webgpu::WebGpuSurfaceTextureError,
+) -> WebGpuSurfaceErrorAction {
     match err {
-        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => WebGpuSurfaceErrorAction::Retry,
-        wgpu::SurfaceError::Timeout => WebGpuSurfaceErrorAction::SkipFrame,
-        wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other => {
-            WebGpuSurfaceErrorAction::Fail
+        webgpu::WebGpuSurfaceTextureError::Lost | webgpu::WebGpuSurfaceTextureError::Outdated => {
+            WebGpuSurfaceErrorAction::Retry
         }
+        webgpu::WebGpuSurfaceTextureError::Timeout
+        | webgpu::WebGpuSurfaceTextureError::Occluded => WebGpuSurfaceErrorAction::SkipFrame,
+        webgpu::WebGpuSurfaceTextureError::Validation => WebGpuSurfaceErrorAction::Fail,
     }
 }
 
@@ -2684,7 +2687,7 @@ impl TermWindow {
             Ok(ok) => Ok(ok),
             Err(err) => {
                 match err
-                    .downcast_ref::<wgpu::SurfaceError>()
+                    .downcast_ref::<webgpu::WebGpuSurfaceTextureError>()
                     .map(classify_webgpu_surface_error)
                 {
                     Some(WebGpuSurfaceErrorAction::Retry) => {
@@ -3322,7 +3325,9 @@ impl TermWindow {
             let again = if let Some(lua) = lua {
                 let args = lua.pack_multi((window.clone(), pane))?;
 
-                if let Err(err) = config::lua::emit_event(&lua, (name.clone(), args)).await {
+                if let Err(err) =
+                    config::lua::emit_event(lua.as_ref().clone(), (name.clone(), args)).await
+                {
                     log::error!("while processing {} event: {:#}", name, err);
                 }
                 true
@@ -3732,8 +3737,11 @@ impl TermWindow {
         ) -> anyhow::Result<()> {
             if let Some(lua) = lua {
                 let args = lua.pack_multi((window.clone(), pane, name, value))?;
-                if let Err(err) =
-                    config::lua::emit_event(&lua, ("user-var-changed".to_string(), args)).await
+                if let Err(err) = config::lua::emit_event(
+                    lua.as_ref().clone(),
+                    ("user-var-changed".to_string(), args),
+                )
+                .await
                 {
                     log::error!("while processing user-var-changed event: {:#}", err);
                 }
@@ -5531,12 +5539,15 @@ impl TermWindow {
                 let default_click = match lua {
                     Some(lua) => {
                         let args = lua.pack_multi((window, pane, link.clone()))?;
-                        config::lua::emit_event(&lua, ("open-uri".to_string(), args))
-                            .await
-                            .map_err(|e| {
-                                log::error!("while processing open-uri event: {:#}", e);
-                                e
-                            })?
+                        config::lua::emit_event(
+                            lua.as_ref().clone(),
+                            ("open-uri".to_string(), args),
+                        )
+                        .await
+                        .map_err(|e| {
+                            log::error!("while processing open-uri event: {:#}", e);
+                            e
+                        })?
                     }
                     None => true,
                 };
@@ -6059,7 +6070,7 @@ mod tests {
         reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
         should_force_paint_for_frame_budget, should_run_frame_budget_decision,
         should_skip_clean_line, terminal_pane_id_to_u64, terminal_u16_from_stable_delta,
-        terminal_u16_from_usize,
+        terminal_u16_from_usize, webgpu,
     };
 
     #[test]
@@ -7096,11 +7107,11 @@ mod tests {
     #[test]
     fn webgpu_surface_error_classification_retries_stale_surfaces() {
         assert_eq!(
-            classify_webgpu_surface_error(&wgpu::SurfaceError::Lost),
+            classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Lost),
             WebGpuSurfaceErrorAction::Retry
         );
         assert_eq!(
-            classify_webgpu_surface_error(&wgpu::SurfaceError::Outdated),
+            classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Outdated),
             WebGpuSurfaceErrorAction::Retry
         );
     }
@@ -7108,7 +7119,11 @@ mod tests {
     #[test]
     fn webgpu_surface_error_classification_skips_timeout_frames() {
         assert_eq!(
-            classify_webgpu_surface_error(&wgpu::SurfaceError::Timeout),
+            classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Timeout),
+            WebGpuSurfaceErrorAction::SkipFrame
+        );
+        assert_eq!(
+            classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Occluded),
             WebGpuSurfaceErrorAction::SkipFrame
         );
     }
@@ -7116,11 +7131,7 @@ mod tests {
     #[test]
     fn webgpu_surface_error_classification_fails_terminal_errors() {
         assert_eq!(
-            classify_webgpu_surface_error(&wgpu::SurfaceError::OutOfMemory),
-            WebGpuSurfaceErrorAction::Fail
-        );
-        assert_eq!(
-            classify_webgpu_surface_error(&wgpu::SurfaceError::Other),
+            classify_webgpu_surface_error(&webgpu::WebGpuSurfaceTextureError::Validation),
             WebGpuSurfaceErrorAction::Fail
         );
     }

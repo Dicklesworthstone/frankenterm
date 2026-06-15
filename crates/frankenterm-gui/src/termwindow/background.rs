@@ -54,8 +54,8 @@ impl CachedGradient {
         }
 
         // Map t which is in range [a, b] to range [c, d]
-        fn remap(t: f64, a: f64, b: f64, c: f64, d: f64) -> f64 {
-            (t - a) * ((d - c) / (b - a)) + c
+        fn remap(t: f64, a: f64, b: f64, c: f32, d: f32) -> f32 {
+            ((t - a) * (f64::from(d - c) / (b - a)) + f64::from(c)) as f32
         }
 
         let (dmin, dmax) = grad.domain();
@@ -145,7 +145,7 @@ impl CachedGradient {
                     };
 
                     let t = (nx + (x - cx).powi(2) + (ny + y - cy).powi(2)).sqrt() / radius;
-                    *pixel = to_pixel(grad.at(t));
+                    *pixel = to_pixel(grad.at(t as f32));
                 }
             }
         }

@@ -1274,10 +1274,7 @@ mod tests {
     #[test]
     fn text_from_glyph_cluster_rejects_out_of_range_offset() {
         let err = text_from_glyph_cluster("abc", 4).unwrap_err();
-        assert!(
-            err.to_string().contains("outside text length 3"),
-            "{err:#}"
-        );
+        assert!(err.to_string().contains("outside text length 3"), "{err:#}");
     }
 
     #[test]

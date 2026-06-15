@@ -532,7 +532,7 @@ async fn trigger_gui_startup(
     };
 
     let args = lua.pack_multi(spawn)?;
-    config::lua::emit_event(&lua, ("gui-startup".to_string(), args)).await?;
+    config::lua::emit_event(lua.as_ref().clone(), ("gui-startup".to_string(), args)).await?;
     Ok(true)
 }
 
@@ -552,7 +552,7 @@ async fn trigger_gui_attached(
     };
 
     let args = lua.pack_multi(domain)?;
-    config::lua::emit_event(&lua, ("gui-attached".to_string(), args)).await?;
+    config::lua::emit_event(lua.as_ref().clone(), ("gui-attached".to_string(), args)).await?;
     Ok(true)
 }
 

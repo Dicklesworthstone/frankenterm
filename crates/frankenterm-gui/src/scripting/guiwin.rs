@@ -68,7 +68,7 @@ impl GuiWin {
 }
 
 impl UserData for GuiWin {
-    fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, _: ()| {
             Ok(format!(
                 "GuiWin(mux_window_id:{}, pid:{})",
@@ -178,7 +178,7 @@ impl UserData for GuiWin {
                     tx.try_send(term_window.current_event.to_dynamic()).ok();
                 })));
             let result = rx.recv_async().await.map_err(mlua::Error::external)?;
-            luahelper::dynamic_to_lua_value(lua, result)
+            luahelper::dynamic_to_lua_value(&lua, result)
         });
         methods.add_async_method(
             "perform_action",
@@ -213,7 +213,7 @@ impl UserData for GuiWin {
                 .map_err(|e| anyhow::anyhow!("{:#}", e))
                 .map_err(luaerr)?;
 
-            dynamic_to_lua_value(lua, overrides)
+            dynamic_to_lua_value(&lua, overrides)
         });
         methods.add_method("set_config_overrides", |_, this, value: mlua::Value| {
             let value = lua_value_to_dynamic(value)?;

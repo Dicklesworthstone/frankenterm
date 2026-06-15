@@ -22,6 +22,7 @@ use frankenterm_core::wayland_direct_scanout::{
     evaluate_direct_scanout,
 };
 use std::cell::RefCell;
+use std::fmt;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
@@ -33,6 +34,29 @@ use window::raw_window_handle::{
 use window::{BitmapImage, Dimensions, Rect, Window};
 
 const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebGpuSurfaceTextureError {
+    Timeout,
+    Occluded,
+    Outdated,
+    Lost,
+    Validation,
+}
+
+impl fmt::Display for WebGpuSurfaceTextureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("webgpu surface texture acquisition timed out"),
+            Self::Occluded => f.write_str("webgpu surface is occluded"),
+            Self::Outdated => f.write_str("webgpu surface configuration is outdated"),
+            Self::Lost => f.write_str("webgpu surface was lost"),
+            Self::Validation => f.write_str("webgpu surface texture acquisition failed validation"),
+        }
+    }
+}
+
+impl std::error::Error for WebGpuSurfaceTextureError {}
 const WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL: &str = "wgpu-25.0.2";
 const WEBGPU_SHADER_SOURCE: &str = include_str!("../shader.wgsl");
 
@@ -839,13 +863,14 @@ pub fn build_sparse_atlas_startup_probe(
     }
 }
 
-fn compute_compatibility_list(
+async fn compute_compatibility_list(
     instance: &wgpu::Instance,
     backends: wgpu::Backends,
-    surface: &wgpu::Surface,
+    surface: &wgpu::Surface<'_>,
 ) -> Vec<String> {
     instance
         .enumerate_adapters(backends)
+        .await
         .into_iter()
         .map(|a| {
             let info = adapter_info_to_gpu_info(a.get_info());
@@ -959,10 +984,9 @@ impl WebGpuState {
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
         let backends = wgpu::Backends::all();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends,
-            ..Default::default()
-        });
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = backends;
+        let instance = wgpu::Instance::new(descriptor);
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&handle)?)?
         };
@@ -970,7 +994,7 @@ impl WebGpuState {
         let mut adapter: Option<wgpu::Adapter> = None;
 
         if let Some(preference) = &config.webgpu_preferred_adapter {
-            for a in instance.enumerate_adapters(backends) {
+            for a in instance.enumerate_adapters(backends).await {
                 if !a.is_surface_supported(&surface) {
                     let info = adapter_info_to_gpu_info(a.get_info());
                     log::warn!("{} is not compatible with surface", info.to_string());
@@ -1012,7 +1036,7 @@ impl WebGpuState {
             }
 
             if adapter.is_none() {
-                let adapters = compute_compatibility_list(&instance, backends, &surface);
+                let adapters = compute_compatibility_list(&instance, backends, &surface).await;
                 log::warn!(
                     "Your webgpu preferred adapter '{}' was either not \
                      found or is not compatible with your display. Available:\n{}",
@@ -1039,13 +1063,16 @@ impl WebGpuState {
             );
         }
 
-        let adapter = adapter.ok_or_else(|| {
-            let adapters = compute_compatibility_list(&instance, backends, &surface);
-            anyhow!(
-                "no compatible adapter found. Available:\n{}",
-                adapters.join("\n")
-            )
-        })?;
+        let adapter = match adapter {
+            Some(adapter) => adapter,
+            None => {
+                let adapters = compute_compatibility_list(&instance, backends, &surface).await;
+                return Err(anyhow!(
+                    "no compatible adapter found. Available:\n{}",
+                    adapters.join("\n")
+                ));
+            }
+        };
 
         let adapter_info = adapter.get_info();
         log::trace!("Using adapter: {adapter_info:?}");
@@ -1097,6 +1124,7 @@ impl WebGpuState {
                     wgpu::Limits::downlevel_defaults()
                 }
                 .using_resolution(adapter.limits()),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 label: None,
                 memory_hints: Default::default(),
                 trace: wgpu::Trace::Off,
@@ -1175,7 +1203,7 @@ impl WebGpuState {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
         let texture_linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1184,7 +1212,7 @@ impl WebGpuState {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -1215,11 +1243,11 @@ impl WebGpuState {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
                 bind_group_layouts: &[
-                    &shader_uniform_bind_group_layout,
-                    &texture_bind_group_layout,
-                    &texture_bind_group_layout,
+                    Some(&shader_uniform_bind_group_layout),
+                    Some(&texture_bind_group_layout),
+                    Some(&texture_bind_group_layout),
                 ],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1257,7 +1285,7 @@ impl WebGpuState {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1414,9 +1442,13 @@ mod tests {
             vendor: 0x10de,
             device: 0x2684,
             device_type: wgpu::DeviceType::DiscreteGpu,
+            device_pci_bus_id: String::new(),
             driver: driver.to_string(),
             driver_info: driver_info.to_string(),
             backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: wgpu::MINIMUM_SUBGROUP_MIN_SIZE,
+            subgroup_max_size: wgpu::MAXIMUM_SUBGROUP_MAX_SIZE,
+            transient_saves_memory: false,
         }
     }
 

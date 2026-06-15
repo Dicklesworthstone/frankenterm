@@ -458,12 +458,15 @@ impl super::TermWindow {
                         format!("{button:?}"),
                         action.clone(),
                     ))?;
-                    config::lua::emit_event(&lua, ("new-tab-button-click".to_string(), args))
-                        .await
-                        .map_err(|e| {
-                            log::error!("while processing new-tab-button-click event: {:#}", e);
-                            e
-                        })?
+                    config::lua::emit_event(
+                        lua.as_ref().clone(),
+                        ("new-tab-button-click".to_string(), args),
+                    )
+                    .await
+                    .map_err(|e| {
+                        log::error!("while processing new-tab-button-click event: {:#}", e);
+                        e
+                    })?
                 }
                 None => true,
             };
