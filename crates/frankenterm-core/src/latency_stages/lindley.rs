@@ -30,6 +30,25 @@ pub const LINDLEY_ATTESTATION_BURST_EVENTS: f64 = 10.0;
 /// attestation uses a 10% steady-state margin.
 pub const LINDLEY_ATTESTATION_ARRIVAL_RATE_EVENTS_PER_MS: f64 = 90.0;
 
+/// Storage-write service rate used by the W9.2 group-commit
+/// re-attestation.
+///
+/// W9.1 changed the attested same-pane burst path from one sequence
+/// lookup plus one insert per segment to one sequence lookup per
+/// group plus one insert per segment, all inside one explicit WAL
+/// transaction. For the 10-event attestation burst, that is a
+/// conservative statement-count improvement from 20 to 11 before
+/// considering avoided per-row transaction setup. Applying 20/11 to
+/// the legacy 100 events/ms row gives ~181 events/ms; the published
+/// service curve caps that at the next bottleneck stage
+/// (DeltaExtraction, 150 events/ms) so the artifact does not
+/// overclaim beyond the pipeline's limiting rate.
+pub const LINDLEY_GROUP_COMMIT_STORAGE_WRITE_SERVICE_RATE_EVENTS_PER_MS: f64 = 150.0;
+
+/// Storage-write p99 carried forward until a retained batch benchmark
+/// publishes a replacement empirical latency row.
+pub const LINDLEY_GROUP_COMMIT_STORAGE_WRITE_P99_LATENCY_MS: f64 = 5.0;
+
 /// Per-stage telemetry consumed by the Lindley-bounds attestation.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LindleyStageTelemetry {
@@ -98,23 +117,7 @@ impl LindleyTelemetryModel {
         Self {
             arrival_burst_events: LINDLEY_ATTESTATION_BURST_EVENTS,
             arrival_rate_events_per_ms: LINDLEY_ATTESTATION_ARRIVAL_RATE_EVENTS_PER_MS,
-            stages: vec![
-                LindleyStageTelemetry {
-                    stage: LatencyStage::PtyCapture,
-                    service_rate_events_per_ms: 200.0,
-                    p99_latency_ms: 1.0,
-                },
-                LindleyStageTelemetry {
-                    stage: LatencyStage::DeltaExtraction,
-                    service_rate_events_per_ms: 150.0,
-                    p99_latency_ms: 2.0,
-                },
-                LindleyStageTelemetry {
-                    stage: LatencyStage::StorageWrite,
-                    service_rate_events_per_ms: 100.0,
-                    p99_latency_ms: 5.0,
-                },
-            ],
+            stages: documented_capture_benchmark_stage_rows(),
         }
     }
 
@@ -125,36 +128,23 @@ impl LindleyTelemetryModel {
     /// without pretending the release artifact has an empirical
     /// agreement row for the wider path yet.
     pub fn documented_end_to_end_capture_default() -> Self {
+        let mut stages = documented_capture_benchmark_stage_rows();
+        stages.extend([
+            LindleyStageTelemetry {
+                stage: LatencyStage::PatternDetection,
+                service_rate_events_per_ms: 100.0,
+                p99_latency_ms: 10.0,
+            },
+            LindleyStageTelemetry {
+                stage: LatencyStage::EventEmission,
+                service_rate_events_per_ms: 100.0,
+                p99_latency_ms: 5.0,
+            },
+        ]);
         Self {
             arrival_burst_events: LINDLEY_ATTESTATION_BURST_EVENTS,
             arrival_rate_events_per_ms: LINDLEY_ATTESTATION_ARRIVAL_RATE_EVENTS_PER_MS,
-            stages: vec![
-                LindleyStageTelemetry {
-                    stage: LatencyStage::PtyCapture,
-                    service_rate_events_per_ms: 200.0,
-                    p99_latency_ms: 1.0,
-                },
-                LindleyStageTelemetry {
-                    stage: LatencyStage::DeltaExtraction,
-                    service_rate_events_per_ms: 150.0,
-                    p99_latency_ms: 2.0,
-                },
-                LindleyStageTelemetry {
-                    stage: LatencyStage::StorageWrite,
-                    service_rate_events_per_ms: 100.0,
-                    p99_latency_ms: 5.0,
-                },
-                LindleyStageTelemetry {
-                    stage: LatencyStage::PatternDetection,
-                    service_rate_events_per_ms: 100.0,
-                    p99_latency_ms: 10.0,
-                },
-                LindleyStageTelemetry {
-                    stage: LatencyStage::EventEmission,
-                    service_rate_events_per_ms: 100.0,
-                    p99_latency_ms: 5.0,
-                },
-            ],
+            stages,
         }
     }
 
@@ -236,6 +226,27 @@ impl LindleyTelemetryModel {
                 .collect(),
         ))
     }
+}
+
+fn documented_capture_benchmark_stage_rows() -> Vec<LindleyStageTelemetry> {
+    vec![
+        LindleyStageTelemetry {
+            stage: LatencyStage::PtyCapture,
+            service_rate_events_per_ms: 200.0,
+            p99_latency_ms: 1.0,
+        },
+        LindleyStageTelemetry {
+            stage: LatencyStage::DeltaExtraction,
+            service_rate_events_per_ms: 150.0,
+            p99_latency_ms: 2.0,
+        },
+        LindleyStageTelemetry {
+            stage: LatencyStage::StorageWrite,
+            service_rate_events_per_ms:
+                LINDLEY_GROUP_COMMIT_STORAGE_WRITE_SERVICE_RATE_EVENTS_PER_MS,
+            p99_latency_ms: LINDLEY_GROUP_COMMIT_STORAGE_WRITE_P99_LATENCY_MS,
+        },
+    ]
 }
 
 fn lindley_stage_name(stage: LatencyStage) -> &'static str {

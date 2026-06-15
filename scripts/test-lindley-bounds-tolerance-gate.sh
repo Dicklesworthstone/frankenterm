@@ -60,11 +60,11 @@ run_case() {
 }
 
 # Case 1: within tolerance — uses the documented reference value.
-# The substrate's pipeline_delay_bound returns ~8.1 ms; 8.5 ms is
+# The substrate's pipeline_delay_bound returns ~8.067 ms; 8.5 ms is
 # within ±20% so the gate must pass.
 run_case "within_tolerance" "8.5" 0
 
-# Case 2: outside tolerance — 999 ms empirical against ~8.1 ms
+# Case 2: outside tolerance — 999 ms empirical against ~8.067 ms
 # analytical is a ~12_000% deviation, far above the 20% TOLERANCE_PCT.
 # The gate must fail with exit 1.
 run_case "outside_tolerance" "999.0" 1

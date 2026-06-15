@@ -197,7 +197,14 @@ fn test_lindley_documented_default_builds_substrate_inputs() {
     );
 
     let bound = crate::network_calculus_bound::pipeline_delay_bound(arrival, &stages).unwrap();
-    assert!((bound - 8.1).abs() < 1e-9, "bound={bound}");
+    assert_eq!(
+        stages[2].service.rate(),
+        LINDLEY_GROUP_COMMIT_STORAGE_WRITE_SERVICE_RATE_EVENTS_PER_MS
+    );
+    let expected_bound = 8.0
+        + LINDLEY_ATTESTATION_BURST_EVENTS
+            / LINDLEY_GROUP_COMMIT_STORAGE_WRITE_SERVICE_RATE_EVENTS_PER_MS;
+    assert!((bound - expected_bound).abs() < 1e-9, "bound={bound}");
 }
 
 #[test]
@@ -227,6 +234,10 @@ fn test_lindley_end_to_end_capture_model_covers_full_capture_path() {
     );
 
     let bound = crate::network_calculus_bound::pipeline_delay_bound(arrival, &stages).unwrap();
+    assert_eq!(
+        stages[2].service.rate(),
+        LINDLEY_GROUP_COMMIT_STORAGE_WRITE_SERVICE_RATE_EVENTS_PER_MS
+    );
     assert!((bound - 23.1).abs() < 1e-9, "bound={bound}");
     assert!(bound < 50.0, "bound={bound}");
 }

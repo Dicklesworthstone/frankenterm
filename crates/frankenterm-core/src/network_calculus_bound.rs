@@ -449,7 +449,7 @@ fn canonical_lindley_stage_json(stage: &StageModel) -> String {
 }
 
 fn sha256_hex(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    hex::encode(Sha256::digest(value.as_bytes()))
 }
 
 fn render_lindley_coverage_status_json() -> String {
@@ -855,17 +855,18 @@ mod tests {
         // Realistic-ish numbers for the bead's headline pipeline:
         // capture stage at 200 events/ms with 1ms latency,
         // delta-extract at 150 events/ms with 2ms latency,
-        // storage write at 100 events/ms with 5ms latency.
+        // storage write at 150 events/ms with 5ms latency after the
+        // append_segment group-commit service-curve refresh.
         // Arrival: burst 50 events, rate 80 events/ms.
         let arrival = ArrivalCurve::new(50.0, 80.0);
         let stages = vec![
             StageModel::new("capture", ServiceCurve::new(200.0, 1.0)),
             StageModel::new("delta_extract", ServiceCurve::new(150.0, 2.0)),
-            StageModel::new("storage_write", ServiceCurve::new(100.0, 5.0)),
+            StageModel::new("storage_write", ServiceCurve::new(150.0, 5.0)),
         ];
-        // Composed: rate=100, latency=8 → bound = 8 + 50/100 = 8.5ms
+        // Composed: rate=150, latency=8 → bound = 8 + 50/150 ≈ 8.333ms
         let bound = pipeline_delay_bound(arrival, &stages).unwrap();
-        assert!(approx(bound, 8.5));
+        assert!(approx(bound, 8.0 + 50.0 / 150.0));
         // Comfortably under the 50ms headline.
         assert!(bound < 50.0, "{bound} should be < 50ms headline claim");
     }
@@ -879,7 +880,7 @@ mod tests {
         let stages = vec![
             StageModel::new("capture", ServiceCurve::new(200.0, 1.0)),
             StageModel::new("delta_extract", ServiceCurve::new(150.0, 2.0)),
-            StageModel::new("storage_write", ServiceCurve::new(100.0, 5.0)),
+            StageModel::new("storage_write", ServiceCurve::new(150.0, 5.0)),
         ];
         let analytical = pipeline_delay_bound(arrival, &stages).unwrap();
         let empirical = analytical * 0.95; // 5% lower than bound — passing.

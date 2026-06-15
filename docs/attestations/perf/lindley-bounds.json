@@ -17,7 +17,7 @@
     },
     {
       "name": "storage_write",
-      "service_rate": 100,
+      "service_rate": 150,
       "service_latency": 5
     }
   ],
@@ -32,12 +32,12 @@
     },
     {
       "name": "storage_write",
-      "content_sha256": "f90156cc25d538d5f954236559036528b0000f2744a2e83c696994c94faf18c7"
+      "content_sha256": "348bc6cad6a3e9ee2e42fde886b67f18e97f85e75425fc81bcf01fb9325ca59a"
     }
   ],
-  "analytical_bound_ms": 8.1,
+  "analytical_bound_ms": 8.066666666666666,
   "empirical_p99_ms": 8.5,
-  "deviation_pct": 4.938271604938276,
+  "deviation_pct": 5.371900826446284,
   "within_tolerance": true,
   "coverage_status": [
     {

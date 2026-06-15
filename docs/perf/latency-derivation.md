@@ -12,7 +12,7 @@ attestation artifact published per release at
 For the currently published headline benchmark pipeline
 `capture -> delta-extract -> storage write`:
 
-- **Analytical bound**: 8.1ms (Lindley `h(alpha, beta) = T + b/R`).
+- **Analytical bound**: 8.067ms (Lindley `h(alpha, beta) = T + b/R`).
 - **Empirical p99**: 8.5ms (measured on the bench corpus).
 - **Verdict**: within the substrate's 20% agreement tolerance.
 
@@ -97,16 +97,27 @@ included in the current attestation artifact.
 |-------------------|----------------------|-----------------|--------|
 | capture (PTY read)| 200                  | 1.0             | `latency_stages.rs` p99 |
 | delta-extract     | 150                  | 2.0             | `latency_stages.rs` p99 |
-| storage write     | 100                  | 5.0             | `latency_stages.rs` p99 |
+| storage write     | 150                  | 5.0             | W9.1 group-commit service curve; p99 carried forward |
 
 Arrival: burst `b = 10 events`, rate `r = 90 events/ms`. The original
 operator sketch used 100 events/ms, but the substrate requires strict
 stability (`r < min(R_i)`) and the slowest service rate in this slice is
-100 events/ms, so the release artifact uses a 10% steady-state margin.
+150 events/ms, so the release artifact uses a 40% steady-state margin.
 
-Composed pipeline: `β = min(200, 150, 100) · (t - 1 - 2 - 5)⁺ = 100·(t - 8)⁺`.
+W9.1 changed the storage-write hot path from one sequence lookup plus
+one insert per segment to one sequence lookup per same-pane group plus
+one insert per segment, all inside one explicit WAL transaction. For
+the attestation burst `N = 10`, the conservative modeled statement
+count improves from `2N = 20` to `N + 1 = 11` before counting avoided
+per-row transaction setup. Applying that `20/11` factor to the old
+100 events/ms storage row yields about 181 events/ms. The checked-in
+service curve caps storage at 150 events/ms, matching the
+DeltaExtraction bottleneck, and keeps the old 5.0ms p99 until a
+retained batch benchmark publishes a new empirical latency row.
 
-Lindley bound: `h = 8 + 10/100 = 8.1ms` per arrival.
+Composed pipeline: `β = min(200, 150, 150) · (t - 1 - 2 - 5)⁺ = 150·(t - 8)⁺`.
+
+Lindley bound: `h = 8 + 10/150 = 8.0666666667ms` per arrival.
 
 The README's `<50ms` figure remains the user-facing budget ceiling for
 the benchmark lane. The Lindley artifact is a tighter analytical
@@ -177,7 +188,7 @@ Per release, the bench harness produces:
 
 ```rust
 EmpiricalComparison {
-    analytical_bound_ms: 8.1,     // from pipeline_delay_bound
+    analytical_bound_ms: 8.0666666667, // from pipeline_delay_bound
     empirical_p99_ms: 8.5,         // from headline-claim bench
 }
 ```
@@ -186,9 +197,9 @@ Substrate predicates:
 - `within_tolerance()` — `|empirical - analytical| / analytical ≤ 20%`
 - `exceeds_bound()` — `empirical > analytical` (release blocker)
 
-For the current modeled slice: empirical (8.5) and analytical (8.1) are
-within the 20% agreement tolerance. If a release violates either
-predicate, the substrate
+For the current modeled slice: empirical (8.5) and analytical
+(8.0666666667) are within the 20% agreement tolerance. If a release
+violates either predicate, the substrate
 emits a regression event and the integration's release CI files a
 P1 bead via `br create`.
 
@@ -206,16 +217,16 @@ Per release, the substrate's
   "stages": [
     { "name": "capture",  "service_rate": 200, "service_latency": 1.0 },
     { "name": "delta_extract",  "service_rate": 150, "service_latency": 2.0 },
-    { "name": "storage_write",  "service_rate": 100, "service_latency": 5.0 }
+    { "name": "storage_write",  "service_rate": 150, "service_latency": 5.0 }
   ],
   "stage_content_hashes": [
     { "name": "capture", "content_sha256": "..." },
     { "name": "delta_extract", "content_sha256": "..." },
     { "name": "storage_write", "content_sha256": "..." }
   ],
-  "analytical_bound_ms": 8.1,
+  "analytical_bound_ms": 8.0666666667,
   "empirical_p99_ms": 8.5,
-  "deviation_pct": 4.94,
+  "deviation_pct": 5.37,
   "within_tolerance": true,
   "coverage_status": [
     { "claim_surface": "capture_4kb_overlap_benchmark", "status": "covered" },
