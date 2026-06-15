@@ -2852,8 +2852,8 @@ mod tests {
 
     #[test]
     fn swarm_scent_redaction_scrubs_report_free_text() {
-        let secret_prefix = ["sk", "ant", "api03"].join("-");
-        let secret = format!("{secret_prefix}-{}", "a".repeat(80));
+        let probe_prefix = ["sk", "ant", "api03"].join("-");
+        let redaction_probe = format!("{probe_prefix}-{}", "a".repeat(80));
         let mut report = SwarmScentReport {
             schema_version: 1,
             generated_at_ms: 1,
@@ -2864,9 +2864,9 @@ mod tests {
                 agent_type: "codex".to_string(),
                 state: "active".to_string(),
                 source: DetectionSource::PaneTitle,
-                cwd: Some(format!("file:///repo/{secret}")),
-                session_id: Some(format!("session-{secret}")),
-                last_rule_id: Some(format!("codex.{secret}")),
+                cwd: Some(format!("file:///repo/{redaction_probe}")),
+                session_id: Some(format!("session-{redaction_probe}")),
+                last_rule_id: Some(format!("codex.{redaction_probe}")),
                 state_age_ms: 10,
                 ttl_remaining_ms: 59_990,
             }],
@@ -2874,35 +2874,35 @@ mod tests {
                 id: 1,
                 pane_id: 7,
                 owner_kind: "agent".to_string(),
-                owner_id: format!("cod7-{secret}"),
-                reason: Some(format!("touching {secret}")),
+                owner_id: format!("cod7-{redaction_probe}"),
+                reason: Some(format!("touching {redaction_probe}")),
                 created_at_ms: 1,
                 expires_at_ms: 2,
                 ttl_remaining_ms: 1,
             }],
             work_claims: vec![SwarmScentWorkClaim {
-                claim_id: format!("claim-{secret}"),
-                owner: format!("owner-{secret}"),
+                claim_id: format!("claim-{redaction_probe}"),
+                owner: format!("owner-{redaction_probe}"),
                 priority: 1,
-                labels: vec![format!("label-{secret}")],
+                labels: vec![format!("label-{redaction_probe}")],
                 claimed_at_ms: Some(1),
                 updated_at_ms: 2,
-                summary: Some(format!("summary {secret}")),
+                summary: Some(format!("summary {redaction_probe}")),
             }],
             tx_intents: vec![SwarmScentTxIntent {
-                tx_id: format!("tx-{secret}"),
-                plan_id: format!("plan-{secret}"),
-                requested_by: format!("operator-{secret}"),
+                tx_id: format!("tx-{redaction_probe}"),
+                plan_id: format!("plan-{redaction_probe}"),
+                requested_by: format!("operator-{redaction_probe}"),
                 lifecycle_state: "Prepared".to_string(),
                 outcome: "Pending".to_string(),
-                summary: format!("deploy {secret}"),
-                correlation_id: format!("corr-{secret}"),
+                summary: format!("deploy {redaction_probe}"),
+                correlation_id: format!("corr-{redaction_probe}"),
                 created_at_ms: 1,
-                contract_file: format!("/tmp/{secret}/tx.json"),
+                contract_file: format!("/tmp/{redaction_probe}/tx.json"),
             }],
             sources: vec![SwarmScentSourceStatus::unavailable(
                 "pane_cwd",
-                format!("source detail {secret}"),
+                format!("source detail {redaction_probe}"),
             )],
             summary: SwarmScentSummary {
                 tracked_agents: 1,
@@ -2919,7 +2919,7 @@ mod tests {
         let rendered = serde_json::to_string(&report).expect("serialize redacted scent report");
 
         assert!(
-            !rendered.contains(&secret),
+            !rendered.contains(&redaction_probe),
             "wa://swarm/scent report leaked raw secret: {rendered}"
         );
         assert!(
