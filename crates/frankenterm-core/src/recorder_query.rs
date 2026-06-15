@@ -122,6 +122,20 @@ fn default_true() -> bool {
     true
 }
 
+/// Char-boundary-safe truncation of an audited query string. Returns the
+/// redacted-truncated form when the query exceeds 50 characters, else `None`
+/// (the caller leaves a short query unchanged). Truncating by chars — not
+/// bytes — avoids the `&q[..50]` panic when byte index 50 lands inside a
+/// multi-byte UTF-8 sequence (ft-c8z2q).
+fn redact_audit_query(q: &str) -> Option<String> {
+    if q.chars().count() > 50 {
+        let truncated: String = q.chars().take(50).collect();
+        Some(format!("{truncated}...[redacted]"))
+    } else {
+        None
+    }
+}
+
 impl Default for RecorderQueryRequest {
     fn default() -> Self {
         Self {
@@ -906,8 +920,8 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
         // Redact the query text in audit if it might contain sensitive content.
         if effective_tier < AccessTier::A3PrivilegedRaw {
             if let Some(ref q) = scope.query {
-                if q.len() > 50 {
-                    scope.query = Some(format!("{}...[redacted]", &q[..50]));
+                if let Some(redacted) = redact_audit_query(q) {
+                    scope.query = Some(redacted);
                 }
             }
         }
@@ -1105,6 +1119,33 @@ mod tests {
         RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
         RecorderTextEncoding,
     };
+
+    #[test]
+    fn redact_audit_query_is_char_boundary_safe(/* ft-c8z2q */) {
+        // Multibyte char straddling byte 50: 49 ASCII + 'é' (2 bytes, bytes
+        // 49-50) + filler to exceed 50 chars. Old `&q[..50]` panicked because
+        // byte 50 was mid-`é`.
+        let q = format!("{}é{}", "a".repeat(49), "b".repeat(10));
+        assert!(q.len() > 50, "must exceed 50 bytes to hit the old slice");
+        assert!(
+            !q.is_char_boundary(50),
+            "byte 50 must be mid-char for repro"
+        );
+        let redacted = redact_audit_query(&q).expect("query >50 chars is truncated");
+        assert!(redacted.ends_with("...[redacted]"));
+        // 50 chars kept (49 'a' + the 'é'), then the marker — no panic.
+        assert_eq!(redacted, format!("{}é...[redacted]", "a".repeat(49)));
+        // Short queries and exactly-50-char queries are left unredacted.
+        assert_eq!(redact_audit_query("short"), None);
+        assert_eq!(redact_audit_query(&"x".repeat(50)), None);
+        // Pure multibyte beyond 50 chars truncates cleanly without panic.
+        let emoji = "🚀".repeat(60);
+        assert!(
+            redact_audit_query(&emoji)
+                .unwrap()
+                .ends_with("...[redacted]")
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Helpers
