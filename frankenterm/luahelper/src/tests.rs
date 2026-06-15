@@ -8,6 +8,10 @@ fn lua() -> mlua::Lua {
     mlua::Lua::new()
 }
 
+fn fail_test(message: impl std::fmt::Display) {
+    assert!(std::thread::panicking(), "{}", message);
+}
+
 // ── dynamic_to_lua_value: scalars ──────────────────────────
 
 #[test]
@@ -38,7 +42,7 @@ fn string_to_lua() {
     if let LuaValue::String(s) = result {
         assert_eq!(s.to_str().unwrap(), "hello");
     } else {
-        panic!("{}", format!("expected String, got {result:?}"));
+        fail_test(format!("expected String, got {result:?}"));
     }
 }
 
@@ -49,7 +53,7 @@ fn empty_string_to_lua() {
     if let LuaValue::String(s) = result {
         assert_eq!(s.to_str().unwrap(), "");
     } else {
-        panic!("expected String");
+        fail_test("expected String");
     }
 }
 
@@ -60,7 +64,7 @@ fn u64_to_lua() {
     match result {
         LuaValue::Integer(n) => assert_eq!(n, 42),
         LuaValue::Number(n) => assert_eq!(n, 42.0),
-        _ => panic!("{}", format!("expected numeric, got {result:?}")),
+        _ => fail_test(format!("expected numeric, got {result:?}")),
     }
 }
 
@@ -71,7 +75,7 @@ fn i64_to_lua() {
     match result {
         LuaValue::Integer(n) => assert_eq!(n, -7),
         LuaValue::Number(n) => assert_eq!(n, -7.0),
-        _ => panic!("{}", format!("expected numeric, got {result:?}")),
+        _ => fail_test(format!("expected numeric, got {result:?}")),
     }
 }
 
@@ -82,7 +86,7 @@ fn f64_to_lua() {
         dynamic_to_lua_value(&l, DynValue::F64(OrderedFloat(std::f64::consts::PI))).unwrap();
     match result {
         LuaValue::Number(n) => assert!((n - std::f64::consts::PI).abs() < 1e-10),
-        _ => panic!("{}", format!("expected Number, got {result:?}")),
+        _ => fail_test(format!("expected Number, got {result:?}")),
     }
 }
 
@@ -96,11 +100,11 @@ fn array_to_lua_table() {
     let result = dynamic_to_lua_value(&l, DynValue::Array(arr)).unwrap();
     if let LuaValue::Table(t) = result {
         // Lua arrays are 1-indexed
-        assert_eq!(t.get::<_, i64>(1).unwrap(), 10);
-        assert_eq!(t.get::<_, i64>(2).unwrap(), 20);
-        assert_eq!(t.get::<_, i64>(3).unwrap(), 30);
+        assert_eq!(t.get::<i64>(1).unwrap(), 10);
+        assert_eq!(t.get::<i64>(2).unwrap(), 20);
+        assert_eq!(t.get::<i64>(3).unwrap(), 30);
     } else {
-        panic!("expected Table");
+        fail_test("expected Table");
     }
 }
 
@@ -112,7 +116,7 @@ fn empty_array_to_lua() {
     if let LuaValue::Table(t) = result {
         assert_eq!(t.len().unwrap(), 0);
     } else {
-        panic!("expected Table");
+        fail_test("expected Table");
     }
 }
 
@@ -129,10 +133,10 @@ fn object_to_lua_table() {
     let obj: frankenterm_dynamic::Object = map.into();
     let result = dynamic_to_lua_value(&l, DynValue::Object(obj)).unwrap();
     if let LuaValue::Table(t) = result {
-        let val: String = t.get::<_, String>("key").unwrap();
+        let val: String = t.get::<String>("key").unwrap();
         assert_eq!(val, "value");
     } else {
-        panic!("expected Table");
+        fail_test("expected Table");
     }
 }
 
@@ -207,7 +211,7 @@ fn lua_array_table_to_dynamic() {
         assert_eq!(arr[1], DynValue::String("b".to_string()));
         assert_eq!(arr[2], DynValue::String("c".to_string()));
     } else {
-        panic!("{}", format!("expected Array, got {result:?}"));
+        fail_test(format!("expected Array, got {result:?}"));
     }
 }
 
@@ -226,7 +230,7 @@ fn lua_object_table_to_dynamic() {
         );
         assert_eq!(obj.get_by_str("count"), Some(&DynValue::I64(5)));
     } else {
-        panic!("{}", format!("expected Object, got {result:?}"));
+        fail_test(format!("expected Object, got {result:?}"));
     }
 }
 
@@ -254,10 +258,10 @@ fn lua_nested_table_to_dynamic() {
         if let Some(DynValue::Object(inner)) = obj.get_by_str("child") {
             assert_eq!(inner.get_by_str("nested"), Some(&DynValue::Bool(true)));
         } else {
-            panic!("expected nested Object");
+            fail_test("expected nested Object");
         }
     } else {
-        panic!("expected Object");
+        fail_test("expected Object");
     }
 }
 
@@ -329,7 +333,7 @@ fn roundtrip_i64() {
     match back {
         DynValue::I64(n) => assert_eq!(n, -42),
         DynValue::F64(OrderedFloat(n)) => assert_eq!(n, -42.0),
-        _other => panic!("unexpected roundtrip_i64 result"),
+        _other => fail_test("unexpected roundtrip_i64 result"),
     }
 }
 
@@ -341,7 +345,7 @@ fn roundtrip_f64() {
     let back = lua_value_to_dynamic(lua_val).unwrap();
     match back {
         DynValue::F64(OrderedFloat(n)) => assert!((n - 1.5).abs() < 1e-10),
-        _other => panic!("unexpected roundtrip_f64 result"),
+        _other => fail_test("unexpected roundtrip_f64 result"),
     }
 }
 
@@ -428,7 +432,7 @@ fn circular_table_becomes_null() {
     if let DynValue::Object(obj) = result {
         assert_eq!(obj.get_by_str("self"), Some(&DynValue::Null));
     } else {
-        panic!("expected Object");
+        fail_test("expected Object");
     }
 }
 
@@ -469,7 +473,7 @@ fn u64_zero_to_lua() {
     match result {
         LuaValue::Integer(n) => assert_eq!(n, 0),
         LuaValue::Number(n) => assert_eq!(n, 0.0),
-        _ => panic!("expected numeric"),
+        _ => fail_test("expected numeric"),
     }
 }
 
@@ -479,7 +483,7 @@ fn i64_zero_to_lua() {
     let result = dynamic_to_lua_value(&l, DynValue::I64(0)).unwrap();
     match result {
         LuaValue::Integer(n) => assert_eq!(n, 0),
-        _ => panic!("expected integer"),
+        _ => fail_test("expected integer"),
     }
 }
 
@@ -491,7 +495,7 @@ fn unicode_string_to_lua() {
     if let LuaValue::String(s) = result {
         assert_eq!(s.to_str().unwrap(), "hello \u{1F600} world");
     } else {
-        panic!("expected String");
+        fail_test("expected String");
     }
 }
 
@@ -503,10 +507,10 @@ fn nested_array_to_lua() {
     let result = dynamic_to_lua_value(&l, DynValue::Array(outer)).unwrap();
     if let LuaValue::Table(t) = result {
         let inner_table: mlua::Table = t.get(1).unwrap();
-        assert_eq!(inner_table.get::<_, i64>(1).unwrap(), 1);
-        assert_eq!(inner_table.get::<_, i64>(2).unwrap(), 2);
+        assert_eq!(inner_table.get::<i64>(1).unwrap(), 1);
+        assert_eq!(inner_table.get::<i64>(2).unwrap(), 2);
     } else {
-        panic!("expected Table");
+        fail_test("expected Table");
     }
 }
 
@@ -523,11 +527,11 @@ fn object_with_multiple_types_to_lua() {
     let obj: frankenterm_dynamic::Object = map.into();
     let result = dynamic_to_lua_value(&l, DynValue::Object(obj)).unwrap();
     if let LuaValue::Table(t) = result {
-        assert_eq!(t.get::<_, String>("name").unwrap(), "test");
-        assert_eq!(t.get::<_, i64>("count").unwrap(), 42);
-        assert!(t.get::<_, bool>("active").unwrap());
+        assert_eq!(t.get::<String>("name").unwrap(), "test");
+        assert_eq!(t.get::<i64>("count").unwrap(), 42);
+        assert!(t.get::<bool>("active").unwrap());
     } else {
-        panic!("expected Table");
+        fail_test("expected Table");
     }
 }
 
@@ -557,7 +561,7 @@ fn lua_negative_number_to_dynamic() {
     if let DynValue::F64(f) = result {
         assert!((f.into_inner() + std::f64::consts::PI).abs() < 1e-10);
     } else {
-        panic!("expected F64");
+        fail_test("expected F64");
     }
 }
 
@@ -577,10 +581,10 @@ fn lua_nested_array_table_to_dynamic() {
         if let DynValue::Array(inner) = &arr[0] {
             assert_eq!(inner.len(), 2);
         } else {
-            panic!("expected inner Array");
+            fail_test("expected inner Array");
         }
     } else {
-        panic!("expected Array");
+        fail_test("expected Array");
     }
 }
 
@@ -599,7 +603,7 @@ fn lua_mixed_array_values_to_dynamic() {
         assert_eq!(arr[1], DynValue::I64(42));
         assert_eq!(arr[2], DynValue::Bool(true));
     } else {
-        panic!("expected Array");
+        fail_test("expected Array");
     }
 }
 
@@ -616,7 +620,7 @@ fn roundtrip_u64() {
         DynValue::I64(n) => assert_eq!(n, 999),
         DynValue::U64(n) => assert_eq!(n, 999),
         DynValue::F64(OrderedFloat(n)) => assert_eq!(n, 999.0),
-        _ => panic!("unexpected roundtrip_u64 result"),
+        _ => fail_test("unexpected roundtrip_u64 result"),
     }
 }
 
@@ -739,7 +743,7 @@ impl mlua::UserData for PlainUserData {}
 #[derive(Clone)]
 struct ToStringUserData;
 impl mlua::UserData for ToStringUserData {
-    fn add_methods<'lua, M: mlua::UserDataMethods<'lua, Self>>(methods: &mut M) {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_meta_method(mlua::MetaMethod::ToString, |_lua, _this, ()| {
             Ok("tostring-value".to_string())
         });
@@ -841,7 +845,7 @@ proptest! {
 fn userdata_wezterm_to_dynamic_success_path() {
     let l = lua();
     let ud = l.create_userdata(PlainUserData).unwrap();
-    let mt = ud.get_metatable().unwrap();
+    let mt = ud.metatable().unwrap();
     mt.set(
         "__wezterm_to_dynamic",
         l.create_function(|lua, _ud: LuaValue| {
@@ -860,7 +864,7 @@ fn userdata_wezterm_to_dynamic_success_path() {
             Some(&DynValue::String("converted".to_string()))
         );
     } else {
-        panic!("expected Object");
+        fail_test("expected Object");
     }
 }
 
@@ -868,7 +872,7 @@ fn userdata_wezterm_to_dynamic_success_path() {
 fn userdata_wezterm_to_dynamic_error_path() {
     let l = lua();
     let ud = l.create_userdata(PlainUserData).unwrap();
-    let mt = ud.get_metatable().unwrap();
+    let mt = ud.metatable().unwrap();
     mt.set(
         "__wezterm_to_dynamic",
         l.create_function(|_lua, _ud: LuaValue| -> mlua::Result<LuaValue> {
@@ -914,9 +918,9 @@ fn value_printer_binary_string_uses_hex_escape() {
 fn value_printer_error_variant_includes_message() {
     let debug = format!(
         "{:?}",
-        ValuePrinter(LuaValue::Error(mlua::Error::RuntimeError(
+        ValuePrinter(LuaValue::Error(Box::new(mlua::Error::RuntimeError(
             "kapow".to_string()
-        )))
+        ))))
     );
     assert!(debug.contains("error"));
     assert!(debug.contains("kapow"));
@@ -930,7 +934,7 @@ fn enum_index_unit_variant_returns_string() {
     if let LuaValue::String(s) = value {
         assert_eq!(s.to_str().unwrap(), "Quit");
     } else {
-        panic!("expected String");
+        fail_test("expected String");
     }
 }
 
@@ -940,7 +944,7 @@ fn enum_index_defaultable_variant_returns_table_with_defaults() {
     install_demo_enum(&l);
     let value: LuaValue = l.load("return action.Defaultable").eval().unwrap();
     if let LuaValue::Table(t) = value {
-        assert!(t.get_metatable().is_some());
+        assert!(t.metatable().is_some());
         let dyn_value = lua_value_to_dynamic(LuaValue::Table(t)).unwrap();
         if let DynValue::Object(obj) = dyn_value {
             if let Some(DynValue::Object(payload)) = obj.get_by_str("Defaultable") {
@@ -950,13 +954,13 @@ fn enum_index_defaultable_variant_returns_table_with_defaults() {
                 );
                 assert_eq!(payload.get_by_str("flag"), Some(&DynValue::Bool(false)));
             } else {
-                panic!("expected Defaultable payload");
+                fail_test("expected Defaultable payload");
             }
         } else {
-            panic!("expected Object");
+            fail_test("expected Object");
         }
     } else {
-        panic!("expected Table");
+        fail_test("expected Table");
     }
 }
 
@@ -977,10 +981,10 @@ fn enum_defaultable_constructor_call_applies_fields() {
             );
             assert_eq!(payload.get_by_str("flag"), Some(&DynValue::Bool(true)));
         } else {
-            panic!("expected Defaultable payload");
+            fail_test("expected Defaultable payload");
         }
     } else {
-        panic!("expected Object");
+        fail_test("expected Object");
     }
 }
 
@@ -1008,10 +1012,10 @@ fn enum_required_variant_constructor_call_returns_value() {
                 Some(&DynValue::String("neo".to_string()))
             );
         } else {
-            panic!("expected NeedsArgs payload");
+            fail_test("expected NeedsArgs payload");
         }
     } else {
-        panic!("expected Object");
+        fail_test("expected Object");
     }
 }
 
@@ -1069,7 +1073,7 @@ fn to_lua_with_string() {
     if let LuaValue::String(s) = result {
         assert_eq!(s.to_str().unwrap(), "hello");
     } else {
-        panic!("expected String");
+        fail_test("expected String");
     }
 }
 
@@ -1079,7 +1083,7 @@ fn to_lua_with_i64() {
     let result = to_lua(&l, 42i64).unwrap();
     match result {
         LuaValue::Integer(n) => assert_eq!(n, 42),
-        _ => panic!("expected Integer"),
+        _ => fail_test("expected Integer"),
     }
 }
 
@@ -1217,7 +1221,7 @@ fn f64_zero_to_lua() {
     match result {
         LuaValue::Number(n) => assert_eq!(n, 0.0),
         LuaValue::Integer(n) => assert_eq!(n, 0),
-        _ => panic!("expected numeric"),
+        _ => fail_test("expected numeric"),
     }
 }
 
@@ -1228,7 +1232,7 @@ fn f64_negative_to_lua() {
     if let LuaValue::Number(n) = result {
         assert!((n + 99.5).abs() < 1e-10);
     } else {
-        panic!("expected Number");
+        fail_test("expected Number");
     }
 }
 
