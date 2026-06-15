@@ -1493,8 +1493,9 @@ impl ObservationRuntime {
         mut self,
         config: ConnectorOutboundBridgeConfig,
     ) -> Self {
-        self.connector_outbound_bridge =
-            Some(Arc::new(StdMutex::new(ConnectorOutboundBridge::new(config))));
+        self.connector_outbound_bridge = Some(Arc::new(StdMutex::new(
+            ConnectorOutboundBridge::new(config),
+        )));
         self
     }
 
@@ -1513,9 +1514,9 @@ impl ObservationRuntime {
         });
         match bridge.lock() {
             Ok(mut guard) => guard.add_rule(rule),
-            Err(_) => warn!(
-                "connector outbound bridge lock poisoned while registering routing rule"
-            ),
+            Err(_) => {
+                warn!("connector outbound bridge lock poisoned while registering routing rule")
+            }
         }
         runtime
     }
@@ -4143,24 +4144,25 @@ fn dispatch_connector_outbound_action(
         action.correlation_id.clone(),
         action.action_kind.required_capability(),
     );
-    let result = {
-        let host = bridge.policy_engine_mut().connector_host_runtime_mut();
-        host.authorize_operation(now_ms, request)
-    };
+    let result = bridge
+        .policy_engine_mut()
+        .route_connector_operation_through_mesh(action.target_connector.clone(), request, now_ms);
 
     match result {
-        Ok(envelope) => {
+        Ok(dispatch) => {
             bridge.record_action_success(action, now_ms);
             info!(
                 connector = %action.target_connector,
                 action = %action.action_kind,
                 correlation_id = %action.correlation_id,
-                operation_id = %envelope.operation_id,
-                "connector outbound action accepted by host runtime"
+                operation_id = %dispatch.operation_envelope.operation_id,
+                host_id = %dispatch.routing_decision.host_id,
+                zone_id = %dispatch.routing_decision.zone_id,
+                "connector outbound action accepted by mesh-routed host runtime"
             );
         }
         Err(err) => {
-            let kind = connector_host_runtime_error_kind(&err);
+            let kind = connector_operation_dispatch_error_kind(&err);
             let dlq_entry_id = bridge.record_action_failure(action, err.to_string(), kind, now_ms);
             warn!(
                 connector = %action.target_connector,
@@ -4175,21 +4177,13 @@ fn dispatch_connector_outbound_action(
     }
 }
 
-fn connector_host_runtime_error_kind(
-    err: &crate::connector_host_runtime::ConnectorHostRuntimeError,
+fn connector_operation_dispatch_error_kind(
+    err: &crate::policy::ConnectorOperationDispatchError,
 ) -> ConnectorErrorKind {
-    match err {
-        crate::connector_host_runtime::ConnectorHostRuntimeError::StartupProbeFailed { .. }
-        | crate::connector_host_runtime::ConnectorHostRuntimeError::BudgetExceeded { .. }
-        | crate::connector_host_runtime::ConnectorHostRuntimeError::HostNotRunnable { .. } => {
-            ConnectorErrorKind::ServiceUnavailable
-        }
-        crate::connector_host_runtime::ConnectorHostRuntimeError::InvalidConfig { .. }
-        | crate::connector_host_runtime::ConnectorHostRuntimeError::InvalidTransition { .. }
-        | crate::connector_host_runtime::ConnectorHostRuntimeError::SandboxViolation { .. }
-        | crate::connector_host_runtime::ConnectorHostRuntimeError::ProtocolUpgradeRejected {
-            ..
-        } => ConnectorErrorKind::Permanent,
+    if err.is_retryable() {
+        ConnectorErrorKind::ServiceUnavailable
+    } else {
+        ConnectorErrorKind::Permanent
     }
 }
 
@@ -5622,7 +5616,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_outbound_runtime_event_dispatches_and_records_host_failure() {
+    fn connector_outbound_runtime_event_dispatches_through_mesh_and_host_runtime() {
         let mut bridge = crate::connector_outbound_bridge::ConnectorOutboundBridge::new(
             crate::connector_outbound_bridge::ConnectorOutboundBridgeConfig::default(),
         );
@@ -5659,13 +5653,34 @@ mod tests {
 
         assert_eq!(bridge.pending_action_count(), 0);
         assert_eq!(bridge.telemetry().actions_dispatched, 1);
+        let policy = bridge.policy_engine();
+        let mesh = policy.connector_mesh().telemetry().snapshot();
+        assert_eq!(mesh.zones_created, 1);
+        assert_eq!(mesh.hosts_registered, 1);
+        assert_eq!(mesh.heartbeats_received, 1);
+        assert_eq!(mesh.routing_requests, 1);
+        assert_eq!(mesh.routing_successes, 1);
+        assert_eq!(policy.connector_mesh().health_snapshot().total_active, 0);
         assert_eq!(
-            bridge
-                .policy_engine()
-                .reliability_registry()
-                .total_dlq_depth(),
+            policy.connector_host_runtime().state().phase(),
+            crate::connector_host_runtime::ConnectorLifecyclePhase::Running
+        );
+        assert_eq!(
+            policy
+                .connector_host_runtime()
+                .sandbox_decision_history()
+                .len(),
             1,
-            "stopped connector host runtime must fail closed and feed reliability feedback"
+            "runtime dispatch must authorize through the policy-owned host runtime"
+        );
+        assert_eq!(
+            policy.reliability_registry().total_dlq_depth(),
+            0,
+            "mesh-routed runtime dispatch should complete without DLQ feedback"
+        );
+        assert!(
+            policy.reliability_registry().get("worker").is_some(),
+            "successful dispatch should feed reliability success for the target connector"
         );
     }
 

@@ -4472,6 +4472,117 @@ pub struct PolicyEngineTelemetrySnapshot {
     pub namespace_isolation_enabled: bool,
 }
 
+/// Result of routing a connector operation through the policy-owned mesh and
+/// host runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorMeshOperationResult {
+    pub routing_decision: crate::connector_mesh::RoutingDecision,
+    pub operation_envelope: crate::connector_host_runtime::ConnectorOperationEnvelope,
+}
+
+/// Error returned by the production connector operation boundary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectorOperationDispatchError {
+    #[error("connector operation denied: {reason}")]
+    Denied { reason: String },
+    #[error("connector mesh routing failed: {reason}")]
+    Mesh { reason: String, retryable: bool },
+    #[error("connector host runtime failed: {reason}")]
+    HostRuntime {
+        reason: String,
+        failure_class: crate::connector_host_runtime::ConnectorFailureClass,
+        retryable: bool,
+    },
+}
+
+impl ConnectorOperationDispatchError {
+    fn from_mesh_error(err: crate::connector_mesh::ConnectorMeshError) -> Self {
+        let reason = err.to_string();
+        let retryable = matches!(
+            err,
+            crate::connector_mesh::ConnectorMeshError::NoHealthyHosts { .. }
+                | crate::connector_mesh::ConnectorMeshError::RoutingFailed { .. }
+                | crate::connector_mesh::ConnectorMeshError::CapacityExceeded { .. }
+                | crate::connector_mesh::ConnectorMeshError::PartitionDetected { .. }
+        );
+        Self::Mesh { reason, retryable }
+    }
+
+    fn from_host_runtime_error(
+        err: crate::connector_host_runtime::ConnectorHostRuntimeError,
+    ) -> Self {
+        let failure_class = match &err {
+            crate::connector_host_runtime::ConnectorHostRuntimeError::StartupProbeFailed {
+                class,
+                ..
+            } => *class,
+            crate::connector_host_runtime::ConnectorHostRuntimeError::BudgetExceeded { .. } => {
+                crate::connector_host_runtime::ConnectorFailureClass::Quota
+            }
+            crate::connector_host_runtime::ConnectorHostRuntimeError::SandboxViolation {
+                ..
+            } => crate::connector_host_runtime::ConnectorFailureClass::Policy,
+            crate::connector_host_runtime::ConnectorHostRuntimeError::InvalidConfig { .. }
+            | crate::connector_host_runtime::ConnectorHostRuntimeError::InvalidTransition {
+                ..
+            }
+            | crate::connector_host_runtime::ConnectorHostRuntimeError::ProtocolUpgradeRejected {
+                ..
+            } => crate::connector_host_runtime::ConnectorFailureClass::Validation,
+            crate::connector_host_runtime::ConnectorHostRuntimeError::HostNotRunnable {
+                ..
+            } => crate::connector_host_runtime::ConnectorFailureClass::Unknown,
+        };
+        let reason = err.to_string();
+        let retryable = matches!(
+            err,
+            crate::connector_host_runtime::ConnectorHostRuntimeError::StartupProbeFailed { .. }
+                | crate::connector_host_runtime::ConnectorHostRuntimeError::BudgetExceeded { .. }
+                | crate::connector_host_runtime::ConnectorHostRuntimeError::HostNotRunnable { .. }
+        );
+        Self::HostRuntime {
+            reason,
+            failure_class,
+            retryable,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            Self::Denied { .. } => false,
+            Self::Mesh { retryable, .. } | Self::HostRuntime { retryable, .. } => *retryable,
+        }
+    }
+
+    #[must_use]
+    pub const fn failure_class(&self) -> crate::connector_host_runtime::ConnectorFailureClass {
+        match self {
+            Self::Denied { .. } => crate::connector_host_runtime::ConnectorFailureClass::Policy,
+            Self::Mesh { retryable, .. } => {
+                if *retryable {
+                    crate::connector_host_runtime::ConnectorFailureClass::Network
+                } else {
+                    crate::connector_host_runtime::ConnectorFailureClass::Validation
+                }
+            }
+            Self::HostRuntime { failure_class, .. } => *failure_class,
+        }
+    }
+}
+
+fn connector_mesh_health_from_host_snapshot(
+    snapshot: &crate::connector_host_runtime::ConnectorHealthSnapshot,
+) -> crate::connector_mesh::HostHealth {
+    if snapshot.is_ready {
+        crate::connector_mesh::HostHealth::Healthy
+    } else if snapshot.is_live {
+        crate::connector_mesh::HostHealth::Degraded
+    } else {
+        crate::connector_mesh::HostHealth::Unreachable
+    }
+}
+
 // ============================================================================
 // Policy Engine
 // ============================================================================
@@ -4912,6 +5023,243 @@ impl PolicyEngine {
     /// Access the connector mesh mutably.
     pub fn connector_mesh_mut(&mut self) -> &mut crate::connector_mesh::ConnectorMesh {
         &mut self.connector_mesh
+    }
+
+    /// Production operator boundary for connector lifecycle management
+    /// (ft-7h5da.5.11).
+    ///
+    /// This is the single gated entry point that drives connector
+    /// install/update/enable/disable/restart/uninstall/rollback intents
+    /// through the owned [`ConnectorLifecycleManager`], so lifecycle telemetry
+    /// (`op_counter`) reflects real operator-driven operations rather than the
+    /// initialized-but-idle state that diagnostics would otherwise report.
+    ///
+    /// Robot/CLI/runtime surfaces MUST route lifecycle mutations through here
+    /// instead of calling <code>[Self::lifecycle_manager_mut]().execute()</code>
+    /// directly, so the policy gate (emergency kill switch) and the structured
+    /// audit log always apply. Denied intents fail closed and never perturb the
+    /// manager (telemetry is not advanced on a denial).
+    ///
+    /// [`ConnectorLifecycleManager`]: crate::connector_lifecycle::ConnectorLifecycleManager
+    pub fn run_connector_lifecycle_intent(
+        &mut self,
+        intent: crate::connector_lifecycle::LifecycleIntent,
+        now_ms: u64,
+    ) -> Result<crate::connector_lifecycle::LifecycleResult, String> {
+        // Emergency kill switch blocks all connector admin mutations before
+        // they can reach — or perturb the telemetry of — the lifecycle manager.
+        if self.quarantine_registry.kill_switch().is_emergency() {
+            tracing::warn!(
+                op = intent.op_name(),
+                connector_id = intent.connector_id(),
+                "connector lifecycle intent denied: emergency kill switch active"
+            );
+            return Err("connector lifecycle denied: emergency kill switch active".to_string());
+        }
+
+        let op = intent.op_name();
+        let connector_id = intent.connector_id().to_string();
+        match self.lifecycle_manager_mut().execute(intent, now_ms) {
+            Ok(outcome) => {
+                tracing::info!(
+                    connector_id = %connector_id,
+                    op,
+                    success = outcome.success,
+                    admin_state = ?outcome.admin_state,
+                    "connector lifecycle intent executed via production boundary"
+                );
+                Ok(outcome)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    connector_id = %connector_id,
+                    op,
+                    error = %err,
+                    "connector lifecycle intent failed at production boundary"
+                );
+                Err(err.to_string())
+            }
+        }
+    }
+
+    /// Route a connector operation through the policy-owned connector mesh and
+    /// host runtime.
+    ///
+    /// This is the production dispatch boundary for connector operations. It
+    /// keeps the owned host runtime live, mirrors that runtime into
+    /// [`ConnectorMesh`], routes the connector request through the mesh, and
+    /// only then authorizes the operation envelope against the host sandbox.
+    /// Callers should use this boundary instead of directly invoking
+    /// [`Self::connector_mesh_mut`] or [`Self::connector_host_runtime_mut`] so
+    /// mesh telemetry, host heartbeats, sandbox decisions, and fail-closed
+    /// kill-switch handling stay in one path.
+    ///
+    /// [`ConnectorMesh`]: crate::connector_mesh::ConnectorMesh
+    pub fn route_connector_operation_through_mesh(
+        &mut self,
+        connector_id: impl Into<String>,
+        request: crate::connector_host_runtime::ConnectorOperationRequest,
+        now_ms: u64,
+    ) -> Result<ConnectorMeshOperationResult, ConnectorOperationDispatchError> {
+        if self.quarantine_registry.kill_switch().is_emergency() {
+            return Err(ConnectorOperationDispatchError::Denied {
+                reason: "connector operation denied: emergency kill switch active".to_string(),
+            });
+        }
+
+        self.ensure_connector_host_runtime_ready(now_ms)?;
+
+        let connector_id = connector_id.into();
+        let host_config = self.connector_host_runtime().config().clone();
+        let host_snapshot = self.connector_host_runtime().health_snapshot(now_ms);
+        self.sync_connector_mesh_host(&host_config, &host_snapshot, now_ms)?;
+
+        let routing_request = crate::connector_mesh::RoutingRequest {
+            connector_id: connector_id.clone(),
+            required_capabilities: vec![request.capability],
+            preferred_zone: Some(host_config.sandbox.zone_id.clone()),
+            strategy: Some(crate::connector_mesh::RoutingStrategy::ZoneAffinity),
+        };
+        let routing_decision = self
+            .connector_mesh_mut()
+            .route(&routing_request, now_ms)
+            .map_err(ConnectorOperationDispatchError::from_mesh_error)?;
+
+        if routing_decision.host_id != host_config.host_id {
+            let _ = self
+                .connector_mesh_mut()
+                .release_connector(&routing_decision.host_id);
+            let reason = format!(
+                "connector mesh selected unmanaged host {} for connector {}",
+                routing_decision.host_id, connector_id
+            );
+            self.connector_mesh_mut()
+                .record_failure(crate::connector_mesh::MeshFailureEvent {
+                    host_id: routing_decision.host_id,
+                    zone_id: routing_decision.zone_id,
+                    failure_class: crate::connector_host_runtime::ConnectorFailureClass::Policy,
+                    description: reason.clone(),
+                    timestamp_ms: now_ms,
+                });
+            return Err(ConnectorOperationDispatchError::Denied { reason });
+        }
+
+        let operation_envelope = match self
+            .connector_host_runtime_mut()
+            .authorize_operation(now_ms, request)
+        {
+            Ok(envelope) => envelope,
+            Err(err) => {
+                let dispatch_error = ConnectorOperationDispatchError::from_host_runtime_error(err);
+                self.connector_mesh_mut()
+                    .record_failure(crate::connector_mesh::MeshFailureEvent {
+                        host_id: routing_decision.host_id.clone(),
+                        zone_id: routing_decision.zone_id.clone(),
+                        failure_class: dispatch_error.failure_class(),
+                        description: dispatch_error.to_string(),
+                        timestamp_ms: now_ms,
+                    });
+                let _ = self
+                    .connector_mesh_mut()
+                    .release_connector(&routing_decision.host_id);
+                return Err(dispatch_error);
+            }
+        };
+
+        self.connector_mesh_mut()
+            .release_connector(&routing_decision.host_id)
+            .map_err(ConnectorOperationDispatchError::from_mesh_error)?;
+
+        tracing::info!(
+            connector_id = %connector_id,
+            host_id = %routing_decision.host_id,
+            zone_id = %routing_decision.zone_id,
+            operation_id = %operation_envelope.operation_id,
+            "connector operation routed through production mesh boundary"
+        );
+
+        Ok(ConnectorMeshOperationResult {
+            routing_decision,
+            operation_envelope,
+        })
+    }
+
+    fn ensure_connector_host_runtime_ready(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<(), ConnectorOperationDispatchError> {
+        let phase = self.connector_host_runtime().state().phase();
+        match phase {
+            crate::connector_host_runtime::ConnectorLifecyclePhase::Stopped => self
+                .connector_host_runtime_mut()
+                .start(now_ms)
+                .map_err(ConnectorOperationDispatchError::from_host_runtime_error),
+            crate::connector_host_runtime::ConnectorLifecyclePhase::Running => self
+                .connector_host_runtime_mut()
+                .record_heartbeat(now_ms)
+                .map_err(ConnectorOperationDispatchError::from_host_runtime_error),
+            crate::connector_host_runtime::ConnectorLifecyclePhase::Starting
+            | crate::connector_host_runtime::ConnectorLifecyclePhase::Degraded
+            | crate::connector_host_runtime::ConnectorLifecyclePhase::Failed => {
+                Err(ConnectorOperationDispatchError::from_host_runtime_error(
+                    crate::connector_host_runtime::ConnectorHostRuntimeError::HostNotRunnable {
+                        phase,
+                    },
+                ))
+            }
+        }
+    }
+
+    fn sync_connector_mesh_host(
+        &mut self,
+        host_config: &crate::connector_host_runtime::ConnectorHostConfig,
+        host_snapshot: &crate::connector_host_runtime::ConnectorHealthSnapshot,
+        now_ms: u64,
+    ) -> Result<(), ConnectorOperationDispatchError> {
+        let zone_id = host_config.sandbox.zone_id.clone();
+        if self.connector_mesh().get_zone(&zone_id).is_none() {
+            self.connector_mesh_mut()
+                .register_zone(crate::connector_mesh::MeshZone::new(
+                    zone_id.clone(),
+                    zone_id.clone(),
+                ))
+                .map_err(ConnectorOperationDispatchError::from_mesh_error)?;
+        }
+
+        let health = connector_mesh_health_from_host_snapshot(host_snapshot);
+        if self
+            .connector_mesh()
+            .get_host(&host_config.host_id)
+            .is_none()
+        {
+            let max_connectors =
+                usize::try_from(host_config.budgets.max_inflight_ops).unwrap_or(usize::MAX);
+            self.connector_mesh_mut()
+                .register_host(crate::connector_mesh::MeshHost {
+                    host_id: host_config.host_id.clone(),
+                    zone_id,
+                    health,
+                    capabilities: host_config
+                        .sandbox
+                        .capability_envelope
+                        .allowed_capabilities
+                        .clone(),
+                    active_connectors: 0,
+                    max_connectors,
+                    last_heartbeat_ms: now_ms,
+                    phase: host_snapshot.phase,
+                    metadata: std::collections::BTreeMap::new(),
+                })
+                .map_err(ConnectorOperationDispatchError::from_mesh_error)?;
+        } else {
+            self.connector_mesh_mut()
+                .update_health(&host_config.host_id, health)
+                .map_err(ConnectorOperationDispatchError::from_mesh_error)?;
+        }
+
+        self.connector_mesh_mut()
+            .record_heartbeat(&host_config.host_id, now_ms)
+            .map_err(ConnectorOperationDispatchError::from_mesh_error)
     }
 
     /// Access the ingestion pipeline.
@@ -16196,6 +16544,37 @@ mod tests {
         assert_eq!(conn.admin_state, AdminState::Enabled);
     }
 
+    #[test]
+    fn run_connector_lifecycle_intent_production_boundary_drives_telemetry() {
+        // ft-7h5da.5.11: the production operator boundary must drive the owned
+        // ConnectorLifecycleManager so its `op_counter` telemetry advances from
+        // a real production call path (PolicyEngine::run_connector_lifecycle_intent),
+        // not just from initialized-but-idle state. This is the non-test
+        // production path that operator/CLI/runtime surfaces route through.
+        let mut engine = PolicyEngine::permissive();
+        let before = engine.lifecycle_manager().op_counter();
+
+        // Enable on a not-yet-installed connector still drives the manager
+        // (op_counter increments before the per-intent match) and surfaces a
+        // real lifecycle error instead of silently succeeding on idle state.
+        let result = engine.run_connector_lifecycle_intent(
+            crate::connector_lifecycle::LifecycleIntent::Enable {
+                connector_id: "slack".to_string(),
+            },
+            1000,
+        );
+
+        assert_eq!(
+            engine.lifecycle_manager().op_counter(),
+            before + 1,
+            "production boundary must drive lifecycle-manager telemetry (op_counter)"
+        );
+        assert!(
+            result.is_err(),
+            "enabling a non-installed connector should surface a real lifecycle error"
+        );
+    }
+
     // ── Data Classifier integration tests ────────────────────────────
 
     #[test]
@@ -16364,6 +16743,54 @@ mod tests {
                 .connector_host_runtime()
                 .transition_history()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn route_connector_operation_through_mesh_drives_mesh_and_host_runtime() {
+        let mut engine = PolicyEngine::permissive();
+        let before = engine.connector_mesh().telemetry().snapshot();
+
+        let result = engine
+            .route_connector_operation_through_mesh(
+                "slack",
+                crate::connector_host_runtime::ConnectorOperationRequest::new(
+                    "connector.slack.invoke",
+                    "corr-mesh-1",
+                    crate::connector_host_runtime::ConnectorCapability::Invoke,
+                ),
+                10_000,
+            )
+            .expect("mesh-routed connector operation should be authorized");
+
+        assert_eq!(result.routing_decision.connector_id, "slack");
+        assert_eq!(
+            result.operation_envelope.host_id,
+            engine.connector_host_runtime().config().host_id
+        );
+        assert_eq!(
+            engine.connector_host_runtime().state().phase(),
+            crate::connector_host_runtime::ConnectorLifecyclePhase::Running
+        );
+        assert_eq!(
+            engine
+                .connector_host_runtime()
+                .sandbox_decision_history()
+                .len(),
+            1,
+            "production mesh boundary must authorize through the host sandbox"
+        );
+
+        let after = engine.connector_mesh().telemetry().snapshot();
+        assert_eq!(after.zones_created, before.zones_created + 1);
+        assert_eq!(after.hosts_registered, before.hosts_registered + 1);
+        assert_eq!(after.heartbeats_received, before.heartbeats_received + 1);
+        assert_eq!(after.routing_requests, before.routing_requests + 1);
+        assert_eq!(after.routing_successes, before.routing_successes + 1);
+        assert_eq!(
+            engine.connector_mesh().health_snapshot().total_active,
+            0,
+            "immediate dispatch path must release the mesh slot after authorization"
         );
     }
 
