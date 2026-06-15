@@ -92,10 +92,12 @@ exists but relies on shared schema with **no dedicated parity test**:
 `workflow-run/list/status/abort`, `rules-lint`, `accounts-list/refresh`, `why`,
 `approve`, `dom`, `agent-subspace-rpc`.
 
-### G3 — `dom` redaction not in the read-path matrix
+### G3 — `dom` redaction not in the read-path matrix (tracked: `ft-5puf0`)
 `wa.dom` returns OSC-133 semantic zones that can carry pane-sourced text, but
 `dom` is absent from `docs/security/read-path-redaction-matrix.md`. Confirm the
 dom handler runs zone text through `Redactor::redact`, then add the row (or fix).
+Filed as **`ft-5puf0`** (security) — a read surface serving unredacted pane
+content would be a fail-closed redaction violation.
 
 ### G4 — Registry completeness: policy-gated MCP mutations absent from `ApiSurface::ALL`
 `wa.mission_pause` / `wa.mission_resume` / `wa.mission_abort` are policy-gated
