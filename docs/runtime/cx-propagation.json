@@ -1,14 +1,14 @@
 {
   "buckets": {
     "capture": {
-      "covered": 6,
+      "covered": 7,
       "exempt_file": 0,
       "files": [
         "ingest.rs",
         "recorder_migration.rs"
       ],
-      "total": 12,
-      "uncovered": 0,
+      "total": 14,
+      "uncovered": 1,
       "wrapper_exempt": 6
     },
     "connectors": {
@@ -40,7 +40,7 @@
       "wrapper_exempt": 5
     },
     "other": {
-      "covered": 369,
+      "covered": 387,
       "exempt_file": 43,
       "files": [
         "alerts.rs",
@@ -103,8 +103,8 @@
         "web_framework.rs",
         "wezterm.rs"
       ],
-      "total": 779,
-      "uncovered": 0,
+      "total": 812,
+      "uncovered": 15,
       "wrapper_exempt": 367
     },
     "tx": {
@@ -128,10 +128,11 @@
       "wrapper_exempt": 5
     },
     "workflow": {
-      "covered": 33,
+      "covered": 35,
       "exempt_file": 0,
       "files": [
         "workflows/account_steps.rs",
+        "workflows/builtin_workflows.rs",
         "workflows/codex_exit.rs",
         "workflows/context.rs",
         "workflows/engine.rs",
@@ -140,12 +141,12 @@
         "workflows/runner.rs",
         "workflows/wait_execution.rs"
       ],
-      "total": 59,
-      "uncovered": 0,
+      "total": 63,
+      "uncovered": 2,
       "wrapper_exempt": 26
     }
   },
-  "generated_at": "2026-06-08T10:36:13Z",
+  "generated_at": "2026-06-16T10:30:14Z",
   "labruntime_coverage": {
     "by_bucket": {
       "capture": {
@@ -203,10 +204,10 @@
   },
   "schema_version": 2,
   "totals": {
-    "covered_sites": 420,
+    "covered_sites": 441,
     "exempt_file_sites": 43,
-    "total_sites": 872,
-    "uncovered_sites": 0,
+    "total_sites": 911,
+    "uncovered_sites": 18,
     "wrapper_exempt_sites": 409
   }
 }
