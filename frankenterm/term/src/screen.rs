@@ -450,6 +450,12 @@ enum LogicalLineForResize {
 }
 
 #[derive(Debug, Clone)]
+struct LogicalLineRebuild {
+    logical_lines: Vec<LogicalLineForResize>,
+    physical_ranges: Vec<Range<usize>>,
+}
+
+#[derive(Debug, Clone)]
 enum RewrapScratch {
     PhysicalLine(usize),
     Lines(Vec<Line>),
@@ -1400,6 +1406,18 @@ impl Screen {
         }
 
         let logical_ranges = Self::logical_line_physical_ranges(&self.lines);
+        self.build_viewport_reflow_plan_for_logical_ranges(&logical_ranges, logical_count)
+    }
+
+    fn build_viewport_reflow_plan_for_logical_ranges(
+        &self,
+        logical_ranges: &[Range<usize>],
+        logical_count: usize,
+    ) -> ViewportReflowPlan {
+        if logical_count == 0 {
+            return ViewportReflowPlan::default();
+        }
+
         if logical_ranges.len() != logical_count {
             return ViewportReflowPlan::full_scan(logical_count);
         }
@@ -1473,28 +1491,44 @@ impl Screen {
         );
     }
 
+    #[cfg(test)]
     fn rebuild_logical_lines_from_physical(&self, seqno: SequenceNo) -> Vec<LogicalLineForResize> {
         self.rebuild_logical_lines_from_physical_inner(seqno, None)
+            .logical_lines
     }
 
-    fn rebuild_logical_lines_from_physical_with_signature(
+    fn rebuild_logical_lines_from_physical_with_ranges(
         &self,
         seqno: SequenceNo,
-    ) -> (Vec<LogicalLineForResize>, u64) {
+    ) -> (Vec<LogicalLineForResize>, Vec<Range<usize>>) {
+        let rebuild = self.rebuild_logical_lines_from_physical_inner(seqno, None);
+        (rebuild.logical_lines, rebuild.physical_ranges)
+    }
+
+    fn rebuild_logical_lines_from_physical_with_signature_and_ranges(
+        &self,
+        seqno: SequenceNo,
+    ) -> (Vec<LogicalLineForResize>, u64, Vec<Range<usize>>) {
         let mut hasher = DefaultHasher::new();
-        let logical_lines =
+        let rebuild =
             self.rebuild_logical_lines_from_physical_inner(seqno, Some(&mut hasher));
         self.lines.len().hash(&mut hasher);
-        (logical_lines, hasher.finish())
+        (
+            rebuild.logical_lines,
+            hasher.finish(),
+            rebuild.physical_ranges,
+        )
     }
 
     fn rebuild_logical_lines_from_physical_inner(
         &self,
         seqno: SequenceNo,
         mut signature_hasher: Option<&mut DefaultHasher>,
-    ) -> Vec<LogicalLineForResize> {
+    ) -> LogicalLineRebuild {
         let mut logical_lines: Vec<LogicalLineForResize> = Vec::with_capacity(self.lines.len());
+        let mut physical_ranges: Vec<Range<usize>> = Vec::with_capacity(self.lines.len());
         let mut logical_line: Option<Line> = None;
+        let mut logical_start = 0usize;
 
         for (idx, physical_line) in self.lines.iter().enumerate() {
             if let Some(hasher) = signature_hasher.as_deref_mut() {
@@ -1517,6 +1551,8 @@ impl Screen {
                 } else {
                     logical_lines.push(LogicalLineForResize::PhysicalLine(idx));
                 }
+                physical_ranges.push(logical_start..idx + 1);
+                logical_start = idx + 1;
                 continue;
             }
 
@@ -1541,9 +1577,13 @@ impl Screen {
 
         if let Some(line) = logical_line.take() {
             logical_lines.push(LogicalLineForResize::Owned(line));
+            physical_ranges.push(logical_start..self.lines.len());
         }
 
-        logical_lines
+        LogicalLineRebuild {
+            logical_lines,
+            physical_ranges,
+        }
     }
 
     fn prepare_rewrap_scratch_slots(&mut self, logical_count: usize) {
@@ -1652,19 +1692,22 @@ impl Screen {
             }
         }
 
-        let (logical_lines, source_signature) = match source_signature {
-            Some(source_signature) => (
-                self.rebuild_logical_lines_from_physical(seqno),
-                source_signature,
-            ),
-            None => self.rebuild_logical_lines_from_physical_with_signature(seqno),
+        let (logical_lines, source_signature, logical_ranges) = match source_signature {
+            Some(source_signature) => {
+                let (logical_lines, logical_ranges) =
+                    self.rebuild_logical_lines_from_physical_with_ranges(seqno);
+                (logical_lines, source_signature, logical_ranges)
+            }
+            None => self.rebuild_logical_lines_from_physical_with_signature_and_ranges(seqno),
         };
         let logical_count = logical_lines.len();
+        let reflow_plan =
+            self.build_viewport_reflow_plan_for_logical_ranges(&logical_ranges, logical_count);
         self.wrap_logical_lines_for_resize(
             &logical_lines,
             physical_cols,
             seqno,
-            Some(&self.build_viewport_reflow_plan_for_current_snapshot(logical_count)),
+            Some(&reflow_plan),
         );
         let cache_logical_lines = logical_lines
             .iter()
@@ -3797,7 +3840,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_logical_lines_with_signature_matches_standalone_signature() {
+    fn rebuild_logical_lines_with_signature_and_ranges_matches_standalone_scans() {
         let attrs = CellAttributes::blank();
         let mut screen = test_screen(4, 6, 96);
         screen.lines = VecDeque::from(vec![
@@ -3807,10 +3850,12 @@ mod tests {
         ]);
 
         let expected_signature = screen.compute_layout_signature();
-        let (logical_lines, fused_signature) =
-            screen.rebuild_logical_lines_from_physical_with_signature(2);
+        let expected_ranges = Screen::logical_line_physical_ranges(&screen.lines);
+        let (logical_lines, fused_signature, fused_ranges) =
+            screen.rebuild_logical_lines_from_physical_with_signature_and_ranges(2);
 
         assert_eq!(fused_signature, expected_signature);
+        assert_eq!(fused_ranges, expected_ranges);
         assert_eq!(logical_lines.len(), 2);
         assert!(matches!(logical_lines[0], LogicalLineForResize::Owned(_)));
         assert!(matches!(
