@@ -2974,7 +2974,7 @@ mod test {
             config_file_path: Some(PathBuf::from("/etc/ft.toml")),
             min_supported: CODEC_VERSION_MIN_SUPPORTED,
         };
-        assert_eq!(resp.codec_vers, 46);
+        assert_eq!(resp.codec_vers, CODEC_VERSION);
         assert_eq!(resp.version_string, "1.0.0");
     }
 
