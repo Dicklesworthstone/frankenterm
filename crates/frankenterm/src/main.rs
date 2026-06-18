@@ -24312,11 +24312,16 @@ fn add_distributed_remote_pane_text_placeholders(
 async fn robot_list_panes_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
 ) -> frankenterm_core::Result<Vec<frankenterm_core::wezterm::PaneInfo>> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        wezterm.list_panes_with_cx(&cx).await
-    });
+    // Mint a non-root parent Cx and thread it explicitly into the spawned task
+    // (mirrors `batch_get_pane_text`). Reading `Cx::current()` here would return
+    // the ambient ROOT-region (region 0) Cx because `task::spawn` does not push a
+    // child-region frame, and feeding region 0 into the vendored MuxPool semaphore
+    // obligation reservation trips asupersync's [ASUP-E103] root-region assert.
+    let parent_cx = frankenterm_core::cx::for_request();
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |child_cx| async move { wezterm.list_panes_with_cx(&child_cx).await },
+    );
     task.await
         .map_err(|err| frankenterm_core::Error::RuntimeOperation {
             operation: "robot.list_panes.await_task",
@@ -24329,11 +24334,16 @@ async fn robot_get_text_on_runtime_task(
     pane_id: u64,
     escapes: bool,
 ) -> frankenterm_core::Result<String> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        wezterm.get_text_with_cx(&cx, pane_id, escapes).await
-    });
+    // Mint a non-root parent Cx and thread it explicitly into the spawned task
+    // (mirrors `batch_get_pane_text`). Reading `Cx::current()` here would return
+    // the ambient ROOT-region (region 0) Cx because `task::spawn` does not push a
+    // child-region frame, and feeding region 0 into the vendored MuxPool semaphore
+    // obligation reservation trips asupersync's [ASUP-E103] root-region assert.
+    let parent_cx = frankenterm_core::cx::for_request();
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |child_cx| async move { wezterm.get_text_with_cx(&child_cx, pane_id, escapes).await },
+    );
     task.await
         .map_err(|err| frankenterm_core::Error::RuntimeOperation {
             operation: "robot.get_text.await_task",
@@ -24345,11 +24355,18 @@ async fn robot_get_semantic_snapshot_on_runtime_task(
     wezterm: frankenterm_core::wezterm::WeztermHandle,
     pane_id: u64,
 ) -> frankenterm_core::Result<frankenterm_core::wezterm::MuxSemanticSnapshot> {
-    let task = frankenterm_core::runtime_async::task::spawn(async move {
-        let cx =
-            frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
-        wezterm.get_semantic_zones_with_cx(&cx, pane_id).await
-    });
+    // Mint a non-root parent Cx and thread it explicitly into the spawned task
+    // (mirrors `batch_get_pane_text`). Reading `Cx::current()` here would return
+    // the ambient ROOT-region (region 0) Cx because `task::spawn` does not push a
+    // child-region frame, and feeding region 0 into the vendored MuxPool semaphore
+    // obligation reservation trips asupersync's [ASUP-E103] root-region assert.
+    let parent_cx = frankenterm_core::cx::for_request();
+    let task = frankenterm_core::runtime_async::task::spawn_with_cx(
+        &parent_cx,
+        move |child_cx| async move {
+            wezterm.get_semantic_zones_with_cx(&child_cx, pane_id).await
+        },
+    );
     task.await
         .map_err(|err| frankenterm_core::Error::RuntimeOperation {
             operation: "robot.dom.await_task",
