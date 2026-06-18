@@ -306,7 +306,8 @@ impl<'a> std::hash::Hash for dyn ShapeCacheKeyTrait + 'a {
 #[cfg(test)]
 mod test {
     use super::{
-        InternedShapedRun, SHAPED_RUN_INTERNER, build_shaped_infos,
+        InternedShapedRun, SHAPED_RUN_INTERNER, SHAPED_RUN_INTERNER_MAX_COLLISIONS,
+        SHAPED_RUN_INTERNER_MAX_ENTRIES, ShapedRunInterner, ShapedRunKey, build_shaped_infos,
         glyph_run_interning_enabled, shaped_run_key, shaped_run_signature,
     };
     use crate::glyphcache::{CachedGlyph, GlyphCache};
@@ -314,6 +315,7 @@ mod test {
     use crate::utilsprites::RenderMetrics;
     use config::{FontAttributes, TextStyle};
     use frankenterm_font::shaper::{GlyphInfo, PresentationWidth};
+    use frankenterm_font::units::PixelLength;
     use frankenterm_font::{FontConfiguration, LoadedFont};
     use std::rc::Rc;
     use termwiz::cell::CellAttributes;
@@ -373,6 +375,46 @@ mod test {
         }
 
         (all_infos, all_glyphs)
+    }
+
+    fn fake_glyph_info(seed: u32, cluster: u32, only_char: char) -> GlyphInfo {
+        GlyphInfo {
+            text: only_char.to_string(),
+            only_char: Some(only_char),
+            is_space: only_char == ' ',
+            num_cells: 1,
+            cluster,
+            font_idx: 0,
+            glyph_pos: 10_000 + seed,
+            x_advance: PixelLength::new(seed as f64 + 1.0),
+            y_advance: PixelLength::zero(),
+            x_offset: PixelLength::new(seed as f64 / 16.0),
+            y_offset: PixelLength::zero(),
+        }
+    }
+
+    fn fake_cached_glyph(seed: u32) -> Rc<CachedGlyph> {
+        Rc::new(CachedGlyph {
+            has_color: false,
+            brightness_adjust: 1.0,
+            x_offset: PixelLength::new(seed as f64 / 32.0),
+            y_offset: PixelLength::zero(),
+            x_advance: PixelLength::new(seed as f64 + 2.0),
+            bearing_x: PixelLength::new(seed as f64 / 8.0),
+            bearing_y: PixelLength::zero(),
+            texture: None,
+            scale: 1.0,
+        })
+    }
+
+    fn fake_shaped_run(seed: u32) -> (Vec<GlyphInfo>, Vec<Rc<CachedGlyph>>, Vec<ShapedInfo>) {
+        let infos = vec![
+            fake_glyph_info(seed * 2, 0, 'a'),
+            fake_glyph_info(seed * 2 + 1, 1, 'b'),
+        ];
+        let glyphs = vec![fake_cached_glyph(seed * 2), fake_cached_glyph(seed * 2 + 1)];
+        let shaped = build_shaped_infos(&infos, &glyphs);
+        (infos, glyphs, shaped)
     }
 
     fn cluster_and_shape(
@@ -449,6 +491,84 @@ mod test {
     }
 
     #[test]
+    fn interner_rejects_forced_key_collision_and_stale_cluster_mapping() {
+        let collision_key = ShapedRunKey {
+            hash: 0xfeed_cafe_dead_beef,
+            len: 2,
+        };
+        let mut interner = ShapedRunInterner::default();
+        let (first_infos, first_glyphs, first_run) = fake_shaped_run(1);
+        let (second_infos, second_glyphs, second_run) = fake_shaped_run(2);
+
+        interner.insert(collision_key, &first_infos, &first_glyphs, &first_run);
+        assert!(
+            interner
+                .lookup(collision_key, &second_infos, &second_glyphs)
+                .is_none(),
+            "same-key collision must not return a different interned run"
+        );
+
+        interner.insert(collision_key, &second_infos, &second_glyphs, &second_run);
+        let first_hit = interner
+            .lookup(collision_key, &first_infos, &first_glyphs)
+            .expect("first colliding run must remain addressable by signature");
+        assert_shaped_runs_identical(&first_run, &first_hit);
+        let second_hit = interner
+            .lookup(collision_key, &second_infos, &second_glyphs)
+            .expect("second colliding run must be addressable by signature");
+        assert_shaped_runs_identical(&second_run, &second_hit);
+
+        let mut stale_cluster_infos = first_infos.clone();
+        stale_cluster_infos[1].cluster = stale_cluster_infos[1].cluster.wrapping_add(17);
+        assert!(
+            interner
+                .lookup(collision_key, &stale_cluster_infos, &first_glyphs)
+                .is_none(),
+            "stale cluster/byte mapping must not hit an interned run for another text"
+        );
+    }
+
+    #[test]
+    fn interner_enforces_collision_bucket_and_entry_bounds() {
+        let collision_key = ShapedRunKey {
+            hash: 0x1234,
+            len: 2,
+        };
+        let mut interner = ShapedRunInterner::default();
+        for seed in 0..(SHAPED_RUN_INTERNER_MAX_COLLISIONS as u32 + 2) {
+            let (infos, glyphs, run) = fake_shaped_run(100 + seed);
+            interner.insert(collision_key, &infos, &glyphs, &run);
+        }
+        assert_eq!(
+            interner.runs.get(&collision_key).map(Vec::len),
+            Some(SHAPED_RUN_INTERNER_MAX_COLLISIONS),
+            "collision buckets must stay bounded"
+        );
+        assert_eq!(
+            interner.entries, SHAPED_RUN_INTERNER_MAX_COLLISIONS,
+            "entry accounting must follow collision eviction"
+        );
+
+        let mut interner = ShapedRunInterner::default();
+        for seed in 0..=(SHAPED_RUN_INTERNER_MAX_ENTRIES as u32) {
+            let key = ShapedRunKey {
+                hash: u64::from(seed),
+                len: 2,
+            };
+            let (infos, glyphs, run) = fake_shaped_run(1_000 + seed);
+            interner.insert(key, &infos, &glyphs, &run);
+        }
+        assert!(
+            interner.entries <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
+            "global interner entries must stay bounded"
+        );
+        assert!(
+            interner.runs.len() <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
+            "global interner buckets must stay bounded"
+        );
+    }
+
+    #[test]
     fn interned_run_matches_fresh_shape_for_same_font_and_attrs() {
         config::use_test_configuration();
 
@@ -497,10 +617,7 @@ mod test {
                 .borrow()
                 .runs
                 .get(&hit_key)
-                .and_then(|runs| {
-                    runs.iter()
-                        .find(|run| run.matches(&hit_infos, &hit_glyphs))
-                })
+                .and_then(|runs| runs.iter().find(|run| run.matches(&hit_infos, &hit_glyphs)))
                 .cloned()
         });
         let interned_hit = interned_hit.expect("matching interned run must be retained");
