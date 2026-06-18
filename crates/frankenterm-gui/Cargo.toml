@@ -77,6 +77,7 @@ frankenterm-core = { workspace = true, features = ["native-wezterm"] }
 frankenterm-alloc = { workspace = true, optional = true }
 
 # Vendored FrankenTerm crates (ex-WezTerm)
+ahash.workspace = true
 codec = { workspace = true, features = ["async-asupersync"] }
 config.workspace = true
 filedescriptor.workspace = true

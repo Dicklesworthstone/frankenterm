@@ -2,6 +2,7 @@ use super::utilsprites::RenderMetrics;
 use crate::customglyph::*;
 use crate::renderstate::RenderContext;
 use crate::termwindow::render::paint::AllowImage;
+use ahash::AHashMap;
 use anyhow::Context;
 use config::{AllowSquareGlyphOverflow, TextStyle};
 use euclid::num::Zero;
@@ -17,7 +18,6 @@ use image::{
 use lfucache::LfuCache;
 use ordered_float::NotNan;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::Seek;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -738,20 +738,20 @@ impl DecodedImage {
     }
 }
 
-/// A number of items here are HashMaps rather than LfuCaches;
+/// A number of items here are AHashMaps rather than LfuCaches;
 /// eviction is managed by recreating Self when the Atlas is filled
 pub struct GlyphCache {
-    glyph_cache: HashMap<GlyphKey, Rc<CachedGlyph>>,
+    glyph_cache: AHashMap<GlyphKey, Rc<CachedGlyph>>,
     pub atlas: Atlas,
     pub fonts: Rc<FontConfiguration>,
     pub image_cache: LfuCache<[u8; 32], DecodedImage>,
     image_cache_retained_bytes: usize,
-    image_cache_entry_bytes: HashMap<[u8; 32], usize>,
-    frame_cache: HashMap<[u8; 32], Sprite>,
-    line_glyphs: HashMap<LineKey, Sprite>,
-    pub block_glyphs: HashMap<SizedBlockKey, Sprite>,
-    pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
-    pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
+    image_cache_entry_bytes: AHashMap<[u8; 32], usize>,
+    frame_cache: AHashMap<[u8; 32], Sprite>,
+    line_glyphs: AHashMap<LineKey, Sprite>,
+    pub block_glyphs: AHashMap<SizedBlockKey, Sprite>,
+    pub cursor_glyphs: AHashMap<(Option<CursorShape>, u8), Sprite>,
+    pub color: AHashMap<(RgbColor, NotNan<f32>), Sprite>,
     min_frame_duration: Duration,
     /// Per-frame snapshot of `atlas.version()` at the start of the
     /// frame (ft-c9arc). Sprites whose stamped version is `<=
@@ -770,7 +770,7 @@ impl GlyphCache {
 
         Ok(Self {
             fonts: Rc::clone(fonts),
-            glyph_cache: HashMap::new(),
+            glyph_cache: AHashMap::new(),
             image_cache: LfuCache::new(
                 "glyph_cache.image_cache.hit.rate",
                 "glyph_cache.image_cache.miss.rate",
@@ -778,13 +778,13 @@ impl GlyphCache {
                 &fonts.config(),
             ),
             image_cache_retained_bytes: 0,
-            image_cache_entry_bytes: HashMap::new(),
-            frame_cache: HashMap::new(),
+            image_cache_entry_bytes: AHashMap::new(),
+            frame_cache: AHashMap::new(),
             atlas,
-            line_glyphs: HashMap::new(),
-            block_glyphs: HashMap::new(),
-            cursor_glyphs: HashMap::new(),
-            color: HashMap::new(),
+            line_glyphs: AHashMap::new(),
+            block_glyphs: AHashMap::new(),
+            cursor_glyphs: AHashMap::new(),
+            color: AHashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
             last_synced_version: 0,
         })
@@ -802,7 +802,7 @@ impl GlyphCache {
 
         Ok(Self {
             fonts: Rc::clone(fonts),
-            glyph_cache: HashMap::new(),
+            glyph_cache: AHashMap::new(),
             image_cache: LfuCache::new(
                 "glyph_cache.image_cache.hit.rate",
                 "glyph_cache.image_cache.miss.rate",
@@ -810,13 +810,13 @@ impl GlyphCache {
                 &fonts.config(),
             ),
             image_cache_retained_bytes: 0,
-            image_cache_entry_bytes: HashMap::new(),
-            frame_cache: HashMap::new(),
+            image_cache_entry_bytes: AHashMap::new(),
+            frame_cache: AHashMap::new(),
             atlas,
-            line_glyphs: HashMap::new(),
-            block_glyphs: HashMap::new(),
-            cursor_glyphs: HashMap::new(),
-            color: HashMap::new(),
+            line_glyphs: AHashMap::new(),
+            block_glyphs: AHashMap::new(),
+            cursor_glyphs: AHashMap::new(),
+            color: AHashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
             last_synced_version: 0,
         })
@@ -968,7 +968,7 @@ impl GlyphCache {
     /// so no lookup at the current scale can resolve to it — rendered pixels are
     /// unchanged. A later scale-back re-rasterizes the dropped glyphs identically
     /// through `cached_glyph` (cache miss → same rasterizer, same metrics). This
-    /// reclaims the CPU-side `HashMap`s; the atlas is a bump allocator, so its
+    /// reclaims the CPU-side maps; the atlas is a bump allocator, so its
     /// texture space is reclaimed only by a subsequent grow/rebuild, not here.
     pub fn evict_stale_cell_metrics(&mut self, current: CellMetricKey) -> usize {
         let before = self.glyph_cache.len() + self.block_glyphs.len();
@@ -1427,7 +1427,7 @@ impl GlyphCache {
     }
 
     fn cached_image_impl(
-        frame_cache: &mut HashMap<[u8; 32], Sprite>,
+        frame_cache: &mut AHashMap<[u8; 32], Sprite>,
         atlas: &mut Atlas,
         decoded: &DecodedImage,
         padding: Option<usize>,
