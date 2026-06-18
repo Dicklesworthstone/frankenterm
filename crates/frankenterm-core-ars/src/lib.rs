@@ -2,8 +2,8 @@
 //! extracted from `frankenterm-core` under ft-y0loj.2 / ft-mr35k.
 //!
 //! 15 modules carved out as a Tier-1 leaf extraction (no feature gate;
-//! ARS was always-on in the parent crate). The cluster captures
-//! frankenterm's automated-reasoning pipeline:
+//! ARS was always-on in the parent crate). The cluster implements an
+//! automated-reasoning subsystem with these capabilities:
 //!
 //! - [`ars_blast_radius`]    — maturity-tier policy + deny-reason taxonomy
 //! - [`ars_compile`]         — descriptor → reflex compilation
@@ -20,6 +20,23 @@
 //! - [`ars_serialize`]       — reflex-record persistence
 //! - [`ars_symbolic_exec`]   — symbolic execution of command flows
 //! - [`ars_timeout`]         — timeout-decision policy
+//!
+//! ## Wiring status — NOT an active safety layer (ft-7p0qz)
+//!
+//! As of this writing ARS has **no production consumer**. No live code
+//! path in `frankenterm-core`, the CLI, GUI, or mux-server consults
+//! [`ars_secret_scan::ArsSecretScanner`], [`ars_intercept`],
+//! [`ars_blast_radius`], [`ars_symbolic_exec`], or any other guard here:
+//! the crate is pulled in only as a `[dev-dependencies]` of
+//! `frankenterm-core` so that `tests/proptest_ars_*.rs` can exercise it.
+//!
+//! The guards are fully implemented and unit-tested, but **currently
+//! inert**: ARS does not scan, intercept, or gate any real action or
+//! workflow step today, and must NOT be relied on as an active safety
+//! layer until it is wired into the production action/workflow-dispatch
+//! path (tracked under the W4 dead-wire program; see ft-7p0qz /
+//! ft-7h5da.5). Read the capability list above as describing the
+//! subsystem itself, not any live pipeline.
 //!
 //! ## Dependency direction
 //!
