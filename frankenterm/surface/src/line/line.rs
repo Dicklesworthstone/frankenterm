@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 use crate::cellcluster::CellCluster;
 use crate::hyperlink::Rule;
 use crate::line::cellref::CellRef;
@@ -406,7 +408,29 @@ impl Line {
         let mut cells: Vec<CellRef> = self.visible_cells().collect();
         if let Some(end_idx) = cells.iter().rposition(|c| c.str() != " ") {
             cells.truncate(end_idx + 1);
+            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+            let shape_hash = compute_wrap_shape_hash(self.bits, &cells);
             let tokens: Vec<Cell> = cells.into_iter().map(|cell| cell.as_cell()).collect();
+
+            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+            let cache_key = MemoizedWrapPointCacheKey {
+                shape_hash,
+                width,
+                cost_model,
+            };
+
+            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+            if let Some(cached) = memoized_wrap_point_cache_get(cache_key) {
+                return LineWrapReport {
+                    lines: materialize_wrap_lines_from_tokens(
+                        &tokens,
+                        &cached.break_offsets,
+                        seqno,
+                    ),
+                    scorecard: cached.scorecard,
+                };
+            }
+
             width_prefix_scratch.rebuild(&tokens);
             let plan = bounded_monospace_wrap_plan_with_width_prefix(
                 &tokens,
@@ -431,22 +455,33 @@ impl Line {
                 width_prefix_scratch,
             );
 
+            let scorecard = LineWrapScorecard {
+                mode: plan.mode,
+                greedy_total_cost: greedy_candidate.total_cost,
+                selected_total_cost: selected_candidate.total_cost,
+                badness_delta: saturating_diff_i64(
+                    selected_candidate.total_cost,
+                    greedy_candidate.total_cost,
+                ),
+                greedy_forced_breaks: greedy_candidate.forced_breaks,
+                selected_forced_breaks: selected_candidate.forced_breaks,
+                line_count: selected_candidate.line_count,
+                estimated_states: plan.estimated_states,
+                evaluated_states: plan.evaluated_states,
+            };
+
+            #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+            memoized_wrap_point_cache_insert(
+                cache_key,
+                MemoizedWrapPointCacheEntry {
+                    break_offsets: plan.break_offsets.clone(),
+                    scorecard,
+                },
+            );
+
             LineWrapReport {
                 lines: materialize_wrap_lines_from_tokens(&tokens, &plan.break_offsets, seqno),
-                scorecard: LineWrapScorecard {
-                    mode: plan.mode,
-                    greedy_total_cost: greedy_candidate.total_cost,
-                    selected_total_cost: selected_candidate.total_cost,
-                    badness_delta: saturating_diff_i64(
-                        selected_candidate.total_cost,
-                        greedy_candidate.total_cost,
-                    ),
-                    greedy_forced_breaks: greedy_candidate.forced_breaks,
-                    selected_forced_breaks: selected_candidate.forced_breaks,
-                    line_count: selected_candidate.line_count,
-                    estimated_states: plan.estimated_states,
-                    evaluated_states: plan.evaluated_states,
-                },
+                scorecard,
             }
         } else {
             width_prefix_scratch.clear();
@@ -1515,7 +1550,7 @@ pub const KP_DEFAULT_LOOKAHEAD_LIMIT: usize = 64;
 pub const KP_DEFAULT_MAX_DP_STATES: usize = 8_192;
 
 /// Scoring and complexity contract for bounded Knuth-Plass line breaking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MonospaceKpCostModel {
     /// Cubic slack multiplier.
     pub badness_scale: u64,
@@ -1675,6 +1710,83 @@ pub struct LineWrapReport {
     pub scorecard: LineWrapScorecard,
 }
 
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+const MAX_MEMOIZED_WRAP_POINT_CACHE_ENTRIES: usize = 16_384;
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MemoizedWrapPointCacheKey {
+    shape_hash: [u8; 16],
+    width: usize,
+    cost_model: MonospaceKpCostModel,
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoizedWrapPointCacheEntry {
+    break_offsets: Vec<usize>,
+    scorecard: LineWrapScorecard,
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+#[derive(Debug, Default)]
+struct MemoizedWrapPointCache {
+    entries: std::collections::HashMap<MemoizedWrapPointCacheKey, MemoizedWrapPointCacheEntry>,
+    order: std::collections::VecDeque<MemoizedWrapPointCacheKey>,
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+impl MemoizedWrapPointCache {
+    fn get(&mut self, key: MemoizedWrapPointCacheKey) -> Option<MemoizedWrapPointCacheEntry> {
+        self.entries.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: MemoizedWrapPointCacheKey, entry: MemoizedWrapPointCacheEntry) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, entry);
+            return;
+        }
+
+        while self.entries.len() >= MAX_MEMOIZED_WRAP_POINT_CACHE_ENTRIES {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+
+        self.entries.insert(key, entry);
+        self.order.push_back(key);
+    }
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache() -> &'static std::sync::Mutex<MemoizedWrapPointCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<MemoizedWrapPointCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(MemoizedWrapPointCache::default()))
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_get(
+    key: MemoizedWrapPointCacheKey,
+) -> Option<MemoizedWrapPointCacheEntry> {
+    memoized_wrap_point_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_insert(
+    key: MemoizedWrapPointCacheKey,
+    entry: MemoizedWrapPointCacheEntry,
+) {
+    memoized_wrap_point_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, entry);
+}
+
 /// Reusable prefix-width storage for resize-time line wrapping.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LineWrapWidthPrefixScratch {
@@ -1724,6 +1836,17 @@ impl LineWrapReport {
         let mode = self.scorecard.mode;
         (self.lines, mode)
     }
+}
+
+#[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn compute_wrap_shape_hash(bits: LineBits, cells: &[CellRef<'_>]) -> [u8; 16] {
+    let mut hasher = SipHasher::new();
+    bits.bits().hash(&mut hasher);
+    for cell in cells {
+        cell.compute_shape_hash(&mut hasher);
+        cell.width().hash(&mut hasher);
+    }
+    hasher.finish128().as_bytes()
 }
 
 #[cfg(test)]
