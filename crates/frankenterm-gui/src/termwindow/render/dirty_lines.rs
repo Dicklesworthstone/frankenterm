@@ -143,12 +143,36 @@ impl DirtyLineBitmap {
 
     /// Mark a contiguous range of rows dirty (selection extend,
     /// resize-shifted region).
+    ///
+    /// Word-parallel: instead of touching one bit per row, this ORs a
+    /// precomputed mask into each affected 64-bit word, so a range of
+    /// `R` rows costs `ceil(R/64)` word writes rather than `R`
+    /// per-bit `mark()` calls. The newly-dirtied count is derived from
+    /// `popcount(mask & !prev)` per word, so `dirty_marks_total` keeps
+    /// its exact "count 0->1 set transitions only" semantics (a range
+    /// overlapping already-dirty rows still does not double-count).
     pub fn mark_range(&mut self, range: std::ops::Range<usize>) {
         let start = range.start.min(self.capacity);
         let end = range.end.min(self.capacity);
-        for row in start..end {
-            self.mark(row);
+        if start >= end {
+            return;
         }
+
+        let first_word = start / BITS_PER_WORD;
+        let last_word = (end - 1) / BITS_PER_WORD;
+        let mut newly_marked = 0u64;
+        for w in first_word..=last_word {
+            let word_lo = w * BITS_PER_WORD;
+            // Bit offsets within this word that fall inside [start, end):
+            // `lo` in 0..BITS_PER_WORD, `hi` in 1..=BITS_PER_WORD.
+            let lo = start.saturating_sub(word_lo).min(BITS_PER_WORD);
+            let hi = (end - word_lo).min(BITS_PER_WORD);
+            let mask = word_range_mask(lo, hi);
+            let prev = self.words[w];
+            newly_marked = newly_marked.saturating_add(u64::from((mask & !prev).count_ones()));
+            self.words[w] = prev | mask;
+        }
+        self.dirty_marks_total = self.dirty_marks_total.saturating_add(newly_marked);
     }
 
     /// Whether the given row is currently dirty.
@@ -289,6 +313,26 @@ impl<'a> FusedIterator for DirtyLineIter<'a> {}
 #[inline]
 fn words_for(capacity: usize) -> usize {
     capacity.div_ceil(BITS_PER_WORD)
+}
+
+/// Build a `u64` with bits `[lo, hi)` set, where
+/// `0 <= lo < hi <= BITS_PER_WORD`. Used by `mark_range` to set a
+/// contiguous bit span within one storage word. Guards the
+/// shift-by-`BITS_PER_WORD` UB at both ends.
+#[inline]
+fn word_range_mask(lo: usize, hi: usize) -> u64 {
+    debug_assert!(lo < hi && hi <= BITS_PER_WORD);
+    // Bits at or above `lo`. `lo` is always < BITS_PER_WORD here, so the
+    // shift is in range.
+    let low = u64::MAX << lo;
+    // Bits below `hi`. `hi == BITS_PER_WORD` would overflow the shift, so
+    // treat a full word specially.
+    let high = if hi >= BITS_PER_WORD {
+        u64::MAX
+    } else {
+        (1u64 << hi) - 1
+    };
+    low & high
 }
 
 #[cfg(test)]
