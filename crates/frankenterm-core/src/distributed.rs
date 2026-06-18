@@ -1150,7 +1150,11 @@ fn distributed_bind_host(bind_addr: &str) -> String {
 // ## Rollout Steps
 //
 // 1. Build with `cargo build --features distributed`
-// 2. Run `ft doctor` to verify security posture
+// 2. Review distributed-security-spec.md against the `evaluate_readiness()`
+//    checklist (a library go/no-go evaluator; it is NOT yet exposed via a CLI
+//    command — `ft doctor` does not run it — so inspect the report
+//    programmatically. The live listener enforces its security primitives,
+//    token/rate/size/replay/timeout, directly at runtime regardless.)
 // 3. Configure `[distributed]` in ft.toml (see distributed-security-spec.md)
 // 4. Start with loopback bind first, verify locally
 // 5. Switch to non-loopback with TLS, verify E2E
@@ -1195,6 +1199,12 @@ pub struct ReadinessReport {
 }
 
 /// Evaluate the distributed mode readiness checklist against a config.
+///
+/// This is a library evaluator: it builds the report but is not yet wired into
+/// any CLI command (notably `ft doctor` does not run it), so it never executes
+/// in a production path on its own. Callers that want a pre-flight go/no-go must
+/// invoke this directly and inspect [`ReadinessReport::ready`]. The live
+/// listener enforces its security primitives at runtime independently of this.
 ///
 /// Returns a report with pass/fail for each item and an overall go/no-go.
 /// The checklist covers:
