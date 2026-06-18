@@ -146,13 +146,59 @@ impl<'a> Performer<'a> {
         }
     }
 
+    #[inline]
+    fn printable_ascii_prefix_len(bytes: &[u8]) -> usize {
+        #[cfg(target_pointer_width = "64")]
+        {
+            return Self::printable_ascii_prefix_len_swar(bytes);
+        }
+
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            Self::printable_ascii_prefix_len_scalar(bytes)
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    fn printable_ascii_prefix_len_swar(bytes: &[u8]) -> usize {
+        let mut offset = 0;
+        while offset + 8 <= bytes.len() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[offset..offset + 8]);
+            let word = u64::from_ne_bytes(chunk);
+            if Self::swar_non_printable_ascii_mask(word) != 0 {
+                return offset + Self::printable_ascii_prefix_len_scalar(&bytes[offset..offset + 8]);
+            }
+            offset += 8;
+        }
+
+        offset + Self::printable_ascii_prefix_len_scalar(&bytes[offset..])
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    fn swar_non_printable_ascii_mask(word: u64) -> u64 {
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        const HIGHS: u64 = 0x8080_8080_8080_8080;
+        let below_space = word.wrapping_sub(ONES * 0x20) & !word & HIGHS;
+        let above_tilde = (word.wrapping_add(ONES) | word) & HIGHS;
+        below_space | above_tilde
+    }
+
+    #[inline]
+    fn printable_ascii_prefix_len_scalar(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .position(|byte| !matches!(*byte, 0x20..=0x7e))
+            .unwrap_or(bytes.len())
+    }
+
     fn flush_ascii_print(&mut self, text: &str, seqno: usize) -> bool {
         if self.insert
             || self.wrap_next
             || self.active_charset() != CharSet::Ascii
-            || !text
-                .bytes()
-                .all(|byte| matches!(byte, 0x20..=0x7e))
+            || Self::printable_ascii_prefix_len(text.as_bytes()) != text.len()
         {
             return false;
         }
@@ -167,12 +213,12 @@ impl<'a> Performer<'a> {
         }
 
         let y = self.cursor.y;
+        let pen = self.pen.clone();
+        let screen = self.screen_mut();
         for (offset, _) in text.bytes().enumerate() {
             let x = start_x + offset;
             let grapheme = &text[offset..offset + 1];
-            let pen = self.pen.clone();
-            self.screen_mut()
-                .set_cell_grapheme(x, y, grapheme, 1, pen, seqno);
+            screen.set_cell_grapheme(x, y, grapheme, 1, pen.clone(), seqno);
         }
 
         let next_x = start_x + text.len();
