@@ -519,4 +519,41 @@ mod tests {
         assert!(plan.moves.is_empty());
         assert_eq!(plan.close_windows, vec![1]);
     }
+
+    #[test]
+    fn foundation_contract_dedups_selects_canonical_and_scopes_workspace() {
+        let windows = vec![
+            win(1, "ws", vec![tab(10, 7, &[300, 100]), tab(11, 7, &[400])]),
+            win(2, "ws", vec![tab(20, 7, &[100, 300]), tab(21, 7, &[500])]),
+            win(3, "other", vec![tab(30, 7, &[100, 300])]),
+        ];
+        let plan = plan_unify_domain(&windows, 7, "ws", None);
+
+        // Windows 1 and 2 tie on in-scope tab count, so canonical selection
+        // falls back to the lower window id. Window 3 is a different workspace
+        // and must not participate even though it mirrors the same remote tab.
+        assert_eq!(plan.canonical_window, Some(1));
+        assert_eq!(
+            plan.drops,
+            vec![TabDrop {
+                tab_id: 20,
+                window: 2,
+                duplicate_of: 10,
+            }]
+        );
+        assert_eq!(
+            plan.moves,
+            vec![TabMove {
+                tab_id: 21,
+                from_window: 2,
+                to_window: 1,
+            }]
+        );
+        assert_eq!(plan.close_windows, vec![2]);
+        assert!(
+            plan.moves.iter().all(|m| m.tab_id != 30)
+                && plan.drops.iter().all(|d| d.tab_id != 30),
+            "same-identity tabs in other workspaces stay untouched",
+        );
+    }
 }
