@@ -544,43 +544,23 @@ pub(super) fn mcp_mission_lifecycle_transitions(
 }
 
 pub(super) fn mcp_mission_failure_catalog() -> Vec<McpMissionFailureCatalogEntry> {
-    vec![
-        McpMissionFailureCatalogEntry {
-            code: "PolicyDenied".to_string(),
-            reason_code: "policy_denied".to_string(),
-            error_code: "mission.failure.policy_denied".to_string(),
-        },
-        McpMissionFailureCatalogEntry {
-            code: "ApprovalDenied".to_string(),
-            reason_code: "approval_denied".to_string(),
-            error_code: "mission.failure.approval_denied".to_string(),
-        },
-        McpMissionFailureCatalogEntry {
-            code: "ApprovalExpired".to_string(),
-            reason_code: "approval_expired".to_string(),
-            error_code: "mission.failure.approval_expired".to_string(),
-        },
-        McpMissionFailureCatalogEntry {
-            code: "DispatchFailed".to_string(),
-            reason_code: "dispatch_failed".to_string(),
-            error_code: "mission.failure.dispatch_failed".to_string(),
-        },
-        McpMissionFailureCatalogEntry {
-            code: "ExecutionFailed".to_string(),
-            reason_code: "execution_failed".to_string(),
-            error_code: "mission.failure.execution_failed".to_string(),
-        },
-        McpMissionFailureCatalogEntry {
-            code: "Timeout".to_string(),
-            reason_code: "timeout".to_string(),
-            error_code: "mission.failure.timeout".to_string(),
-        },
-        McpMissionFailureCatalogEntry {
-            code: "KillSwitchActivated".to_string(),
-            reason_code: "kill_switch".to_string(),
-            error_code: "mission.failure.kill_switch".to_string(),
-        },
-    ]
+    // Derived from the canonical `plan::MissionFailureCode` enum rather than a
+    // hand-maintained list, so wa.mission_explain's failure_catalog always
+    // matches the failure modes a mission can actually produce. The previous
+    // hardcoded vec had drifted: it invented codes no variant emits
+    // (DispatchFailed/ExecutionFailed/Timeout), omitted four real modes
+    // (ReservationConflict/RateLimited/StaleState/ApprovalRequired), and used
+    // `mission.failure.*` strings that no production emitter produces — leaving
+    // an agent prepared for codes that never arrive and blind to real ones
+    // (ft-dfnoe).
+    crate::plan::MissionFailureCode::ALL
+        .iter()
+        .map(|&code| McpMissionFailureCatalogEntry {
+            code: format!("{code:?}"),
+            reason_code: code.reason_code().to_string(),
+            error_code: code.error_code().to_string(),
+        })
+        .collect()
 }
 
 /// Build assignment data from a Mission, with optional filtering.
@@ -882,9 +862,38 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn failure_catalog_has_seven_entries() {
+    fn failure_catalog_covers_every_failure_code() {
         let catalog = mcp_mission_failure_catalog();
-        assert_eq!(catalog.len(), 7);
+        assert_eq!(
+            catalog.len(),
+            crate::plan::MissionFailureCode::ALL.len(),
+            "catalog must surface exactly one entry per MissionFailureCode variant"
+        );
+    }
+
+    /// Anti-drift guard (ft-dfnoe): the catalog must be a faithful projection of
+    /// the canonical `MissionFailureCode` enum — same variants, same
+    /// reason/error code strings — so wa.mission_explain never advertises a
+    /// failure mode a mission cannot produce, nor omits one it can.
+    #[test]
+    fn failure_catalog_matches_mission_failure_code_contract() {
+        let catalog = mcp_mission_failure_catalog();
+        for (entry, code) in catalog
+            .iter()
+            .zip(crate::plan::MissionFailureCode::ALL.iter().copied())
+        {
+            assert_eq!(entry.code, format!("{code:?}"), "catalog code drifted");
+            assert_eq!(
+                entry.reason_code,
+                code.reason_code(),
+                "catalog reason_code drifted from MissionFailureCode::reason_code()"
+            );
+            assert_eq!(
+                entry.error_code,
+                code.error_code(),
+                "catalog error_code drifted from MissionFailureCode::error_code()"
+            );
+        }
     }
 
     #[test]
@@ -901,8 +910,8 @@ mod tests {
         let catalog = mcp_mission_failure_catalog();
         for entry in &catalog {
             assert!(
-                entry.error_code.starts_with("mission.failure."),
-                "error_code {} missing prefix",
+                entry.error_code.starts_with("robot.mission_"),
+                "error_code {} missing canonical robot.mission_ prefix",
                 entry.error_code
             );
         }
