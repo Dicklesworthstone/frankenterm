@@ -3540,6 +3540,12 @@ enum RobotCommands {
         escapes: bool,
     },
 
+    /// GUI control-plane commands
+    Gui {
+        #[command(subcommand)]
+        command: RobotGuiCommands,
+    },
+
     /// Get text from a pane
     #[command(visible_aliases = ["read", "tail"])]
     GetText {
@@ -4207,6 +4213,25 @@ enum RobotProofCommands {
         /// Override RCH admission state for classification
         #[arg(long = "admission-state")]
         admission_state: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RobotGuiCommands {
+    /// Plan or apply window unification for remote GUI mirrors
+    #[command(name = "unify-windows", visible_alias = "unify_windows")]
+    UnifyWindows {
+        /// Domain name or numeric domain id to unify
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Return the computed MergePlan without applying it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Compute/apply a plan for every remote-mirror domain in the active workspace
+        #[arg(long = "all-domains", visible_alias = "all_domains")]
+        all_domains: bool,
     },
 }
 
@@ -6669,6 +6694,8 @@ const ROBOT_ERR_AGENT_MAIL_OUTBOX: &str = "robot.agent_mail_outbox_unavailable";
 const ROBOT_ERR_INCIDENT_NOT_FOUND: &str = "robot.incident.not_found";
 const ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE: &str = "robot.incident.source_unavailable";
 const ROBOT_ERR_INCIDENT_DAG: &str = "robot.incident.dag_error";
+const ROBOT_ERR_GUI_UNAVAILABLE: &str = "robot.gui.unavailable";
+const ROBOT_ERR_GUI_UNIFY: &str = "robot.gui.unify_windows_error";
 const ROBOT_APPROVAL_RECOVERY_HINT: &str = "Run `ft watch` so approvals can be issued, then validate any issued token with `ft approve <CODE>` before retrying.";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
     "Live get-text is unavailable for distributed panes";
@@ -6729,6 +6756,361 @@ fn robot_reservation_error_details(
         ),
         _ => (ROBOT_ERR_STORAGE, None),
     }
+}
+
+const ROBOT_GUI_UNIFY_WINDOWS_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Serialize)]
+struct RobotGuiUnifyWindowsData {
+    schema_version: u32,
+    dry_run: bool,
+    applied: bool,
+    all_domains: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_domain: Option<String>,
+    workspace: String,
+    plans: Vec<RobotGuiUnifyDomainReceipt>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotGuiUnifyDomainReceipt {
+    domain_id: mux::domain::DomainId,
+    domain_name: String,
+    plan: RobotGuiMergePlanData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apply: Option<RobotGuiUnifyApplyReceipt>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotGuiMergePlanData {
+    canonical_window: Option<mux::window::WindowId>,
+    moves: Vec<RobotGuiTabMoveData>,
+    drops: Vec<RobotGuiTabDropData>,
+    close_windows: Vec<mux::window::WindowId>,
+    noop: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotGuiTabMoveData {
+    tab_id: mux::tab::TabId,
+    from_window: mux::window::WindowId,
+    to_window: mux::window::WindowId,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotGuiTabDropData {
+    tab_id: mux::tab::TabId,
+    window: mux::window::WindowId,
+    duplicate_of: mux::tab::TabId,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RobotGuiUnifyApplyReceipt {
+    moved_tabs: Vec<mux::tab::TabId>,
+    dropped_tabs: Vec<mux::tab::TabId>,
+    closed_windows: Vec<mux::window::WindowId>,
+}
+
+fn robot_gui_unify_windows_response(
+    domain: Option<&str>,
+    dry_run: bool,
+    all_domains: bool,
+    elapsed_ms: u64,
+) -> RobotResponse<RobotGuiUnifyWindowsData> {
+    let Some(mux) = mux::Mux::try_get() else {
+        return RobotResponse::<RobotGuiUnifyWindowsData>::error_with_code(
+            ROBOT_ERR_GUI_UNAVAILABLE,
+            "No live GUI mux is available in this process",
+            Some(
+                "Run this command in a process with the FrankenTerm GUI mux initialized; external pane listings cannot prove remote duplicate identities."
+                    .to_string(),
+            ),
+            elapsed_ms,
+        );
+    };
+
+    if !all_domains && domain.is_none() {
+        return RobotResponse::<RobotGuiUnifyWindowsData>::error_with_code(
+            ROBOT_ERR_INVALID_ARGS,
+            "Pass --domain <name-or-id> or --all-domains",
+            Some("Example: ft robot gui unify-windows --domain ssh:prod --dry-run".to_string()),
+            elapsed_ms,
+        );
+    }
+
+    let workspace = mux.active_workspace();
+    let initial_windows = robot_gui_unify_window_snapshots(&mux);
+    let selected_domains = match robot_gui_unify_selected_domains(
+        &mux,
+        domain,
+        all_domains,
+        &workspace,
+        &initial_windows,
+    ) {
+        Ok(domains) => domains,
+        Err(err) => {
+            return RobotResponse::<RobotGuiUnifyWindowsData>::error_with_code(
+                ROBOT_ERR_GUI_UNIFY,
+                err.to_string(),
+                Some("Use --all-domains or pass a domain name/id known to the live mux.".to_string()),
+                elapsed_ms,
+            );
+        }
+    };
+
+    let mut plans = Vec::new();
+    for (domain_id, domain_name) in selected_domains {
+        let windows = if dry_run {
+            initial_windows.clone()
+        } else {
+            robot_gui_unify_window_snapshots(&mux)
+        };
+        let plan = mux::unify::plan_unify_domain(&windows, domain_id, &workspace, None);
+        let apply = if dry_run {
+            None
+        } else {
+            match robot_gui_apply_unify_plan(&mux, &plan) {
+                Ok(receipt) => Some(receipt),
+                Err(err) => {
+                    return RobotResponse::<RobotGuiUnifyWindowsData>::error_with_code(
+                        ROBOT_ERR_GUI_UNIFY,
+                        err.to_string(),
+                        None,
+                        elapsed_ms,
+                    );
+                }
+            }
+        };
+        plans.push(RobotGuiUnifyDomainReceipt {
+            domain_id,
+            domain_name,
+            plan: robot_gui_merge_plan_data(&plan),
+            apply,
+        });
+    }
+
+    RobotResponse::success(
+        RobotGuiUnifyWindowsData {
+            schema_version: ROBOT_GUI_UNIFY_WINDOWS_SCHEMA_VERSION,
+            dry_run,
+            applied: !dry_run,
+            all_domains,
+            requested_domain: domain.map(str::to_string),
+            workspace,
+            plans,
+        },
+        elapsed_ms,
+    )
+}
+
+fn robot_gui_unify_selected_domains(
+    mux: &mux::Mux,
+    domain: Option<&str>,
+    all_domains: bool,
+    workspace: &str,
+    windows: &[mux::unify::WindowSnapshot],
+) -> anyhow::Result<BTreeMap<mux::domain::DomainId, String>> {
+    let mut selected = BTreeMap::new();
+    if all_domains {
+        for window in windows.iter().filter(|window| window.workspace == workspace) {
+            for tab in &window.tabs {
+                if let Some(identity) = &tab.identity {
+                    selected
+                        .entry(identity.domain_id)
+                        .or_insert_with(|| robot_gui_domain_name(mux, identity.domain_id));
+                }
+            }
+        }
+        return Ok(selected);
+    }
+
+    let selector = domain.expect("caller checked required domain");
+    let (domain_id, domain_name) = robot_gui_resolve_domain(mux, selector)?;
+    selected.insert(domain_id, domain_name);
+    Ok(selected)
+}
+
+fn robot_gui_resolve_domain(
+    mux: &mux::Mux,
+    selector: &str,
+) -> anyhow::Result<(mux::domain::DomainId, String)> {
+    if let Ok(domain_id) = selector.parse::<mux::domain::DomainId>() {
+        let domain = mux.get_domain(domain_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "domain id {domain_id} is invalid. Available domains: {}",
+                robot_gui_available_domains(mux)
+            )
+        })?;
+        return Ok((domain_id, domain.domain_name().to_string()));
+    }
+
+    let domain = mux.get_domain_by_name(selector).ok_or_else(|| {
+        anyhow::anyhow!(
+            "domain name {selector:?} is invalid. Available domains: {}",
+            robot_gui_available_domains(mux)
+        )
+    })?;
+    Ok((domain.domain_id(), domain.domain_name().to_string()))
+}
+
+fn robot_gui_available_domains(mux: &mux::Mux) -> String {
+    let mut domains: Vec<String> = mux
+        .iter_domains()
+        .into_iter()
+        .map(|domain| format!("{} ({})", domain.domain_name(), domain.domain_id()))
+        .collect();
+    domains.sort();
+    if domains.is_empty() {
+        "<none>".to_string()
+    } else {
+        domains.join(", ")
+    }
+}
+
+fn robot_gui_domain_name(mux: &mux::Mux, domain_id: mux::domain::DomainId) -> String {
+    mux.get_domain(domain_id)
+        .map(|domain| domain.domain_name().to_string())
+        .unwrap_or_else(|| domain_id.to_string())
+}
+
+fn robot_gui_unify_window_snapshots(mux: &mux::Mux) -> Vec<mux::unify::WindowSnapshot> {
+    let mut window_ids = mux.iter_windows();
+    window_ids.sort_unstable();
+    window_ids
+        .into_iter()
+        .filter_map(|window_id| {
+            let window = mux.get_window(window_id)?;
+            let workspace = window.get_workspace().to_string();
+            let tabs = window
+                .iter()
+                .map(|tab| robot_gui_unify_tab_snapshot(tab))
+                .collect();
+            Some(mux::unify::WindowSnapshot {
+                window_id,
+                workspace,
+                tabs,
+            })
+        })
+        .collect()
+}
+
+fn robot_gui_unify_tab_snapshot(tab: &Arc<mux::tab::Tab>) -> mux::unify::TabSnapshot {
+    let mut domain_id: Option<mux::domain::DomainId> = None;
+    let mut remote_pane_ids = Vec::new();
+
+    for positioned in tab.iter_panes_ignoring_zoom() {
+        if !robot_gui_collect_client_pane_identity(
+            &positioned.pane,
+            &mut domain_id,
+            &mut remote_pane_ids,
+        ) {
+            return mux::unify::TabSnapshot {
+                tab_id: tab.tab_id(),
+                identity: None,
+            };
+        }
+    }
+    for positioned in tab.iter_floating_panes() {
+        if !robot_gui_collect_client_pane_identity(
+            &positioned.pane,
+            &mut domain_id,
+            &mut remote_pane_ids,
+        ) {
+            return mux::unify::TabSnapshot {
+                tab_id: tab.tab_id(),
+                identity: None,
+            };
+        }
+    }
+
+    let identity =
+        domain_id.map(|domain_id| mux::unify::TabIdentity::new(domain_id, remote_pane_ids));
+    mux::unify::TabSnapshot {
+        tab_id: tab.tab_id(),
+        identity,
+    }
+}
+
+fn robot_gui_collect_client_pane_identity(
+    pane: &Arc<dyn mux::pane::Pane>,
+    domain_id: &mut Option<mux::domain::DomainId>,
+    remote_pane_ids: &mut Vec<mux::pane::PaneId>,
+) -> bool {
+    let Some(client_pane) = pane.downcast_ref::<frankenterm_client::pane::ClientPane>() else {
+        return true;
+    };
+
+    let pane_domain_id = pane.domain_id();
+    if let Some(existing) = domain_id {
+        if *existing != pane_domain_id {
+            return false;
+        }
+    } else {
+        domain_id.replace(pane_domain_id);
+    }
+    remote_pane_ids.push(client_pane.remote_pane_id());
+    true
+}
+
+fn robot_gui_merge_plan_data(plan: &mux::unify::MergePlan) -> RobotGuiMergePlanData {
+    RobotGuiMergePlanData {
+        canonical_window: plan.canonical_window,
+        moves: plan
+            .moves
+            .iter()
+            .map(|tab_move| RobotGuiTabMoveData {
+                tab_id: tab_move.tab_id,
+                from_window: tab_move.from_window,
+                to_window: tab_move.to_window,
+            })
+            .collect(),
+        drops: plan
+            .drops
+            .iter()
+            .map(|tab_drop| RobotGuiTabDropData {
+                tab_id: tab_drop.tab_id,
+                window: tab_drop.window,
+                duplicate_of: tab_drop.duplicate_of,
+            })
+            .collect(),
+        close_windows: plan.close_windows.clone(),
+        noop: plan.is_noop(),
+    }
+}
+
+fn robot_gui_apply_unify_plan(
+    mux: &mux::Mux,
+    plan: &mux::unify::MergePlan,
+) -> anyhow::Result<RobotGuiUnifyApplyReceipt> {
+    let mut moved_tabs = Vec::new();
+    let mut dropped_tabs = Vec::new();
+    let mut closed_windows = Vec::new();
+
+    for tab_move in &plan.moves {
+        mux.move_tab_between_windows(tab_move.tab_id, tab_move.to_window, None)?;
+        moved_tabs.push(tab_move.tab_id);
+    }
+
+    for tab_drop in &plan.drops {
+        mux.remove_tab_local_only(tab_drop.tab_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "planned local-only drop tab {} was not present in the mux",
+                tab_drop.tab_id
+            )
+        })?;
+        dropped_tabs.push(tab_drop.tab_id);
+    }
+
+    for &window_id in &plan.close_windows {
+        mux.kill_window(window_id);
+        closed_windows.push(window_id);
+    }
+
+    Ok(RobotGuiUnifyApplyReceipt {
+        moved_tabs,
+        dropped_tabs,
+        closed_windows,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -17953,7 +18335,6 @@ struct RobotContextActiveRow {
     depth: i64,
     token_budget: i64,
     tokens_consumed: i64,
-    pressure_tier: String,
 }
 
 #[derive(Debug, Clone)]
@@ -18078,7 +18459,6 @@ fn robot_context_active_row_from_sql(
         depth: row.get(1)?,
         token_budget: row.get(2)?,
         tokens_consumed: row.get(3)?,
-        pressure_tier: row.get(4)?,
     })
 }
 
@@ -18101,7 +18481,7 @@ fn robot_context_rotation_row_from_sql(
 }
 
 const ROBOT_CONTEXT_SELECT_ACTIVE: &str = r"
-    SELECT context_id, depth, token_budget, tokens_consumed, pressure_tier
+    SELECT context_id, depth, token_budget, tokens_consumed
     FROM pane_contexts
     WHERE pane_id = ?1 AND state = 'active'
 ";
@@ -38451,6 +38831,21 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let response = RobotResponse::success(report, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
+                        RobotCommands::Gui { command } => match command {
+                            RobotGuiCommands::UnifyWindows {
+                                domain,
+                                dry_run,
+                                all_domains,
+                            } => {
+                                let response = robot_gui_unify_windows_response(
+                                    domain.as_deref(),
+                                    dry_run,
+                                    all_domains,
+                                    elapsed_ms(start),
+                                );
+                                print_robot_response(&response, format, stats)?;
+                            }
+                        },
                         RobotCommands::Resource { command } => match command {
                             RobotResourceCommands::WhatIf {
                                 trace,
