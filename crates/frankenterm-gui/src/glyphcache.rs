@@ -1041,25 +1041,17 @@ impl GlyphCache {
                     break;
                 }
 
-                let key = BorrowedGlyphKey {
-                    font_idx: info.font_idx,
-                    glyph_pos: info.glyph_pos,
-                    font_feature_atlas_key: monochrome_glyph_feature_atlas_key(
-                        font.id(),
-                        info.glyph_pos,
-                    ),
-                    subpixel_bin: SubpixelBin::Quarter0,
+                match self.cached_glyph_for_subpixel_bin_with_status(
+                    &info,
+                    &style,
+                    false,
+                    &font,
+                    metrics,
                     num_cells,
-                    style: &style,
-                    followed_by_space: false,
-                    metric: metrics.into(),
-                    id: font.id(),
-                };
-                let was_cached = self.glyph_cache.contains_key(&key as &dyn GlyphKeyTrait);
-
-                match self.cached_glyph(&info, &style, false, &font, metrics, num_cells) {
-                    Ok(_) if was_cached => stats.cache_hits += 1,
-                    Ok(_) => stats.warmed_glyphs += 1,
+                    SubpixelBin::Quarter0,
+                ) {
+                    Ok((_, true)) => stats.cache_hits += 1,
+                    Ok((_, false)) => stats.warmed_glyphs += 1,
                     Err(err) => {
                         log::debug!(
                             "glyph warm-up rasterization failed for {:?} ({:?}): {err:#}",
@@ -1132,6 +1124,28 @@ impl GlyphCache {
         num_cells: u8,
         subpixel_bin: SubpixelBin,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
+        self.cached_glyph_for_subpixel_bin_with_status(
+            info,
+            style,
+            followed_by_space,
+            font,
+            metrics,
+            num_cells,
+            subpixel_bin,
+        )
+        .map(|(glyph, _)| glyph)
+    }
+
+    fn cached_glyph_for_subpixel_bin_with_status(
+        &mut self,
+        info: &GlyphInfo,
+        style: &TextStyle,
+        followed_by_space: bool,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        num_cells: u8,
+        subpixel_bin: SubpixelBin,
+    ) -> anyhow::Result<(Rc<CachedGlyph>, bool)> {
         let key = BorrowedGlyphKey {
             font_idx: info.font_idx,
             glyph_pos: info.glyph_pos,
@@ -1146,7 +1160,7 @@ impl GlyphCache {
 
         if let Some(entry) = self.glyph_cache.get(&key as &dyn GlyphKeyTrait) {
             metrics::histogram!("glyph_cache.glyph_cache.hit.rate").record(1.);
-            return Ok(Rc::clone(entry));
+            return Ok((Rc::clone(entry), true));
         }
         metrics::histogram!("glyph_cache.glyph_cache.miss.rate").record(1.);
 
@@ -1186,7 +1200,7 @@ impl GlyphCache {
             }
         };
         self.glyph_cache.insert(key.to_owned(), Rc::clone(&glyph));
-        Ok(glyph)
+        Ok((glyph, false))
     }
 
     pub fn config_changed(&mut self) {
