@@ -3,12 +3,25 @@
 //! Measures native handler dispatch overhead to verify the <1 μs target
 //! required by wa-3dfxb.13.
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use anyhow::Error;
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use frankenterm_term::color::ColorPalette;
+use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+use mux::domain::DomainId;
 use mux::events::{
     Event, EventAction, EventBus, EventPayload, EventType, HandlerFn, HandlerPriority,
 };
+use mux::localpane::LocalPane;
+use mux::pane::{Pane, PaneId};
+use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
 use std::hint::black_box;
+use std::io::{Cursor, Read, Result as IoResult, Write};
 use std::sync::Arc;
+
+// Keep below LocalPane's disruptor ring capacity (1024). The staged-contention
+// bench intentionally holds the terminal lock, so filling the ring would enter
+// the production blocking fallback and deadlock the harness.
+const PANE_IO_BATCH_COUNT: usize = 256;
 
 /// Benchmark: fire a single native handler (no filter).
 fn bench_fire_single_native(c: &mut Criterion) {
@@ -161,6 +174,156 @@ fn bench_update_status_60hz(c: &mut Criterion) {
     });
 }
 
+#[derive(Debug)]
+struct BenchTermConfig;
+
+impl TerminalConfiguration for BenchTermConfig {
+    fn color_palette(&self) -> ColorPalette {
+        ColorPalette::default()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BenchChild;
+
+impl ChildKiller for BenchChild {
+    fn kill(&mut self) -> IoResult<()> {
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl Child for BenchChild {
+    fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+        Ok(None)
+    }
+
+    fn wait(&mut self) -> IoResult<ExitStatus> {
+        Ok(ExitStatus::with_exit_code(0))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+}
+
+struct BenchMasterPty;
+
+impl MasterPty for BenchMasterPty {
+    fn resize(&self, _size: PtySize) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn get_size(&self) -> Result<PtySize, Error> {
+        Ok(PtySize::default())
+    }
+
+    fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, Error> {
+        Ok(Box::new(Cursor::new(Vec::new())))
+    }
+
+    fn take_writer(&self) -> Result<Box<dyn Write + Send>, Error> {
+        Ok(Box::new(Vec::<u8>::new()))
+    }
+
+    #[cfg(unix)]
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
+    #[cfg(unix)]
+    fn tty_name(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+fn make_local_pane() -> LocalPane {
+    let terminal = Terminal::new(
+        TerminalSize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 960,
+            pixel_height: 384,
+            dpi: 96,
+        },
+        Arc::new(BenchTermConfig),
+        "frankenterm-mux-event-bus-bench",
+        env!("CARGO_PKG_VERSION"),
+        Box::new(Vec::<u8>::new()),
+    );
+
+    LocalPane::new(
+        9001 as PaneId,
+        terminal,
+        Box::new(BenchChild),
+        Box::new(BenchMasterPty),
+        Box::new(Vec::<u8>::new()),
+        1 as DomainId,
+        "bench-localpane".to_string(),
+    )
+}
+
+fn pane_io_batches() -> Vec<Vec<termwiz::escape::Action>> {
+    (0..PANE_IO_BATCH_COUNT)
+        .map(|idx| {
+            let line = format!("pane-output-{idx:04}: compiling mux event path\r\n");
+            line.chars()
+                .map(termwiz::escape::Action::Print)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Benchmark: LocalPane pane-output action application. In the default build
+/// this is the direct terminal-mutex path. With `disruptor-pane-io` enabled, the
+/// first case measures the feature's uncontended fast path and the feature-only
+/// second case forces real ring staging under terminal-lock contention.
+fn bench_pane_io_perform_actions(c: &mut Criterion) {
+    let batches = pane_io_batches();
+    let action_count: usize = batches.iter().map(Vec::len).sum();
+    let mut group = c.benchmark_group("pane_io_perform_actions");
+    group.throughput(Throughput::Elements(action_count as u64));
+
+    group.bench_function("default_or_uncontended_feature_path", |b| {
+        b.iter_batched(
+            make_local_pane,
+            |pane| {
+                for actions in &batches {
+                    pane.perform_actions(black_box(actions.clone()));
+                }
+                black_box(pane.get_cursor_position());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    #[cfg(feature = "disruptor-pane-io")]
+    group.bench_function("disruptor_staged_under_terminal_lock", |b| {
+        b.iter_batched(
+            make_local_pane,
+            |pane| {
+                pane.bench_with_terminal_lock_held(|| {
+                    for actions in &batches {
+                        pane.perform_actions(black_box(actions.clone()));
+                    }
+                });
+                black_box(pane.get_cursor_position());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fire_single_native,
@@ -170,5 +333,6 @@ criterion_group!(
     bench_register_deregister,
     bench_fire_pane_text_payload,
     bench_update_status_60hz,
+    bench_pane_io_perform_actions,
 );
 criterion_main!(benches);

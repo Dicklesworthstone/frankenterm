@@ -29,8 +29,13 @@ zstd.workspace = true
 [dev-dependencies]
 base91.workspace = true
 chrono.workspace = true
+criterion.workspace = true
 proptest = "1.8.0"
 serde_json.workspace = true
+
+[[bench]]
+name = "cdc_dedup"
+harness = false
 
 [features]
 default = ["async-asupersync"]

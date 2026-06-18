@@ -1405,6 +1405,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "config",
+ "criterion",
  "frankenterm-term",
  "leb128",
  "log",

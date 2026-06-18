@@ -1450,6 +1450,21 @@ impl LocalPane {
         }
     }
 
+    /// Bench-only contention hook for the ft-87qfi harness. Holding the terminal
+    /// lock while invoking `perform_actions` forces the feature-gated producer
+    /// path to stage into the disruptor ring, so `mux/benches/event_bus.rs`
+    /// measures the real contended pane-IO path rather than the uncontended
+    /// direct-apply fast path.
+    #[cfg(feature = "disruptor-pane-io")]
+    #[doc(hidden)]
+    pub fn bench_with_terminal_lock_held<F>(&self, f: F)
+    where
+        F: FnOnce(),
+    {
+        let _terminal = self.terminal.lock();
+        f();
+    }
+
     fn enqueue_resize(&self, size: TerminalSize) -> Result<(), Error> {
         let pty_size = PtySize {
             rows: size.rows.try_into()?,
