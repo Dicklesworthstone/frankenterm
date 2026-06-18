@@ -106,6 +106,7 @@ pub struct TieredScrollbackStatus {
 
 const MAX_WRAP_CACHE_ENTRIES: usize = 6;
 const MAX_WRAP_LINE_CACHE_ENTRIES: usize = 16_384;
+const FT_OSYAF_PERSISTENT_REFLOW_CHUNKS: bool = true;
 const MAX_REFLOW_BATCH_LOGICAL_LINES: usize = 64;
 const REFLOW_OVERSCAN_ROW_MULTIPLIER: usize = 1;
 const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
@@ -466,7 +467,7 @@ impl WrapLineCacheKey {
 
 #[derive(Debug, Clone)]
 struct CachedWrappedLine {
-    lines: Vec<Line>,
+    lines: Arc<[Line]>,
     scorecard: Option<MonospaceLineWrapScorecard>,
 }
 
@@ -474,12 +475,12 @@ struct CachedWrappedLine {
 struct LogicalLineWrapCache {
     source_signature: u64,
     logical_lines: Vec<Line>,
-    wrapped_by_key: HashMap<WrapCacheKey, Vec<Vec<Line>>>,
+    wrapped_by_key: HashMap<WrapCacheKey, Vec<Arc<[Line]>>>,
     wrap_key_order: VecDeque<WrapCacheKey>,
 }
 
 enum WrappedResizeLines {
-    Cached(Vec<Vec<Line>>),
+    Cached(Vec<Arc<[Line]>>),
     Scratch { logical_count: usize },
 }
 
@@ -499,6 +500,7 @@ struct LogicalLineRebuild {
 enum RewrapScratch {
     PhysicalLine(usize),
     Lines(Vec<Line>),
+    SharedLines(Arc<[Line]>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -648,7 +650,7 @@ impl LogicalLineWrapCache {
         self.wrap_key_order.push_back(key);
     }
 
-    fn get_wrapped(&mut self, key: WrapCacheKey) -> Option<Vec<Vec<Line>>> {
+    fn get_wrapped(&mut self, key: WrapCacheKey) -> Option<Vec<Arc<[Line]>>> {
         let wrapped = self.wrapped_by_key.get(&key).cloned();
         if wrapped.is_some() {
             self.touch_key(key);
@@ -656,7 +658,7 @@ impl LogicalLineWrapCache {
         wrapped
     }
 
-    fn insert_wrapped(&mut self, key: WrapCacheKey, wrapped: Vec<Vec<Line>>) {
+    fn insert_wrapped(&mut self, key: WrapCacheKey, wrapped: Vec<Arc<[Line]>>) {
         if !self.wrapped_by_key.contains_key(&key)
             && self.wrapped_by_key.len() >= MAX_WRAP_CACHE_ENTRIES
         {
@@ -715,13 +717,15 @@ impl RewrapScratch {
         match self {
             Self::PhysicalLine(_) => 1,
             Self::Lines(lines) => lines.len(),
+            Self::SharedLines(lines) => lines.len(),
         }
     }
 
-    fn clone_lines(&self, physical_lines: &VecDeque<Line>) -> Vec<Line> {
+    fn shared_chunk(&self, physical_lines: &VecDeque<Line>) -> Arc<[Line]> {
         match self {
-            Self::PhysicalLine(idx) => vec![physical_lines[*idx].clone()],
-            Self::Lines(lines) => lines.clone(),
+            Self::PhysicalLine(idx) => Arc::from(vec![physical_lines[*idx].clone()]),
+            Self::Lines(lines) => Arc::from(lines.clone()),
+            Self::SharedLines(lines) => Arc::clone(lines),
         }
     }
 }
@@ -1280,9 +1284,18 @@ impl Screen {
         &self,
         key: WrapLineCacheKey,
     ) -> Option<(RewrapScratch, Option<MonospaceLineWrapScorecard>)> {
+        if !FT_OSYAF_PERSISTENT_REFLOW_CHUNKS {
+            return None;
+        }
+
         self.rewrap_line_cache
             .get(&key)
-            .map(|cached| (RewrapScratch::Lines(cached.lines.clone()), cached.scorecard))
+            .map(|cached| {
+                (
+                    RewrapScratch::SharedLines(Arc::clone(&cached.lines)),
+                    cached.scorecard,
+                )
+            })
     }
 
     fn insert_rewrap_line_cache(&mut self, key: WrapLineCacheKey, cached: CachedWrappedLine) {
@@ -1377,7 +1390,7 @@ impl Screen {
             self.insert_rewrap_line_cache(
                 key,
                 CachedWrappedLine {
-                    lines: lines.clone(),
+                    lines: Arc::from(lines.clone()),
                     scorecard,
                 },
             );
@@ -1710,19 +1723,19 @@ impl Screen {
         }
     }
 
-    fn clone_wrapped_from_scratch(&self, logical_count: usize) -> Vec<Vec<Line>> {
+    fn clone_wrapped_from_scratch(&self, logical_count: usize) -> Vec<Arc<[Line]>> {
         let mut wrapped = Vec::with_capacity(logical_count);
         for slot in self.rewrap_scratch_slots.iter().take(logical_count) {
             wrapped.push(
                 slot.as_ref()
                     .expect("missing wrapped line result after planner")
-                    .clone_lines(&self.lines),
+                    .shared_chunk(&self.lines),
             );
         }
         wrapped
     }
 
-    fn rebuild_rewrap_row_prefix_scratch(&mut self, wrapped: &[Vec<Line>]) {
+    fn rebuild_rewrap_row_prefix_scratch(&mut self, wrapped: &[Arc<[Line]>]) {
         self.rewrap_row_prefix_scratch.clear();
         self.rewrap_row_prefix_scratch
             .reserve(wrapped.len().saturating_add(1));
@@ -1994,7 +2007,7 @@ impl Screen {
                                 if let Some(cached) = line_cache.get(&key) {
                                     wrapped.push((
                                         idx,
-                                        RewrapScratch::Lines(cached.lines.clone()),
+                                        RewrapScratch::SharedLines(Arc::clone(&cached.lines)),
                                         cached.scorecard,
                                         None,
                                         true,
@@ -2016,7 +2029,7 @@ impl Screen {
                                 (Some(key), RewrapScratch::Lines(lines)) => Some((
                                     key,
                                     CachedWrappedLine {
-                                        lines: lines.clone(),
+                                        lines: Arc::from(lines.clone()),
                                         scorecard: line_scorecard,
                                     },
                                 )),
@@ -2198,8 +2211,9 @@ impl Screen {
                 if additional > 0 {
                     rewrapped.reserve(additional);
                 }
-                for lines in wrapped {
-                    for mut line in lines {
+                for chunk in wrapped {
+                    for line in chunk.iter() {
+                        let mut line = line.clone();
                         line.update_last_change_seqno(seqno);
                         rewrapped.push_back(line);
                     }
@@ -2234,6 +2248,13 @@ impl Screen {
                         }
                         RewrapScratch::Lines(lines) => {
                             for mut line in lines {
+                                line.update_last_change_seqno(seqno);
+                                rewrapped.push_back(line);
+                            }
+                        }
+                        RewrapScratch::SharedLines(chunk) => {
+                            for line in chunk.iter() {
+                                let mut line = line.clone();
                                 line.update_last_change_seqno(seqno);
                                 rewrapped.push_back(line);
                             }
