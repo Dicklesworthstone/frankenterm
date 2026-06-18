@@ -1,9 +1,20 @@
-//! Write-ahead log engine for continuous zero-cost state persistence.
+//! Write-ahead log engine — a standalone library primitive for append-only,
+//! checkpointed state persistence.
 //!
 //! Provides an append-only log with monotonic sequence numbers, O(1) checkpoint
 //! markers, background compaction, and deterministic replay. State mutations are
 //! recorded as structured entries; "snapshots" reduce to placing a checkpoint
 //! marker (zero cost) rather than serializing full state.
+//!
+//! # Integration status (ft-g38ao)
+//!
+//! NOT YET WIRED. The engine itself is real and correct (CRC32 framing, fsync
+//! gating, tail-truncation recovery in `load_existing`), but nothing in the
+//! mux / server / runtime constructs a `MuxDiskWal` or appends a `MuxMutation` —
+//! its only callers are benches and tests. Live mux durability is currently
+//! provided by SQLite's own WAL, not this engine. The use cases listed below are
+//! therefore the *intended* design once integrated, not behavior the running
+//! application exhibits today.
 //!
 //! # Design
 //!
@@ -16,7 +27,7 @@
 //!  O(1) cost    (background)  (restore)
 //! ```
 //!
-//! # Use cases in FrankenTerm
+//! # Intended use cases (once integrated — see Integration status above)
 //!
 //! - **Crash recovery**: Replay WAL entries since last checkpoint to restore state.
 //! - **Continuous persistence**: Every state change is logged; no periodic "save".
