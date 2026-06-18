@@ -8246,7 +8246,12 @@ fn proof_doctor_cargo_argv(command: &[String]) -> &[String] {
 
 fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(manifest_path).ok()?;
-    let document = raw.parse::<toml::Value>().ok()?;
+    // toml 1.x: `parse::<toml::Value>()` parses a single bare VALUE, not a
+    // document, so a real Cargo.toml fails to parse and this silently returns
+    // None. Parse the document as a `toml::Table` instead (ft-vxxzk, mirrors the
+    // ft-crsdl fix). `Table::get` / `Value::get` both yield `Option<&Value>`, so
+    // the lookup chain below is unchanged.
+    let document = raw.parse::<toml::Table>().ok()?;
     document
         .get("package")
         .and_then(|package| package.get("name"))
@@ -8256,7 +8261,10 @@ fn proof_doctor_manifest_package_name(manifest_path: &Path) -> Option<String> {
 
 fn proof_doctor_workspace_members_from_manifest(manifest_path: &Path) -> Option<Vec<String>> {
     let raw = std::fs::read_to_string(manifest_path).ok()?;
-    let document = match raw.parse::<toml::Value>() {
+    // toml 1.x: parse the document as a `toml::Table` (not `toml::Value`, which
+    // parses a single bare value and would fail on a real Cargo.toml, silently
+    // returning None). ft-vxxzk, mirrors the ft-crsdl fix.
+    let document = match raw.parse::<toml::Table>() {
         Ok(document) => document,
         Err(_) => return None,
     };
