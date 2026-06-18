@@ -3,9 +3,16 @@
 //! Replaces Lua callbacks in performance-critical paths (update-status,
 //! pane-output, user-var-changed, window-resized) with typed Rust handlers.
 //!
-//! Dispatch order: **Native → WASM → Lua**.  Native handlers run first with
-//! zero allocation overhead.  Scripting-engine handlers are dispatched after
-//! native handlers via the `ScriptingEngine` trait's `fire_event` method.
+//! Handler PRIORITY ordering is **Native → WASM → Lua**: native handlers run
+//! first (with zero allocation overhead), and any scripting-engine handlers
+//! would run after them via the `ScriptingEngine` trait's `fire_event` method.
+//!
+//! NOTE: the WASM/Lua tiers are a forward-looking capability of the priority
+//! model, not an active production path. No production code currently registers
+//! WASM or Lua handlers — the `frankenterm-scripting` crate that would is not
+//! wired into mux (it is exercised only by benches/tests/fuzz) — so in
+//! production this bus dispatches native handlers only. The ordering is still
+//! enforced whenever such handlers ARE registered (see the priority tests).
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

@@ -3,6 +3,14 @@
 //! This crate defines a common `ScriptingEngine` trait and a
 //! `ScriptingDispatcher` that can coordinate multiple engines
 //! (for example Lua + WASM) behind one interface.
+//!
+//! STATUS: experimental / not yet integrated. No production crate depends on
+//! `frankenterm-scripting` (only `fuzz/` does, behind an optional feature); its
+//! engines, dispatcher, and lifecycle are exercised only by tests, benches, and
+//! fuzz targets, so nothing here can affect the running terminal today. Treat
+//! the dispatch-order and security-boundary language throughout as the intended
+//! design, NOT an active runtime guarantee, until the crate is wired into the
+//! mux/gui config-reload + event paths (see ft-rxk40 / ft-0dki4).
 
 use anyhow::Result;
 use std::path::Path;
