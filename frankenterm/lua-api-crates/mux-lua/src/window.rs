@@ -52,8 +52,28 @@ impl UserData for MuxWindow {
             let _: () = window.set_workspace(&new_name);
             Ok(())
         });
-        methods.add_method("spawn_tab", |_, this, spawn: SpawnTab| {
-            promise::spawn::block_on(spawn.spawn(this))
+        // Must be an async Lua method: `spawn.spawn()` awaits
+        // `Mux::spawn_tab_or_window`, whose future is only driven once the GUI
+        // event loop runs. Driving it with `promise::spawn::block_on` deadlocks
+        // (and trips the main-thread dispatch guard) when `spawn_tab` is invoked
+        // from a `gui-startup`/event handler running on the main-thread spawn
+        // queue. (Regressed to block_on during the mlua 0.11 migration.)
+        //
+        // mlua 0.11's `add_async_method` (send feature on) requires a `Send`
+        // future, but `Mux::spawn_tab_or_window`'s future is `!Send` (the
+        // `Domain` trait yields `Pin<Box<dyn Future>>` local futures), so we
+        // cannot `.await` it directly. Instead spawn the `!Send` work on the
+        // main-thread-local executor — `promise::spawn::spawn` lifts the `Send`
+        // bound and schedules onto the same main-thread queue the loop pumps —
+        // and `.await` its `Task` join handle, which IS `Send` (the result is
+        // Copy IDs). This future therefore holds only the `Send` join handle
+        // across the await; the actual spawn work still yields to the GUI loop,
+        // so there is no `block_on` and no main-thread dispatch deadlock.
+        methods.add_async_method("spawn_tab", |_, this, spawn: SpawnTab| async move {
+            // MuxWindow is Copy: take the id by value so the deferred task does
+            // not retain the Lua `UserDataRef` registry handle.
+            let window = *this;
+            promise::spawn::spawn(async move { spawn.spawn(&window).await }).await
         });
         methods.add_method("get_title", |_, this, _: ()| {
             let mux = get_mux()?;
