@@ -299,6 +299,8 @@ pub mod command_rules {
             pane_select_default_action(PaneSelectMode::MoveToNewWindow),
             RotatePanes(RotationDirection::Clockwise),
             RotatePanes(RotationDirection::CounterClockwise),
+            UnifyWindowsOnActiveDomain,
+            UnifyAllWindows,
             // --- Swap Layouts & Floating Panes ---
             SwapLayoutNext,
             SwapLayoutPrev,

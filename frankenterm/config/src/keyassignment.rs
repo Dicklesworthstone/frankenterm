@@ -702,6 +702,8 @@ pub enum KeyAssignment {
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),
+    UnifyWindowsOnActiveDomain,
+    UnifyAllWindows,
     PromptInputLine(PromptInputLine),
     InputSelector(InputSelector),
     Confirmation(Confirmation),

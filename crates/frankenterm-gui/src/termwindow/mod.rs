@@ -57,6 +57,7 @@ use frankenterm_gui::triple_buffer_gui::{
 use frankenterm_toast_notification::persistent_toast_notification;
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
+use mux::domain::DomainId;
 use mux::pane::{
     CachePolicy, CloseReason, Pane, PaneId, Pattern as MuxPattern, PerformAssignmentResult,
 };
@@ -66,6 +67,7 @@ use mux::tab::{
     TabId,
 };
 use mux::window::WindowId as MuxWindowId;
+use mux::unify::{MergePlan, TabIdentity, TabSnapshot, WindowSnapshot, plan_unify_domain};
 use mux::{
     Mux, MuxNotification, SynchronizedOutputAdmissionDecision, SynchronizedOutputDepthOutcome,
     SynchronizedOutputDrainCause, SynchronizedOutputEvent,
@@ -73,7 +75,7 @@ use mux::{
 use mux_lua::MuxPane;
 use promise::spawn::sleep;
 use std::cell::{RefCell, RefMut};
-use std::collections::{HashMap, LinkedList};
+use std::collections::{BTreeSet, HashMap, LinkedList};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,6 +87,7 @@ use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
+use frankenterm_client::pane::ClientPane;
 
 pub mod background;
 pub mod box_model;
@@ -210,6 +213,45 @@ impl UIItem {
 
 fn usize_to_isize_saturating(value: usize) -> isize {
     isize::try_from(value).unwrap_or(isize::MAX)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WindowUnifyScope {
+    ActiveDomain,
+    AllDomains,
+}
+
+#[derive(Clone, Debug)]
+struct GuiWindowUnifyPlan {
+    title: String,
+    workspace: String,
+    plans: Vec<MergePlan>,
+    close_windows: Vec<MuxWindowId>,
+}
+
+impl GuiWindowUnifyPlan {
+    fn move_count(&self) -> usize {
+        self.plans.iter().map(|plan| plan.moves.len()).sum()
+    }
+
+    fn drop_count(&self) -> usize {
+        self.plans.iter().map(|plan| plan.drops.len()).sum()
+    }
+
+    fn close_count(&self) -> usize {
+        self.close_windows.len()
+    }
+
+    fn summary_message(&self) -> String {
+        format!(
+            "{}\nWorkspace: {}\n\nPlan summary:\nMoves: {}\nDrops: {}\nWindows to close: {}\n\nContinue?",
+            self.title,
+            self.workspace,
+            self.move_count(),
+            self.drop_count(),
+            self.close_count(),
+        )
+    }
 }
 
 #[derive(Clone, Default)]
@@ -4218,6 +4260,231 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    fn tab_unify_identity(tab: &Tab) -> Option<TabIdentity> {
+        let mut panes: Vec<Arc<dyn Pane>> = tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .map(|pane| pane.pane)
+            .collect();
+        panes.extend(
+            tab.iter_floating_panes()
+                .into_iter()
+                .map(|pane| pane.pane),
+        );
+
+        if panes.is_empty() {
+            return None;
+        }
+
+        let mut domain_id = None;
+        let mut remote_pane_ids = Vec::with_capacity(panes.len());
+        for pane in panes {
+            let client_pane = pane.downcast_ref::<ClientPane>()?;
+            let pane_domain = pane.domain_id();
+            if domain_id.replace(pane_domain).is_some_and(|id| id != pane_domain) {
+                return None;
+            }
+            remote_pane_ids.push(client_pane.remote_pane_id());
+        }
+
+        domain_id.map(|domain_id| TabIdentity::new(domain_id, remote_pane_ids))
+    }
+
+    fn collect_window_unify_snapshots(mux: &Mux) -> Vec<WindowSnapshot> {
+        mux.iter_windows()
+            .into_iter()
+            .filter_map(|window_id| {
+                let window = mux.get_window(window_id)?;
+                let tabs = window
+                    .iter()
+                    .map(|tab| TabSnapshot {
+                        tab_id: tab.tab_id(),
+                        identity: Self::tab_unify_identity(tab),
+                    })
+                    .collect();
+                Some(WindowSnapshot {
+                    window_id,
+                    workspace: window.get_workspace().to_string(),
+                    tabs,
+                })
+            })
+            .collect()
+    }
+
+    fn close_windows_after_unify_plans(
+        snapshots: &[WindowSnapshot],
+        workspace: &str,
+        plans: &[MergePlan],
+    ) -> Vec<MuxWindowId> {
+        let changed_tabs: BTreeSet<TabId> = plans
+            .iter()
+            .flat_map(|plan| {
+                plan.moves
+                    .iter()
+                    .map(|tab_move| tab_move.tab_id)
+                    .chain(plan.drops.iter().map(|tab_drop| tab_drop.tab_id))
+            })
+            .collect();
+        let canonical_windows: BTreeSet<MuxWindowId> = plans
+            .iter()
+            .filter_map(|plan| plan.canonical_window)
+            .collect();
+
+        let mut close_windows: Vec<MuxWindowId> = snapshots
+            .iter()
+            .filter(|window| window.workspace == workspace)
+            .filter(|window| !canonical_windows.contains(&window.window_id))
+            .filter(|window| !window.tabs.is_empty())
+            .filter(|window| {
+                window
+                    .tabs
+                    .iter()
+                    .all(|tab| changed_tabs.contains(&tab.tab_id))
+            })
+            .map(|window| window.window_id)
+            .collect();
+        close_windows.sort_unstable();
+        close_windows.dedup();
+        close_windows
+    }
+
+    fn build_window_unify_plan(
+        &self,
+        scope: WindowUnifyScope,
+    ) -> anyhow::Result<GuiWindowUnifyPlan> {
+        let mux = self.mux_or_err("plan window unify")?;
+        let workspace = mux
+            .get_window(self.mux_window_id)
+            .map(|window| window.get_workspace().to_string())
+            .ok_or_else(|| anyhow!("window {} not found", self.mux_window_id))?;
+        let snapshots = Self::collect_window_unify_snapshots(&mux);
+
+        let (title, plans) = match scope {
+            WindowUnifyScope::ActiveDomain => {
+                let active_pane = self
+                    .get_active_pane_no_overlay()
+                    .ok_or_else(|| anyhow!("cannot unify windows without an active pane"))?;
+                let domain_id = active_pane.domain_id();
+                let domain_name = mux
+                    .get_domain(domain_id)
+                    .map(|domain| domain.domain_name().to_string())
+                    .unwrap_or_else(|| format!("domain {domain_id}"));
+                (
+                    format!("Unify windows on this domain ({domain_name})"),
+                    vec![plan_unify_domain(
+                        &snapshots,
+                        domain_id,
+                        &workspace,
+                        Some(self.mux_window_id),
+                    )],
+                )
+            }
+            WindowUnifyScope::AllDomains => {
+                let domain_ids: BTreeSet<DomainId> = snapshots
+                    .iter()
+                    .filter(|window| window.workspace == workspace)
+                    .flat_map(|window| window.tabs.iter())
+                    .filter_map(|tab| tab.identity.as_ref().map(|identity| identity.domain_id))
+                    .collect();
+                let plans = domain_ids
+                    .iter()
+                    .map(|domain_id| {
+                        plan_unify_domain(
+                            &snapshots,
+                            *domain_id,
+                            &workspace,
+                            Some(self.mux_window_id),
+                        )
+                    })
+                    .collect();
+                ("Unify all".to_string(), plans)
+            }
+        };
+        let close_windows = Self::close_windows_after_unify_plans(&snapshots, &workspace, &plans);
+
+        Ok(GuiWindowUnifyPlan {
+            title,
+            workspace,
+            plans,
+            close_windows,
+        })
+    }
+
+    fn apply_window_unify_plan(plan: GuiWindowUnifyPlan) {
+        let Some(mux) = Mux::try_get() else {
+            log::warn!("cannot apply window-unify plan: mux is no longer active");
+            return;
+        };
+
+        for merge_plan in &plan.plans {
+            for tab_move in &merge_plan.moves {
+                if let Err(err) =
+                    mux.move_tab_between_windows(tab_move.tab_id, tab_move.to_window, None)
+                {
+                    log::error!(
+                        "failed to move tab {} into window {} while applying window-unify plan: {err:#}",
+                        tab_move.tab_id,
+                        tab_move.to_window,
+                    );
+                    return;
+                }
+            }
+        }
+
+        for merge_plan in &plan.plans {
+            for tab_drop in &merge_plan.drops {
+                if mux.remove_tab_local_only(tab_drop.tab_id).is_none() {
+                    log::warn!(
+                        "window-unify planned to drop tab {}, but it no longer exists",
+                        tab_drop.tab_id,
+                    );
+                }
+            }
+        }
+
+        for window_id in plan.close_windows {
+            mux.kill_window(window_id);
+        }
+    }
+
+    fn show_window_unify_confirmation(&mut self, scope: WindowUnifyScope) {
+        let plan = match self.build_window_unify_plan(scope) {
+            Ok(plan) => plan,
+            Err(err) => {
+                persistent_toast_notification("Window unify unavailable", &format!("{err:#}"));
+                return;
+            }
+        };
+        let message = plan.summary_message();
+
+        let Some(mux) = self.mux_or_log("start window-unify confirmation overlay") else {
+            return;
+        };
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+
+        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, mut term| {
+            if crate::overlay::confirm::run_confirmation(&message, &mut term)? {
+                promise::spawn::spawn_into_main_thread(async move {
+                    Self::apply_window_unify_plan(plan);
+                    anyhow::Result::<()>::Ok(())
+                })
+                .detach();
+            }
+            Ok(())
+        }) {
+            Ok(overlay) => overlay,
+            Err(err) => {
+                log::error!("failed to start window-unify confirmation overlay: {err:#}");
+                return;
+            }
+        };
+        self.assign_overlay(tab.tab_id(), overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
     fn show_confirmation(&mut self, args: &Confirmation) {
         let Some(mux) = self.mux_or_log("start confirmation overlay") else {
             return;
@@ -5244,6 +5511,12 @@ impl TermWindow {
                     RotationDirection::Clockwise => tab.rotate_clockwise(),
                     RotationDirection::CounterClockwise => tab.rotate_counter_clockwise(),
                 }
+            }
+            UnifyWindowsOnActiveDomain => {
+                self.show_window_unify_confirmation(WindowUnifyScope::ActiveDomain);
+            }
+            UnifyAllWindows => {
+                self.show_window_unify_confirmation(WindowUnifyScope::AllDomains);
             }
             SwapLayoutNext => {
                 let Some(mux) = self.mux_or_log("swap to next layout") else {

@@ -2181,6 +2181,34 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["View"],
             icon: Some("md_dashboard"),
         },
+        UnifyWindowsOnActiveDomain => CommandDef {
+            brief: "Unify windows on this domain".into(),
+            doc: "Merge duplicate windows for the active pane domain after showing the plan summary"
+                .into(),
+            keys: vec![(
+                Modifiers::CTRL
+                    .union(Modifiers::ALT)
+                    .union(Modifiers::SHIFT),
+                "u".into(),
+            )],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: Some("md_call_merge"),
+        },
+        UnifyAllWindows => CommandDef {
+            brief: "Unify all".into(),
+            doc: "Merge duplicate windows for every remote domain in the current workspace after showing the plan summary"
+                .into(),
+            keys: vec![(
+                Modifiers::SUPER
+                    .union(Modifiers::ALT)
+                    .union(Modifiers::SHIFT),
+                "u".into(),
+            )],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: Some("md_call_merge"),
+        },
         SplitPane(split) => {
             let direction = split.direction;
             CommandDef {
