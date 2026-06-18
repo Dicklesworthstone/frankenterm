@@ -1,9 +1,31 @@
+#![allow(unexpected_cfgs)]
+
 use crate::customglyph::BlockKey;
 use crate::glyphcache::CachedGlyph;
+use ahash::{AHashMap, AHasher};
 use config::TextStyle;
 use frankenterm_font::shaper::GlyphInfo;
 use frankenterm_font::units::*;
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+
+const SHAPED_RUN_INTERNER_MAX_ENTRIES: usize = 8192;
+const SHAPED_RUN_INTERNER_MAX_COLLISIONS: usize = 4;
+
+#[cfg(ft_disable_glyph_run_interning)]
+const GLYPH_RUN_INTERNING_CFG_ENABLED: bool = false;
+
+#[cfg(not(ft_disable_glyph_run_interning))]
+const GLYPH_RUN_INTERNING_CFG_ENABLED: bool = true;
+
+static GLYPH_RUN_INTERNING_ENV_ENABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FT_DISABLE_GLYPH_RUN_INTERNING").is_none());
+
+thread_local! {
+    static SHAPED_RUN_INTERNER: RefCell<ShapedRunInterner> =
+        RefCell::new(ShapedRunInterner::default());
+}
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct ShapeCacheKey {
@@ -11,7 +33,7 @@ pub struct ShapeCacheKey {
     pub text: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GlyphPosition {
     pub glyph_idx: u32,
     pub num_cells: u8,
@@ -20,7 +42,7 @@ pub struct GlyphPosition {
     pub bitmap_pixel_width: u32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ShapedInfo {
     pub glyph: Rc<CachedGlyph>,
     pub pos: GlyphPosition,
@@ -31,26 +53,137 @@ impl ShapedInfo {
     /// Process the results from the shaper, stitching together glyph
     /// and positioning information
     pub fn process(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedInfo> {
-        let mut pos: Vec<ShapedInfo> = Vec::with_capacity(infos.len());
-
-        for (info, glyph) in infos.iter().zip(glyphs.iter()) {
-            pos.push(ShapedInfo {
-                pos: GlyphPosition {
-                    glyph_idx: info.glyph_pos,
-                    bitmap_pixel_width: glyph
-                        .texture
-                        .as_ref()
-                        .map_or(0, |t| t.coords.width() as u32),
-                    num_cells: info.num_cells,
-                    x_offset: info.x_offset,
-                    bearing_x: glyph.bearing_x.get() as f32,
-                },
-                glyph: Rc::clone(glyph),
-                block_key: info.only_char.and_then(BlockKey::from_char),
-            });
+        if !glyph_run_interning_enabled() || infos.len() != glyphs.len() || infos.len() < 2 {
+            return build_shaped_infos(infos, glyphs);
         }
-        pos
+
+        let key = shaped_run_key(infos, glyphs);
+        if let Some(run) =
+            SHAPED_RUN_INTERNER.with(|interner| interner.borrow().lookup(key, infos, glyphs))
+        {
+            return run;
+        }
+
+        let run = build_shaped_infos(infos, glyphs);
+        SHAPED_RUN_INTERNER.with(|interner| interner.borrow_mut().insert(key, &run));
+        run
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ShapedRunKey {
+    hash: u64,
+    len: usize,
+}
+
+#[derive(Default)]
+struct ShapedRunInterner {
+    runs: AHashMap<ShapedRunKey, Vec<Vec<ShapedInfo>>>,
+    entries: usize,
+}
+
+impl ShapedRunInterner {
+    fn lookup(
+        &self,
+        key: ShapedRunKey,
+        infos: &[GlyphInfo],
+        glyphs: &[Rc<CachedGlyph>],
+    ) -> Option<Vec<ShapedInfo>> {
+        self.runs.get(&key).and_then(|runs| {
+            runs.iter()
+                .find(|run| shaped_run_matches(infos, glyphs, run))
+                .cloned()
+        })
+    }
+
+    fn insert(&mut self, key: ShapedRunKey, run: &[ShapedInfo]) {
+        if self.entries >= SHAPED_RUN_INTERNER_MAX_ENTRIES {
+            self.runs.clear();
+            self.entries = 0;
+        }
+
+        let bucket = self.runs.entry(key).or_default();
+        if bucket.len() >= SHAPED_RUN_INTERNER_MAX_COLLISIONS {
+            bucket.swap_remove(0);
+            self.entries = self.entries.saturating_sub(1);
+        }
+
+        bucket.push(run.to_vec());
+        self.entries += 1;
+    }
+}
+
+#[inline]
+fn glyph_run_interning_enabled() -> bool {
+    GLYPH_RUN_INTERNING_CFG_ENABLED && *GLYPH_RUN_INTERNING_ENV_ENABLED
+}
+
+fn build_shaped_infos(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedInfo> {
+    let mut pos: Vec<ShapedInfo> = Vec::with_capacity(infos.len());
+
+    for (info, glyph) in infos.iter().zip(glyphs.iter()) {
+        pos.push(ShapedInfo {
+            pos: GlyphPosition {
+                glyph_idx: info.glyph_pos,
+                bitmap_pixel_width: glyph_bitmap_pixel_width(glyph),
+                num_cells: info.num_cells,
+                x_offset: info.x_offset,
+                bearing_x: glyph.bearing_x.get() as f32,
+            },
+            glyph: Rc::clone(glyph),
+            block_key: info.only_char.and_then(BlockKey::from_char),
+        });
+    }
+    pos
+}
+
+fn shaped_run_key(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> ShapedRunKey {
+    let mut hasher = AHasher::default();
+    infos.len().hash(&mut hasher);
+
+    for (info, glyph) in infos.iter().zip(glyphs.iter()) {
+        info.glyph_pos.hash(&mut hasher);
+        info.num_cells.hash(&mut hasher);
+        info.x_offset.get().to_bits().hash(&mut hasher);
+        (Rc::as_ptr(glyph) as usize).hash(&mut hasher);
+        glyph_bitmap_pixel_width(glyph).hash(&mut hasher);
+        glyph.bearing_x.get().to_bits().hash(&mut hasher);
+        info.only_char
+            .and_then(BlockKey::from_char)
+            .hash(&mut hasher);
+    }
+
+    ShapedRunKey {
+        hash: hasher.finish(),
+        len: infos.len(),
+    }
+}
+
+fn shaped_run_matches(
+    infos: &[GlyphInfo],
+    glyphs: &[Rc<CachedGlyph>],
+    run: &[ShapedInfo],
+) -> bool {
+    run.len() == infos.len()
+        && glyphs.len() == infos.len()
+        && infos
+            .iter()
+            .zip(glyphs.iter())
+            .zip(run.iter())
+            .all(|((info, glyph), shaped)| {
+                Rc::ptr_eq(&shaped.glyph, glyph)
+                    && shaped.pos.glyph_idx == info.glyph_pos
+                    && shaped.pos.num_cells == info.num_cells
+                    && shaped.pos.x_offset == info.x_offset
+                    && shaped.pos.bearing_x == glyph.bearing_x.get() as f32
+                    && shaped.pos.bitmap_pixel_width == glyph_bitmap_pixel_width(glyph)
+                    && shaped.block_key == info.only_char.and_then(BlockKey::from_char)
+            })
+}
+
+#[inline]
+fn glyph_bitmap_pixel_width(glyph: &CachedGlyph) -> u32 {
+    glyph.texture.as_ref().map_or(0, |t| t.coords.width() as u32)
 }
 
 /// We'd like to avoid allocating when resolving from the cache
