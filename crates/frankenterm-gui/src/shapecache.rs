@@ -65,7 +65,8 @@ impl ShapedInfo {
         }
 
         let run = build_shaped_infos(infos, glyphs);
-        SHAPED_RUN_INTERNER.with(|interner| interner.borrow_mut().insert(key, &run));
+        SHAPED_RUN_INTERNER
+            .with(|interner| interner.borrow_mut().insert(key, infos, glyphs, &run));
         run
     }
 }
@@ -78,7 +79,7 @@ struct ShapedRunKey {
 
 #[derive(Default)]
 struct ShapedRunInterner {
-    runs: AHashMap<ShapedRunKey, Vec<Vec<ShapedInfo>>>,
+    runs: AHashMap<ShapedRunKey, Vec<InternedShapedRun>>,
     entries: usize,
 }
 
@@ -92,11 +93,17 @@ impl ShapedRunInterner {
         self.runs.get(&key).and_then(|runs| {
             runs.iter()
                 .find(|run| shaped_run_matches(infos, glyphs, run))
-                .cloned()
+                .map(|run| run.shaped.clone())
         })
     }
 
-    fn insert(&mut self, key: ShapedRunKey, run: &[ShapedInfo]) {
+    fn insert(
+        &mut self,
+        key: ShapedRunKey,
+        infos: &[GlyphInfo],
+        glyphs: &[Rc<CachedGlyph>],
+        run: &[ShapedInfo],
+    ) {
         if self.entries >= SHAPED_RUN_INTERNER_MAX_ENTRIES {
             self.runs.clear();
             self.entries = 0;
@@ -108,8 +115,73 @@ impl ShapedRunInterner {
             self.entries = self.entries.saturating_sub(1);
         }
 
-        bucket.push(run.to_vec());
+        bucket.push(InternedShapedRun::new(infos, glyphs, run));
         self.entries += 1;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InternedShapedRun {
+    signature: Vec<ShapedRunGlyph>,
+    shaped: Vec<ShapedInfo>,
+}
+
+impl InternedShapedRun {
+    fn new(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>], shaped: &[ShapedInfo]) -> Self {
+        Self {
+            signature: shaped_run_signature(infos, glyphs),
+            shaped: shaped.to_vec(),
+        }
+    }
+
+    fn matches(&self, infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> bool {
+        self.signature.len() == infos.len()
+            && glyphs.len() == infos.len()
+            && self
+                .signature
+                .iter()
+                .zip(infos.iter())
+                .zip(glyphs.iter())
+                .all(|((cached, info), glyph)| *cached == ShapedRunGlyph::new(info, glyph))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ShapedRunGlyph {
+    only_char: Option<char>,
+    is_space: bool,
+    num_cells: u8,
+    cluster: u32,
+    font_idx: usize,
+    glyph_pos: u32,
+    x_advance_bits: u64,
+    y_advance_bits: u64,
+    x_offset_bits: u64,
+    y_offset_bits: u64,
+    glyph_ptr: usize,
+    bitmap_pixel_width: u32,
+    bearing_x_bits: u64,
+    block_key: Option<BlockKey>,
+}
+
+impl ShapedRunGlyph {
+    fn new(info: &GlyphInfo, glyph: &Rc<CachedGlyph>) -> Self {
+        Self {
+            only_char: info.only_char,
+            is_space: info.is_space,
+            num_cells: info.num_cells,
+            cluster: info.cluster,
+            font_idx: info.font_idx,
+            glyph_pos: info.glyph_pos,
+            x_advance_bits: info.x_advance.get().to_bits(),
+            y_advance_bits: info.y_advance.get().to_bits(),
+            x_offset_bits: info.x_offset.get().to_bits(),
+            y_offset_bits: info.y_offset.get().to_bits(),
+            glyph_ptr: Rc::as_ptr(glyph) as usize,
+            bitmap_pixel_width: glyph_bitmap_pixel_width(glyph),
+            bearing_x_bits: glyph.bearing_x.get().to_bits(),
+            block_key: info.only_char.and_then(BlockKey::from_char),
+        }
     }
 }
 
@@ -142,15 +214,7 @@ fn shaped_run_key(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> ShapedRunK
     infos.len().hash(&mut hasher);
 
     for (info, glyph) in infos.iter().zip(glyphs.iter()) {
-        info.glyph_pos.hash(&mut hasher);
-        info.num_cells.hash(&mut hasher);
-        info.x_offset.get().to_bits().hash(&mut hasher);
-        (Rc::as_ptr(glyph) as usize).hash(&mut hasher);
-        glyph_bitmap_pixel_width(glyph).hash(&mut hasher);
-        glyph.bearing_x.get().to_bits().hash(&mut hasher);
-        info.only_char
-            .and_then(BlockKey::from_char)
-            .hash(&mut hasher);
+        ShapedRunGlyph::new(info, glyph).hash(&mut hasher);
     }
 
     ShapedRunKey {
@@ -162,23 +226,17 @@ fn shaped_run_key(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> ShapedRunK
 fn shaped_run_matches(
     infos: &[GlyphInfo],
     glyphs: &[Rc<CachedGlyph>],
-    run: &[ShapedInfo],
+    run: &InternedShapedRun,
 ) -> bool {
-    run.len() == infos.len()
-        && glyphs.len() == infos.len()
-        && infos
-            .iter()
-            .zip(glyphs.iter())
-            .zip(run.iter())
-            .all(|((info, glyph), shaped)| {
-                Rc::ptr_eq(&shaped.glyph, glyph)
-                    && shaped.pos.glyph_idx == info.glyph_pos
-                    && shaped.pos.num_cells == info.num_cells
-                    && shaped.pos.x_offset == info.x_offset
-                    && shaped.pos.bearing_x == glyph.bearing_x.get() as f32
-                    && shaped.pos.bitmap_pixel_width == glyph_bitmap_pixel_width(glyph)
-                    && shaped.block_key == info.only_char.and_then(BlockKey::from_char)
-            })
+    run.matches(infos, glyphs)
+}
+
+fn shaped_run_signature(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedRunGlyph> {
+    infos
+        .iter()
+        .zip(glyphs.iter())
+        .map(|(info, glyph)| ShapedRunGlyph::new(info, glyph))
+        .collect()
 }
 
 #[inline]
@@ -248,7 +306,8 @@ impl<'a> std::hash::Hash for dyn ShapeCacheKeyTrait + 'a {
 #[cfg(test)]
 mod test {
     use super::{
-        SHAPED_RUN_INTERNER, build_shaped_infos, glyph_run_interning_enabled, shaped_run_key,
+        InternedShapedRun, SHAPED_RUN_INTERNER, build_shaped_infos,
+        glyph_run_interning_enabled, shaped_run_key, shaped_run_signature,
     };
     use crate::glyphcache::{CachedGlyph, GlyphCache};
     use crate::shapecache::{GlyphPosition, ShapedInfo};
@@ -261,7 +320,7 @@ mod test {
     use termwiz::surface::{Line, SEQ_ZERO};
     use wezterm_bidi::Direction;
 
-    fn cluster_and_shape(
+    fn shape_infos_and_glyphs(
         render_metrics: &RenderMetrics,
         glyph_cache: &mut GlyphCache,
         style: &TextStyle,
@@ -334,37 +393,16 @@ mod test {
             .collect()
     }
 
-    fn assert_shaping_stream_eq(left: &[GlyphInfo], right: &[GlyphInfo]) {
-        let left_stream: Vec<_> = left
-            .iter()
-            .map(|info| {
-                (
-                    info.glyph_pos,
-                    info.cluster,
-                    info.x_advance.get().to_bits(),
-                    info.y_advance.get().to_bits(),
-                    info.x_offset.get().to_bits(),
-                    info.y_offset.get().to_bits(),
-                    info.num_cells,
-                )
-            })
-            .collect();
-        let right_stream: Vec<_> = right
-            .iter()
-            .map(|info| {
-                (
-                    info.glyph_pos,
-                    info.cluster,
-                    info.x_advance.get().to_bits(),
-                    info.y_advance.get().to_bits(),
-                    info.x_offset.get().to_bits(),
-                    info.y_offset.get().to_bits(),
-                    info.num_cells,
-                )
-            })
-            .collect();
-
-        assert_eq!(left_stream, right_stream);
+    fn assert_shaping_stream_eq(
+        left_infos: &[GlyphInfo],
+        left_glyphs: &[Rc<CachedGlyph>],
+        right_infos: &[GlyphInfo],
+        right_glyphs: &[Rc<CachedGlyph>],
+    ) {
+        assert_eq!(
+            shaped_run_signature(left_infos, left_glyphs),
+            shaped_run_signature(right_infos, right_glyphs)
+        );
     }
 
     fn assert_shaped_runs_identical(left: &[ShapedInfo], right: &[ShapedInfo]) {
@@ -381,6 +419,33 @@ mod test {
                 "cached glyph identity differed at {idx}"
             );
         }
+    }
+
+    fn assert_signature_mismatch_rejects_hit(
+        interned: &InternedShapedRun,
+        infos: &[GlyphInfo],
+        glyphs: &[Rc<CachedGlyph>],
+    ) {
+        let mut wrong_glyph_id = interned.clone();
+        wrong_glyph_id.signature[0].glyph_pos ^= 1;
+        assert!(
+            !wrong_glyph_id.matches(infos, glyphs),
+            "glyph-id mismatch must not be accepted as an interner hit"
+        );
+
+        let mut wrong_advance = interned.clone();
+        wrong_advance.signature[0].x_advance_bits ^= 1;
+        assert!(
+            !wrong_advance.matches(infos, glyphs),
+            "x-advance mismatch must not be accepted as an interner hit"
+        );
+
+        let mut wrong_cluster = interned.clone();
+        wrong_cluster.signature[0].cluster = wrong_cluster.signature[0].cluster.wrapping_add(1);
+        assert!(
+            !wrong_cluster.matches(infos, glyphs),
+            "cluster mismatch must not be accepted as an interner hit"
+        );
     }
 
     #[test]
@@ -418,7 +483,7 @@ mod test {
 
         let (hit_infos, hit_glyphs) =
             shape_infos_and_glyphs(&render_metrics, &mut glyph_cache, &style, &font, text);
-        assert_shaping_stream_eq(&miss_infos, &hit_infos);
+        assert_shaping_stream_eq(&miss_infos, &miss_glyphs, &hit_infos, &hit_glyphs);
 
         let fresh_hit_run = build_shaped_infos(&hit_infos, &hit_glyphs);
         let hit_key = shaped_run_key(&hit_infos, &hit_glyphs);
@@ -426,6 +491,24 @@ mod test {
             .with(|interner| interner.borrow().lookup(hit_key, &hit_infos, &hit_glyphs))
             .expect("second identical shape must hit the glyph-run interner");
         assert_shaped_runs_identical(&fresh_hit_run, &lookup_hit);
+
+        let interned_hit = SHAPED_RUN_INTERNER.with(|interner| {
+            interner
+                .borrow()
+                .runs
+                .get(&hit_key)
+                .and_then(|runs| {
+                    runs.iter()
+                        .find(|run| run.matches(&hit_infos, &hit_glyphs))
+                })
+                .cloned()
+        });
+        let interned_hit = interned_hit.expect("matching interned run must be retained");
+        assert_eq!(
+            shaped_run_signature(&hit_infos, &hit_glyphs),
+            interned_hit.signature
+        );
+        assert_signature_mismatch_rejects_hit(&interned_hit, &hit_infos, &hit_glyphs);
 
         let process_hit = ShapedInfo::process(&hit_infos, &hit_glyphs);
         assert_shaped_runs_identical(&fresh_hit_run, &process_hit);
