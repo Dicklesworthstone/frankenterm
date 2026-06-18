@@ -3708,9 +3708,14 @@ pub struct McpClientConfig {
     pub proxy_mount_all_discovered: bool,
     /// Explicit remote server names (ordered) to mount when proxying.
     pub proxy_servers: Vec<String>,
-    /// If true, proxy setup failures fail server startup.
+    /// On proxy setup failure (when `proxy_enabled`): if true, fail server
+    /// startup. Must be the inverse of `proxy_fallback_to_local` — exactly one
+    /// of the two selects the on-failure behavior; setting both to the same
+    /// value is rejected by [`McpClientConfig::validate`] as contradictory
+    /// (they collapse to `fail_fast = proxy_strict || !proxy_fallback_to_local`).
     pub proxy_strict: bool,
-    /// If true, continue with local-only server when proxy setup fails.
+    /// On proxy setup failure (when `proxy_enabled`): if true, continue with a
+    /// local-only server. Must be the inverse of `proxy_strict` (see that field).
     pub proxy_fallback_to_local: bool,
     /// If true, include remote tools marked as destructive/mutating.
     pub proxy_allow_mutating_tools: bool,
@@ -3833,6 +3838,25 @@ impl McpClientConfig {
                     "mcp_client.proxy_mount_all_discovered=false requires proxy_servers or preferred_servers"
                         .to_string(),
                 );
+            }
+
+            // proxy_strict and proxy_fallback_to_local are NOT independent: the
+            // only production consumer derives
+            // `fail_fast = proxy_strict || !proxy_fallback_to_local`
+            // (mcp_proxy.rs). So the two must be inverses — exactly one selects
+            // the on-proxy-failure behavior. Equal values are contradictory and
+            // silently collapse to fail_fast=true: both=true ignores
+            // proxy_fallback_to_local (never continues local-only), both=false
+            // ignores proxy_strict=false (still fails startup). Reject them with
+            // a clear error rather than surprise the operator (ft-b877r).
+            if self.proxy_strict == self.proxy_fallback_to_local {
+                return Err(format!(
+                    "mcp_client.proxy_strict and mcp_client.proxy_fallback_to_local must be \
+                     opposites (exactly one selects the on-proxy-failure behavior), but both are \
+                     {}; set proxy_strict=true to fail startup on proxy errors, or \
+                     proxy_fallback_to_local=true to continue with a local-only server",
+                    self.proxy_strict
+                ));
             }
         }
 
@@ -7538,6 +7562,44 @@ proxy_allow_mutating_tools = false
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("mcp_client.proxy_enabled requires mcp_client.enabled=true"));
+    }
+
+    #[test]
+    fn mcp_client_validation_rejects_contradictory_proxy_failure_policy() {
+        // ft-b877r: proxy_strict and proxy_fallback_to_local must be inverses;
+        // equal values are contradictory (both collapse to fail_fast=true).
+        for &flag in &[true, false] {
+            let mut config = Config::default();
+            config.mcp_client.enabled = true;
+            config.mcp_client.proxy_enabled = true;
+            config.mcp_client.proxy_strict = flag;
+            config.mcp_client.proxy_fallback_to_local = flag;
+
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(
+                    "mcp_client.proxy_strict and mcp_client.proxy_fallback_to_local must be opposites"
+                ),
+                "expected contradiction error when both are {flag}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_client_validation_accepts_inverse_proxy_failure_policy() {
+        // ft-b877r: the two coherent combos (exactly one flag set) validate.
+        for (strict, fallback) in [(true, false), (false, true)] {
+            let mut config = Config::default();
+            config.mcp_client.enabled = true;
+            config.mcp_client.proxy_enabled = true;
+            config.mcp_client.proxy_strict = strict;
+            config.mcp_client.proxy_fallback_to_local = fallback;
+
+            assert!(
+                config.validate().is_ok(),
+                "inverse proxy failure policy (strict={strict}, fallback={fallback}) must validate"
+            );
+        }
     }
 
     #[test]
