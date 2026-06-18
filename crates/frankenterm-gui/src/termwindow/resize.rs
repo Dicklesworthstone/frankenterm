@@ -367,16 +367,35 @@ impl super::TermWindow {
 
         log::trace!("apply_dimensions computed size {:?}, dims {:?}", size, dims);
 
+        // ft-t9l62: coalesce reshape storms. During a live-resize drag macOS
+        // fires `resize()` at 60-120Hz, but a cell is ~8x16px, so consecutive
+        // events usually map to the SAME rows x cols (`avail / cell_size`,
+        // integer division). `Tab::resize` is NOT a no-op on an unchanged size
+        // — it tree-walks the width+height constraints and reshapes every pane
+        // (mux/tab.rs:3007) — so re-running it for every sub-cell drag pixel is
+        // pure waste. Skip the grid reshape (and the overlay reshape, which is
+        // also sized to the grid) whenever the freshly recomputed `size` is
+        // byte-identical to what the tabs were last sized to: resizing a
+        // terminal to its current dimensions is idempotent, so the grid is
+        // identical either way. Scale/DPI changes alter `cell_size`, hence
+        // `size.pixel_*`, so they never compare equal here and are never
+        // skipped. The window pixel dimensions (`self.dimensions`) were already
+        // updated above and the panes marked dirty, so letterboxing + re-render
+        // at the new pixel size still happen — only the redundant reflow is
+        // elided.
+        let grid_size_changed = size != self.terminal_size;
         self.terminal_size = size;
 
-        if let Some(mux) = Mux::try_get() {
-            if let Some(window) = mux.get_window(self.mux_window_id) {
-                for tab in window.iter() {
-                    tab.resize(size);
+        if grid_size_changed {
+            if let Some(mux) = Mux::try_get() {
+                if let Some(window) = mux.get_window(self.mux_window_id) {
+                    for tab in window.iter() {
+                        tab.resize(size);
+                    }
                 }
             }
+            self.resize_overlays();
         }
-        self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();
 
