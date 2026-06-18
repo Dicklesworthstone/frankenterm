@@ -2223,14 +2223,185 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pane::{ForEachPaneLogicalLine, LogicalLine, WithPaneLines};
+    use crate::renderable::{RenderableDimensions, StableCursorPosition};
+    use frankenterm_term::color::ColorPalette;
+    use frankenterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
+    use parking_lot::{MappedMutexGuard, MutexGuard};
     use proptest::prelude::*;
+    use rangeset::RangeSet;
+    use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::MutexGuard as StdMutexGuard;
+    use termwiz::surface::{Line, SequenceNo};
 
     fn global_test_lock() -> StdMutexGuard<'static, ()> {
         crate::MUX_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner())
+    }
+
+    struct KillCountingPane {
+        id: PaneId,
+        size: Mutex<TerminalSize>,
+        kills: Arc<AtomicUsize>,
+        writes: Mutex<Vec<u8>>,
+    }
+
+    impl KillCountingPane {
+        fn new(id: PaneId, size: TerminalSize) -> (Arc<dyn Pane>, Arc<AtomicUsize>) {
+            let kills = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn Pane> = Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                kills: Arc::clone(&kills),
+                writes: Mutex::new(Vec::new()),
+            });
+            (pane, kills)
+        }
+    }
+
+    impl Pane for KillCountingPane {
+        fn pane_id(&self) -> PaneId {
+            self.id
+        }
+
+        fn get_cursor_position(&self) -> StableCursorPosition {
+            StableCursorPosition::default()
+        }
+
+        fn get_current_seqno(&self) -> SequenceNo {
+            0
+        }
+
+        fn get_changed_since(
+            &self,
+            _lines: Range<StableRowIndex>,
+            _seqno: SequenceNo,
+        ) -> RangeSet<StableRowIndex> {
+            RangeSet::new()
+        }
+
+        fn get_lines(&self, _lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
+            (0, Vec::new())
+        }
+
+        fn with_lines_mut(
+            &self,
+            _lines: Range<StableRowIndex>,
+            _with_lines: &mut dyn WithPaneLines,
+        ) {
+        }
+
+        fn for_each_logical_line_in_stable_range_mut(
+            &self,
+            _lines: Range<StableRowIndex>,
+            _for_line: &mut dyn ForEachPaneLogicalLine,
+        ) {
+        }
+
+        fn get_logical_lines(&self, _lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
+            Vec::new()
+        }
+
+        fn get_dimensions(&self) -> RenderableDimensions {
+            let size = *self.size.lock();
+            RenderableDimensions {
+                cols: size.cols,
+                viewport_rows: size.rows,
+                scrollback_rows: size.rows,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: size.dpi,
+                pixel_width: size.pixel_width,
+                pixel_height: size.pixel_height,
+                reverse_video: false,
+            }
+        }
+
+        fn get_title(&self) -> String {
+            format!("kill-counting-pane-{}", self.id)
+        }
+
+        fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
+            Ok(None)
+        }
+
+        fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
+            MutexGuard::map(self.writes.lock(), |writes| {
+                let writer: &mut dyn std::io::Write = writes;
+                writer
+            })
+        }
+
+        fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+            *self.size.lock() = size;
+            Ok(())
+        }
+
+        fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn key_up(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn is_dead(&self) -> bool {
+            false
+        }
+
+        fn kill(&self) {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
+        fn domain_id(&self) -> DomainId {
+            1
+        }
+
+        fn is_mouse_grabbed(&self) -> bool {
+            false
+        }
+
+        fn is_alt_screen_active(&self) -> bool {
+            false
+        }
+
+        fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<url::Url> {
+            None
+        }
+    }
+
+    fn test_size() -> TerminalSize {
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        }
+    }
+
+    fn tab_with_kill_counter(mux: &Mux, pane_id: PaneId) -> (Arc<Tab>, Arc<AtomicUsize>) {
+        let size = test_size();
+        let tab = Arc::new(Tab::new(&size));
+        let (pane, kills) = KillCountingPane::new(pane_id, size);
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("test tab should register with mux");
+        (tab, kills)
     }
 
     #[test]
@@ -3006,6 +3177,95 @@ mod tests {
         assert!(observed.load(Ordering::Relaxed));
 
         drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn move_tab_between_windows_preserves_live_tab_and_pane() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let src_window = mux.new_empty_window(Some("winunify".to_string()), None);
+        let src_window_id = *src_window;
+        let dst_window = mux.new_empty_window(Some("winunify".to_string()), None);
+        let dst_window_id = *dst_window;
+        let (tab, kills) = tab_with_kill_counter(&mux, 401);
+        let tab_id = tab.tab_id();
+        mux.add_tab_to_window(&tab, src_window_id)
+            .expect("tab should start in source window");
+
+        mux.move_tab_between_windows(tab_id, dst_window_id, Some(0))
+            .expect("metadata move should succeed");
+
+        assert_eq!(mux.window_containing_tab(tab_id), Some(dst_window_id));
+        assert!(
+            mux.get_tab(tab_id)
+                .map(|stored| Arc::ptr_eq(&stored, &tab))
+                .unwrap_or(false),
+            "move must keep the same live Arc<Tab> in the mux registry",
+        );
+        assert!(
+            mux.get_pane(401).is_some(),
+            "move must keep the tab's pane registered",
+        );
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "metadata move must not kill the pane",
+        );
+
+        drop(dst_window);
+        drop(src_window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn remove_tab_local_only_drops_mirror_without_killing_pane() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let local_only_window = mux.new_empty_window(Some("winunify".to_string()), None);
+        let local_only_window_id = *local_only_window;
+        let (local_only_tab, local_only_kills) = tab_with_kill_counter(&mux, 501);
+        let local_only_tab_id = local_only_tab.tab_id();
+        mux.add_tab_to_window(&local_only_tab, local_only_window_id)
+            .expect("local-only tab should be attached to a window");
+
+        let normal_window = mux.new_empty_window(Some("winunify".to_string()), None);
+        let normal_window_id = *normal_window;
+        let (normal_tab, normal_kills) = tab_with_kill_counter(&mux, 502);
+        let normal_tab_id = normal_tab.tab_id();
+        mux.add_tab_to_window(&normal_tab, normal_window_id)
+            .expect("normal tab should be attached to a window");
+
+        let removed = mux
+            .remove_tab_local_only(local_only_tab_id)
+            .expect("local-only tab should be removed");
+        assert!(Arc::ptr_eq(&removed, &local_only_tab));
+        assert!(mux.get_tab(local_only_tab_id).is_none());
+        assert!(mux.get_pane(501).is_none());
+        assert_eq!(
+            local_only_kills.load(Ordering::SeqCst),
+            0,
+            "local-only tab removal must not call Pane::kill / Pdu::KillPane path",
+        );
+
+        let normal_removed = mux
+            .remove_tab(normal_tab_id)
+            .expect("normal tab should be removed");
+        assert!(Arc::ptr_eq(&normal_removed, &normal_tab));
+        assert_eq!(
+            normal_kills.load(Ordering::SeqCst),
+            1,
+            "ordinary tab removal remains the killing path",
+        );
+
+        drop(normal_window);
+        drop(local_only_window);
         Mux::shutdown();
     }
 
