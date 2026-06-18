@@ -251,10 +251,13 @@ impl StepOutcome {
 
 // ── Step Execution Record ────────────────────────────────────────────────────
 
-/// Immutable record of a single step execution within a tx instance.
+/// Record of a single step execution within a tx instance.
 ///
 /// Records form a hash chain: each record includes the hash of the previous record,
 /// enabling tamper detection (consistent with `recorder_audit.rs`).
+/// Appended records are stable except for the write-ahead path, which may
+/// upgrade `StepOutcome::Pending` to the terminal outcome and then re-hash the
+/// affected suffix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepExecutionRecord {
     /// Monotonic ordinal within this tx ledger.
@@ -672,6 +675,72 @@ impl TxExecutionLedger {
         self.records.push(record);
 
         Ok(record_hash)
+    }
+
+    /// Upgrade a previously reserved pending record to its terminal outcome.
+    ///
+    /// The tx executor writes `StepOutcome::Pending` before dispatching an
+    /// external side effect. After dispatch returns, this method rewrites that
+    /// reservation in place and re-hashes the affected suffix of the chain so a
+    /// crash between reservation and dispatch fails closed on replay, while the
+    /// normal path still leaves one canonical record for the idempotency key.
+    pub fn complete_pending(
+        &mut self,
+        idem_key: &IdempotencyKey,
+        outcome: StepOutcome,
+        timestamp_ms: u64,
+    ) -> Result<String, IdempotencyError> {
+        if self.phase.is_terminal() {
+            return Err(IdempotencyError::LedgerSealed { phase: self.phase });
+        }
+
+        if self.key_index.is_empty() && !self.records.is_empty() {
+            self.rebuild_index_checked()
+                .map_err(|reason| IdempotencyError::LedgerIndexCorrupt { reason })?;
+        }
+
+        let ordinal = *self.key_index.get(idem_key.as_str()).ok_or_else(|| {
+            IdempotencyError::LedgerIndexCorrupt {
+                reason: format!(
+                    "cannot complete unreserved idempotency key {}",
+                    idem_key.as_str()
+                ),
+            }
+        })?;
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.ordinal == ordinal)
+            .ok_or_else(|| IdempotencyError::LedgerIndexCorrupt {
+                reason: format!(
+                    "idempotency key {} points to missing ordinal {}",
+                    idem_key.as_str(),
+                    ordinal
+                ),
+            })?;
+
+        if !self.records[index].outcome.is_pending() {
+            return Err(IdempotencyError::DuplicateExecution {
+                key: idem_key.as_str().to_string(),
+            });
+        }
+
+        self.records[index].outcome = outcome;
+        self.records[index].timestamp_ms = timestamp_ms;
+        for idx in index..self.records.len() {
+            self.records[idx].prev_hash = if idx == 0 {
+                String::new()
+            } else {
+                self.records[idx - 1].hash()
+            };
+        }
+        self.last_hash = self
+            .records
+            .last()
+            .map(StepExecutionRecord::hash)
+            .unwrap_or_default();
+
+        Ok(self.records[index].hash())
     }
 
     /// Verify the hash chain integrity. Returns details of any breaks.
@@ -1246,6 +1315,32 @@ impl IdempotencyStore {
         // commit/compensation step; a fail-closed persist error aborts the tx
         // (mapped to TxExecutionError::LedgerWrite) rather than letting a
         // non-durable commit proceed.
+        self.persist_ledger(execution_id)?;
+
+        Ok(hash)
+    }
+
+    /// Complete a durable pending reservation created before side-effect
+    /// dispatch, then refresh the cross-instance dedup guard and persistence
+    /// spool with the terminal outcome.
+    pub fn complete_execution(
+        &mut self,
+        execution_id: &str,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        timestamp_ms: u64,
+    ) -> Result<String, IdempotencyError> {
+        let ledger =
+            self.ledgers
+                .get_mut(execution_id)
+                .ok_or_else(|| IdempotencyError::LedgerNotFound {
+                    execution_id: execution_id.to_string(),
+                })?;
+        let hash = ledger.complete_pending(&idem_key, outcome.clone(), timestamp_ms)?;
+
+        self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
+        self.dedup
+            .record(&idem_key, execution_id, outcome, timestamp_ms);
         self.persist_ledger(execution_id)?;
 
         Ok(hash)

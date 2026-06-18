@@ -1030,7 +1030,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &mut events,
             &mut decision_path,
             effective_kill_switch,
-            store.as_deref(),
+            store.as_deref_mut(),
             now_ms,
         )?;
 
@@ -1065,7 +1065,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     &execution_id,
                     &mut events,
                     &mut decision_path,
-                    store.as_deref(),
+                    store.as_deref_mut(),
                     now_ms,
                 )?;
 
@@ -1304,7 +1304,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
         kill_switch: MissionKillSwitchLevel,
-        store: Option<&IdempotencyStore>,
+        store: Option<&mut IdempotencyStore>,
         now_ms: i64,
     ) -> Result<TxCommitReport, TxExecutionError> {
         events.push(self.make_event(
@@ -1331,7 +1331,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         let commit_inputs = if kill_switch != MissionKillSwitchLevel::Off || safety_paused {
             Vec::new()
         } else {
-            self.commit_inputs_with_dedup(contract, store, now_ms)?
+            self.commit_inputs_with_dedup(contract, execution_id, store, now_ms)?
         };
 
         let report =
@@ -1349,7 +1349,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         execution_id: &str,
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
-        store: Option<&IdempotencyStore>,
+        store: Option<&mut IdempotencyStore>,
         now_ms: i64,
     ) -> Result<TxCompensationReport, TxExecutionError> {
         events.push(self.make_event(
@@ -1362,8 +1362,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             now_ms,
         ));
 
-        let comp_inputs =
-            self.compensation_inputs_with_dedup(contract, commit_report, store, now_ms)?;
+        let comp_inputs = self.compensation_inputs_with_dedup(
+            contract,
+            commit_report,
+            execution_id,
+            store,
+            now_ms,
+        )?;
 
         let report = execute_compensation_phase(contract, commit_report, &comp_inputs, now_ms)
             .map_err(TxExecutionError::CompensationPhase)?;
@@ -1395,7 +1400,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
     fn commit_inputs_with_dedup(
         &self,
         contract: &MissionTxContract,
-        store: Option<&IdempotencyStore>,
+        execution_id: &str,
+        store: Option<&mut IdempotencyStore>,
         now_ms: i64,
     ) -> Result<Vec<TxCommitStepInput>, TxExecutionError> {
         let Some(store) = store else {
@@ -1415,6 +1421,23 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             if let Some(outcome) = store.check_dedup(&idem_key) {
                 commit_inputs.push(deduped_commit_input(&step.step_id, outcome, now_ms)?);
             } else {
+                let risk = contract_step_risk(contract, step.step_id.0.as_str());
+                let agent_id = format!("agent-{}", step.step_id.0);
+                store
+                    .record_execution(
+                        execution_id,
+                        idem_key,
+                        StepOutcome::Pending,
+                        risk,
+                        &agent_id,
+                        now_ms as u64,
+                    )
+                    .map_err(|err| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "failed to reserve commit step {} before dispatch: {err}",
+                            step.step_id.0
+                        ))
+                    })?;
                 dispatch_contract.plan.steps.push(step.clone());
             }
         }
@@ -1434,7 +1457,8 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         &self,
         contract: &MissionTxContract,
         commit_report: &TxCommitReport,
-        store: Option<&IdempotencyStore>,
+        execution_id: &str,
+        store: Option<&mut IdempotencyStore>,
         now_ms: i64,
     ) -> Result<Vec<TxCompensationStepInput>, TxExecutionError> {
         let Some(store) = store else {
@@ -1467,6 +1491,23 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     now_ms,
                 )?);
             } else {
+                let risk = compensation_step_risk(contract, step_result.step_id.0.as_str());
+                let agent_id = format!("agent-{}", step_result.step_id.0);
+                store
+                    .record_execution(
+                        execution_id,
+                        idem_key,
+                        StepOutcome::Pending,
+                        risk,
+                        &agent_id,
+                        now_ms as u64,
+                    )
+                    .map_err(|err| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "failed to reserve compensation step {} before dispatch: {err}",
+                            step_result.step_id.0
+                        ))
+                    })?;
                 dispatch_report.step_results.push(step_result.clone());
             }
         }
@@ -1523,8 +1564,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             let agent_id = format!("agent-{}", step_result.step_id.0);
             let timestamp_ms = now_ms as u64;
             if let Some(store) = store.as_deref_mut() {
-                store
-                    .record_execution(
+                let current_record_is_pending = store
+                    .get_ledger(execution_id)
+                    .and_then(|ledger| ledger.get_outcome(&idem_key))
+                    .is_some_and(StepOutcome::is_pending);
+                let store_result = if current_record_is_pending {
+                    store.complete_execution(
+                        execution_id,
+                        idem_key.clone(),
+                        outcome.clone(),
+                        timestamp_ms,
+                    )
+                } else {
+                    store.record_execution(
                         execution_id,
                         idem_key.clone(),
                         outcome.clone(),
@@ -1532,12 +1584,13 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                         &agent_id,
                         timestamp_ms,
                     )
-                    .map_err(|err| {
-                        TxExecutionError::LedgerWrite(format!(
-                            "failed to record commit step {} in idempotency store: {err}",
-                            step_result.step_id.0
-                        ))
-                    })?;
+                };
+                store_result.map_err(|err| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "failed to record commit step {} in idempotency store: {err}",
+                        step_result.step_id.0
+                    ))
+                })?;
             }
 
             ledger
@@ -1620,8 +1673,19 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 let agent_id = format!("agent-{step_id}");
                 let timestamp_ms = now_ms as u64;
                 if let Some(store) = store.as_deref_mut() {
-                    store
-                        .record_execution(
+                    let current_record_is_pending = store
+                        .get_ledger(execution_id)
+                        .and_then(|ledger| ledger.get_outcome(&idem_key))
+                        .is_some_and(StepOutcome::is_pending);
+                    let store_result = if current_record_is_pending {
+                        store.complete_execution(
+                            execution_id,
+                            idem_key.clone(),
+                            outcome.clone(),
+                            timestamp_ms,
+                        )
+                    } else {
+                        store.record_execution(
                             execution_id,
                             idem_key.clone(),
                             outcome.clone(),
@@ -1629,11 +1693,12 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                             &agent_id,
                             timestamp_ms,
                         )
-                        .map_err(|err| {
-                            TxExecutionError::LedgerWrite(format!(
-                                "failed to record compensation step {step_id} in idempotency store: {err}"
-                            ))
-                        })?;
+                    };
+                    store_result.map_err(|err| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "failed to record compensation step {step_id} in idempotency store: {err}"
+                        ))
+                    })?;
                 }
 
                 ledger
