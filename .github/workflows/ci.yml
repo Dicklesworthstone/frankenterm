@@ -161,6 +161,14 @@ jobs:
       - name: asupersync-test-only tokio-test guard (ft-tf6g3.7)
         run: scripts/check_asupersync_test_only.sh
 
+      # ft-3dz22 — fast mlua block_on regression guard. The mlua 0.11 migration
+      # briefly wrapped async Lua callbacks in sync create_function/add_method
+      # closures that called promise::spawn::block_on, which aborts when invoked
+      # from gui-startup/event/keybinding handlers on the main-thread queue.
+      # Keep this static so CI catches the regression before heavier test lanes.
+      - name: Lua API promise block_on guard (ft-3dz22)
+        run: bash scripts/check_lua_api_no_promise_block_on.sh
+
       # ft-tf6g3.2 — Auto-stamped README/AGENTS counts. Hand-edited
       # workspace counts in README.md / AGENTS.md drift fast (ft-d3awp
       # / ft-hdvvo). The stamper at scripts/stamp-readme-counts.sh
