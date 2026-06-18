@@ -1,10 +1,19 @@
-//! Unified replay test orchestrator, CI evidence bundle, and log-retention policy.
+//! Replay test orchestration model: gate sequencing, CI evidence manifest, and
+//! log-retention policy as data structures.
 //!
 //! Bead: ft-og6q6.7.7
 //!
-//! Runs all replay test classes in gate order (Gate 1 → 2 → 3), generates
-//! CI evidence bundles with manifests and checksums, and enforces a
-//! configurable log retention policy.
+//! Provides the pure evaluation logic and data model only. `orchestrate`
+//! sequences *pre-computed* `GateReport`s in gate order (Gate 1 -> 2 -> 3),
+//! applies fail-fast, and tallies an overall status; it does NOT execute the
+//! test classes (that is the caller's responsibility).
+//!
+//! The CI evidence manifest (`ManifestEntry`) and retention policy are modeled
+//! as serializable types from caller-supplied entries: this module does not
+//! compute checksums, write evidence bundles (`orchestrate` returns
+//! `evidence_path: None`, and `EVIDENCE_DIR` has no readers), or enforce
+//! `retention_days`. (ft-yuovv: corrected from an earlier header that claimed it
+//! runs the tests, generates checksummed bundles, and enforces retention.)
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
