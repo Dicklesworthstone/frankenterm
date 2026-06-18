@@ -1,8 +1,19 @@
 //! Bayesian evidence ledger for pane state classification.
 //!
-//! Maintains full posterior distributions over pane states (Active, Thinking,
-//! Idle, etc.) and evidence ledgers that explain exactly WHY each classification
-//! decision was made.
+//! A [`BayesianClassifier`] maintains full posterior distributions over pane
+//! states (Active, Thinking, Idle, etc.) and evidence ledgers that record WHY
+//! each classification decision was made.
+//!
+//! # Wiring status — experimental / NOT the production classifier (ft-y6tvc)
+//!
+//! As of this writing this engine has **no production driver**: nothing outside
+//! this module's own `#[cfg(test)]` tests constructs a [`BayesianClassifier`]
+//! or feeds it [`Evidence`]. The only production import of this module is the
+//! [`PaneState`] enum (a shared foundation type). Live pane-state classification
+//! is performed by the threshold-based [`crate::agent_pane_state::AgentPaneState`]
+//! instead. Treat the posterior/ledger machinery below as an alternative,
+//! not-yet-wired inference engine — the "explains exactly WHY each decision was
+//! made" property applies only if/when it is wired into the pane-monitoring path.
 //!
 //! # Algorithm
 //!
