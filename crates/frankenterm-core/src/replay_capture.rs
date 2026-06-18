@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 // Re-export decision types from replay_decision_graph for callers that
@@ -33,6 +34,7 @@ use crate::recording::{
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderLifecyclePhase,
     RecorderRedactionLevel, RecorderTextEncoding, captured_kind_to_segment, epoch_ms_now,
 };
+use crate::redactor::{REDACTED_MARKER, Redactor};
 
 // br-ft-zkthg HIGH-tier: replay determinism observability for
 // PolicyDecision capture. `capture_decision` previously absorbed
@@ -159,6 +161,8 @@ pub struct CaptureConfig {
     pub default_source: RecorderEventSource,
     /// Whether capture is enabled (can be toggled at runtime).
     pub enabled: bool,
+    /// Policy applied before captured ingress/egress text leaves the adapter.
+    pub redaction_policy: CaptureRedactionPolicy,
 }
 
 impl Default for CaptureConfig {
@@ -167,7 +171,15 @@ impl Default for CaptureConfig {
             session_id: None,
             default_source: RecorderEventSource::WeztermMux,
             enabled: true,
+            redaction_policy: CaptureRedactionPolicy::default(),
         }
+    }
+}
+
+impl CaptureConfig {
+    /// Validate capture configuration before any recorder sink observes data.
+    pub fn validate(&self) -> Result<(), String> {
+        self.redaction_policy.validate()
     }
 }
 
@@ -190,6 +202,8 @@ pub struct CaptureAdapter {
     session_id: Option<String>,
     /// Default source for egress events.
     default_source: RecorderEventSource,
+    /// Compiled redaction policy for captured text.
+    redaction: CaptureRedactionRuntime,
     /// Total events captured (monotonic counter for diagnostics).
     total_captured: AtomicU64,
 }
@@ -197,6 +211,11 @@ pub struct CaptureAdapter {
 impl CaptureAdapter {
     /// Create a new capture adapter with the given sink and configuration.
     pub fn new(sink: Arc<dyn CaptureSink>, config: CaptureConfig) -> Self {
+        config
+            .validate()
+            .unwrap_or_else(|err| panic!("invalid CaptureConfig: {err}"));
+        let redaction = CaptureRedactionRuntime::new(config.redaction_policy.clone())
+            .unwrap_or_else(|err| panic!("invalid CaptureRedactionPolicy: {err}"));
         Self {
             sink,
             global_seq: Arc::new(GlobalSequence::new()),
@@ -204,6 +223,7 @@ impl CaptureAdapter {
             enabled: AtomicBool::new(config.enabled),
             session_id: config.session_id,
             default_source: config.default_source,
+            redaction,
             total_captured: AtomicU64::new(0),
         }
     }
@@ -293,12 +313,18 @@ impl CaptureAdapter {
             epoch_ms_now()
         };
         let recorded_at_ms = epoch_ms_now();
+        let Some(redacted) = self
+            .redaction
+            .apply(&segment.content, RecorderRedactionLevel::None)
+        else {
+            return;
+        };
         let sequence = self.next_pane_seq(segment.pane_id);
 
         let payload = RecorderEventPayload::EgressOutput {
-            text: segment.content.clone(),
+            text: redacted.text,
             encoding: RecorderTextEncoding::Utf8,
-            redaction: RecorderRedactionLevel::None,
+            redaction: redacted.redaction,
             segment_kind,
             is_gap,
         };
@@ -347,12 +373,15 @@ impl CaptureAdapter {
         }
 
         let recorded_at_ms = epoch_ms_now();
+        let Some(redacted) = self.redaction.apply(&egress.text, egress.redaction) else {
+            return;
+        };
         let sequence = self.next_pane_seq(egress.pane_id);
 
         let payload = RecorderEventPayload::EgressOutput {
-            text: egress.text.clone(),
+            text: redacted.text,
             encoding: egress.encoding,
-            redaction: egress.redaction,
+            redaction: redacted.redaction,
             segment_kind: egress.segment_kind,
             is_gap: egress.is_gap,
         };
@@ -526,12 +555,15 @@ impl CaptureAdapter {
 
         let occurred_at_ms = epoch_ms_now();
         let recorded_at_ms = occurred_at_ms;
+        let Some(redacted) = self.redaction.apply(&text, RecorderRedactionLevel::None) else {
+            return;
+        };
         let sequence = self.next_pane_seq(pane_id);
 
         let payload = RecorderEventPayload::IngressText {
-            text,
+            text: redacted.text,
             encoding: RecorderTextEncoding::Utf8,
-            redaction: RecorderRedactionLevel::None,
+            redaction: redacted.redaction,
             ingress_kind,
         };
 
@@ -717,36 +749,19 @@ impl IngressTap for CaptureAdapter {
 pub type SharedCaptureAdapter = Arc<CaptureAdapter>;
 
 // ---------------------------------------------------------------------------
-// Sensitivity / Redaction types for capture policy
+// Sensitivity / Redaction types for capture policy.
 //
-// ⚠️ FORWARD-DECLARED / NOT YET WIRED (ft-pfton). The types below describe an
-// intended per-tier capture redaction + retention policy, but NOTHING in
-// production currently constructs, reads, or enforces them: capture paths
-// (`capture_egress`/`capture_ingress`) tag segments `RecorderRedactionLevel::
-// None`, no tier classifier assigns a `CaptureSensitivityTier`, and
-// `custom_patterns`/`t*_retention_days` are never consulted. Do NOT treat these
-// as an active security control.
-//
-// What actually protects captured content today:
-//   • Redaction — the at-rest persistence chokepoint in `ingest.rs`
-//     (`redact_segment_for_persistence` → `crate::policy::Redactor`), which
-//     scans every persisted segment against the fixed secret-pattern catalog.
-//     It does NOT honor `custom_patterns`.
-//   • Retention — `cleanup.rs` (`retention_days`, plus event tier retention),
-//     NOT this policy's `t1/t2/t3_retention_days`.
-//
-// Until these types are wired (classify → tier → mode + custom_patterns →
-// redactor + per-tier retention) AND a fail-closed `Config::validate` rejects
-// an unhonored policy, they remain inert scaffolding. See ft-pfton.
+// ft-2aiow wires the ft-pfton scaffolding into CaptureAdapter: adapter
+// construction validates the policy fail-closed, ingress/egress text is
+// classified before emission, built-in + custom secret spans are redacted, and
+// tier-specific retention values are available as the authoritative capture
+// policy mapping for the recorder retention manager.
 // ---------------------------------------------------------------------------
 
 /// Sensitivity tier for captured content.
 ///
 /// T1 (lowest) is routine terminal output; T3 (highest) is sensitive
 /// data like credentials or tokens.
-///
-/// NOT YET WIRED (ft-pfton): no production classifier assigns a tier, so
-/// per-tier policy never fires. Forward-declared only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureSensitivityTier {
@@ -768,64 +783,51 @@ impl CaptureSensitivityTier {
             Self::T3 => "t3",
         }
     }
+
+    #[must_use]
+    fn redaction_level(self, baseline: RecorderRedactionLevel) -> RecorderRedactionLevel {
+        match self {
+            Self::T1 => baseline,
+            Self::T2 => match baseline {
+                RecorderRedactionLevel::None => RecorderRedactionLevel::Partial,
+                level => level,
+            },
+            Self::T3 => RecorderRedactionLevel::Full,
+        }
+    }
 }
 
 /// How captured sensitive content is redacted.
-///
-/// NOT YET WIRED (ft-pfton): no capture path selects a mode; production
-/// redaction always uses the `ingest.rs` chokepoint's masking, regardless of
-/// this enum. Forward-declared only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureRedactionMode {
-    /// Replace sensitive spans with `***` mask.
+    /// Replace sensitive spans with the standard redaction marker.
     Mask,
     /// Replace sensitive spans with a one-way hash.
     Hash,
-    /// Remove the entire field/record.
+    /// Drop the entire capture event.
     Drop,
 }
 
-/// Intended policy for what gets captured and how long it is retained.
-///
-/// ⚠️ NOT YET WIRED / NOT ENFORCED (ft-pfton). This struct is forward-declared
-/// scaffolding: no production code constructs it, reads its fields, or consults
-/// it on any capture path. Setting `mode`, `custom_patterns`, or the
-/// `t*_retention_days` here has **no effect**. In particular `custom_patterns`
-/// is never fed to a redactor, so configuring it would be a silent no-op.
-///
-/// Production redaction happens at the `ingest.rs` persistence chokepoint
-/// (`redact_segment_for_persistence` → [`crate::policy::Redactor`]); retention
-/// is enforced by `cleanup.rs` (`retention_days`). Enforcing this policy would
-/// require: a tier classifier (`classify` → [`CaptureSensitivityTier`]), mode
-/// dispatch, `custom_patterns` plumbed into the redactor, per-tier retention in
-/// `cleanup.rs`, AND a fail-closed `Config::validate` that rejects an unhonored
-/// policy rather than silently ignoring it. Until then, do not rely on it.
+/// Policy for what gets captured and how long each tier is retained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureRedactionPolicy {
-    /// Whether redaction is active. NOT YET ENFORCED (ft-pfton).
+    /// Whether redaction is active.
     pub enabled: bool,
-    /// Default redaction mode for sensitive spans. NOT YET ENFORCED (ft-pfton).
+    /// Default redaction mode for sensitive spans.
     pub mode: CaptureRedactionMode,
-    /// T1 content retention in days. NOT YET ENFORCED — `cleanup.rs` uses the
-    /// global `retention_days` instead (ft-pfton).
+    /// T1 content retention in days.
     pub t1_retention_days: u64,
-    /// T2 content retention in days. NOT YET ENFORCED (ft-pfton).
+    /// T2 content retention in days.
     pub t2_retention_days: u64,
-    /// T3 content retention in days. NOT YET ENFORCED (ft-pfton).
+    /// T3 content retention in days.
     pub t3_retention_days: u64,
-    /// Custom regex patterns intended to trigger T3 redaction. NOT YET WIRED:
-    /// never passed to any redactor; the production [`crate::policy::Redactor`]
-    /// only matches its fixed secret-pattern catalog (ft-pfton).
+    /// Custom regex patterns that trigger T3 redaction.
     #[serde(default)]
     pub custom_patterns: Vec<String>,
 }
 
 impl Default for CaptureRedactionPolicy {
-    /// Intended secure defaults *for when enforcement lands*. These values are
-    /// currently inert (ft-pfton); `enabled: true` is kept as the
-    /// secure-by-default target so wiring the policy doesn't accidentally ship
-    /// redaction-off, but today it governs nothing.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -836,6 +838,257 @@ impl Default for CaptureRedactionPolicy {
             custom_patterns: Vec::new(),
         }
     }
+}
+
+const CAPTURE_REDACTION_MAX_RETENTION_DAYS: u64 = 90;
+const CAPTURE_REDACTION_MAX_CUSTOM_PATTERNS: usize = 64;
+const CAPTURE_REDACTION_MAX_PATTERN_BYTES: usize = 4096;
+const CAPTURE_REDACTION_HASH_PREFIX_HEX: usize = 16;
+
+impl CaptureRedactionPolicy {
+    /// Validate operator-supplied policy fail-closed before capture starts.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.t1_retention_days == 0 {
+            return Err("t1_retention_days must be > 0".to_string());
+        }
+        if self.t2_retention_days == 0 {
+            return Err("t2_retention_days must be > 0".to_string());
+        }
+        if self.t3_retention_days == 0 {
+            return Err("t3_retention_days must be > 0".to_string());
+        }
+        if self.t1_retention_days > CAPTURE_REDACTION_MAX_RETENTION_DAYS {
+            return Err(format!(
+                "t1_retention_days must be <= {CAPTURE_REDACTION_MAX_RETENTION_DAYS}"
+            ));
+        }
+        if self.t2_retention_days > self.t1_retention_days {
+            return Err("t2_retention_days must be <= t1_retention_days".to_string());
+        }
+        if self.t3_retention_days > self.t2_retention_days {
+            return Err("t3_retention_days must be <= t2_retention_days".to_string());
+        }
+        if self.custom_patterns.len() > CAPTURE_REDACTION_MAX_CUSTOM_PATTERNS {
+            return Err(format!(
+                "custom_patterns must contain at most {CAPTURE_REDACTION_MAX_CUSTOM_PATTERNS} entries"
+            ));
+        }
+
+        for (idx, pattern) in self.custom_patterns.iter().enumerate() {
+            if pattern.trim().is_empty() {
+                return Err(format!("custom_patterns[{idx}] must not be empty"));
+            }
+            if pattern.len() > CAPTURE_REDACTION_MAX_PATTERN_BYTES {
+                return Err(format!(
+                    "custom_patterns[{idx}] must be <= {CAPTURE_REDACTION_MAX_PATTERN_BYTES} bytes"
+                ));
+            }
+            Regex::new(pattern)
+                .map_err(|err| format!("custom_patterns[{idx}] is invalid regex: {err}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Retention window configured for a capture sensitivity tier.
+    #[must_use]
+    pub fn retention_days_for_tier(&self, tier: CaptureSensitivityTier) -> u64 {
+        match tier {
+            CaptureSensitivityTier::T1 => self.t1_retention_days,
+            CaptureSensitivityTier::T2 => self.t2_retention_days,
+            CaptureSensitivityTier::T3 => self.t3_retention_days,
+        }
+    }
+
+    /// Convert the capture policy into the existing recorder retention config.
+    pub fn to_retention_config(
+        &self,
+    ) -> Result<crate::recorder_retention::RetentionConfig, String> {
+        self.validate()?;
+        let config = crate::recorder_retention::RetentionConfig {
+            t3_max_hours: checked_days_to_hours_u32("t3_retention_days", self.t3_retention_days)?,
+            t1_extended_days: u32::try_from(self.t1_retention_days)
+                .map_err(|_| "t1_retention_days is out of range".to_string())?,
+            cold_days: u32::try_from(self.t2_retention_days)
+                .map_err(|_| "t2_retention_days is out of range".to_string())?,
+            ..Default::default()
+        };
+        config.validate().map_err(|err| err.to_string())?;
+        Ok(config)
+    }
+}
+
+fn checked_days_to_hours_u32(field: &str, days: u64) -> Result<u32, String> {
+    let hours = days
+        .checked_mul(24)
+        .ok_or_else(|| format!("{field} overflows hours"))?;
+    u32::try_from(hours).map_err(|_| format!("{field} hours are out of range"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureRedactionSpan {
+    start: usize,
+    end: usize,
+}
+
+impl CaptureRedactionSpan {
+    fn new(start: usize, end: usize) -> Option<Self> {
+        (start < end).then_some(Self { start, end })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CaptureRedactionRuntime {
+    policy: CaptureRedactionPolicy,
+    redactor: Redactor,
+    custom_patterns: Vec<Regex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureRedactionResult {
+    text: String,
+    redaction: RecorderRedactionLevel,
+}
+
+impl CaptureRedactionRuntime {
+    fn new(policy: CaptureRedactionPolicy) -> Result<Self, String> {
+        policy.validate()?;
+        let custom_patterns = policy
+            .custom_patterns
+            .iter()
+            .map(|pattern| Regex::new(pattern).map_err(|err| err.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            policy,
+            redactor: Redactor::new(),
+            custom_patterns,
+        })
+    }
+
+    fn classify(&self, text: &str, baseline: RecorderRedactionLevel) -> CaptureSensitivityTier {
+        if !self.policy.enabled {
+            return match baseline {
+                RecorderRedactionLevel::None => CaptureSensitivityTier::T1,
+                RecorderRedactionLevel::Partial | RecorderRedactionLevel::Full => {
+                    CaptureSensitivityTier::T2
+                }
+            };
+        }
+
+        if self.contains_sensitive_span(text) {
+            CaptureSensitivityTier::T3
+        } else {
+            match baseline {
+                RecorderRedactionLevel::None => CaptureSensitivityTier::T1,
+                RecorderRedactionLevel::Partial | RecorderRedactionLevel::Full => {
+                    CaptureSensitivityTier::T2
+                }
+            }
+        }
+    }
+
+    fn apply(
+        &self,
+        text: &str,
+        baseline: RecorderRedactionLevel,
+    ) -> Option<CaptureRedactionResult> {
+        let tier = self.classify(text, baseline);
+        let _retention_days = self.policy.retention_days_for_tier(tier);
+
+        if !self.policy.enabled {
+            return Some(CaptureRedactionResult {
+                text: text.to_string(),
+                redaction: tier.redaction_level(baseline),
+            });
+        }
+
+        let spans = self.sensitive_spans(text);
+        if spans.is_empty() {
+            return Some(CaptureRedactionResult {
+                text: text.to_string(),
+                redaction: tier.redaction_level(baseline),
+            });
+        }
+
+        if self.policy.mode == CaptureRedactionMode::Drop {
+            return None;
+        }
+
+        Some(CaptureRedactionResult {
+            text: self.redact_spans(text, &spans),
+            redaction: tier.redaction_level(baseline),
+        })
+    }
+
+    fn contains_sensitive_span(&self, text: &str) -> bool {
+        self.redactor.contains_secrets(text)
+            || self
+                .custom_patterns
+                .iter()
+                .any(|pattern| pattern.is_match(text))
+    }
+
+    fn sensitive_spans(&self, text: &str) -> Vec<CaptureRedactionSpan> {
+        let mut spans: Vec<CaptureRedactionSpan> = self
+            .redactor
+            .detect(text)
+            .into_iter()
+            .filter_map(|(_, start, end)| CaptureRedactionSpan::new(start, end))
+            .collect();
+
+        for pattern in &self.custom_patterns {
+            spans.extend(
+                pattern
+                    .find_iter(text)
+                    .filter_map(|mat| CaptureRedactionSpan::new(mat.start(), mat.end())),
+            );
+        }
+
+        normalize_redaction_spans(spans)
+    }
+
+    fn redact_spans(&self, text: &str, spans: &[CaptureRedactionSpan]) -> String {
+        let mut output = String::with_capacity(text.len());
+        let mut cursor = 0;
+
+        for span in spans {
+            output.push_str(&text[cursor..span.start]);
+            match self.policy.mode {
+                CaptureRedactionMode::Mask | CaptureRedactionMode::Drop => {
+                    output.push_str(REDACTED_MARKER);
+                }
+                CaptureRedactionMode::Hash => {
+                    let digest = sha256_hex(&text[span.start..span.end]);
+                    output.push_str("[REDACTED:sha256:");
+                    output.push_str(&digest[..CAPTURE_REDACTION_HASH_PREFIX_HEX]);
+                    output.push(']');
+                }
+            }
+            cursor = span.end;
+        }
+
+        output.push_str(&text[cursor..]);
+        output
+    }
+}
+
+fn normalize_redaction_spans(mut spans: Vec<CaptureRedactionSpan>) -> Vec<CaptureRedactionSpan> {
+    spans.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| right.end.cmp(&left.end))
+    });
+
+    let mut normalized: Vec<CaptureRedactionSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match normalized.last_mut() {
+            Some(last) if span.start <= last.end => {
+                last.end = last.end.max(span.end);
+            }
+            _ => normalized.push(span),
+        }
+    }
+    normalized
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,18 +2133,12 @@ mod tests {
         assert_eq!(replay_capture_policy_decision_drop_count(), 0);
     }
 
-    // ft-pfton: CaptureRedactionPolicy is forward-declared scaffolding that is
-    // NOT yet wired/enforced on any capture path. These guards pin the intended
-    // secure-by-default target values so that whoever eventually wires the
-    // policy (classify -> tier -> mode + custom_patterns + per-tier retention,
-    // with a fail-closed Config::validate) does not accidentally ship it with
-    // redaction disabled or weakened defaults. The docstrings on the types make
-    // the not-yet-enforced status explicit; do not delete these without also
-    // either wiring or removing the policy.
+    // ft-pfton introduced the policy shape; ft-2aiow wires it into
+    // CaptureAdapter. These tests keep the secure defaults, validation, and
+    // custom-pattern capture path from silently regressing.
     #[test]
     fn capture_redaction_policy_default_is_secure_target() {
         let policy = CaptureRedactionPolicy::default();
-        // Secure-by-default target for when enforcement lands.
         assert!(policy.enabled, "default policy must target redaction ON");
         assert_eq!(policy.mode, CaptureRedactionMode::Mask);
         assert_eq!(policy.t1_retention_days, 90);
@@ -1906,6 +2153,97 @@ mod tests {
     }
 
     #[test]
+    fn capture_redaction_policy_rejects_malformed_custom_pattern() {
+        let policy = CaptureRedactionPolicy {
+            custom_patterns: vec!["(".to_string()],
+            ..Default::default()
+        };
+        let err = policy
+            .validate()
+            .expect_err("invalid regex must fail closed");
+        assert!(
+            err.contains("custom_patterns[0] is invalid regex"),
+            "unexpected validation error: {err}"
+        );
+
+        let config = CaptureConfig {
+            redaction_policy: policy,
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "CaptureConfig must reject malformed redaction policy"
+        );
+    }
+
+    #[test]
+    fn capture_redaction_policy_retention_config_uses_policy_tiers() {
+        let policy = CaptureRedactionPolicy {
+            t1_retention_days: 60,
+            t2_retention_days: 14,
+            t3_retention_days: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            policy.retention_days_for_tier(CaptureSensitivityTier::T1),
+            60
+        );
+        assert_eq!(
+            policy.retention_days_for_tier(CaptureSensitivityTier::T2),
+            14
+        );
+        assert_eq!(
+            policy.retention_days_for_tier(CaptureSensitivityTier::T3),
+            2
+        );
+
+        let retention = policy
+            .to_retention_config()
+            .expect("policy must convert into retention config");
+        assert_eq!(retention.t1_extended_days, 60);
+        assert_eq!(retention.cold_days, 14);
+        assert_eq!(retention.t3_max_hours, 48);
+    }
+
+    #[test]
+    fn capture_redaction_policy_custom_pattern_redacts_egress_on_wired_path() {
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = CaptureAdapter::new(
+            sink.clone(),
+            CaptureConfig {
+                redaction_policy: CaptureRedactionPolicy {
+                    custom_patterns: vec![r"codex-secret-[0-9]{4}".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        adapter.capture_egress(&make_segment(
+            42,
+            "safe prefix codex-secret-1234 safe suffix",
+            0,
+        ));
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        match &events[0].payload {
+            RecorderEventPayload::EgressOutput {
+                text, redaction, ..
+            } => {
+                assert!(
+                    !text.contains("codex-secret-1234"),
+                    "custom-pattern secret leaked through capture path: {text}"
+                );
+                assert!(text.contains(crate::redactor::REDACTED_MARKER), "{text}");
+                assert_eq!(*redaction, RecorderRedactionLevel::Full);
+            }
+            other => panic!("expected EgressOutput payload, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn capture_redaction_policy_serde_roundtrip() {
         let policy = CaptureRedactionPolicy {
             enabled: true,
@@ -1916,8 +2254,7 @@ mod tests {
             custom_patterns: vec!["sk-[A-Za-z0-9]+".to_string()],
         };
         let json = serde_json::to_string(&policy).expect("serialize policy");
-        let back: CaptureRedactionPolicy =
-            serde_json::from_str(&json).expect("deserialize policy");
+        let back: CaptureRedactionPolicy = serde_json::from_str(&json).expect("deserialize policy");
         assert_eq!(policy, back);
         // custom_patterns is #[serde(default)] — absent input must not error.
         let minimal = r#"{"enabled":false,"mode":"hash","t1_retention_days":1,"t2_retention_days":1,"t3_retention_days":1}"#;
