@@ -10,6 +10,12 @@ publish = false
 [features]
 default = ["lua", "async-asupersync"]
 lua = ["dep:luahelper", "dep:mlua", "config/lua", "procinfo/lua"]
+# ft-87qfi (round-3 moonshot): route the pane->render parsed-action hot path
+# through a lock-free LMAX-disruptor-style SPSC staging ring (crossbeam
+# ArrayQueue) so the single parser thread never blocks on the terminal mutex
+# under render contention. OFF by default — the mutex path is the fallback;
+# enabling this flag swaps in the ring. Clean revert = drop the flag.
+disruptor-pane-io = []
 no-lua = ["config/no-lua"]
 # Legacy fallback path kept for staged migration/testing.
 async-smol = ["config/async-smol", "frankenterm-ssh/async-smol"]

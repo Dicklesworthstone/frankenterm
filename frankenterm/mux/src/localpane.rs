@@ -36,7 +36,18 @@ use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
 use url::Url;
 
+#[cfg(feature = "disruptor-pane-io")]
+use crossbeam::queue::ArrayQueue;
+
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
+
+/// ft-87qfi: capacity (in action batches) of the lock-free SPSC staging ring
+/// used on the pane->render hot path when `disruptor-pane-io` is enabled. Each
+/// slot holds one parsed `Vec<Action>` batch; when the ring saturates the
+/// producer falls back to a blocking apply (back-pressure). Sized to absorb a
+/// few render frames of buffered output without unbounded memory growth.
+#[cfg(feature = "disruptor-pane-io")]
+const PANE_ACTION_RING_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
 enum ProcessState {
@@ -349,6 +360,17 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    /// ft-87qfi: lock-free LMAX-disruptor-style SPSC staging ring for parsed
+    /// action batches on the pane->render hot path. The SINGLE parser thread is
+    /// the producer (via `perform_actions`); the consumer is whichever thread
+    /// next locks the terminal (serialized by the terminal mutex, drained FIFO
+    /// in `locked_terminal`). Lets the parser stage a batch and keep parsing
+    /// instead of blocking on the terminal lock while the renderer reads. Uses
+    /// `crossbeam::queue::ArrayQueue` (a safe, vetted lock-free bounded ring —
+    /// NO `unsafe`). Present only under the `disruptor-pane-io` feature; the
+    /// default build keeps the plain mutex path.
+    #[cfg(feature = "disruptor-pane-io")]
+    action_ring: ArrayQueue<Vec<Action>>,
 }
 
 fn record_input_for_current_identity() {
@@ -386,7 +408,7 @@ impl Pane for LocalPane {
     }
 
     fn get_cursor_position(&self) -> StableCursorPosition {
-        let mut cursor = terminal_get_cursor_position(&mut self.terminal.lock());
+        let mut cursor = terminal_get_cursor_position(&mut self.locked_terminal());
         if self.tmux_domain.lock().is_some() {
             cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
         }
@@ -397,12 +419,12 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             KeyboardEncoding::Xterm
         } else {
-            self.terminal.lock().get_keyboard_encoding()
+            self.locked_terminal().get_keyboard_encoding()
         }
     }
 
     fn get_current_seqno(&self) -> SequenceNo {
-        self.terminal.lock().current_seqno()
+        self.locked_terminal().current_seqno()
     }
 
     fn get_changed_since(
@@ -410,7 +432,7 @@ impl Pane for LocalPane {
         lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
-        terminal_get_dirty_lines(&mut self.terminal.lock(), lines, seqno)
+        terminal_get_dirty_lines(&mut self.locked_terminal(), lines, seqno)
     }
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -419,18 +441,18 @@ impl Pane for LocalPane {
         for_line: &mut dyn ForEachPaneLogicalLine,
     ) {
         terminal_for_each_logical_line_in_stable_range_mut(
-            &mut self.terminal.lock(),
+            &mut self.locked_terminal(),
             lines,
             for_line,
         );
     }
 
     fn with_lines_mut(&self, lines: Range<StableRowIndex>, with_lines: &mut dyn WithPaneLines) {
-        terminal_with_lines_mut(&mut self.terminal.lock(), lines, with_lines)
+        terminal_with_lines_mut(&mut self.locked_terminal(), lines, with_lines)
     }
 
     fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
-        terminal_get_lines(&mut self.terminal.lock(), lines)
+        terminal_get_lines(&mut self.locked_terminal(), lines)
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
@@ -438,7 +460,7 @@ impl Pane for LocalPane {
     }
 
     fn get_dimensions(&self) -> RenderableDimensions {
-        terminal_get_dimensions(&mut self.terminal.lock())
+        terminal_get_dimensions(&mut self.locked_terminal())
     }
 
     fn get_tiered_scrollback_status(
@@ -454,7 +476,7 @@ impl Pane for LocalPane {
     }
 
     fn copy_user_vars(&self) -> HashMap<String, String> {
-        self.terminal.lock().user_vars().clone()
+        self.locked_terminal().user_vars().clone()
     }
 
     fn exit_behavior(&self) -> Option<ExitBehavior> {
@@ -606,28 +628,37 @@ impl Pane for LocalPane {
     }
 
     fn set_clipboard(&self, clipboard: &Arc<dyn Clipboard>) {
-        self.terminal.lock().set_clipboard(clipboard);
+        self.locked_terminal().set_clipboard(clipboard);
     }
 
     fn set_download_handler(&self, handler: &Arc<dyn DownloadHandler>) {
-        self.terminal.lock().set_download_handler(handler);
+        self.locked_terminal().set_download_handler(handler);
     }
 
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
-        self.terminal.lock().set_config(config);
+        self.locked_terminal().set_config(config);
     }
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
-        Some(self.terminal.lock().get_config())
+        Some(self.locked_terminal().get_config())
     }
 
     fn perform_actions(&self, actions: Vec<termwiz::escape::Action>) {
-        self.terminal.lock().perform_actions(actions)
+        #[cfg(not(feature = "disruptor-pane-io"))]
+        {
+            // Default path: apply directly under the terminal mutex.
+            self.terminal.lock().perform_actions(actions);
+        }
+        #[cfg(feature = "disruptor-pane-io")]
+        {
+            // ft-87qfi: lock-free SPSC staging — see `perform_actions_disruptor`.
+            self.perform_actions_disruptor(actions);
+        }
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
         record_input_for_current_identity();
-        self.terminal.lock().mouse_event(event)
+        self.locked_terminal().mouse_event(event)
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
@@ -635,17 +666,17 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             log::trace!("key: {:?}", key);
             if key == KeyCode::Char('q') {
-                self.terminal.lock().send_paste("detach\n")?;
+                self.locked_terminal().send_paste("detach\n")?;
             }
             return Ok(());
         } else {
-            self.terminal.lock().key_down(key, mods)
+            self.locked_terminal().key_down(key, mods)
         }
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
         record_input_for_current_identity();
-        self.terminal.lock().key_up(key, mods)
+        self.locked_terminal().key_up(key, mods)
     }
 
     fn resize(&self, size: TerminalSize) -> Result<(), Error> {
@@ -669,12 +700,12 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             Ok(())
         } else {
-            self.terminal.lock().send_paste(text)
+            self.locked_terminal().send_paste(text)
         }
     }
 
     fn get_title(&self) -> String {
-        let title = self.terminal.lock().get_title().to_string();
+        let title = self.locked_terminal().get_title().to_string();
         // If the title is the default pane title, then try to spice
         // things up a bit by returning the process basename instead
         if title == "wezterm" {
@@ -690,11 +721,11 @@ impl Pane for LocalPane {
     }
 
     fn get_progress(&self) -> Progress {
-        self.terminal.lock().get_progress()
+        self.locked_terminal().get_progress()
     }
 
     fn palette(&self) -> ColorPalette {
-        self.terminal.lock().palette()
+        self.locked_terminal().palette()
     }
 
     fn domain_id(&self) -> DomainId {
@@ -704,27 +735,27 @@ impl Pane for LocalPane {
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
         match erase_mode {
             ScrollbackEraseMode::ScrollbackOnly => {
-                self.terminal.lock().erase_scrollback();
+                self.locked_terminal().erase_scrollback();
             }
             ScrollbackEraseMode::ScrollbackAndViewport => {
-                self.terminal.lock().erase_scrollback_and_viewport();
+                self.locked_terminal().erase_scrollback_and_viewport();
             }
         }
     }
 
     fn focus_changed(&self, focused: bool) {
-        self.terminal.lock().focus_changed(focused);
+        self.locked_terminal().focus_changed(focused);
     }
 
     fn has_unseen_output(&self) -> bool {
-        self.terminal.lock().has_unseen_output()
+        self.locked_terminal().has_unseen_output()
     }
 
     fn is_mouse_grabbed(&self) -> bool {
         if self.tmux_domain.lock().is_some() {
             false
         } else {
-            self.terminal.lock().is_mouse_grabbed()
+            self.locked_terminal().is_mouse_grabbed()
         }
     }
 
@@ -732,7 +763,7 @@ impl Pane for LocalPane {
         if self.tmux_domain.lock().is_some() {
             false
         } else {
-            self.terminal.lock().is_alt_screen_active()
+            self.locked_terminal().is_alt_screen_active()
         }
     }
 
@@ -934,12 +965,12 @@ impl Pane for LocalPane {
     }
 
     fn get_semantic_zones(&self) -> anyhow::Result<Vec<SemanticZone>> {
-        let mut term = self.terminal.lock();
+        let mut term = self.locked_terminal();
         term.get_semantic_zones()
     }
 
     fn get_semantic_exit_code(&self) -> anyhow::Result<Option<i32>> {
-        let term = self.terminal.lock();
+        let term = self.locked_terminal();
         Ok(term.last_semantic_command_status())
     }
 
@@ -949,7 +980,7 @@ impl Pane for LocalPane {
         range: Range<StableRowIndex>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let term = self.terminal.lock();
+        let term = self.locked_terminal();
         let screen = term.screen();
 
         enum CompiledPattern {
@@ -1345,6 +1376,71 @@ fn split_child(
 }
 
 impl LocalPane {
+    // ── ft-87qfi: lock-free SPSC disruptor staging for the pane->render path ──
+    //
+    // Every terminal access in this file goes through `locked_terminal()` rather
+    // than `self.terminal.lock()` directly. With the `disruptor-pane-io` feature
+    // OFF this is a zero-cost inline wrapper. With it ON, the single parser thread
+    // (producer) may stage parsed action batches in `action_ring` instead of
+    // blocking on the terminal mutex while the renderer reads; `locked_terminal`
+    // drains the ring (FIFO) under the lock before returning the guard, so every
+    // reader/writer observes all prior output applied in order. Correct-by-
+    // construction: a single producer, and a consumer serialized by the terminal
+    // mutex. Uses crossbeam `ArrayQueue` — a safe, vetted lock-free ring (no
+    // `unsafe`).
+
+    /// Lock the terminal, first draining any disruptor-staged action batches so
+    /// the terminal reflects all parsed output before the caller observes it.
+    #[cfg(feature = "disruptor-pane-io")]
+    #[inline]
+    fn locked_terminal(&self) -> MutexGuard<'_, Terminal> {
+        let mut term = self.terminal.lock();
+        self.drain_action_ring_locked(&mut term);
+        term
+    }
+
+    /// Default build: a transparent wrapper around the terminal mutex.
+    #[cfg(not(feature = "disruptor-pane-io"))]
+    #[inline]
+    fn locked_terminal(&self) -> MutexGuard<'_, Terminal> {
+        self.terminal.lock()
+    }
+
+    /// Apply every staged action batch to `term`, in FIFO order, emptying the
+    /// ring. Called only while the terminal mutex is held (so drains are
+    /// serialized even though the producer pushes lock-free).
+    #[cfg(feature = "disruptor-pane-io")]
+    #[inline]
+    fn drain_action_ring_locked(&self, term: &mut Terminal) {
+        while let Some(actions) = self.action_ring.pop() {
+            term.perform_actions(actions);
+        }
+    }
+
+    /// Producer side (parser thread). If the terminal lock is free, drain any
+    /// staged batches and apply directly — identical to the mutex path, no
+    /// deferral. If the renderer holds the lock, stage the batch in the lock-free
+    /// ring and return immediately so the parser keeps parsing; the batch is
+    /// applied (in order) by the next `locked_terminal` drain. If the ring is
+    /// saturated, fall back to a blocking apply (back-pressure), draining first
+    /// to preserve order.
+    #[cfg(feature = "disruptor-pane-io")]
+    fn perform_actions_disruptor(&self, actions: Vec<Action>) {
+        if actions.is_empty() {
+            return;
+        }
+        if let Some(mut term) = self.terminal.try_lock() {
+            self.drain_action_ring_locked(&mut term);
+            term.perform_actions(actions);
+            return;
+        }
+        if let Err(actions) = self.action_ring.push(actions) {
+            let mut term = self.terminal.lock();
+            self.drain_action_ring_locked(&mut term);
+            term.perform_actions(actions);
+        }
+    }
+
     fn enqueue_resize(&self, size: TerminalSize) -> Result<(), Error> {
         let pty_size = PtySize {
             rows: size.rows.try_into()?,
@@ -1683,6 +1779,8 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            #[cfg(feature = "disruptor-pane-io")]
+            action_ring: ArrayQueue::new(PANE_ACTION_RING_CAPACITY),
         };
 
         // Prime the proc_list cache asynchronously. The 250 ms delay gives
