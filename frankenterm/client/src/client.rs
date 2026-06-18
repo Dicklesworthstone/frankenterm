@@ -1,7 +1,7 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
-use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
 use asupersync::Cx;
 use async_channel::{bounded, unbounded, Receiver, Sender};
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use codec::*;
 use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
-use futures::future::{select, Either};
+use futures::future::{ready, select, Either};
 use futures::pin_mut;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
@@ -432,9 +432,17 @@ async fn client_thread_async(
         map: HashMap::new(),
     };
 
-    let mut stream = reconnectable.take_stream().ok_or_else(|| {
+    // Wrap the connection in a persistent buffered reader so PDU decoding pulls
+    // its leb128 length headers and bodies from an in-memory buffer (one socket
+    // read per refill, default 8 KiB) instead of one syscall per byte
+    // (decode_async reads leb128 a byte at a time — ~30 syscalls per PDU). The
+    // BufReader lives across the whole reader loop so partially-buffered and
+    // pipelined PDUs carry over between iterations. Writes still go straight to
+    // the socket via `get_mut()` (BufReader only buffers reads), so the encode
+    // path is byte-for-byte unchanged.
+    let mut reader = BufReader::new(reconnectable.take_stream().ok_or_else(|| {
         anyhow::anyhow!("mux client stream not available — connection not established")
-    })?;
+    })?);
 
     enum NextEvent {
         Message(Result<ReaderMessage, async_channel::RecvError>),
@@ -444,7 +452,24 @@ async fn client_thread_async(
     loop {
         let next_event = {
             let rx_msg = rx.recv();
-            let wait_for_read = stream.wait_for_readable();
+            // Readiness must be buffer-aware: a prior socket read may have
+            // already buffered a complete (pipelined) PDU while the underlying
+            // socket has nothing pending. Waiting on the socket alone would then
+            // strand that buffered PDU until more bytes happen to arrive (a
+            // latency stall / hang). So treat a non-empty buffer as immediately
+            // readable and only park on the socket once the buffer is drained.
+            //
+            // The two cases must be combined via `Either` rather than an `async`
+            // block: `wait_for_readable()` is an `#[async_trait]` boxed `Send`
+            // future, but an `async` block awaiting it would capture `&reader`
+            // across the await, and `Box<dyn AsyncReadAndWrite>` is `Send` but
+            // not `Sync`, so that reference is `!Send` — which would make the
+            // whole reader future `!Send` and fail `block_on_io`.
+            let wait_for_read = if reader.buffer().is_empty() {
+                Either::Left(reader.get_ref().wait_for_readable())
+            } else {
+                Either::Right(ready(Ok::<(), anyhow::Error>(())))
+            };
 
             pin_mut!(rx_msg);
             pin_mut!(wait_for_read);
@@ -461,16 +486,20 @@ async fn client_thread_async(
                 next_serial += 1;
                 promises.map.insert(serial, promise);
 
-                pdu.encode_async(&mut stream, serial)
+                pdu.encode_async(reader.get_mut(), serial)
                     .await
                     .context("encoding a PDU to send to the server")?;
-                stream.flush().await.context("flushing PDU to server")?;
+                reader
+                    .get_mut()
+                    .flush()
+                    .await
+                    .context("flushing PDU to server")?;
             }
             NextEvent::Message(Err(_)) => {
                 return Err(NotReconnectableError::ClientWasDestroyed.into());
             }
             NextEvent::Readable(Ok(())) => {
-                match Pdu::decode_async(&mut stream, Some(next_serial)).await {
+                match Pdu::decode_async(&mut reader, Some(next_serial)).await {
                     Ok(decoded) => {
                         log::debug!(
                             "decoded serial {} {}",
