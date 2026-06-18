@@ -2,6 +2,21 @@
 //!
 //! Compiles mission assignment outputs into an executable dependency graph
 //! with explicit preconditions and compensating actions.
+//!
+//! # Integration status (ft-xatg5)
+//!
+//! NOT YET WIRED. The compiler itself is real and correct (Kahn topological
+//! sort, parallel-level computation, tag-based risk classification, policy/
+//! context precondition injection, auto-compensation, cycle/duplicate rejection,
+//! content `plan_hash`), but no production code constructs a `PlannerAssignment`
+//! or calls `compile_tx_plan` / `compile_tx_plan_strict` — the only callers are
+//! tests. The live tx path (`compiled_plan_from_contract` in `tx_execution`)
+//! hand-rolls a DEGENERATE `TxPlan` instead (no DAG edges, no preconditions,
+//! `plan_hash = 0`, a single parallel level), bypassing this compiler entirely.
+//! So production tx plans get no topological ordering, no compiler-injected
+//! preconditions, and no parallel levels today. Wiring a mission-assignment
+//! producer to feed `compile_tx_plan_strict` (and building
+//! `MissionTxContract.plan` from its output) is the remaining integration work.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
