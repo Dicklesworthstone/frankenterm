@@ -5327,6 +5327,20 @@ mod test {
 
     #[test]
     fn tab_mux_optional_paths_do_not_panic_without_singleton() {
+        // This test asserts the *no-singleton* path of the optional-Mux helpers
+        // (notably `prune_dead_panes`, which is a no-op when `Mux::try_get()` is
+        // None). The Mux singleton is a process global, so without serializing
+        // against the mux-creating tests a concurrent `ensure_mux_initialized`
+        // can `set_mux` between our `Mux::shutdown()` and the assertions below.
+        // `Mux::try_get()` would then return Some — a mux that does NOT contain
+        // these FakePanes — so `prune_dead_panes()` would treat them as
+        // not-in-mux and prune them, flaking `assert!(!tab.prune_dead_panes())`.
+        // Holding MUX_TEST_LOCK (the same lock `ensure_mux_initialized` takes)
+        // for the whole body keeps `try_get()` None for the duration. (Safe:
+        // shutdown/set_mux/try_get lock the distinct `MUX` global, not this one.)
+        let _mux_guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         Mux::shutdown();
         let size = TerminalSize {
             rows: 24,
