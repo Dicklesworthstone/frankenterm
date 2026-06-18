@@ -258,3 +258,4 @@ ubs_*.txt
 /docs/attestations/0.0.0-smoke*.json
 /docs/attestations/0.0.0-smoke*.sigstore
 /docs/attestations/0.0.0-smoke*.canonical.json
+.ntm-marching-orders.md
