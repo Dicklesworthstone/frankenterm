@@ -138,6 +138,54 @@ impl<'a> Performer<'a> {
         true
     }
 
+    fn active_charset(&self) -> CharSet {
+        if self.shift_out {
+            self.g1_charset
+        } else {
+            self.g0_charset
+        }
+    }
+
+    fn flush_ascii_print(&mut self, text: &str, seqno: usize) -> bool {
+        if self.insert
+            || self.wrap_next
+            || self.active_charset() != CharSet::Ascii
+            || !text
+                .bytes()
+                .all(|byte| matches!(byte, 0x20..=0x7e))
+        {
+            return false;
+        }
+
+        let right_margin = self.left_and_right_margins.end;
+        let start_x = self.cursor.x;
+        let Some(available_cols) = right_margin.checked_sub(start_x) else {
+            return false;
+        };
+        if text.is_empty() || text.len() > available_cols {
+            return false;
+        }
+
+        let y = self.cursor.y;
+        for (offset, _) in text.bytes().enumerate() {
+            let x = start_x + offset;
+            let grapheme = &text[offset..offset + 1];
+            let pen = self.pen.clone();
+            self.screen_mut()
+                .set_cell_grapheme(x, y, grapheme, 1, pen, seqno);
+        }
+
+        let next_x = start_x + text.len();
+        if next_x >= right_margin {
+            self.cursor.x = right_margin.saturating_sub(1);
+            self.wrap_next = self.dec_auto_wrap;
+        } else {
+            self.cursor.x = next_x;
+            self.wrap_next = false;
+        }
+        true
+    }
+
     /// Apply character set related remapping to the input glyph if required
     fn remap_grapheme<'b>(&self, g: &'b str) -> &'b str {
         if (self.shift_out && self.g1_charset == CharSet::DecLineDrawing)
@@ -197,7 +245,9 @@ impl<'a> Performer<'a> {
         let seqno = self.seqno;
         let mut p = std::mem::take(&mut self.print);
         let normalized: String;
-        let text = if self.config.normalize_output_to_unicode_nfc()
+        let text = if p.is_ascii() {
+            p.as_str()
+        } else if self.config.normalize_output_to_unicode_nfc()
             && is_nfc_quick(p.chars()) != IsNormalized::Yes
         {
             normalized = p.as_str().nfc().collect();
@@ -205,6 +255,12 @@ impl<'a> Performer<'a> {
         } else {
             p.as_str()
         };
+
+        if self.flush_ascii_print(text, seqno) {
+            std::mem::swap(&mut self.print, &mut p);
+            self.print.clear();
+            return;
+        }
 
         for g in Graphemes::new(text) {
             let g = self.remap_grapheme(g);
