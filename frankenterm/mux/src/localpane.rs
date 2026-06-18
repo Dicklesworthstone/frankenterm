@@ -2846,3 +2846,131 @@ mod tests {
         assert_eq!(o3.queue_depth_hint, 2);
     }
 }
+
+/// ft-87qfi keep-gate: the lock-free SPSC ring's concurrency contract.
+///
+/// This is the gate that decides whether the disruptor moonshot is safe to keep.
+/// The whole risk of the technique is a lock-free ordering bug, so this exercises
+/// the exact primitive the pane->render staging ring is built on
+/// (`crossbeam::queue::ArrayQueue<Vec<u8>>`, used the same way: producer thread
+/// pushes batches with back-pressure on full, consumer thread drains, spinning on
+/// empty) and asserts EXACT in-order delivery — zero loss, zero duplication, zero
+/// reordering — across many iterations while the small bounded ring repeatedly
+/// fills, wraps, and empties. No `unsafe`.
+#[cfg(all(test, feature = "disruptor-pane-io"))]
+mod disruptor_ring_keep_gate {
+    use crossbeam::queue::ArrayQueue;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    /// A batch is the little-endian bytes of its sequence index plus a sentinel
+    /// tail byte, so every batch is self-identifying and framing corruption is
+    /// detectable. Mirrors the real ring's `Vec<Action>` batches.
+    const TAIL_SENTINEL: u8 = 0xAB;
+    const BATCH_LEN: usize = 9; // 8 index bytes + 1 sentinel
+
+    fn make_batch(index: u64) -> Vec<u8> {
+        let mut batch = index.to_le_bytes().to_vec();
+        batch.push(TAIL_SENTINEL);
+        batch
+    }
+
+    fn decode_index(batch: &[u8]) -> u64 {
+        assert_eq!(batch.len(), BATCH_LEN, "batch framing corrupted (len)");
+        assert_eq!(batch[8], TAIL_SENTINEL, "batch framing corrupted (sentinel)");
+        let mut idx_bytes = [0u8; 8];
+        idx_bytes.copy_from_slice(&batch[..8]);
+        u64::from_le_bytes(idx_bytes)
+    }
+
+    #[test]
+    fn spsc_ring_delivers_every_batch_exactly_once_in_order() {
+        // Small, non-power-of-two capacity so the ring wraps and hits full and
+        // empty edges thousands of times per iteration.
+        const CAP: usize = 7;
+        // Enough batches to wrap the ring ~thousands of times per iteration.
+        const BATCHES: u64 = 20_000;
+        // Many independent runs to vary producer/consumer interleaving.
+        const ITERATIONS: usize = 16;
+
+        for iter in 0..ITERATIONS {
+            let ring: Arc<ArrayQueue<Vec<u8>>> = Arc::new(ArrayQueue::new(CAP));
+            // Signals that the producer has pushed ALL batches. Lets the consumer
+            // terminate (instead of hanging) if a batch were lost: once the
+            // producer is done and the ring is empty, no more batches can arrive.
+            let producer_done = Arc::new(AtomicBool::new(false));
+
+            let producer = {
+                let ring = Arc::clone(&ring);
+                let producer_done = Arc::clone(&producer_done);
+                thread::spawn(move || {
+                    for i in 0..BATCHES {
+                        let mut pending = make_batch(i);
+                        // Bounded ring => back-pressure: spin until it accepts.
+                        loop {
+                            match ring.push(pending) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    pending = returned;
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
+                    }
+                    producer_done.store(true, Ordering::Release);
+                })
+            };
+
+            let consumer = {
+                let ring = Arc::clone(&ring);
+                let producer_done = Arc::clone(&producer_done);
+                thread::spawn(move || {
+                    let mut drained: Vec<u64> = Vec::with_capacity(BATCHES as usize);
+                    loop {
+                        match ring.pop() {
+                            Some(batch) => drained.push(decode_index(&batch)),
+                            None => {
+                                // No item right now. If the producer has finished
+                                // and the ring is empty, there is nothing more
+                                // coming — stop (a short count then proves loss).
+                                if producer_done.load(Ordering::Acquire) && ring.is_empty() {
+                                    break;
+                                }
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+                    drained
+                })
+            };
+
+            producer.join().expect("producer thread panicked");
+            let drained = consumer.join().expect("consumer thread panicked");
+
+            // Zero loss + zero duplication: exactly BATCHES items delivered.
+            assert_eq!(
+                drained.len() as u64,
+                BATCHES,
+                "iter {iter}: delivered {} batches, expected {BATCHES} (loss or duplication)",
+                drained.len()
+            );
+            // Zero reordering: the batch drained at position p is exactly the
+            // batch produced at position p. Combined with the exact count above,
+            // this proves the drained sequence equals the produced sequence byte
+            // for byte, in order.
+            for (pos, &index) in drained.iter().enumerate() {
+                assert_eq!(
+                    index, pos as u64,
+                    "iter {iter}: ordering/identity violation at position {pos}: \
+                     got batch index {index} (lock-free SPSC loss/dup/reorder)"
+                );
+            }
+            // The ring must be fully drained at the end.
+            assert!(
+                ring.pop().is_none(),
+                "iter {iter}: ring not empty after consuming all batches"
+            );
+        }
+    }
+}
