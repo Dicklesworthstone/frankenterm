@@ -4009,6 +4009,72 @@ mod tests {
     }
 
     #[test]
+    fn rewrap_shared_lines_materializes_same_as_owned_lines_across_resize() {
+        let attrs = CellAttributes::blank();
+        let mut seed = test_screen(5, 6, 96);
+        seed.lines = VecDeque::from(vec![Line::from_text("abcdef", &attrs, 0, None)]);
+
+        let mut direct_path = seed.clone();
+        let mut shared_path = seed.clone();
+        let target_cols = 3;
+        let resize_seqno = 7;
+
+        let key = WrapLineCacheKey::new(
+            &shared_path.lines[0],
+            target_cols,
+            shared_path.dpi,
+            shared_path.resize_wrap_policy,
+        );
+        let mut width_prefix_scratch = LineWrapWidthPrefixScratch::default();
+        let (wrapped_lines, scorecard) = Screen::wrap_single_logical_line_for_resize(
+            shared_path.lines[0].clone(),
+            target_cols,
+            resize_seqno,
+            shared_path.resize_wrap_policy,
+            &mut width_prefix_scratch,
+        );
+        shared_path.insert_rewrap_line_cache(
+            key,
+            CachedWrappedLine {
+                lines: Arc::from(wrapped_lines),
+                scorecard,
+            },
+        );
+        shared_path.rewrap_line_cache_hits = 0;
+
+        let cursor = test_cursor(0, 0, 1);
+        let direct_cursor =
+            direct_path.resize(test_size(5, target_cols, 96), cursor, resize_seqno, false);
+        let shared_cursor =
+            shared_path.resize(test_size(5, target_cols, 96), cursor, resize_seqno, false);
+
+        let materialized_snapshot = |screen: &Screen| {
+            screen
+                .lines
+                .iter()
+                .map(|line| {
+                    (
+                        line.as_str().to_string(),
+                        line.last_cell_was_wrapped(),
+                        line.current_seqno(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(shared_cursor, direct_cursor);
+        assert!(
+            shared_path.rewrap_line_cache_hits > 0,
+            "shared path must exercise RewrapScratch::SharedLines"
+        );
+        assert_eq!(
+            materialized_snapshot(&shared_path),
+            materialized_snapshot(&direct_path),
+            "SharedLines(Arc) and Lines materialization must be byte-identical"
+        );
+    }
+
+    #[test]
     fn resize_reflow_reuses_scratch_buffers() {
         let mut screen = test_screen(4, 6, 96);
         let attrs = CellAttributes::blank();
