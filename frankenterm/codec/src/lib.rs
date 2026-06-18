@@ -58,6 +58,352 @@ mod bounded_varbincode;
 /// Wire-format-compatible with `varbincode::serialize`. (gauntlet FND-013)
 pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize;
 
+/// Content-defined-chunking (CDC) rolling-hash dedup of mux output payloads
+/// (ft-6c1t0, round-3 moonshot — OPT-IN, default-inert).
+///
+/// The mux wire repeats a lot of output: the same prompt redrawn, identical
+/// frames mirrored across panes, repeated ANSI runs. This module provides a
+/// stateful, **byte-for-byte lossless** dedup codec that a connection can run
+/// over serialized PDU payloads before framing (and the inverse after
+/// unframing): payloads are split into content-defined chunks via a FastCDC
+/// gear rolling hash, and a chunk seen earlier in the session is replaced on
+/// the wire by a small back-reference instead of its bytes.
+///
+/// It is intentionally self-contained (no wire-format change to the existing
+/// PDU framing) and opt-in: nothing in the default encode/decode path calls it,
+/// so the build is byte-identical until a caller wires
+/// [`CdcDedupEncoder`]/[`CdcDedupDecoder`] in per connection-direction. That
+/// keeps this experiment trivially revertable (delete the module) and lets the
+/// orchestrator measure the dedup ratio + throughput on a real mux-output
+/// corpus before any protocol change.
+///
+/// ## Synchronization contract (losslessness)
+///
+/// The encoder and the matching decoder process the *same* token stream in the
+/// *same order* over a reliable, ordered transport (TCP / the mux wire). Each
+/// `LITERAL_CACHE` token deterministically assigns the next sequential chunk id
+/// on both sides, so a `REFERENCE(id)` resolves identically. Decode of a stream
+/// produced by a synchronized encoder reconstructs the original bytes exactly.
+/// Decode of arbitrary/adversarial bytes returns `Err` (never panics, never
+/// allocates unboundedly): every length is bounds-checked, every reference id is
+/// range-checked, the chunk cache is capped, and reconstructed output is capped
+/// at [`MAX_PDU_SIZE`].
+pub mod cdc_dedup {
+    use anyhow::{bail, Result};
+    use std::collections::HashMap;
+    use std::convert::TryFrom;
+
+    use super::MAX_PDU_SIZE;
+
+    /// Minimum content-defined chunk length (bytes). Below this no boundary is
+    /// taken, bounding per-chunk token overhead on incompressible input.
+    const MIN_CHUNK: usize = 64;
+    /// Target average chunk length. MUST be a power of two so `AVG_CHUNK - 1` is
+    /// the boundary mask; tuned small because terminal output repeats at the
+    /// granularity of short ANSI/line runs.
+    const AVG_CHUNK: usize = 256;
+    /// Maximum chunk length (bytes); forces a boundary so a non-repetitive run
+    /// cannot grow an unbounded chunk.
+    const MAX_CHUNK: usize = 1024;
+    /// Low-bit mask used to detect a content-defined boundary.
+    const BOUNDARY_MASK: u64 = (AVG_CHUNK as u64) - 1;
+    /// Cap on distinct cached chunks per direction (bounds dictionary memory and,
+    /// on the decode side, makes a malformed stream fail closed rather than OOM).
+    const MAX_CACHED_CHUNKS: usize = 1 << 16;
+
+    // Token tag (low 2 bits of the per-token leb128 header):
+    //   00 = LITERAL_CACHE   (len = hdr>>2) bytes follow; cache as next chunk id
+    //   01 = REFERENCE       (id  = hdr>>2) to a previously cached chunk
+    //   10 = LITERAL_NOCACHE (len = hdr>>2) bytes follow; do NOT cache (cap hit)
+    const TAG_LITERAL_CACHE: u64 = 0b00;
+    const TAG_REFERENCE: u64 = 0b01;
+    const TAG_LITERAL_NOCACHE: u64 = 0b10;
+
+    /// FastCDC gear table: 256 pseudo-random u64s derived deterministically at
+    /// compile time via splitmix64 (so encoder and decoder builds agree).
+    const GEAR: [u64; 256] = {
+        let mut table = [0u64; 256];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut i = 0;
+        while i < 256 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            table[i] = z;
+            i += 1;
+        }
+        table
+    };
+
+    /// Find the end index (exclusive) of the content-defined chunk that starts
+    /// at `start`. Deterministic and dependent only on the bytes, so encoder and
+    /// decoder agree without exchanging boundaries.
+    fn next_boundary(data: &[u8], start: usize) -> usize {
+        let n = data.len();
+        let mut hash = 0u64;
+        let mut i = start;
+        while i < n {
+            hash = (hash << 1).wrapping_add(GEAR[data[i] as usize]);
+            let len = i - start + 1;
+            if (len >= MIN_CHUNK && (hash & BOUNDARY_MASK) == 0) || len >= MAX_CHUNK {
+                return i + 1;
+            }
+            i += 1;
+        }
+        n
+    }
+
+    fn write_leb(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Read a leb128 value from `data` starting at `pos`; returns `(value,
+    /// next_pos)`. Bounds- and overflow-checked so malformed input fails closed.
+    fn read_leb(data: &[u8], pos: usize) -> Result<(u64, usize)> {
+        let mut value = 0u64;
+        let mut shift = 0u32;
+        let mut i = pos;
+        loop {
+            let byte = *data.get(i).ok_or_else(|| anyhow::anyhow!("cdc: truncated leb128"))?;
+            i += 1;
+            if shift >= 64 {
+                bail!("cdc: leb128 overflow");
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        Ok((value, i))
+    }
+
+    /// Per-direction dedup encoder. Owns the session chunk dictionary; reuse the
+    /// same instance for every payload sent in one direction of a connection.
+    #[derive(Debug, Default)]
+    pub struct CdcDedupEncoder {
+        /// chunk bytes -> assigned id
+        dict: HashMap<Box<[u8]>, u32>,
+        next_id: u32,
+    }
+
+    impl CdcDedupEncoder {
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Number of distinct chunks currently cached.
+        #[must_use]
+        pub fn cached_chunks(&self) -> usize {
+            self.dict.len()
+        }
+
+        /// Dedup-encode one payload. The output is consumed by a
+        /// [`CdcDedupDecoder`] that has seen the same prior payloads in order.
+        #[must_use]
+        pub fn encode(&mut self, data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(data.len() / 2 + 16);
+            let mut start = 0;
+            while start < data.len() {
+                let end = next_boundary(data, start);
+                let chunk = &data[start..end];
+                if let Some(&id) = self.dict.get(chunk) {
+                    write_leb(&mut out, (u64::from(id) << 2) | TAG_REFERENCE);
+                } else if (self.next_id as usize) < MAX_CACHED_CHUNKS {
+                    write_leb(&mut out, ((chunk.len() as u64) << 2) | TAG_LITERAL_CACHE);
+                    out.extend_from_slice(chunk);
+                    self.dict.insert(chunk.into(), self.next_id);
+                    self.next_id += 1;
+                } else {
+                    write_leb(&mut out, ((chunk.len() as u64) << 2) | TAG_LITERAL_NOCACHE);
+                    out.extend_from_slice(chunk);
+                }
+                start = end;
+            }
+            out
+        }
+    }
+
+    /// Per-direction dedup decoder. Mirror of [`CdcDedupEncoder`]; reuse one
+    /// instance for every payload received in one direction of a connection.
+    #[derive(Debug, Default)]
+    pub struct CdcDedupDecoder {
+        chunks: Vec<Box<[u8]>>,
+    }
+
+    impl CdcDedupDecoder {
+        #[must_use]
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Reconstruct the original payload from a token stream produced by a
+        /// synchronized [`CdcDedupEncoder`]. Lossless for well-formed input;
+        /// returns `Err` (never panics/OOMs) for malformed input.
+        pub fn decode(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut pos = 0;
+            while pos < data.len() {
+                let (header, next) = read_leb(data, pos)?;
+                pos = next;
+                let tag = header & 0b11;
+                let payload = header >> 2;
+                match tag {
+                    TAG_REFERENCE => {
+                        let id = usize::try_from(payload)
+                            .map_err(|_| anyhow::anyhow!("cdc: reference id overflow"))?;
+                        let chunk = self
+                            .chunks
+                            .get(id)
+                            .ok_or_else(|| anyhow::anyhow!("cdc: reference id out of range"))?;
+                        push_capped(&mut out, chunk)?;
+                    }
+                    TAG_LITERAL_CACHE | TAG_LITERAL_NOCACHE => {
+                        let len = usize::try_from(payload)
+                            .map_err(|_| anyhow::anyhow!("cdc: literal length overflow"))?;
+                        let end = pos
+                            .checked_add(len)
+                            .ok_or_else(|| anyhow::anyhow!("cdc: literal length overflow"))?;
+                        if end > data.len() {
+                            bail!("cdc: literal overruns token stream");
+                        }
+                        let chunk = &data[pos..end];
+                        pos = end;
+                        push_capped(&mut out, chunk)?;
+                        if tag == TAG_LITERAL_CACHE {
+                            if self.chunks.len() >= MAX_CACHED_CHUNKS {
+                                bail!("cdc: cache cap exceeded (stream desynchronized)");
+                            }
+                            self.chunks.push(chunk.into());
+                        }
+                    }
+                    _ => bail!("cdc: invalid token tag"),
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    fn push_capped(out: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+        if out.len().saturating_add(chunk.len()) > MAX_PDU_SIZE {
+            bail!("cdc: reconstructed payload exceeds MAX_PDU_SIZE");
+        }
+        out.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn round_trip(payloads: &[&[u8]]) {
+            let mut enc = CdcDedupEncoder::new();
+            let mut dec = CdcDedupDecoder::new();
+            for &p in payloads {
+                let encoded = enc.encode(p);
+                let decoded = dec.decode(&encoded).expect("decode must succeed");
+                assert_eq!(decoded, p, "lossless round-trip failed");
+            }
+        }
+
+        #[test]
+        fn round_trip_empty_and_small() {
+            round_trip(&[b"", b"x", b"hello world", b"\x00\x01\x02\xff"]);
+        }
+
+        #[test]
+        fn round_trip_large_and_binary() {
+            let big: Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(2654435761) >> 16) as u8).collect();
+            round_trip(&[&big]);
+        }
+
+        #[test]
+        fn round_trip_repeated_payloads_dedup() {
+            // The same payload sent 5x: first carries literals, the rest should
+            // be almost entirely references (the win), and all decode exactly.
+            let payload: Vec<u8> = b"PROMPT> the quick brown fox jumps over the lazy dog\r\n"
+                .iter()
+                .cycle()
+                .take(8000)
+                .copied()
+                .collect();
+            let mut enc = CdcDedupEncoder::new();
+            let mut dec = CdcDedupDecoder::new();
+            let first = enc.encode(&payload);
+            assert_eq!(dec.decode(&first).unwrap(), payload);
+            let mut later_total = 0usize;
+            for _ in 0..4 {
+                let e = enc.encode(&payload);
+                later_total += e.len();
+                assert_eq!(dec.decode(&e).unwrap(), payload);
+            }
+            // A repeated payload must compress hard on the wire.
+            assert!(
+                later_total < payload.len(),
+                "repeated payloads did not dedup: {later_total} vs {}",
+                payload.len()
+            );
+        }
+
+        #[test]
+        fn cross_payload_dedup_across_frames() {
+            // Content shared between two *different* payloads (mirrored across
+            // panes) should reference chunks cached by the earlier payload.
+            let shared = b"\x1b[2J\x1b[H==== shared header block repeated across panes ====\r\n";
+            let a: Vec<u8> = shared.iter().chain(b"pane-A unique tail").copied().collect();
+            let b: Vec<u8> = shared.iter().chain(b"pane-B unique tail").copied().collect();
+            round_trip(&[&a, &b]);
+        }
+
+        #[test]
+        fn encoding_is_deterministic() {
+            let data = b"deterministic content-defined chunking, same in same out".repeat(50);
+            let e1 = CdcDedupEncoder::new().encode(&data);
+            let e2 = CdcDedupEncoder::new().encode(&data);
+            assert_eq!(e1, e2);
+        }
+
+        #[test]
+        fn decode_arbitrary_input_never_panics() {
+            // A fresh decoder on pseudo-random bytes must return Ok or Err, never
+            // panic or hang. (proptest-style smoke without the dep.)
+            let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+            for _ in 0..5000 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let len = (state >> 56) as usize % 64;
+                let bytes: Vec<u8> = (0..len)
+                    .map(|k| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        (state >> 33) as u8 ^ k as u8
+                    })
+                    .collect();
+                let _ = CdcDedupDecoder::new().decode(&bytes);
+            }
+        }
+
+        #[test]
+        fn reference_out_of_range_is_rejected() {
+            // A REFERENCE to id 0 with an empty dictionary must fail, not panic.
+            let mut out = Vec::new();
+            write_leb(&mut out, (0u64 << 2) | TAG_REFERENCE);
+            assert!(CdcDedupDecoder::new().decode(&out).is_err());
+        }
+    }
+}
+
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize_for_fuzz;
