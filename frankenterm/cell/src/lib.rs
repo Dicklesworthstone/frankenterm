@@ -160,7 +160,7 @@ pub struct AttributeRuns {
 struct AttrRun {
     attrs: CellAttributes,
     /// Number of consecutive cells that share `attrs` (always >= 1).
-    run_len: u32,
+    run_len: usize,
 }
 
 #[cfg(feature = "succinct_attrs")]
@@ -203,10 +203,11 @@ impl AttributeRuns {
         if count == 0 {
             return;
         }
+        let count = count as usize;
         if let Some(last) = self.runs.last_mut() {
             if last.attrs == *attrs {
                 last.run_len = last.run_len.saturating_add(count);
-                self.len += count as usize;
+                self.len = self.len.saturating_add(count);
                 return;
             }
         }
@@ -214,7 +215,7 @@ impl AttributeRuns {
             attrs: attrs.clone(),
             run_len: count,
         });
-        self.len += count as usize;
+        self.len = self.len.saturating_add(count);
     }
 
     /// Attributes at logical cell index `idx`, or `None` if out of range.
@@ -225,7 +226,7 @@ impl AttributeRuns {
         }
         let mut offset = 0usize;
         for run in &self.runs {
-            offset += run.run_len as usize;
+            offset = offset.saturating_add(run.run_len);
             if idx < offset {
                 return Some(&run.attrs);
             }
@@ -290,6 +291,23 @@ mod succinct_attrs_tests {
         r.push(&plain(), 5);
         assert_eq!(r.run_count(), 1, "identical adjacent runs must merge");
         assert_eq!(r.len(), 8);
+    }
+
+    #[test]
+    fn coalesced_large_run_preserves_boundary_lookup() {
+        let mut r = AttributeRuns::new();
+        r.push(&plain(), u32::MAX);
+        r.push(&plain(), 1);
+
+        let tail_idx = u32::MAX as usize;
+        assert_eq!(r.run_count(), 1, "equal large runs should still coalesce");
+        assert_eq!(r.len(), tail_idx + 1);
+        assert_eq!(
+            r.get(tail_idx),
+            Some(&plain()),
+            "coalescing past u32::MAX must not make the represented tail unreachable"
+        );
+        assert_eq!(r.get(tail_idx + 1), None);
     }
 
     #[test]
