@@ -1516,12 +1516,18 @@ pub struct StorageConfig {
     /// When empty, all events use `retention_days` as a flat policy.
     pub retention_tiers: Vec<RetentionTier>,
 
-    /// br-ft-z4u60 substrate-pass: per-pane mmap-backed scrollback
-    /// size cap, in megabytes. The wired-pass mmap writer
-    /// (crates/frankenterm-core/src/scrollback_mmap_writer.rs)
-    /// honours this when sizing the per-pane `.bin` file at
-    /// `~/.local/share/ft/scrollback/<pane_uuid>.bin` and when
-    /// deciding when to wrap the write cursor.
+    /// br-ft-z4u60 substrate-pass: intended per-pane mmap-backed scrollback
+    /// size cap, in megabytes.
+    ///
+    /// RESERVED / not yet consulted in the production core-ingest path: the
+    /// builder that would apply this cap, `MmapScrollback::with_cap_mb`
+    /// (crates/frankenterm-core/src/scrollback_mmap_writer.rs), currently has
+    /// no callers, and the per-pane mmap writer is not wired into core ingest
+    /// (capture is governed by `config.snapshots`). Once wired it is meant to
+    /// bound the per-pane `.bin` file at
+    /// `~/.local/share/ft/scrollback/<pane_uuid>.bin` and govern when the write
+    /// cursor wraps. (ft-3csof: corrected from an earlier docstring that claimed
+    /// the writer already honours it.)
     ///
     /// `0` disables the cap (writer falls back to the file's
     /// existing size or a system default).
