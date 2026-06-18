@@ -266,7 +266,15 @@ static PERPLEXITY_KEY: LazyLock<Regex> =
 /// `MISTRAL_API_KEY: "..."`.
 static AI_PROVIDER_KEYED_VALUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(?:cohere|mistral|together(?:_ai)?|fireworks|deepinfra|nvidia[_-]?api|databricks[_-]?token|azure[_-]?openai)[_-]?(?:api[_-]?)?(?:key|token|secret)\s*[=:]\s*['"]?([a-zA-Z0-9_/+=.-]{16,})['"]?"#
+        // `databricks` (not `databricks[_-]?token`): the shared trailing
+        // `(?:key|token|secret)` suffix must terminate the provider name, exactly
+        // as it does for `cohere`/`mistral`. The old `databricks[_-]?token`
+        // alternative consumed the literal `databricks_token`, leaving the
+        // mandatory suffix to face the `=`/`:` separator and fail -- so the real
+        // `databricks_token=`, `DATABRICKS_TOKEN=`, and `databricks_api_key=`
+        // forms were never matched and the ai_provider_keyed coverage was dead
+        // for this provider (ft-sydcu).
+        r#"(?i)(?:cohere|mistral|together(?:_ai)?|fireworks|deepinfra|nvidia[_-]?api|databricks|azure[_-]?openai)[_-]?(?:api[_-]?)?(?:key|token|secret)\s*[=:]\s*['"]?([a-zA-Z0-9_/+=.-]{16,})['"]?"#
     )
     .expect("AI provider keyed value regex")
 });

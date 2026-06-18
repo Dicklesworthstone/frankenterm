@@ -883,6 +883,30 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "DDDDDDDDDDDDDDDDEEEEEEEEEE",
             "ai_provider_keyed_value",
         ),
+        // ft-sydcu: real `databricks_token=dapi...` form. Before the regex fix
+        // (`databricks[_-]?token` -> `databricks`) this was a FALSE NEGATIVE —
+        // the corpus had zero databricks vectors so the recall floor was
+        // vacuously green while the dedicated provider branch was dead. This
+        // vector now exercises that branch so the gate fails if it regresses.
+        pos(
+            "databricks_keyed",
+            "ai_provider_keyed",
+            "databricks_token= form (ft-sydcu: provider name must end at the shared key/token/secret suffix)",
+            "databricks_token=dapideadbeefcafef00d0123456789ab",
+            "dapideadbeefcafef00d0123456789ab",
+            "ai_provider_keyed_value",
+        ),
+        // ft-sydcu: NVIDIA_API_KEY= form. The `nvidia[_-]?api` branch already
+        // fired correctly, but the corpus never exercised it; this positive
+        // vector puts it under the recall gate alongside databricks.
+        pos(
+            "nvidia_keyed",
+            "ai_provider_keyed",
+            "NVIDIA_API_KEY uppercase env form (ft-sydcu: exercise the nvidia[_-]?api branch in the recall gate)",
+            "NVIDIA_API_KEY=nvapi-0123456789abcdefABCDEFGH",
+            "nvapi-0123456789abcdefABCDEFGH",
+            "ai_provider_keyed_value",
+        ),
         // -----------------------------------------------------
         // AWS Access Key ID
         // -----------------------------------------------------
