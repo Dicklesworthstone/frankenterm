@@ -1733,12 +1733,19 @@ struct MemoizedWrapPointCacheEntry {
 struct MemoizedWrapPointCache {
     entries: std::collections::HashMap<MemoizedWrapPointCacheKey, MemoizedWrapPointCacheEntry>,
     order: std::collections::VecDeque<MemoizedWrapPointCacheKey>,
+    #[cfg(test)]
+    hits: usize,
 }
 
 #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
 impl MemoizedWrapPointCache {
     fn get(&mut self, key: MemoizedWrapPointCacheKey) -> Option<MemoizedWrapPointCacheEntry> {
-        self.entries.get(&key).cloned()
+        let entry = self.entries.get(&key).cloned();
+        #[cfg(test)]
+        if entry.is_some() {
+            self.hits = self.hits.saturating_add(1);
+        }
+        entry
     }
 
     fn insert(&mut self, key: MemoizedWrapPointCacheKey, entry: MemoizedWrapPointCacheEntry) {
@@ -1756,6 +1763,18 @@ impl MemoizedWrapPointCache {
 
         self.entries.insert(key, entry);
         self.order.push_back(key);
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.hits = 0;
+    }
+
+    #[cfg(test)]
+    fn peek(&self, key: MemoizedWrapPointCacheKey) -> Option<MemoizedWrapPointCacheEntry> {
+        self.entries.get(&key).cloned()
     }
 }
 
@@ -1785,6 +1804,42 @@ fn memoized_wrap_point_cache_insert(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(key, entry);
+}
+
+#[cfg(all(test, feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_clear_for_test() {
+    memoized_wrap_point_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+#[cfg(all(test, feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_hits_for_test() -> usize {
+    memoized_wrap_point_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hits
+}
+
+#[cfg(all(test, feature = "std", not(ft_disable_memoized_wrap_points)))]
+fn memoized_wrap_point_cache_entry_for_test(
+    line: &Line,
+    width: usize,
+    cost_model: MonospaceKpCostModel,
+) -> Option<MemoizedWrapPointCacheEntry> {
+    let mut cells: Vec<CellRef> = line.visible_cells().collect();
+    let end_idx = cells.iter().rposition(|c| c.str() != " ")?;
+    cells.truncate(end_idx + 1);
+    let key = MemoizedWrapPointCacheKey {
+        shape_hash: compute_wrap_shape_hash(line.bits, &cells),
+        width,
+        cost_model,
+    };
+    memoized_wrap_point_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .peek(key)
 }
 
 /// Reusable prefix-width storage for resize-time line wrapping.
@@ -2614,6 +2669,149 @@ mod tests {
         assert_eq!(wrapped[0].as_str().as_ref(), "abc");
         assert!(wrapped[0].last_cell_was_wrapped());
         assert_eq!(wrapped[1].as_str().as_ref(), "def");
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    fn wrap_report_signature(
+        report: &LineWrapReport,
+    ) -> (Vec<(String, bool, usize)>, LineWrapScorecard) {
+        (
+            report
+                .lines
+                .iter()
+                .map(|line| {
+                    (
+                        line.as_str().into_owned(),
+                        line.last_cell_was_wrapped(),
+                        line.len(),
+                    )
+                })
+                .collect(),
+            report.scorecard,
+        )
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    fn cached_wrap_entry_for_test(
+        line: &Line,
+        width: usize,
+        cost_model: MonospaceKpCostModel,
+        label: &str,
+    ) -> MemoizedWrapPointCacheEntry {
+        memoized_wrap_point_cache_entry_for_test(line, width, cost_model)
+            .unwrap_or_else(|| panic!("missing memoized wrap entry after {}", label))
+    }
+
+    #[cfg(all(feature = "std", not(ft_disable_memoized_wrap_points)))]
+    #[test]
+    fn memoized_wrap_points_match_fresh_recompute_after_hit_and_mutation_ft_3vdce() {
+        let attrs = CellAttributes::default();
+        let width = 5usize;
+        let cost_model = MonospaceKpCostModel {
+            max_dp_states: 0,
+            ..MonospaceKpCostModel::terminal_default()
+        };
+        let mut line = Line::from_text("abcdefghijklmnopq", &attrs, SEQ_ZERO, None);
+
+        memoized_wrap_point_cache_clear_for_test();
+        let original_miss = line.clone().wrap_with_report(width, 1, cost_model);
+        let original_miss_entry =
+            cached_wrap_entry_for_test(&line, width, cost_model, "original miss");
+        assert_eq!(
+            memoized_wrap_point_cache_hits_for_test(),
+            0,
+            "first wrap should populate the cache without a hit"
+        );
+
+        let hits_before_original_hit = memoized_wrap_point_cache_hits_for_test();
+        let original_hit = line.clone().wrap_with_report(width, 2, cost_model);
+        assert!(
+            memoized_wrap_point_cache_hits_for_test() > hits_before_original_hit,
+            "second wrap of unchanged content+width must hit the memoized entry"
+        );
+        let original_hit_entry =
+            cached_wrap_entry_for_test(&line, width, cost_model, "original hit");
+
+        memoized_wrap_point_cache_clear_for_test();
+        let original_recomputed = line.clone().wrap_with_report(width, 3, cost_model);
+        let original_recomputed_entry =
+            cached_wrap_entry_for_test(&line, width, cost_model, "original recompute");
+        assert_eq!(
+            original_hit_entry.break_offsets, original_recomputed_entry.break_offsets,
+            "cache hit wrap points must equal cleared-cache recompute wrap points"
+        );
+        assert_eq!(
+            original_hit_entry.scorecard, original_recomputed_entry.scorecard,
+            "cache hit scorecard must equal cleared-cache recompute scorecard"
+        );
+        assert_eq!(
+            wrap_report_signature(&original_hit),
+            wrap_report_signature(&original_recomputed),
+            "cache hit materialization must equal cleared-cache recompute"
+        );
+        assert_eq!(
+            wrap_report_signature(&original_miss),
+            wrap_report_signature(&original_hit),
+            "first miss and subsequent hit must materialize the same wrap"
+        );
+        assert_eq!(
+            original_miss_entry.break_offsets, original_hit_entry.break_offsets,
+            "initial miss and subsequent hit must expose identical wrap points"
+        );
+
+        memoized_wrap_point_cache_clear_for_test();
+        let _ = line.clone().wrap_with_report(width, 4, cost_model);
+        let original_cached_before_mutation =
+            cached_wrap_entry_for_test(&line, width, cost_model, "pre-mutation original");
+        let hits_before_mutation = memoized_wrap_point_cache_hits_for_test();
+
+        line.set_cell_grapheme(0, "中", 2, attrs.clone(), 5);
+        let mutated_miss = line.clone().wrap_with_report(width, 6, cost_model);
+        assert_eq!(
+            memoized_wrap_point_cache_hits_for_test(),
+            hits_before_mutation,
+            "content mutation must not hit the stale cache entry for the old content"
+        );
+        let mutated_miss_entry =
+            cached_wrap_entry_for_test(&line, width, cost_model, "mutated miss");
+        assert_ne!(
+            mutated_miss_entry.break_offsets, original_cached_before_mutation.break_offsets,
+            "test fixture must change wrap points after mutation"
+        );
+
+        let hits_before_mutated_hit = memoized_wrap_point_cache_hits_for_test();
+        let mutated_hit = line.clone().wrap_with_report(width, 7, cost_model);
+        assert!(
+            memoized_wrap_point_cache_hits_for_test() > hits_before_mutated_hit,
+            "second wrap of mutated content+width must hit its new memoized entry"
+        );
+        let mutated_hit_entry =
+            cached_wrap_entry_for_test(&line, width, cost_model, "mutated hit");
+
+        memoized_wrap_point_cache_clear_for_test();
+        let mutated_recomputed = line.clone().wrap_with_report(width, 8, cost_model);
+        let mutated_recomputed_entry =
+            cached_wrap_entry_for_test(&line, width, cost_model, "mutated recompute");
+        assert_eq!(
+            mutated_hit_entry.break_offsets, mutated_recomputed_entry.break_offsets,
+            "mutated cache hit wrap points must equal cleared-cache recompute wrap points"
+        );
+        assert_eq!(
+            mutated_hit_entry.scorecard, mutated_recomputed_entry.scorecard,
+            "mutated cache hit scorecard must equal cleared-cache recompute scorecard"
+        );
+        assert_eq!(
+            wrap_report_signature(&mutated_hit),
+            wrap_report_signature(&mutated_recomputed),
+            "mutated cache hit materialization must equal cleared-cache recompute"
+        );
+        assert_eq!(
+            wrap_report_signature(&mutated_miss),
+            wrap_report_signature(&mutated_hit),
+            "mutated miss and subsequent hit must materialize the same wrap"
+        );
+
+        memoized_wrap_point_cache_clear_for_test();
     }
 
     #[test]
