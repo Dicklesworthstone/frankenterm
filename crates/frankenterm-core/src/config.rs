@@ -281,18 +281,23 @@ impl SmartSelectionConfig {
         errors
     }
 
-    /// Compile every entry's regex. Panics on any parse failure —
-    /// callers should run [`Self::validate`] first.
-    #[must_use]
-    pub fn compile(&self) -> Vec<CompiledUserPattern> {
+    /// Compile every entry's regex into a [`CompiledUserPattern`].
+    ///
+    /// Returns the first `regex::Error` if any (operator-supplied) entry regex
+    /// fails to parse, rather than panicking. [`Self::validate`] reports every
+    /// bad pattern with full context up front; `compile` is the fallible
+    /// last-line guard so a future direct caller that skips validation can
+    /// never panic on a malformed `[smart_selection]` config string.
+    pub fn compile(&self) -> Result<Vec<CompiledUserPattern>, regex::Error> {
         self.patterns
             .iter()
-            .map(|entry| CompiledUserPattern {
-                name: entry.name.clone(),
-                regex: regex::Regex::new(&entry.regex)
-                    .expect("compile() called on unvalidated SmartSelectionConfig"),
-                priority: entry.priority,
-                display_name: entry.display_name.clone(),
+            .map(|entry| {
+                Ok(CompiledUserPattern {
+                    name: entry.name.clone(),
+                    regex: regex::Regex::new(&entry.regex)?,
+                    priority: entry.priority,
+                    display_name: entry.display_name.clone(),
+                })
             })
             .collect()
     }
@@ -433,11 +438,22 @@ mod smart_selection_tests {
             patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
         };
         assert!(cfg.validate().is_empty());
-        let compiled = cfg.compile();
+        let compiled = cfg.compile().expect("validated patterns compile");
         assert_eq!(compiled.len(), 1);
         assert_eq!(compiled[0].name, "issue-ref");
         assert!(compiled[0].regex.is_match("ft-abcde"));
         assert!(!compiled[0].regex.is_match("nope"));
+    }
+
+    #[test]
+    fn compile_returns_err_on_invalid_regex_instead_of_panicking() {
+        // An operator-supplied malformed regex must surface as a recoverable
+        // `Err`, never a panic (the prior `.expect()` made this a landmine for
+        // any caller that compiled without validating first).
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("bad", r"(unclosed")],
+        };
+        assert!(cfg.compile().is_err());
     }
 
     // -----------------------------------------------------------------
