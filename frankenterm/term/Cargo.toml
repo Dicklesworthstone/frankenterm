@@ -12,6 +12,7 @@ readme = "README.md"
 publish = false
 
 [features]
+bench-scalar-vte-scan = []
 use_serde = ["termwiz/use_serde", "frankenterm-cell/use_serde", "frankenterm-escape-parser/use_serde", "frankenterm-surface/use_serde"]
 
 [dependencies]
@@ -41,10 +42,15 @@ frankenterm-escape-parser = {workspace = true, features=["std", "use_image"]}
 frankenterm-surface = {workspace = true, features=["std", "appdata", "use_image"]}
 
 [dev-dependencies]
+criterion.workspace = true
 env_logger.workspace = true
 k9.workspace = true
 proptest = "1.8.0"
 serde_json.workspace = true
+
+[[bench]]
+name = "byte_to_grid"
+harness = false
 
 [dependencies.termwiz]
 workspace = true

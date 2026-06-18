@@ -1,12 +1,12 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
-    CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry, default_color_map,
+    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
-use crate::{ClipboardSelection, DCS, Position, ST, TerminalState, VisibleRowIndex};
+use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::{
-    Cell, CellAttributes, SemanticType, grapheme_column_width, is_white_space_grapheme,
+    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
 use frankenterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -16,7 +16,7 @@ use frankenterm_escape_parser::osc::{
     ITermUnicodeVersionOp, Selection,
 };
 use frankenterm_escape_parser::{
-    Action, CSI, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand,
+    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
 };
 use log::{debug, error};
 use num_traits::FromPrimitive;
@@ -25,7 +25,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
 use termwiz::input::KeyboardEncoding;
-use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
+use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
@@ -157,18 +157,29 @@ impl<'a> Performer<'a> {
             return Self::printable_ascii_prefix_len_scalar(bytes);
         }
 
-        #[cfg(target_pointer_width = "64")]
+        #[cfg(feature = "bench-scalar-vte-scan")]
         {
-            return Self::printable_ascii_prefix_len_swar(bytes);
+            Self::printable_ascii_prefix_len_scalar(bytes)
         }
 
-        #[cfg(not(target_pointer_width = "64"))]
+        #[cfg(all(not(feature = "bench-scalar-vte-scan"), target_pointer_width = "64"))]
+        {
+            Self::printable_ascii_prefix_len_swar(bytes)
+        }
+
+        #[cfg(all(
+            not(feature = "bench-scalar-vte-scan"),
+            not(target_pointer_width = "64")
+        ))]
         {
             Self::printable_ascii_prefix_len_scalar(bytes)
         }
     }
 
-    #[cfg(target_pointer_width = "64")]
+    #[cfg(any(
+        test,
+        all(target_pointer_width = "64", not(feature = "bench-scalar-vte-scan"))
+    ))]
     #[inline]
     fn printable_ascii_prefix_len_swar(bytes: &[u8]) -> usize {
         let mut offset = 0;
@@ -186,7 +197,10 @@ impl<'a> Performer<'a> {
         offset + Self::printable_ascii_prefix_len_scalar(&bytes[offset..])
     }
 
-    #[cfg(target_pointer_width = "64")]
+    #[cfg(any(
+        test,
+        all(target_pointer_width = "64", not(feature = "bench-scalar-vte-scan"))
+    ))]
     #[inline]
     fn swar_non_printable_ascii_mask(word: u64) -> u64 {
         const ONES: u64 = 0x0101_0101_0101_0101;

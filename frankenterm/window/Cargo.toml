@@ -13,6 +13,7 @@ categories = ["command-line-utilities"]
 
 [dev-dependencies]
 criterion = { workspace = true }
+frankenterm-term.workspace = true
 k9.workspace = true
 
 [[bench]]
