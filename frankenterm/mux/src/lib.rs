@@ -1497,6 +1497,61 @@ impl Mux {
         tab
     }
 
+    /// Remove a pane from the mux registry **without** killing it.
+    ///
+    /// This is the local-only counterpart to [`Mux::remove_pane_internal`]: it
+    /// performs the same registry/bookkeeping cleanup but deliberately does NOT
+    /// call [`Pane::kill`]. For a remote `ClientPane` mirror, `kill` sends
+    /// `Pdu::KillPane` to the server and destroys the *remote* session; here we
+    /// only drop the local mirror. (`ClientPane` has no `Drop` impl that sends a
+    /// kill, so dropping the `Arc` tears down local state without touching the
+    /// remote.)
+    fn remove_pane_local_only(&self, pane_id: PaneId) {
+        log::debug!("removing pane (local-only) {}", pane_id);
+        self.discard_high_rate_alert_state(pane_id);
+        self.discard_client_focus_for_pane(pane_id);
+        self.discard_pending_pane_output_notification(pane_id);
+        if self.panes.write().remove(&pane_id).is_some() {
+            // NB: intentionally NO `pane.kill()` here -- see the doc comment.
+            self.notify(MuxNotification::PaneRemoved(pane_id));
+            self.recompute_pane_count();
+        }
+    }
+
+    /// Drop the LOCAL mirror of a tab without disturbing the remote session.
+    ///
+    /// Mirrors [`Mux::remove_tab`] (registry removal, detach from every window,
+    /// drop the tab's panes, prune now-empty windows) EXCEPT that the panes are
+    /// removed via [`Mux::remove_pane_local_only`], so no `Pdu::KillPane` is
+    /// sent. This is the safety crux of the window-unify feature: when two local
+    /// tabs mirror the SAME remote session, the duplicate's mirror is dropped
+    /// here while the canonical window keeps its mirror and the remote session
+    /// stays alive.
+    pub fn remove_tab_local_only(&self, tab_id: TabId) -> Option<Arc<Tab>> {
+        log::debug!("remove_tab_local_only tab {}", tab_id);
+
+        let tab = self.tabs.write().remove(&tab_id)?;
+
+        if let Some(mut windows) = self.windows.try_write() {
+            for w in windows.values_mut() {
+                w.remove_by_id(tab_id);
+            }
+        }
+
+        let mut pane_ids = vec![];
+        for pos in tab.iter_panes_ignoring_zoom() {
+            pane_ids.push(pos.pane.pane_id());
+        }
+        log::debug!("panes to drop (local-only): {pane_ids:?}");
+        for pane_id in pane_ids {
+            self.remove_pane_local_only(pane_id);
+        }
+        self.recompute_pane_count();
+        self.prune_dead_windows();
+
+        Some(tab)
+    }
+
     pub fn prune_dead_windows(&self) {
         if Activity::count() > 0 {
             log::trace!("prune_dead_windows: Activity::count={}", Activity::count());
@@ -1622,6 +1677,66 @@ impl Mux {
             }
         }
         None
+    }
+
+    /// Move a tab from whichever window currently contains it into
+    /// `dst_window` at position `idx` (appended when `idx` is `None`).
+    ///
+    /// This is a pure *metadata* move: the live `Arc<Tab>` (and all of its
+    /// panes) is preserved in the mux tab registry and merely re-parented
+    /// between the windows' ordered tab lists. No pane is killed and no
+    /// `Pdu::KillPane` is sent -- this is the mechanism the window-unify
+    /// feature uses to relocate non-duplicate tabs onto the canonical window.
+    ///
+    /// Window-lifecycle decisions (closing a now-empty source window) are left
+    /// to the caller; this primitive does not prune. Workspace policy
+    /// (same-workspace-only) is likewise enforced by the planner, not here.
+    pub fn move_tab_between_windows(
+        &self,
+        tab_id: TabId,
+        dst_window: WindowId,
+        idx: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let tab = self
+            .tabs
+            .read()
+            .get(&tab_id)
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} not found in mux"))?;
+        let src_window = self
+            .window_containing_tab(tab_id)
+            .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} is not in any window"))?;
+
+        {
+            let mut windows = self.windows.write();
+            if !windows.contains_key(&dst_window) {
+                return Err(anyhow!(
+                    "move_tab_between_windows: destination window {dst_window} not found"
+                ));
+            }
+            // Detach from the source window's ordered tab list first. When
+            // src == dst this also lets us re-insert at `idx` (a reorder).
+            // `Window::remove_by_id` only touches window-local bookkeeping; it
+            // does NOT kill panes or remove the tab from `self.tabs`.
+            if let Some(win) = windows.get_mut(&src_window) {
+                win.remove_by_id(tab_id);
+            }
+            let dst = windows
+                .get_mut(&dst_window)
+                .expect("destination window presence checked above");
+            let pos = idx.map(|i| i.min(dst.len())).unwrap_or_else(|| dst.len());
+            dst.insert(pos, &tab);
+        }
+
+        // Pane count is unchanged for a within-workspace move; recompute keeps
+        // the per-workspace tallies correct if a caller ever moves across
+        // workspaces.
+        self.recompute_pane_count();
+        self.notify(MuxNotification::TabAddedToWindow {
+            tab_id,
+            window_id: dst_window,
+        });
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
