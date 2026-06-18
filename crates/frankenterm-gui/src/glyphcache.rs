@@ -280,6 +280,14 @@ struct LineKey {
     size: CellMetricKey,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BlankFrameKey {
+    width: usize,
+    height: usize,
+    padding: Option<usize>,
+    scale_down: Option<usize>,
+}
+
 /// A helper struct to implement BitmapImage for ImageDataType while
 /// holding the mutex for the sake of safety.
 struct DecodedImageHandle<'a> {
@@ -748,6 +756,7 @@ pub struct GlyphCache {
     image_cache_retained_bytes: usize,
     image_cache_entry_bytes: AHashMap<[u8; 32], usize>,
     frame_cache: AHashMap<[u8; 32], Sprite>,
+    blank_frame_cache: AHashMap<BlankFrameKey, Sprite>,
     line_glyphs: AHashMap<LineKey, Sprite>,
     pub block_glyphs: AHashMap<SizedBlockKey, Sprite>,
     pub cursor_glyphs: AHashMap<(Option<CursorShape>, u8), Sprite>,
@@ -780,6 +789,7 @@ impl GlyphCache {
             image_cache_retained_bytes: 0,
             image_cache_entry_bytes: AHashMap::new(),
             frame_cache: AHashMap::new(),
+            blank_frame_cache: AHashMap::new(),
             atlas,
             line_glyphs: AHashMap::new(),
             block_glyphs: AHashMap::new(),
@@ -812,6 +822,7 @@ impl GlyphCache {
             image_cache_retained_bytes: 0,
             image_cache_entry_bytes: AHashMap::new(),
             frame_cache: AHashMap::new(),
+            blank_frame_cache: AHashMap::new(),
             atlas,
             line_glyphs: AHashMap::new(),
             block_glyphs: AHashMap::new(),
@@ -1442,6 +1453,7 @@ impl GlyphCache {
 
     fn cached_image_impl(
         frame_cache: &mut AHashMap<[u8; 32], Sprite>,
+        blank_frame_cache: &mut AHashMap<BlankFrameKey, Sprite>,
         atlas: &mut Atlas,
         decoded: &DecodedImage,
         padding: Option<usize>,
@@ -1588,9 +1600,14 @@ impl GlyphCache {
                         frames.current_frame.width, frames.current_frame.height
                     ));
                     frames.load_state = LoadState::Failed;
-                    let frame = Image::new(1, 1);
-                    let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
-                    frame_cache.insert(hash, sprite.clone());
+                    let sprite = Self::cached_blank_frame_sprite(
+                        blank_frame_cache,
+                        atlas,
+                        1,
+                        1,
+                        padding,
+                        scale_down,
+                    )?;
                     return Ok((sprite, next, frames.load_state));
                 };
 
@@ -1609,26 +1626,37 @@ impl GlyphCache {
                                 data.len()
                             ));
                             frames.load_state = LoadState::Failed;
-                            vec![0u8; expected_byte_size]
+                            None
                         } else {
-                            data
+                            Some(data)
                         }
                     }
                     Err(err) => {
                         report_frame_error(format!("frame data error: {err:#}"));
                         frames.load_state = LoadState::Failed;
-                        vec![0u8; expected_byte_size]
+                        None
                     }
                 };
 
-                let frame = Image::from_raw(
-                    frames.current_frame.width,
-                    frames.current_frame.height,
-                    frame_data,
-                );
-                let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
-
-                frame_cache.insert(hash, sprite.clone());
+                let sprite = if let Some(frame_data) = frame_data {
+                    let frame = Image::from_raw(
+                        frames.current_frame.width,
+                        frames.current_frame.height,
+                        frame_data,
+                    );
+                    let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
+                    frame_cache.insert(hash, sprite.clone());
+                    sprite
+                } else {
+                    Self::cached_blank_frame_sprite(
+                        blank_frame_cache,
+                        atlas,
+                        frames.current_frame.width,
+                        frames.current_frame.height,
+                        padding,
+                        scale_down,
+                    )?
+                };
 
                 Ok((
                     sprite,
@@ -1637,6 +1665,30 @@ impl GlyphCache {
                 ))
             }
         }
+    }
+
+    fn cached_blank_frame_sprite(
+        blank_frame_cache: &mut AHashMap<BlankFrameKey, Sprite>,
+        atlas: &mut Atlas,
+        width: usize,
+        height: usize,
+        padding: Option<usize>,
+        scale_down: Option<usize>,
+    ) -> anyhow::Result<Sprite> {
+        let key = BlankFrameKey {
+            width,
+            height,
+            padding,
+            scale_down,
+        };
+        if let Some(sprite) = blank_frame_cache.get(&key) {
+            return Ok(sprite.clone());
+        }
+
+        let frame = Image::new(width, height);
+        let sprite = atlas.allocate_with_padding(&frame, padding, scale_down)?;
+        blank_frame_cache.insert(key, sprite.clone());
+        Ok(sprite)
     }
 
     pub fn cached_image(
@@ -1651,6 +1703,7 @@ impl GlyphCache {
             self.image_cache.get(&hash).map(|decoded| {
                 let result = Self::cached_image_impl(
                     &mut self.frame_cache,
+                    &mut self.blank_frame_cache,
                     &mut self.atlas,
                     decoded,
                     padding,
@@ -1668,6 +1721,7 @@ impl GlyphCache {
         let decoded = DecodedImage::load(image_data);
         let res = Self::cached_image_impl(
             &mut self.frame_cache,
+            &mut self.blank_frame_cache,
             &mut self.atlas,
             &decoded,
             padding,
