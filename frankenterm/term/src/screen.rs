@@ -1273,12 +1273,16 @@ impl Screen {
         let mut line_count = 0usize;
         for (idx, line) in lines.into_iter().enumerate() {
             line_count = idx + 1;
-            line.len().hash(&mut hasher);
-            line.last_cell_was_wrapped().hash(&mut hasher);
-            line.compute_shape_hash().hash(&mut hasher);
+            Self::hash_layout_line(&mut hasher, line);
         }
         line_count.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn hash_layout_line(hasher: &mut DefaultHasher, line: &Line) {
+        line.len().hash(hasher);
+        line.last_cell_was_wrapped().hash(hasher);
+        line.compute_shape_hash().hash(hasher);
     }
 
     fn compute_layout_signature(&self) -> u64 {
@@ -1470,10 +1474,33 @@ impl Screen {
     }
 
     fn rebuild_logical_lines_from_physical(&self, seqno: SequenceNo) -> Vec<LogicalLineForResize> {
+        self.rebuild_logical_lines_from_physical_inner(seqno, None)
+    }
+
+    fn rebuild_logical_lines_from_physical_with_signature(
+        &self,
+        seqno: SequenceNo,
+    ) -> (Vec<LogicalLineForResize>, u64) {
+        let mut hasher = DefaultHasher::new();
+        let logical_lines =
+            self.rebuild_logical_lines_from_physical_inner(seqno, Some(&mut hasher));
+        self.lines.len().hash(&mut hasher);
+        (logical_lines, hasher.finish())
+    }
+
+    fn rebuild_logical_lines_from_physical_inner(
+        &self,
+        seqno: SequenceNo,
+        mut signature_hasher: Option<&mut DefaultHasher>,
+    ) -> Vec<LogicalLineForResize> {
         let mut logical_lines: Vec<LogicalLineForResize> = Vec::with_capacity(self.lines.len());
         let mut logical_line: Option<Line> = None;
 
         for (idx, physical_line) in self.lines.iter().enumerate() {
+            if let Some(hasher) = signature_hasher.as_deref_mut() {
+                Self::hash_layout_line(hasher, physical_line);
+            }
+
             let was_wrapped = physical_line.last_cell_was_wrapped();
             let mut line = if logical_line.is_some() || was_wrapped {
                 let mut line = physical_line.clone();
@@ -1573,7 +1600,6 @@ impl Screen {
 
     fn logical_wraps_for_resize(
         &mut self,
-        source_signature: u64,
         physical_cols: usize,
         seqno: SequenceNo,
     ) -> (WrappedResizeLines, usize, bool, bool, usize) {
@@ -1584,8 +1610,13 @@ impl Screen {
         let mut logical_cache_hit = false;
         let mut wrap_cache_hit = false;
         let mut cache = self.rewrap_cache.take();
+        let source_signature = if cache.is_some() {
+            Some(self.compute_layout_signature())
+        } else {
+            None
+        };
 
-        if let Some(entry) = cache.as_mut() {
+        if let (Some(entry), Some(source_signature)) = (cache.as_mut(), source_signature) {
             if entry.source_signature == source_signature {
                 logical_cache_hit = true;
                 let logical_count = entry.logical_lines.len();
@@ -1621,7 +1652,13 @@ impl Screen {
             }
         }
 
-        let logical_lines = self.rebuild_logical_lines_from_physical(seqno);
+        let (logical_lines, source_signature) = match source_signature {
+            Some(source_signature) => (
+                self.rebuild_logical_lines_from_physical(seqno),
+                source_signature,
+            ),
+            None => self.rebuild_logical_lines_from_physical_with_signature(seqno),
+        };
         let logical_count = logical_lines.len();
         self.wrap_logical_lines_for_resize(
             &logical_lines,
@@ -1887,10 +1924,9 @@ impl Screen {
                 .unwrap_or(original_len)
                 .max(original_len)
         };
-        let source_signature = self.compute_layout_signature();
         let logical_cursor = self.logical_cursor_from_physical(cursor_x, cursor_y);
         let (wrapped, logical_count, logical_cache_hit, wrap_cache_hit, cache_entries) =
-            self.logical_wraps_for_resize(source_signature, physical_cols, seqno);
+            self.logical_wraps_for_resize(physical_cols, seqno);
         match &wrapped {
             WrappedResizeLines::Cached(wrapped) => self.rebuild_rewrap_row_prefix_scratch(wrapped),
             WrappedResizeLines::Scratch { logical_count } => {
@@ -3758,6 +3794,29 @@ mod tests {
 
         assert_eq!(cached_cursor, direct_cursor);
         assert_eq!(cached_lines, direct_lines);
+    }
+
+    #[test]
+    fn rebuild_logical_lines_with_signature_matches_standalone_signature() {
+        let attrs = CellAttributes::blank();
+        let mut screen = test_screen(4, 6, 96);
+        screen.lines = VecDeque::from(vec![
+            Line::from_text_with_wrapped_last_col("abcdef", &attrs, 0),
+            Line::from_text("ghij", &attrs, 0, None),
+            Line::from_text("kl", &attrs, 0, None),
+        ]);
+
+        let expected_signature = screen.compute_layout_signature();
+        let (logical_lines, fused_signature) =
+            screen.rebuild_logical_lines_from_physical_with_signature(2);
+
+        assert_eq!(fused_signature, expected_signature);
+        assert_eq!(logical_lines.len(), 2);
+        assert!(matches!(logical_lines[0], LogicalLineForResize::Owned(_)));
+        assert!(matches!(
+            logical_lines[1],
+            LogicalLineForResize::PhysicalLine(2)
+        ));
     }
 
     #[test]
