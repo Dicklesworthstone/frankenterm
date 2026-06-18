@@ -46,9 +46,10 @@ fn should_shape_cluster_with_paragraph_context(cluster: &CellCluster) -> bool {
 }
 
 fn any_cluster_needs_paragraph_context(cell_clusters: &[CellCluster]) -> bool {
-    cell_clusters
-        .iter()
-        .any(should_shape_cluster_with_paragraph_context)
+    cell_clusters.len() > 1
+        && cell_clusters
+            .iter()
+            .any(should_shape_cluster_with_paragraph_context)
 }
 
 impl crate::TermWindow {
@@ -958,6 +959,7 @@ impl crate::TermWindow {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use termwiz::cell::Cell;
     use termwiz::hyperlink::Hyperlink;
     use termwiz::surface::{Line, SEQ_ZERO};
 
@@ -987,12 +989,28 @@ mod tests {
 
         let ascii = Line::from_text("link text", &attrs, SEQ_ZERO, None);
         let ascii_clusters = ascii.cluster(None);
-        assert!(any_cluster_needs_paragraph_context(&ascii_clusters));
+        assert_eq!(ascii_clusters.len(), 1);
+        assert!(!any_cluster_needs_paragraph_context(&ascii_clusters));
         assert!(
             ascii_clusters
                 .iter()
                 .all(should_shape_cluster_with_paragraph_context)
         );
+
+        let mut bold_attrs = CellAttributes::default();
+        bold_attrs.set_intensity(wezterm_term::Intensity::Bold);
+        let ascii_split = Line::from_cells(
+            vec![
+                Cell::new('l', attrs.clone()),
+                Cell::new('i', attrs.clone()),
+                Cell::new('n', bold_attrs.clone()),
+                Cell::new('k', bold_attrs),
+            ],
+            SEQ_ZERO,
+        );
+        let ascii_split_clusters = ascii_split.cluster(None);
+        assert!(ascii_split_clusters.len() > 1);
+        assert!(any_cluster_needs_paragraph_context(&ascii_split_clusters));
 
         let mut hyperlink_attrs = CellAttributes::default();
         hyperlink_attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
