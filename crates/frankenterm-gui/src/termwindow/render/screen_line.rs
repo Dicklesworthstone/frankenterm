@@ -456,7 +456,7 @@ impl crate::TermWindow {
             }
         }
 
-        let mut overlay_images = vec![];
+        let mut overlay_images = None;
 
         // Number of cells we've rendered, starting from the edge of the line
         let mut visual_cell_idx = 0;
@@ -469,7 +469,7 @@ impl crate::TermWindow {
         for item in shaped.iter() {
             let cluster = &item.cluster;
             let glyph_info = &item.glyph_info;
-            let images = cluster.attrs.images().unwrap_or_else(|| vec![]);
+            let images = cluster.attrs.images();
             let valign_adjust = match cluster.attrs.vertical_align() {
                 termwiz::cell::VerticalAlign::BaseLine => 0.,
                 termwiz::cell::VerticalAlign::SuperScript => {
@@ -501,18 +501,20 @@ impl crate::TermWindow {
                 }
 
                 for glyph_idx in 0..info.pos.num_cells as usize {
-                    for img in &images {
-                        if img.z_index() < 0 {
-                            self.populate_image_quad(
-                                &img,
-                                gl_state,
-                                layers,
-                                0,
-                                visual_cell_idx + glyph_idx,
-                                &params,
-                                hsv,
-                                item.fg_color,
-                            )?;
+                    if let Some(images) = images.as_ref() {
+                        for img in images {
+                            if img.z_index() < 0 {
+                                self.populate_image_quad(
+                                    img,
+                                    gl_state,
+                                    layers,
+                                    0,
+                                    visual_cell_idx + glyph_idx,
+                                    &params,
+                                    hsv,
+                                    item.fg_color,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -696,13 +698,15 @@ impl crate::TermWindow {
                 }
 
                 for glyph_idx in 0..info.pos.num_cells as usize {
-                    for img in &images {
-                        if img.z_index() >= 0 {
-                            overlay_images.push((
-                                visual_cell_idx + glyph_idx,
-                                img.clone(),
-                                item.fg_color,
-                            ));
+                    if let Some(images) = images.as_ref() {
+                        for img in images {
+                            if img.z_index() >= 0 {
+                                overlay_images.get_or_insert_with(Vec::new).push((
+                                    visual_cell_idx + glyph_idx,
+                                    img.clone(),
+                                    item.fg_color,
+                                ));
+                            }
                         }
                     }
                 }
@@ -727,18 +731,20 @@ impl crate::TermWindow {
             }
         }
 
-        for (cell_idx, img, glyph_color) in overlay_images {
-            self.populate_image_quad(
-                &img,
-                gl_state,
-                layers,
-                2,
-                phys(cell_idx, num_cols, direction),
-                &params,
-                hsv,
-                glyph_color,
-            )
-            .context("populate_image_quad")?;
+        if let Some(overlay_images) = overlay_images {
+            for (cell_idx, img, glyph_color) in overlay_images {
+                self.populate_image_quad(
+                    &img,
+                    gl_state,
+                    layers,
+                    2,
+                    phys(cell_idx, num_cols, direction),
+                    &params,
+                    hsv,
+                    glyph_color,
+                )
+                .context("populate_image_quad")?;
+            }
         }
 
         metrics::histogram!("render_screen_line").record(start.elapsed());
