@@ -12,6 +12,13 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use frankenterm_gui::glyph_quad_staging::{
+    GlyphQuadSoaBuffers, GlyphQuadStagingInstance, VERTICES_PER_GLYPH_QUAD,
+    aos_glyph_quad_vertices, expand_glyph_quad_soa_buffers, moonshot_instanced_glyph_quads_enabled,
+};
+use frankenterm_gui::glyph_run_interning::{
+    GlyphRunProbeGlyph, glyph_run_interning_enabled, glyph_run_probe_iteration,
+};
 use frankenterm_gui::headless_render::render_headless;
 use frankenterm_gui::renderer_slo::headless::{
     known_key_headless_input, trace_from_headless_frame,
@@ -38,6 +45,147 @@ fn bench_known_key_input_to_headless_frame(c: &mut Criterion) {
             black_box(frame.rgba.len());
         });
     });
+}
+
+fn bench_ft_3r0yk_soa_quad_staging_toggle(c: &mut Criterion) {
+    let fixture = SoaQuadBenchFixture::new(192);
+    c.bench_function("ft_3r0yk/soa_quad_staging_toggle", |b| {
+        b.iter(|| {
+            let vertex_count = if moonshot_instanced_glyph_quads_enabled() {
+                expand_glyph_quad_soa_buffers(black_box(fixture.buffers())).len()
+            } else {
+                fixture.expand_aos_baseline_len()
+            };
+            black_box(vertex_count);
+        });
+    });
+}
+
+fn bench_ft_egok5_glyph_run_interning_toggle(c: &mut Criterion) {
+    let glyphs = glyph_run_probe_fixture(64);
+    c.bench_function("ft_egok5/glyph_run_interning_toggle", |b| {
+        b.iter(|| {
+            let retained = if glyph_run_interning_enabled() {
+                glyph_run_probe_iteration(black_box(&glyphs), 16)
+            } else {
+                glyph_run_probe_disabled_iteration(black_box(&glyphs), 16)
+            };
+            black_box(retained);
+        });
+    });
+}
+
+struct SoaQuadBenchFixture {
+    instances: Vec<GlyphQuadStagingInstance>,
+    positions: Vec<[f32; 4]>,
+    tex_rects: Vec<[f32; 4]>,
+    fg_colors: Vec<[f32; 4]>,
+    alt_colors: Vec<[f32; 4]>,
+    hsv: Vec<[f32; 3]>,
+    has_color: Vec<f32>,
+    mix_values: Vec<f32>,
+}
+
+impl SoaQuadBenchFixture {
+    fn new(len: usize) -> Self {
+        let mut instances = Vec::with_capacity(len);
+        let mut positions = Vec::with_capacity(len);
+        let mut tex_rects = Vec::with_capacity(len);
+        let mut fg_colors = Vec::with_capacity(len);
+        let mut alt_colors = Vec::with_capacity(len);
+        let mut hsv = Vec::with_capacity(len);
+        let mut has_color = Vec::with_capacity(len);
+        let mut mix_values = Vec::with_capacity(len);
+
+        for idx in 0..len {
+            let col = (idx % 96) as f32;
+            let row = (idx / 96) as f32;
+            let left = -384.0 + col * 8.0;
+            let top = -220.0 + row * 16.0;
+            let tex_left = ((idx % 32) as f32) / 64.0;
+            let tex_top = ((idx / 32) as f32) / 64.0;
+            let instance = GlyphQuadStagingInstance::new(
+                [left, top, left + 8.0, top + 16.0],
+                [tex_left, tex_left + 0.015625, tex_top, tex_top + 0.03125],
+                [
+                    0.20 + (idx % 5) as f32 * 0.03,
+                    0.40 + (idx % 7) as f32 * 0.02,
+                    0.72,
+                    1.0,
+                ],
+                [0.88, 0.18 + (idx % 3) as f32 * 0.08, 0.12, 0.70],
+                [1.0, 1.0 - (idx % 4) as f32 * 0.05, 0.90],
+                idx % 11 == 0,
+                (idx % 8) as f32 / 8.0,
+            );
+            positions.push(instance.position);
+            tex_rects.push(instance.tex);
+            fg_colors.push(instance.fg_color);
+            alt_colors.push(instance.alt_color);
+            hsv.push(instance.hsv);
+            has_color.push(instance.has_color);
+            mix_values.push(instance.mix_value);
+            instances.push(instance);
+        }
+
+        Self {
+            instances,
+            positions,
+            tex_rects,
+            fg_colors,
+            alt_colors,
+            hsv,
+            has_color,
+            mix_values,
+        }
+    }
+
+    fn buffers(&self) -> GlyphQuadSoaBuffers<'_> {
+        GlyphQuadSoaBuffers {
+            positions: &self.positions,
+            tex_rects: &self.tex_rects,
+            fg_colors: &self.fg_colors,
+            alt_colors: &self.alt_colors,
+            hsv: &self.hsv,
+            has_color: &self.has_color,
+            mix_values: &self.mix_values,
+        }
+    }
+
+    fn expand_aos_baseline_len(&self) -> usize {
+        let mut vertices = Vec::with_capacity(self.instances.len() * VERTICES_PER_GLYPH_QUAD);
+        for instance in &self.instances {
+            vertices.extend_from_slice(&aos_glyph_quad_vertices(*instance));
+        }
+        vertices.len()
+    }
+}
+
+fn glyph_run_probe_fixture(len: u32) -> Vec<GlyphRunProbeGlyph> {
+    (0..len)
+        .map(|idx| GlyphRunProbeGlyph {
+            glyph_pos: 400 + idx,
+            cluster: idx,
+            font_idx: (idx % 3) as usize,
+            x_advance_bits: (8.0f64 + f64::from(idx % 7) / 16.0).to_bits(),
+            x_offset_bits: (f64::from(idx % 5) / 32.0).to_bits(),
+            glyph_ptr: 0x1000 + idx as usize * 64,
+            bitmap_pixel_width: 8 + idx % 11,
+            bearing_x_bits: (1.0f64 + f64::from(idx % 9) / 64.0).to_bits(),
+        })
+        .collect()
+}
+
+fn glyph_run_probe_disabled_iteration(glyphs: &[GlyphRunProbeGlyph], repeats: usize) -> usize {
+    let mut retained = 0usize;
+    for _ in 0..repeats {
+        let run = glyphs.to_vec();
+        retained = retained
+            .wrapping_add(run.len())
+            .wrapping_add(run.capacity());
+        black_box(run);
+    }
+    retained
 }
 
 fn bench_config() -> Criterion {
@@ -138,6 +286,9 @@ fn now_ms() -> u64 {
 criterion_group!(
     name = benches;
     config = bench_config();
-    targets = bench_known_key_input_to_headless_frame
+    targets =
+        bench_known_key_input_to_headless_frame,
+        bench_ft_3r0yk_soa_quad_staging_toggle,
+        bench_ft_egok5_glyph_run_interning_toggle,
 );
 criterion_main!(benches);

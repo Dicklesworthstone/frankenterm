@@ -1,5 +1,3 @@
-#![allow(unexpected_cfgs)]
-
 use crate::customglyph::BlockKey;
 use crate::glyphcache::CachedGlyph;
 use ahash::{AHashMap, AHasher};
@@ -12,15 +10,6 @@ use std::rc::Rc;
 
 const SHAPED_RUN_INTERNER_MAX_ENTRIES: usize = 8192;
 const SHAPED_RUN_INTERNER_MAX_COLLISIONS: usize = 4;
-
-#[cfg(ft_disable_glyph_run_interning)]
-const GLYPH_RUN_INTERNING_CFG_ENABLED: bool = false;
-
-#[cfg(not(ft_disable_glyph_run_interning))]
-const GLYPH_RUN_INTERNING_CFG_ENABLED: bool = true;
-
-static GLYPH_RUN_INTERNING_ENV_ENABLED: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var_os("FT_DISABLE_GLYPH_RUN_INTERNING").is_none());
 
 thread_local! {
     static SHAPED_RUN_INTERNER: RefCell<ShapedRunInterner> =
@@ -65,8 +54,7 @@ impl ShapedInfo {
         }
 
         let run = build_shaped_infos(infos, glyphs);
-        SHAPED_RUN_INTERNER
-            .with(|interner| interner.borrow_mut().insert(key, infos, glyphs, &run));
+        SHAPED_RUN_INTERNER.with(|interner| interner.borrow_mut().insert(key, infos, glyphs, &run));
         run
     }
 }
@@ -187,7 +175,7 @@ impl ShapedRunGlyph {
 
 #[inline]
 fn glyph_run_interning_enabled() -> bool {
-    GLYPH_RUN_INTERNING_CFG_ENABLED && *GLYPH_RUN_INTERNING_ENV_ENABLED
+    frankenterm_gui::glyph_run_interning::glyph_run_interning_enabled()
 }
 
 fn build_shaped_infos(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedInfo> {
@@ -241,7 +229,10 @@ fn shaped_run_signature(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> Vec<
 
 #[inline]
 fn glyph_bitmap_pixel_width(glyph: &CachedGlyph) -> u32 {
-    glyph.texture.as_ref().map_or(0, |t| t.coords.width() as u32)
+    glyph
+        .texture
+        .as_ref()
+        .map_or(0, |t| t.coords.width() as u32)
 }
 
 /// We'd like to avoid allocating when resolving from the cache

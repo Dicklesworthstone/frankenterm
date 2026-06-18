@@ -45,6 +45,8 @@ pub fn checked_stable_row_range_from_top(
 }
 
 pub mod glyph_quad_staging {
+    use std::sync::LazyLock;
+
     pub const VERTICES_PER_GLYPH_QUAD: usize = 4;
 
     const V_TOP_LEFT: usize = 0;
@@ -53,6 +55,23 @@ pub mod glyph_quad_staging {
     const V_BOT_RIGHT: usize = 3;
     const GLYPH_QUAD_HAS_COLOR: f32 = 0.0;
     const COLOR_GLYPH_QUAD_HAS_COLOR: f32 = 1.0;
+    const FT_DISABLE_MOONSHOT_INSTANCED_GLYPH_QUADS: &str =
+        "FT_DISABLE_MOONSHOT_INSTANCED_GLYPH_QUADS";
+    const FT_MOONSHOT_INSTANCED_GLYPH_QUADS: &str = "FT_MOONSHOT_INSTANCED_GLYPH_QUADS";
+
+    static MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        if std::env::var_os(FT_DISABLE_MOONSHOT_INSTANCED_GLYPH_QUADS).is_some() {
+            return false;
+        }
+
+        cfg!(feature = "headless-render")
+            || std::env::var_os(FT_MOONSHOT_INSTANCED_GLYPH_QUADS).is_some()
+    });
+
+    #[must_use]
+    pub fn moonshot_instanced_glyph_quads_enabled() -> bool {
+        *MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED
+    }
 
     #[repr(C)]
     #[derive(Copy, Clone, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -422,6 +441,166 @@ pub mod glyph_quad_staging {
                 ),
                 &expected_vertices,
             ));
+        }
+    }
+}
+
+#[allow(unexpected_cfgs)]
+pub mod glyph_run_interning {
+    use ahash::{AHashMap, AHasher};
+    use std::hash::{Hash, Hasher};
+    use std::rc::Rc;
+    use std::sync::LazyLock;
+
+    const SHAPED_RUN_INTERNER_MAX_ENTRIES: usize = 8192;
+    const SHAPED_RUN_INTERNER_MAX_COLLISIONS: usize = 4;
+
+    #[cfg(ft_disable_glyph_run_interning)]
+    const GLYPH_RUN_INTERNING_CFG_ENABLED: bool = false;
+
+    #[cfg(not(ft_disable_glyph_run_interning))]
+    const GLYPH_RUN_INTERNING_CFG_ENABLED: bool = true;
+
+    static GLYPH_RUN_INTERNING_ENV_ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FT_DISABLE_GLYPH_RUN_INTERNING").is_none());
+
+    #[must_use]
+    #[inline]
+    pub fn glyph_run_interning_enabled() -> bool {
+        GLYPH_RUN_INTERNING_CFG_ENABLED && *GLYPH_RUN_INTERNING_ENV_ENABLED
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub struct GlyphRunProbeGlyph {
+        pub glyph_pos: u32,
+        pub cluster: u32,
+        pub font_idx: usize,
+        pub x_advance_bits: u64,
+        pub x_offset_bits: u64,
+        pub glyph_ptr: usize,
+        pub bitmap_pixel_width: u32,
+        pub bearing_x_bits: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    struct GlyphRunProbeKey {
+        hash: u64,
+        len: usize,
+    }
+
+    #[derive(Default)]
+    pub struct GlyphRunProbeInterner {
+        runs: AHashMap<GlyphRunProbeKey, Vec<Rc<[GlyphRunProbeGlyph]>>>,
+        entries: usize,
+    }
+
+    impl GlyphRunProbeInterner {
+        #[must_use]
+        pub fn intern_or_build(
+            &mut self,
+            glyphs: &[GlyphRunProbeGlyph],
+        ) -> Rc<[GlyphRunProbeGlyph]> {
+            if !glyph_run_interning_enabled() || glyphs.len() < 2 {
+                return Rc::from(glyphs.to_vec().into_boxed_slice());
+            }
+
+            let key = glyph_run_probe_key(glyphs);
+            if let Some(run) = self.lookup(key, glyphs) {
+                return run;
+            }
+
+            let run: Rc<[GlyphRunProbeGlyph]> = Rc::from(glyphs.to_vec().into_boxed_slice());
+            self.insert(key, Rc::clone(&run));
+            run
+        }
+
+        fn lookup(
+            &self,
+            key: GlyphRunProbeKey,
+            glyphs: &[GlyphRunProbeGlyph],
+        ) -> Option<Rc<[GlyphRunProbeGlyph]>> {
+            self.runs
+                .get(&key)
+                .and_then(|runs| runs.iter().find(|run| run.as_ref() == glyphs).cloned())
+        }
+
+        fn insert(&mut self, key: GlyphRunProbeKey, run: Rc<[GlyphRunProbeGlyph]>) {
+            if self.entries >= SHAPED_RUN_INTERNER_MAX_ENTRIES {
+                self.runs.clear();
+                self.entries = 0;
+            }
+
+            let bucket = self.runs.entry(key).or_default();
+            if bucket.len() >= SHAPED_RUN_INTERNER_MAX_COLLISIONS {
+                bucket.swap_remove(0);
+                self.entries = self.entries.saturating_sub(1);
+            }
+
+            bucket.push(run);
+            self.entries += 1;
+        }
+    }
+
+    #[must_use]
+    pub fn glyph_run_probe_iteration(glyphs: &[GlyphRunProbeGlyph], repeats: usize) -> usize {
+        let mut interner = GlyphRunProbeInterner::default();
+        let mut retained = 0usize;
+        for _ in 0..repeats {
+            let run = interner.intern_or_build(glyphs);
+            retained = retained
+                .wrapping_add(run.len())
+                .wrapping_add(Rc::strong_count(&run));
+        }
+        retained
+    }
+
+    fn glyph_run_probe_key(glyphs: &[GlyphRunProbeGlyph]) -> GlyphRunProbeKey {
+        let mut hasher = AHasher::default();
+        glyphs.len().hash(&mut hasher);
+        glyphs.hash(&mut hasher);
+        GlyphRunProbeKey {
+            hash: hasher.finish(),
+            len: glyphs.len(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            GlyphRunProbeGlyph, GlyphRunProbeInterner, glyph_run_interning_enabled,
+            glyph_run_probe_iteration,
+        };
+        use std::rc::Rc;
+
+        fn probe_glyphs() -> Vec<GlyphRunProbeGlyph> {
+            (0..8)
+                .map(|idx| GlyphRunProbeGlyph {
+                    glyph_pos: 40 + idx,
+                    cluster: idx,
+                    font_idx: 1,
+                    x_advance_bits: (8.0f64 + f64::from(idx) / 16.0).to_bits(),
+                    x_offset_bits: (f64::from(idx) / 32.0).to_bits(),
+                    glyph_ptr: 0x1000 + idx as usize * 32,
+                    bitmap_pixel_width: 9 + idx,
+                    bearing_x_bits: (1.0f64 + f64::from(idx) / 64.0).to_bits(),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn glyph_run_probe_hits_when_interning_enabled() {
+            assert!(
+                glyph_run_interning_enabled(),
+                "glyph-run interning must be enabled for the bench gate"
+            );
+            let glyphs = probe_glyphs();
+            let mut interner = GlyphRunProbeInterner::default();
+
+            let miss = interner.intern_or_build(&glyphs);
+            let hit = interner.intern_or_build(&glyphs);
+
+            assert!(Rc::ptr_eq(&miss, &hit));
+            assert!(glyph_run_probe_iteration(&glyphs, 4) >= glyphs.len());
         }
     }
 }

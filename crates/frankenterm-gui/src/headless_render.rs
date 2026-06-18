@@ -316,10 +316,9 @@ async fn render_headless_async(
 ) -> Result<HeadlessFrame, HeadlessRenderError> {
     let started = Instant::now();
     let force_software = env_flag(FORCE_SOFTWARE_ENV);
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
-        ..Default::default()
-    });
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = wgpu::Backends::all();
+    let instance = wgpu::Instance::new(descriptor);
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: if force_software {
@@ -343,6 +342,7 @@ async fn render_headless_async(
         .request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
             label: Some("frankenterm-gui headless render device"),
             memory_hints: Default::default(),
             trace: wgpu::Trace::Off,
@@ -411,6 +411,7 @@ async fn render_headless_async(
             label: Some("frankenterm-gui headless clear pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &target_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -425,6 +426,7 @@ async fn render_headless_async(
             depth_stencil_attachment: None,
             occlusion_query_set: None,
             timestamp_writes: None,
+            multiview_mask: None,
         });
     }
     encoder.copy_texture_to_texture(

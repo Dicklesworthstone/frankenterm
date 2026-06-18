@@ -23,11 +23,12 @@ use frankenterm_core::wayland_direct_scanout::{
 };
 use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex,
+    moonshot_instanced_glyph_quads_enabled as lib_moonshot_instanced_glyph_quads_enabled,
     visit_expanded_glyph_quad_soa_vertices,
 };
 use std::cell::RefCell;
 use std::fmt;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 use window::bitmaps::{Texture2d, TextureRect, validate_texture_readback_request};
@@ -40,8 +41,6 @@ use window::{BitmapImage, Dimensions, Rect, Window};
 
 const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-static MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED: OnceLock<bool> = OnceLock::new();
-
 /// Runtime gate for the ft-3r0yk SoA glyph-quad experiment.
 ///
 /// `input_to_photon` is a `headless-render` bench, so that feature exercises the
@@ -50,14 +49,7 @@ static MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED: OnceLock<bool> = OnceLock::new();
 /// immediate fallback without a rebuild.
 #[must_use]
 pub fn moonshot_instanced_glyph_quads_enabled() -> bool {
-    *MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED.get_or_init(|| {
-        if std::env::var_os("FT_DISABLE_MOONSHOT_INSTANCED_GLYPH_QUADS").is_some() {
-            return false;
-        }
-
-        cfg!(feature = "headless-render")
-            || std::env::var_os("FT_MOONSHOT_INSTANCED_GLYPH_QUADS").is_some()
-    })
+    lib_moonshot_instanced_glyph_quads_enabled()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
