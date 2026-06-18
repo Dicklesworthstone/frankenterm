@@ -1,9 +1,17 @@
-//! Post-incident feedback loop automation.
+//! Post-incident feedback loop — SIMULATED contract-shape harness.
 //!
 //! Bead: ft-og6q6.7.6
 //!
-//! Automates: incident trace → regression artifact → tracking bead → notification.
-//! Ensures every resolved incident becomes a regression test in the replay corpus.
+//! Models the intended post-incident pipeline shape (incident trace →
+//! regression artifact → tracking bead → notification) as a dry-run.
+//! `execute_pipeline` validates its input and returns canned per-step success
+//! results (see the "Simulated Pipeline Execution" section); it performs NO
+//! real work — it harvests no artifact, registers no bead, and sends no
+//! notification — and is not wired into any production path (nothing outside
+//! tests constructs `PostIncidentInput` or invokes it). Wiring the five steps
+//! to the replay artifact registry / `br` / webhook is future work. (ft-0kplz:
+//! corrected from an earlier doc that claimed it "automates" the loop and
+//! "ensures every resolved incident becomes a regression test".)
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
