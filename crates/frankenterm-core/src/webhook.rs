@@ -1,8 +1,13 @@
 //! Webhook notification delivery.
 //!
 //! Delivers event notifications to external services via HTTP webhooks
-//! with configurable payload templates, circuit breaker protection,
-//! and retry with exponential backoff.
+//! with configurable payload templates. Delivery is single-attempt and
+//! best-effort: each matched endpoint is sent exactly once per event, with
+//! no retry, no exponential backoff, and no circuit-breaker isolation. A
+//! failed POST (5xx / connection refused) is recorded once as not-accepted
+//! and is not re-attempted. (ft-37q59: corrected from an earlier doc that
+//! advertised circuit-breaker protection and retry/backoff; the crate's
+//! `retry.rs` / `circuit_breaker.rs` are not wired into this path.)
 //!
 //! # Architecture
 //!
@@ -11,8 +16,7 @@
 //!                    ↓ (if Send)
 //!            WebhookDispatcher
 //!            ├── render payload (generic/slack/discord)
-//!            ├── check circuit breaker
-//!            └── send via WebhookTransport (with retry)
+//!            └── send via WebhookTransport (single-shot, no retry)
 //! ```
 //!
 //! # Transport Abstraction
@@ -337,8 +341,9 @@ pub trait WebhookTransport: Send + Sync {
 
 /// Dispatches webhook notifications to configured endpoints.
 ///
-/// Combines endpoint matching, template rendering, and delivery with
-/// circuit breaker protection.
+/// Combines endpoint matching, template rendering, and single-attempt
+/// best-effort delivery (no retry/backoff or circuit breaker — see the
+/// module docs).
 pub struct WebhookDispatcher {
     endpoints: Vec<WebhookEndpointConfig>,
     transport: Box<dyn WebhookTransport>,
