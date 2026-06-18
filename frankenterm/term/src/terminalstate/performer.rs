@@ -1666,4 +1666,105 @@ mod tests {
             }
         }
     }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn swar_prefix_scan_matches_scalar_on_adversarial_boundaries() {
+        let fixed_cases: &[(&str, &[u8])] = &[
+            ("empty", b""),
+            ("single_space", b" "),
+            ("single_tilde", b"~"),
+            ("single_nul", b"\0"),
+            ("single_us", b"\x1f"),
+            ("single_del", b"\x7f"),
+            ("single_non_ascii", b"\x80"),
+        ];
+        for (name, bytes) in fixed_cases {
+            assert_eq!(
+                Performer::printable_ascii_prefix_len_swar(bytes),
+                Performer::printable_ascii_prefix_len_scalar(bytes),
+                "SWAR prefix length diverged from scalar for {name}"
+            );
+        }
+
+        for run_len in 0..=17 {
+            let printable_run = vec![b'x'; run_len];
+            assert_eq!(
+                Performer::printable_ascii_prefix_len_swar(&printable_run),
+                Performer::printable_ascii_prefix_len_scalar(&printable_run),
+                "SWAR prefix length diverged for printable tail length {run_len}"
+            );
+
+            for (name, marker) in [
+                ("nul", b"\0".as_slice()),
+                ("lf", b"\n".as_slice()),
+                ("del", b"\x7f".as_slice()),
+                ("non_ascii", b"\xc3".as_slice()),
+            ] {
+                let mut bytes = printable_run.clone();
+                bytes.extend_from_slice(marker);
+                assert_eq!(
+                    Performer::printable_ascii_prefix_len_swar(&bytes),
+                    Performer::printable_ascii_prefix_len_scalar(&bytes),
+                    "SWAR prefix length diverged for {name} after printable run length {run_len}"
+                );
+            }
+        }
+
+        for (name, run_len, marker) in [
+            ("utf8_two_byte_split_at_8", 7, b"\xc3\xa9".as_slice()),
+            ("utf8_three_byte_split_at_8", 6, b"\xe2\x82\xac".as_slice()),
+            (
+                "utf8_four_byte_split_at_16",
+                15,
+                b"\xf0\x9f\x9a\x80".as_slice(),
+            ),
+            (
+                "utf8_first_byte_at_word_boundary",
+                8,
+                b"\xc3\xa9".as_slice(),
+            ),
+            ("control_at_word_boundary", 8, b"\x1b".as_slice()),
+            ("non_ascii_at_word_boundary", 16, b"\x80".as_slice()),
+        ] {
+            let mut bytes = vec![b'a'; run_len];
+            bytes.extend_from_slice(marker);
+            assert_eq!(
+                Performer::printable_ascii_prefix_len_swar(&bytes),
+                Performer::printable_ascii_prefix_len_scalar(&bytes),
+                "SWAR prefix length diverged for {name}"
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn swar_non_printable_mask_matches_scalar_for_both_byte_orders() {
+        assert_eq!(
+            Performer::swar_non_printable_ascii_mask(u64::from_le_bytes(*b"ABCDEFGH")),
+            0
+        );
+        assert_eq!(
+            Performer::swar_non_printable_ascii_mask(u64::from_be_bytes(*b"ABCDEFGH")),
+            0
+        );
+
+        for pos in 0..8 {
+            for byte in [0x00, 0x1f, 0x20, 0x7e, 0x7f, 0x80, 0xc3, 0xff] {
+                let mut bytes = [b'A'; 8];
+                bytes[pos] = byte;
+                let expected = bytes.iter().any(|byte| !matches!(*byte, 0x20..=0x7e));
+                assert_eq!(
+                    Performer::swar_non_printable_ascii_mask(u64::from_le_bytes(bytes)) != 0,
+                    expected,
+                    "little-endian SWAR mask diverged at byte position {pos} for byte {byte:#04x}"
+                );
+                assert_eq!(
+                    Performer::swar_non_printable_ascii_mask(u64::from_be_bytes(bytes)) != 0,
+                    expected,
+                    "big-endian SWAR mask diverged at byte position {pos} for byte {byte:#04x}"
+                );
+            }
+        }
+    }
 }
