@@ -1261,14 +1261,45 @@ impl Line {
     }
 
     pub fn fill_range(&mut self, cols: Range<usize>, cell: &Cell, seqno: SequenceNo) {
-        if self.len() == 0 && *cell == Cell::blank() {
+        if cols.start >= cols.end {
+            return;
+        }
+
+        let is_default_blank = *cell == Cell::blank();
+        let current_len = self.len();
+        if is_default_blank && (current_len == 0 || cols.start >= current_len) {
             // We would be filling it with blanks only to prune
             // them all away again before we return; NOP
             return;
         }
-        for x in cols {
-            // FIXME: we can skip the look-back for second and subsequent iterations
-            self.set_cell_impl(x, cell.clone(), true, seqno);
+
+        let start = cols.start;
+        let end = if is_default_blank {
+            cols.end.min(current_len)
+        } else {
+            cols.end
+        };
+        let Some(width) = end.checked_sub(start) else {
+            return;
+        };
+        if width == 0 || checked_materialized_end(start, width).is_none() {
+            return;
+        }
+
+        self.invalidate_implicit_hyperlinks(seqno);
+        self.invalidate_zones();
+        self.update_last_change_seqno(seqno);
+        if cell.attrs().hyperlink().is_some() {
+            self.bits |= LineBits::HAS_HYPERLINK;
+        }
+
+        self.invalidate_grapheme_at_or_before(start);
+        {
+            let cells = self.coerce_vec_storage();
+            if end > cells.len() {
+                cells.resize_with(end, Cell::blank);
+            }
+            cells[start..end].fill(cell.clone());
         }
         self.prune_trailing_blanks(seqno);
     }
