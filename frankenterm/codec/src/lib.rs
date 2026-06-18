@@ -16,7 +16,7 @@
 // smol Async streams into codec async APIs, mixed graphs must continue to use
 // the smol path until those callers migrate.
 
-use anyhow::{bail, Context as _, Error};
+use anyhow::{Context as _, Error, bail};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, TerminalSize};
@@ -89,7 +89,7 @@ pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize;
 /// range-checked, the chunk cache is capped, and reconstructed output is capped
 /// at [`MAX_PDU_SIZE`].
 pub mod cdc_dedup {
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
     use std::collections::HashMap;
     use std::convert::TryFrom;
 
@@ -176,12 +176,18 @@ pub mod cdc_dedup {
         let mut shift = 0u32;
         let mut i = pos;
         loop {
-            let byte = *data.get(i).ok_or_else(|| anyhow::anyhow!("cdc: truncated leb128"))?;
+            let byte = *data
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("cdc: truncated leb128"))?;
             i += 1;
             if shift >= 64 {
                 bail!("cdc: leb128 overflow");
             }
-            value |= u64::from(byte & 0x7f) << shift;
+            let payload = u64::from(byte & 0x7f);
+            if payload > (u64::MAX >> shift) {
+                bail!("cdc: leb128 overflow");
+            }
+            value |= payload << shift;
             if byte & 0x80 == 0 {
                 break;
             }
@@ -263,6 +269,8 @@ pub mod cdc_dedup {
         /// the gate exercise over-cap rejection without allocating 256 MiB.
         fn decode_with_cap(&mut self, data: &[u8], cap: usize) -> Result<Vec<u8>> {
             let mut out = Vec::new();
+            let base_chunk_count = self.chunks.len();
+            let mut pending_chunks: Vec<Box<[u8]>> = Vec::new();
             let mut pos = 0;
             while pos < data.len() {
                 let (header, next) = read_leb(data, pos)?;
@@ -273,10 +281,17 @@ pub mod cdc_dedup {
                     TAG_REFERENCE => {
                         let id = usize::try_from(payload)
                             .map_err(|_| anyhow::anyhow!("cdc: reference id overflow"))?;
-                        let chunk = self
-                            .chunks
-                            .get(id)
-                            .ok_or_else(|| anyhow::anyhow!("cdc: reference id out of range"))?;
+                        let chunk = if id < base_chunk_count {
+                            self.chunks
+                                .get(id)
+                                .ok_or_else(|| anyhow::anyhow!("cdc: reference id out of range"))?
+                                .as_ref()
+                        } else {
+                            pending_chunks
+                                .get(id - base_chunk_count)
+                                .ok_or_else(|| anyhow::anyhow!("cdc: reference id out of range"))?
+                                .as_ref()
+                        };
                         push_capped(&mut out, chunk, cap)?;
                     }
                     TAG_LITERAL_CACHE | TAG_LITERAL_NOCACHE => {
@@ -292,15 +307,19 @@ pub mod cdc_dedup {
                         pos = end;
                         push_capped(&mut out, chunk, cap)?;
                         if tag == TAG_LITERAL_CACHE {
-                            if self.chunks.len() >= MAX_CACHED_CHUNKS {
+                            let staged_chunk_count = base_chunk_count
+                                .checked_add(pending_chunks.len())
+                                .ok_or_else(|| anyhow::anyhow!("cdc: cache length overflow"))?;
+                            if staged_chunk_count >= MAX_CACHED_CHUNKS {
                                 bail!("cdc: cache cap exceeded (stream desynchronized)");
                             }
-                            self.chunks.push(chunk.into());
+                            pending_chunks.push(chunk.into());
                         }
                     }
                     _ => bail!("cdc: invalid token tag"),
                 }
             }
+            self.chunks.extend(pending_chunks);
             Ok(out)
         }
     }
@@ -334,7 +353,9 @@ pub mod cdc_dedup {
 
         #[test]
         fn round_trip_large_and_binary() {
-            let big: Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(2654435761) >> 16) as u8).collect();
+            let big: Vec<u8> = (0..100_000u32)
+                .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+                .collect();
             round_trip(&[&big]);
         }
 
@@ -371,8 +392,16 @@ pub mod cdc_dedup {
             // Content shared between two *different* payloads (mirrored across
             // panes) should reference chunks cached by the earlier payload.
             let shared = b"\x1b[2J\x1b[H==== shared header block repeated across panes ====\r\n";
-            let a: Vec<u8> = shared.iter().chain(b"pane-A unique tail").copied().collect();
-            let b: Vec<u8> = shared.iter().chain(b"pane-B unique tail").copied().collect();
+            let a: Vec<u8> = shared
+                .iter()
+                .chain(b"pane-A unique tail")
+                .copied()
+                .collect();
+            let b: Vec<u8> = shared
+                .iter()
+                .chain(b"pane-B unique tail")
+                .copied()
+                .collect();
             round_trip(&[&a, &b]);
         }
 
@@ -390,7 +419,9 @@ pub mod cdc_dedup {
             // panic or hang. (proptest-style smoke without the dep.)
             let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
             for _ in 0..5000 {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let len = (state >> 56) as usize % 64;
                 let bytes: Vec<u8> = (0..len)
                     .map(|k| {
@@ -408,6 +439,42 @@ pub mod cdc_dedup {
             let mut out = Vec::new();
             write_leb(&mut out, (0u64 << 2) | TAG_REFERENCE);
             assert!(CdcDedupDecoder::new().decode(&out).is_err());
+        }
+
+        #[test]
+        fn leb128_overflow_is_rejected() {
+            // Ten-byte u64 LEB128 values may only use bit 63 in the final byte.
+            // Anything larger must fail closed rather than wrapping to a small
+            // literal length/reference id.
+            let mut overflow = vec![0x80; 9];
+            overflow.push(0x02);
+            assert!(CdcDedupDecoder::new().decode(&overflow).is_err());
+        }
+
+        #[test]
+        fn failed_decode_does_not_poison_decoder_cache() {
+            let payload = b"legitimate CDC payload".repeat(16);
+            let mut enc = CdcDedupEncoder::new();
+            let first = enc.encode(&payload);
+            let second = enc.encode(&payload);
+
+            let mut poisoned = Vec::new();
+            write_leb(&mut poisoned, (6u64 << 2) | TAG_LITERAL_CACHE);
+            poisoned.extend_from_slice(b"poison");
+            poisoned.push(0x80); // truncated next leb128 token
+
+            let mut dec = CdcDedupDecoder::new();
+            assert!(dec.decode(&poisoned).is_err());
+            assert!(
+                dec.chunks.is_empty(),
+                "failed token streams must not commit decoder cache entries"
+            );
+            assert_eq!(dec.decode(&first).expect("first valid frame"), payload);
+            assert_eq!(
+                dec.decode(&second).expect("reference frame after failure"),
+                payload,
+                "failed malicious frame poisoned the reference dictionary"
+            );
         }
 
         // -- gate-hardening: adversarial / property round-trip (ft-6c1t0) --
@@ -431,7 +498,8 @@ pub mod cdc_dedup {
             let encoded = enc.encode(stream);
             let decoded = dec.decode(&encoded).expect("decode must succeed");
             assert_eq!(
-                decoded, stream,
+                decoded,
+                stream,
                 "lossless round-trip lost/corrupted bytes (len={})",
                 stream.len()
             );

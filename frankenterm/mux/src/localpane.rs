@@ -9,7 +9,7 @@ use crate::{Domain, Mux, MuxNotification};
 use anyhow::Error;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
+use config::{ExitBehavior, ExitBehaviorMessaging, configuration};
 use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
@@ -26,11 +26,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::{Duration, Instant};
-use termwiz::escape::csi::{Sgr, CSI};
+use termwiz::escape::csi::{CSI, Sgr};
 use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
@@ -370,7 +370,7 @@ pub struct LocalPane {
     /// NO `unsafe`). Present only under the `disruptor-pane-io` feature; the
     /// default build keeps the plain mutex path.
     #[cfg(feature = "disruptor-pane-io")]
-    action_ring: ArrayQueue<Vec<Action>>,
+    action_ring: Arc<ArrayQueue<Vec<Action>>>,
 }
 
 fn record_input_for_current_identity() {
@@ -1412,7 +1412,16 @@ impl LocalPane {
     #[cfg(feature = "disruptor-pane-io")]
     #[inline]
     fn drain_action_ring_locked(&self, term: &mut Terminal) {
-        while let Some(actions) = self.action_ring.pop() {
+        Self::drain_action_ring_into(self.action_ring.as_ref(), term);
+    }
+
+    /// Drain `action_ring` into `term` while the caller holds the terminal
+    /// mutex. This is shared by normal `LocalPane` terminal access and the
+    /// resize worker, whose static helper cannot call `locked_terminal`.
+    #[cfg(feature = "disruptor-pane-io")]
+    #[inline]
+    fn drain_action_ring_into(action_ring: &ArrayQueue<Vec<Action>>, term: &mut Terminal) {
+        while let Some(actions) = action_ring.pop() {
             term.perform_actions(actions);
         }
     }
@@ -1470,6 +1479,8 @@ impl LocalPane {
             Self::spawn_resize_worker(
                 self.pane_id,
                 Arc::clone(&self.terminal),
+                #[cfg(feature = "disruptor-pane-io")]
+                Arc::clone(&self.action_ring),
                 Arc::clone(&self.pty),
                 Arc::clone(&self.resize_queue),
             );
@@ -1481,6 +1492,7 @@ impl LocalPane {
     fn spawn_resize_worker(
         pane_id: PaneId,
         terminal: Arc<Mutex<Terminal>>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: Arc<ArrayQueue<Vec<Action>>>,
         pty: Arc<Mutex<Box<dyn MasterPty>>>,
         resize_queue: Arc<Mutex<ResizeQueueState>>,
     ) {
@@ -1499,6 +1511,8 @@ impl LocalPane {
                         match Self::apply_resize_sync(
                             pane_id,
                             terminal.as_ref(),
+                            #[cfg(feature = "disruptor-pane-io")]
+                            action_ring.as_ref(),
                             pty.as_ref(),
                             pending.seq,
                             pending.size,
@@ -1586,6 +1600,7 @@ impl LocalPane {
     fn apply_resize_sync(
         pane_id: PaneId,
         terminal: &Mutex<Terminal>,
+        #[cfg(feature = "disruptor-pane-io")] action_ring: &ArrayQueue<Vec<Action>>,
         pty: &Mutex<Box<dyn MasterPty>>,
         commit_id: u64,
         size: TerminalSize,
@@ -1593,6 +1608,13 @@ impl LocalPane {
         mut superseded_by: impl FnMut() -> Option<u64>,
     ) -> Result<ResizeApplyMetrics, Error> {
         let terminal_probe_lock_start = Instant::now();
+        #[cfg(feature = "disruptor-pane-io")]
+        let current_size = {
+            let mut terminal = terminal.lock();
+            Self::drain_action_ring_into(action_ring, &mut terminal);
+            terminal.get_size()
+        };
+        #[cfg(not(feature = "disruptor-pane-io"))]
         let current_size = terminal.lock().get_size();
         let terminal_probe_lock_wait = terminal_probe_lock_start.elapsed();
 
@@ -1693,6 +1715,8 @@ impl LocalPane {
 
         let terminal_apply_lock_start = Instant::now();
         let mut terminal = terminal.lock();
+        #[cfg(feature = "disruptor-pane-io")]
+        Self::drain_action_ring_into(action_ring, &mut terminal);
         let terminal_apply_lock_wait = terminal_apply_lock_start.elapsed();
         if let Some(superseded_by_seq) = superseded_by() {
             return Ok(ResizeApplyMetrics {
@@ -1780,7 +1804,7 @@ impl LocalPane {
             leader: Arc::new(Mutex::new(None)),
             command_description,
             #[cfg(feature = "disruptor-pane-io")]
-            action_ring: ArrayQueue::new(PANE_ACTION_RING_CAPACITY),
+            action_ring: Arc::new(ArrayQueue::new(PANE_ACTION_RING_CAPACITY)),
         };
 
         // Prime the proc_list cache asynchronously. The 250 ms delay gives
@@ -2859,9 +2883,10 @@ mod tests {
 /// fills, wraps, and empties. No `unsafe`.
 #[cfg(all(test, feature = "disruptor-pane-io"))]
 mod disruptor_ring_keep_gate {
+    use super::*;
     use crossbeam::queue::ArrayQueue;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     /// A batch is the little-endian bytes of its sequence index plus a sentinel
@@ -2878,10 +2903,119 @@ mod disruptor_ring_keep_gate {
 
     fn decode_index(batch: &[u8]) -> u64 {
         assert_eq!(batch.len(), BATCH_LEN, "batch framing corrupted (len)");
-        assert_eq!(batch[8], TAIL_SENTINEL, "batch framing corrupted (sentinel)");
+        assert_eq!(
+            batch[8], TAIL_SENTINEL,
+            "batch framing corrupted (sentinel)"
+        );
         let mut idx_bytes = [0u8; 8];
         idx_bytes.copy_from_slice(&batch[..8]);
         u64::from_le_bytes(idx_bytes)
+    }
+
+    #[derive(Debug)]
+    struct TestTermConfig;
+
+    impl TerminalConfiguration for TestTermConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    struct TestMasterPty;
+
+    impl MasterPty for TestMasterPty {
+        fn resize(&self, _size: PtySize) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> Result<PtySize, Error> {
+            Ok(PtySize::default())
+        }
+
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, Error> {
+            Ok(Box::new(std::io::Cursor::new(Vec::new())))
+        }
+
+        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error> {
+            Ok(Box::new(Vec::<u8>::new()))
+        }
+
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    fn test_terminal(size: TerminalSize) -> Terminal {
+        Terminal::new(
+            size,
+            Arc::new(TestTermConfig),
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn term_size(cols: usize, rows: usize) -> TerminalSize {
+        TerminalSize {
+            cols,
+            rows,
+            pixel_width: cols,
+            pixel_height: rows,
+            dpi: 96,
+        }
+    }
+
+    fn pty_size(cols: u16, rows: u16) -> PtySize {
+        PtySize {
+            cols,
+            rows,
+            pixel_width: cols,
+            pixel_height: rows,
+        }
+    }
+
+    #[test]
+    fn resize_worker_drains_staged_actions_before_noop_probe() {
+        let size = term_size(10, 1);
+        let ring = ArrayQueue::new(4);
+        ring.push(vec![Action::Print('x')])
+            .expect("ring should accept staged action");
+
+        let terminal = Mutex::new(test_terminal(size));
+        let pty: Mutex<Box<dyn MasterPty>> = Mutex::new(Box::new(TestMasterPty));
+        let metrics = LocalPane::apply_resize_sync(
+            7,
+            &terminal,
+            &ring,
+            &pty,
+            1,
+            size,
+            pty_size(10, 1),
+            || None,
+        )
+        .expect("resize probe should succeed");
+
+        assert!(metrics.noop);
+        assert!(
+            ring.is_empty(),
+            "resize worker left staged actions undrained"
+        );
+        assert_eq!(
+            terminal.lock().cursor_pos().x,
+            1,
+            "staged output must be applied before resize observes terminal state"
+        );
     }
 
     #[test]
@@ -2969,7 +3103,8 @@ mod disruptor_ring_keep_gate {
             // The ring must be fully drained at the end.
             assert!(
                 ring.pop().is_none(),
-                "iter {iter}: ring not empty after consuming all batches"
+                "iter {}: ring not empty after consuming all batches",
+                iter
             );
         }
     }
