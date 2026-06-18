@@ -324,27 +324,39 @@ pub fn check_schema_preservation(
     }
 }
 
-/// Convenience: run the gate check for the fusion output path.
+/// Convenience: identity check that the `FusedResult` element schema is
+/// self-consistent on the fusion output path.
 ///
-/// Compares legacy `FusedResult` schema against `FacadeResult` to verify
-/// that the facade output is a superset of the legacy output.
+/// NOTE (ft-ottca): this is a vacuous placeholder, NOT a real drift gate — it
+/// compares `FusedResult` against itself, so `check_schema_preservation` can
+/// never report a missing/lossy field. It deliberately does NOT compare against
+/// `FacadeResult`: that type *wraps* `Vec<FusedResult>` (fields
+/// `results`/`routing_used`/`shadow_comparison`) and is not field-comparable
+/// with a single `FusedResult`, so the comparison would falsely report `id` and
+/// `score` as missing. A genuine drift gate would compare the current snapshot
+/// against a *frozen golden baseline* (which this module does not yet persist).
 #[must_use]
 pub fn gate_fusion_schema() -> SchemaGateResult {
     let source = snapshot_fused_result_schema();
-    // The facade result contains `results: Vec<FusedResult>` so each individual
-    // `FusedResult` is unchanged. We verify that directly.
+    // Self-compare: the fusion/facade paths still emit `Vec<FusedResult>`, so
+    // the element schema is the only thing this convenience can check without a
+    // golden baseline. Always "safe" — see the doc note above.
     let target = snapshot_fused_result_schema();
     check_schema_preservation(&source, &target)
 }
 
-/// Convenience: run the gate check comparing `OrchestrationResult` against
-/// the original `FusedResult` to verify that the orchestrated path produces
-/// results that are compatible with the legacy consumer expectation.
+/// Convenience: identity check that the `FusedResult` element schema is
+/// self-consistent on the orchestrated output path.
+///
+/// NOTE (ft-ottca): vacuous placeholder, same as [`gate_fusion_schema`]. It
+/// does NOT compare against `OrchestrationResult` (which wraps
+/// `Vec<FusedResult>` plus `metrics` and is likewise not field-comparable with
+/// a single `FusedResult`); doing so would falsely fail. A real gate needs a
+/// frozen golden baseline.
 #[must_use]
 pub fn gate_orchestration_schema() -> SchemaGateResult {
     let source = snapshot_fused_result_schema();
-    // The orchestrated path still outputs Vec<FusedResult>, so the schemas
-    // should be identical.
+    // Self-compare; always "safe" — see the doc note above.
     let target = snapshot_fused_result_schema();
     check_schema_preservation(&source, &target)
 }
