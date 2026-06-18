@@ -35,7 +35,7 @@ use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
 use crate::runtime_async::{Mutex, RwLock, mpsc, watch};
-use crate::session_pane_state::PaneStateSnapshot;
+use crate::session_pane_state::{PaneStateSnapshot, ScrollbackRef};
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
 
@@ -245,6 +245,14 @@ pub struct SnapshotResult {
     pub trigger: SnapshotTrigger,
 }
 
+/// Per-capture options for call sites that need snapshot behavior beyond the
+/// engine's normal periodic/event defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SnapshotCaptureOptions {
+    /// Link the checkpoint to already-captured scrollback segments.
+    pub include_scrollback: bool,
+}
+
 /// Error returned when a snapshot cannot be captured.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -369,6 +377,18 @@ impl SnapshotEngine {
         self.capture_with_cx(&cx, panes, trigger).await
     }
 
+    /// Capture a full mux state snapshot with explicit per-call options.
+    pub async fn capture_with_options(
+        &self,
+        panes: &[PaneInfo],
+        trigger: SnapshotTrigger,
+        options: SnapshotCaptureOptions,
+    ) -> std::result::Result<SnapshotResult, SnapshotError> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.capture_with_cx_options(&cx, panes, trigger, options)
+            .await
+    }
+
     /// Capture a full mux state snapshot bound to the caller's asupersync
     /// capability context (ft-xbnl0.2.3 Cx-first entry point).
     ///
@@ -395,6 +415,19 @@ impl SnapshotEngine {
         cx: &crate::cx::Cx,
         panes: &[PaneInfo],
         trigger: SnapshotTrigger,
+    ) -> std::result::Result<SnapshotResult, SnapshotError> {
+        self.capture_with_cx_options(cx, panes, trigger, SnapshotCaptureOptions::default())
+            .await
+    }
+
+    /// Capture a full mux state snapshot bound to the caller's Cx and explicit
+    /// per-call options.
+    pub async fn capture_with_cx_options(
+        &self,
+        cx: &crate::cx::Cx,
+        panes: &[PaneInfo],
+        trigger: SnapshotTrigger,
+        options: SnapshotCaptureOptions,
     ) -> std::result::Result<SnapshotResult, SnapshotError> {
         self.telemetry
             .captures_attempted
@@ -440,6 +473,7 @@ impl SnapshotEngine {
         // 3. Correlate agent identity/state + build per-pane snapshots
         let mut correlator = AgentCorrelator::new();
         let pane_ids: Vec<u64> = panes.iter().map(|p| p.pane_id).collect();
+        let detection_pane_ids = pane_ids.clone();
         let db_path_for_detections = Arc::clone(&self.db_path);
         let cutoff_ms: i64 =
             i64::try_from(now_ms.saturating_sub(STATE_DETECTION_MAX_AGE.as_millis() as u64))
@@ -448,7 +482,7 @@ impl SnapshotEngine {
         let detections_by_pane = Self::spawn_blocking_db_best_effort(move || {
             load_latest_detections_by_pane_sync(
                 db_path_for_detections.as_str(),
-                &pane_ids,
+                &detection_pane_ids,
                 cutoff_ms,
             )
         })
@@ -461,10 +495,27 @@ impl SnapshotEngine {
             correlator.update_from_pane_info(pane);
         }
 
+        let scrollback_refs = if options.include_scrollback {
+            let db_path_for_scrollback = Arc::clone(&self.db_path);
+            let scrollback_pane_ids = pane_ids.clone();
+            Self::spawn_blocking_db(move || {
+                load_latest_scrollback_refs_sync(
+                    db_path_for_scrollback.as_str(),
+                    &scrollback_pane_ids,
+                )
+            })
+            .await?
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let pane_states: Vec<PaneStateSnapshot> = panes
             .iter()
             .map(|p| {
                 let mut snapshot = PaneStateSnapshot::from_pane_info(p, now_ms, false);
+                if let Some(scrollback_ref) = scrollback_refs.get(&p.pane_id) {
+                    snapshot = snapshot.with_scrollback(scrollback_ref.clone());
+                }
                 if let Some(agent) = correlator.get_metadata(p.pane_id) {
                     snapshot = snapshot.with_agent(agent);
                 }
@@ -1289,6 +1340,62 @@ fn load_latest_detections_by_pane_sync(
     }
 
     Ok(out)
+}
+
+fn load_latest_scrollback_refs_sync(
+    db_path: &str,
+    pane_ids: &[u64],
+) -> std::result::Result<std::collections::HashMap<u64, ScrollbackRef>, String> {
+    use std::collections::HashMap;
+
+    if pane_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let conn = open_conn(db_path).map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT MAX(seq), COUNT(*), MAX(captured_at)
+             FROM output_segments
+             WHERE pane_id = ?1",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut refs = HashMap::new();
+    for &pane_id in pane_ids {
+        let pane_id_i64 = i64::try_from(pane_id)
+            .map_err(|_| format!("pane_id {pane_id} exceeds sqlite integer range"))?;
+        let (max_seq, segment_count, last_capture_at): (Option<i64>, i64, Option<i64>) = stmt
+            .query_row([pane_id_i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| error.to_string())?;
+
+        let Some(output_segments_seq) = max_seq else {
+            continue;
+        };
+        let Some(last_capture_at) = last_capture_at else {
+            continue;
+        };
+        if output_segments_seq < 0 || segment_count <= 0 || last_capture_at < 0 {
+            return Err(format!(
+                "invalid scrollback segment metadata for pane_id={pane_id}: \
+                 max_seq={output_segments_seq}, count={segment_count}, \
+                 last_capture_at={last_capture_at}"
+            ));
+        }
+
+        refs.insert(
+            pane_id,
+            ScrollbackRef {
+                output_segments_seq,
+                total_lines_captured: segment_count as u64,
+                last_capture_at: last_capture_at as u64,
+            },
+        );
+    }
+
+    Ok(refs)
 }
 
 fn is_missing_events_table(err: &rusqlite::Error) -> bool {

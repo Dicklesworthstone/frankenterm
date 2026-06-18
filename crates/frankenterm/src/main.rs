@@ -20011,6 +20011,21 @@ fn persist_robot_checkpoint_metadata(
     Ok(())
 }
 
+fn robot_checkpoint_scrollback_included(db_path: &str, checkpoint_id: i64) -> anyhow::Result<bool> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let included = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM mux_pane_state
+             WHERE checkpoint_id = ?1
+               AND scrollback_checkpoint_seq IS NOT NULL
+         )",
+        [checkpoint_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(included != 0)
+}
+
 fn robot_checkpoint_list_data(
     db_path: &str,
     limit: usize,
@@ -20206,7 +20221,7 @@ async fn robot_checkpoint_save_data(
     config: &frankenterm_core::config::Config,
     elapsed_ms: u64,
 ) -> RobotJsonResult<serde_json::Value> {
-    use frankenterm_core::snapshot_engine::SnapshotEngine;
+    use frankenterm_core::snapshot_engine::{SnapshotCaptureOptions, SnapshotEngine};
     use std::sync::Arc;
 
     let db_path = layout.db_path.to_string_lossy().to_string();
@@ -20243,16 +20258,26 @@ async fn robot_checkpoint_save_data(
     let engine = SnapshotEngine::new(Arc::new(db_path.clone()), config.snapshots.clone());
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     let result = engine
-        .capture_with_cx(
+        .capture_with_cx_options(
             &cx,
             &panes,
             frankenterm_core::snapshot_engine::SnapshotTrigger::Manual,
+            SnapshotCaptureOptions { include_scrollback },
         )
         .await
         .map_err(|err| {
             robot_checkpoint_error_response(
                 ROBOT_ERR_STORAGE,
                 format!("Checkpoint save failed: {err}"),
+                None,
+                elapsed_ms,
+            )
+        })?;
+    let scrollback_included = robot_checkpoint_scrollback_included(&db_path, result.checkpoint_id)
+        .map_err(|err| {
+            robot_checkpoint_error_response(
+                ROBOT_ERR_STORAGE,
+                format!("Checkpoint scrollback verification failed: {err}"),
                 None,
                 elapsed_ms,
             )
@@ -20284,7 +20309,7 @@ async fn robot_checkpoint_save_data(
         "label": label,
         "pane_count": result.pane_count,
         "bytes_persisted": u64::try_from(result.total_bytes).unwrap_or(u64::MAX),
-        "scrollback_included": include_scrollback,
+        "scrollback_included": scrollback_included,
         "created_at": now_ms(),
         "trigger": format!("{:?}", result.trigger),
         "audit_receipt": {
