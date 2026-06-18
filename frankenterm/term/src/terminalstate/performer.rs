@@ -673,6 +673,34 @@ impl<'a> Performer<'a> {
         }
     }
 
+    fn cursor_left(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+
+        if self.reverse_wraparound_mode && self.dec_auto_wrap {
+            for _ in 0..n {
+                self.control(ControlCode::Backspace);
+            }
+            return;
+        }
+
+        if self.cursor.x < self.left_and_right_margins.start {
+            for _ in 0..n {
+                self.control(ControlCode::Backspace);
+            }
+            return;
+        }
+
+        let min_x = self.left_and_right_margins.start;
+        let new_x = self.cursor.x.saturating_sub(n as usize).max(min_x);
+        if new_x != self.cursor.x {
+            self.cursor.x = new_x;
+            self.cursor.seqno = self.seqno;
+            self.wrap_next = false;
+        }
+    }
+
     fn csi_dispatch(&mut self, csi: CSI) {
         self.pop_tmux_title_state();
         self.flush_print();
@@ -682,9 +710,7 @@ impl<'a> Performer<'a> {
                 // We treat CUB (Cursor::Left) the same as Backspace as
                 // that is what xterm does.
                 // <https://github.com/wezterm/wezterm/issues/1273>
-                for _ in 0..n {
-                    self.control(ControlCode::Backspace);
-                }
+                self.cursor_left(n);
             }
             CSI::Cursor(cursor) => self.state.perform_csi_cursor(cursor),
             CSI::Edit(edit) => self.state.perform_csi_edit(edit),
