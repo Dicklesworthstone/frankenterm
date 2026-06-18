@@ -933,10 +933,18 @@ pub fn build_tls_server_name(bind_addr: &str) -> Result<ServerName<'static>, Dis
 // Distributed HTTP client (asupersync-native, wa-1u55z)
 // =============================================================================
 
-/// HTTP client for distributed node-to-node communication.
+/// Cancel-aware HTTP/1.1 client utility for the `distributed` feature.
 ///
-/// Wraps [`asupersync::http::h1::http_client::HttpClient`] for making
-/// requests between distributed nodes without requiring reqwest.
+/// Wraps [`asupersync::http::h1::http_client::HttpClient`] for making HTTP
+/// requests to trusted peer URLs without pulling in reqwest.
+///
+/// NOTE: this is NOT the node-to-node wire transport. Inter-node traffic uses a
+/// JSON-lines protocol over raw TCP/TLS (`WireEnvelope::to_json` + newline
+/// framing), wired through `ft distributed agent` -> the `ft watch` aggregator
+/// listener — nodes do not speak HTTP to each other. This client currently has
+/// no production callers; it is retained as a general HTTP utility and as the
+/// canonical `race_with_cx_cancel` cancellation exemplar referenced by
+/// `runtime_async`.
 ///
 /// For plain HTTP (loopback testing, health checks), use [`Self::plaintext()`].
 /// For HTTPS with standard WebPKI roots, use [`Self::new()`].
@@ -960,8 +968,9 @@ impl DistributedHttpClient {
     ///
     /// # Redirect policy (ft-kfkyi)
     ///
-    /// This client is used for node-to-node RPC where URLs are supposed
-    /// to point at trusted peer nodes. Transparent redirect following
+    /// This client makes HTTP RPCs to URLs that are supposed to point at
+    /// trusted peer nodes (it is not the node wire transport — see the
+    /// type-level note). Transparent redirect following
     /// would let a compromised peer respond 302 with an attacker-controlled
     /// `Location:` header and exfiltrate the next request's body there.
     ///
