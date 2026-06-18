@@ -356,7 +356,13 @@ impl LayerStack {
             ..RenderReport::default()
         };
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            let dirty = match layer.dirty_rect() {
+            // Reuse the dirty rect already snapshotted for the cull pass
+            // instead of re-calling `layer.dirty_rect()`: no layer is mutated
+            // between the snapshot and this point (the cull pass only reads,
+            // and rendering layer j<i cannot change layer i's own dirty rect),
+            // so `dirties[i]` is identical to a fresh call — one fewer
+            // `dirty_rect()` evaluation per layer per frame.
+            let dirty = match dirties[i] {
                 Some(r) if !r.is_empty() => r,
                 _ => {
                     report.layers_skipped_clean = report.layers_skipped_clean.saturating_add(1);
