@@ -286,11 +286,20 @@ pub struct RenderReport {
 #[derive(Debug, Default)]
 pub struct LayerStack {
     layers: Vec<Box<dyn Layer>>,
+    /// Frame-to-frame scratch for `render`'s cull pass: one
+    /// `(dirty_rect, opaque, covered_by_opaque_above)` entry per layer.
+    /// Reused (cleared + refilled) every frame so steady-state rendering
+    /// performs no per-frame heap allocation for the cull bookkeeping
+    /// (previously three fresh `Vec`s per render).
+    scratch: Vec<(Option<DirtyRect>, bool, bool)>,
 }
 
 impl LayerStack {
     pub fn new() -> Self {
-        Self { layers: Vec::new() }
+        Self {
+            layers: Vec::new(),
+            scratch: Vec::new(),
+        }
     }
 
     /// Add a layer. Layers are kept in z-order ascending, so
@@ -322,33 +331,42 @@ impl LayerStack {
     /// layer. Returns the per-frame telemetry.
     pub fn render(&mut self, ctx: &LayerContext) -> RenderReport {
         let n = self.layers.len();
-        // Snapshot dirty rects + opacity once so the cull pass and
-        // the render pass don't double-index the layer vec.
-        let dirties: Vec<Option<DirtyRect>> = self.layers.iter().map(|l| l.dirty_rect()).collect();
-        let opaques: Vec<bool> = self.layers.iter().map(|l| l.opaque()).collect();
 
-        // For each layer i (sorted ascending z), compute whether
-        // any layer j > i is opaque AND covers layer i's dirty
-        // rect.
-        let mut opaque_above_covers_dirty: Vec<bool> = vec![false; n];
-        for (i, dirty_opt) in dirties.iter().enumerate() {
-            let Some(dirty) = dirty_opt else {
-                continue;
+        // Reuse a frame-to-frame scratch buffer instead of allocating three
+        // fresh Vecs (dirty rects, opacity, cull flags) on every render.
+        // Taking it out by value lets us refill it while `self.layers` is
+        // borrowed; it is restored before returning, so steady-state rendering
+        // allocates nothing here. Each entry is
+        // `(dirty_rect, opaque, covered_by_opaque_above)`; the dirty rect is
+        // snapshotted once so neither the cull pass nor the render pass calls
+        // `dirty_rect()` twice.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.extend(self.layers.iter().map(|l| (l.dirty_rect(), l.opaque(), false)));
+
+        // For each layer i (sorted ascending z), mark it covered if any layer
+        // j > i is opaque AND contains layer i's dirty rect. Reads of
+        // `scratch[j]` are copied out (DirtyRect/bool are Copy) and the write
+        // to `scratch[i].2` happens after the inner loop, so no borrow overlaps.
+        for i in 0..n {
+            let dirty = match scratch[i].0 {
+                Some(d) if !d.is_empty() => d,
+                _ => continue,
             };
-            if dirty.is_empty() {
-                continue;
-            }
-            for (j, jr_opt) in dirties.iter().enumerate().skip(i + 1) {
-                if !opaques[j] {
+            let mut covered = false;
+            for j in (i + 1)..n {
+                let (jr, j_opaque) = (scratch[j].0, scratch[j].1);
+                if !j_opaque {
                     continue;
                 }
-                if let Some(jr) = jr_opt {
-                    if !jr.is_empty() && jr.contains(dirty) {
-                        opaque_above_covers_dirty[i] = true;
+                if let Some(jr) = jr {
+                    if !jr.is_empty() && jr.contains(&dirty) {
+                        covered = true;
                         break;
                     }
                 }
             }
+            scratch[i].2 = covered;
         }
 
         let mut report = RenderReport {
@@ -356,20 +374,19 @@ impl LayerStack {
             ..RenderReport::default()
         };
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            // Reuse the dirty rect already snapshotted for the cull pass
-            // instead of re-calling `layer.dirty_rect()`: no layer is mutated
-            // between the snapshot and this point (the cull pass only reads,
-            // and rendering layer j<i cannot change layer i's own dirty rect),
-            // so `dirties[i]` is identical to a fresh call — one fewer
-            // `dirty_rect()` evaluation per layer per frame.
-            let dirty = match dirties[i] {
+            // Reuse the snapshotted dirty rect instead of re-calling
+            // `layer.dirty_rect()`: no layer is mutated between the snapshot
+            // and this point (the cull pass only reads, and rendering layer
+            // j<i cannot change layer i's own dirty rect), so `scratch[i].0`
+            // is identical to a fresh call.
+            let dirty = match scratch[i].0 {
                 Some(r) if !r.is_empty() => r,
                 _ => {
                     report.layers_skipped_clean = report.layers_skipped_clean.saturating_add(1);
                     continue;
                 }
             };
-            if opaque_above_covers_dirty[i] {
+            if scratch[i].2 {
                 report.layers_skipped_opaque_above =
                     report.layers_skipped_opaque_above.saturating_add(1);
                 continue;
@@ -380,6 +397,8 @@ impl LayerStack {
             report.commands.extend(cmds);
             report.damage = report.damage.union(&dirty);
         }
+
+        self.scratch = scratch;
         report
     }
 
