@@ -1,7 +1,4 @@
-use crate::quad::{
-    TripleLayerQuadAllocatorTrait, V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT,
-    VERTICES_PER_CELL, Vertex,
-};
+use crate::quad::{TripleLayerQuadAllocatorTrait, VERTICES_PER_CELL, Vertex};
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, HsbTransform, WebGpuPowerPreference};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
@@ -24,6 +21,10 @@ use frankenterm_core::wayland_direct_scanout::{
     ScanoutSupport as DirectScanoutSupport, WaylandCompositor as DirectScanoutCompositor,
     evaluate_direct_scanout,
 };
+use frankenterm_gui::glyph_quad_staging::{
+    GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex,
+    visit_expanded_glyph_quad_soa_vertices,
+};
 use std::cell::RefCell;
 use std::fmt;
 use std::sync::{Arc, OnceLock, mpsc};
@@ -38,8 +39,6 @@ use window::raw_window_handle::{
 use window::{BitmapImage, Dimensions, Rect, Window};
 
 const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
-const GLYPH_QUAD_HAS_COLOR: f32 = 0.0;
-const COLOR_GLYPH_QUAD_HAS_COLOR: f32 = 1.0;
 
 static MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -63,13 +62,7 @@ pub fn moonshot_instanced_glyph_quads_enabled() -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlyphQuadInstance {
-    position: [f32; 4],
-    tex: [f32; 4],
-    fg_color: [f32; 4],
-    alt_color: [f32; 4],
-    hsv: [f32; 3],
-    has_color: f32,
-    mix_value: f32,
+    staging: GlyphQuadStagingInstance,
 }
 
 impl GlyphQuadInstance {
@@ -87,49 +80,35 @@ impl GlyphQuadInstance {
             .map(|t| [t.hue, t.saturation, t.brightness])
             .unwrap_or([1.0, 1.0, 1.0]);
         Self {
-            position,
-            tex: [
-                texture.min_x(),
-                texture.max_x(),
-                texture.min_y(),
-                texture.max_y(),
-            ],
-            fg_color: fg_color.into(),
-            alt_color: alt_color.into(),
-            hsv,
-            has_color: if has_color {
-                COLOR_GLYPH_QUAD_HAS_COLOR
-            } else {
-                GLYPH_QUAD_HAS_COLOR
-            },
-            mix_value,
+            staging: GlyphQuadStagingInstance::new(
+                position,
+                [
+                    texture.min_x(),
+                    texture.max_x(),
+                    texture.min_y(),
+                    texture.max_y(),
+                ],
+                fg_color.into(),
+                alt_color.into(),
+                hsv,
+                has_color,
+                mix_value,
+            ),
         }
     }
+}
 
-    #[must_use]
-    pub fn expanded_vertices(self) -> [Vertex; VERTICES_PER_CELL] {
-        let [left, top, right, bottom] = self.position;
-        let [tex_left, tex_right, tex_top, tex_bottom] = self.tex;
-        let mut vertices = [Vertex {
-            fg_color: self.fg_color,
-            alt_color: self.alt_color,
-            hsv: self.hsv,
-            has_color: self.has_color,
-            mix_value: self.mix_value,
-            ..Vertex::default()
-        }; VERTICES_PER_CELL];
-
-        vertices[V_TOP_LEFT].position = [left, top];
-        vertices[V_TOP_RIGHT].position = [right, top];
-        vertices[V_BOT_LEFT].position = [left, bottom];
-        vertices[V_BOT_RIGHT].position = [right, bottom];
-
-        vertices[V_TOP_LEFT].tex = [tex_left, tex_top];
-        vertices[V_TOP_RIGHT].tex = [tex_right, tex_top];
-        vertices[V_BOT_LEFT].tex = [tex_left, tex_bottom];
-        vertices[V_BOT_RIGHT].tex = [tex_right, tex_bottom];
-
-        vertices
+impl From<GlyphQuadStagingVertex> for Vertex {
+    fn from(vertex: GlyphQuadStagingVertex) -> Self {
+        Self {
+            position: vertex.position,
+            tex: vertex.tex,
+            fg_color: vertex.fg_color,
+            alt_color: vertex.alt_color,
+            hsv: vertex.hsv,
+            has_color: vertex.has_color,
+            mix_value: vertex.mix_value,
+        }
     }
 }
 
@@ -166,13 +145,13 @@ impl GlyphQuadSoaBatch {
     }
 
     pub fn push(&mut self, instance: GlyphQuadInstance) {
-        self.positions.push(instance.position);
-        self.tex_rects.push(instance.tex);
-        self.fg_colors.push(instance.fg_color);
-        self.alt_colors.push(instance.alt_color);
-        self.hsv.push(instance.hsv);
-        self.has_color.push(instance.has_color);
-        self.mix_values.push(instance.mix_value);
+        self.positions.push(instance.staging.position);
+        self.tex_rects.push(instance.staging.tex);
+        self.fg_colors.push(instance.staging.fg_color);
+        self.alt_colors.push(instance.staging.alt_color);
+        self.hsv.push(instance.staging.hsv);
+        self.has_color.push(instance.staging.has_color);
+        self.mix_values.push(instance.staging.mix_value);
     }
 
     #[must_use]
@@ -195,18 +174,18 @@ impl GlyphQuadSoaBatch {
         }
 
         let mut vertices = Vec::with_capacity(self.len() * VERTICES_PER_CELL);
-        for idx in 0..self.len() {
-            let instance = GlyphQuadInstance {
-                position: self.positions[idx],
-                tex: self.tex_rects[idx],
-                fg_color: self.fg_colors[idx],
-                alt_color: self.alt_colors[idx],
-                hsv: self.hsv[idx],
-                has_color: self.has_color[idx],
-                mix_value: self.mix_values[idx],
-            };
-            vertices.extend_from_slice(&instance.expanded_vertices());
-        }
+        visit_expanded_glyph_quad_soa_vertices(
+            GlyphQuadSoaBuffers {
+                positions: &self.positions,
+                tex_rects: &self.tex_rects,
+                fg_colors: &self.fg_colors,
+                alt_colors: &self.alt_colors,
+                hsv: &self.hsv,
+                has_color: &self.has_color,
+                mix_values: &self.mix_values,
+            },
+            |vertex| vertices.push(vertex.into()),
+        );
         layers.extend_with(layer_num, &vertices);
     }
 }

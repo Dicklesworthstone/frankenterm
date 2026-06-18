@@ -44,6 +44,388 @@ pub fn checked_stable_row_range_from_top(
     Some(top..end)
 }
 
+pub mod glyph_quad_staging {
+    pub const VERTICES_PER_GLYPH_QUAD: usize = 4;
+
+    const V_TOP_LEFT: usize = 0;
+    const V_TOP_RIGHT: usize = 1;
+    const V_BOT_LEFT: usize = 2;
+    const V_BOT_RIGHT: usize = 3;
+    const GLYPH_QUAD_HAS_COLOR: f32 = 0.0;
+    const COLOR_GLYPH_QUAD_HAS_COLOR: f32 = 1.0;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct GlyphQuadStagingVertex {
+        pub position: [f32; 2],
+        pub tex: [f32; 2],
+        pub fg_color: [f32; 4],
+        pub alt_color: [f32; 4],
+        pub hsv: [f32; 3],
+        pub has_color: f32,
+        pub mix_value: f32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct GlyphQuadStagingInstance {
+        pub position: [f32; 4],
+        pub tex: [f32; 4],
+        pub fg_color: [f32; 4],
+        pub alt_color: [f32; 4],
+        pub hsv: [f32; 3],
+        pub has_color: f32,
+        pub mix_value: f32,
+    }
+
+    impl GlyphQuadStagingInstance {
+        #[must_use]
+        pub fn new(
+            position: [f32; 4],
+            tex: [f32; 4],
+            fg_color: [f32; 4],
+            alt_color: [f32; 4],
+            hsv: [f32; 3],
+            has_color: bool,
+            mix_value: f32,
+        ) -> Self {
+            Self {
+                position,
+                tex,
+                fg_color,
+                alt_color,
+                hsv,
+                has_color: if has_color {
+                    COLOR_GLYPH_QUAD_HAS_COLOR
+                } else {
+                    GLYPH_QUAD_HAS_COLOR
+                },
+                mix_value,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct GlyphQuadSoaBuffers<'a> {
+        pub positions: &'a [[f32; 4]],
+        pub tex_rects: &'a [[f32; 4]],
+        pub fg_colors: &'a [[f32; 4]],
+        pub alt_colors: &'a [[f32; 4]],
+        pub hsv: &'a [[f32; 3]],
+        pub has_color: &'a [f32],
+        pub mix_values: &'a [f32],
+    }
+
+    impl GlyphQuadSoaBuffers<'_> {
+        #[must_use]
+        pub fn len(&self) -> usize {
+            self.positions.len()
+        }
+
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.positions.is_empty()
+        }
+
+        fn assert_consistent_lengths(&self) {
+            let len = self.len();
+            assert_eq!(self.tex_rects.len(), len, "tex rect staging length");
+            assert_eq!(self.fg_colors.len(), len, "fg color staging length");
+            assert_eq!(self.alt_colors.len(), len, "alt color staging length");
+            assert_eq!(self.hsv.len(), len, "hsv staging length");
+            assert_eq!(self.has_color.len(), len, "has-color staging length");
+            assert_eq!(self.mix_values.len(), len, "mix-value staging length");
+        }
+
+        fn instance_at(&self, idx: usize) -> GlyphQuadStagingInstance {
+            GlyphQuadStagingInstance {
+                position: self.positions[idx],
+                tex: self.tex_rects[idx],
+                fg_color: self.fg_colors[idx],
+                alt_color: self.alt_colors[idx],
+                hsv: self.hsv[idx],
+                has_color: self.has_color[idx],
+                mix_value: self.mix_values[idx],
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn expand_glyph_quad_instance(
+        instance: GlyphQuadStagingInstance,
+    ) -> [GlyphQuadStagingVertex; VERTICES_PER_GLYPH_QUAD] {
+        let [left, top, right, bottom] = instance.position;
+        let [tex_left, tex_right, tex_top, tex_bottom] = instance.tex;
+        let mut vertices = [GlyphQuadStagingVertex {
+            fg_color: instance.fg_color,
+            alt_color: instance.alt_color,
+            hsv: instance.hsv,
+            has_color: instance.has_color,
+            mix_value: instance.mix_value,
+            ..GlyphQuadStagingVertex::default()
+        }; VERTICES_PER_GLYPH_QUAD];
+
+        vertices[V_TOP_LEFT].position = [left, top];
+        vertices[V_TOP_RIGHT].position = [right, top];
+        vertices[V_BOT_LEFT].position = [left, bottom];
+        vertices[V_BOT_RIGHT].position = [right, bottom];
+
+        vertices[V_TOP_LEFT].tex = [tex_left, tex_top];
+        vertices[V_TOP_RIGHT].tex = [tex_right, tex_top];
+        vertices[V_BOT_LEFT].tex = [tex_left, tex_bottom];
+        vertices[V_BOT_RIGHT].tex = [tex_right, tex_bottom];
+
+        vertices
+    }
+
+    #[must_use]
+    pub fn aos_glyph_quad_vertices(
+        instance: GlyphQuadStagingInstance,
+    ) -> [GlyphQuadStagingVertex; VERTICES_PER_GLYPH_QUAD] {
+        let [left, top, right, bottom] = instance.position;
+        let mut vertices = [GlyphQuadStagingVertex::default(); VERTICES_PER_GLYPH_QUAD];
+        let mut quad = AosGlyphQuad {
+            vertices: &mut vertices,
+        };
+
+        quad.set_position(left, top, right, bottom);
+        quad.set_fg_color(instance.fg_color);
+        quad.set_alt_color_and_mix_value(instance.alt_color, instance.mix_value);
+        quad.set_texture(instance.tex);
+        quad.set_hsv(instance.hsv);
+        quad.set_has_color_impl(instance.has_color);
+
+        vertices
+    }
+
+    pub fn visit_expanded_glyph_quad_soa_vertices(
+        buffers: GlyphQuadSoaBuffers<'_>,
+        mut visit: impl FnMut(GlyphQuadStagingVertex),
+    ) {
+        buffers.assert_consistent_lengths();
+        for idx in 0..buffers.len() {
+            for vertex in expand_glyph_quad_instance(buffers.instance_at(idx)) {
+                visit(vertex);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn expand_glyph_quad_soa_buffers(
+        buffers: GlyphQuadSoaBuffers<'_>,
+    ) -> Vec<GlyphQuadStagingVertex> {
+        let mut vertices = Vec::with_capacity(buffers.len() * VERTICES_PER_GLYPH_QUAD);
+        visit_expanded_glyph_quad_soa_vertices(buffers, |vertex| vertices.push(vertex));
+        vertices
+    }
+
+    #[must_use]
+    pub fn glyph_quad_soa_staging_matches_aos_vertices(
+        buffers: GlyphQuadSoaBuffers<'_>,
+        expected_aos_vertices: &[GlyphQuadStagingVertex],
+    ) -> bool {
+        let actual_vertices = expand_glyph_quad_soa_buffers(buffers);
+        bytemuck::cast_slice::<GlyphQuadStagingVertex, u8>(&actual_vertices)
+            == bytemuck::cast_slice::<GlyphQuadStagingVertex, u8>(expected_aos_vertices)
+    }
+
+    struct AosGlyphQuad<'a> {
+        vertices: &'a mut [GlyphQuadStagingVertex; VERTICES_PER_GLYPH_QUAD],
+    }
+
+    impl AosGlyphQuad<'_> {
+        fn set_position(&mut self, left: f32, top: f32, right: f32, bottom: f32) {
+            self.vertices[V_TOP_LEFT].position = [left, top];
+            self.vertices[V_TOP_RIGHT].position = [right, top];
+            self.vertices[V_BOT_LEFT].position = [left, bottom];
+            self.vertices[V_BOT_RIGHT].position = [right, bottom];
+        }
+
+        fn set_texture(&mut self, tex: [f32; 4]) {
+            let [x1, x2, y1, y2] = tex;
+            self.vertices[V_TOP_LEFT].tex = [x1, y1];
+            self.vertices[V_TOP_RIGHT].tex = [x2, y1];
+            self.vertices[V_BOT_LEFT].tex = [x1, y2];
+            self.vertices[V_BOT_RIGHT].tex = [x2, y2];
+        }
+
+        fn set_fg_color(&mut self, color: [f32; 4]) {
+            for vertex in self.vertices.iter_mut() {
+                vertex.fg_color = color;
+            }
+            self.set_alt_color_and_mix_value(color, 0.0);
+        }
+
+        fn set_alt_color_and_mix_value(&mut self, color: [f32; 4], mix_value: f32) {
+            for vertex in self.vertices.iter_mut() {
+                vertex.alt_color = color;
+                vertex.mix_value = mix_value;
+            }
+        }
+
+        fn set_hsv(&mut self, hsv: [f32; 3]) {
+            for vertex in self.vertices.iter_mut() {
+                vertex.hsv = hsv;
+            }
+        }
+
+        fn set_has_color_impl(&mut self, has_color: f32) {
+            for vertex in self.vertices.iter_mut() {
+                vertex.has_color = has_color;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex,
+            VERTICES_PER_GLYPH_QUAD, aos_glyph_quad_vertices, expand_glyph_quad_instance,
+            expand_glyph_quad_soa_buffers, glyph_quad_soa_staging_matches_aos_vertices,
+        };
+
+        fn vertex_bytes(vertices: &[GlyphQuadStagingVertex]) -> &[u8] {
+            bytemuck::cast_slice(vertices)
+        }
+
+        fn screen_line_strips() -> [GlyphQuadStagingInstance; 2] {
+            [
+                GlyphQuadStagingInstance::new(
+                    [-240.0, -18.5, -232.0, -2.5],
+                    [0.125, 0.1875, 0.25, 0.375],
+                    [0.2, 0.4, 0.8, 1.0],
+                    [0.9, 0.6, 0.1, 0.75],
+                    [0.9, 0.8, 0.7],
+                    false,
+                    0.375,
+                ),
+                GlyphQuadStagingInstance::new(
+                    [-232.0, -18.5, -224.0, -2.5],
+                    [0.5, 0.5625, 0.625, 0.75],
+                    [1.0, 0.25, 0.15, 0.95],
+                    [0.05, 0.6, 0.7, 0.8],
+                    [1.0, 1.0, 1.0],
+                    true,
+                    0.625,
+                ),
+            ]
+        }
+
+        fn buffers_from_parts<'a>(
+            positions: &'a [[f32; 4]],
+            tex_rects: &'a [[f32; 4]],
+            fg_colors: &'a [[f32; 4]],
+            alt_colors: &'a [[f32; 4]],
+            hsv: &'a [[f32; 3]],
+            has_color: &'a [f32],
+            mix_values: &'a [f32],
+        ) -> GlyphQuadSoaBuffers<'a> {
+            GlyphQuadSoaBuffers {
+                positions,
+                tex_rects,
+                fg_colors,
+                alt_colors,
+                hsv,
+                has_color,
+                mix_values,
+            }
+        }
+
+        #[test]
+        fn soa_glyph_staging_matches_aos_quad_bytes_for_screen_line_strips() {
+            let strips = screen_line_strips();
+            let mut expected_vertices = Vec::with_capacity(strips.len() * VERTICES_PER_GLYPH_QUAD);
+
+            let mut positions = Vec::with_capacity(strips.len());
+            let mut tex_rects = Vec::with_capacity(strips.len());
+            let mut fg_colors = Vec::with_capacity(strips.len());
+            let mut alt_colors = Vec::with_capacity(strips.len());
+            let mut hsv = Vec::with_capacity(strips.len());
+            let mut has_color = Vec::with_capacity(strips.len());
+            let mut mix_values = Vec::with_capacity(strips.len());
+
+            for strip in strips {
+                let aos_vertices = aos_glyph_quad_vertices(strip);
+                let soa_vertices = expand_glyph_quad_instance(strip);
+                assert_eq!(vertex_bytes(&soa_vertices), vertex_bytes(&aos_vertices));
+
+                expected_vertices.extend_from_slice(&aos_vertices);
+                positions.push(strip.position);
+                tex_rects.push(strip.tex);
+                fg_colors.push(strip.fg_color);
+                alt_colors.push(strip.alt_color);
+                hsv.push(strip.hsv);
+                has_color.push(strip.has_color);
+                mix_values.push(strip.mix_value);
+            }
+
+            let buffers = buffers_from_parts(
+                &positions,
+                &tex_rects,
+                &fg_colors,
+                &alt_colors,
+                &hsv,
+                &has_color,
+                &mix_values,
+            );
+            let actual_vertices = expand_glyph_quad_soa_buffers(buffers);
+
+            assert_eq!(
+                vertex_bytes(&actual_vertices),
+                vertex_bytes(&expected_vertices)
+            );
+            assert!(glyph_quad_soa_staging_matches_aos_vertices(
+                buffers,
+                &expected_vertices
+            ));
+
+            let mut changed_tex_rects = tex_rects.clone();
+            changed_tex_rects[1][0] += 0.03125;
+            assert!(!glyph_quad_soa_staging_matches_aos_vertices(
+                buffers_from_parts(
+                    &positions,
+                    &changed_tex_rects,
+                    &fg_colors,
+                    &alt_colors,
+                    &hsv,
+                    &has_color,
+                    &mix_values,
+                ),
+                &expected_vertices,
+            ));
+
+            let mut changed_fg_colors = fg_colors.clone();
+            changed_fg_colors[0][2] += 0.125;
+            assert!(!glyph_quad_soa_staging_matches_aos_vertices(
+                buffers_from_parts(
+                    &positions,
+                    &tex_rects,
+                    &changed_fg_colors,
+                    &alt_colors,
+                    &hsv,
+                    &has_color,
+                    &mix_values,
+                ),
+                &expected_vertices,
+            ));
+
+            let mut reordered_positions = positions.clone();
+            reordered_positions.swap(0, 1);
+            assert!(!glyph_quad_soa_staging_matches_aos_vertices(
+                buffers_from_parts(
+                    &reordered_positions,
+                    &tex_rects,
+                    &fg_colors,
+                    &alt_colors,
+                    &hsv,
+                    &has_color,
+                    &mix_values,
+                ),
+                &expected_vertices,
+            ));
+        }
+    }
+}
+
 #[doc(hidden)]
 pub mod owner_last_guard {
     use std::mem::ManuallyDrop;
