@@ -413,12 +413,15 @@ mod tests {
     #[test]
     fn duplicate_is_dropped_never_moved() {
         // A duplicate must be classified as a local-only drop, and no tab may be
-        // both moved and dropped.
+        // both moved and dropped. Pin the canonical to window 1 (otherwise the
+        // most-in-scope-tabs heuristic would pick window 2, making tab 10 the
+        // dropped duplicate); with window 1 canonical, the non-canonical
+        // duplicate (tab 20) must be DROPPED and the distinct tab (21) MOVED.
         let windows = vec![
             win(1, "ws", vec![tab(10, 7, &[100])]),
             win(2, "ws", vec![tab(20, 7, &[100]), tab(21, 7, &[999])]),
         ];
-        let plan = plan_unify_domain(&windows, 7, "ws", None);
+        let plan = plan_unify_domain(&windows, 7, "ws", Some(1));
         let moved: HashSet<TabId> = plan.moves.iter().map(|m| m.tab_id).collect();
         let dropped: HashSet<TabId> = plan.drops.iter().map(|d| d.tab_id).collect();
         assert!(dropped.contains(&20), "duplicate mirror must be dropped");
