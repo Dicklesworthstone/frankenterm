@@ -422,11 +422,7 @@ impl<'a> Performer<'a> {
         }
         match action {
             Action::Print(c) => self.print(c),
-            Action::PrintString(s) => {
-                for c in s.chars() {
-                    self.print(c)
-                }
-            }
+            Action::PrintString(s) => self.print_string(&s),
             Action::Control(code) => self.control(code),
             Action::DeviceControl(ctrl) => self.device_control(ctrl),
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
@@ -548,6 +544,16 @@ impl<'a> Performer<'a> {
             }
         } else {
             self.print.push(c);
+        }
+    }
+
+    fn print_string(&mut self, s: &str) {
+        if self.accumulating_title.is_some() {
+            for c in s.chars() {
+                self.print(c);
+            }
+        } else {
+            self.print.push_str(s);
         }
     }
 
