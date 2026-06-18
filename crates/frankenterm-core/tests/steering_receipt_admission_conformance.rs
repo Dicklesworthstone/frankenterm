@@ -179,3 +179,190 @@ fn flipping_the_verdict_to_admit_without_resealing_is_rejected() {
         "verdict tamper must surface as Invalid (receipt_id mismatch), got {g:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. Run gate: happy path + live-contract drift detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate_admits_a_valid_unexpired_admit_receipt_with_a_confirmed_tx_binding() {
+    let r = admit_receipt(Some("tx-A"), 1_000, Some(10_000));
+    // Mission is unbound (None); the captured tx binding is confirmed by a
+    // matching live hash, so the gate must pass. (A positive control: the gate
+    // is not refusing everything.)
+    let g = steer_run_gate(&r, None, Some("tx-A"), 5_000);
+    assert!(
+        g.is_valid(),
+        "a sealed admit receipt with a confirmed tx binding must pass the gate, got {g:?}"
+    );
+}
+
+#[test]
+fn gate_rejects_tx_contract_drift_never_a_silent_replan() {
+    let r = admit_receipt(Some("tx-A"), 1_000, Some(10_000));
+    // The live tx hash differs from the one admitted: the contract drifted.
+    let g = steer_run_gate(&r, None, Some("tx-B"), 5_000);
+    assert!(!g.is_valid());
+    assert!(
+        matches!(g, SteerRunGate::HashMismatch { contract: "tx" }),
+        "live tx drift must surface as a typed tx HashMismatch (never a silent re-plan), got {g:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Schema-invariant rejections: validate() fails closed -> gate Invalid
+// ---------------------------------------------------------------------------
+
+#[test]
+fn negative_ttl_receipt_is_rejected_as_invalid() {
+    // ttl is excluded from `receipt_id`, so `new` still seals a matching id; the
+    // negative-ttl invariant is what `validate` must reject at the boundary.
+    let r = admit_receipt(Some("plan-A"), 1_000, Some(-1));
+    let g = receipt_admits_action(&r, "plan-A", 1_500);
+    assert!(!g.is_valid());
+    assert!(
+        matches!(g, SteerRunGate::Invalid(_)),
+        "a negative ttl must surface as Invalid, got {g:?}"
+    );
+}
+
+#[test]
+fn a_schema_version_from_the_future_is_rejected_as_invalid() {
+    let mut r = admit_receipt(Some("plan-A"), 1_000, Some(10_000));
+    // A receipt minted by a newer build must not be trusted by an older one
+    // (forward-compatibility guard fails closed, not open).
+    r.schema_version = u32::MAX;
+    let g = receipt_admits_action(&r, "plan-A", 5_000);
+    assert!(!g.is_valid());
+    assert!(
+        matches!(g, SteerRunGate::Invalid(_)),
+        "an unsupported (future) schema version must surface as Invalid, got {g:?}"
+    );
+}
+
+#[test]
+fn a_rehearsal_score_out_of_range_is_rejected_as_invalid() {
+    // Score > 1000 is sealed into a valid id but violates the schema invariant.
+    let r = SteeringReceipt::new(
+        "objective",
+        "ws",
+        None,
+        Some("plan-A".to_string()),
+        "envelope.admit",
+        Some(1_001),
+        Vec::new(),
+        1_000,
+        Some(10_000),
+    );
+    let g = receipt_admits_action(&r, "plan-A", 5_000);
+    assert!(!g.is_valid());
+    assert!(
+        matches!(g, SteerRunGate::Invalid(_)),
+        "a rehearsal score > 1000 must surface as Invalid, got {g:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Additional forgery vectors: every content-bound field is sealed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn moving_a_receipt_across_workspaces_without_resealing_is_rejected() {
+    // "receipts never cross workspaces": workspace_id is in canonical_string, so
+    // repointing it at another workspace without re-sealing must be caught.
+    let mut r = admit_receipt(Some("plan-A"), 1_000, Some(10_000));
+    assert!(receipt_admits_action(&r, "plan-A", 5_000).is_valid());
+
+    r.workspace_id = "other-workspace".to_string();
+    let g = receipt_admits_action(&r, "plan-A", 5_000);
+    assert!(!g.is_valid(), "a cross-workspace-repurposed receipt must not admit");
+    assert!(
+        matches!(g, SteerRunGate::Invalid(_)),
+        "workspace tamper must surface as Invalid (receipt_id mismatch), got {g:?}"
+    );
+}
+
+#[test]
+fn altering_the_required_approval_set_without_resealing_is_rejected() {
+    // required_approvals is sealed (sorted) into receipt_id, so silently
+    // growing/shrinking the approval set must be rejected.
+    let mut r = SteeringReceipt::new(
+        "objective",
+        "ws",
+        None,
+        Some("plan-A".to_string()),
+        "envelope.admit",
+        Some(900),
+        vec!["approve-deploy".to_string()],
+        1_000,
+        Some(10_000),
+    );
+    assert!(receipt_admits_action(&r, "plan-A", 5_000).is_valid());
+
+    r.required_approvals.push("approve-extra".to_string());
+    let g = receipt_admits_action(&r, "plan-A", 5_000);
+    assert!(!g.is_valid(), "an altered approval set must not admit");
+    assert!(
+        matches!(g, SteerRunGate::Invalid(_)),
+        "approvals tamper must surface as Invalid (receipt_id mismatch), got {g:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8. Typed robot error codes: the refusal contract surfaced to callers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn each_admission_outcome_surfaces_its_typed_robot_error_code() {
+    // Valid admit -> no error code.
+    let ok = admit_receipt(Some("plan-A"), 1_000, Some(10_000));
+    assert_eq!(
+        receipt_admits_action(&ok, "plan-A", 5_000).error_code(),
+        None,
+        "an admitted action has no refusal code"
+    );
+
+    // HashMismatch (tx drift) -> hash mismatch code.
+    assert_eq!(
+        receipt_admits_action(&ok, "plan-B", 5_000).error_code(),
+        Some("robot.steer_hash_mismatch")
+    );
+
+    // Expired -> expired code.
+    let expired = admit_receipt(Some("plan-A"), 1_000, Some(1_000));
+    assert_eq!(
+        receipt_admits_action(&expired, "plan-A", 5_000).error_code(),
+        Some("robot.steer_receipt_expired")
+    );
+
+    // NotAdmitted (non-admit verdict) -> not-admitted code.
+    let not_admit = SteeringReceipt::new(
+        "objective",
+        "ws",
+        None,
+        Some("plan-A".to_string()),
+        "envelope.requires_approval",
+        Some(900),
+        Vec::new(),
+        1_000,
+        Some(10_000),
+    );
+    assert_eq!(
+        receipt_admits_action(&not_admit, "plan-A", 5_000).error_code(),
+        Some("robot.steer_receipt_not_admitted")
+    );
+
+    // UnverifiableBinding (captured tx, no live tx supplied) -> unverifiable code.
+    assert_eq!(
+        steer_run_gate(&ok, None, None, 5_000).error_code(),
+        Some("robot.steer_binding_unverifiable")
+    );
+
+    // Invalid (tampered, unsealed) -> invalid code.
+    let mut forged = admit_receipt(Some("plan-A"), 1_000, Some(10_000));
+    forged.tx_contract_hash = Some("plan-B".to_string());
+    assert_eq!(
+        receipt_admits_action(&forged, "plan-B", 5_000).error_code(),
+        Some("robot.steer_receipt_invalid")
+    );
+}
