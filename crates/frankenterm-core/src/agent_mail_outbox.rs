@@ -1,8 +1,21 @@
-//! Durable Agent Mail outage-spool entry contract.
+//! Agent Mail outage-spool entry contract (read surface wired; writer not yet).
 //!
 //! The types here describe intended coordination writes captured while Agent
 //! Mail is unavailable after the single allowed retry. They deliberately do not
 //! claim delivery; replay state is recorded separately and remains auditable.
+//!
+//! # Integration status (ft-hb7nt)
+//!
+//! WRITER / REPLAY HALF NOT YET WIRED. `build_queued_outbox_entry`,
+//! `dry_run_replay_outbox_entry`, and `mark_outbox_entry_replayed` /
+//! `_replay_failed` build and validate `AgentMailOutboxEntry` values in memory
+//! but never PERSIST them (there is no fs/DB write anywhere in this module) and
+//! have no production callers — nothing on the Agent-Mail send/reserve failure
+//! path spools an entry. Only the READER, `load_agent_mail_outbox_surface`, is
+//! wired (into `mcp_resources` + the `ft robot agent-mail-outbox` CLI); it
+//! `fs::read`s and summarizes pre-existing JSON. So the spool is never written
+//! when Agent Mail fails today — the "durable" framing is aspirational until the
+//! writer is invoked from the failure path and persists the queue.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
