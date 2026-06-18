@@ -5,6 +5,9 @@ use crate::termwindow::render::{
     LineToElementShape, RenderScreenLineParams, RenderScreenLineResult, resolve_fg_color_attr,
     same_hyperlink, same_hyperlink_or_both_none, update_next_frame_time,
 };
+use crate::termwindow::webgpu::{
+    GlyphQuadInstance, GlyphQuadSoaBatch, moonshot_instanced_glyph_quads_enabled,
+};
 use ::window::DeadKeyStatus;
 use anyhow::Context;
 use config::{HsbTransform, TextStyle};
@@ -458,6 +461,8 @@ impl crate::TermWindow {
         }
 
         let mut overlay_images = None;
+        let mut glyph_quad_batch = moonshot_instanced_glyph_quads_enabled()
+            .then(|| GlyphQuadSoaBatch::with_capacity(shaped.len().saturating_mul(2).max(8)));
 
         // Number of cells we've rendered, starting from the edge of the line
         let mut visual_cell_idx = 0;
@@ -674,17 +679,7 @@ impl crate::TermWindow {
 
                             let texture_rect = texture.texture.to_texture_coords(pixel_rect);
 
-                            let mut quad = layers.allocate(1).context("layers.allocate(1)")?;
-                            quad.set_position(
-                                gl_x + range.start,
-                                pos_y + top,
-                                gl_x + range.end,
-                                pos_y + top + texture.coords.size.height as f32 * height_scale,
-                            );
-                            quad.set_fg_color(glyph_color);
-                            quad.set_alt_color_and_mix_value(fg_color_alt, fg_color_mix);
-                            quad.set_texture(texture_rect);
-                            quad.set_hsv(if glyph.brightness_adjust != 1.0 {
+                            let glyph_hsv = if glyph.brightness_adjust != 1.0 {
                                 let hsv = hsv.unwrap_or_else(|| HsbTransform::default());
                                 Some(HsbTransform {
                                     brightness: hsv.brightness * glyph.brightness_adjust,
@@ -692,8 +687,38 @@ impl crate::TermWindow {
                                 })
                             } else {
                                 hsv
-                            });
-                            quad.set_has_color(glyph.has_color);
+                            };
+                            let position = [
+                                gl_x + range.start,
+                                pos_y + top,
+                                gl_x + range.end,
+                                pos_y + top + texture.coords.size.height as f32 * height_scale,
+                            ];
+                            if let Some(batch) = glyph_quad_batch.as_mut() {
+                                batch.push(GlyphQuadInstance::new(
+                                    position,
+                                    texture_rect,
+                                    glyph_color,
+                                    fg_color_alt,
+                                    fg_color_mix,
+                                    glyph_hsv,
+                                    glyph.has_color,
+                                ));
+                            } else {
+                                let mut quad =
+                                    layers.allocate(1).context("layers.allocate(1)")?;
+                                quad.set_position(
+                                    position[0],
+                                    position[1],
+                                    position[2],
+                                    position[3],
+                                );
+                                quad.set_fg_color(glyph_color);
+                                quad.set_alt_color_and_mix_value(fg_color_alt, fg_color_mix);
+                                quad.set_texture(texture_rect);
+                                quad.set_hsv(glyph_hsv);
+                                quad.set_has_color(glyph.has_color);
+                            }
                         }
                     }
                 }
@@ -730,6 +755,10 @@ impl crate::TermWindow {
                 }
                 Direction::LeftToRight => {}
             }
+        }
+
+        if let Some(glyph_quad_batch) = glyph_quad_batch {
+            glyph_quad_batch.extend_layer_as_expanded_vertices(layers, 1);
         }
 
         if let Some(overlay_images) = overlay_images {

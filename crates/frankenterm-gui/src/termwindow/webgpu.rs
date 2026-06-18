@@ -1,6 +1,9 @@
-use crate::quad::Vertex;
+use crate::quad::{
+    TripleLayerQuadAllocatorTrait, V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT,
+    VERTICES_PER_CELL, Vertex,
+};
 use anyhow::anyhow;
-use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
+use config::{ConfigHandle, GpuInfo, HsbTransform, WebGpuPowerPreference};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
 use frankenterm_core::display_pipeline::{
     ForcePresentSignals, PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrMechanism,
@@ -23,10 +26,11 @@ use frankenterm_core::wayland_direct_scanout::{
 };
 use std::cell::RefCell;
 use std::fmt;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
-use window::bitmaps::{Texture2d, validate_texture_readback_request};
+use window::bitmaps::{Texture2d, TextureRect, validate_texture_readback_request};
+use window::color::LinearRgba;
 use window::raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
     RawWindowHandle, WindowHandle,
@@ -34,6 +38,178 @@ use window::raw_window_handle::{
 use window::{BitmapImage, Dimensions, Rect, Window};
 
 const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const GLYPH_QUAD_HAS_COLOR: f32 = 0.0;
+const COLOR_GLYPH_QUAD_HAS_COLOR: f32 = 1.0;
+
+static MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Runtime gate for the ft-3r0yk SoA glyph-quad experiment.
+///
+/// `input_to_photon` is a `headless-render` bench, so that feature exercises the
+/// risky path centrally. Default GUI builds keep the classic direct-quad path
+/// unless explicitly opted in, and the disable env var gives operators an
+/// immediate fallback without a rebuild.
+#[must_use]
+pub fn moonshot_instanced_glyph_quads_enabled() -> bool {
+    *MOONSHOT_INSTANCED_GLYPH_QUADS_ENABLED.get_or_init(|| {
+        if std::env::var_os("FT_DISABLE_MOONSHOT_INSTANCED_GLYPH_QUADS").is_some() {
+            return false;
+        }
+
+        cfg!(feature = "headless-render")
+            || std::env::var_os("FT_MOONSHOT_INSTANCED_GLYPH_QUADS").is_some()
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlyphQuadInstance {
+    position: [f32; 4],
+    tex: [f32; 4],
+    fg_color: [f32; 4],
+    alt_color: [f32; 4],
+    hsv: [f32; 3],
+    has_color: f32,
+    mix_value: f32,
+}
+
+impl GlyphQuadInstance {
+    #[must_use]
+    pub fn new(
+        position: [f32; 4],
+        texture: TextureRect,
+        fg_color: LinearRgba,
+        alt_color: LinearRgba,
+        mix_value: f32,
+        hsv: Option<HsbTransform>,
+        has_color: bool,
+    ) -> Self {
+        let hsv = hsv
+            .map(|t| [t.hue, t.saturation, t.brightness])
+            .unwrap_or([1.0, 1.0, 1.0]);
+        Self {
+            position,
+            tex: [
+                texture.min_x(),
+                texture.max_x(),
+                texture.min_y(),
+                texture.max_y(),
+            ],
+            fg_color: fg_color.into(),
+            alt_color: alt_color.into(),
+            hsv,
+            has_color: if has_color {
+                COLOR_GLYPH_QUAD_HAS_COLOR
+            } else {
+                GLYPH_QUAD_HAS_COLOR
+            },
+            mix_value,
+        }
+    }
+
+    #[must_use]
+    pub fn expanded_vertices(self) -> [Vertex; VERTICES_PER_CELL] {
+        let [left, top, right, bottom] = self.position;
+        let [tex_left, tex_right, tex_top, tex_bottom] = self.tex;
+        let mut vertices = [Vertex {
+            fg_color: self.fg_color,
+            alt_color: self.alt_color,
+            hsv: self.hsv,
+            has_color: self.has_color,
+            mix_value: self.mix_value,
+            ..Vertex::default()
+        }; VERTICES_PER_CELL];
+
+        vertices[V_TOP_LEFT].position = [left, top];
+        vertices[V_TOP_RIGHT].position = [right, top];
+        vertices[V_BOT_LEFT].position = [left, bottom];
+        vertices[V_BOT_RIGHT].position = [right, bottom];
+
+        vertices[V_TOP_LEFT].tex = [tex_left, tex_top];
+        vertices[V_TOP_RIGHT].tex = [tex_right, tex_top];
+        vertices[V_BOT_LEFT].tex = [tex_left, tex_bottom];
+        vertices[V_BOT_RIGHT].tex = [tex_right, tex_bottom];
+
+        vertices
+    }
+}
+
+/// Structure-of-arrays staging for the ft-3r0yk instanced glyph path.
+///
+/// The current live WebGPU draw loop still consumes expanded `Vertex` quads.
+/// This batch is the reversible bridge: screen-line rendering records one
+/// instance per glyph strip in SoA form, then expands once at the fallback
+/// boundary. The next wiring step can upload these arrays directly as an
+/// instance buffer and issue one draw per atlas page.
+#[derive(Debug, Default)]
+pub struct GlyphQuadSoaBatch {
+    positions: Vec<[f32; 4]>,
+    tex_rects: Vec<[f32; 4]>,
+    fg_colors: Vec<[f32; 4]>,
+    alt_colors: Vec<[f32; 4]>,
+    hsv: Vec<[f32; 3]>,
+    has_color: Vec<f32>,
+    mix_values: Vec<f32>,
+}
+
+impl GlyphQuadSoaBatch {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            positions: Vec::with_capacity(capacity),
+            tex_rects: Vec::with_capacity(capacity),
+            fg_colors: Vec::with_capacity(capacity),
+            alt_colors: Vec::with_capacity(capacity),
+            hsv: Vec::with_capacity(capacity),
+            has_color: Vec::with_capacity(capacity),
+            mix_values: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn push(&mut self, instance: GlyphQuadInstance) {
+        self.positions.push(instance.position);
+        self.tex_rects.push(instance.tex);
+        self.fg_colors.push(instance.fg_color);
+        self.alt_colors.push(instance.alt_color);
+        self.hsv.push(instance.hsv);
+        self.has_color.push(instance.has_color);
+        self.mix_values.push(instance.mix_value);
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    pub fn extend_layer_as_expanded_vertices(
+        &self,
+        layers: &mut impl TripleLayerQuadAllocatorTrait,
+        layer_num: usize,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+
+        let mut vertices = Vec::with_capacity(self.len() * VERTICES_PER_CELL);
+        for idx in 0..self.len() {
+            let instance = GlyphQuadInstance {
+                position: self.positions[idx],
+                tex: self.tex_rects[idx],
+                fg_color: self.fg_colors[idx],
+                alt_color: self.alt_colors[idx],
+                hsv: self.hsv[idx],
+                has_color: self.has_color[idx],
+                mix_value: self.mix_values[idx],
+            };
+            vertices.extend_from_slice(&instance.expanded_vertices());
+        }
+        layers.extend_with(layer_num, &vertices);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebGpuSurfaceTextureError {
