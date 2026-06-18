@@ -292,6 +292,7 @@ pub mod fleet_mutation;
 pub mod fleet_scrollback_coordinator;
 pub mod font_features;
 pub mod forbidden_dep_guards;
+pub mod governor_advisory;
 // `forensic_export` extracted to `frankenterm-core-audit-types` (ft-rqu5e /
 // ft-8nqx0 Phase 1). Leaf-clean per the boundary scan (zero `crate::*` deps,
 // only `std` + `serde`). Re-exported so `crate::forensic_export::*` and
