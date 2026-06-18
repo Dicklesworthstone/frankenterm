@@ -56,6 +56,10 @@ use_image = ["image", "dep:image", "frankenterm-escape-parser/use_image", "frank
 image = ["sha2", "frankenterm-blob-leases", "frankenterm-escape-parser/image"]
 tmux_cc = ["pest", "pest_derive", "frankenterm-escape-parser/tmux_cc"]
 docs = ["widgets", "use_serde", "image", "tmux_cc"]
+# ft-dkfiy (MOONSHOT, experimental): pass through to frankenterm-cell's additive
+# succinct run-length attribute store so the `cell` bench can exercise it via
+# `-p termwiz --features succinct_attrs`. Off by default; clean to revert.
+succinct_attrs = ["frankenterm-cell/succinct_attrs"]
 
 [dev-dependencies]
 criterion.workspace = true
