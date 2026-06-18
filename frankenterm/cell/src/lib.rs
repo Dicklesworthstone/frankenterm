@@ -671,6 +671,27 @@ impl TeenyString {
         }
     }
 
+    const fn from_inline_byte(byte: u8, width: usize) -> Self {
+        let word = if cfg!(target_endian = "little") {
+            byte as u64
+        } else {
+            (byte as u64) << 56
+        };
+        Self(Self::set_marker_bit(word, width))
+    }
+
+    fn can_assume_default_ascii_width(unicode_version: Option<&UnicodeVersion>) -> bool {
+        #[cfg(feature = "std")]
+        if unicode_version
+            .and_then(|version| version.cell_widths.as_ref())
+            .is_some()
+        {
+            return false;
+        }
+
+        true
+    }
+
     const fn normalize_explicit_width(width: usize) -> usize {
         if width > 2 {
             2
@@ -700,9 +721,15 @@ impl TeenyString {
 
         let bytes = s.as_bytes();
         let len = bytes.len();
-        let width = width
-            .map(Self::normalize_explicit_width)
-            .unwrap_or_else(|| grapheme_column_width(s, unicode_version));
+        let explicit_width = width.map(Self::normalize_explicit_width);
+
+        if len == 1
+            && (explicit_width.is_some() || Self::can_assume_default_ascii_width(unicode_version))
+        {
+            return Self::from_inline_byte(bytes[0], explicit_width.unwrap_or(1));
+        }
+
+        let width = explicit_width.unwrap_or_else(|| grapheme_column_width(s, unicode_version));
 
         if len < core::mem::size_of::<u64>() && width < 3 {
             let mut word = 0u64;
@@ -734,6 +761,16 @@ impl TeenyString {
     }
 
     pub fn from_char(c: char) -> Self {
+        if c.is_ascii() {
+            let byte = c as u8;
+            let byte = if byte < 0x20 || byte == 0x7f {
+                b' '
+            } else {
+                byte
+            };
+            return Self::from_inline_byte(byte, 1);
+        }
+
         let mut bytes = [0u8; 8];
         Self::from_str(c.encode_utf8(&mut bytes), None, None)
     }
