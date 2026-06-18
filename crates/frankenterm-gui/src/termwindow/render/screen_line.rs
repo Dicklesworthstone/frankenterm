@@ -987,10 +987,128 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quad::{
+        Quad, QuadImpl, QuadTrait, TripleLayerQuadAllocatorTrait, VERTICES_PER_CELL, Vertex,
+    };
+    use ::window::bitmaps::{TextureCoord, TextureRect, TextureSize};
     use std::sync::Arc;
     use termwiz::cell::Cell;
     use termwiz::hyperlink::Hyperlink;
     use termwiz::surface::{Line, SEQ_ZERO};
+
+    #[derive(Default)]
+    struct CapturedLayerVertices {
+        calls: Vec<(usize, Vec<Vertex>)>,
+    }
+
+    impl TripleLayerQuadAllocatorTrait for CapturedLayerVertices {
+        fn allocate(&mut self, layer_num: usize) -> anyhow::Result<QuadImpl<'_>> {
+            unreachable!("SoA glyph staging should extend layer {layer_num} in one batch")
+        }
+
+        fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
+            self.calls.push((layer_num, vertices.to_vec()));
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct ScreenLineGlyphStrip {
+        position: [f32; 4],
+        texture: TextureRect,
+        fg_color: LinearRgba,
+        alt_color: LinearRgba,
+        mix_value: f32,
+        hsv: Option<HsbTransform>,
+        has_color: bool,
+    }
+
+    fn texture_rect(left: f32, top: f32, right: f32, bottom: f32) -> TextureRect {
+        TextureRect::new(
+            TextureCoord::new(left, top),
+            TextureSize::new(right - left, bottom - top),
+        )
+    }
+
+    fn aos_glyph_vertices(strip: ScreenLineGlyphStrip) -> [Vertex; VERTICES_PER_CELL] {
+        let [left, top, right, bottom] = strip.position;
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+
+        quad.set_position(left, top, right, bottom);
+        quad.set_fg_color(strip.fg_color);
+        quad.set_alt_color_and_mix_value(strip.alt_color, strip.mix_value);
+        quad.set_texture(strip.texture);
+        quad.set_hsv(strip.hsv);
+        quad.set_has_color(strip.has_color);
+
+        vertices
+    }
+
+    fn soa_instance(strip: ScreenLineGlyphStrip) -> GlyphQuadInstance {
+        GlyphQuadInstance::new(
+            strip.position,
+            strip.texture,
+            strip.fg_color,
+            strip.alt_color,
+            strip.mix_value,
+            strip.hsv,
+            strip.has_color,
+        )
+    }
+
+    fn vertex_bytes(vertices: &[Vertex]) -> &[u8] {
+        bytemuck::cast_slice(vertices)
+    }
+
+    #[test]
+    fn soa_glyph_staging_matches_aos_quad_bytes_for_screen_line_strips() {
+        let strips = [
+            ScreenLineGlyphStrip {
+                position: [-240.0, -18.5, -232.0, -2.5],
+                texture: texture_rect(0.125, 0.25, 0.1875, 0.375),
+                fg_color: LinearRgba::with_components(0.2, 0.4, 0.8, 1.0),
+                alt_color: LinearRgba::with_components(0.9, 0.6, 0.1, 0.75),
+                mix_value: 0.375,
+                hsv: Some(HsbTransform {
+                    hue: 0.9,
+                    saturation: 0.8,
+                    brightness: 0.7,
+                }),
+                has_color: false,
+            },
+            ScreenLineGlyphStrip {
+                position: [-232.0, -18.5, -224.0, -2.5],
+                texture: texture_rect(0.5, 0.625, 0.5625, 0.75),
+                fg_color: LinearRgba::with_components(1.0, 0.25, 0.15, 0.95),
+                alt_color: LinearRgba::with_components(0.05, 0.6, 0.7, 0.8),
+                mix_value: 0.625,
+                hsv: None,
+                has_color: true,
+            },
+        ];
+
+        let mut expected_vertices = Vec::with_capacity(strips.len() * VERTICES_PER_CELL);
+        let mut batch = GlyphQuadSoaBatch::with_capacity(strips.len());
+
+        for strip in strips {
+            let aos_vertices = aos_glyph_vertices(strip);
+            let soa_vertices = soa_instance(strip).expanded_vertices();
+            assert_eq!(vertex_bytes(&soa_vertices), vertex_bytes(&aos_vertices));
+
+            expected_vertices.extend_from_slice(&aos_vertices);
+            batch.push(soa_instance(strip));
+        }
+
+        let mut captured = CapturedLayerVertices::default();
+        batch.extend_layer_as_expanded_vertices(&mut captured, 1);
+
+        assert_eq!(captured.calls.len(), 1);
+        let (layer_num, actual_vertices) = &captured.calls[0];
+        assert_eq!(*layer_num, 1);
+        assert_eq!(vertex_bytes(actual_vertices), vertex_bytes(&expected_vertices));
+    }
 
     #[test]
     fn cluster_paragraph_context_tracks_rtl_and_indic_ranges() {
