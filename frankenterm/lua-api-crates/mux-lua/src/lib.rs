@@ -109,7 +109,27 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
 
     mux_mod.set(
         "spawn_window",
-        lua.create_function(|_, spawn: SpawnWindow| promise::spawn::block_on(spawn.spawn()))?,
+        // Must stay an async Lua function. `promise::spawn::block_on` (the form
+        // this regressed to during the mlua 0.11 migration) trips the
+        // main-thread dispatch guard -> SIGABRT when `mux.spawn_window` is
+        // invoked from a `gui-startup` handler / event handler / keybinding
+        // running on the main-thread spawn queue.
+        //
+        // We can't simply `spawn.spawn().await` directly: it awaits
+        // `mux.spawn_tab_or_window`, whose future is `!Send` (it boxes non-Send
+        // `dyn Future`s, and for remote `ClientDomain`s drives network RPCs),
+        // but mlua 0.11's `create_async_function` requires a `Send` future.
+        //
+        // So spawn the `!Send` work onto the main-thread queue via
+        // `promise::spawn::spawn` (which uses `spawn_local`, lifting the `Send`
+        // bound on the future) and await the resulting `Task` handle, which IS
+        // `Send`. The event loop drives the spawned future to completion --
+        // including remote-domain I/O -- while we yield here; no `block_on`, so
+        // no dispatch-guard trip, and only the `Send` `Task` is live across the
+        // await, satisfying mlua.
+        lua.create_async_function(|_, spawn: SpawnWindow| async move {
+            promise::spawn::spawn(spawn.spawn()).await
+        })?,
     )?;
 
     mux_mod.set(
