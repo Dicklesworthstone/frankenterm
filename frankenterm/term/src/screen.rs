@@ -4349,8 +4349,8 @@ mod tests {
                 .map(|slot| {
                     slot.as_ref()
                         .expect("missing rewrap scratch slot")
-                        .clone_lines(&screen.lines)
-                        .into_iter()
+                        .shared_chunk(&screen.lines)
+                        .iter()
                         .map(|line| {
                             (
                                 line.as_str().to_string(),
