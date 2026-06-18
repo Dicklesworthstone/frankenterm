@@ -1,12 +1,12 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
-    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
+    CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry, default_color_map,
 };
-use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use crate::{ClipboardSelection, DCS, Position, ST, TerminalState, VisibleRowIndex};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+    Cell, CellAttributes, SemanticType, grapheme_column_width, is_white_space_grapheme,
 };
 use frankenterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -16,7 +16,7 @@ use frankenterm_escape_parser::osc::{
     ITermUnicodeVersionOp, Selection,
 };
 use frankenterm_escape_parser::{
-    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
+    Action, CSI, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand,
 };
 use log::{debug, error};
 use num_traits::FromPrimitive;
@@ -25,7 +25,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
 use termwiz::input::KeyboardEncoding;
-use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use url::Url;
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
@@ -34,6 +34,10 @@ pub(crate) struct Performer<'a> {
     pub state: &'a mut TerminalState,
     print: String,
 }
+
+#[cfg(test)]
+static FORCE_SCALAR_PRINTABLE_ASCII_SCAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl<'a> Deref for Performer<'a> {
     type Target = TerminalState;
@@ -148,6 +152,11 @@ impl<'a> Performer<'a> {
 
     #[inline]
     fn printable_ascii_prefix_len(bytes: &[u8]) -> usize {
+        #[cfg(test)]
+        if FORCE_SCALAR_PRINTABLE_ASCII_SCAN.load(std::sync::atomic::Ordering::Relaxed) {
+            return Self::printable_ascii_prefix_len_scalar(bytes);
+        }
+
         #[cfg(target_pointer_width = "64")]
         {
             return Self::printable_ascii_prefix_len_swar(bytes);
@@ -168,7 +177,8 @@ impl<'a> Performer<'a> {
             chunk.copy_from_slice(&bytes[offset..offset + 8]);
             let word = u64::from_ne_bytes(chunk);
             if Self::swar_non_printable_ascii_mask(word) != 0 {
-                return offset + Self::printable_ascii_prefix_len_scalar(&bytes[offset..offset + 8]);
+                return offset
+                    + Self::printable_ascii_prefix_len_scalar(&bytes[offset..offset + 8]);
             }
             offset += 8;
         }
@@ -1465,5 +1475,195 @@ fn selection_to_selection(sel: Selection) -> ClipboardSelection {
         // also use the same fallback configuration as NONE,
         // if/when we add it
         _ => ClipboardSelection::Clipboard,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::ColorPalette;
+    use crate::config::ScrollbackTierConfig;
+    use crate::terminal::{Terminal, TerminalSize};
+    use crate::{CellAttributes, CursorPosition, Line, TerminalConfiguration};
+    use frankenterm_escape_parser::parser::Parser;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct GateTermConfig;
+
+    impl TerminalConfiguration for GateTermConfig {
+        fn scrollback_size(&self) -> usize {
+            64
+        }
+
+        fn scrollback_tier_config(&self) -> ScrollbackTierConfig {
+            ScrollbackTierConfig::default()
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct LineSnapshot {
+        text: String,
+        wrapped: bool,
+        cells: Vec<(String, usize, CellAttributes)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TerminalSnapshot {
+        cursor: CursorPosition,
+        title: String,
+        current_dir: Option<String>,
+        progress: Progress,
+        palette: ColorPalette,
+        all_lines: Vec<LineSnapshot>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct GateRun {
+        actions: Vec<Action>,
+        terminal: TerminalSnapshot,
+    }
+
+    struct ScalarScanOverride;
+
+    impl ScalarScanOverride {
+        fn set(force_scalar: bool) -> Self {
+            FORCE_SCALAR_PRINTABLE_ASCII_SCAN
+                .store(force_scalar, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for ScalarScanOverride {
+        fn drop(&mut self) {
+            FORCE_SCALAR_PRINTABLE_ASCII_SCAN.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn gate_corpus() -> Vec<(&'static str, Vec<u8>)> {
+        let mut cases = vec![
+            ("pure_ascii_short", b"simple printable ascii run".to_vec()),
+            (
+                "pure_ascii_long",
+                std::iter::repeat(b'x').take(96).collect(),
+            ),
+            ("ascii_control_mix", b"abc\r\ndef\tghi\x08!".to_vec()),
+            (
+                "utf8_multibyte",
+                b"caf\xc3\xa9 \xe2\x82\xac A\xcc\x81 \xf0\x9f\x9a\x80 end".to_vec(),
+            ),
+            (
+                "embedded_sgr_csi",
+                b"lead\x1b[31mred\x1b[0mtail\x1b[2Jafter".to_vec(),
+            ),
+            ("embedded_osc", b"\x1b]0;swar gate\x07after".to_vec()),
+        ];
+
+        for boundary in [8, 16, 64] {
+            cases.push(("ascii_run_boundary_lf", boundary_case(boundary, b"\n")));
+            cases.push((
+                "ascii_run_boundary_csi",
+                boundary_case(boundary, b"\x1b[4m"),
+            ));
+            cases.push((
+                "ascii_run_boundary_utf8",
+                boundary_case(boundary, b"\xc3\xa9"),
+            ));
+        }
+
+        cases
+    }
+
+    fn boundary_case(printable_prefix_len: usize, boundary_bytes: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(printable_prefix_len + boundary_bytes.len() + 8);
+        bytes.extend(std::iter::repeat(b'a').take(printable_prefix_len));
+        bytes.extend_from_slice(boundary_bytes);
+        bytes.extend_from_slice(b"tail");
+        bytes
+    }
+
+    fn make_terminal() -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows: 8,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 128,
+                dpi: 96,
+            },
+            Arc::new(GateTermConfig),
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn snapshot_line(line: &Line) -> LineSnapshot {
+        LineSnapshot {
+            text: line.as_str().to_string(),
+            wrapped: line.last_cell_was_wrapped(),
+            cells: line
+                .visible_cells()
+                .map(|cell| (cell.str().to_string(), cell.width(), cell.attrs().clone()))
+                .collect(),
+        }
+    }
+
+    fn snapshot_terminal(term: &Terminal) -> TerminalSnapshot {
+        let mut cursor = term.cursor_pos();
+        cursor.seqno = 0;
+        TerminalSnapshot {
+            cursor,
+            title: term.get_title().to_string(),
+            current_dir: term.get_current_dir().map(|url| url.to_string()),
+            progress: term.get_progress(),
+            palette: term.palette(),
+            all_lines: term
+                .screen()
+                .all_lines()
+                .iter()
+                .map(snapshot_line)
+                .collect(),
+        }
+    }
+
+    fn run_gate_stream(bytes: &[u8], force_scalar: bool) -> GateRun {
+        let _scan_override = ScalarScanOverride::set(force_scalar);
+        let mut parser = Parser::new();
+        let actions = parser.parse_as_vec(bytes);
+        let mut term = make_terminal();
+        term.advance_bytes(bytes);
+        GateRun {
+            actions,
+            terminal: snapshot_terminal(&term),
+        }
+    }
+
+    #[test]
+    fn swar_terminal_effects_match_scalar_for_representative_vte_streams() {
+        for (name, bytes) in gate_corpus() {
+            let swar = run_gate_stream(&bytes, false);
+            let scalar = run_gate_stream(&bytes, true);
+            assert_eq!(swar, scalar, "SWAR diverged from scalar for {name}");
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn swar_prefix_scan_matches_scalar_on_every_gate_stream_suffix() {
+        for (name, bytes) in gate_corpus() {
+            for offset in 0..=bytes.len() {
+                let suffix = &bytes[offset..];
+                assert_eq!(
+                    Performer::printable_ascii_prefix_len_swar(suffix),
+                    Performer::printable_ascii_prefix_len_scalar(suffix),
+                    "SWAR prefix length diverged from scalar for {name} at offset {offset}"
+                );
+            }
+        }
     }
 }
