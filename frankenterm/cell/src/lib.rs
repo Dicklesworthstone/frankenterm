@@ -128,6 +128,200 @@ impl FatAttributes {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// ft-dkfiy (MOONSHOT, cfg `succinct_attrs`): succinct run-length attribute store
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Succinct run-length storage for a line's worth of cell attributes.
+///
+/// Terminal lines have long runs of identical attributes (an entire line of
+/// default-attr text, a single colored span), so storing `(CellAttributes,
+/// run_len)` pairs instead of one [`CellAttributes`] per cell is dramatically
+/// more compact — a 200-column uniform-attribute line collapses from
+/// `200 × size_of::<CellAttributes>()` (3200 bytes) to a single ~20-byte run —
+/// and improves cache locality for the attribute scans done during reflow and
+/// paint.
+///
+/// This is an EXPERIMENTAL, purely ADDITIVE primitive: it does NOT change the
+/// default per-cell [`Cell`] / [`CellAttributes`] representation, so existing
+/// behaviour and golden outputs are unaffected. It is intended as the storage
+/// backing a future run-length line representation. Gated behind the
+/// `succinct_attrs` feature so it is trivially revertible.
+#[cfg(feature = "succinct_attrs")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AttributeRuns {
+    runs: Vec<AttrRun>,
+    /// Total number of logical cells represented by `runs`.
+    len: usize,
+}
+
+#[cfg(feature = "succinct_attrs")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AttrRun {
+    attrs: CellAttributes,
+    /// Number of consecutive cells that share `attrs` (always >= 1).
+    run_len: u32,
+}
+
+#[cfg(feature = "succinct_attrs")]
+impl AttributeRuns {
+    /// An empty attribute store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pre-allocate space for `runs` distinct attribute runs.
+    pub fn with_run_capacity(runs: usize) -> Self {
+        Self {
+            runs: Vec::with_capacity(runs),
+            len: 0,
+        }
+    }
+
+    /// Total number of logical cells represented.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when no cells are stored.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Number of distinct attribute runs — the succinct size. For a line of
+    /// uniform attributes this is `1` regardless of column count.
+    #[inline]
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// Append `count` cells carrying `attrs`, coalescing with the trailing run
+    /// when the attributes are identical (the common case for terminal text).
+    pub fn push(&mut self, attrs: &CellAttributes, count: u32) {
+        if count == 0 {
+            return;
+        }
+        if let Some(last) = self.runs.last_mut() {
+            if last.attrs == *attrs {
+                last.run_len = last.run_len.saturating_add(count);
+                self.len += count as usize;
+                return;
+            }
+        }
+        self.runs.push(AttrRun {
+            attrs: attrs.clone(),
+            run_len: count,
+        });
+        self.len += count as usize;
+    }
+
+    /// Attributes at logical cell index `idx`, or `None` if out of range.
+    /// Scans runs (`O(run_count)`, which is `<<` cell count for real lines).
+    pub fn get(&self, idx: usize) -> Option<&CellAttributes> {
+        if idx >= self.len {
+            return None;
+        }
+        let mut offset = 0usize;
+        for run in &self.runs {
+            offset += run.run_len as usize;
+            if idx < offset {
+                return Some(&run.attrs);
+            }
+        }
+        None
+    }
+
+    /// Expand back into one [`CellAttributes`] clone per logical cell — the
+    /// inverse of repeated [`push`](Self::push). Proves the run encoding is
+    /// lossless and bridges to per-cell consumers.
+    pub fn to_per_cell(&self) -> Vec<CellAttributes> {
+        let mut out = Vec::with_capacity(self.len);
+        for run in &self.runs {
+            for _ in 0..run.run_len {
+                out.push(run.attrs.clone());
+            }
+        }
+        out
+    }
+}
+
+#[cfg(all(test, feature = "succinct_attrs"))]
+mod succinct_attrs_tests {
+    use super::*;
+
+    fn plain() -> CellAttributes {
+        CellAttributes::blank()
+    }
+
+    fn reversed() -> CellAttributes {
+        let mut a = CellAttributes::blank();
+        a.set_reverse(true);
+        a
+    }
+
+    #[test]
+    fn empty_store() {
+        let r = AttributeRuns::new();
+        assert!(r.is_empty());
+        assert_eq!(r.len(), 0);
+        assert_eq!(r.run_count(), 0);
+        assert_eq!(r.get(0), None);
+        assert!(r.to_per_cell().is_empty());
+    }
+
+    #[test]
+    fn uniform_line_collapses_to_one_run() {
+        let mut r = AttributeRuns::new();
+        r.push(&plain(), 200);
+        assert_eq!(r.len(), 200);
+        assert_eq!(r.run_count(), 1, "a uniform line must use a single run");
+        for i in 0..200 {
+            assert_eq!(r.get(i), Some(&plain()));
+        }
+        assert_eq!(r.get(200), None);
+    }
+
+    #[test]
+    fn adjacent_equal_pushes_coalesce() {
+        let mut r = AttributeRuns::new();
+        r.push(&plain(), 3);
+        r.push(&plain(), 5);
+        assert_eq!(r.run_count(), 1, "identical adjacent runs must merge");
+        assert_eq!(r.len(), 8);
+    }
+
+    #[test]
+    fn zero_count_push_is_noop() {
+        let mut r = AttributeRuns::new();
+        r.push(&plain(), 0);
+        assert!(r.is_empty());
+        assert_eq!(r.run_count(), 0);
+    }
+
+    #[test]
+    fn distinct_runs_and_lookup_match_per_cell_oracle() {
+        // Encode [plain×2, reversed×3, plain×1] and verify every index against
+        // an explicit per-cell oracle (the run encoding is lossless).
+        let spec: [(CellAttributes, u32); 3] = [(plain(), 2), (reversed(), 3), (plain(), 1)];
+        let mut r = AttributeRuns::new();
+        let mut oracle: Vec<CellAttributes> = Vec::new();
+        for (attrs, count) in &spec {
+            r.push(attrs, *count);
+            for _ in 0..*count {
+                oracle.push(attrs.clone());
+            }
+        }
+        assert_eq!(r.run_count(), 3, "non-adjacent-equal runs stay distinct");
+        assert_eq!(r.len(), oracle.len());
+        for (i, want) in oracle.iter().enumerate() {
+            assert_eq!(r.get(i), Some(want), "mismatch at cell {i}");
+        }
+        assert_eq!(r.to_per_cell(), oracle, "round-trip must reproduce the oracle");
+    }
+}
+
 /// Define getter and setter for the attributes bitfield.
 /// The first form is for a simple boolean value stored in
 /// a single bit.  The $bitnum parameter specifies which bit.

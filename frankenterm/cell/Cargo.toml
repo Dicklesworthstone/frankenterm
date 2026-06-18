@@ -28,5 +28,9 @@ frankenterm-dynamic.workspace = true
 std = ["serde/std", "frankenterm-char-props/std", "frankenterm-color-types/std", "frankenterm-escape-parser/std", "frankenterm-dynamic/std", "finl_unicode/std"]
 use_serde = ["dep:serde", "frankenterm-color-types/use_serde"]
 use_image = ["dep:image", "dep:frankenterm-blob-leases", "dep:log", "dep:ordered-float", "dep:sha2", "dep:thiserror"]
+# ft-dkfiy (MOONSHOT, experimental): additive succinct run-length storage for a
+# line's worth of cell attributes. Gated so it is trivially revertible and does
+# not affect the default Cell/CellAttributes representation (goldens unaffected).
+succinct_attrs = []
 
 [dev-dependencies]
