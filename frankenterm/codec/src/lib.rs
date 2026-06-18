@@ -252,8 +252,16 @@ pub mod cdc_dedup {
 
         /// Reconstruct the original payload from a token stream produced by a
         /// synchronized [`CdcDedupEncoder`]. Lossless for well-formed input;
-        /// returns `Err` (never panics/OOMs) for malformed input.
+        /// returns `Err` (never panics/OOMs) for malformed input. Reconstructed
+        /// output is capped at [`MAX_PDU_SIZE`].
         pub fn decode(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+            self.decode_with_cap(data, MAX_PDU_SIZE)
+        }
+
+        /// As [`Self::decode`], but with an explicit reconstruction cap. The
+        /// public `decode` always uses [`MAX_PDU_SIZE`]; the injectable cap lets
+        /// the gate exercise over-cap rejection without allocating 256 MiB.
+        fn decode_with_cap(&mut self, data: &[u8], cap: usize) -> Result<Vec<u8>> {
             let mut out = Vec::new();
             let mut pos = 0;
             while pos < data.len() {
@@ -269,7 +277,7 @@ pub mod cdc_dedup {
                             .chunks
                             .get(id)
                             .ok_or_else(|| anyhow::anyhow!("cdc: reference id out of range"))?;
-                        push_capped(&mut out, chunk)?;
+                        push_capped(&mut out, chunk, cap)?;
                     }
                     TAG_LITERAL_CACHE | TAG_LITERAL_NOCACHE => {
                         let len = usize::try_from(payload)
@@ -282,7 +290,7 @@ pub mod cdc_dedup {
                         }
                         let chunk = &data[pos..end];
                         pos = end;
-                        push_capped(&mut out, chunk)?;
+                        push_capped(&mut out, chunk, cap)?;
                         if tag == TAG_LITERAL_CACHE {
                             if self.chunks.len() >= MAX_CACHED_CHUNKS {
                                 bail!("cdc: cache cap exceeded (stream desynchronized)");
@@ -297,9 +305,9 @@ pub mod cdc_dedup {
         }
     }
 
-    fn push_capped(out: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
-        if out.len().saturating_add(chunk.len()) > MAX_PDU_SIZE {
-            bail!("cdc: reconstructed payload exceeds MAX_PDU_SIZE");
+    fn push_capped(out: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<()> {
+        if out.len().saturating_add(chunk.len()) > cap {
+            bail!("cdc: reconstructed payload exceeds reconstruction cap");
         }
         out.extend_from_slice(chunk);
         Ok(())
@@ -400,6 +408,167 @@ pub mod cdc_dedup {
             let mut out = Vec::new();
             write_leb(&mut out, (0u64 << 2) | TAG_REFERENCE);
             assert!(CdcDedupDecoder::new().decode(&out).is_err());
+        }
+
+        // -- gate-hardening: adversarial / property round-trip (ft-6c1t0) --
+        // A dedup that loses or corrupts a single byte must fail these.
+
+        fn lcg(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        }
+
+        fn random_bytes(state: &mut u64, len: usize) -> Vec<u8> {
+            (0..len).map(|_| (lcg(state) & 0xff) as u8).collect()
+        }
+
+        /// Round-trip one stream through a fresh encoder/decoder; assert exact.
+        fn assert_lossless(stream: &[u8]) {
+            let mut enc = CdcDedupEncoder::new();
+            let mut dec = CdcDedupDecoder::new();
+            let encoded = enc.encode(stream);
+            let decoded = dec.decode(&encoded).expect("decode must succeed");
+            assert_eq!(
+                decoded, stream,
+                "lossless round-trip lost/corrupted bytes (len={})",
+                stream.len()
+            );
+        }
+
+        /// Round-trip a sequence through ONE encoder/decoder pair (cross-frame
+        /// dedup statefulness); assert each frame is exact.
+        fn assert_lossless_sequence(streams: &[Vec<u8>]) {
+            let mut enc = CdcDedupEncoder::new();
+            let mut dec = CdcDedupDecoder::new();
+            for s in streams {
+                let encoded = enc.encode(s);
+                let decoded = dec.decode(&encoded).expect("decode must succeed");
+                assert_eq!(&decoded, s, "stateful round-trip lost/corrupted bytes");
+            }
+        }
+
+        #[test]
+        fn gate_adversarial_roundtrip_is_byte_exact() {
+            // empty + every single-byte value class
+            assert_lossless(b"");
+            for b in [0x00u8, 0x01, 0x41, 0x7f, 0x80, 0xff] {
+                assert_lossless(&[b]);
+            }
+
+            // all-same-byte at lengths straddling MIN/AVG/MAX chunk sizes
+            for &len in &[2usize, 63, 64, 65, 255, 256, 257, 1023, 1024, 1025, 9000] {
+                for b in [0x00u8, 0x41, 0xff] {
+                    assert_lossless(&vec![b; len]);
+                }
+            }
+
+            // highly repetitive (short ANSI-ish pattern cycled large)
+            let rep: Vec<u8> = b"\x1b[32mok\x1b[0m "
+                .iter()
+                .cycle()
+                .take(50_000)
+                .copied()
+                .collect();
+            assert_lossless(&rep);
+
+            // random streams of many lengths (fresh enc/dec each)
+            let mut st = 0x0123_4567_89ab_cdefu64;
+            for _ in 0..400 {
+                let len = (lcg(&mut st) % 4096) as usize;
+                let bytes = random_bytes(&mut st, len);
+                assert_lossless(&bytes);
+            }
+            for &len in &[10_000usize, 65_537, 131_072] {
+                let bytes = random_bytes(&mut st, len);
+                assert_lossless(&bytes);
+            }
+
+            // chunk-boundary-straddling: an identical block at every alignment in
+            // 0..=130 (content-defined chunking must still round-trip exactly when
+            // the same bytes land at different offsets relative to the boundary).
+            let block: Vec<u8> = b"REPEATED-BLOCK-0123456789-"
+                .iter()
+                .cycle()
+                .take(3000)
+                .copied()
+                .collect();
+            for shift in 0..=130usize {
+                let mut s = vec![0x2au8; shift];
+                s.extend_from_slice(&block);
+                assert_lossless(&s);
+            }
+
+            // stateful cross-frame: overlapping payloads through one pair
+            let shared: Vec<u8> = b"==== mirrored across panes ====\r\n"
+                .iter()
+                .cycle()
+                .take(4000)
+                .copied()
+                .collect();
+            let frames: Vec<Vec<u8>> = (0..8u8)
+                .map(|tag| {
+                    let mut f = shared.clone();
+                    f.push(tag);
+                    f
+                })
+                .collect();
+            assert_lossless_sequence(&frames);
+        }
+
+        #[test]
+        fn gate_cache_eviction_roundtrip_is_lossless() {
+            // Feed > MAX_CACHED_CHUNKS distinct sub-MIN_CHUNK payloads (each is a
+            // single distinct chunk) through one pair. Once the dictionary fills,
+            // the encoder falls back to LITERAL_NOCACHE and the decoder must
+            // reconstruct those uncached chunks exactly — no byte may be lost.
+            let mut enc = CdcDedupEncoder::new();
+            let mut dec = CdcDedupDecoder::new();
+            let total = MAX_CACHED_CHUNKS + 2048;
+            for i in 0..total {
+                let mut chunk = [0u8; 24]; // < MIN_CHUNK => exactly one chunk
+                chunk[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                chunk[8] = 0xAB;
+                let encoded = enc.encode(&chunk);
+                let decoded = dec.decode(&encoded).expect("decode must succeed");
+                assert_eq!(
+                    decoded,
+                    chunk.to_vec(),
+                    "post-eviction round-trip corrupted bytes (i={i})"
+                );
+            }
+            assert_eq!(
+                enc.cached_chunks(),
+                MAX_CACHED_CHUNKS,
+                "cache did not fill — the eviction path was never exercised"
+            );
+        }
+
+        #[test]
+        fn gate_exceeds_reconstruction_cap_is_rejected_not_corrupted() {
+            // A stream whose reconstruction exceeds the cap must fail closed
+            // (Err) rather than truncate/corrupt. A small injected cap keeps the
+            // test cheap; the production cap is MAX_PDU_SIZE.
+            let payload: Vec<u8> = (0..20_000u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                .collect();
+            let encoded = CdcDedupEncoder::new().encode(&payload);
+
+            assert_eq!(
+                CdcDedupDecoder::new()
+                    .decode_with_cap(&encoded, payload.len())
+                    .expect("decode at exact cap must succeed"),
+                payload,
+                "exact-cap decode must reproduce the payload byte-for-byte"
+            );
+
+            assert!(
+                CdcDedupDecoder::new()
+                    .decode_with_cap(&encoded, payload.len() - 1)
+                    .is_err(),
+                "over-cap reconstruction must be rejected, not silently corrupted"
+            );
         }
     }
 }
