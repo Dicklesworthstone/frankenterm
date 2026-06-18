@@ -247,11 +247,14 @@ impl<'a> std::hash::Hash for dyn ShapeCacheKeyTrait + 'a {
 
 #[cfg(test)]
 mod test {
-    use crate::glyphcache::GlyphCache;
+    use super::{
+        SHAPED_RUN_INTERNER, build_shaped_infos, glyph_run_interning_enabled, shaped_run_key,
+    };
+    use crate::glyphcache::{CachedGlyph, GlyphCache};
     use crate::shapecache::{GlyphPosition, ShapedInfo};
     use crate::utilsprites::RenderMetrics;
     use config::{FontAttributes, TextStyle};
-    use frankenterm_font::shaper::PresentationWidth;
+    use frankenterm_font::shaper::{GlyphInfo, PresentationWidth};
     use frankenterm_font::{FontConfiguration, LoadedFont};
     use std::rc::Rc;
     use termwiz::cell::CellAttributes;
@@ -264,9 +267,8 @@ mod test {
         style: &TextStyle,
         font: &Rc<LoadedFont>,
         text: &str,
-    ) -> Vec<GlyphPosition> {
+    ) -> (Vec<GlyphInfo>, Vec<Rc<CachedGlyph>>) {
         let line = Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None);
-        eprintln!("{:?}", line);
         let mut all_infos = vec![];
         let mut all_glyphs = vec![];
 
@@ -311,12 +313,122 @@ mod test {
             all_glyphs.append(&mut glyphs);
         }
 
+        (all_infos, all_glyphs)
+    }
+
+    fn cluster_and_shape(
+        render_metrics: &RenderMetrics,
+        glyph_cache: &mut GlyphCache,
+        style: &TextStyle,
+        font: &Rc<LoadedFont>,
+        text: &str,
+    ) -> Vec<GlyphPosition> {
+        let (all_infos, all_glyphs) =
+            shape_infos_and_glyphs(render_metrics, glyph_cache, style, font, text);
+
         eprintln!("infos: {:#?}", all_infos);
         eprintln!("glyphs: {:#?}", all_glyphs);
         ShapedInfo::process(&all_infos, &all_glyphs)
             .into_iter()
             .map(|p| p.pos)
             .collect()
+    }
+
+    fn assert_shaping_stream_eq(left: &[GlyphInfo], right: &[GlyphInfo]) {
+        let left_stream: Vec<_> = left
+            .iter()
+            .map(|info| {
+                (
+                    info.glyph_pos,
+                    info.cluster,
+                    info.x_advance.get().to_bits(),
+                    info.y_advance.get().to_bits(),
+                    info.x_offset.get().to_bits(),
+                    info.y_offset.get().to_bits(),
+                    info.num_cells,
+                )
+            })
+            .collect();
+        let right_stream: Vec<_> = right
+            .iter()
+            .map(|info| {
+                (
+                    info.glyph_pos,
+                    info.cluster,
+                    info.x_advance.get().to_bits(),
+                    info.y_advance.get().to_bits(),
+                    info.x_offset.get().to_bits(),
+                    info.y_offset.get().to_bits(),
+                    info.num_cells,
+                )
+            })
+            .collect();
+
+        assert_eq!(left_stream, right_stream);
+    }
+
+    fn assert_shaped_runs_identical(left: &[ShapedInfo], right: &[ShapedInfo]) {
+        assert_eq!(left.len(), right.len());
+
+        for (idx, (left, right)) in left.iter().zip(right.iter()).enumerate() {
+            assert_eq!(left.pos, right.pos, "glyph position differed at {idx}");
+            assert_eq!(
+                left.block_key, right.block_key,
+                "block glyph key differed at {idx}"
+            );
+            assert!(
+                Rc::ptr_eq(&left.glyph, &right.glyph),
+                "cached glyph identity differed at {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn interned_run_matches_fresh_shape_for_same_font_and_attrs() {
+        config::use_test_configuration();
+
+        let config = config::configuration();
+        let fonts = Rc::new(
+            FontConfiguration::new(
+                None,
+                config.dpi.unwrap_or_else(::window::default_dpi) as usize,
+            )
+            .unwrap(),
+        );
+        let render_metrics = RenderMetrics::new(&fonts).unwrap();
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+
+        let style = TextStyle::default();
+        let font = fonts.resolve_font(&style).unwrap();
+        let text = "status != ready <= retry";
+
+        assert!(
+            glyph_run_interning_enabled(),
+            "glyph-run interning must be enabled for the equivalence gate"
+        );
+        SHAPED_RUN_INTERNER.with(|interner| {
+            *interner.borrow_mut() = Default::default();
+        });
+
+        let (miss_infos, miss_glyphs) =
+            shape_infos_and_glyphs(&render_metrics, &mut glyph_cache, &style, &font, text);
+        let fresh_miss_run = build_shaped_infos(&miss_infos, &miss_glyphs);
+        let miss_run = ShapedInfo::process(&miss_infos, &miss_glyphs);
+        assert_shaped_runs_identical(&fresh_miss_run, &miss_run);
+
+        let (hit_infos, hit_glyphs) =
+            shape_infos_and_glyphs(&render_metrics, &mut glyph_cache, &style, &font, text);
+        assert_shaping_stream_eq(&miss_infos, &hit_infos);
+
+        let fresh_hit_run = build_shaped_infos(&hit_infos, &hit_glyphs);
+        let hit_key = shaped_run_key(&hit_infos, &hit_glyphs);
+        let lookup_hit = SHAPED_RUN_INTERNER
+            .with(|interner| interner.borrow().lookup(hit_key, &hit_infos, &hit_glyphs))
+            .expect("second identical shape must hit the glyph-run interner");
+        assert_shaped_runs_identical(&fresh_hit_run, &lookup_hit);
+
+        let process_hit = ShapedInfo::process(&hit_infos, &hit_glyphs);
+        assert_shaped_runs_identical(&fresh_hit_run, &process_hit);
     }
 
     #[test]
