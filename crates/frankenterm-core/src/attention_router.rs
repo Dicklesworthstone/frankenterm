@@ -2888,8 +2888,10 @@ fn attention_router_next_entry(
 
 /// Build the deterministic ranked advisory view from a scored snapshot.
 ///
-/// Ranking is `severity x age x pane-priority` packed into a stable integer
-/// composite (descending), with `item_id` as the final tiebreak. When
+/// Ranking packs four factors lexicographically into a stable `u64` composite
+/// (descending) — severity (high bits), observation age, pane priority, then
+/// confidence label (low bits) — with `item_id` as the final tiebreak. (See
+/// [`attention_router_next_composite`].) When
 /// `budget_tokens` is `Some`, entries are emitted in rank order until the token
 /// budget is exhausted; the top entry is always emitted (so `next` is never
 /// empty when items exist), and any elided tail yields a continuation cursor.

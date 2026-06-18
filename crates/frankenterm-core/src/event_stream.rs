@@ -1061,7 +1061,12 @@ type SubscriptionMap = std::collections::HashMap<SubscriptionId, SubscriptionInf
 /// Registry of active streaming subscriptions.
 ///
 /// Tracks all active subscriptions for introspection and management.
-/// Used by the robot API to expose subscription state.
+///
+/// NOTE: this registry currently has no production consumer — the robot
+/// subscription-state surface that would expose it is not yet wired (the
+/// `SubscriptionRegistry`/`SubscriptionInfo`/`SubscriptionId` family is
+/// referenced only by its own unit tests). Kept as the intended introspection
+/// API for that future surface.
 pub struct SubscriptionRegistry {
     next_id: AtomicU64,
     subscriptions: std::sync::Mutex<SubscriptionMap>,
