@@ -168,3 +168,77 @@ fn doctor_report_surfaces_accurate_collected_state() {
         "the doctor report must surface the real analyzed cargo job count"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. Negative & optional-field cases: the analyzer is a real parser, not a
+//    blanket "always intercept / always populated" stub.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_non_cargo_command_is_not_intercepted_and_carries_no_cargo_fields() {
+    // A real parser must distinguish non-cargo commands rather than
+    // blanket-intercepting; the trailing `-j 4` is NOT a cargo job count here.
+    let a = analyze_rch_admission_cargo_command("ls -la /tmp -j 4", no_env(), None);
+    assert!(!a.would_intercept, "a non-cargo command must not be intercepted");
+    assert_eq!(a.cargo_subcommand, None, "a non-cargo command has no cargo subcommand");
+    assert!(a.package_scope.is_empty(), "a non-cargo command has no package scope");
+    assert_eq!(
+        a.explicit_jobs, None,
+        "a bare -j on a non-cargo command is not a cargo job count"
+    );
+    assert!(a.raw.contains("ls -la"), "the raw command text is still preserved");
+}
+
+#[test]
+fn a_cargo_command_without_p_or_j_has_absent_optional_fields_not_defaults() {
+    // Optional fields must be genuinely absent (None / empty), never stubbed
+    // with placeholder defaults.
+    let a = analyze_rch_admission_cargo_command("cargo build", no_env(), None);
+    assert_eq!(a.cargo_subcommand.as_deref(), Some("build"));
+    assert!(a.would_intercept, "any cargo command is intercepted by the hook");
+    assert!(a.package_scope.is_empty(), "no -p means an empty package scope");
+    assert_eq!(a.explicit_jobs, None, "no -j means no explicit job count");
+}
+
+#[test]
+fn multiple_p_flags_are_all_captured_in_package_scope() {
+    let a = analyze_rch_admission_cargo_command("cargo test -p alpha -p beta", no_env(), None);
+    assert!(
+        a.package_scope.contains(&"alpha".to_string()),
+        "first -p package must be captured, got {:?}",
+        a.package_scope
+    );
+    assert!(
+        a.package_scope.contains(&"beta".to_string()),
+        "second -p package must be captured, got {:?}",
+        a.package_scope
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Doctor report reflects ACTUAL collected state (real-not-stub at the
+//    operator surface): absent when nothing was collected, present when it was.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_report_reports_no_job_count_when_nothing_was_collected() {
+    // Contrast with doctor_report_surfaces_accurate_collected_state: with no
+    // analysis applied, the report must surface None — not a stubbed default.
+    let input =
+        RchAdmissionCollectorInput::new(1_000, "doctor", RchAdmissionCommandDiagnostic::new("seed"));
+    let report = build_rch_admission_report(&input);
+    assert_eq!(
+        report.cargo_jobs, None,
+        "with nothing collected the doctor must report no job count, not a default"
+    );
+}
+
+#[test]
+fn doctor_report_surfaces_a_directly_collected_job_count() {
+    // The report faithfully surfaces a job count collected from any source.
+    let input =
+        RchAdmissionCollectorInput::new(1_000, "doctor", RchAdmissionCommandDiagnostic::new("seed"))
+            .with_cargo_jobs(7);
+    let report = build_rch_admission_report(&input);
+    assert_eq!(report.cargo_jobs, Some(7), "the doctor must surface the collected job count");
+}
