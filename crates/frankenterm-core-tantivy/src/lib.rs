@@ -8,7 +8,7 @@
 //!
 //! - [`tantivy_ingest`]   — Tantivy index writer adapter + ingestion pipeline
 //! - [`tantivy_policy`]   — query policy / filter rules
-//! - [`tantivy_quality`]  — ranking-quality harness
+//! - [`tantivy_quality`]  — golden-query + boolean relevance-assertion harness
 //! - [`tantivy_query`]    — search service + snippet extraction
 //! - [`tantivy_reindex`]  — index rebuild orchestration
 //! - [`recorder_lexical_ingest`] — `LexicalIndexer` wiring the recorder

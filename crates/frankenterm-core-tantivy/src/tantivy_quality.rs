@@ -1,5 +1,5 @@
-//! Lexical search quality harness with golden queries, relevance assertions,
-//! and latency budgets.
+//! Lexical search golden-query harness with boolean relevance assertions and
+//! latency budgets.
 //!
 //! Bead: wa-oegrb.4.6
 //!
@@ -8,8 +8,12 @@
 //!
 //! - **Golden query suites**: Predefined queries with expected results derived
 //!   from realistic terminal workflows.
-//! - **Relevance assertions**: Must-hit document checks and ordering tolerances
-//!   for search result quality.
+//! - **Relevance assertions (boolean)**: Membership / ordering / hit-count
+//!   predicates — must-hit (`InTopN`), relative ordering (`RankedBefore`), and
+//!   total-hit bounds (`Min`/`MaxTotalHits`). These are pass/fail checks; the
+//!   harness does NOT compute graded ranking-quality metrics (no NDCG@k,
+//!   precision@k, recall, or MRR), so e.g. a query returning many junk hits
+//!   still satisfies `MinTotalHits` (ft-jsonm).
 //! - **Latency budgets**: Per-query-class timing constraints to detect
 //!   performance regressions.
 //! - **CI integration**: Machine-readable pass/fail reports suitable for

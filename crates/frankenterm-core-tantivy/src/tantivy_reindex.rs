@@ -8,8 +8,11 @@
 //! - **Full reindex**: Wipe and rebuild the entire index from ordinal 0.
 //! - **Range backfill**: Re-index a specific ordinal or time range (for
 //!   schema evolution, corruption repair, or historical imports).
-//! - **Integrity verification**: Compare index contents against the append
-//!   log to detect missing, extra, or offset-mismatched documents.
+//! - **Integrity verification**: Compare the append log against the index to
+//!   detect documents missing from the index or at offset-mismatched positions.
+//!   Note: the check iterates the log, so it does NOT detect *extra* (stale /
+//!   orphan) documents present in the index but absent from the log —
+//!   `total_index_docs` is captured but not compared (ft-jsonm).
 //!
 //! All operations use resumable checkpoints with a separate consumer ID
 //! so they don't interfere with the live incremental indexer.
