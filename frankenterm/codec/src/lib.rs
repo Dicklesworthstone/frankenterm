@@ -319,7 +319,17 @@ fn reserve_next_payload_chunk(
     let end = start
         .checked_add(chunk_len)
         .context("payload chunk length overflow")?;
-    data.try_reserve_exact(chunk_len).with_context(|| {
+    // Amortized (geometric) growth, NOT `try_reserve_exact`. This runs once per
+    // PAYLOAD_READ_CHUNK (64 KiB) while accumulating a multi-chunk payload, so
+    // `_exact` -- which never over-allocates -- reallocated and recopied the
+    // ENTIRE buffer on every chunk: O(n^2) memcpy in the payload size (a 256 MiB
+    // PDU recopies on the order of hundreds of GiB). `try_reserve` over-allocates
+    // geometrically, making total growth O(n) amortized. It still bounds
+    // allocation to what has actually been DELIVERED (capacity tracks bytes read
+    // so far, ~x2, never the attacker-advertised `data_len`), preserving the
+    // incremental-allocation DoS guard; and it stays fallible to reject OOM
+    // rather than abort. Output `data` is byte-identical -- only capacity differs.
+    data.try_reserve(chunk_len).with_context(|| {
         format!(
             "allocating next {} bytes for PDU payload of length {} \
             with frame length {} serial={} ident={}",
