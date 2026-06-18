@@ -271,6 +271,17 @@ where
 /// Spawn a child task with explicit `Cx` threading and wait for it with a timeout.
 ///
 /// Returns an error string when the timeout elapses before completion.
+///
+/// The task future is driven directly under the timeout — a cancel-on-drop
+/// task — rather than eagerly scheduled as a detached runtime task. asupersync's
+/// `JoinHandle` has no abort-on-`Drop` (and `abort()` is only a soft signal), so
+/// eagerly `spawn`-ing the task and letting `budget_timeout` drop the
+/// `JoinHandle` on the timeout branch would DETACH the task: it would keep
+/// running unbounded past the deadline while the caller already saw a timeout
+/// error. Driving the future inline means a timeout drops (cooperatively
+/// cancels) the actual task future, so no work outlives the timeout. The
+/// `HandleContextFuture` wrapper still installs the `RuntimeHandle`, so nested
+/// `task::spawn` / `spawn_*_with_cx` calls inside the task keep working.
 pub async fn spawn_with_timeout<F, Fut, T>(
     handle: &RuntimeHandle,
     cx: &Cx,
@@ -282,7 +293,12 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    crate::runtime_async::timeout_with_cx(cx, timeout, spawn_with_cx(handle, cx, task)).await
+    let child_cx = cx.clone();
+    let wrapped = HandleContextFuture {
+        handle: handle.clone(),
+        future: Box::pin(async move { task(child_cx).await }),
+    };
+    crate::runtime_async::timeout_with_cx(cx, timeout, wrapped).await
 }
 
 #[cfg(test)]
