@@ -4380,11 +4380,14 @@ fn dispatch_connector_outbound_action(
         action.target_connector,
         action.action_kind.as_str()
     );
-    let request = crate::connector_host_runtime::ConnectorOperationRequest::new(
+    let mut request = crate::connector_host_runtime::ConnectorOperationRequest::new(
         operation_name,
         action.correlation_id.clone(),
-        action.action_kind.required_capability(),
+        action.dispatch_capability(),
     );
+    if let Some(target) = action.sandbox_target() {
+        request = request.with_target(target);
+    }
     let result = bridge
         .policy_engine_mut()
         .route_connector_operation_through_mesh(action.target_connector.clone(), request, now_ms);

@@ -17,6 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -207,6 +208,162 @@ impl ConnectorActionKind {
 impl std::fmt::Display for ConnectorActionKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+fn parse_connector_capability(value: &str) -> Option<ConnectorCapability> {
+    match value.trim() {
+        "invoke" => Some(ConnectorCapability::Invoke),
+        "read_state" => Some(ConnectorCapability::ReadState),
+        "stream_events" => Some(ConnectorCapability::StreamEvents),
+        "filesystem_read" | "fs_read" => Some(ConnectorCapability::FilesystemRead),
+        "filesystem_write" | "fs_write" => Some(ConnectorCapability::FilesystemWrite),
+        "network_egress" | "network" => Some(ConnectorCapability::NetworkEgress),
+        "secret_broker" => Some(ConnectorCapability::SecretBroker),
+        "process_exec" | "exec" => Some(ConnectorCapability::ProcessExec),
+        _ => None,
+    }
+}
+
+fn payload_string<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn payload_declared_capability(payload: &Value) -> Option<ConnectorCapability> {
+    payload_string(
+        payload,
+        &["capability", "required_capability", "sandbox_capability"],
+    )
+    .and_then(parse_connector_capability)
+}
+
+fn payload_declares_exec(payload: &Value) -> bool {
+    payload.get("argv").is_some()
+        || payload_string(payload, &["exec_command", "program", "binary"]).is_some()
+}
+
+fn sandbox_capability_for_payload(
+    action_kind: ConnectorActionKind,
+    payload: &Value,
+) -> ConnectorCapability {
+    payload_declared_capability(payload).unwrap_or_else(|| {
+        if action_kind == ConnectorActionKind::Invoke && payload_declares_exec(payload) {
+            ConnectorCapability::ProcessExec
+        } else {
+            action_kind.required_capability()
+        }
+    })
+}
+
+fn normalize_network_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let authority = if let Some((_, remainder)) = value.split_once("://") {
+        remainder.split(['/', '?', '#']).next().unwrap_or(remainder)
+    } else {
+        value.split(['/', '?', '#']).next().unwrap_or(value)
+    };
+    let authority = authority.rsplit('@').next().unwrap_or(authority).trim();
+    if authority.is_empty() {
+        return None;
+    }
+
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, _) = rest.split_once(']')?;
+        host
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    }
+    .trim()
+    .trim_end_matches('.');
+
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn payload_network_target(payload: &Value) -> Option<String> {
+    payload_string(
+        payload,
+        &[
+            "host",
+            "hostname",
+            "network_host",
+            "target_host",
+            "url",
+            "uri",
+            "endpoint",
+            "target",
+        ],
+    )
+    .and_then(normalize_network_host)
+}
+
+fn payload_filesystem_target(payload: &Value) -> Option<String> {
+    payload_string(
+        payload,
+        &[
+            "path",
+            "file",
+            "file_path",
+            "filepath",
+            "directory",
+            "dir",
+            "source_path",
+            "destination_path",
+            "target_path",
+            "read_path",
+            "write_path",
+        ],
+    )
+    .map(ToOwned::to_owned)
+}
+
+fn payload_exec_target(payload: &Value) -> Option<String> {
+    if let Some(argv0) = payload
+        .get("argv")
+        .and_then(Value::as_array)
+        .and_then(|argv| argv.first())
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(argv0.to_string());
+    }
+
+    payload_string(
+        payload,
+        &[
+            "command",
+            "cmd",
+            "exec",
+            "exec_command",
+            "program",
+            "binary",
+        ],
+    )
+    .map(ToOwned::to_owned)
+}
+
+fn sandbox_target_for_payload(capability: ConnectorCapability, payload: &Value) -> Option<String> {
+    match capability {
+        ConnectorCapability::FilesystemRead | ConnectorCapability::FilesystemWrite => {
+            payload_filesystem_target(payload)
+        }
+        ConnectorCapability::NetworkEgress => payload_network_target(payload),
+        ConnectorCapability::ProcessExec => payload_exec_target(payload),
+        ConnectorCapability::Invoke
+        | ConnectorCapability::ReadState
+        | ConnectorCapability::StreamEvents
+        | ConnectorCapability::SecretBroker => None,
     }
 }
 
@@ -518,6 +675,20 @@ pub struct ConnectorAction {
     pub params: serde_json::Value,
     /// Timestamp when the action was created.
     pub created_at_ms: u64,
+}
+
+impl ConnectorAction {
+    /// Capability the host runtime must authorize for this concrete action.
+    #[must_use]
+    pub fn dispatch_capability(&self) -> ConnectorCapability {
+        sandbox_capability_for_payload(self.action_kind, &self.params)
+    }
+
+    /// Destination target used by capability allow-lists, when the payload carries one.
+    #[must_use]
+    pub fn sandbox_target(&self) -> Option<String> {
+        sandbox_target_for_payload(self.dispatch_capability(), &self.params)
+    }
 }
 
 /// Supported credential-broker operations for connector actions.
@@ -1073,24 +1244,57 @@ impl OutboundSandboxChecker {
         self.default_zone = zone;
     }
 
-    /// Check if a connector has the required capability.
+    fn capability_has_target_scope(
+        zone: &ConnectorSandboxZone,
+        capability: ConnectorCapability,
+    ) -> bool {
+        match capability {
+            ConnectorCapability::FilesystemRead => {
+                !zone.capability_envelope.filesystem_read_prefixes.is_empty()
+            }
+            ConnectorCapability::FilesystemWrite => !zone
+                .capability_envelope
+                .filesystem_write_prefixes
+                .is_empty(),
+            ConnectorCapability::NetworkEgress => {
+                !zone.capability_envelope.network_allow_hosts.is_empty()
+            }
+            ConnectorCapability::ProcessExec => {
+                !zone.capability_envelope.allowed_exec_commands.is_empty()
+            }
+            ConnectorCapability::Invoke
+            | ConnectorCapability::ReadState
+            | ConnectorCapability::StreamEvents
+            | ConnectorCapability::SecretBroker => false,
+        }
+    }
+
+    /// Check if a connector has the required capability and target allowance.
     #[must_use]
     pub fn check_capability(
         &self,
         connector: &str,
         capability: ConnectorCapability,
+        target: Option<&str>,
     ) -> SandboxCheckResult {
         let zone = self.zones.get(connector).unwrap_or(&self.default_zone);
-        if zone
-            .capability_envelope
-            .allowed_capabilities
-            .contains(&capability)
-        {
-            SandboxCheckResult::Allowed
-        } else if zone.fail_closed {
+        if !zone.capability_envelope.allows_capability(capability) {
+            if !zone.fail_closed {
+                return SandboxCheckResult::Allowed;
+            }
             SandboxCheckResult::Denied {
                 zone_id: zone.zone_id.clone(),
                 reason: format!("sandbox.denied.capability.{}", capability.as_str()),
+            }
+        } else if Self::capability_has_target_scope(zone, capability)
+            && !zone.capability_envelope.allows_target(capability, target)
+        {
+            if !zone.fail_closed {
+                return SandboxCheckResult::Allowed;
+            }
+            SandboxCheckResult::Denied {
+                zone_id: zone.zone_id.clone(),
+                reason: format!("sandbox.denied.target.{}", capability.as_str()),
             }
         } else {
             SandboxCheckResult::Allowed
@@ -1529,14 +1733,16 @@ impl ConnectorOutboundBridge {
                 continue;
             }
 
-            let required_cap = rule.action_kind.required_capability();
+            let required_cap = sandbox_capability_for_payload(rule.action_kind, &event.payload);
+            let sandbox_target = sandbox_target_for_payload(required_cap, &event.payload);
 
             // 3b. Sandbox check
             if self.config.enforce_sandbox {
-                match self
-                    .sandbox
-                    .check_capability(&rule.target_connector, required_cap)
-                {
+                match self.sandbox.check_capability(
+                    &rule.target_connector,
+                    required_cap,
+                    sandbox_target.as_deref(),
+                ) {
                     SandboxCheckResult::Allowed => {}
                     SandboxCheckResult::Denied { zone_id, reason } => {
                         self.telemetry.actions_blocked_sandbox =
@@ -1545,6 +1751,7 @@ impl ConnectorOutboundBridge {
                             rule_id = %rule.rule_id,
                             connector = %rule.target_connector,
                             capability = %required_cap.as_str(),
+                            target = ?sandbox_target,
                             zone_id = %zone_id,
                             "outbound action blocked by sandbox"
                         );
@@ -1562,7 +1769,10 @@ impl ConnectorOutboundBridge {
                                     rule.action_kind,
                                     now_ms,
                                 )
-                                .with_detail(format!("zone_id={zone_id}")),
+                                .with_detail(match sandbox_target.as_deref() {
+                                    Some(target) => format!("zone_id={zone_id},target={target}"),
+                                    None => format!("zone_id={zone_id},target=<missing>"),
+                                }),
                             ),
                             policy_decision: Some(policy_decision.clone()),
                         });
@@ -2111,6 +2321,23 @@ mod tests {
         }
     }
 
+    fn network_scoped_zone(allowed_hosts: &[&str]) -> ConnectorSandboxZone {
+        ConnectorSandboxZone {
+            zone_id: "zone.network_scoped".to_string(),
+            fail_closed: true,
+            capability_envelope: ConnectorCapabilityEnvelope {
+                allowed_capabilities: vec![ConnectorCapability::NetworkEgress],
+                filesystem_read_prefixes: vec![],
+                filesystem_write_prefixes: vec![],
+                network_allow_hosts: allowed_hosts
+                    .iter()
+                    .map(|host| (*host).to_string())
+                    .collect(),
+                allowed_exec_commands: vec![],
+            },
+        }
+    }
+
     // ---- Config defaults ----
 
     #[test]
@@ -2427,7 +2654,7 @@ mod tests {
     fn connector_outbound_bridge_sandbox_allows_registered_capability() {
         let mut checker = OutboundSandboxChecker::new();
         checker.register_zone("slack", permissive_zone());
-        let result = checker.check_capability("slack", ConnectorCapability::NetworkEgress);
+        let result = checker.check_capability("slack", ConnectorCapability::NetworkEgress, None);
         assert_eq!(result, SandboxCheckResult::Allowed);
     }
 
@@ -2435,7 +2662,7 @@ mod tests {
     fn connector_outbound_bridge_sandbox_denies_missing_capability() {
         let mut checker = OutboundSandboxChecker::new();
         checker.register_zone("restricted", restrictive_zone());
-        let result = checker.check_capability("restricted", ConnectorCapability::Invoke);
+        let result = checker.check_capability("restricted", ConnectorCapability::Invoke, None);
         assert!(matches!(result, SandboxCheckResult::Denied { .. }));
     }
 
@@ -2443,11 +2670,59 @@ mod tests {
     fn connector_outbound_bridge_sandbox_uses_default_zone_for_unknown() {
         let checker = OutboundSandboxChecker::new();
         // Default zone allows Invoke, ReadState, StreamEvents
-        let result = checker.check_capability("unknown", ConnectorCapability::Invoke);
+        let result = checker.check_capability("unknown", ConnectorCapability::Invoke, None);
         assert_eq!(result, SandboxCheckResult::Allowed);
         // But denies capabilities not in default set
-        let result = checker.check_capability("unknown", ConnectorCapability::SecretBroker);
+        let result = checker.check_capability("unknown", ConnectorCapability::SecretBroker, None);
         assert!(matches!(result, SandboxCheckResult::Denied { .. }));
+    }
+
+    #[test]
+    fn connector_outbound_bridge_sandbox_denies_non_allowlisted_network_target_ft_l0yxu() {
+        let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.register_sandbox_zone("webhook", network_scoped_zone(&["api.allowed.test"]));
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "webhook",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = OutboundEvent::new(
+            OutboundEventSource::Custom,
+            "connector.notify",
+            serde_json::json!({"url": "https://evil.example.test/hook"}),
+        )
+        .with_timestamp_ms(1000);
+
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(
+            result.actions_dispatched.is_empty(),
+            "non-allowlisted network target must not be queued for dispatch"
+        );
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert!(
+            result.actions_blocked[0]
+                .reason
+                .contains("sandbox.denied.target.network_egress"),
+            "sandbox denial should name the target allow-list failure"
+        );
+        let denial = result.actions_blocked[0]
+            .denial
+            .as_ref()
+            .expect("sandbox block should emit typed denial envelope");
+        assert_eq!(denial.error_code, "connector.sandbox_denied");
+        assert_eq!(denial.reason_code, "sandbox.denied.target.network_egress");
+        assert_eq!(denial.connector_id, "webhook");
+        assert_eq!(denial.action_kind, ConnectorActionKind::Notify);
+        assert_eq!(
+            denial.detail.as_deref(),
+            Some("zone_id=zone.network_scoped,target=evil.example.test")
+        );
+        assert_eq!(bridge.pending_action_count(), 0);
+        assert_eq!(bridge.telemetry().actions_blocked_sandbox, 1);
     }
 
     #[test]

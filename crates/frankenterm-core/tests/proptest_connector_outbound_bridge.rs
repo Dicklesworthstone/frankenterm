@@ -431,7 +431,7 @@ proptest! {
     fn sandbox_permissive_zone_allows_any_capability(cap in arb_capability()) {
         let mut checker = OutboundSandboxChecker::new();
         checker.register_zone("test-conn", permissive_zone("test-conn"));
-        let result = checker.check_capability("test-conn", cap);
+        let result = checker.check_capability("test-conn", cap, None);
         prop_assert_eq!(result, SandboxCheckResult::Allowed);
     }
 
@@ -439,7 +439,7 @@ proptest! {
     fn sandbox_restrictive_zone_denies_non_readstate(cap in arb_capability()) {
         let mut checker = OutboundSandboxChecker::new();
         checker.register_zone("locked", restrictive_zone("locked"));
-        let result = checker.check_capability("locked", cap);
+        let result = checker.check_capability("locked", cap, None);
         if cap == ConnectorCapability::ReadState {
             prop_assert_eq!(result, SandboxCheckResult::Allowed);
         } else {
@@ -452,7 +452,7 @@ proptest! {
     fn sandbox_unknown_connector_uses_default_zone(cap in arb_capability()) {
         let checker = OutboundSandboxChecker::new();
         // Default zone has fail_closed=true with default capabilities (Invoke, ReadState, StreamEvents)
-        let result = checker.check_capability("unknown-connector", cap);
+        let result = checker.check_capability("unknown-connector", cap, None);
         let default_allowed = matches!(
             cap,
             ConnectorCapability::Invoke
