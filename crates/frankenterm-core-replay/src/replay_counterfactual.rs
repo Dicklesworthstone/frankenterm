@@ -3,8 +3,20 @@
 //! Provides:
 //! - [`OverridePackage`] — Declarative what-if experiment manifest (.ftoverride format).
 //! - [`OverridePackageLoader`] — Validates and loads override packages from TOML.
-//! - [`OverrideApplicator`] — Matches rule IDs to overrides at decision time.
+//! - [`OverrideApplicator`] — Matches rule IDs to overrides for substitution.
 //! - [`OverrideManifest`] — Hash-pair list for diff detection.
+//!
+//! # Integration status (ft-l4nnf)
+//!
+//! NOT YET WIRED at decision time. The format, loader, applicator, and
+//! `lookup_pattern` / `lookup_workflow` / `lookup_policy` logic are real and
+//! correct, but no production decision path invokes [`OverrideApplicator`] — it
+//! has zero references outside this module and its tests, so `.ftoverride`
+//! packages load and validate but are never re-run against a baseline decision
+//! stream to produce a `DecisionDiff`. (The parallel `ResourceControlOverride`
+//! path IS wired into the resource digital-twin simulate path; this
+//! rule/workflow/policy applicator has no equivalent consumer yet.) Wiring
+//! `lookup_*` into the decision-graph replay path is the remaining work.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1272,7 +1284,9 @@ pub struct SubstitutionRecord {
     pub override_hash: Option<String>,
 }
 
-/// Applies overrides at decision time and records substitutions.
+/// Matches rule IDs to overrides and records substitutions. NOTE: not wired
+/// into any decision-time path — no production caller invokes this (see the
+/// module-level integration-status note); it is lookup/substitution logic only.
 pub struct OverrideApplicator {
     /// Pattern overrides indexed by exact rule_id; wildcards stored separately.
     exact_patterns: HashMap<String, PatternOverride>,
