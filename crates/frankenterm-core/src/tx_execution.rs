@@ -348,6 +348,18 @@ fn execute_step_action(
 ) -> (bool, String, Option<String>) {
     let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
     // For SendText, the backend's own timeouts apply.
+
+    // ft-506i5: capture the parent tx `Cx` on THIS (driver) thread, before any
+    // `std::thread::spawn` below. `Cx::current()` is task-local and is NOT
+    // carried into a freshly spawned OS thread, so the in-thread
+    // `Cx::current()` always saw `None` and fell back to an unlinked
+    // `for_request()` Cx — silently dropping the parent cancellation token,
+    // deadline, and budget. Capturing here and threading a clone into each
+    // spawned backend call + poll loop restores propagation so an operator
+    // cancel or the parent deadline interrupts an in-flight step (within one
+    // poll interval) instead of blocking on `join()` until `timeout_ms`.
+    let parent_cx = crate::cx::Cx::current();
+
     match action {
         crate::plan::StepAction::SendText {
             pane_id,
@@ -358,6 +370,7 @@ fn execute_step_action(
             let pane_id = *pane_id;
             let text = text.clone();
             let no_paste = paste_mode.is_some_and(|pm| !pm);
+            let thread_cx = parent_cx.clone();
             let result = match std::thread::Builder::new()
                 .name("ft-tx-send-step".to_string())
                 .spawn(move || {
@@ -366,8 +379,11 @@ fn execute_step_action(
                         .map_err(|e| format!("failed to build runtime for pane step: {e}"))?;
                     rt.block_on(async {
                         // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
-                        let send_cx =
-                            crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                        // ft-506i5: use the parent tx Cx captured on the driver
+                        // thread (thread::spawn does not propagate the task-local
+                        // Cx); fall back to a fresh request Cx only when there was
+                        // no ambient cx to begin with.
+                        let send_cx = thread_cx.unwrap_or_else(crate::cx::for_request);
                         let result = if no_paste {
                             h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
                         } else {
@@ -436,6 +452,23 @@ fn execute_step_action(
                     if registry.is_signaled(key) {
                         return (true, "wait_for_external_satisfied".to_string(), None);
                     }
+                    // ft-506i5: this external wait runs on the driver thread, so
+                    // the captured `parent_cx` is the live tx Cx. Honor
+                    // cancellation / deadline / budget each iteration rather than
+                    // blocking until `timeout_ms`. (No ambient cx -> no gate, same
+                    // as before.)
+                    if parent_cx
+                        .as_ref()
+                        .is_some_and(|cx| cx.checkpoint().is_err())
+                    {
+                        return (
+                            false,
+                            "wait_for_cancelled".to_string(),
+                            Some(format!(
+                                "FTX_WAIT_CANCELLED: external signal '{key}' wait interrupted by tx cancellation or deadline"
+                            )),
+                        );
+                    }
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         return (
@@ -475,6 +508,7 @@ fn execute_step_action(
                 | crate::plan::WaitCondition::External { .. } => String::new(),
             };
             let h = handle.clone();
+            let thread_cx = parent_cx.clone();
             let result = match std::thread::Builder::new()
                 .name("ft-tx-wait-step".to_string())
                 .spawn(move || {
@@ -483,8 +517,9 @@ fn execute_step_action(
                         .map_err(|e| format!("failed to build runtime for wait_for step: {e}"))?;
                     rt.block_on(async {
                         // ft-xbnl0.2.3 tick 262: cx-first tx-execution wait_for poll.
-                        let wait_cx =
-                            crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                        // ft-506i5: parent tx Cx captured pre-spawn instead of the
+                        // always-None in-thread Cx::current().
+                        let wait_cx = thread_cx.unwrap_or_else(crate::cx::for_request);
                         let deadline =
                             std::time::Instant::now()
                                 .checked_add(timeout)
@@ -493,6 +528,15 @@ fn execute_step_action(
                                 })?;
                         let poll_interval = std::time::Duration::from_millis(200);
                         loop {
+                            // ft-506i5: race tx cancellation / deadline / budget
+                            // each iteration so an operator cancel or the parent
+                            // deadline interrupts the wait within one poll interval
+                            // instead of blocking until the step `timeout_ms`.
+                            if wait_cx.checkpoint().is_err() {
+                                return Err(format!(
+                                    "wait_for interrupted by tx cancellation or deadline on pane {target_pane}"
+                                ));
+                            }
                             match h.get_text_with_cx(&wait_cx, target_pane, false).await {
                                 Ok(text) if !pattern.is_empty() && text.contains(&pattern) => {
                                     return Ok(());
