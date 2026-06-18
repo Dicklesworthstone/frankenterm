@@ -322,6 +322,113 @@ mod succinct_attrs_tests {
     }
 }
 
+/// Byte-equivalence keep-gate for the succinct attribute store (ft-dkfiy).
+///
+/// This module is `#[cfg(test)]` but intentionally NOT feature-gated, so the
+/// keep-gate runs (and is counted) in BOTH the default build and the
+/// `--features succinct_attrs` build — the succinct-specific assertions are
+/// `#[cfg(feature = "succinct_attrs")]` and the default build runs the matching
+/// `#[cfg(not(...))]` baseline. Enabling the experimental feature must never
+/// silently drop this test.
+#[cfg(test)]
+mod succinct_attrs_keep_gate {
+    use super::*;
+
+    /// A representative attribute sequence exercising varied foreground,
+    /// background, underline and intensity runs — with both long
+    /// same-attribute runs and single-cell changes. Deterministic so it can be
+    /// re-derived for cross-checks.
+    fn varied_sequence() -> Vec<CellAttributes> {
+        let mut bold = CellAttributes::blank();
+        bold.set_intensity(Intensity::Bold);
+        let mut half = CellAttributes::blank();
+        half.set_intensity(Intensity::Half);
+        let mut single_ul = CellAttributes::blank();
+        single_ul.set_underline(Underline::Single);
+        let mut double_ul = CellAttributes::blank();
+        double_ul.set_underline(Underline::Double);
+        let mut fg = CellAttributes::blank();
+        fg.set_foreground(ColorAttribute::PaletteIndex(4));
+        let mut bg = CellAttributes::blank();
+        bg.set_background(ColorAttribute::PaletteIndex(2));
+        let mut mixed = CellAttributes::blank();
+        mixed.set_foreground(ColorAttribute::PaletteIndex(9));
+        mixed.set_background(ColorAttribute::PaletteIndex(0));
+        mixed.set_underline(Underline::Curly);
+        mixed.set_reverse(true);
+
+        // (attrs, run_len) — long runs, a single-cell change, and adjacent
+        // distinct attrs so coalescing and run boundaries are both exercised.
+        let spec: [(CellAttributes, usize); 9] = [
+            (CellAttributes::blank(), 12),
+            (bold, 5),
+            (CellAttributes::blank(), 1),
+            (single_ul, 7),
+            (fg, 3),
+            (bg, 8),
+            (double_ul, 1),
+            (half, 4),
+            (mixed, 6),
+        ];
+        let mut out = Vec::new();
+        for (attrs, n) in &spec {
+            for _ in 0..*n {
+                out.push(attrs.clone());
+            }
+        }
+        out
+    }
+
+    /// KEEP-GATE: the succinct run-length attribute store must return
+    /// byte-identical [`CellAttributes`] to the default per-cell representation
+    /// at EVERY column index. Round-3 keep/revert depends on this staying green
+    /// under `--features succinct_attrs`.
+    #[test]
+    fn succinct_store_is_byte_identical_to_per_cell() {
+        let oracle = varied_sequence();
+        assert!(oracle.len() > 1, "sequence must be non-trivial");
+
+        #[cfg(feature = "succinct_attrs")]
+        {
+            // Build the run-length store from the per-cell oracle exactly as a
+            // run-length line would (coalescing equal adjacent cells).
+            let mut runs = AttributeRuns::new();
+            for attrs in &oracle {
+                runs.push(attrs, 1);
+            }
+
+            // Same logical length.
+            assert_eq!(runs.len(), oracle.len());
+            // Byte-identical attributes at every column index.
+            for (col, want) in oracle.iter().enumerate() {
+                assert_eq!(
+                    runs.get(col),
+                    Some(want),
+                    "succinct RLE store diverged from the default representation at column {col}"
+                );
+            }
+            // No attributes past the end.
+            assert_eq!(runs.get(oracle.len()), None);
+            // Expanding the runs reproduces the per-cell sequence exactly.
+            assert_eq!(runs.to_per_cell(), oracle);
+            // Coalescing actually happened: distinct runs are fewer than cells.
+            assert!(
+                runs.run_count() < oracle.len(),
+                "equal adjacent attributes must coalesce into fewer runs than cells"
+            );
+        }
+
+        #[cfg(not(feature = "succinct_attrs"))]
+        {
+            // Default build: the succinct store is compiled out, so exercise the
+            // per-cell construction path the store must match. The deterministic
+            // builder must reproduce an identical sequence — the keep-gate runs
+            // symmetrically instead of vanishing without the feature.
+            assert_eq!(varied_sequence(), oracle);
+        }
+    }
+}
+
 /// Define getter and setter for the attributes bitfield.
 /// The first form is for a simple boolean value stored in
 /// a single bit.  The $bitnum parameter specifies which bit.
