@@ -1,6 +1,6 @@
 //! Secret redaction for read, export, and audit surfaces.
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -618,6 +618,16 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
     },
 ];
 
+/// Combined match-set over all [`SECRET_PATTERNS`], used as a single-scan
+/// fast-path gate in [`Redactor::redact`]. Built from the SAME pattern sources
+/// (`Regex::as_str`) so it is exactly equivalent to OR-ing each pattern's
+/// `is_match` — but in one pass instead of 32. When nothing matches, the
+/// per-pattern replacement loop is a guaranteed no-op, so `redact` skips it.
+static SECRET_PATTERN_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new(SECRET_PATTERNS.iter().map(|pattern| pattern.regex.as_str()))
+        .expect("each SECRET_PATTERNS regex is individually valid; their union is too")
+});
+
 /// Names of every live secret pattern in priority order.
 ///
 /// The coverage matrix uses this as the catalog source of truth
@@ -680,6 +690,17 @@ impl Redactor {
     pub fn redact(&self, text: &str) -> String {
         // FND-002 / MT8: per-frame self-time (no-op unless `hot-path-metrics`).
         let _hpt = crate::hot_path_metrics::HotPathTimer::start("redactor.redact");
+
+        // Fast path: one combined RegexSet scan. When no secret pattern matches
+        // (the overwhelming common case for captured output), the per-pattern
+        // loop below is a guaranteed no-op — every `replace_all` returns its
+        // input unchanged — so we skip all 32 full-content scans and the
+        // up-to-33 full-content String allocations and return a single owned
+        // copy. Output-identical: with zero matches the loop result is `text`.
+        if !SECRET_PATTERN_SET.is_match(text) {
+            return text.to_string();
+        }
+
         let mut result = text.to_string();
 
         for pattern in SECRET_PATTERNS {
