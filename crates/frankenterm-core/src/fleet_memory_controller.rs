@@ -1127,8 +1127,7 @@ impl PidReclaimController {
         // Anti-windup via conditional integration: tentatively integrate, then
         // back off if the tentative output is saturated in the same direction.
         let proposed_integral = self.integral + error * dt;
-        let unsaturated =
-            cfg.kp * error + cfg.ki * proposed_integral + cfg.kd * derivative;
+        let unsaturated = cfg.kp * error + cfg.ki * proposed_integral + cfg.kd * derivative;
         let saturating_up = unsaturated > cfg.out_max && error > 0.0;
         let saturating_down = unsaturated < cfg.out_min && error < 0.0;
         if !(saturating_up || saturating_down) {
@@ -1411,7 +1410,8 @@ impl FleetScrollbackOrchestrator {
                 #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
                 let reclaim_bytes = ((fleet_warm_bytes as f64) * reclaim_fraction)
                     .round()
-                    .clamp(0.0, fleet_warm_bytes as f64) as usize;
+                    .clamp(0.0, fleet_warm_bytes as f64)
+                    as usize;
                 let pid_target = fleet_warm_bytes - reclaim_bytes;
                 match tier {
                     // Monotone floor: never reclaim LESS than legacy at the

@@ -562,11 +562,7 @@ impl TieredScrollback {
     /// `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` / `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP`
     /// env vars through [`Self::new`].
     #[must_use]
-    pub fn new_with_options(
-        config: ScrollbackConfig,
-        prefix_index: bool,
-        cdc_dedup: bool,
-    ) -> Self {
+    pub fn new_with_options(config: ScrollbackConfig, prefix_index: bool, cdc_dedup: bool) -> Self {
         let config = config.sanitized();
         let compressor = ByteCompressor::new(config.compression);
         Self {
@@ -804,11 +800,7 @@ impl TieredScrollback {
     /// coordinate `target = flushed_total - 1 - remaining`, and the containing
     /// page is found by a single `partition_point` over the monotone cumulative
     /// ends.
-    fn locate_warm_cold_indexed(
-        &self,
-        offset_from_end: usize,
-        hot_len: usize,
-    ) -> IndexedLocate {
+    fn locate_warm_cold_indexed(&self, offset_from_end: usize, hot_len: usize) -> IndexedLocate {
         let Some(idx) = self.prefix.as_ref() else {
             return IndexedLocate::Fallback;
         };
@@ -2380,7 +2372,10 @@ mod tests {
                 pos = *e;
             }
             assert_eq!(pos, len, "chunks must cover the whole buffer (len {len})");
-            assert_eq!(rebuilt, raw, "concatenated chunks must equal input (len {len})");
+            assert_eq!(
+                rebuilt, raw,
+                "concatenated chunks must equal input (len {len})"
+            );
         }
     }
 
@@ -2407,13 +2402,19 @@ mod tests {
             let lines = [
                 format!("{prompt}run task {}", i % 7),
                 "=== redraw banner: status OK ===".to_string(),
-                format!("output {i}: unicode ✓ café ★ — padded to a reasonable terminal width here"),
+                format!(
+                    "output {i}: unicode ✓ café ★ — padded to a reasonable terminal width here"
+                ),
                 if i % 5 == 0 {
                     "multi\nline\nembedded\ncontent".to_string()
                 } else {
                     format!("line {i}")
                 },
-                if i % 11 == 0 { String::new() } else { "tail".to_string() },
+                if i % 11 == 0 {
+                    String::new()
+                } else {
+                    "tail".to_string()
+                },
             ];
             for l in lines {
                 cdc.push_line(l.clone());
@@ -2424,9 +2425,16 @@ mod tests {
         assert_eq!(cdc.hot_len(), legacy.hot_len());
         assert_eq!(cdc.warm_page_count(), legacy.warm_page_count());
         assert_eq!(cdc.total_line_count(), legacy.total_line_count());
-        assert!(cdc.warm_page_count() > 4, "must exercise multiple warm pages");
+        assert!(
+            cdc.warm_page_count() > 4,
+            "must exercise multiple warm pages"
+        );
 
-        assert_eq!(warm_dump(&cdc), warm_dump(&legacy), "warm pages must decode identically");
+        assert_eq!(
+            warm_dump(&cdc),
+            warm_dump(&legacy),
+            "warm pages must decode identically"
+        );
         assert_eq!(cdc.tail(cdc.hot_len()), legacy.tail(legacy.hot_len()));
 
         // Accounting invariant: warm_bytes == live CAS compressed bytes.
@@ -2460,7 +2468,11 @@ mod tests {
             }
         }
 
-        assert_eq!(warm_dump(&cdc), warm_dump(&legacy), "dedup must stay byte-identical");
+        assert_eq!(
+            warm_dump(&cdc),
+            warm_dump(&legacy),
+            "dedup must stay byte-identical"
+        );
         assert!(
             cdc.warm_total_bytes() < legacy.warm_total_bytes(),
             "dedup must shrink warm bytes: cdc={} legacy={}",
@@ -2497,7 +2509,11 @@ mod tests {
 
         let mut pushed = Vec::new();
         for i in 0..400usize {
-            let l = format!("evt {} :: {}", i % 9, if i % 3 == 0 { "REPEATED" } else { "x" });
+            let l = format!(
+                "evt {} :: {}",
+                i % 9,
+                if i % 3 == 0 { "REPEATED" } else { "x" }
+            );
             cdc.push_line(l.clone());
             pushed.push(l);
         }

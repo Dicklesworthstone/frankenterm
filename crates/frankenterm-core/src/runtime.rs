@@ -4609,7 +4609,11 @@ fn build_leak_risk_inventory(
 /// mirroring [`crate::memory_budget::PaneBudget`] thresholds:
 /// `>= budget_bytes` is `OverBudget`, `>= budget_bytes * high_ratio` is
 /// `Throttled`, otherwise `Normal`. A zero budget is always `Normal`.
-fn classify_pane_budget_level(tracked_bytes: u64, budget_bytes: u64, high_ratio: f64) -> BudgetLevel {
+fn classify_pane_budget_level(
+    tracked_bytes: u64,
+    budget_bytes: u64,
+    high_ratio: f64,
+) -> BudgetLevel {
     if budget_bytes == 0 {
         return BudgetLevel::Normal;
     }
@@ -4649,7 +4653,11 @@ fn classify_pane_budget_level(tracked_bytes: u64, budget_bytes: u64, high_ratio:
 /// RSS/cgroup `MemoryBudgetManager` is not wired into the observation
 /// runtime; the logical arena accounting sampled here is the
 /// eviction-relevant per-pane signal.
-fn worst_pane_budget_level<I>(tracked_bytes_iter: I, budget_bytes: u64, high_ratio: f64) -> BudgetLevel
+fn worst_pane_budget_level<I>(
+    tracked_bytes_iter: I,
+    budget_bytes: u64,
+    high_ratio: f64,
+) -> BudgetLevel
 where
     I: IntoIterator<Item = u64>,
 {

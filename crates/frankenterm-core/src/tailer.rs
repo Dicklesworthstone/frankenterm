@@ -2543,11 +2543,7 @@ mod tests {
             "replay trace must contain at least one output burst"
         );
         latencies.sort_unstable();
-        let idx = latencies
-            .len()
-            .saturating_mul(95)
-            .saturating_add(99)
-            / 100;
+        let idx = latencies.len().saturating_mul(95).saturating_add(99) / 100;
         latencies[idx.saturating_sub(1).min(latencies.len() - 1)]
     }
 

@@ -1204,10 +1204,11 @@ impl IdempotencyStore {
         let Some(ledger) = self.ledgers.get(execution_id) else {
             return Ok(());
         };
-        let json =
-            serde_json::to_string_pretty(ledger).map_err(|err| IdempotencyError::LedgerPersist {
+        let json = serde_json::to_string_pretty(ledger).map_err(|err| {
+            IdempotencyError::LedgerPersist {
                 reason: format!("serialize ledger {execution_id}: {err}"),
-            })?;
+            }
+        })?;
         let final_path = dir.join(format!("{execution_id}.json"));
         let tmp_path = dir.join(format!("{execution_id}.json.tmp"));
         std::fs::write(&tmp_path, json.as_bytes()).map_err(|err| {
@@ -1216,7 +1217,11 @@ impl IdempotencyStore {
             }
         })?;
         std::fs::rename(&tmp_path, &final_path).map_err(|err| IdempotencyError::LedgerPersist {
-            reason: format!("rename {} -> {}: {err}", tmp_path.display(), final_path.display()),
+            reason: format!(
+                "rename {} -> {}: {err}",
+                tmp_path.display(),
+                final_path.display()
+            ),
         })?;
         Ok(())
     }
@@ -2928,7 +2933,9 @@ mod tests {
         {
             let mut store =
                 IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
-            store.create_ledger("txe-1000", &plan).expect("create ledger");
+            store
+                .create_ledger("txe-1000", &plan)
+                .expect("create ledger");
             store
                 .record_execution(
                     "txe-1000",
@@ -2950,8 +2957,8 @@ mod tests {
         // dedups the already-committed step — the ft-iz1ki gap (re-dispatch
         // after crash) is closed.
         {
-            let reopened =
-                IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("reopen store");
+            let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+                .expect("reopen store");
             assert_eq!(
                 reopened.check_dedup(&key),
                 Some(&outcome),
@@ -2968,7 +2975,9 @@ mod tests {
         // never errors.
         let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
         let plan = make_plan(1);
-        store.create_ledger("txe-2000", &plan).expect("create ledger");
+        store
+            .create_ledger("txe-2000", &plan)
+            .expect("create ledger");
         store
             .record_execution(
                 "txe-2000",

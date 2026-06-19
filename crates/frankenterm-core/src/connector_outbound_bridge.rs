@@ -1769,7 +1769,9 @@ impl ConnectorOutboundBridge {
                                     rule.action_kind,
                                     now_ms,
                                 )
-                                .with_detail(match sandbox_target.as_deref() {
+                                .with_detail(match sandbox_target
+                                    .as_deref()
+                                {
                                     Some(target) => format!("zone_id={zone_id},target={target}"),
                                     None => format!("zone_id={zone_id},target=<missing>"),
                                 }),
@@ -3254,7 +3256,10 @@ mod tests {
         );
 
         let tel = bridge.telemetry();
-        assert_eq!(tel.actions_dispatched, 2, "both actions proceeded to dispatch");
+        assert_eq!(
+            tel.actions_dispatched, 2,
+            "both actions proceeded to dispatch"
+        );
         assert!(
             tel.actions_throttled >= 1,
             "the throttled action must increment actions_throttled"
@@ -3299,19 +3304,31 @@ mod tests {
         let mut inbound =
             ConnectorInboundBridge::new(Arc::clone(&bus), ConnectorInboundBridgeConfig::default());
 
-        let sig1 = ConnectorSignal::new("github", ConnectorSignalKind::Webhook, serde_json::json!({}))
-            .with_pane_id(7)
-            .with_sub_type("push")
-            .with_correlation_id("evt-1")
-            .with_timestamp_ms(1000);
-        let sig2 = ConnectorSignal::new("github", ConnectorSignalKind::Webhook, serde_json::json!({}))
-            .with_pane_id(7)
-            .with_sub_type("push")
-            .with_correlation_id("evt-2")
-            .with_timestamp_ms(1001);
+        let sig1 = ConnectorSignal::new(
+            "github",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({}),
+        )
+        .with_pane_id(7)
+        .with_sub_type("push")
+        .with_correlation_id("evt-1")
+        .with_timestamp_ms(1000);
+        let sig2 = ConnectorSignal::new(
+            "github",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({}),
+        )
+        .with_pane_id(7)
+        .with_sub_type("push")
+        .with_correlation_id("evt-2")
+        .with_timestamp_ms(1001);
 
-        let r1 = inbound.route_signal(&sig1).expect("inbound routes signal 1");
-        let r2 = inbound.route_signal(&sig2).expect("inbound routes signal 2");
+        let r1 = inbound
+            .route_signal(&sig1)
+            .expect("inbound routes signal 1");
+        let r2 = inbound
+            .route_signal(&sig2)
+            .expect("inbound routes signal 2");
         assert!(
             r1.delivered_count > 0 && !r1.deduplicated,
             "stage 1: signal 1 must be delivered to the bus"
@@ -3363,12 +3380,20 @@ mod tests {
         outbound.set_connector_admission_enforced("slack", true);
         outbound.register_sandbox_zone("slack", permissive_zone());
         // None/None filters: the rule matches the PatternDetected-derived event.
-        outbound.add_rule(make_rule("r1", None, None, "slack", ConnectorActionKind::Notify));
+        outbound.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
 
         // First event: governor Allow -> dispatched. Proves the message traversed
         // inbound -> bus -> outbound AND that the governor was consulted and
         // admitted it.
-        let d1 = outbound.process_event(&out_ev1).expect("stage 3: dispatch 1");
+        let d1 = outbound
+            .process_event(&out_ev1)
+            .expect("stage 3: dispatch 1");
         assert_eq!(
             d1.actions_dispatched.len(),
             1,
@@ -3378,7 +3403,9 @@ mod tests {
         // Second event (queue depth 1): governor Throttle. The action must NOT be
         // silently dropped — it still dispatches (allowed-after-delay) and is
         // counted as a throttle, never as a hard rejection.
-        let d2 = outbound.process_event(&out_ev2).expect("stage 3: dispatch 2");
+        let d2 = outbound
+            .process_event(&out_ev2)
+            .expect("stage 3: dispatch 2");
         assert_eq!(
             d2.actions_dispatched.len(),
             1,

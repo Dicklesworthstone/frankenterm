@@ -1799,7 +1799,12 @@ fn hash_text(text: &str) -> u64 {
 /// it finds the largest overlap where a suffix of `previous` matches a prefix of `current`.
 #[must_use]
 pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
-    extract_delta_with_overlap_mode(previous, current, overlap_size, delta_linear_overlap_enabled())
+    extract_delta_with_overlap_mode(
+        previous,
+        current,
+        overlap_size,
+        delta_linear_overlap_enabled(),
+    )
 }
 
 /// Q3 moonshot gate env var (`ingest.delta_linear_overlap`, default false).
@@ -2249,8 +2254,9 @@ impl OutputCache {
         // guard); fires at most once per ~capacity refreshes.
         record_output_cache_lru_steps(self.lru_order.len() as u64);
         let live = &self.global_hashes;
-        self.lru_order
-            .retain(|&(hash, generation)| live.get(&hash).is_some_and(|e| e.generation == generation));
+        self.lru_order.retain(|&(hash, generation)| {
+            live.get(&hash).is_some_and(|e| e.generation == generation)
+        });
     }
 
     /// Prune stale per-pane entries older than max_age.

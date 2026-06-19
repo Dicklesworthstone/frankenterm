@@ -1058,10 +1058,7 @@ impl SnapshotEngine {
         match crate::session_retention::cleanup_sessions_async_cx(cx, db_path, config).await {
             Ok(result) => {
                 let total = result.total_sessions_deleted();
-                if total > 0
-                    || result.orphaned_checkpoints > 0
-                    || result.orphaned_pane_states > 0
-                {
+                if total > 0 || result.orphaned_checkpoints > 0 || result.orphaned_pane_states > 0 {
                     tracing::info!(
                         sessions_deleted = total,
                         orphaned_checkpoints = result.orphaned_checkpoints,
@@ -1740,8 +1737,14 @@ mod tests {
             .expect("now - 1h fits in Instant");
 
         // Startup pass (never run before) is always due, even with interval 0.
-        assert!(session_cleanup_due(None, 0, now), "startup must run with interval=0");
-        assert!(session_cleanup_due(None, 24, now), "startup must run with interval=24");
+        assert!(
+            session_cleanup_due(None, 0, now),
+            "startup must run with interval=0"
+        );
+        assert!(
+            session_cleanup_due(None, 24, now),
+            "startup must run with interval=24"
+        );
 
         // interval_hours == 0 => only-on-startup: never due again after a run.
         assert!(

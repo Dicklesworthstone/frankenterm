@@ -129,10 +129,16 @@ pub fn quota_gate_advisory(decision: &crate::quota_gate::LaunchDecision) -> Gove
     let recommendation = match decision.verdict {
         LaunchVerdict::Allow => "launch now".to_string(),
         LaunchVerdict::Warn => {
-            format!("launch with caution ({} warning(s) active)", decision.warnings.len())
+            format!(
+                "launch with caution ({} warning(s) active)",
+                decision.warnings.len()
+            )
         }
         LaunchVerdict::Block => {
-            format!("hold launch ({} blocking reason(s))", decision.block_count())
+            format!(
+                "hold launch ({} blocking reason(s))",
+                decision.block_count()
+            )
         }
     };
     GovernorAdvisory::new("quota_gate", verdict, reason_code, recommendation, severity)
@@ -178,7 +184,11 @@ pub fn fleet_memory_advisory(
 ) -> GovernorAdvisory {
     use crate::fleet_memory_controller::FleetMemoryAction as A;
     let (verdict, recommendation, severity) = match action {
-        A::None => ("none", "no memory intervention needed", AdvisorySeverity::Allow),
+        A::None => (
+            "none",
+            "no memory intervention needed",
+            AdvisorySeverity::Allow,
+        ),
         A::ThrottlePolling => (
             "throttle_polling",
             "raise idle pane poll intervals to relieve memory",
@@ -200,7 +210,13 @@ pub fn fleet_memory_advisory(
             AdvisorySeverity::RejectClass,
         ),
     };
-    GovernorAdvisory::new("fleet_memory_controller", verdict, verdict, recommendation, severity)
+    GovernorAdvisory::new(
+        "fleet_memory_controller",
+        verdict,
+        verdict,
+        recommendation,
+        severity,
+    )
 }
 
 /// Render a `backpressure` resource-pressure signal as an advisory.
@@ -242,7 +258,11 @@ pub fn operating_envelope_advisory(
 ) -> GovernorAdvisory {
     use crate::operating_envelope::OperatingEnvelopeOutcome as O;
     let (verdict, recommendation, severity) = match outcome {
-        O::Admit => ("admit", "admit at the current envelope", AdvisorySeverity::Allow),
+        O::Admit => (
+            "admit",
+            "admit at the current envelope",
+            AdvisorySeverity::Allow,
+        ),
         O::Defer => (
             "defer",
             "defer until conditions improve",
@@ -253,8 +273,16 @@ pub fn operating_envelope_advisory(
             "proceed at a reduced envelope",
             AdvisorySeverity::Throttle,
         ),
-        O::Shed => ("shed", "shed load to relieve pressure", AdvisorySeverity::Throttle),
-        O::Wait => ("wait", "wait for an admission window", AdvisorySeverity::Throttle),
+        O::Shed => (
+            "shed",
+            "shed load to relieve pressure",
+            AdvisorySeverity::Throttle,
+        ),
+        O::Wait => (
+            "wait",
+            "wait for an admission window",
+            AdvisorySeverity::Throttle,
+        ),
         O::Block => (
             "block",
             "block until the envelope recovers",
@@ -266,7 +294,13 @@ pub fn operating_envelope_advisory(
         .first()
         .cloned()
         .unwrap_or_else(|| verdict.to_string());
-    GovernorAdvisory::new("operating_envelope", verdict, reason_code, recommendation, severity)
+    GovernorAdvisory::new(
+        "operating_envelope",
+        verdict,
+        reason_code,
+        recommendation,
+        severity,
+    )
 }
 
 #[cfg(test)]

@@ -2403,9 +2403,10 @@ fn segment_embeddings_embedded_at_default_is_ms(conn: &Connection) -> Result<boo
     let mut rows = stmt
         .query([])
         .map_err(|e| StorageError::MigrationFailed(format!("table_info query failed: {e}")))?;
-    while let Some(row) = rows.next().map_err(|e| {
-        StorageError::MigrationFailed(format!("table_info row read failed: {e}"))
-    })? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| StorageError::MigrationFailed(format!("table_info row read failed: {e}")))?
+    {
         let name: String = row.get(1).map_err(|e| {
             StorageError::MigrationFailed(format!("table_info name read failed: {e}"))
         })?;
@@ -3220,11 +3221,17 @@ mod tests {
                 let result = build_migration_plan(from, to);
 
                 if from > SCHEMA_VERSION {
-                    assert!(result.is_err(), "future from_version {from} must fail closed");
+                    assert!(
+                        result.is_err(),
+                        "future from_version {from} must fail closed"
+                    );
                     continue;
                 }
                 if to > SCHEMA_VERSION || to < 1 {
-                    assert!(result.is_err(), "out-of-range to_version {to} must be rejected");
+                    assert!(
+                        result.is_err(),
+                        "out-of-range to_version {to} must be rejected"
+                    );
                     continue;
                 }
 

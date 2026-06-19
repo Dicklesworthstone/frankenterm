@@ -287,14 +287,12 @@ impl BocpdModel {
         for ss in &self.sufficient_stats {
             pred_log_liks.push(ss.predictive_log_likelihood(x));
         }
-        let shiryaev_roberts_alarm = if matches!(
-            self.config.detector,
-            BocpdDetectorKind::ShiryaevRoberts
-        ) {
-            self.update_shiryaev_roberts_statistic(x, &pred_log_liks)
-        } else {
-            None
-        };
+        let shiryaev_roberts_alarm =
+            if matches!(self.config.detector, BocpdDetectorKind::ShiryaevRoberts) {
+                self.update_shiryaev_roberts_statistic(x, &pred_log_liks)
+            } else {
+                None
+            };
 
         // Step 2: Compute growth probabilities (log-space)
         // Clamp hazard_rate to avoid ln(0) = -inf which propagates NaN
@@ -400,11 +398,7 @@ impl BocpdModel {
     /// Update the Shiryaev-Roberts statistic and return its probability-shaped
     /// alarm score. Invalid or degenerate predictive likelihoods fail closed by
     /// returning `None`, which keeps the existing BOCPD Student-t statistic.
-    fn update_shiryaev_roberts_statistic(
-        &mut self,
-        x: f64,
-        pred_log_liks: &[f64],
-    ) -> Option<f64> {
+    fn update_shiryaev_roberts_statistic(&mut self, x: f64, pred_log_liks: &[f64]) -> Option<f64> {
         let null_ll = pred_log_liks.get(self.map_run_length()).copied()?;
         let change_ll = NormalGammaSS::prior().predictive_log_likelihood(x);
         if is_degenerate_student_t_fallback(null_ll)
@@ -433,9 +427,9 @@ impl BocpdModel {
     /// the e-value required to fire.
     fn shiryaev_roberts_boundary(&self) -> f64 {
         let h = self.config.hazard_rate.clamp(1.0e-10, 1.0 - 1.0e-10);
-        let false_alarm_alpha =
-            ((1.0 - self.config.detection_threshold) * h / self.config.detection_threshold)
-                .clamp(1.0e-12, 0.5);
+        let false_alarm_alpha = ((1.0 - self.config.detection_threshold) * h
+            / self.config.detection_threshold)
+            .clamp(1.0e-12, 0.5);
         1.0 / false_alarm_alpha
     }
 
@@ -1249,8 +1243,8 @@ mod tests {
             ..default_config.clone()
         };
         let trace = [
-            10.0, 10.2, 9.8, 10.1, 9.9, 10.0, 10.1, 9.9, 10.2, 9.8, 10.0, 10.1, 10.0, 10.1,
-            9.9, 10.0, 80.0, 80.2, 79.8, 80.1, 80.0, 79.9, 80.1, 80.0,
+            10.0, 10.2, 9.8, 10.1, 9.9, 10.0, 10.1, 9.9, 10.2, 9.8, 10.0, 10.1, 10.0, 10.1, 9.9,
+            10.0, 80.0, 80.2, 79.8, 80.1, 80.0, 79.9, 80.1, 80.0,
         ];
         let mut default_model = BocpdModel::new(default_config);
         let mut explicit_model = BocpdModel::new(explicit_config);
@@ -1272,7 +1266,10 @@ mod tests {
             });
 
             assert_eq!(default_cp, explicit_cp);
-            assert_eq!(default_model.map_run_length(), explicit_model.map_run_length());
+            assert_eq!(
+                default_model.map_run_length(),
+                explicit_model.map_run_length()
+            );
             assert_eq!(
                 default_model.change_point_probability().to_bits(),
                 explicit_model.change_point_probability().to_bits()
@@ -1316,8 +1313,7 @@ mod tests {
 
         let bocpd_index = first_alarm_index(bocpd_config, &corpus)
             .expect("BOCPD should eventually detect the runaway");
-        let sr_index = first_alarm_index(sr_config, &corpus)
-            .expect("SR should detect the runaway");
+        let sr_index = first_alarm_index(sr_config, &corpus).expect("SR should detect the runaway");
         assert!(
             bocpd_index >= change_at && sr_index >= change_at,
             "both alarms should occur after the synthetic change point: \

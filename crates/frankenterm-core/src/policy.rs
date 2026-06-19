@@ -6573,7 +6573,9 @@ impl PolicyEngine {
                     "policy.kill_switch",
                     true,
                     Some("deny"),
-                    Some(format!("kill switch {level} — new workflow launches paused")),
+                    Some(format!(
+                        "kill switch {level} — new workflow launches paused"
+                    )),
                 );
                 context.set_determining_rule("policy.kill_switch");
                 return PolicyDecision::deny_with_rule(
@@ -15698,7 +15700,11 @@ mod tests {
         // through SoftStop entirely (is_blocked_for_writes was only reached
         // for pane-ful is_mutating actions, and WorkflowRun is neither).
         assert!(killswitch_blocked(SoftStop, ActionKind::WorkflowRun, None));
-        assert!(killswitch_blocked(SoftStop, ActionKind::WorkflowRun, Some(1)));
+        assert!(killswitch_blocked(
+            SoftStop,
+            ActionKind::WorkflowRun,
+            Some(1)
+        ));
         assert!(killswitch_blocked(
             SoftStop,
             ActionKind::ConnectorTriggerWorkflow,
@@ -15768,8 +15774,16 @@ mod tests {
     #[test]
     fn killswitch_emergency_halt_blocks_even_reads() {
         use crate::policy_quarantine::KillSwitchLevel::EmergencyHalt;
-        assert!(killswitch_blocked(EmergencyHalt, ActionKind::ReadOutput, None));
-        assert!(killswitch_blocked(EmergencyHalt, ActionKind::WorkflowRun, None));
+        assert!(killswitch_blocked(
+            EmergencyHalt,
+            ActionKind::ReadOutput,
+            None
+        ));
+        assert!(killswitch_blocked(
+            EmergencyHalt,
+            ActionKind::WorkflowRun,
+            None
+        ));
     }
 
     #[test]
