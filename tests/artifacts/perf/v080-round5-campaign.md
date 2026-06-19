@@ -45,3 +45,11 @@ _(tick entries appended by the orchestrator tend-loop)_
   progressing) → nudged cod_3 to commit code-first, cod_1+cod_5 to retry. cod_2 (scroll/mem benches),
   cc_1 (bocpd --lib), cc_2 (D1 proof), cc_3 (E1 M6 proof), cod_4 (gui M3+C1) working; several on slow
   remote core builds (25-29min, not RED). No beads closed yet (proofs pending — no close without green).
+- 2026-06-19 tend#2 — cod_2 .5 CLOSED (green RCH proof vmi1167313, scroll/mem benches 8eef1f001).
+  First real local env-gate A/B LAUNCHED: Q1 scrollback_prefix_index (build-once, ~30min). cod_2 freed →
+  dispatched D3 fresh-idea mining (.13). Wedged RCH builds: cod_3 (.6 WAL, 56m no-exit) + cod_4 (.7 gui
+  bench stuck at X11/XCB pkg-config) — both nudged to cancel+commit-code-first+retry; M3 frame-time A/B
+  reassigned to local (Mac has GUI stack). Dirty core-src (bocpd/distributed/ingest/storage) compiles
+  (cod_2's proof was green against it) but cod_3's ingest/storage still uncommitted → contamination
+  watch. cod_1 (.4 retry), cod_5 (.8 retry), cc_1 (.9 bocpd, "PASS=false" diag — watch), cc_2 (.10 D1
+  conformance proof), cc_3 (.11 E1 M6 proof) all working. Flagged possible mis-scoped CLI main.rs edit.

@@ -21,7 +21,7 @@ both from one run); `metric≠ns` = win is hit-rate/bytes/delay, adjudicate the 
 
 | Flag | Gate | A/B shape | Bench source | Quantified delta | Verdict |
 |---|---|---|---|---|---|
-| Q1 prefix-sum | env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` | gate-toggle (deep-scroll) | A1S (.5) new | _pending_ | _pending_ |
+| Q1 prefix-sum | env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` | gate-toggle (deep-scroll) | scrollback_prefix_index/deep_scroll_locate_offset (8eef1f001) | _running (local env A/B)_ | _pending_ |
 | Q2 group-commit+condvar | config storage.group_commit_events/writer_blocking_recv | gate-toggle (WAL burst) | A2W (.6) wire | _pending_ | _pending_ |
 | Q3 linear KMP overlap | config ingest.delta_linear_overlap | gate-toggle (box/emoji) | A2W (.6)/delta_extraction | _pending_ | _pending_ |
 | Q4 lazy captures | feature patterns-lazy-captures | gate-toggle (high-suppression) | existing pattern_detection_context | _pending_ | _pending_ |
