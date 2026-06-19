@@ -1019,6 +1019,22 @@ pub struct StorageConfig {
     /// wake latency and idle CPU change. Production opt-in is via the
     /// `FT_MOONSHOT_WRITER_BLOCKING_RECV` env var.
     pub writer_blocking_recv: bool,
+    /// [round-4 M8] Make the writer's batch size + linger timer adaptive via a
+    /// Pollaczek-Khinchine / Kingman M/G/1 controller driven by observed arrival
+    /// and service rates (`group_commit = adaptive` vs the default `fixed`).
+    ///
+    /// `false` (fixed) keeps the legacy greedy drain with no linger — byte-
+    /// identical to the prior writer. When `true`, after the greedy drain empties
+    /// the queue the writer may linger up to a Kingman-bounded `tau` (always
+    /// `<= the current park`) to accumulate a batch sized by Little's law, so
+    /// more commands share one group-commit transaction (fewer fsyncs) under
+    /// load. The set of durable writes, their order, and their results are
+    /// unchanged — only batch grouping + timing move, so a DB dump is identical.
+    /// Fail-closed: batch clamped to `[1, WRITER_BATCH_CAP]`, `tau <= park`,
+    /// strict/durability-class commands bypass the linger, and an estimated
+    /// utilization `rho >= 1` collapses to flush-every-command. Production opt-in
+    /// is via the `FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE` env var.
+    pub group_commit_adaptive: bool,
 }
 
 impl Default for StorageConfig {
@@ -1029,6 +1045,7 @@ impl Default for StorageConfig {
             defer_fts_triggers: false,
             group_commit_events: false,
             writer_blocking_recv: false,
+            group_commit_adaptive: false,
         }
     }
 }
@@ -1060,6 +1077,8 @@ const FT_STORAGE_MMAP_DIR_ENV: &str = "FT_STORAGE_MMAP_DIR";
 const FT_MOONSHOT_GROUP_COMMIT_EVENTS_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_EVENTS";
 /// [round-4 Q2] Env opt-in for [`StorageConfig::writer_blocking_recv`].
 const FT_MOONSHOT_WRITER_BLOCKING_RECV_ENV: &str = "FT_MOONSHOT_WRITER_BLOCKING_RECV";
+/// [round-4 M8] Env opt-in for [`StorageConfig::group_commit_adaptive`].
+const FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE";
 
 /// Park ceiling for the condvar-driven writer wake (`writer_blocking_recv`).
 ///
@@ -1106,19 +1125,213 @@ impl WriterWakeup {
     /// `park_for_work` either observes the depth bump under the lock or is woken
     /// by this notification; it can never wedge between the two.
     fn notify(&self) {
-        let _guard = self.lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         self.condvar.notify_one();
     }
 
     /// Park until notified or `timeout` elapses, skipping the sleep entirely if
     /// `queued_depth` already shows pending work.
     fn park_for_work(&self, timeout: std::time::Duration, queued_depth: &AtomicUsize) {
-        let guard = self.lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        let guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if queued_depth.load(AtomicOrdering::Acquire) > 0 {
             return;
         }
         let _ = self.condvar.wait_timeout(guard, timeout);
     }
+}
+
+/// EWMA smoothing factor for the adaptive controller's rate/service estimates.
+const ADAPTIVE_EWMA_ALPHA: f64 = 0.2;
+/// Cycles observed before the adaptive controller trusts its model; until then
+/// it behaves exactly like the fixed writer (greedy drain to cap, no linger).
+const ADAPTIVE_WARMUP_SAMPLES: u64 = 8;
+/// Utilization at/above which the controller fails closed to flush-every-command
+/// (no linger). The Pollaczek-Khinchine wait diverges as `rho -> 1`, so a margin
+/// below 1 keeps the model in its stable regime.
+const ADAPTIVE_RHO_CEILING: f64 = 0.98;
+/// Default service-time SCV (`C_s^2 = 1`, i.e. M/M/1) used until enough samples
+/// give a variance estimate. With Poisson arrivals (`C_a^2 = 1`) Kingman reduces
+/// to exactly the Pollaczek-Khinchine M/G/1 formula.
+const ADAPTIVE_DEFAULT_SERVICE_SCV: f64 = 1.0;
+/// Upper clamp on the estimated service SCV so a transient spike can't blow up
+/// the linger estimate.
+const ADAPTIVE_SCV_CAP: f64 = 16.0;
+/// Poll granularity while lingering: the writer sleeps in quanta this small,
+/// re-checking the channel and the linger deadline between each.
+const ADAPTIVE_LINGER_POLL_QUANTUM: std::time::Duration = std::time::Duration::from_micros(250);
+
+/// Batch-size + linger plan emitted by [`AdaptiveGroupCommitController::plan`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AdaptivePlan {
+    /// Target batch size to accumulate, clamped to `[1, WRITER_BATCH_CAP]`.
+    batch_target: usize,
+    /// Linger window to wait for arrivals once the queue empties, `<= park`.
+    linger: std::time::Duration,
+}
+
+/// [round-4 M8] Adaptive M/G/1 group-commit controller.
+///
+/// Observes the writer's arrival rate `lambda` (commands dequeued per wall-clock
+/// second, including idle) and per-command service time `E[S]` (group-commit
+/// dispatch time / batch size) as EWMAs, yielding utilization `rho = lambda *
+/// E[S]`. From the Pollaczek-Khinchine M/G/1 mean queue wait
+/// `W_q = (rho/(1-rho)) * ((1 + C_s^2)/2) * E[S]` (Kingman with Poisson
+/// arrivals) it derives a linger `tau = clamp(W_q, 0, park)` and, by Little's
+/// law, a batch target `1 + round(lambda * tau)`.
+///
+/// It is fail-closed by construction: warm-up and any non-finite / saturated
+/// (`rho >= ADAPTIVE_RHO_CEILING`) estimate collapse to the deterministic legacy
+/// path (greedy drain or flush-every-command, no linger), the batch is clamped
+/// to `[1, WRITER_BATCH_CAP]`, and the linger never exceeds the current park.
+struct AdaptiveGroupCommitController {
+    /// Current park duration; the linger is never allowed to exceed it.
+    park: std::time::Duration,
+    /// Number of completed observation cycles.
+    samples: u64,
+    /// EWMA arrival rate, commands per second.
+    arrival_rate: f64,
+    /// EWMA per-command service time, seconds.
+    service_per_cmd: f64,
+    /// EWMA of the per-command service time (first moment) for the SCV estimate.
+    service_mean: f64,
+    /// EWMA of the per-command service time squared (second moment) for the SCV.
+    service_m2: f64,
+    /// Start instant of the previous cycle, for the inter-cycle period.
+    last_cycle_start: Option<std::time::Instant>,
+}
+
+impl AdaptiveGroupCommitController {
+    fn new(park: std::time::Duration) -> Self {
+        Self {
+            park,
+            samples: 0,
+            arrival_rate: 0.0,
+            service_per_cmd: 0.0,
+            service_mean: 0.0,
+            service_m2: 0.0,
+            last_cycle_start: None,
+        }
+    }
+
+    /// Pure function of the current estimates → the batch/linger plan. Pulled out
+    /// of the hot loop so it is unit-testable in isolation.
+    fn plan(&self) -> AdaptivePlan {
+        // Warm-up: indistinguishable from the fixed writer (greedy to cap, no linger).
+        if self.samples < ADAPTIVE_WARMUP_SAMPLES {
+            return AdaptivePlan {
+                batch_target: WRITER_BATCH_CAP,
+                linger: std::time::Duration::ZERO,
+            };
+        }
+        let lambda = self.arrival_rate;
+        let svc = self.service_per_cmd;
+        let rho = lambda * svc;
+        // Fail-closed: degenerate / saturated / non-finite → flush every command.
+        if !lambda.is_finite()
+            || !svc.is_finite()
+            || !rho.is_finite()
+            || lambda <= 0.0
+            || svc <= 0.0
+            || rho >= ADAPTIVE_RHO_CEILING
+        {
+            return AdaptivePlan {
+                batch_target: 1,
+                linger: std::time::Duration::ZERO,
+            };
+        }
+        // Service-time squared coefficient of variation (P-K variability term).
+        let scv = {
+            let var = (self.service_m2 - self.service_mean * self.service_mean).max(0.0);
+            if self.service_mean > 0.0 {
+                (var / (self.service_mean * self.service_mean)).clamp(0.0, ADAPTIVE_SCV_CAP)
+            } else {
+                ADAPTIVE_DEFAULT_SERVICE_SCV
+            }
+        };
+        // Pollaczek-Khinchine M/G/1 mean queue wait.
+        let wq = (rho / (1.0 - rho)) * ((1.0 + scv) / 2.0) * svc;
+        // Linger no longer than the queue's own wait, and never beyond the park.
+        let park_secs = self.park.as_secs_f64();
+        let linger_secs = if wq.is_finite() {
+            wq.clamp(0.0, park_secs)
+        } else {
+            park_secs
+        };
+        let linger = std::time::Duration::from_secs_f64(linger_secs);
+        // Little's law: the command that opened the batch plus expected arrivals
+        // during the linger window. Clamp to [1, WRITER_BATCH_CAP].
+        let expected = 1.0 + lambda * linger_secs;
+        let batch_target = if expected.is_finite() {
+            (expected.round() as i64).clamp(1, WRITER_BATCH_CAP as i64) as usize
+        } else {
+            1
+        };
+        AdaptivePlan {
+            batch_target,
+            linger,
+        }
+    }
+
+    /// Fold one completed cycle's measurements into the EWMA estimates.
+    /// `cycle_start` is the instant the cycle began (its first command was
+    /// dequeued); `service` is the group-commit dispatch duration.
+    fn observe(
+        &mut self,
+        batch_len: usize,
+        service: std::time::Duration,
+        cycle_start: std::time::Instant,
+    ) {
+        if batch_len == 0 {
+            return;
+        }
+        let n = batch_len as f64;
+        let svc_per_cmd = (service.as_secs_f64() / n).max(0.0);
+        // Arrival rate as commands-per-cycle over the inter-cycle period (which
+        // includes idle/park time), so lambda*E[S] recovers the busy fraction.
+        let lambda_sample = match self.last_cycle_start {
+            Some(prev) => {
+                let period = cycle_start.saturating_duration_since(prev).as_secs_f64();
+                if period > 0.0 {
+                    n / period
+                } else {
+                    self.arrival_rate
+                }
+            }
+            None => self.arrival_rate,
+        };
+        self.last_cycle_start = Some(cycle_start);
+
+        if self.samples == 0 {
+            self.arrival_rate = lambda_sample;
+            self.service_per_cmd = svc_per_cmd;
+            self.service_mean = svc_per_cmd;
+            self.service_m2 = svc_per_cmd * svc_per_cmd;
+        } else {
+            let a = ADAPTIVE_EWMA_ALPHA;
+            self.arrival_rate = a * lambda_sample + (1.0 - a) * self.arrival_rate;
+            self.service_per_cmd = a * svc_per_cmd + (1.0 - a) * self.service_per_cmd;
+            self.service_mean = a * svc_per_cmd + (1.0 - a) * self.service_mean;
+            self.service_m2 = a * (svc_per_cmd * svc_per_cmd) + (1.0 - a) * self.service_m2;
+        }
+        self.samples = self.samples.saturating_add(1);
+    }
+}
+
+/// A writer command is linger-eligible only if it is one of the high-volume,
+/// deferrable, coalescable commands. Strict/durability-class commands (gaps,
+/// audits, FTS, and every barrier) bypass the adaptive linger so their latency
+/// is never inflated by batching.
+fn is_linger_eligible(cmd: &WriteCommand) -> bool {
+    matches!(
+        cmd,
+        WriteCommand::AppendSegment { .. } | WriteCommand::RecordEvent { .. }
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1874,6 +2087,9 @@ impl StorageHandle {
             || storage_env_flag_enabled(FT_MOONSHOT_GROUP_COMMIT_EVENTS_ENV);
         let writer_blocking_recv = config.writer_blocking_recv
             || storage_env_flag_enabled(FT_MOONSHOT_WRITER_BLOCKING_RECV_ENV);
+        // [round-4 M8] group_commit = adaptive vs fixed (default).
+        let group_commit_adaptive = config.group_commit_adaptive
+            || storage_env_flag_enabled(FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE_ENV);
 
         // Create bounded channel for write commands
         let (write_tx_raw, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
@@ -1897,6 +2113,7 @@ impl StorageHandle {
                     &queued_depth_for_writer,
                     group_commit_events,
                     writer_wakeup_for_writer.as_deref(),
+                    group_commit_adaptive,
                 );
             })
             .map_err(|e| {
@@ -9239,9 +9456,22 @@ fn writer_loop(
     queued_depth: &AtomicUsize,
     group_commit_events: bool,
     writer_wakeup: Option<&WriterWakeup>,
+    group_commit_adaptive: bool,
 ) {
     let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
     let mut io_gate = StorageIoWriterGate::default();
+
+    // [round-4 M8] The adaptive M/G/1 controller is constructed only when
+    // `group_commit = adaptive`; when `None` the writer takes the byte-identical
+    // fixed path with zero added timing/branch cost. The linger ceiling tracks
+    // the active park (1 ms fixed poll vs the condvar park), honoring `tau <= park`.
+    let park_duration = if writer_wakeup.is_some() {
+        std::time::Duration::from_millis(WRITER_BLOCKING_RECV_PARK_MS)
+    } else {
+        std::time::Duration::from_millis(1)
+    };
+    let mut adaptive =
+        group_commit_adaptive.then(|| AdaptiveGroupCommitController::new(park_duration));
 
     // ft-ixgqo: removed the per-thread asupersync runtime + `block_on`
     // bridge that ft-3tvvt's audit flagged. The writer runs on a
@@ -9262,17 +9492,69 @@ fn writer_loop(
         match rx.try_recv() {
             Ok(first_cmd) => {
                 WriteCommandSender::mark_command_dequeued(queued_depth);
+                // Adaptive plan + timing are computed only when the controller is
+                // active; in fixed mode these stay `None` (the `.map` closures
+                // never run) so the path below is byte-identical to the legacy
+                // writer with no `Instant::now()` cost.
+                let cycle_start = adaptive.as_ref().map(|_| std::time::Instant::now());
+                let plan = adaptive.as_ref().map(AdaptiveGroupCommitController::plan);
                 let mut should_break = false;
                 let mut batch = VecDeque::with_capacity(WRITER_BATCH_CAP);
+                let mut linger_blocked = !is_linger_eligible(&first_cmd);
                 batch.push_back(first_cmd);
 
+                // Greedy drain of already-queued commands (fixed AND adaptive),
+                // up to the hard cap — unchanged from the legacy writer.
                 while batch.len() < WRITER_BATCH_CAP {
                     let Ok(cmd) = rx.try_recv() else {
                         break;
                     };
                     WriteCommandSender::mark_command_dequeued(queued_depth);
+                    linger_blocked |= !is_linger_eligible(&cmd);
                     batch.push_back(cmd);
                 }
+
+                // [round-4 M8] Adaptive linger: only when the queue drained below
+                // the model's batch target and the whole batch is linger-eligible
+                // (no strict/durability-class command is held up). FIFO order is
+                // preserved, so the durable write stream is byte-identical to
+                // fixed — only batch grouping + timing differ.
+                if let Some(plan) = plan {
+                    if !linger_blocked
+                        && plan.linger > std::time::Duration::ZERO
+                        && batch.len() < plan.batch_target
+                    {
+                        let deadline = std::time::Instant::now() + plan.linger;
+                        while batch.len() < plan.batch_target {
+                            match rx.try_recv() {
+                                Ok(cmd) => {
+                                    WriteCommandSender::mark_command_dequeued(queued_depth);
+                                    let eligible = is_linger_eligible(&cmd);
+                                    batch.push_back(cmd);
+                                    if !eligible {
+                                        // A strict command arrived: stop lingering
+                                        // and commit immediately.
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::RecvError::Empty) => {
+                                    let now = std::time::Instant::now();
+                                    if now >= deadline {
+                                        break;
+                                    }
+                                    let remaining = deadline.saturating_duration_since(now);
+                                    std::thread::sleep(remaining.min(ADAPTIVE_LINGER_POLL_QUANTUM));
+                                }
+                                Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let batch_len = batch.len();
+                let dispatch_start = adaptive.as_ref().map(|_| std::time::Instant::now());
 
                 dispatch_write_command_batch(
                     backend,
@@ -9283,6 +9565,12 @@ fn writer_loop(
                     &mut io_gate,
                     group_commit_events,
                 );
+
+                if let (Some(ctl), Some(start), Some(cstart)) =
+                    (adaptive.as_mut(), dispatch_start, cycle_start)
+                {
+                    ctl.observe(batch_len, start.elapsed(), cstart);
+                }
 
                 if should_break {
                     break 'main;
@@ -10089,7 +10377,10 @@ mod writer_io_scheduler_tests {
                 .iter()
                 .filter(|(sql, _)| sql.contains("INSERT INTO events"))
                 .count();
-            assert_eq!(insert_count, 3, "every grouped event inserts inside the txn");
+            assert_eq!(
+                insert_count, 3,
+                "every grouped event inserts inside the txn"
+            );
         });
     }
 
@@ -10587,7 +10878,11 @@ mod writer_io_scheduler_tests {
             }
 
             let segments = storage.get_segments(1, 1000).await.expect("read segments");
-            assert_eq!(segments.len(), 16, "condvar-park writer persisted all segments");
+            assert_eq!(
+                segments.len(),
+                16,
+                "condvar-park writer persisted all segments"
+            );
             let events = storage
                 .get_events(EventQuery {
                     limit: Some(1000),
@@ -10598,6 +10893,394 @@ mod writer_io_scheduler_tests {
             assert_eq!(events.len(), 16, "condvar-park writer persisted all events");
             // Clean shutdown proves the Shutdown command notifies and wakes the
             // parked writer rather than waiting out the park ceiling.
+            storage.shutdown().await.expect("shutdown");
+        });
+    }
+
+    // ----------------------------------------------------------------------
+    // [round-4 M8] Adaptive M/G/1 group-commit proofs.
+    //
+    // The controller's plan() is a pure function of its EWMA estimates, so the
+    // queueing math + every fail-closed clamp is unit-tested deterministically
+    // (the test module is a child of `crate::storage`, so it can set the private
+    // estimate fields directly). The end-to-end durability-order golden then
+    // proves the adaptive writer's durable write stream is byte-identical to the
+    // fixed writer's over a mixed segment/event/gap workload.
+    // ----------------------------------------------------------------------
+
+    /// Build a post-warm-up controller with exact estimates. `scv` is encoded
+    /// into the service moments so `plan()` sees the intended `C_s^2`.
+    fn mk_adaptive_controller(
+        park_ms: u64,
+        samples: u64,
+        lambda: f64,
+        svc: f64,
+        scv: f64,
+    ) -> AdaptiveGroupCommitController {
+        let mut c = AdaptiveGroupCommitController::new(std::time::Duration::from_millis(park_ms));
+        c.samples = samples;
+        c.arrival_rate = lambda;
+        c.service_per_cmd = svc;
+        c.service_mean = svc;
+        // var = m2 - mean^2 = scv*svc^2  =>  C_s^2 = var/mean^2 = scv.
+        c.service_m2 = (1.0 + scv) * svc * svc;
+        c
+    }
+
+    #[test]
+    fn adaptive_plan_warmup_matches_fixed_writer() {
+        let c = mk_adaptive_controller(25, ADAPTIVE_WARMUP_SAMPLES - 1, 5000.0, 1e-4, 1.0);
+        let plan = c.plan();
+        assert_eq!(
+            plan.batch_target, WRITER_BATCH_CAP,
+            "warm-up greedy-drains to cap"
+        );
+        assert_eq!(
+            plan.linger,
+            std::time::Duration::ZERO,
+            "warm-up never lingers"
+        );
+    }
+
+    #[test]
+    fn adaptive_plan_fails_closed_on_saturation() {
+        // rho = 9900 * 1e-4 = 0.99 >= ceiling -> flush every command, no linger.
+        let c = mk_adaptive_controller(25, 64, 9900.0, 1e-4, 1.0);
+        let plan = c.plan();
+        assert_eq!(plan.batch_target, 1);
+        assert_eq!(plan.linger, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn adaptive_plan_fails_closed_on_non_finite_estimates() {
+        let inf_lambda = mk_adaptive_controller(25, 64, f64::INFINITY, 1e-4, 1.0);
+        assert_eq!(inf_lambda.plan().batch_target, 1);
+        assert_eq!(inf_lambda.plan().linger, std::time::Duration::ZERO);
+        let nan_svc = mk_adaptive_controller(25, 64, 5000.0, f64::NAN, 1.0);
+        assert_eq!(nan_svc.plan().batch_target, 1);
+        let zero_svc = mk_adaptive_controller(25, 64, 5000.0, 0.0, 1.0);
+        assert_eq!(
+            zero_svc.plan().batch_target,
+            1,
+            "degenerate service fails closed"
+        );
+    }
+
+    #[test]
+    fn adaptive_plan_grows_with_load_within_bounds() {
+        let low = mk_adaptive_controller(25, 64, 5000.0, 1e-4, 1.0).plan(); // rho = 0.5
+        let high = mk_adaptive_controller(25, 64, 9000.0, 1e-4, 1.0).plan(); // rho = 0.9
+        assert!(low.batch_target >= 1 && low.batch_target <= WRITER_BATCH_CAP);
+        assert!(high.batch_target <= WRITER_BATCH_CAP);
+        assert!(
+            high.batch_target > low.batch_target,
+            "higher utilization must enlarge the batch target: {} !> {}",
+            high.batch_target,
+            low.batch_target
+        );
+        assert!(
+            high.linger >= low.linger,
+            "higher utilization lingers at least as long"
+        );
+        assert!(
+            high.linger <= std::time::Duration::from_millis(25),
+            "linger never exceeds the park"
+        );
+    }
+
+    #[test]
+    fn adaptive_plan_clamps_linger_to_park() {
+        // rho = 0.97, E[S] = 1ms -> P-K W_q ~ 32ms, clamped to the 25ms park.
+        let park = std::time::Duration::from_millis(25);
+        let plan = mk_adaptive_controller(25, 64, 970.0, 1e-3, 1.0).plan();
+        assert!(
+            plan.linger <= park,
+            "linger must never exceed the park, got {:?}",
+            plan.linger
+        );
+        assert!(
+            plan.linger >= park - std::time::Duration::from_micros(50),
+            "an over-park W_q must clamp the linger up to ~park, got {:?}",
+            plan.linger
+        );
+        assert!(plan.batch_target <= WRITER_BATCH_CAP);
+        assert!(plan.batch_target >= 1);
+    }
+
+    #[test]
+    fn adaptive_plan_clamps_batch_to_cap() {
+        // High arrival rate + high service SCV drives the Little's-law target well
+        // past the cap; it must clamp to WRITER_BATCH_CAP.
+        let plan = mk_adaptive_controller(25, 64, 19_400.0, 5e-5, 16.0).plan();
+        assert_eq!(
+            plan.batch_target, WRITER_BATCH_CAP,
+            "batch target clamps to cap"
+        );
+        assert!(plan.linger <= std::time::Duration::from_millis(25));
+    }
+
+    #[test]
+    fn adaptive_observe_recovers_utilization() {
+        let mut c = AdaptiveGroupCommitController::new(std::time::Duration::from_millis(25));
+        let base = std::time::Instant::now();
+        // Steady stream: 10 commands/cycle, 1ms service, 2ms period => rho = 0.5.
+        let batch = 10usize;
+        let service = std::time::Duration::from_micros(1000);
+        let period = std::time::Duration::from_micros(2000);
+        for k in 0..40u32 {
+            c.observe(batch, service, base + period * k);
+        }
+        let rho = c.arrival_rate * c.service_per_cmd;
+        assert!((rho - 0.5).abs() < 0.05, "estimated rho ~ 0.5, got {rho}");
+        let plan = c.plan();
+        assert!(plan.batch_target >= 1 && plan.batch_target <= WRITER_BATCH_CAP);
+        assert!(plan.linger <= std::time::Duration::from_millis(25));
+    }
+
+    #[test]
+    fn adaptive_observe_zero_batch_is_ignored() {
+        let mut c = AdaptiveGroupCommitController::new(std::time::Duration::from_millis(1));
+        c.observe(
+            0,
+            std::time::Duration::from_micros(10),
+            std::time::Instant::now(),
+        );
+        assert_eq!(c.samples, 0, "an empty batch contributes no sample");
+    }
+
+    #[test]
+    fn linger_eligibility_excludes_strict_and_barrier_commands() {
+        let (tx, _rx) = oneshot::channel();
+        assert!(is_linger_eligible(&WriteCommand::AppendSegment {
+            pane_id: 1,
+            content: "x".to_string(),
+            content_hash: None,
+            zone_type: None,
+            respond: tx,
+        }));
+        let (tx, _rx) = oneshot::channel();
+        assert!(is_linger_eligible(&WriteCommand::RecordEvent {
+            event: sample_event(1, "r", 1, None),
+            respond: tx,
+        }));
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            !is_linger_eligible(&WriteCommand::RecordGap {
+                pane_id: 1,
+                reason: "gap".to_string(),
+                respond: tx,
+            }),
+            "gaps are GapAndContinuity (strict) and must bypass the linger"
+        );
+        let (tx, _rx) = oneshot::channel();
+        assert!(
+            !is_linger_eligible(&WriteCommand::Shutdown { respond: tx }),
+            "barriers must bypass the linger"
+        );
+    }
+
+    #[test]
+    fn group_commit_adaptive_real_db_dump_matches_fixed() {
+        run_storage_async_test(async {
+            async fn run_workload(group_commit_adaptive: bool) -> String {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let db_path = temp_dir.path().join("adaptive_commit.db");
+                let db_path_str = db_path.to_string_lossy().to_string();
+                let config = StorageConfig {
+                    // Compose with Q2 group-commit so the widened batches coalesce.
+                    group_commit_events: true,
+                    group_commit_adaptive,
+                    ..StorageConfig::default()
+                };
+                let storage = StorageHandle::with_config(&db_path_str, config)
+                    .await
+                    .expect("open storage");
+                storage
+                    .upsert_pane(PaneRecord {
+                        pane_id: 1,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("adaptive".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1_700_000_000_000,
+                        last_seen_at: 1_700_000_000_000,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("upsert pane");
+
+                for i in 0..36_i64 {
+                    storage
+                        .append_segment(1, &format!("segment-content-{i}"), None)
+                        .await
+                        .expect("append segment");
+                    if i % 3 == 0 {
+                        let event = StoredEvent {
+                            id: 0,
+                            pane_id: 1,
+                            rule_id: format!("rule-{i}"),
+                            agent_type: "unknown".to_string(),
+                            event_type: "pattern".to_string(),
+                            severity: "info".to_string(),
+                            confidence: 0.5,
+                            extracted: None,
+                            matched_text: Some(format!("match-{i}")),
+                            segment_id: None,
+                            detected_at: 1_700_000_000_000 + i,
+                            dedupe_key: Some(format!("dedupe-{i}")),
+                            handled_at: None,
+                            handled_by_workflow_id: None,
+                            handled_status: None,
+                        };
+                        storage.record_event(event).await.expect("record event");
+                    }
+                    if i % 5 == 0 {
+                        storage
+                            .record_gap(1, &format!("gap-{i}"))
+                            .await
+                            .expect("record gap");
+                    }
+                }
+
+                let segments = storage.get_segments(1, 1000).await.expect("segments");
+                let events = storage
+                    .get_events(EventQuery {
+                        limit: Some(1000),
+                        ..EventQuery::default()
+                    })
+                    .await
+                    .expect("events");
+                let gaps = storage.get_gaps().await.expect("gaps");
+                storage.shutdown().await.expect("shutdown");
+
+                // Durability-order golden: compare the durable content + order with
+                // wall-clock timestamps normalized away (captured_at / detected_at
+                // differ run-to-run regardless of the gate).
+                let seg_norm: Vec<_> = segments
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.id,
+                            s.pane_id,
+                            s.seq,
+                            s.content.clone(),
+                            s.content_hash.clone(),
+                            s.content_len,
+                        )
+                    })
+                    .collect();
+                let ev_norm: Vec<_> = events
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.id,
+                            e.pane_id,
+                            e.rule_id.clone(),
+                            e.event_type.clone(),
+                            e.matched_text.clone(),
+                            e.dedupe_key.clone(),
+                        )
+                    })
+                    .collect();
+                let gap_norm: Vec<_> = gaps
+                    .iter()
+                    .map(|g| (g.id, g.pane_id, g.seq_before, g.seq_after, g.reason.clone()))
+                    .collect();
+                format!("segments={seg_norm:?}\nevents={ev_norm:?}\ngaps={gap_norm:?}")
+            }
+
+            let fixed = run_workload(false).await;
+            let adaptive = run_workload(true).await;
+            assert_eq!(
+                fixed, adaptive,
+                "adaptive group-commit must preserve the durable write stream byte-for-byte"
+            );
+        });
+    }
+
+    #[test]
+    fn group_commit_adaptive_processes_all_writes_and_shuts_down() {
+        run_storage_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("adaptive_functional.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            // All three round-4 writer gates composed.
+            let config = StorageConfig {
+                group_commit_events: true,
+                group_commit_adaptive: true,
+                writer_blocking_recv: true,
+                ..StorageConfig::default()
+            };
+            let storage = StorageHandle::with_config(&db_path_str, config)
+                .await
+                .expect("open storage");
+            storage
+                .upsert_pane(PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("adaptive-fn".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("upsert pane");
+
+            // Enough writes to drive the controller past warm-up and into the
+            // adaptive linger regime.
+            for i in 0..40_i64 {
+                storage
+                    .append_segment(1, &format!("seg-{i}"), None)
+                    .await
+                    .expect("append segment");
+                if i % 2 == 0 {
+                    let event = StoredEvent {
+                        id: 0,
+                        pane_id: 1,
+                        rule_id: format!("rule-{i}"),
+                        agent_type: "unknown".to_string(),
+                        event_type: "pattern".to_string(),
+                        severity: "info".to_string(),
+                        confidence: 0.7,
+                        extracted: None,
+                        matched_text: Some(format!("match-{i}")),
+                        segment_id: None,
+                        detected_at: 1_700_000_000_000 + i,
+                        dedupe_key: Some(format!("dedupe-{i}")),
+                        handled_at: None,
+                        handled_by_workflow_id: None,
+                        handled_status: None,
+                    };
+                    storage.record_event(event).await.expect("record event");
+                }
+            }
+
+            let segments = storage.get_segments(1, 1000).await.expect("segments");
+            assert_eq!(
+                segments.len(),
+                40,
+                "adaptive writer persisted every segment"
+            );
+            let events = storage
+                .get_events(EventQuery {
+                    limit: Some(1000),
+                    ..EventQuery::default()
+                })
+                .await
+                .expect("events");
+            assert_eq!(events.len(), 20, "adaptive writer persisted every event");
             storage.shutdown().await.expect("shutdown");
         });
     }
@@ -15141,7 +15824,9 @@ fn delete_oldest_segments_backend(backend: &dyn StorageBackend, limit: usize) ->
             "DELETE FROM output_segments WHERE id IN (
                  SELECT id FROM output_segments ORDER BY captured_at ASC, id ASC LIMIT ?1
              ) RETURNING id",
-            &[ToSqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX))],
+            &[ToSqlValue::Integer(
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            )],
         )
         .map_err(|err| storage_backend_error("Failed to evict oldest segments", err))?;
     let deleted = deleted_rows.len();
@@ -25274,6 +25959,7 @@ fn storage_handle_writer_queue_processes_all() {
             defer_fts_triggers: false,
             group_commit_events: false,
             writer_blocking_recv: false,
+            group_commit_adaptive: false,
         };
         let storage = StorageHandle::with_config(&db_path_str, config)
             .await

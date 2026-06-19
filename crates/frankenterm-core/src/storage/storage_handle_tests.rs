@@ -198,7 +198,10 @@ fn storage_handle_append_auto_writes_segment_embedding_ft_xx5cl() {
 
         // The append produced an embedding row for this segment under the query
         // embedder — the production writer that was missing before ft-xx5cl.
-        let stored = handle.get_embedding(seg.id, QUERY_EMBEDDER_ID).await.unwrap();
+        let stored = handle
+            .get_embedding(seg.id, QUERY_EMBEDDER_ID)
+            .await
+            .unwrap();
         assert!(
             stored.is_some(),
             "append must auto-write a segment embedding under {QUERY_EMBEDDER_ID}"
@@ -206,9 +209,9 @@ fn storage_handle_append_auto_writes_segment_embedding_ft_xx5cl() {
 
         let stats = handle.embedding_stats().await.unwrap();
         assert!(
-            stats.iter().any(
-                |s| s.embedder_id == QUERY_EMBEDDER_ID && s.dimension == 128 && s.count == 1
-            ),
+            stats
+                .iter()
+                .any(|s| s.embedder_id == QUERY_EMBEDDER_ID && s.dimension == 128 && s.count == 1),
             "embedding_stats must show the auto-written fnv1a-hash-128 embedding: {stats:?}"
         );
 
@@ -938,7 +941,15 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
 
     let backend = RusqliteBackend::new(conn);
     let queued_depth = AtomicUsize::new(3);
-    writer_loop(&backend, &mut rx, &mut mmap_mirror, &queued_depth, false, None);
+    writer_loop(
+        &backend,
+        &mut rx,
+        &mut mmap_mirror,
+        &queued_depth,
+        false,
+        None,
+        false,
+    );
     let conn = backend.into_connection();
 
     let segment_count: i64 = conn
@@ -1332,6 +1343,7 @@ fn storage_handle_with_small_queue_handles_burst() {
             defer_fts_triggers: false,
             group_commit_events: false,
             writer_blocking_recv: false,
+            group_commit_adaptive: false,
         };
         let handle: StorageHandle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
@@ -1363,6 +1375,7 @@ fn storage_handle_reopen_preserves_synchronous_fts_indexing() {
             defer_fts_triggers: false,
             group_commit_events: false,
             writer_blocking_recv: false,
+            group_commit_adaptive: false,
         };
         let fts_trigger_count = |conn: &Connection| -> i64 {
             conn.query_row(
