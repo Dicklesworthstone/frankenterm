@@ -218,3 +218,13 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls âˆ
 **A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a write-replay bench attributes above-noise fsync/wait cost at sustained ~200-pane burst (adaptive batch beats fixed-128 only when service-time CV is high).
 **Baseline comparator:** fixed WRITER_BATCH_CAP=128 + 1ms park (now Q2 condvar wake).
 **Rollback:** config default fixed; `git revert 970c3ee9a`.
+
+### 2026-06-19 | Q6 / cod_1 | Fingerprint dedup with O(1) LRU (patterns)
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** feature `patterns-fingerprint-dedup` (default off)
+**Commit:** b0db1ea5b
+**Behavior-preservation:** 64-bit fingerprint dedup + O(1) ring-LRU replaces `HashMap<String,_>` + O(n) FIFO retain; superset-suppression equivalent to string dedup within bounded FP rate; code-first.
+**A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if a dedup-cache bench shows per-key String alloc or O(n) retain-eviction cost above noise at high seen-key churn.
+**Baseline comparator:** `HashMap<String,SeenEntry>` + FIFO O(n) retain.
+**Rollback:** feature default-off; `git revert b0db1ea5b`.
