@@ -75,4 +75,22 @@ A breach of any one → reject → write an entry below.
 
 ## Entries
 
-_None yet — round-4 campaign opening. The first rejected/reverted candidate lands here._
+### 2026-06-19 | M6 (stretch) | Persistent COW scrollback grid — DEFERRED (not attempted)
+
+**Status:** deferred-stretch (not attempted) — the boldest remaining idea; deliberately not started to land a clean v0.7.0 convergence rather than open a large high-risk moonshot late in the campaign.
+
+**Gate (intended):** feature `persistent-scrollback` (default off)
+
+**Scope:** `im`-style path-copying rope for the hot scrollback tier giving O(1) immutable snapshots for lock-free search-while-streaming. Touches `frankenterm/term/` + scrollback (core) — large surface, 2-4x memory overhead, collides with Q1/M4 (scrollback) and M1 (term).
+
+**Why deferred:** round-4 already kept 16 ideas (incl. 2 stretch) + RS-erasure + min-plus; M6 is the highest-effort/highest-risk remaining and would delay the release + risk the clean convergence. No measured bottleneck currently attributes contention to scrollback read-vs-write locking.
+
+**Retry-condition predicate (Form 1):** retry only if a profiler attributes a clearly-above-noise share to scrollback read/render lock contention (or clone cost) on a concurrent search-while-streaming workload at high pane count. Until then it is speculative.
+
+**Baseline comparator:** `VecDeque` hot tier + lock/clone for concurrent reads.
+
+**Rollback:** N/A (never landed).
+
+---
+
+_(reverts / within-noise rejections land below as A/B quantification runs on a quiet host)_

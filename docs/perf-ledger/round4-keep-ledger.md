@@ -208,3 +208,13 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls âˆ
 **A/B verdict:** DEFERRED. Retry-condition (Form 5): do not retry from a cold read; use a recorded pane-output trace replay (captures reduced >=15% at p95 capture-latency non-regressed) once the m7 RCH build stops wedging.
 **Baseline comparator:** x1.5 multiplicative backoff + static pane_tiers table.
 **Rollback:** config default backoff; `git revert 6fdd6b1d2`.
+
+### 2026-06-19 | M8 / cc_2 | Adaptive M/G/1 group-commit (P-K/Kingman batch+linger)
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** config `storage.group_commit=adaptive` (default fixed)
+**Commit:** 970c3ee9a
+**Behavior-preservation:** composes with Q2 group-commit; batch clamped [1,WRITER_BATCH_CAP], linger tau<=current park, strict/durability classes bypass linger, rho>=1 -> flush-every-command; durability-order golden; pane-reported RCH-pass.
+**A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a write-replay bench attributes above-noise fsync/wait cost at sustained ~200-pane burst (adaptive batch beats fixed-128 only when service-time CV is high).
+**Baseline comparator:** fixed WRITER_BATCH_CAP=128 + 1ms park (now Q2 condvar wake).
+**Rollback:** config default fixed; `git revert 970c3ee9a`.

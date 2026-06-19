@@ -161,3 +161,9 @@ _(tick entries appended here by the operator tend-loop)_
   HELD cc_1+cc_3 to let the dirty tree drain. In flight: cod_1 Q6 (fingerprint dedup), cod_3 M7-retry,
   cod_4 min-plus (latency_envelope.rs), cod_5 RS erasure (mmap_store), cc_2 M8 adaptive commit, cod_2
   (bocpd wrap). REMAINING: Q6, M5 MPHF (assign cod_1 after Q6), M6 persistent grid (OPTIONAL stretch).
+- 2026-06-19 tend#9 — M8 adaptive group-commit 970c3ee9a (cc_2) landed + adjudicated (16 ideas, 0
+  reverted). M6 persistent COW grid DEFERRED (negative-ledger entry, not-attempted, retry-predicate
+  recorded) — landing a clean v0.7.0 convergence over opening the largest/riskiest moonshot late.
+  CONVERGENCE ~3 ideas away: Q6 (cod_1 building, ~1h20m), RS (cod_5 building), min-plus (cod_4 building),
+  then M5 MPHF (assign cod_1 after Q6). Held free panes (cod_2/cod_3/cc_1/cc_3 — M5 blocked on cod_1).
+  Benign cargo-fmt churn in ~8 unowned files still uncommitted -> commit as style(core) at release prep.
