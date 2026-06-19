@@ -1,6 +1,7 @@
 //! Pattern detection engine
 //!
 //! Provides fast, reliable detection of agent state transitions.
+#![allow(unexpected_cfgs)]
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -405,14 +406,14 @@ fn detect_with_context_materialization_count() -> u64 {
     DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.load(Ordering::Relaxed)
 }
 
-/// Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
-/// `seen_order` tokens examined during dedup LRU maintenance (eviction
-/// skip-loop + compaction retain). The amortized-O(1) contract is that this
-/// grows linearly with the number of marks, not as `marks * MAX_SEEN_KEYS`
-/// (the old O(n) string position-scan per mark).
-///
-/// Thread-local + `cfg(test)`: zero production overhead, and each test (its own
-/// thread) sees only its own counts despite parallel test execution.
+// Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
+// `seen_order` tokens examined during dedup LRU maintenance (eviction
+// skip-loop + compaction retain). The amortized-O(1) contract is that this
+// grows linearly with the number of marks, not as `marks * MAX_SEEN_KEYS`
+// (the old O(n) string position-scan per mark).
+//
+// Thread-local + `cfg(test)`: zero production overhead, and each test (its own
+// thread) sees only its own counts despite parallel test execution.
 #[cfg(test)]
 thread_local! {
     static DETECTION_DEDUP_MAINTENANCE_STEPS: std::cell::Cell<u64> =
@@ -3719,29 +3720,65 @@ impl PatternEngine {
                         continue;
                     }
 
-                    let dedup_key = Self::dedup_key_from_captures(&rule.id, compiled, &captures);
-                    if context.is_seen_key(&dedup_key) {
-                        continue;
+                    #[cfg(feature = "patterns-lazy-captures")]
+                    {
+                        let dedup_key =
+                            Self::dedup_key_from_captures(&rule.id, compiled, &captures);
+                        if context.is_seen_key(&dedup_key) {
+                            continue;
+                        }
+
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures
+                            .get(0)
+                            .map_or_else(|| fallback_anchor.to_string(), |m| {
+                                m.as_str().to_string()
+                            });
+
+                        record_detect_with_context_materialization();
+                        context.mark_seen_key(dedup_key);
+                        result.push(Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        });
+                        emitted_matches += 1;
                     }
 
-                    let extracted = Self::extract_captures(compiled, &captures);
-                    let matched_text = captures
-                        .get(0)
-                        .map_or_else(|| fallback_anchor.to_string(), |m| m.as_str().to_string());
+                    #[cfg(not(feature = "patterns-lazy-captures"))]
+                    {
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures
+                            .get(0)
+                            .map_or_else(|| fallback_anchor.to_string(), |m| {
+                                m.as_str().to_string()
+                            });
+                        let detection = Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        };
 
-                    record_detect_with_context_materialization();
-                    context.mark_seen_key(dedup_key);
-                    result.push(Detection {
-                        rule_id: rule.id.clone(),
-                        agent_type: rule.agent_type,
-                        event_type: rule.event_type.clone(),
-                        severity: rule.severity,
-                        confidence: 0.95,
-                        extracted: serde_json::Value::Object(extracted),
-                        matched_text,
-                        span,
-                    });
-                    emitted_matches += 1;
+                        record_detect_with_context_materialization();
+                        let dedup_key = detection.dedup_key();
+                        if context.is_seen_key(&dedup_key) {
+                            continue;
+                        }
+
+                        context.mark_seen_key(dedup_key);
+                        result.push(detection);
+                        emitted_matches += 1;
+                    }
                 }
             } else {
                 if overlap_len > 0 && fallback_span.1 <= overlap_len {
@@ -4099,6 +4136,7 @@ impl PatternEngine {
         extracted
     }
 
+    #[cfg(feature = "patterns-lazy-captures")]
     fn dedup_key_from_captures(
         rule_id: &str,
         compiled: &CompiledRule,
@@ -6790,9 +6828,16 @@ rules:
             long_repeat.is_empty(),
             "repeat long detection should be dropped by dedupe"
         );
+        #[cfg(feature = "patterns-lazy-captures")]
+        assert_eq!(
+            (short_materializations, long_materializations),
+            (0, 0),
+            "lazy-capture dedupe drop-path should not materialize allocation-heavy detections"
+        );
+        #[cfg(not(feature = "patterns-lazy-captures"))]
         assert!(
-            short_materializations == 0 && long_materializations == 0,
-            "dedupe drop-path should not materialize allocation-heavy detections: short={short_materializations} long={long_materializations}"
+            short_materializations > 0 && long_materializations > 0,
+            "default eager path should materialize before dedupe: short={short_materializations} long={long_materializations}"
         );
     }
 
@@ -9448,6 +9493,60 @@ rules:
         assert!(
             repeated_context.is_empty(),
             "context path must dedupe repeated extracted values across calls"
+        );
+    }
+
+    #[cfg(feature = "patterns-lazy-captures")]
+    #[test]
+    fn lazy_capture_materialization_matches_trace_oracle_after_dedup_gate() {
+        let rule_id = "codex.lazy_capture_equivalence";
+        let anchor = "LAZY";
+        let regex = r"LAZY code=(?P<code>\d+) name=(?P<name>[A-Za-z_]+)";
+        let text = concat!(
+            "prefix LAZY code=7 name=alpha\n",
+            "LAZY code=7 name=alpha\n",
+            "LAZY code=8 name=beta suffix"
+        );
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        reset_detect_with_context_materialization_count();
+        let mut lazy_context = DetectionContext::new();
+        let lazy_detections = engine.detect_with_context(text, &mut lazy_context);
+        let lazy_materializations = detect_with_context_materialization_count();
+
+        let mut trace_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut trace_context,
+            &TraceOptions::default(),
+        );
+
+        assert_eq!(
+            detection_fingerprints(&lazy_detections),
+            detection_fingerprints(&trace_detections),
+            "lazy capture path must be byte-equivalent to the traced eager oracle"
+        );
+        assert_eq!(
+            detection_fingerprints(&lazy_detections).len(),
+            2,
+            "duplicate extracted values should dedupe before materialization"
+        );
+        assert_eq!(traces.len(), 2);
+        assert_eq!(
+            lazy_materializations, 2,
+            "lazy path should only materialize the two emitted detections"
+        );
+
+        reset_detect_with_context_materialization_count();
+        let repeat = engine.detect_with_context(text, &mut lazy_context);
+        assert!(
+            repeat.is_empty(),
+            "repeated lazy path scan should drop every duplicate detection"
+        );
+        assert_eq!(
+            detect_with_context_materialization_count(),
+            0,
+            "lazy path should defer capture materialization past the dedup gate"
         );
     }
 
