@@ -25,7 +25,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use crate::byte_compression::{ByteCompressor, CompressionLevel};
 
@@ -79,6 +79,22 @@ impl ScrollbackConfig {
 // Scrollback Page
 // =============================================================================
 
+/// Backing store for a compressed warm page.
+///
+/// An instance is uniformly one variant: a `cdc_dedup`-off scrollback only ever
+/// builds [`PageData::Plain`] pages, an on scrollback only [`PageData::Cdc`]
+/// pages. The default (off) representation is byte-for-byte the legacy
+/// standalone-zstd blob, so the legacy path is unchanged.
+#[derive(Debug, Clone)]
+enum PageData {
+    /// Legacy: a standalone zstd blob of the page's raw `lines_to_bytes` buffer.
+    Plain(Vec<u8>),
+    /// M4: ordered chunk ids (the "recipe") resolved against the shared
+    /// content-addressed [`CdcStore`]. The page owns no bytes directly; its
+    /// chunks live (deduplicated, zstd-compressed) in the store.
+    Cdc(Vec<u64>),
+}
+
 /// A compressed page of scrollback lines.
 #[derive(Debug, Clone)]
 struct CompressedPage {
@@ -87,17 +103,10 @@ struct CompressedPage {
     page_index: u64,
     /// Number of lines in this page.
     line_count: usize,
-    /// Compressed bytes (zstd).
-    data: Vec<u8>,
+    /// Compressed backing (standalone blob, or CDC recipe into the chunk store).
+    data: PageData,
     /// Uncompressed size for memory accounting.
     uncompressed_size: usize,
-}
-
-impl CompressedPage {
-    /// Compressed size in bytes.
-    fn compressed_size(&self) -> usize {
-        self.data.len()
-    }
 }
 
 /// Tier in which a line resides.
@@ -204,6 +213,211 @@ pub struct TieredScrollback {
     /// `scrollback.prefix_index` gate (env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX`,
     /// or [`Self::new_with_prefix_index`]) is enabled. Default **off**.
     prefix: Option<PrefixIndex>,
+    /// M4 (round-4 gauntlet): shared content-addressed chunk store for
+    /// content-defined-chunking dedup of warm pages before zstd. Identical
+    /// chunks across pages (repeated prompts/redraws) are stored once,
+    /// refcounted, and freed on eviction. `None` unless the
+    /// `scrollback.cdc_dedup` gate (env `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP`, or
+    /// [`Self::new_with_options`]) is enabled. Default **off**; the off path is
+    /// byte-for-byte the legacy standalone-zstd page.
+    cdc: Option<CdcStore>,
+}
+
+// =============================================================================
+// M4: content-defined chunking (CDC) dedup
+// =============================================================================
+
+/// A unique, deduplicated chunk held in the shared [`CdcStore`].
+#[derive(Debug)]
+struct CdcChunk {
+    /// zstd-compressed chunk bytes (the dedup unit, compressed once).
+    data: Vec<u8>,
+    /// Length of the *raw* (uncompressed) chunk — an integrity guard checked on
+    /// reconstruction so a damaged blob can never silently shift page bytes.
+    raw_len: usize,
+    /// 128-bit content key (kept so the index entry can be removed on free).
+    key: u128,
+    /// Reference count across the currently-resident warm pages.
+    refs: u32,
+}
+
+/// Shared content-addressed store backing every [`PageData::Cdc`] page of one
+/// scrollback instance.
+///
+/// Dedup is content-addressed by a 128-bit hash of the raw chunk bytes; the
+/// probability of a collision (the only theoretical way reconstruction could
+/// diverge) is ~2⁻⁶⁴ even across 10⁹ distinct chunks, far below any real
+/// hardware error rate. Reconstruction is otherwise exact: every chunk is
+/// stored losslessly (zstd) and `raw_len`-guarded, and a page's `recipe`
+/// concatenates its chunks in order to reproduce the original `lines_to_bytes`
+/// buffer byte-for-byte.
+#[derive(Debug, Default)]
+struct CdcStore {
+    /// `chunk_id` → stored chunk.
+    chunks: HashMap<u64, CdcChunk>,
+    /// content key → `chunk_id` (the dedup index).
+    index: HashMap<u128, u64>,
+    /// Next chunk id to assign (monotonic; ids are never reused).
+    next_id: u64,
+    /// Total compressed bytes of all live chunks (this instance's
+    /// `warm_bytes` contribution when CDC is enabled).
+    total_compressed: usize,
+}
+
+impl CdcStore {
+    /// Chunk `raw` (content-defined boundaries), intern each chunk, and return
+    /// `(recipe, newly_added_compressed_bytes)`. Reused chunks add 0 bytes;
+    /// only chunks new to the store contribute to `warm_bytes`.
+    fn intern_page(&mut self, raw: &[u8], compressor: &ByteCompressor) -> (Vec<u64>, usize) {
+        let mut recipe = Vec::new();
+        let mut added = 0usize;
+        for (start, end) in cdc_chunk_bounds(raw) {
+            let chunk = &raw[start..end];
+            let key = content_key_128(chunk);
+            let id = if let Some(&existing) = self.index.get(&key) {
+                if let Some(c) = self.chunks.get_mut(&existing) {
+                    c.refs += 1;
+                }
+                existing
+            } else {
+                let compressed = compressor.compress(chunk);
+                let clen = compressed.len();
+                let id = self.next_id;
+                self.next_id += 1;
+                self.chunks.insert(
+                    id,
+                    CdcChunk {
+                        data: compressed,
+                        raw_len: chunk.len(),
+                        key,
+                        refs: 1,
+                    },
+                );
+                self.index.insert(key, id);
+                self.total_compressed += clen;
+                added += clen;
+                id
+            };
+            recipe.push(id);
+        }
+        (recipe, added)
+    }
+
+    /// Release every chunk referenced by `recipe`; free chunks whose refcount
+    /// reaches zero. Returns the number of compressed bytes freed (subtracted
+    /// from `warm_bytes`).
+    fn release_recipe(&mut self, recipe: &[u64]) -> usize {
+        let mut freed = 0usize;
+        for &id in recipe {
+            let drop_it = match self.chunks.get_mut(&id) {
+                Some(c) => {
+                    c.refs = c.refs.saturating_sub(1);
+                    c.refs == 0
+                }
+                None => false,
+            };
+            if drop_it {
+                if let Some(c) = self.chunks.remove(&id) {
+                    self.index.remove(&c.key);
+                    self.total_compressed = self.total_compressed.saturating_sub(c.data.len());
+                    freed += c.data.len();
+                }
+            }
+        }
+        freed
+    }
+
+    /// Reconstruct a page's raw `lines_to_bytes` buffer from its recipe, exactly.
+    /// Returns `None` if a chunk is missing or fails its `raw_len` integrity
+    /// guard (fail-closed: the caller then treats the page as undecodable).
+    fn reconstruct(&self, recipe: &[u64], compressor: &ByteCompressor) -> Option<Vec<u8>> {
+        let mut raw = Vec::new();
+        for &id in recipe {
+            let chunk = self.chunks.get(&id)?;
+            let part = compressor.decompress(&chunk.data).ok()?;
+            if part.len() != chunk.raw_len {
+                return None;
+            }
+            raw.extend_from_slice(&part);
+        }
+        Some(raw)
+    }
+
+    /// Clear all chunks (on scrollback `clear`).
+    fn clear(&mut self) {
+        self.chunks.clear();
+        self.index.clear();
+        self.next_id = 0;
+        self.total_compressed = 0;
+    }
+}
+
+/// Deterministic 256-entry Gear table for content-defined chunking.
+///
+/// Built once from a fixed xorshift seed so chunk boundaries — and therefore
+/// the dedup outcome — are reproducible across runs and processes.
+fn gear_table() -> &'static [u64; 256] {
+    static TABLE: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [0u64; 256];
+        let mut s = 0x2545_F491_4F6C_DD1D_u64;
+        for slot in t.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *slot = s;
+        }
+        t
+    })
+}
+
+/// Minimum chunk size (bytes) — avoids pathological tiny chunks.
+const CDC_MIN: usize = 64;
+/// Average chunk-size mask: a boundary is allowed when the low `1` bits of the
+/// Gear hash are clear, targeting ~512-byte average chunks.
+const CDC_MASK: u64 = (1 << 9) - 1;
+/// Maximum chunk size (bytes) — forces a boundary so chunks stay bounded.
+const CDC_MAX: usize = 4096;
+
+/// Split `raw` into contiguous, non-overlapping content-defined chunks via a
+/// Gear rolling hash, returning `(start, end)` byte ranges that exactly tile
+/// `raw` in order. Identical byte regions (bounded by the same content) chunk
+/// identically regardless of surrounding shifts — the property that lets
+/// repeated prompts/redraws across pages deduplicate.
+fn cdc_chunk_bounds(raw: &[u8]) -> Vec<(usize, usize)> {
+    let table = gear_table();
+    let n = raw.len();
+    let mut bounds = Vec::new();
+    let mut start = 0usize;
+    let mut h = 0u64;
+    let mut i = 0usize;
+    while i < n {
+        h = (h << 1).wrapping_add(table[raw[i] as usize]);
+        let len = i - start + 1;
+        if (len >= CDC_MIN && (h & CDC_MASK) == 0) || len >= CDC_MAX {
+            bounds.push((start, i + 1));
+            start = i + 1;
+            h = 0;
+        }
+        i += 1;
+    }
+    if start < n {
+        bounds.push((start, n));
+    }
+    bounds
+}
+
+/// 128-bit content key for a chunk: two independently-salted `DefaultHasher`
+/// (SipHash) passes concatenated. Deterministic (fixed keys) and effectively
+/// collision-free for content addressing.
+fn content_key_128(chunk: &[u8]) -> u128 {
+    use std::hash::Hasher;
+    let mut a = std::collections::hash_map::DefaultHasher::new();
+    a.write(chunk);
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    b.write_u64(0x9E37_79B9_7F4A_7C15);
+    b.write(chunk);
+    ((a.finish() as u128) << 64) | b.finish() as u128
 }
 
 /// Incrementally-maintained cumulative line-count prefix over the warm and cold
@@ -307,12 +521,16 @@ impl TieredScrollback {
     /// first, so a zero `page_size` is clamped instead of degrading the
     /// tier-migration loop.
     ///
-    /// The Q1 prefix-index fast path defaults **off**; it is enabled only when
-    /// the `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` env gate is set (see
-    /// [`Self::new_with_prefix_index`] for a deterministic, env-free opt-in).
+    /// The Q1 prefix-index and M4 CDC-dedup fast paths default **off**; each is
+    /// enabled only when its `FT_MOONSHOT_SCROLLBACK_*` env gate is set (see
+    /// [`Self::new_with_options`] for a deterministic, env-free opt-in).
     #[must_use]
     pub fn new(config: ScrollbackConfig) -> Self {
-        Self::new_with_prefix_index(config, prefix_index_enabled_from_env())
+        Self::new_with_options(
+            config,
+            prefix_index_enabled_from_env(),
+            cdc_dedup_enabled_from_env(),
+        )
     }
 
     /// Create a tiered scrollback, explicitly choosing the Q1 prefix-index gate.
@@ -323,11 +541,32 @@ impl TieredScrollback {
     /// [`Self::tier_for_offset`]. Observable behavior is identical either way
     /// (proven byte-equivalent); the flag only changes the resolution cost.
     ///
-    /// This constructor is the env-race-free entry point used by property
-    /// proofs and the A/B bench harness; production toggles the same gate via
-    /// the `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` env var through [`Self::new`].
+    /// CDC dedup is taken from the `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` env gate;
+    /// use [`Self::new_with_options`] to choose both gates explicitly.
     #[must_use]
     pub fn new_with_prefix_index(config: ScrollbackConfig, prefix_index: bool) -> Self {
+        Self::new_with_options(config, prefix_index, cdc_dedup_enabled_from_env())
+    }
+
+    /// Create a tiered scrollback, explicitly choosing both round-4 gates.
+    ///
+    /// `cdc_dedup = false` is the default behavior — warm pages are standalone
+    /// zstd blobs, byte-for-byte the legacy representation. `true` enables M4
+    /// content-defined-chunking dedup: warm pages are split into content-defined
+    /// chunks, identical chunks are stored once (content-addressed, refcounted)
+    /// in a shared store, and reconstruction is byte-identical. The flag only
+    /// changes the storage representation, never the decoded content.
+    ///
+    /// This is the env-race-free entry point used by property proofs and the A/B
+    /// bench harness; production toggles the same gates via the
+    /// `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` / `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP`
+    /// env vars through [`Self::new`].
+    #[must_use]
+    pub fn new_with_options(
+        config: ScrollbackConfig,
+        prefix_index: bool,
+        cdc_dedup: bool,
+    ) -> Self {
         let config = config.sanitized();
         let compressor = ByteCompressor::new(config.compression);
         Self {
@@ -346,6 +585,11 @@ impl TieredScrollback {
             prefix_seq: 0,
             prefix: if prefix_index {
                 Some(PrefixIndex::default())
+            } else {
+                None
+            },
+            cdc: if cdc_dedup {
+                Some(CdcStore::default())
             } else {
                 None
             },
@@ -401,7 +645,25 @@ impl TieredScrollback {
         let page = self
             .warm
             .get(self.warm.len().checked_sub(1 + page_offset)?)?;
-        decompress_page(&self.compressor, page)
+        self.decode_page(page)
+    }
+
+    /// Decode a warm page back into its lines, reconstructing the raw
+    /// `lines_to_bytes` buffer from either the standalone zstd blob (legacy) or
+    /// the CDC recipe against the shared chunk store (M4). The decoded bytes are
+    /// byte-identical to what was flushed. Returns `None` on decompression
+    /// failure, a missing/short chunk, or a decoded line-count mismatch (the
+    /// same corruption guard the legacy path used).
+    fn decode_page(&self, page: &CompressedPage) -> Option<Vec<String>> {
+        let raw = match &page.data {
+            PageData::Plain(data) => self.compressor.decompress(data).ok()?,
+            PageData::Cdc(recipe) => self.cdc.as_ref()?.reconstruct(recipe, &self.compressor)?,
+        };
+        let lines = bytes_to_lines(&raw);
+        if lines.len() != page.line_count {
+            return None;
+        }
+        Some(lines)
     }
 
     /// Number of lines currently in the hot tier.
@@ -636,6 +898,18 @@ impl TieredScrollback {
             .unwrap_or(false)
     }
 
+    /// Diagnostic: M4 CDC dedup store stats as `(unique_chunks,
+    /// total_compressed_bytes)`, or `None` when the `cdc_dedup` gate is off.
+    /// Hidden from the public docs; exposed so the round-trip proof / A/B bench
+    /// can assert dedup is engaged and accounting tracks the live chunk set.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cdc_stats(&self) -> Option<(usize, usize)> {
+        self.cdc
+            .as_ref()
+            .map(|cdc| (cdc.chunks.len(), cdc.total_compressed))
+    }
+
     /// Evict up to `count` warm pages to cold tier (proportional eviction).
     ///
     /// Evicts oldest pages first. Returns the number of pages actually evicted.
@@ -717,6 +991,9 @@ impl TieredScrollback {
             idx.warm_cum.clear();
             idx.cold_cum.clear();
         }
+        if let Some(cdc) = self.cdc.as_mut() {
+            cdc.clear();
+        }
         self.republish_prefix_seq();
     }
 
@@ -795,22 +1072,31 @@ impl TieredScrollback {
         let page_lines: Vec<String> = self.hot.drain(..page_size).collect();
         let line_count = page_lines.len();
 
-        // Serialize lines to bytes for compression
+        // Serialize lines to bytes (identical raw buffer in both modes).
         let raw = lines_to_bytes(&page_lines);
         let uncompressed_size = raw.len();
 
-        // Compress
-        let compressed = self.compressor.compress(&raw);
-        let compressed_size = compressed.len();
+        // Build the page backing: legacy standalone zstd blob, or M4 CDC dedup
+        // into the shared content-addressed store. Both add only the bytes new
+        // to this instance to `warm_bytes`.
+        let compressor = &self.compressor;
+        let (data, added_compressed) = if let Some(cdc) = self.cdc.as_mut() {
+            let (recipe, added) = cdc.intern_page(&raw, compressor);
+            (PageData::Cdc(recipe), added)
+        } else {
+            let compressed = compressor.compress(&raw);
+            let len = compressed.len();
+            (PageData::Plain(compressed), len)
+        };
 
         let page = CompressedPage {
             page_index: self.next_page_index,
             line_count,
-            data: compressed,
+            data,
             uncompressed_size,
         };
         self.next_page_index += 1;
-        self.warm_bytes += compressed_size;
+        self.warm_bytes += added_compressed;
         self.warm.push_back(page);
 
         // Prefix index: append the new warm page's absolute global end
@@ -830,7 +1116,18 @@ impl TieredScrollback {
     }
 
     fn evict_warm_page(&mut self, page: CompressedPage) {
-        self.warm_bytes = self.warm_bytes.saturating_sub(page.compressed_size());
+        // Release this page's storage. A Plain page owns its blob; a CDC page
+        // drops chunk references and frees only chunks that reach zero refs
+        // (chunks still shared by resident warm pages stay).
+        let freed = match &page.data {
+            PageData::Plain(data) => data.len(),
+            PageData::Cdc(recipe) => self
+                .cdc
+                .as_mut()
+                .map(|cdc| cdc.release_recipe(recipe))
+                .unwrap_or(0),
+        };
+        self.warm_bytes = self.warm_bytes.saturating_sub(freed);
         self.cold_line_count += page.line_count as u64;
         self.cold_uncompressed_bytes += page.uncompressed_size as u64;
         self.cold_page_count += 1;
@@ -864,7 +1161,21 @@ impl Default for TieredScrollback {
 /// mirroring the existing `FT_MOONSHOT_*` gating convention. Anything else
 /// (unset, empty, `0`, `false`, …) leaves the deterministic linear walk active.
 fn prefix_index_enabled_from_env() -> bool {
-    std::env::var("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX")
+    env_flag_enabled("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX")
+}
+
+/// Whether the M4 `scrollback.cdc_dedup` gate is enabled via the environment.
+///
+/// Default **off**: only `1`/`true`/`yes`/`on` (case-insensitive) on
+/// `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` enable CDC dedup of warm pages, mirroring
+/// the existing `FT_MOONSHOT_*` gating convention.
+fn cdc_dedup_enabled_from_env() -> bool {
+    env_flag_enabled("FT_MOONSHOT_SCROLLBACK_CDC_DEDUP")
+}
+
+/// Shared truthiness parse for the `FT_MOONSHOT_SCROLLBACK_*` gates.
+fn env_flag_enabled(var: &str) -> bool {
+    std::env::var(var)
         .ok()
         .map(|v| {
             let v = v.trim();
@@ -982,7 +1293,7 @@ fn lines_to_bytes(lines: &[String]) -> Vec<u8> {
 /// input: a record's length prefix is only honoured when that many bytes are
 /// actually present in the buffer, so a truncated or corrupt buffer can never
 /// trigger an oversized allocation (the unbounded-length-prefix DoS class).
-/// Decoding stops at the first malformed record; `decompress_page`'s
+/// Decoding stops at the first malformed record; `decode_page`'s
 /// line-count guard then rejects the page as corrupt.
 fn bytes_to_lines(data: &[u8]) -> Vec<String> {
     const PREFIX: usize = std::mem::size_of::<u64>();
@@ -1005,21 +1316,6 @@ fn bytes_to_lines(data: &[u8]) -> Vec<String> {
         pos = end;
     }
     lines
-}
-
-/// Decompress a warm page into lines.
-///
-/// Returns `None` if decompression fails or the decoded line count does not
-/// match the page's recorded `line_count` (corruption guard: the two are
-/// written together by `flush_hot_page`, so a mismatch means the page bytes
-/// are damaged and any offset arithmetic against `line_count` would be wrong).
-fn decompress_page(compressor: &ByteCompressor, page: &CompressedPage) -> Option<Vec<String>> {
-    let raw = compressor.decompress(&page.data).ok()?;
-    let lines = bytes_to_lines(&raw);
-    if lines.len() != page.line_count {
-        return None;
-    }
-    Some(lines)
 }
 
 // =============================================================================
@@ -2057,5 +2353,181 @@ mod tests {
             assert_eq!(indexed.tier_for_offset(o), linear.tier_for_offset(o));
         }
         assert!(indexed.prefix_index_active());
+    }
+
+    // ── M4: CDC dedup byte-equivalence ──────────────────────────────────
+
+    /// All resident warm pages decoded, newest-first, as a flat vec of pages.
+    fn warm_dump(sb: &TieredScrollback) -> Vec<Vec<String>> {
+        (0..sb.warm_page_count())
+            .map(|i| sb.warm_page_lines(i).expect("warm page must decode"))
+            .collect()
+    }
+
+    #[test]
+    fn cdc_chunk_bounds_tile_input_exactly() {
+        // The chunker must partition the buffer into contiguous, gapless,
+        // in-order ranges that reconstruct the input byte-for-byte.
+        for len in [0usize, 1, 63, 64, 65, 511, 512, 4096, 4097, 20_000] {
+            let raw: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let bounds = cdc_chunk_bounds(&raw);
+            let mut pos = 0;
+            let mut rebuilt = Vec::new();
+            for (s, e) in &bounds {
+                assert_eq!(*s, pos, "chunks must be contiguous (len {len})");
+                assert!(e > s || len == 0, "chunks must be non-empty (len {len})");
+                rebuilt.extend_from_slice(&raw[*s..*e]);
+                pos = *e;
+            }
+            assert_eq!(pos, len, "chunks must cover the whole buffer (len {len})");
+            assert_eq!(rebuilt, raw, "concatenated chunks must equal input (len {len})");
+        }
+    }
+
+    #[test]
+    fn cdc_round_trip_is_byte_identical_to_legacy() {
+        // Round-trip byte-identity + golden default-mode unchanged: a CDC page's
+        // decoded lines must match the legacy standalone-zstd page's decoded
+        // lines exactly, over a diverse corpus (repeats, unicode, embedded
+        // newlines, empty + long lines). Eviction off so every page stays warm.
+        let config = ScrollbackConfig {
+            hot_lines: 16,
+            page_size: 8,
+            warm_max_bytes: usize::MAX,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: false,
+        };
+        let mut cdc = TieredScrollback::new_with_options(config.clone(), false, true);
+        let mut legacy = TieredScrollback::new_with_options(config, false, false);
+        assert!(cdc.cdc_stats().is_some(), "cdc arm must have a store");
+        assert!(legacy.cdc_stats().is_none(), "legacy arm must be plain");
+
+        let prompt = "user@host:~/proj$ ";
+        for i in 0..300usize {
+            let lines = [
+                format!("{prompt}run task {}", i % 7),
+                "=== redraw banner: status OK ===".to_string(),
+                format!("output {i}: unicode ✓ café ★ — padded to a reasonable terminal width here"),
+                if i % 5 == 0 {
+                    "multi\nline\nembedded\ncontent".to_string()
+                } else {
+                    format!("line {i}")
+                },
+                if i % 11 == 0 { String::new() } else { "tail".to_string() },
+            ];
+            for l in lines {
+                cdc.push_line(l.clone());
+                legacy.push_line(l);
+            }
+        }
+
+        assert_eq!(cdc.hot_len(), legacy.hot_len());
+        assert_eq!(cdc.warm_page_count(), legacy.warm_page_count());
+        assert_eq!(cdc.total_line_count(), legacy.total_line_count());
+        assert!(cdc.warm_page_count() > 4, "must exercise multiple warm pages");
+
+        assert_eq!(warm_dump(&cdc), warm_dump(&legacy), "warm pages must decode identically");
+        assert_eq!(cdc.tail(cdc.hot_len()), legacy.tail(legacy.hot_len()));
+
+        // Accounting invariant: warm_bytes == live CAS compressed bytes.
+        let (chunks, bytes) = cdc.cdc_stats().unwrap();
+        assert!(chunks > 0 && bytes > 0);
+        assert_eq!(cdc.warm_total_bytes(), bytes);
+    }
+
+    #[test]
+    fn cdc_dedup_saves_bytes_on_repeated_pages() {
+        // Identical repeated content must dedup: pushing the same block twice
+        // adds far fewer unique chunks than references, and CDC warm bytes stay
+        // well under the legacy (non-deduped) size.
+        let config = ScrollbackConfig {
+            hot_lines: 8,
+            page_size: 8,
+            warm_max_bytes: usize::MAX,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: false,
+        };
+        let mut cdc = TieredScrollback::new_with_options(config.clone(), false, true);
+        let mut legacy = TieredScrollback::new_with_options(config, false, false);
+
+        let block: Vec<String> = (0..40)
+            .map(|i| format!("identical repeated prompt and output content row {i} — stable bytes"))
+            .collect();
+        for _ in 0..12 {
+            for l in &block {
+                cdc.push_line(l.clone());
+                legacy.push_line(l.clone());
+            }
+        }
+
+        assert_eq!(warm_dump(&cdc), warm_dump(&legacy), "dedup must stay byte-identical");
+        assert!(
+            cdc.warm_total_bytes() < legacy.warm_total_bytes(),
+            "dedup must shrink warm bytes: cdc={} legacy={}",
+            cdc.warm_total_bytes(),
+            legacy.warm_total_bytes()
+        );
+    }
+
+    /// Resident (warm oldest→newest, then hot) lines, decoded.
+    fn resident_lines(sb: &TieredScrollback) -> Vec<String> {
+        let mut out = Vec::new();
+        for i in (0..sb.warm_page_count()).rev() {
+            out.extend(sb.warm_page_lines(i).expect("warm page must decode"));
+        }
+        out.extend(sb.tail(sb.hot_len()).into_iter().map(|s| s.to_string()));
+        out
+    }
+
+    #[test]
+    fn cdc_eviction_keeps_resident_pages_decodable() {
+        // Under a tight warm cap with eviction on, the CAS refcount must free
+        // only chunks no resident page still references. CDC's smaller
+        // warm_bytes legitimately keeps MORE pages warm than legacy, so we
+        // verify byte-identity against a ground-truth reconstruction (not
+        // legacy page parity): every resident line must equal what was pushed.
+        let config = ScrollbackConfig {
+            hot_lines: 10,
+            page_size: 5,
+            warm_max_bytes: 300, // tight → forces cold eviction
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: true,
+        };
+        let mut cdc = TieredScrollback::new_with_options(config, false, true);
+
+        let mut pushed = Vec::new();
+        for i in 0..400usize {
+            let l = format!("evt {} :: {}", i % 9, if i % 3 == 0 { "REPEATED" } else { "x" });
+            cdc.push_line(l.clone());
+            pushed.push(l);
+        }
+
+        assert!(cdc.cold_page_count() > 0, "must have evicted to cold");
+        assert_eq!(cdc.total_line_count() as usize, pushed.len());
+        let evicted = cdc.cold_line_count() as usize;
+        assert_eq!(
+            resident_lines(&cdc).as_slice(),
+            &pushed[evicted..],
+            "resident lines must reconstruct byte-identically under eviction"
+        );
+
+        // Accounting stays exact across eviction (no leak, no double-free).
+        let (_chunks, bytes) = cdc.cdc_stats().unwrap();
+        assert_eq!(cdc.warm_total_bytes(), bytes);
+
+        // After clear, the store is empty and reusable.
+        cdc.clear();
+        assert_eq!(cdc.cdc_stats(), Some((0, 0)));
+        assert_eq!(cdc.warm_total_bytes(), 0);
+        cdc.push_lines((0..60).map(line));
+        assert!(cdc.cdc_stats().unwrap().0 > 0);
+    }
+
+    #[test]
+    fn cdc_gate_defaults_off() {
+        if std::env::var_os("FT_MOONSHOT_SCROLLBACK_CDC_DEDUP").is_none() {
+            let sb = TieredScrollback::new(small_config());
+            assert!(sb.cdc_stats().is_none(), "cdc dedup must default off");
+        }
     }
 }
