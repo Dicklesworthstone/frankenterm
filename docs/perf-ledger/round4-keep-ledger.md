@@ -247,3 +247,21 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls �
 **A/B verdict:** N/A (robustness, not perf). Proof retry (Form 5): re-run the encode->drop-(n-k)->decode byte-identity fuzz on a quiet host / clean tree.
 **Baseline comparator:** single-copy cold mmap (no recovery).
 **Rollback:** config default-off; `git revert 2b1ca7475`.
+
+### 2026-06-19 | M5 / cod_1 | MPHF perfect-hash anchor dispatch (patterns) — FINAL idea, CONVERGENCE
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** feature `patterns-mphf-dispatch` (default off; declared in Cargo.toml at release prep per M-1)
+**Commit:** ec0356624
+**Behavior-preservation:** minimal-perfect-hash anchor->rule-bitset (immutable base + mutable overflow map for hot-reload); golden oracle `mphf_anchor_dispatch_matches_hashmap_route_oracle` asserts MPHF route == hashmap route for every anchor; code-first.
+**A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a pattern-routing bench attributes above-noise hashmap-probe cost on a high-AC-hit (chatty agent output) workload.
+**Baseline comparator:** `HashMap`-based anchor->indices routing.
+**Rollback:** feature default-off; `git revert ec0356624`.
+
+---
+
+## CONVERGENCE — 19 kept, 0 reverted (2026-06-19)
+
+Phase 1 (Q1-Q6) + Phase 2 (M1-M5, M7-M9; M6 deferred) + stretch (S3-FIFO, Shiryaev-Roberts, min-plus,
+RS-erasure) + harness (ft-perf-gate driver) + the GUI v0.6.1 crash fix (release gate PASSED). All
+default-off, correctness-proven (or code-first proof-deferred), 0 reverts. Cross-review: SAFE to ship.
