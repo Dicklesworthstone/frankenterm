@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
+#[cfg(feature = "teddy-prefilter")]
+use aho_corasick::packed;
 use bloomfilter::Bloom;
 use fancy_regex::{Regex, RegexBuilder};
 use sha2::{Digest, Sha256};
@@ -609,10 +611,11 @@ impl DetectionContext {
         // guard); fires at most once per ~MAX_SEEN_KEYS refreshes.
         record_detection_dedup_steps(self.seen_order.len() as u64);
         let seen_keys = &self.seen_keys;
-        self.seen_order
-            .retain(|(key, generation)| {
-                seen_keys.get(key).is_some_and(|e| e.generation == *generation)
-            });
+        self.seen_order.retain(|(key, generation)| {
+            seen_keys
+                .get(key)
+                .is_some_and(|e| e.generation == *generation)
+        });
     }
 
     /// Check if a detection has been seen before and is unexpired
@@ -1761,6 +1764,8 @@ struct EngineIndex {
     anchor_list: Vec<String>,
     anchor_rule_buckets: Vec<Vec<usize>>,
     anchor_matcher: Option<AhoCorasick>,
+    #[cfg(feature = "teddy-prefilter")]
+    teddy_prefilter: Option<packed::Searcher>,
     quick_bytes: Vec<u8>,
     /// Bloom filter for quick rejection of non-matching text.
     /// Contains all anchor strings for O(1) "definitely not present" checks.
@@ -1771,11 +1776,15 @@ struct EngineIndex {
 
 impl std::fmt::Debug for EngineIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EngineIndex")
+        let mut debug = f.debug_struct("EngineIndex");
+        debug
             .field("compiled_rules", &self.compiled_rules.len())
             .field("anchor_list", &self.anchor_list.len())
             .field("anchor_rule_buckets", &self.anchor_rule_buckets.len())
-            .field("anchor_matcher", &self.anchor_matcher.is_some())
+            .field("anchor_matcher", &self.anchor_matcher.is_some());
+        #[cfg(feature = "teddy-prefilter")]
+        debug.field("teddy_prefilter", &self.teddy_prefilter.is_some());
+        debug
             .field("quick_bytes", &self.quick_bytes.len())
             .field("bloom", &self.bloom.is_some())
             .field("anchor_lengths", &self.anchor_lengths)
@@ -1869,6 +1878,13 @@ where
         )
     };
 
+    #[cfg(feature = "teddy-prefilter")]
+    let teddy_prefilter = if anchor_list.is_empty() {
+        None
+    } else {
+        packed::Searcher::new(anchor_list.iter().map(String::as_str))
+    };
+
     let mut quick_bytes: Vec<u8> = quick_byte_set.into_iter().collect();
     quick_bytes.sort_unstable();
 
@@ -1905,6 +1921,8 @@ where
         anchor_list,
         anchor_rule_buckets,
         anchor_matcher,
+        #[cfg(feature = "teddy-prefilter")]
+        teddy_prefilter,
         quick_bytes,
         bloom,
         anchor_lengths,
@@ -3535,6 +3553,11 @@ impl PatternEngine {
             return Vec::new();
         }
 
+        #[cfg(feature = "teddy-prefilter")]
+        if !Self::teddy_prefilter_may_match(index, text) {
+            return Vec::new();
+        }
+
         let Some(matcher) = index.anchor_matcher.as_ref() else {
             return Vec::new();
         };
@@ -3671,6 +3694,11 @@ impl PatternEngine {
             return Vec::new();
         }
 
+        #[cfg(feature = "teddy-prefilter")]
+        if !Self::teddy_prefilter_may_match(index, input_text.as_ref()) {
+            return Vec::new();
+        }
+
         let Some(matcher) = index.anchor_matcher.as_ref() else {
             return Vec::new();
         };
@@ -3729,11 +3757,10 @@ impl PatternEngine {
                         }
 
                         let extracted = Self::extract_captures(compiled, &captures);
-                        let matched_text = captures
-                            .get(0)
-                            .map_or_else(|| fallback_anchor.to_string(), |m| {
-                                m.as_str().to_string()
-                            });
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
 
                         record_detect_with_context_materialization();
                         context.mark_seen_key(dedup_key);
@@ -3753,11 +3780,10 @@ impl PatternEngine {
                     #[cfg(not(feature = "patterns-lazy-captures"))]
                     {
                         let extracted = Self::extract_captures(compiled, &captures);
-                        let matched_text = captures
-                            .get(0)
-                            .map_or_else(|| fallback_anchor.to_string(), |m| {
-                                m.as_str().to_string()
-                            });
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
                         let detection = Detection {
                             rule_id: rule.id.clone(),
                             agent_type: rule.agent_type,
@@ -3866,6 +3892,11 @@ impl PatternEngine {
         if self.quick_reject_enabled && !Self::quick_reject_with_index(index, text, &self.telemetry)
         {
             self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
+            return (Vec::new(), Vec::new());
+        }
+
+        #[cfg(feature = "teddy-prefilter")]
+        if !Self::teddy_prefilter_may_match(index, text) {
             return (Vec::new(), Vec::new());
         }
 
@@ -4118,6 +4149,14 @@ impl PatternEngine {
         }
 
         (candidate_rules, matched_anchors_by_rule)
+    }
+
+    #[cfg(feature = "teddy-prefilter")]
+    fn teddy_prefilter_may_match(index: &EngineIndex, text: &str) -> bool {
+        index
+            .teddy_prefilter
+            .as_ref()
+            .is_none_or(|searcher| searcher.find(text.as_bytes()).is_some())
     }
 
     fn extract_captures(
@@ -7894,8 +7933,8 @@ preview_command = "do_something_dangerous"
             ..PatternsConfig::default()
         };
 
-        let loaded =
-            load_packs_from_config(&config, None).expect("unsigned pack loads (gated, not rejected)");
+        let loaded = load_packs_from_config(&config, None)
+            .expect("unsigned pack loads (gated, not rejected)");
         assert!(
             loaded.user_pack_names.contains("user:evil"),
             "the unsigned pack must be classified as a user pack"
@@ -9494,6 +9533,69 @@ rules:
             repeated_context.is_empty(),
             "context path must dedupe repeated extracted values across calls"
         );
+    }
+
+    #[cfg(feature = "teddy-prefilter")]
+    #[test]
+    fn teddy_prefilter_matches_aho_candidate_oracle() {
+        let rules = vec![
+            rule_with_anchor(
+                "codex.teddy.error",
+                "TERROR",
+                Some(r"TERROR code (?P<code>\d+)"),
+            ),
+            rule_with_anchor("codex.teddy.ready", "READY_OK", None),
+            rule_with_anchor(
+                "codex.teddy.limit",
+                "LIMIT_NOW",
+                Some(r"LIMIT_NOW (?P<window>[A-Za-z0-9_-]+)"),
+            ),
+        ];
+        let engine = engine_with_rules(rules);
+        let index = engine.index();
+        let Some(matcher) = index.anchor_matcher.as_ref() else {
+            panic!("test rules must build an anchor matcher");
+        };
+
+        if index.teddy_prefilter.is_none() {
+            return;
+        }
+
+        let corpus = [
+            ("plain miss with no anchors", false),
+            ("prefix TERROR code 42 suffix", true),
+            ("READY_OK and unrelated text", true),
+            ("LIMIT_NOW window_a\nTERROR code 7", true),
+            ("TERROX code 99 READY_NO LIMIT_LATER", false),
+        ];
+
+        for (text, should_match) in corpus {
+            let (candidate_rules, _) = PatternEngine::collect_candidate_rules(index, text, matcher);
+            assert_eq!(
+                !candidate_rules.is_empty(),
+                should_match,
+                "Aho candidate oracle mismatch for {text:?}"
+            );
+            assert_eq!(
+                PatternEngine::teddy_prefilter_may_match(index, text),
+                should_match,
+                "Teddy prefilter must agree with Aho candidate presence for {text:?}"
+            );
+
+            let direct = engine.detect(text);
+            let mut trace_context = DetectionContext::new();
+            let (traced, traces) = engine.detect_with_context_and_trace(
+                text,
+                &mut trace_context,
+                &TraceOptions::default(),
+            );
+            assert_eq!(
+                detection_fingerprints(&direct),
+                detection_fingerprints(&traced),
+                "prefiltered direct and traced paths must remain byte-equivalent for {text:?}"
+            );
+            assert_eq!(traces.len(), traced.len());
+        }
     }
 
     #[cfg(feature = "patterns-lazy-captures")]
