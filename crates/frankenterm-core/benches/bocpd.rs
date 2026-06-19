@@ -7,7 +7,9 @@
 //! - Snapshot serialization: **< 500μs**
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::bocpd::{BocpdConfig, BocpdManager, BocpdModel, OutputFeatures};
+use frankenterm_core::bocpd::{
+    BocpdConfig, BocpdDetectorKind, BocpdManager, BocpdModel, OutputFeatures,
+};
 use frankenterm_core::simd_scan::scan_newlines_and_ansi;
 use std::hint::black_box;
 use std::time::Duration;
@@ -34,6 +36,11 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "bocpd_scan_primitives",
         budget: "simd_scan throughput should exceed scalar baseline for larger buffers",
+    },
+    bench_common::BenchBudget {
+        name: "bocpd_detector_ab",
+        budget: "Shiryaev-Roberts detector cost vs BOCPD baseline on a synthetic-changepoint \
+                 stream (env FT_BOCPD_DETECTOR=shiryaev_roberts/bocpd A/B)",
     },
 ];
 
@@ -252,6 +259,85 @@ fn bench_scan_primitives(c: &mut Criterion) {
 }
 
 // =============================================================================
+// Detector A/B: BOCPD (baseline) vs Shiryaev-Roberts (candidate)
+// =============================================================================
+
+/// Runtime detector selector for the env-gated A/B.
+///
+/// The `scripts/round4-bench-ab.sh --gate env:FT_BOCPD_DETECTOR=shiryaev_roberts/bocpd`
+/// driver builds this bench binary ONCE and runs it twice back-to-back, setting
+/// `FT_BOCPD_DETECTOR` to the OFF value (baseline) then the ON value (candidate).
+/// Because the selector is read at run time and `BocpdConfig::detector` is a
+/// public field, both arms are reachable from the same binary with no rebuild,
+/// and they genuinely diverge in the benched path: the SR arm runs the extra
+/// `update_shiryaev_roberts_statistic` e-statistic recursion per observation,
+/// while the BOCPD arm runs the recent-change-mass scan. Anything that is not a
+/// recognized SR token (including empty / unset / "bocpd" / "0" / "off") maps to
+/// the BOCPD baseline so the OFF arm is unambiguous.
+fn detector_from_env() -> BocpdDetectorKind {
+    match std::env::var("FT_BOCPD_DETECTOR")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("shiryaev_roberts" | "sr" | "1" | "on") => BocpdDetectorKind::ShiryaevRoberts,
+        _ => BocpdDetectorKind::Bocpd,
+    }
+}
+
+/// Deterministic synthetic-changepoint trace: a stable regime followed by a
+/// runaway linear drift. Mirrors the in-crate `synthetic_runaway_corpus` shape so
+/// the A/B exercises the detection-relevant path (the alarm crossing), not just
+/// steady-state updates — the point at which the two detectors diverge most.
+fn synthetic_changepoint_trace(stable_len: usize, drift_len: usize) -> Vec<f64> {
+    let noise = [-0.90, 0.35, 0.75, -0.25, 0.50, -0.65, 0.15, -0.05];
+    let mut values = Vec::with_capacity(stable_len + drift_len);
+    for i in 0..stable_len {
+        values.push(100.0 + noise[i % noise.len()]);
+    }
+    for i in 0..drift_len {
+        let drift = (i as f64).mul_add(0.18, 0.20);
+        values.push(100.0 + drift + noise[i % noise.len()]);
+    }
+    values
+}
+
+fn bench_detector_ab(c: &mut Criterion) {
+    // Read ONCE per process; constant for the whole criterion run so the
+    // baseline/candidate arms are clean (the driver flips the env var between the
+    // two back-to-back runs of this same binary).
+    let detector = detector_from_env();
+
+    let mut group = c.benchmark_group("bocpd_detector_ab");
+    let trace = synthetic_changepoint_trace(96, 96);
+    group.throughput(Throughput::Elements(trace.len() as u64));
+
+    // The bench id is CONSTANT across both arms (only the env-selected `detector`
+    // differs) so the A/B comparator pairs baseline vs candidate samples by the
+    // same `--group bocpd_detector_ab --id changepoint_stream`.
+    group.bench_function("changepoint_stream", |b| {
+        b.iter(|| {
+            // Fresh model per iteration so every sample measures the same
+            // stable→runaway detection workload from a clean run-length posterior.
+            let mut model = BocpdModel::new(BocpdConfig {
+                hazard_rate: 0.02,
+                detection_threshold: 0.65,
+                min_observations: 32,
+                max_run_length: 160,
+                detector,
+            });
+            for &value in &trace {
+                black_box(model.update(black_box(value)));
+            }
+        });
+    });
+
+    group.finish();
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
@@ -335,6 +421,7 @@ criterion_group!(
     targets = bench_single_update,
         bench_feature_vector,
         bench_batch_100_panes,
-        bench_scan_primitives
+        bench_scan_primitives,
+        bench_detector_ab
 );
 criterion_main!(benches);
