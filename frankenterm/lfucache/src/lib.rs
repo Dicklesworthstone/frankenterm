@@ -6,9 +6,39 @@ use intrusive_collections::{
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Eq;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::rc::Rc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEvictionPolicy {
+    Lfu,
+    S3Fifo,
+}
+
+impl CacheEvictionPolicy {
+    #[must_use]
+    pub fn from_cache_eviction_value(value: &str) -> Option<Self> {
+        match value {
+            "lfu" | "fifo" | "current" | "default" => Some(Self::Lfu),
+            "s3fifo" | "s3-fifo" | "wtinylfu" | "w-tinylfu" => Some(Self::S3Fifo),
+            _ => None,
+        }
+    }
+}
+
+impl Default for CacheEvictionPolicy {
+    fn default() -> Self {
+        Self::Lfu
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S3Segment {
+    Small,
+    Main,
+}
 
 struct Entry<K, V> {
     hash_link: LinkedListLink,
@@ -16,6 +46,7 @@ struct Entry<K, V> {
     frequency_link: RBTreeLink,
     freq: RefCell<u16>,
     last_tick: RefCell<u32>,
+    s3_segment: RefCell<S3Segment>,
     key: K,
     value: V,
 }
@@ -55,11 +86,19 @@ pub struct LfuCache<K, V, S = BuildHasherDefault<AHasher>> {
     len: usize,
     /// tracks number of operations that affect the frequency/age of entries
     tick: u32,
+    eviction_policy: CacheEvictionPolicy,
+    s3_small_len: usize,
+    s3_ghost: VecDeque<K>,
 }
 
 impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S> {
     #[cfg(test)]
     fn with_capacity(cap: usize) -> Self {
+        Self::with_capacity_and_policy(cap, CacheEvictionPolicy::Lfu)
+    }
+
+    #[cfg(test)]
+    fn with_capacity_and_policy(cap: usize, eviction_policy: CacheEvictionPolicy) -> Self {
         let mut buckets = vec![];
         let num_buckets = (cap / 10).next_power_of_two();
         for _ in 0..num_buckets {
@@ -82,6 +121,9 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             recency_index: LinkedList::new(RecencyAdapter::new()),
             len: 0,
             tick: 0,
+            eviction_policy,
+            s3_small_len: 0,
+            s3_ghost: VecDeque::new(),
             hasher,
         }
     }
@@ -111,7 +153,37 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             recency_index: LinkedList::new(RecencyAdapter::new()),
             len: 0,
             tick: 0,
+            eviction_policy: CacheEvictionPolicy::Lfu,
+            s3_small_len: 0,
+            s3_ghost: VecDeque::new(),
             hasher,
+        }
+    }
+
+    pub fn new_with_eviction_policy(
+        hit: &'static str,
+        miss: &'static str,
+        cap_func: CapFunc,
+        config: &ConfigHandle,
+        eviction_policy: CacheEvictionPolicy,
+    ) -> Self {
+        let mut cache = Self::new(hit, miss, cap_func, config);
+        cache.eviction_policy = eviction_policy;
+        cache
+    }
+
+    pub fn set_eviction_policy(&mut self, eviction_policy: CacheEvictionPolicy) {
+        self.eviction_policy = eviction_policy;
+        self.s3_small_len = if eviction_policy == CacheEvictionPolicy::S3Fifo {
+            self.recency_index
+                .iter()
+                .filter(|entry| *entry.s3_segment.borrow() == S3Segment::Small)
+                .count()
+        } else {
+            0
+        };
+        if eviction_policy == CacheEvictionPolicy::Lfu {
+            self.s3_ghost.clear();
         }
     }
 
@@ -154,8 +226,9 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         let new_cap = (self.cap_func)(config);
         if new_cap != self.cap {
             self.cap = new_cap;
+            self.trim_s3_ghost();
             while self.len > self.cap {
-                if let Some(entry) = self.evict_one() {
+                if let Some(entry) = self.evict_one_for_policy() {
                     evicted.push(entry);
                 } else {
                     break;
@@ -219,6 +292,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         let mut cursor = self.frequency_index.lower_bound_mut(Bound::Included(&0));
         if let Some(entry) = cursor.remove() {
             let bucket = self.bucket_for_key(&entry.key);
+            let was_s3_small = *entry.s3_segment.borrow() == S3Segment::Small;
             unsafe {
                 self.buckets
                     .get_mut(bucket)
@@ -228,9 +302,114 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                 self.recency_index.cursor_mut_from_ptr(&*entry).remove();
             }
             self.len -= 1;
+            if was_s3_small {
+                self.s3_small_len = self.s3_small_len.saturating_sub(1);
+            }
             return Self::entry_into_pair(entry);
         }
         None
+    }
+
+    fn evict_one_for_policy(&mut self) -> Option<(K, V)> {
+        match self.eviction_policy {
+            CacheEvictionPolicy::Lfu => self.evict_one(),
+            CacheEvictionPolicy::S3Fifo => self.evict_s3fifo(),
+        }
+    }
+
+    fn s3_small_capacity(&self) -> usize {
+        if self.cap == 0 {
+            0
+        } else {
+            (self.cap / 10).max(1)
+        }
+    }
+
+    fn s3_ghost_capacity(&self) -> usize {
+        self.cap.saturating_mul(2).max(1)
+    }
+
+    fn trim_s3_ghost(&mut self) {
+        let ghost_capacity = self.s3_ghost_capacity();
+        while self.s3_ghost.len() > ghost_capacity {
+            self.s3_ghost.pop_back();
+        }
+    }
+
+    fn s3_take_ghost_hit(&mut self, key: &K) -> bool {
+        if let Some(index) = self.s3_ghost.iter().position(|ghost| ghost == key) {
+            self.s3_ghost.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn s3_record_ghost(&mut self, key: K) {
+        if self.eviction_policy != CacheEvictionPolicy::S3Fifo {
+            return;
+        }
+        if let Some(index) = self.s3_ghost.iter().position(|ghost| ghost == &key) {
+            self.s3_ghost.remove(index);
+        }
+        self.s3_ghost.push_front(key);
+        self.trim_s3_ghost();
+    }
+
+    fn s3_oldest_small_key(&self) -> Option<K> {
+        let mut candidate = None;
+        for entry in self.recency_index.iter() {
+            if *entry.s3_segment.borrow() == S3Segment::Small {
+                candidate = Some(entry.key.clone());
+            }
+        }
+        candidate
+    }
+
+    fn s3_oldest_main_zero_key(&self) -> Option<K> {
+        let mut candidate = None;
+        for entry in self.recency_index.iter() {
+            if *entry.s3_segment.borrow() == S3Segment::Main && *entry.freq.borrow() == 0 {
+                candidate = Some(entry.key.clone());
+            }
+        }
+        candidate
+    }
+
+    fn s3_has_main_credit(&self) -> bool {
+        self.recency_index.iter().any(|entry| {
+            *entry.s3_segment.borrow() == S3Segment::Main && *entry.freq.borrow() > 0
+        })
+    }
+
+    fn s3_should_reject_scan_candidate(&self, ghost_hit: bool) -> bool {
+        !ghost_hit && self.s3_small_len == 0 && self.s3_has_main_credit()
+    }
+
+    fn s3_remove_victim(&mut self, key: K) -> Option<(K, V)> {
+        let removed = self.remove(&key);
+        if removed.is_some() {
+            self.s3_record_ghost(key);
+        }
+        removed
+    }
+
+    fn evict_s3fifo(&mut self) -> Option<(K, V)> {
+        if self.s3_small_len > self.s3_small_capacity()
+            && let Some(key) = self.s3_oldest_small_key()
+        {
+            return self.s3_remove_victim(key);
+        }
+
+        if let Some(key) = self.s3_oldest_main_zero_key() {
+            return self.s3_remove_victim(key);
+        }
+
+        if let Some(key) = self.s3_oldest_small_key() {
+            return self.s3_remove_victim(key);
+        }
+
+        self.evict_one()
     }
 
     pub fn evict_lfu(&mut self) -> Option<(K, V)> {
@@ -244,6 +423,8 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             bucket.clear();
         }
         self.len = 0;
+        self.s3_small_len = 0;
+        self.s3_ghost.clear();
     }
 
     pub fn remove<Q>(&mut self, k: &Q) -> Option<(K, V)>
@@ -255,12 +436,16 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         let mut cursor = self.buckets.get_mut(bucket)?.front_mut();
         while let Some(entry) = cursor.get() {
             if entry.key.borrow() == k {
+                let was_s3_small = *entry.s3_segment.borrow() == S3Segment::Small;
                 unsafe {
                     self.frequency_index.cursor_mut_from_ptr(entry).remove();
                     self.recency_index.cursor_mut_from_ptr(entry).remove();
                 }
                 let removed = cursor.remove().and_then(Self::entry_into_pair);
                 self.len -= 1;
+                if was_s3_small {
+                    self.s3_small_len = self.s3_small_len.saturating_sub(1);
+                }
                 return removed;
             }
             cursor.move_next();
@@ -293,6 +478,12 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                 self.tick = self.tick.wrapping_add(1);
 
                 *entry.last_tick.borrow_mut() = self.tick;
+                if self.eviction_policy == CacheEvictionPolicy::S3Fifo
+                    && *entry.s3_segment.borrow() == S3Segment::Small
+                {
+                    *entry.s3_segment.borrow_mut() = S3Segment::Main;
+                    self.s3_small_len = self.s3_small_len.saturating_sub(1);
+                }
 
                 // Adjust lfu
                 unsafe {
@@ -303,7 +494,11 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                         .unwrap();
                     {
                         let mut freq = lfu_entry.freq.borrow_mut();
-                        *freq = freq.saturating_add(1);
+                        *freq = if self.eviction_policy == CacheEvictionPolicy::S3Fifo {
+                            freq.saturating_add(1).min(3)
+                        } else {
+                            freq.saturating_add(1)
+                        };
                     }
                     self.frequency_index.insert(lfu_entry);
                 }
@@ -326,6 +521,11 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         let mut evicted = Vec::new();
 
         self.tick = self.tick.wrapping_add(1);
+        let ghost_hit = if self.eviction_policy == CacheEvictionPolicy::S3Fifo {
+            self.s3_take_ghost_hit(&k)
+        } else {
+            false
+        };
 
         // Remove any prior value
         {
@@ -336,6 +536,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                 .front_mut();
             while let Some(entry) = cursor.get() {
                 if entry.key == k {
+                    let was_s3_small = *entry.s3_segment.borrow() == S3Segment::Small;
                     unsafe {
                         self.frequency_index.cursor_mut_from_ptr(entry).remove();
                         self.recency_index.cursor_mut_from_ptr(entry).remove();
@@ -344,6 +545,9 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                         evicted.push(entry);
                     }
                     self.len -= 1;
+                    if was_s3_small {
+                        self.s3_small_len = self.s3_small_len.saturating_sub(1);
+                    }
                     break;
                 }
                 cursor.move_next();
@@ -354,23 +558,45 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             return evicted;
         }
 
+        if self.eviction_policy == CacheEvictionPolicy::S3Fifo
+            && self.len >= self.cap
+            && self.s3_should_reject_scan_candidate(ghost_hit)
+        {
+            return evicted;
+        }
+
         while self.len >= self.cap {
-            if let Some(entry) = self.evict_one() {
+            if let Some(entry) = self.evict_one_for_policy() {
                 evicted.push(entry);
             } else {
                 break;
             }
         }
 
+        let s3_segment = if self.eviction_policy == CacheEvictionPolicy::S3Fifo && !ghost_hit {
+            S3Segment::Small
+        } else {
+            S3Segment::Main
+        };
+        let initial_freq =
+            if self.eviction_policy == CacheEvictionPolicy::S3Fifo && ghost_hit {
+                1
+            } else {
+                0
+            };
         let entry = Rc::new(Entry {
             key: k,
             value: v,
-            freq: RefCell::new(0),
+            freq: RefCell::new(initial_freq),
             recency_link: LinkedListLink::new(),
             frequency_link: RBTreeLink::new(),
             hash_link: LinkedListLink::new(),
             last_tick: RefCell::new(self.tick),
+            s3_segment: RefCell::new(s3_segment),
         });
+        if self.eviction_policy == CacheEvictionPolicy::S3Fifo && s3_segment == S3Segment::Small {
+            self.s3_small_len += 1;
+        }
         self.buckets[bucket].push_front(Rc::clone(&entry));
         self.frequency_index.insert(Rc::clone(&entry));
         self.recency_index.push_front(entry);
@@ -424,6 +650,83 @@ mod test {
             entries.push(EntryData::new(item));
         }
         entries
+    }
+
+    fn lfu_eviction_trace(policy: CacheEvictionPolicy) -> Vec<u64> {
+        let mut cache = LfuCacheU64::with_capacity_and_policy(3, policy);
+        for key in 0..3 {
+            cache.put(key, key);
+        }
+        cache.get(&0);
+        cache.get(&0);
+        cache.get(&1);
+
+        let mut evicted = Vec::new();
+        for key in 3..7 {
+            evicted.extend(
+                cache
+                    .put_capturing_evictions(key, key)
+                    .into_iter()
+                    .map(|(key, _)| key),
+            );
+        }
+        evicted
+    }
+
+    fn scan_trace_hit_rate(policy: CacheEvictionPolicy, scan_len: u64) -> f64 {
+        let mut cache = LfuCacheU64::with_capacity_and_policy(4, policy);
+        let mut hits = 0u64;
+        let mut requests = 0u64;
+
+        for _ in 0..2 {
+            for key in 0..4 {
+                requests += 1;
+                if cache.get(&key).is_some() {
+                    hits += 1;
+                } else {
+                    cache.put(key, key);
+                }
+            }
+        }
+
+        for round in 0..8 {
+            let scan_base = 10_000 + round * 1_000 + scan_len * 100;
+            for offset in 0..scan_len {
+                let key = scan_base + offset;
+                requests += 1;
+                if cache.get(&key).is_some() {
+                    hits += 1;
+                } else {
+                    cache.put(key, key);
+                }
+            }
+            for key in 0..4 {
+                requests += 1;
+                if cache.get(&key).is_some() {
+                    hits += 1;
+                } else {
+                    cache.put(key, key);
+                }
+            }
+        }
+
+        hits as f64 / requests as f64
+    }
+
+    fn mann_whitney_dominance(candidate: &[f64], baseline: &[f64]) -> f64 {
+        let mut wins = 0.0;
+        let mut total = 0.0;
+        for candidate_sample in candidate {
+            for baseline_sample in baseline {
+                total += 1.0;
+                if candidate_sample > baseline_sample {
+                    wins += 1.0;
+                } else if candidate_sample == baseline_sample {
+                    wins += 0.5;
+                }
+            }
+        }
+        wins / total
     }
 
     #[test]
@@ -940,5 +1243,45 @@ mod test {
         assert_eq!(cache.len(), 1);
         assert!(cache.get(&1).is_none());
         assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn default_eviction_policy_reproduces_legacy_lfu_order() {
+        let default_trace = lfu_eviction_trace(CacheEvictionPolicy::default());
+        let explicit_lfu_trace = lfu_eviction_trace(CacheEvictionPolicy::Lfu);
+
+        assert_eq!(
+            CacheEvictionPolicy::from_cache_eviction_value("s3fifo"),
+            Some(CacheEvictionPolicy::S3Fifo)
+        );
+        assert_eq!(
+            CacheEvictionPolicy::from_cache_eviction_value("lfu"),
+            Some(CacheEvictionPolicy::Lfu)
+        );
+        assert_eq!(default_trace, explicit_lfu_trace);
+        assert_eq!(default_trace, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn s3fifo_scan_trace_improves_hit_rate_at_equal_capacity() {
+        let baseline: Vec<f64> = (0..12)
+            .map(|_| scan_trace_hit_rate(CacheEvictionPolicy::Lfu, 12))
+            .collect();
+        let candidate: Vec<f64> = (0..12)
+            .map(|_| scan_trace_hit_rate(CacheEvictionPolicy::S3Fifo, 12))
+            .collect();
+
+        let baseline_mean = baseline.iter().sum::<f64>() / baseline.len() as f64;
+        let candidate_mean = candidate.iter().sum::<f64>() / candidate.len() as f64;
+        let dominance = mann_whitney_dominance(&candidate, &baseline);
+
+        assert!(
+            candidate_mean > baseline_mean,
+            "S3-FIFO should improve scan-resistant hit rate: candidate={candidate_mean}, baseline={baseline_mean}"
+        );
+        assert!(
+            dominance > 0.95,
+            "Mann-Whitney dominance should show candidate wins most pairwise trace comparisons: {dominance}"
+        );
     }
 }
