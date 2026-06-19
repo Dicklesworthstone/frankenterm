@@ -143,6 +143,9 @@ storage.sqlite3.bak
 *.patch
 *.bak
 /test_*
+
+# Git merge-driver temp artifacts (.merge_file_<random> left behind by a merge)
+.merge_file_*
 .write_probe
 **/test_bug.rs
 **/test_deadlock.rs
@@ -164,6 +167,10 @@ opencode.json
 fix_*.py
 refactor_*.py
 update_*.py
+
+# Agent-generated dependency/CLI upgrade progress trackers (one-off scratch
+# state, e.g. Codex-upgrade-progress.json written during an upgrade flow)
+*-upgrade-progress.json
 
 # E2E test artifacts (runtime output)
 tests/e2e/artifacts/
@@ -198,6 +205,11 @@ tmp_re_test/
 .opencode.json.*
 .windsurf.mcp.json.*
 .claude/settings.local.json
+
+# Claude Code per-developer project state (sessions, transcripts, local
+# auto-memory). Machine-local/personal; never shared via the repo. Shared
+# .claude config (settings.json, commands/, agents/) is NOT matched by this.
+.claude/projects/
 
 # Beads recovery directories
 .beads/.br_recovery/
