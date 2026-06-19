@@ -50,7 +50,10 @@ with retry-condition predicate). Code-first → batch-bench → keep/revert (mat
   already impls both HasDisplayHandle + HasWindowHandle); or InstanceDescriptor::new_with_display_handle(...).
   SECONDARY (separate, harden after): main.rs:778 no-args startup can hang handing off to the restored
   v0.5.0 socket before creating a window — fail-fast harden.
-  STATUS: fix blocked on cod_5 finishing M3 (both touch gui/webgpu.rs); apply right after M3 commits.
+  STATUS: FIXED + VERIFIED + RELEASE GATE PASSED (commit 6c8201bbd, cod_4). LLDB launch with
+  FRANKENTERM_LUA_CONFIG=1 reached WebGPU surface configured / Renderer initialized / gui-startup Lua
+  event with NO DisplayHandle error and NO window-creation failure. v0.7.0 GUI launches cleanly.
+  (Secondary main.rs:778 socket-handoff hang still optional-harden; not release-blocking.)
 
 Note: `ft-perf-gate` already ships `sprt.rs`, `conformal.rs`, `regime_shift.rs` as a library; Phase 0 wires
 them into a CLI driver, it does not re-derive the math. `check_bench_stats.py` already ports Mann-Whitney +
@@ -144,3 +147,10 @@ _(tick entries appended here by the operator tend-loop)_
   Q4) then Q5/Q6; nudged cod_2 -> get bocpd.rs COMPILING immediately + commit. HELD cod_5/cc_2/cc_3 idle
   to drain core-WIP contamination before dispatching M5/M8/etc. cod_4 GUI crash-fix applied (webgpu.rs)
   + verifying compile (~27m, gui type-check passed, awaiting final RCH exit).
+- 2026-06-19 tend#7 — contamination CLEARED; 4 commits landed + adjudicated: GUI crash fix 6c8201bbd
+  (cod_4, VERIFIED launch — RELEASE GATE PASSED), Q4 lazy captures 5522d8bbc (cod_1), M4 CDC 31d707ddc
+  (cc_1), Shiryaev-Roberts 834a8b6cf (cod_2). 13 ideas adjudicated, 0 reverted. cod_3 M7 = BLOCKED rch-wedge
+  (4th wedge; tailer.rs code done, told to commit code-first + retry on clean tree). Dispatched to the now-clean
+  tree: cc_2 -> M8 adaptive commit (storage), cod_5 -> RS erasure (mmap_store cold-tier), cod_4 -> min-plus
+  latency cert (new file). HELD cc_1+cc_3 (cap core editors). REMAINING: Q5/Q6 (cod_1), M5 MPHF (after cod_1),
+  M6 persistent grid, M7 commit. Approaching convergence -> Phase 3 release prep next.

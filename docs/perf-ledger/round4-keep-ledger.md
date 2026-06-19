@@ -149,3 +149,42 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls �
 **A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a write-replay bench attributes above-noise fsync/park cost at ~200-pane sustained write load (the 1ms park + per-event autocommit dominates only under burst).
 **Baseline comparator:** 1ms try_recv park + per-event autocommit.
 **Rollback:** config defaults false; `git revert dd3511fa7`.
+
+### 2026-06-19 | GUI v0.6.1 startup-crash fix (RELEASE GATE — PASSED) / cod_4 | WebGPU surface display handle
+
+**Status:** kept (release-critical correctness fix, default-active; VERIFIED) — Form 6 structural-not-numerical
+**Gate:** none — a bug fix, ships on.
+**Commit:** 6c8201bbd
+**Behavior-preservation:** webgpu.rs:1175 now passes the display handle to surface creation (`from_display_and_window`), fixing the wgpu-29 regression (581971fe9) that crashed v0.6.1 instantly on launch. **VERIFIED:** RCH check green + LLDB launch with FRANKENTERM_LUA_CONFIG=1 (the exact repro env) reached "WebGPU surface configured / Renderer initialized / gui-startup Lua event" with NO "No DisplayHandle" and NO "Failed to create window". RELEASE GATE: PASSED — v0.7.0 GUI launches cleanly.
+**A/B verdict:** N/A — correctness fix.
+**Rollback:** `git revert 6c8201bbd` (would re-introduce the launch crash — do NOT).
+
+### 2026-06-19 | Q4 / cod_1 | Lazy capture-group materialization (defer past dedup gate)
+
+**Status:** kept provisional (durable optimization, default-off; A/B + edge-proof pending)
+**Gate:** feature `patterns-lazy-captures` (default off)
+**Commit:** 5522d8bbc
+**Behavior-preservation:** capture spans materialized to JSON/string only after the dedup gate confirms novelty; detection-stream golden unchanged. Default-features proof; the `--no-default-features` dedup edge-proof (ft-0wnq3) was deferred (had been blocked by sibling bocpd dirty-tree contamination).
+**A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if a dhat alloc-count bench shows capture-materialization allocs above noise on a high-suppression (chatty repeated-output) workload.
+**Baseline comparator:** eager `extract_captures` + JSON before dedup.
+**Rollback:** feature default-off; `git revert 5522d8bbc`.
+
+### 2026-06-19 | M4 / cc_1 | Content-defined chunking dedup of warm scrollback pages
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** config `scrollback.cdc_dedup` (default false)
+**Commit:** 31d707ddc
+**Behavior-preservation:** round-trip byte-identity decompress(cdc(page))==page over a capture corpus (`proptest_scrollback_cdc_dedup.rs`); golden default-mode unchanged.
+**A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if a storage-size/CPU bench shows page-redundancy above threshold on a TUI-redraw-heavy capture (dedup amortizes only when intra/inter-page self-similarity is high).
+**Baseline comparator:** plain per-page zstd.
+**Rollback:** config default-off; `git revert 31d707ddc`.
+
+### 2026-06-19 | Shiryaev-Roberts (stretch) / cod_2 | Low-delay change detector (bocpd)
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** config `bocpd.detector=shiryaev_roberts` (default bocpd)
+**Commit:** 834a8b6cf
+**Behavior-preservation:** alternate detector parallel to Adams-MacKay BOCPD; degenerate priors -> existing Student-t fallback; Schmitt hysteresis applies to both; golden default bocpd-mode unchanged. NOTE: an earlier mid-edit of this file was the dirty-tree contamination source; now committed + compiling.
+**A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a synthetic-changepoint corpus shows SR lower detection-delay at matched false-alarm rate (ARL0/ARL1 tradeoff) vs BOCPD.
+**Baseline comparator:** Adams-MacKay BOCPD recent-change-mass alarm.
+**Rollback:** config default bocpd; `git revert 834a8b6cf`.
