@@ -89,3 +89,13 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls âˆ
 **A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if a warm/cold scrollback memory bench shows attr-store RSS or cache-miss share above noise on a deep-scrollback workload.
 **Baseline comparator:** AoS `Vec<CellAttributes>` per cell.
 **Rollback:** feature default-off; `git revert 2e2f729dc`.
+
+### 2026-06-19 | M1 / cod_4 | Branchless ANSI DFA table (build.rs-generated)
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** feature `ansi-dfa-table` (default off)
+**Commit:** 6d2d02f7e
+**Behavior-preservation:** build.rs-generated flat transition+action table is provably equal to the existing `ansi_state_step` FSM â€” exhaustive (state,byte) equivalence test + chunk fuzz byte-equal counts; pane-reported RCH-pass ("ansi-dfa-table ansi_dfa passed").
+**A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a profiler attributes a clearly-above-noise share to the scalar `ansi_state_step` loop on an ANSI-dense workload (TUI/vim capture); current scan benches may not isolate the branch-mispredict cost.
+**Baseline comparator:** per-byte scalar match-based `ansi_state_step` FSM.
+**Rollback:** feature default-off; `git revert 6d2d02f7e`.

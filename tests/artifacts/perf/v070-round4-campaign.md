@@ -102,3 +102,10 @@ _(tick entries appended here by the operator tend-loop)_
   fleet-memory (fleet_memory_controller.rs). Still grinding: cod_1 Q4/5/6 (patterns.rs), cod_4 M1 DFA
   (simd_scan+build.rs), cc_1 Q1 (scrollback_tiers), cc_2 Q2 (storage), cod_2 round-3 gui backfill.
   Recorded GUI v0.6.1 startup-crash as a hard Phase-3 release gate.
+- 2026-06-19 tend#3 — M1 branchless ANSI DFA landed + provisional-keep (6d2d02f7e, cod_4). Fleet
+  congestion: 2 backfill bench-AB builds wedged ~56min (cancelled the RCH-flagged stale one #...517);
+  round-3 gui backfill DEPRIORITIZED to A/B-deferred (can't get clean cv on busy shared fleet = the
+  documented round-3 blocker). Reassigned freed panes: cod_2 -> S3-FIFO eviction (lfucache, light build),
+  cod_4 -> GUI v0.6.1 crash investigation (release gate, diagnosis). Still grinding: cod_1 Q4/5/6
+  (patterns.rs, 56m on RCH), cod_3 M7 (tailer), cod_5 M3 (gui SoA, heavy), cc_1 Q1 (scrollback+proptest),
+  cc_2 Q2 (storage), cc_3 M9 (fleet_memory+cert). 4 ideas adjudicated (Q3, ft-perf-gate, M2, M1).
