@@ -23,7 +23,10 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    env,
+};
 use thiserror::Error;
 
 pub mod causal_attribution;
@@ -49,7 +52,373 @@ pub const EVIDENCE_SAMPLE_SCHEMA_VERSION: &str = "ft.perf.evidence-sample.v1";
 /// Schema marker for proof-gate telemetry events emitted for Robot Mode.
 pub const GATE_METRIC_EVENT_SCHEMA_VERSION: &str = "ft.perf.gate-event.v1";
 
+/// Environment variable selecting the regression-decision driver.
+pub const FT_PERF_GATE_MODE_ENV: &str = "FT_PERF_GATE_MODE";
+
+/// Environment variable selecting the optional distribution-band driver.
+pub const FT_PERF_GATE_BANDS_ENV: &str = "FT_PERF_GATE_BANDS";
+
+/// Default hard sample cap for the additive perf-gate driver.
+pub const PERF_GATE_DEFAULT_MAX_SAMPLES: usize = 1_024;
+
 const INVALID_EVIDENCE_REASON: &str = "sample failed required field validation";
+
+/// Regression-decision mode wired by [`FT_PERF_GATE_MODE_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfGateMode {
+    /// Legacy fixed-sample mean threshold. This is the default.
+    Fixed,
+    /// Wald sequential probability-ratio test.
+    Sprt,
+    /// Howard-et-al anytime-valid confidence sequence.
+    Anytime,
+}
+
+impl Default for PerfGateMode {
+    fn default() -> Self {
+        Self::Fixed
+    }
+}
+
+impl PerfGateMode {
+    /// Parse a mode from an optional environment value.
+    pub fn from_env_value(value: Option<&str>) -> Result<Self, GateDecision> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Fixed);
+        };
+        match value {
+            "fixed" => Ok(Self::Fixed),
+            "sprt" => Ok(Self::Sprt),
+            "anytime" => Ok(Self::Anytime),
+            other => Err(GateDecision::LowConfidence {
+                reason: format!(
+                    "{FT_PERF_GATE_MODE_ENV} must be one of fixed|sprt|anytime; got {other:?}"
+                ),
+                confidence: None,
+            }),
+        }
+    }
+
+    /// Parse a mode from [`FT_PERF_GATE_MODE_ENV`].
+    pub fn from_env() -> Result<Self, GateDecision> {
+        let value = env::var(FT_PERF_GATE_MODE_ENV).ok();
+        Self::from_env_value(value.as_deref())
+    }
+}
+
+/// Distribution-band mode wired by [`FT_PERF_GATE_BANDS_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfGateBandMode {
+    /// Legacy fixed 10% mean threshold only. This is the default.
+    Fixed,
+    /// Split-conformal upper band clamped by the legacy fixed threshold.
+    Conformal,
+}
+
+impl Default for PerfGateBandMode {
+    fn default() -> Self {
+        Self::Fixed
+    }
+}
+
+impl PerfGateBandMode {
+    /// Parse a band mode from an optional environment value.
+    pub fn from_env_value(value: Option<&str>) -> Result<Self, GateDecision> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Fixed);
+        };
+        match value {
+            "fixed" => Ok(Self::Fixed),
+            "conformal" => Ok(Self::Conformal),
+            other => Err(GateDecision::LowConfidence {
+                reason: format!("{FT_PERF_GATE_BANDS_ENV} must be fixed|conformal; got {other:?}"),
+                confidence: None,
+            }),
+        }
+    }
+
+    /// Parse a band mode from [`FT_PERF_GATE_BANDS_ENV`].
+    pub fn from_env() -> Result<Self, GateDecision> {
+        let value = env::var(FT_PERF_GATE_BANDS_ENV).ok();
+        Self::from_env_value(value.as_deref())
+    }
+}
+
+/// Configuration for the additive round-4 perf-gate driver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerfGateDriverConfig {
+    /// Baseline fixed-threshold value from the accepted arm.
+    pub baseline: f64,
+    /// Relative regression threshold; `0.10` is the legacy 10% gate.
+    pub relative_threshold: f64,
+    /// Minimum samples before a terminal statistical decision is allowed.
+    pub min_samples: usize,
+    /// Hard cap on samples consumed by any mode.
+    pub max_samples: usize,
+    /// Confidence carried by the legacy fixed gate.
+    pub confidence: Option<f64>,
+    /// Type-I error rate for sequential/anytime modes and conformal bands.
+    pub alpha: f64,
+    /// Type-II error rate for Wald SPRT.
+    pub beta: f64,
+    /// Measurement-noise scale for sequential/anytime modes.
+    pub sigma: f64,
+    /// Regression-decision mode.
+    pub mode: PerfGateMode,
+    /// Optional distribution-band mode.
+    pub bands: PerfGateBandMode,
+    /// Split-conformal calibration settings for [`PerfGateBandMode::Conformal`].
+    pub conformal: conformal::SplitConformalConfig,
+}
+
+impl PerfGateDriverConfig {
+    /// Build a config whose default path is the legacy fixed 10% gate.
+    #[must_use]
+    pub fn fixed(baseline: f64) -> Self {
+        Self {
+            baseline,
+            relative_threshold: 0.10,
+            min_samples: 2,
+            max_samples: PERF_GATE_DEFAULT_MAX_SAMPLES,
+            confidence: Some(0.95),
+            alpha: 0.05,
+            beta: 0.05,
+            sigma: 1.0,
+            mode: PerfGateMode::Fixed,
+            bands: PerfGateBandMode::Fixed,
+            conformal: conformal::SplitConformalConfig::default(),
+        }
+    }
+
+    /// Build a config from the default fixed gate plus `FT_PERF_GATE_*`.
+    pub fn from_env(baseline: f64) -> Result<Self, GateDecision> {
+        let mut config = Self::fixed(baseline);
+        config.mode = PerfGateMode::from_env()?;
+        config.bands = PerfGateBandMode::from_env()?;
+        Ok(config)
+    }
+
+    fn fixed_config(&self) -> sprt::SprtConfig {
+        sprt::SprtConfig {
+            baseline: self.baseline,
+            relative_threshold: self.relative_threshold,
+            min_samples: self.min_samples,
+            confidence: self.confidence,
+        }
+    }
+
+    fn wald_config(&self) -> sprt::WaldSprtConfig {
+        sprt::WaldSprtConfig {
+            mu_null: self.baseline,
+            mu_alt: self.baseline * (1.0 + self.relative_threshold),
+            sigma: self.sigma,
+            alpha: self.alpha,
+            beta: self.beta,
+            min_samples: self.min_samples,
+            max_samples: self.max_samples,
+        }
+    }
+
+    fn anytime_config(&self) -> sprt::AnytimeValidCiConfig {
+        sprt::AnytimeValidCiConfig {
+            sigma: self.sigma,
+            alpha: self.alpha,
+            threshold: self.baseline * (1.0 + self.relative_threshold),
+            test_kind: sprt::AnytimeValidTest::UpperBoundMustHold,
+            min_samples: self.min_samples,
+            max_samples: self.max_samples,
+        }
+    }
+}
+
+/// Structured result from the additive round-4 perf-gate driver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerfGateDriverReport {
+    /// Claim identifier being evaluated.
+    pub claim_id: String,
+    /// Regression-decision mode used for this report.
+    pub mode: PerfGateMode,
+    /// Distribution-band mode used for this report.
+    pub bands: PerfGateBandMode,
+    /// Candidate samples consumed after the hard cap.
+    pub sample_count: usize,
+    /// Baseline calibration samples consumed after the hard cap.
+    pub baseline_sample_count: usize,
+    /// Candidate arithmetic mean over consumed samples.
+    pub mean: f64,
+    /// Baseline value used by the fixed threshold.
+    pub baseline: f64,
+    /// Legacy fixed upper threshold, normally `baseline * 1.10`.
+    pub legacy_upper_bound: f64,
+    /// Optional clamped conformal band.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<ConformalBand>,
+    /// Final fail-closed gate decision.
+    pub decision: GateDecision,
+    /// True only when the final decision is [`GateDecision::Accept`].
+    pub keep_candidate: bool,
+}
+
+/// Evaluate candidate evidence through the round-4 driver.
+#[must_use]
+pub fn evaluate_perf_gate_driver(
+    candidate_samples: &[EvidenceSample],
+    baseline_samples: &[EvidenceSample],
+    config: &PerfGateDriverConfig,
+) -> PerfGateDriverReport {
+    let max_samples = config.max_samples.max(1);
+    let candidate_samples = capped_samples(candidate_samples, max_samples);
+    let baseline_samples = capped_samples(baseline_samples, max_samples);
+    let claim_id = candidate_samples
+        .first()
+        .or_else(|| baseline_samples.first())
+        .map_or_else(|| "unknown".to_string(), |sample| sample.claim_id.clone());
+    let legacy_upper_bound = config.baseline * (1.0 + config.relative_threshold);
+    let mean = mean_metric_value(candidate_samples).unwrap_or(f64::NAN);
+
+    let primary = validate_driver_config(config)
+        .unwrap_or_else(|| evaluate_driver_mode(candidate_samples, config));
+    let (decision, band) = if matches!(primary, GateDecision::Accept { .. })
+        && config.bands == PerfGateBandMode::Conformal
+    {
+        match evaluate_conformal_upper_band(candidate_samples, baseline_samples, config) {
+            Ok((band, decision)) => (decision, Some(band)),
+            Err(decision) => (decision, None),
+        }
+    } else {
+        (primary, None)
+    };
+    let keep_candidate = matches!(decision, GateDecision::Accept { .. });
+
+    PerfGateDriverReport {
+        claim_id,
+        mode: config.mode,
+        bands: config.bands,
+        sample_count: candidate_samples.len(),
+        baseline_sample_count: baseline_samples.len(),
+        mean,
+        baseline: config.baseline,
+        legacy_upper_bound,
+        band,
+        decision,
+        keep_candidate,
+    }
+}
+
+fn capped_samples(samples: &[EvidenceSample], max_samples: usize) -> &[EvidenceSample] {
+    let end = samples.len().min(max_samples);
+    &samples[..end]
+}
+
+fn validate_driver_config(config: &PerfGateDriverConfig) -> Option<GateDecision> {
+    if !config.baseline.is_finite()
+        || config.baseline <= 0.0
+        || !config.relative_threshold.is_finite()
+        || config.relative_threshold < 0.0
+        || config.min_samples == 0
+        || config.max_samples == 0
+    {
+        return Some(GateDecision::LowConfidence {
+            reason: "perf-gate driver config malformed (baseline, threshold, or sample bounds)"
+                .to_string(),
+            confidence: None,
+        });
+    }
+    None
+}
+
+fn evaluate_driver_mode(
+    candidate_samples: &[EvidenceSample],
+    config: &PerfGateDriverConfig,
+) -> GateDecision {
+    match config.mode {
+        PerfGateMode::Fixed => {
+            sprt::evaluate_samples(candidate_samples, &config.fixed_config()).decision
+        }
+        PerfGateMode::Sprt => {
+            sprt::evaluate_wald_sprt(candidate_samples, &config.wald_config()).decision
+        }
+        PerfGateMode::Anytime => {
+            sprt::evaluate_anytime_valid_ci(candidate_samples, &config.anytime_config()).decision
+        }
+    }
+}
+
+fn evaluate_conformal_upper_band(
+    candidate_samples: &[EvidenceSample],
+    baseline_samples: &[EvidenceSample],
+    config: &PerfGateDriverConfig,
+) -> Result<(ConformalBand, GateDecision), GateDecision> {
+    let mut band = conformal::fit_split_conformal_band(baseline_samples, &config.conformal)?;
+    let legacy_upper = config.baseline * (1.0 + config.relative_threshold);
+    if !legacy_upper.is_finite() {
+        return Err(GateDecision::LowConfidence {
+            reason: "legacy fixed upper bound is not finite".to_string(),
+            confidence: None,
+        });
+    }
+    band.upper = band.upper.min(legacy_upper);
+    if band.lower > band.upper {
+        return Err(GateDecision::LowConfidence {
+            reason: "clamped conformal band lower bound exceeds legacy upper bound".to_string(),
+            confidence: None,
+        });
+    }
+    let Some(candidate_max) = max_metric_value(candidate_samples) else {
+        return Err(GateDecision::LowConfidence {
+            reason: "candidate samples must be non-empty and finite for conformal band gating"
+                .to_string(),
+            confidence: None,
+        });
+    };
+    if candidate_max <= band.upper {
+        Ok((
+            band,
+            GateDecision::Accept {
+                reason: "candidate samples stay within clamped conformal upper band".to_string(),
+                confidence: Some(1.0 - config.conformal.alpha),
+            },
+        ))
+    } else {
+        Ok((
+            band,
+            GateDecision::Reject {
+                reason: "candidate sample exceeds clamped conformal upper band".to_string(),
+                confidence: Some(1.0 - config.conformal.alpha),
+            },
+        ))
+    }
+}
+
+fn mean_metric_value(samples: &[EvidenceSample]) -> Option<f64> {
+    let len = u32::try_from(samples.len()).ok()?;
+    if len == 0 {
+        return None;
+    }
+    Some(
+        samples
+            .iter()
+            .map(|sample| sample.metric_value)
+            .sum::<f64>()
+            / f64::from(len),
+    )
+}
+
+fn max_metric_value(samples: &[EvidenceSample]) -> Option<f64> {
+    let mut max = None;
+    for value in samples.iter().map(|sample| sample.metric_value) {
+        if !value.is_finite() {
+            return None;
+        }
+        max = Some(match max {
+            Some(existing) if existing >= value => existing,
+            _ => value,
+        });
+    }
+    max
+}
 
 /// One normalized measurement in a per-claim evidence JSONL stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,6 +791,144 @@ mod tests {
     }
 
     #[test]
+    fn perf_gate_driver_env_modes_default_to_fixed() {
+        assert_eq!(
+            PerfGateMode::from_env_value(None).unwrap(),
+            PerfGateMode::Fixed
+        );
+        assert_eq!(
+            PerfGateBandMode::from_env_value(None).unwrap(),
+            PerfGateBandMode::Fixed
+        );
+        assert!(matches!(
+            PerfGateMode::from_env_value(Some("bogus")),
+            Err(GateDecision::LowConfidence { .. })
+        ));
+        assert!(matches!(
+            PerfGateBandMode::from_env_value(Some("bogus")),
+            Err(GateDecision::LowConfidence { .. })
+        ));
+    }
+
+    #[test]
+    fn perf_gate_driver_fixed_mode_matches_legacy_mean_gate() {
+        let samples = vec![
+            EvidenceSample::new("robot.p95", 10.0, "ms", 1, 1),
+            EvidenceSample::new("robot.p95", 11.0, "ms", 1, 2),
+            EvidenceSample::new("robot.p95", 12.0, "ms", 1, 3),
+        ];
+        let config = PerfGateDriverConfig {
+            max_samples: samples.len(),
+            ..PerfGateDriverConfig::fixed(10.0)
+        };
+        let legacy = sprt::evaluate_samples(&samples, &config.fixed_config());
+        let report = evaluate_perf_gate_driver(&samples, &[], &config);
+
+        assert_eq!(report.mode, PerfGateMode::Fixed);
+        assert_eq!(report.bands, PerfGateBandMode::Fixed);
+        assert_eq!(report.mean, legacy.mean);
+        assert_eq!(report.decision, legacy.decision);
+        assert_eq!(
+            report.keep_candidate,
+            matches!(legacy.decision, GateDecision::Accept { .. })
+        );
+    }
+
+    #[test]
+    fn perf_gate_driver_wald_sprt_oc_curve_stays_within_alpha_beta() {
+        let trials = 256_u64;
+        let mut config = PerfGateDriverConfig::fixed(10.0);
+        config.mode = PerfGateMode::Sprt;
+        config.relative_threshold = 0.20;
+        config.sigma = 1.0;
+        config.alpha = 0.05;
+        config.beta = 0.05;
+        config.min_samples = 4;
+        config.max_samples = 200;
+
+        let mut false_rejects = 0_u64;
+        let mut false_accepts = 0_u64;
+        for trial in 0..trials {
+            let mut h0_seed = 0xC0FF_EE00_u64 ^ trial;
+            let h0 = gaussian_samples(
+                "robot.p95",
+                10.0,
+                config.sigma,
+                config.max_samples,
+                &mut h0_seed,
+            );
+            let h0_report = evaluate_perf_gate_driver(&h0, &[], &config);
+            if matches!(h0_report.decision, GateDecision::Reject { .. }) {
+                false_rejects += 1;
+            }
+
+            let mut h1_seed = 0xBADB_EE00_u64 ^ trial;
+            let h1 = gaussian_samples(
+                "robot.p95",
+                config.baseline * (1.0 + config.relative_threshold),
+                config.sigma,
+                config.max_samples,
+                &mut h1_seed,
+            );
+            let h1_report = evaluate_perf_gate_driver(&h1, &[], &config);
+            if matches!(h1_report.decision, GateDecision::Accept { .. }) {
+                false_accepts += 1;
+            }
+        }
+
+        let false_reject_rate = (false_rejects as f64) / (trials as f64);
+        let false_accept_rate = (false_accepts as f64) / (trials as f64);
+        assert!(
+            false_reject_rate <= config.alpha,
+            "false-reject rate {false_reject_rate} exceeded alpha {}",
+            config.alpha
+        );
+        assert!(
+            false_accept_rate <= config.beta,
+            "false-accept rate {false_accept_rate} exceeded beta {}",
+            config.beta
+        );
+    }
+
+    #[test]
+    fn perf_gate_driver_conformal_rejects_flat_median_inflated_p999() {
+        let baseline = repeated_samples("robot.p999", 100.0, 64);
+        let mut candidate = repeated_samples("robot.p999", 100.0, 999);
+        candidate.push(EvidenceSample::new("robot.p999", 10_000.0, "ms", 1, 1_000));
+
+        let fixed_config = PerfGateDriverConfig {
+            max_samples: candidate.len(),
+            ..PerfGateDriverConfig::fixed(100.0)
+        };
+        let fixed_report = evaluate_perf_gate_driver(&candidate, &baseline, &fixed_config);
+        assert!(
+            matches!(fixed_report.decision, GateDecision::Accept { .. }),
+            "legacy mean gate should accept the flat-median sample set; got {:?}",
+            fixed_report.decision
+        );
+        assert!(fixed_report.mean <= fixed_report.legacy_upper_bound);
+
+        let mut conformal_config = fixed_config.clone();
+        conformal_config.bands = PerfGateBandMode::Conformal;
+        conformal_config.conformal = conformal::SplitConformalConfig {
+            alpha: 0.05,
+            calibration_fraction: 0.5,
+            min_calibration_samples: 20,
+        };
+        let conformal_report = evaluate_perf_gate_driver(&candidate, &baseline, &conformal_config);
+        assert!(
+            matches!(conformal_report.decision, GateDecision::Reject { .. }),
+            "clamped conformal band should reject inflated p999; got {:?}",
+            conformal_report.decision
+        );
+        assert!(!conformal_report.keep_candidate);
+        let band = conformal_report
+            .band
+            .expect("conformal band should be reported");
+        assert!(band.upper <= conformal_report.legacy_upper_bound);
+    }
+
+    #[test]
     fn jsonl_stream_rejects_invalid_rows() -> Result<(), String> {
         let invalid = r#"{"schema_version":"bad","ts_ms":1,"claim_id":"x","metric_value":1.0,"metric_unit":"ms","sample_size":1}"#;
         let mut stream = JsonlEvidenceStream::from_text(invalid);
@@ -454,5 +961,46 @@ mod tests {
                 .is_none()
         );
         Ok(())
+    }
+
+    fn repeated_samples(claim_id: &str, value: f64, count: u64) -> Vec<EvidenceSample> {
+        (0..count)
+            .map(|i| EvidenceSample::new(claim_id, value, "ms", 1, i + 1))
+            .collect()
+    }
+
+    fn gaussian_samples(
+        claim_id: &str,
+        mean: f64,
+        sigma: f64,
+        count: usize,
+        seed: &mut u64,
+    ) -> Vec<EvidenceSample> {
+        (0..count)
+            .map(|i| {
+                EvidenceSample::new(
+                    claim_id,
+                    mean + gaussian(seed) * sigma,
+                    "ms",
+                    1,
+                    u64::try_from(i + 1).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn gaussian(seed: &mut u64) -> f64 {
+        let u1 = xorshift_uniform(seed).max(1e-12);
+        let u2 = xorshift_uniform(seed);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    fn xorshift_uniform(seed: &mut u64) -> f64 {
+        let mut state = *seed;
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *seed = state;
+        (state as f64) / (u64::MAX as f64)
     }
 }
