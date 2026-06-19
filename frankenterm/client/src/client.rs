@@ -1,29 +1,29 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
+use asupersync::Cx;
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
-use asupersync::Cx;
-use async_channel::{bounded, unbounded, Receiver, Sender};
+use async_channel::{Receiver, Sender, bounded, unbounded};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
+use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
 use filedescriptor::FileDescriptor;
-use futures::future::{ready, select, Either};
+use futures::future::{Either, ready, select};
 use futures::pin_mut;
+use mux::Mux;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
-use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
 use std::collections::HashMap;
 use std::future::poll_fn;
-use std::io::{IoSlice, Read, Write};
+use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
 #[cfg(unix)]
@@ -36,6 +36,8 @@ use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 use wezterm_uds::UnixStream;
+
+const UNIX_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
@@ -563,7 +565,10 @@ pub fn unix_connect_with_retry(
             std::thread::sleep(std::time::Duration::from_millis(iter * 50));
         }
         match target {
-            UnixTarget::Socket(path) => match UnixStream::connect(path) {
+            UnixTarget::Socket(path) => match unix_stream_connect_with_timeout(
+                path.to_path_buf(),
+                UNIX_SOCKET_CONNECT_TIMEOUT,
+            ) {
                 Ok(stream) => return Ok(stream),
                 Err(err) => {
                     error =
@@ -635,6 +640,48 @@ pub fn unix_connect_with_retry(
     }
 
     error.unwrap_or_else(|| Err(anyhow!("unix connection failed without recording a cause")))
+}
+
+fn unix_stream_connect_with_timeout(
+    path: PathBuf,
+    timeout: Duration,
+) -> std::io::Result<UnixStream> {
+    if timeout.is_zero() {
+        return Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "unix socket connect timeout must be greater than zero",
+        ));
+    }
+
+    let display_path = path.display().to_string();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name(format!("frankenterm-unix-connect-{}", std::process::id()))
+        .spawn(move || {
+            let _ = tx.send(UnixStream::connect(path));
+        })
+        .map_err(|err| {
+            std::io::Error::new(
+                ErrorKind::Other,
+                format!("spawn unix socket connect timeout thread: {err}"),
+            )
+        })?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "timed out after {}ms connecting to {}",
+                timeout.as_millis(),
+                display_path
+            ),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+            ErrorKind::ConnectionAborted,
+            format!("unix socket connect worker exited before connecting to {display_path}"),
+        )),
+    }
 }
 
 #[async_trait]
@@ -2451,6 +2498,22 @@ mod tests {
             Err(err) => err,
         };
 
+        assert!(
+            err.to_string().contains("greater than zero"),
+            "unexpected error: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn unix_stream_connect_timeout_rejects_zero_deadline() {
+        let err = unix_stream_connect_with_timeout(
+            PathBuf::from("/tmp/frankenterm-zero-connect-timeout.sock"),
+            Duration::ZERO,
+        )
+        .expect_err("zero connect timeout should fail before attempting to connect");
+
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
         assert!(
             err.to_string().contains("greater than zero"),
             "unexpected error: {:?}",

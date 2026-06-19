@@ -8,13 +8,14 @@
 use std::fs::{self, OpenOptions};
 use std::hint::black_box;
 use std::io::Write;
+use std::mem::size_of;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankenterm_gui::glyph_quad_staging::{
-    GlyphQuadSoaBuffers, GlyphQuadStagingInstance, VERTICES_PER_GLYPH_QUAD,
-    aos_glyph_quad_vertices, expand_glyph_quad_soa_buffers, moonshot_instanced_glyph_quads_enabled,
+    GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex, VERTICES_PER_GLYPH_QUAD,
+    aos_glyph_quad_vertices, moonshot_instanced_glyph_quads_enabled,
 };
 use frankenterm_gui::glyph_run_interning::{
     GlyphRunProbeGlyph, glyph_run_interning_enabled, glyph_run_probe_iteration,
@@ -48,15 +49,15 @@ fn bench_known_key_input_to_headless_frame(c: &mut Criterion) {
 }
 
 fn bench_ft_3r0yk_soa_quad_staging_toggle(c: &mut Criterion) {
-    let fixture = SoaQuadBenchFixture::new(192);
+    let fixture = SoaQuadBenchFixture::glyph_dense_frame(160, 72);
     c.bench_function("ft_3r0yk/soa_quad_staging_toggle", |b| {
         b.iter(|| {
-            let vertex_count = if moonshot_instanced_glyph_quads_enabled() {
-                expand_glyph_quad_soa_buffers(black_box(fixture.buffers())).len()
+            let prepared_bytes = if moonshot_instanced_glyph_quads_enabled() {
+                fixture.soa_instance_upload_bytes()
             } else {
-                fixture.expand_aos_baseline_len()
+                fixture.expand_aos_baseline_bytes()
             };
-            black_box(vertex_count);
+            black_box(prepared_bytes);
         });
     });
 }
@@ -87,7 +88,11 @@ struct SoaQuadBenchFixture {
 }
 
 impl SoaQuadBenchFixture {
-    fn new(len: usize) -> Self {
+    fn glyph_dense_frame(cols: usize, rows: usize) -> Self {
+        Self::new(cols.saturating_mul(rows).max(1), cols.max(1))
+    }
+
+    fn new(len: usize, cols: usize) -> Self {
         let mut instances = Vec::with_capacity(len);
         let mut positions = Vec::with_capacity(len);
         let mut tex_rects = Vec::with_capacity(len);
@@ -98,8 +103,8 @@ impl SoaQuadBenchFixture {
         let mut mix_values = Vec::with_capacity(len);
 
         for idx in 0..len {
-            let col = (idx % 96) as f32;
-            let row = (idx / 96) as f32;
+            let col = (idx % cols) as f32;
+            let row = (idx / cols) as f32;
             let left = -384.0 + col * 8.0;
             let top = -220.0 + row * 16.0;
             let tex_left = ((idx % 32) as f32) / 64.0;
@@ -152,12 +157,46 @@ impl SoaQuadBenchFixture {
         }
     }
 
-    fn expand_aos_baseline_len(&self) -> usize {
+    fn expand_aos_baseline_bytes(&self) -> usize {
         let mut vertices = Vec::with_capacity(self.instances.len() * VERTICES_PER_GLYPH_QUAD);
         for instance in &self.instances {
             vertices.extend_from_slice(&aos_glyph_quad_vertices(*instance));
         }
-        vertices.len()
+        let bytes = vertices.len() * size_of::<GlyphQuadStagingVertex>();
+        black_box(vertices);
+        bytes
+    }
+
+    fn soa_instance_upload_bytes(&self) -> usize {
+        let buffers = self.buffers();
+        buffers.assert_consistent_lengths();
+
+        let mut checksum = 0.0f32;
+        for rect in buffers.positions {
+            checksum += rect.iter().copied().sum::<f32>();
+        }
+        for rect in buffers.tex_rects {
+            checksum += rect.iter().copied().sum::<f32>();
+        }
+        for color in buffers.fg_colors {
+            checksum += color.iter().copied().sum::<f32>();
+        }
+        for color in buffers.alt_colors {
+            checksum += color.iter().copied().sum::<f32>();
+        }
+        for hsv in buffers.hsv {
+            checksum += hsv.iter().copied().sum::<f32>();
+        }
+        for value in buffers.has_color {
+            checksum += *value;
+        }
+        for value in buffers.mix_values {
+            checksum += *value;
+        }
+
+        black_box(checksum);
+        self.positions.len()
+            * (size_of::<[f32; 4]>() * 4 + size_of::<[f32; 3]>() + size_of::<f32>() * 2)
     }
 }
 
