@@ -167,3 +167,13 @@ _(tick entries appended here by the operator tend-loop)_
   CONVERGENCE ~3 ideas away: Q6 (cod_1 building, ~1h20m), RS (cod_5 building), min-plus (cod_4 building),
   then M5 MPHF (assign cod_1 after Q6). Held free panes (cod_2/cod_3/cc_1/cc_3 — M5 blocked on cod_1).
   Benign cargo-fmt churn in ~8 unowned files still uncommitted -> commit as style(core) at release prep.
+- 2026-06-19 tend#12 — min-plus cert be60fc8e7 (cod_4) + RS erasure 2b1ca7475 (cod_5, code-first) landed +
+  adjudicated. 18 ideas, 0 reverted. M5 MPHF still building (cod_1). ADVERSARIAL CROSS-REVIEW complete
+  (agent, diff b7eed340c..HEAD): VERDICT = SAFE to ship v0.7.0, no CRITICAL/HIGH, must-fix=none. All 19
+  gates confirmed default-off/legacy-preserving; adaptive controllers (M7/M8/M9/S3-FIFO/SR) fail-closed;
+  RS GF-math + decode panic-free on untrusted input; GUI fix correct/minimal. RELEASE FOLLOW-UPS:
+  (L-2) run clean-tree cargo test -p frankenterm-core --lib + latency_envelope + erasure filters to convert
+  3 proof-deferred commits to proof-run (= the release scorecard); (M-1) declare the patterns-lazy-captures
+  / teddy-prefilter / patterns-fingerprint-dedup (+ M5 mphf) features in crates/frankenterm-core/Cargo.toml
+  and drop the #![allow(unexpected_cfgs)] so Q4/Q5/Q6/M5 are enableable via cargo --features (currently
+  dead/unreachable = safe-to-ship but not toggleable). Fix M-1 after M5 commits (Cargo.toml).

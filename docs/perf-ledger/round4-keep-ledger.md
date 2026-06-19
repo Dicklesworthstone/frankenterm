@@ -228,3 +228,22 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls �
 **A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if a dedup-cache bench shows per-key String alloc or O(n) retain-eviction cost above noise at high seen-key churn.
 **Baseline comparator:** `HashMap<String,SeenEntry>` + FIFO O(n) retain.
 **Rollback:** feature default-off; `git revert b0db1ea5b`.
+
+### 2026-06-19 | min-plus latency cert (stretch) / cod_4 | Min-plus end-to-end latency certificate
+
+**Status:** kept (durable infra, default-off, observability-only) — Form 6 structural-not-numerical
+**Gate:** config `telemetry.latency_envelope` (default off)
+**Commit:** be60fc8e7
+**Behavior-preservation:** NEW module `latency_envelope.rs`; observability-ONLY (never changes scheduling/admission); composes per-stage min-plus (network-calculus) service curves into an end-to-end capture->storage->index bound + runtime violation monitor; RCH-proven + unit tests.
+**A/B verdict:** N/A — observability certificate, not a runtime perf change.
+**Rollback:** config default-off; `git revert be60fc8e7`.
+
+### 2026-06-19 | RS erasure (stretch) / cod_5 | Reed-Solomon cold-tier erasure (closes ft-odrq7)
+
+**Status:** kept provisional (durable robustness, default-off; proof-deferred)
+**Gate:** config `storage.cold.erasure=rs` (default off)
+**Commit:** 2b1ca7475
+**Behavior-preservation:** [n,k] RS (GF(2^8)) over cold-tier scrollback shards; decode needs any k-of-n; <k survivors -> detected error (CRC), never silent miscorrect; encode off the hot path; default-off == current single-copy behavior. Committed code-first (the erasure round-trip RCH proof was infra-slow). Closes tracked ft-odrq7 (no-fsync cold-tier data-loss window).
+**A/B verdict:** N/A (robustness, not perf). Proof retry (Form 5): re-run the encode->drop-(n-k)->decode byte-identity fuzz on a quiet host / clean tree.
+**Baseline comparator:** single-copy cold mmap (no recovery).
+**Rollback:** config default-off; `git revert 2b1ca7475`.
