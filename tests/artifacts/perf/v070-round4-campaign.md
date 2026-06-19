@@ -154,3 +154,10 @@ _(tick entries appended here by the operator tend-loop)_
   tree: cc_2 -> M8 adaptive commit (storage), cod_5 -> RS erasure (mmap_store cold-tier), cod_4 -> min-plus
   latency cert (new file). HELD cc_1+cc_3 (cap core editors). REMAINING: Q5/Q6 (cod_1), M5 MPHF (after cod_1),
   M6 persistent grid, M7 commit. Approaching convergence -> Phase 3 release prep next.
+- 2026-06-19 tend#8 — Q5 Teddy prefilter c40468e79 (cod_1) + M7 predictive cadence 6fdd6b1d2 (cod_3,
+  code-first proof-deferred) landed + adjudicated. 15 ideas, 0 reverted. Large dirty tree (~20 core files,
+  2226 ins) = real idea code (M8/RS/min-plus/Q6/bocpd) + benign crate-wide cargo-fmt churn in ~9
+  sibling-owned files (whitespace only, compiles) -> fold the fmt churn into a release-prep style commit.
+  HELD cc_1+cc_3 to let the dirty tree drain. In flight: cod_1 Q6 (fingerprint dedup), cod_3 M7-retry,
+  cod_4 min-plus (latency_envelope.rs), cod_5 RS erasure (mmap_store), cc_2 M8 adaptive commit, cod_2
+  (bocpd wrap). REMAINING: Q6, M5 MPHF (assign cod_1 after Q6), M6 persistent grid (OPTIONAL stretch).

@@ -188,3 +188,23 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls âˆ
 **A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a synthetic-changepoint corpus shows SR lower detection-delay at matched false-alarm rate (ARL0/ARL1 tradeoff) vs BOCPD.
 **Baseline comparator:** Adams-MacKay BOCPD recent-change-mass alarm.
 **Rollback:** config default bocpd; `git revert 834a8b6cf`.
+
+### 2026-06-19 | Q5 / cod_1 | Teddy SIMD multi-pattern prefilter (patterns)
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** feature `teddy-prefilter` (default off)
+**Commit:** c40468e79
+**Behavior-preservation:** SIMD packed-literal (aho-corasick Teddy, safe-rust) prefilter ahead of fancy_regex; sound (only skips chunks with no required literal of any rule); byte-equivalent detection stream over conformance corpus; code-first.
+**A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a pattern-detection bench attributes above-noise regex-eval time on a low-match-rate chunk workload (prefilter wins when most chunks match nothing).
+**Baseline comparator:** Bloom prefilter -> per-rule fancy_regex.
+**Rollback:** feature default-off; `git revert c40468e79`.
+
+### 2026-06-19 | M7 / cod_3 | Predictive poll cadence (renewal/hazard)
+
+**Status:** kept provisional (durable optimization, default-off; proof + A/B deferred)
+**Gate:** config `ingest.cadence_model=predictive` (default backoff)
+**Commit:** 6fdd6b1d2
+**Behavior-preservation:** predictive renewal/hazard model governs idle-direction interval only; reset-on-change preserved; hard-floored by token-bucket; fail-closed to x1.5 backoff on cold-start/NaN. Committed code-first (proof deferred â€” the m7 RCH build wedged 4x, infra not code; retry in flight).
+**A/B verdict:** DEFERRED. Retry-condition (Form 5): do not retry from a cold read; use a recorded pane-output trace replay (captures reduced >=15% at p95 capture-latency non-regressed) once the m7 RCH build stops wedging.
+**Baseline comparator:** x1.5 multiplicative backoff + static pane_tiers table.
+**Rollback:** config default backoff; `git revert 6fdd6b1d2`.
