@@ -88,6 +88,9 @@ pub struct TelemetryConfig {
 
     /// PID of the mux server process to monitor (0 = self).
     pub mux_server_pid: u32,
+
+    /// Default-off capture -> storage -> index latency envelope monitor.
+    pub latency_envelope: crate::latency_envelope::LatencyEnvelopeConfig,
 }
 
 impl Default for TelemetryConfig {
@@ -98,6 +101,7 @@ impl Default for TelemetryConfig {
             histogram_buckets: 1024,
             per_process_metrics: true,
             mux_server_pid: 0,
+            latency_envelope: crate::latency_envelope::LatencyEnvelopeConfig::default(),
         }
     }
 }
@@ -1750,6 +1754,7 @@ mod tests {
                 histogram_buckets: 64,
                 per_process_metrics: false,
                 mux_server_pid: 0,
+                latency_envelope: crate::latency_envelope::LatencyEnvelopeConfig::default(),
             });
             // Pre-signal shutdown so iteration 1 breaks out of the loop
             // without entering spawn_blocking or sleeping.
@@ -1823,6 +1828,7 @@ mod tests {
         assert_eq!(config.histogram_buckets, 1024);
         assert!(config.per_process_metrics);
         assert_eq!(config.mux_server_pid, 0);
+        assert!(!config.latency_envelope.enabled);
     }
 
     #[test]
@@ -1851,6 +1857,7 @@ mod tests {
             histogram_buckets: 512,
             per_process_metrics: false,
             mux_server_pid: 42,
+            latency_envelope: crate::latency_envelope::LatencyEnvelopeConfig::enabled(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: TelemetryConfig = serde_json::from_str(&json).unwrap();
@@ -1859,6 +1866,7 @@ mod tests {
         assert_eq!(back.histogram_buckets, 512);
         assert!(!back.per_process_metrics);
         assert_eq!(back.mux_server_pid, 42);
+        assert!(back.latency_envelope.enabled);
     }
 
     #[test]
@@ -1867,6 +1875,7 @@ mod tests {
         let back: TelemetryConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(back.buffer_capacity, 120);
         assert_eq!(back.mux_server_pid, 0);
+        assert!(!back.latency_envelope.enabled);
     }
 
     #[test]
@@ -3714,6 +3723,7 @@ mod tests {
         assert_eq!(config.sample_interval, Duration::from_secs(30));
         assert_eq!(config.histogram_buckets, 1024);
         assert_eq!(config.mux_server_pid, 0);
+        assert!(!config.latency_envelope.enabled);
     }
 
     #[test]
