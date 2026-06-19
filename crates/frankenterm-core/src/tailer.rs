@@ -35,6 +35,74 @@ fn duration_millis_saturating(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// M7 moonshot gate env var (`ingest.cadence_model=predictive`, default backoff).
+///
+/// The shipping path stays on deterministic x1.5 idle backoff unless the
+/// experiment is explicitly enabled. Malformed values fail closed to backoff.
+const FT_MOONSHOT_INGEST_CADENCE_MODEL: &str = "FT_MOONSHOT_INGEST_CADENCE_MODEL";
+const FT_MOONSHOT_PREDICTIVE_POLL_CADENCE: &str = "FT_MOONSHOT_PREDICTIVE_POLL_CADENCE";
+
+const PREDICTIVE_GAP_SLOTS: usize = 5;
+const PREDICTIVE_MIN_GAPS: usize = 2;
+const PREDICTIVE_EWMA_ALPHA: f64 = 0.35;
+const PREDICTIVE_JIT_FRACTION: f64 = 0.90;
+const PREDICTIVE_STALE_HORIZON: f64 = 2.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollCadenceModel {
+    Backoff,
+    Predictive,
+}
+
+static POLL_CADENCE_MODEL: OnceLock<PollCadenceModel> = OnceLock::new();
+
+fn configured_poll_cadence_model() -> PollCadenceModel {
+    *POLL_CADENCE_MODEL.get_or_init(|| {
+        if let Ok(value) = std::env::var(FT_MOONSHOT_INGEST_CADENCE_MODEL) {
+            if value.eq_ignore_ascii_case("predictive") {
+                return PollCadenceModel::Predictive;
+            }
+            return PollCadenceModel::Backoff;
+        }
+
+        if std::env::var_os(FT_MOONSHOT_PREDICTIVE_POLL_CADENCE).is_some() {
+            PollCadenceModel::Predictive
+        } else {
+            PollCadenceModel::Backoff
+        }
+    })
+}
+
+fn duration_from_secs_f64_checked(seconds: f64) -> Option<Duration> {
+    if seconds.is_finite() && (0.0..=Duration::MAX.as_secs_f64()).contains(&seconds) {
+        Some(Duration::from_secs_f64(seconds))
+    } else {
+        None
+    }
+}
+
+fn legacy_backoff_interval(current_interval: Duration, config: &TailerConfig) -> Duration {
+    // Fail closed: `Duration::from_secs_f64` panics on NaN, negative, or
+    // overflowing input. `TailerConfig` does not normalize
+    // `backoff_multiplier`, so hostile or non-finite config saturates to the
+    // slowest legacy poll interval instead of crashing the scheduler.
+    let max_secs = config.max_interval.as_secs_f64();
+    let scaled = current_interval.as_secs_f64() * config.backoff_multiplier;
+    let new_interval = if scaled.is_finite() && scaled >= 0.0 {
+        Duration::from_secs_f64(scaled.min(max_secs))
+    } else {
+        config.max_interval
+    };
+    new_interval.min(config.max_interval)
+}
+
+fn clamp_predictive_interval(interval: Duration, config: &TailerConfig) -> Duration {
+    if config.max_interval < config.min_interval {
+        return config.max_interval;
+    }
+    interval.max(config.min_interval).min(config.max_interval)
+}
+
 /// Configuration for the tailer supervisor.
 #[derive(Debug, Clone)]
 pub struct TailerConfig {
@@ -258,6 +326,111 @@ pub struct CaptureEvent {
     pub segment: CapturedSegment,
 }
 
+#[derive(Clone)]
+struct PredictiveCadenceState {
+    gaps: [Duration; PREDICTIVE_GAP_SLOTS],
+    gap_count: usize,
+    next_slot: usize,
+    ewma_gap_secs: Option<f64>,
+    last_change_poll: Option<Instant>,
+}
+
+impl Default for PredictiveCadenceState {
+    fn default() -> Self {
+        Self {
+            gaps: [Duration::ZERO; PREDICTIVE_GAP_SLOTS],
+            gap_count: 0,
+            next_slot: 0,
+            ewma_gap_secs: None,
+            last_change_poll: None,
+        }
+    }
+}
+
+impl PredictiveCadenceState {
+    fn observe_change(&mut self, now: Instant) {
+        if let Some(previous) = self.last_change_poll {
+            self.observe_gap(now.saturating_duration_since(previous));
+        }
+        self.last_change_poll = Some(now);
+    }
+
+    fn observe_gap(&mut self, gap: Duration) {
+        let secs = gap.as_secs_f64();
+        if !secs.is_finite() || secs <= 0.0 {
+            return;
+        }
+
+        self.gaps[self.next_slot] = gap;
+        self.next_slot = (self.next_slot + 1) % PREDICTIVE_GAP_SLOTS;
+        self.gap_count = self.gap_count.saturating_add(1).min(PREDICTIVE_GAP_SLOTS);
+
+        self.ewma_gap_secs = Some(match self.ewma_gap_secs {
+            Some(previous) if previous.is_finite() && previous > 0.0 => {
+                previous.mul_add(1.0 - PREDICTIVE_EWMA_ALPHA, secs * PREDICTIVE_EWMA_ALPHA)
+            }
+            _ => secs,
+        });
+    }
+
+    fn next_interval_after_no_change(
+        &self,
+        now: Instant,
+        config: &TailerConfig,
+    ) -> Option<Duration> {
+        let last_change = self.last_change_poll?;
+        let estimate_secs = self.estimated_gap_secs()?;
+        let target = duration_from_secs_f64_checked(estimate_secs * PREDICTIVE_JIT_FRACTION)?;
+        let stale_horizon =
+            duration_from_secs_f64_checked(estimate_secs * PREDICTIVE_STALE_HORIZON)?;
+        let age = now.saturating_duration_since(last_change);
+        if age > stale_horizon {
+            return None;
+        }
+
+        let interval = target
+            .checked_sub(age)
+            .unwrap_or(config.min_interval)
+            .max(config.min_interval);
+        Some(clamp_predictive_interval(interval, config))
+    }
+
+    fn estimated_gap_secs(&self) -> Option<f64> {
+        if self.gap_count < PREDICTIVE_MIN_GAPS {
+            return None;
+        }
+
+        let mut sorted = [0.0; PREDICTIVE_GAP_SLOTS];
+        for (idx, gap) in self.gaps.iter().take(self.gap_count).enumerate() {
+            let secs = gap.as_secs_f64();
+            if !secs.is_finite() || secs <= 0.0 {
+                return None;
+            }
+            sorted[idx] = secs;
+        }
+
+        for idx in 1..self.gap_count {
+            let value = sorted[idx];
+            let mut pos = idx;
+            while pos > 0 && sorted[pos - 1] > value {
+                sorted[pos] = sorted[pos - 1];
+                pos -= 1;
+            }
+            sorted[pos] = value;
+        }
+
+        let quantile_idx = ((self.gap_count - 1) * 4) / 5;
+        let quantile = sorted[quantile_idx];
+        let ewma = self.ewma_gap_secs?;
+        let estimate = quantile.min(ewma);
+        if estimate.is_finite() && estimate > 0.0 {
+            Some(estimate)
+        } else {
+            None
+        }
+    }
+}
+
 /// Per-pane tailer state.
 struct PaneTailer {
     /// Pane ID (retained for debugging/logging)
@@ -283,6 +456,8 @@ struct PaneTailer {
     consecutive_backpressure: u64,
     /// Whether an overflow GAP needs to be emitted on the next successful poll
     overflow_gap_pending: bool,
+    /// Per-pane renewal estimate used only by the default-off predictive gate.
+    cadence: PredictiveCadenceState,
 }
 
 impl PaneTailer {
@@ -299,11 +474,16 @@ impl PaneTailer {
             skipped_count: 0,
             consecutive_backpressure: 0,
             overflow_gap_pending: false,
+            cadence: PredictiveCadenceState::default(),
         }
     }
 
     fn should_poll(&self) -> bool {
-        self.last_poll.elapsed() >= self.current_interval
+        self.should_poll_at(Instant::now())
+    }
+
+    fn should_poll_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_poll) >= self.current_interval
     }
 
     #[cfg(test)]
@@ -323,7 +503,25 @@ impl PaneTailer {
         reason: CaptureSkipReason,
         config: &TailerConfig,
     ) {
-        let now = Instant::now();
+        self.record_poll_outcome_at(
+            had_changes,
+            successful_capture,
+            reason,
+            config,
+            Instant::now(),
+            configured_poll_cadence_model(),
+        );
+    }
+
+    fn record_poll_outcome_at(
+        &mut self,
+        had_changes: bool,
+        successful_capture: bool,
+        reason: CaptureSkipReason,
+        config: &TailerConfig,
+        now: Instant,
+        cadence_model: PollCadenceModel,
+    ) {
         self.last_poll = now;
         if successful_capture {
             self.last_successful_capture = Some(now);
@@ -333,24 +531,16 @@ impl PaneTailer {
 
         // Adaptive interval: speed up if changes, slow down if idle
         if had_changes {
+            self.cadence.observe_change(now);
             self.current_interval = config.min_interval;
         } else {
-            // Fail closed: `Duration::from_secs_f64` panics on NaN, negative,
-            // or overflowing input. `TailerConfig` does not normalize
-            // `backoff_multiplier`, so a non-finite / negative value (hostile
-            // config, JSON-permitted NaN, or upstream arithmetic) would crash
-            // the poll scheduler here. Saturate to `max_interval` (the slowest
-            // poll, which we cap to anyway) instead of panicking. Mirrors the
-            // NaN-defence in disk_pressure (ft-761tz) and the histogram path
-            // (ft-b4l62). Behavior-preserving for valid finite multipliers.
-            let max_secs = config.max_interval.as_secs_f64();
-            let scaled = self.current_interval.as_secs_f64() * config.backoff_multiplier;
-            let new_interval = if scaled.is_finite() && scaled >= 0.0 {
-                Duration::from_secs_f64(scaled.min(max_secs))
-            } else {
-                config.max_interval
+            self.current_interval = match cadence_model {
+                PollCadenceModel::Backoff => legacy_backoff_interval(self.current_interval, config),
+                PollCadenceModel::Predictive => self
+                    .cadence
+                    .next_interval_after_no_change(now, config)
+                    .unwrap_or_else(|| legacy_backoff_interval(self.current_interval, config)),
             };
-            self.current_interval = new_interval.min(config.max_interval);
         }
     }
 
@@ -2282,6 +2472,160 @@ mod tests {
         // Changes detected - snap back to min
         tailer.record_poll(true, &config);
         assert_eq!(tailer.current_interval, config.min_interval);
+    }
+
+    #[test]
+    fn m7_backoff_mode_reproduces_legacy_schedule_golden() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 1.5,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(7, config.min_interval);
+        let start = Instant::now();
+        let expected = [
+            Duration::from_nanos(75_000_000),
+            Duration::from_nanos(112_500_000),
+            Duration::from_nanos(168_750_000),
+            Duration::from_nanos(253_125_000),
+            Duration::from_nanos(379_687_500),
+            Duration::from_nanos(569_531_250),
+            Duration::from_nanos(854_296_875),
+            Duration::from_secs(1),
+        ];
+
+        for (idx, expected_interval) in expected.into_iter().enumerate() {
+            let now = start + Duration::from_millis(u64::try_from(idx + 1).unwrap_or(u64::MAX));
+            tailer.record_poll_outcome_at(
+                false,
+                true,
+                CaptureSkipReason::NoChange,
+                &config,
+                now,
+                PollCadenceModel::Backoff,
+            );
+            assert_eq!(tailer.current_interval, expected_interval);
+        }
+    }
+
+    #[test]
+    fn m7_predictive_cold_start_nan_falls_back_to_legacy_backoff() {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: f64::NAN,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(7, config.min_interval);
+
+        tailer.record_poll_outcome_at(
+            false,
+            true,
+            CaptureSkipReason::NoChange,
+            &config,
+            Instant::now(),
+            PollCadenceModel::Predictive,
+        );
+
+        assert_eq!(tailer.current_interval, config.max_interval);
+    }
+
+    #[derive(Debug)]
+    struct M7ReplayStats {
+        captures: u64,
+        p95_latency: Duration,
+    }
+
+    fn m7_p95_latency(mut latencies: Vec<Duration>) -> Duration {
+        assert!(
+            !latencies.is_empty(),
+            "replay trace must contain at least one output burst"
+        );
+        latencies.sort_unstable();
+        let idx = latencies
+            .len()
+            .saturating_mul(95)
+            .saturating_add(99)
+            / 100;
+        latencies[idx.saturating_sub(1).min(latencies.len() - 1)]
+    }
+
+    fn m7_replay_trace(model: PollCadenceModel) -> M7ReplayStats {
+        let config = TailerConfig {
+            min_interval: Duration::from_millis(50),
+            max_interval: Duration::from_secs(1),
+            backoff_multiplier: 1.5,
+            ..Default::default()
+        };
+        let mut tailer = PaneTailer::new(42, config.min_interval);
+        let start = Instant::now();
+        tailer.last_poll = start;
+
+        let bursts = [
+            Duration::from_millis(1_000),
+            Duration::from_millis(2_000),
+            Duration::from_millis(3_000),
+            Duration::from_millis(4_000),
+            Duration::from_millis(5_000),
+            Duration::from_millis(6_000),
+            Duration::from_millis(7_000),
+            Duration::from_millis(8_000),
+            Duration::from_millis(9_000),
+            Duration::from_millis(10_000),
+            Duration::from_millis(11_000),
+            Duration::from_millis(12_000),
+        ];
+
+        let mut burst_idx = 0;
+        let mut captures = 0_u64;
+        let mut latencies = Vec::with_capacity(bursts.len());
+
+        while burst_idx < bursts.len() {
+            let now = tailer.last_poll + tailer.current_interval;
+            assert!(tailer.should_poll_at(now));
+            captures = captures.saturating_add(1);
+
+            let mut had_changes = false;
+            while burst_idx < bursts.len() {
+                let burst_at = start + bursts[burst_idx];
+                if burst_at > now {
+                    break;
+                }
+                had_changes = true;
+                latencies.push(now.saturating_duration_since(burst_at));
+                burst_idx += 1;
+            }
+
+            let reason = if had_changes {
+                CaptureSkipReason::Changed
+            } else {
+                CaptureSkipReason::NoChange
+            };
+            tailer.record_poll_outcome_at(had_changes, true, reason, &config, now, model);
+        }
+
+        M7ReplayStats {
+            captures,
+            p95_latency: m7_p95_latency(latencies),
+        }
+    }
+
+    #[test]
+    fn m7_predictive_replay_reduces_captures_without_p95_latency_regression() {
+        let backoff = m7_replay_trace(PollCadenceModel::Backoff);
+        let predictive = m7_replay_trace(PollCadenceModel::Predictive);
+
+        assert!(
+            predictive.captures.saturating_mul(100) <= backoff.captures.saturating_mul(85),
+            "predictive should reduce captures by at least 15%: backoff={backoff:?}, \
+             predictive={predictive:?}"
+        );
+        assert!(
+            predictive.p95_latency <= backoff.p95_latency,
+            "predictive must not raise p95 capture latency: backoff={backoff:?}, \
+             predictive={predictive:?}"
+        );
     }
 
     #[test]
