@@ -938,7 +938,7 @@ fn writer_loop_does_not_dispatch_commands_queued_after_shutdown() {
 
     let backend = RusqliteBackend::new(conn);
     let queued_depth = AtomicUsize::new(3);
-    writer_loop(&backend, &mut rx, &mut mmap_mirror, &queued_depth);
+    writer_loop(&backend, &mut rx, &mut mmap_mirror, &queued_depth, false, None);
     let conn = backend.into_connection();
 
     let segment_count: i64 = conn
@@ -1330,6 +1330,8 @@ fn storage_handle_with_small_queue_handles_burst() {
             write_queue_size: 4,
             read_pool_size: super::DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
+            group_commit_events: false,
+            writer_blocking_recv: false,
         };
         let handle: StorageHandle = StorageHandle::with_config(&db_path, config).await.unwrap();
 
@@ -1359,6 +1361,8 @@ fn storage_handle_reopen_preserves_synchronous_fts_indexing() {
             write_queue_size: 4,
             read_pool_size: super::DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
+            group_commit_events: false,
+            writer_blocking_recv: false,
         };
         let fts_trigger_count = |conn: &Connection| -> i64 {
             conn.query_row(

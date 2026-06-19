@@ -1438,6 +1438,8 @@ fn storage_handle_with_small_queue_handles_burst() {
             write_queue_size: 4,
             read_pool_size: 8,
             defer_fts_triggers: false,
+            group_commit_events: false,
+            writer_blocking_recv: false,
         };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 

@@ -1001,6 +1001,24 @@ pub struct StorageConfig {
     /// search-freshness lag equal to the tick interval. See ft-wk5fo for
     /// the full deferred-indexing rollout plan.
     pub defer_fts_triggers: bool,
+    /// [round-4 Q2] Coalesce consecutive `RecordEvent`/`RecordGap` writer
+    /// commands into a single explicit SQLite transaction (group-commit
+    /// widen). Default `false` keeps every event/gap on its own implicit
+    /// autocommit — byte-identical to the legacy per-command path. The
+    /// statements, params, insert order, and returned ids are unchanged when
+    /// enabled; only the transaction (and therefore fsync) boundary widens, so
+    /// the win is invisible in a DB dump. Production opt-in is via the
+    /// `FT_MOONSHOT_GROUP_COMMIT_EVENTS` env var (OR'd with this field at writer
+    /// construction); tests set this directly for a deterministic A/B.
+    pub group_commit_events: bool,
+    /// [round-4 Q2] Park the writer thread on a condvar that the command
+    /// sender signals after each enqueue, instead of polling with a fixed
+    /// 1 ms sleep. Default `false` keeps the legacy 1 ms `try_recv` park. A
+    /// bounded `wait_timeout` floor guarantees forward progress even if a
+    /// wake is ever missed, so correctness never depends on the signal — only
+    /// wake latency and idle CPU change. Production opt-in is via the
+    /// `FT_MOONSHOT_WRITER_BLOCKING_RECV` env var.
+    pub writer_blocking_recv: bool,
 }
 
 impl Default for StorageConfig {
@@ -1009,6 +1027,8 @@ impl Default for StorageConfig {
             write_queue_size: 1024,
             read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
+            group_commit_events: false,
+            writer_blocking_recv: false,
         }
     }
 }
@@ -1035,6 +1055,71 @@ impl From<&crate::config::StorageConfig> for StorageConfig {
 
 const FT_STORAGE_MMAP_ENABLE_ENV: &str = "FT_STORAGE_MMAP_ENABLE";
 const FT_STORAGE_MMAP_DIR_ENV: &str = "FT_STORAGE_MMAP_DIR";
+
+/// [round-4 Q2] Env opt-in for [`StorageConfig::group_commit_events`].
+const FT_MOONSHOT_GROUP_COMMIT_EVENTS_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_EVENTS";
+/// [round-4 Q2] Env opt-in for [`StorageConfig::writer_blocking_recv`].
+const FT_MOONSHOT_WRITER_BLOCKING_RECV_ENV: &str = "FT_MOONSHOT_WRITER_BLOCKING_RECV";
+
+/// Park ceiling for the condvar-driven writer wake (`writer_blocking_recv`).
+///
+/// The sender's notify drives sub-millisecond wakeups under load; this timeout
+/// only bounds the worst case if a notification is ever missed and caps how long
+/// a bare sender-drop (a disconnect with no `Shutdown` command) can delay loop
+/// teardown. Graceful shutdown enqueues a `Shutdown` command, which notifies and
+/// wakes the writer immediately, so this ceiling never gates clean shutdown.
+const WRITER_BLOCKING_RECV_PARK_MS: u64 = 25;
+
+/// Read a boolean moonshot/tuning env flag using the shared truthy vocabulary.
+fn storage_env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| env_value_is_truthy(&value))
+        .unwrap_or(false)
+}
+
+/// Condvar-based wakeup shared between [`WriteCommandSender`] and the storage
+/// writer thread, used only when `writer_blocking_recv` is enabled.
+///
+/// The sender calls [`WriterWakeup::notify`] after enqueuing a command; the
+/// writer calls [`WriterWakeup::park_for_work`] when `try_recv` returns empty.
+/// The park re-checks the shared `queued_depth` counter under the lock before
+/// sleeping, which closes the classic enqueue/park lost-wakeup race: any command
+/// made visible (depth incremented) before the writer parks is observed and the
+/// park is skipped. Even if a wake were somehow lost, the bounded `wait_timeout`
+/// guarantees the writer re-polls, so durability/ordering never depend on the
+/// signal — only latency does.
+struct WriterWakeup {
+    lock: Mutex<()>,
+    condvar: std::sync::Condvar,
+}
+
+impl WriterWakeup {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            condvar: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Signal the parked writer. Lock-then-signal so a concurrent
+    /// `park_for_work` either observes the depth bump under the lock or is woken
+    /// by this notification; it can never wedge between the two.
+    fn notify(&self) {
+        let _guard = self.lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        self.condvar.notify_one();
+    }
+
+    /// Park until notified or `timeout` elapses, skipping the sleep entirely if
+    /// `queued_depth` already shows pending work.
+    fn park_for_work(&self, timeout: std::time::Duration, queued_depth: &AtomicUsize) {
+        let guard = self.lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        if queued_depth.load(AtomicOrdering::Acquire) > 0 {
+            return;
+        }
+        let _ = self.condvar.wait_timeout(guard, timeout);
+    }
+}
 
 #[derive(Debug, Clone)]
 struct MmapMirrorRuntimeConfig {
@@ -1154,6 +1239,10 @@ struct WriteCommandSender {
     inner: mpsc::Sender<WriteCommand>,
     queued_depth: Arc<AtomicUsize>,
     max_capacity: usize,
+    /// [round-4 Q2] Present only when `writer_blocking_recv` is enabled; signals
+    /// the condvar-parked writer after each successful enqueue. `None` keeps the
+    /// legacy 1 ms-poll writer untouched (zero added cost on the send path).
+    wakeup: Option<Arc<WriterWakeup>>,
 }
 
 impl WriteCommandSender {
@@ -1162,6 +1251,7 @@ impl WriteCommandSender {
             inner,
             queued_depth: Arc::new(AtomicUsize::new(0)),
             max_capacity,
+            wakeup: None,
         }
     }
 
@@ -1211,7 +1301,15 @@ impl WriteCommandSender {
 
         self.queued_depth.fetch_add(1, AtomicOrdering::AcqRel);
         match permit.try_send(command) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // [round-4 Q2] Wake the condvar-parked writer once the command
+                // is actually visible on the channel. No-op when
+                // `writer_blocking_recv` is off (`wakeup` is `None`).
+                if let Some(wakeup) = &self.wakeup {
+                    wakeup.notify();
+                }
+                Ok(())
+            }
             Err(err) => {
                 Self::mark_command_dequeued(&self.queued_depth);
                 Err(err)
@@ -1768,11 +1866,23 @@ impl StorageHandle {
             Self::checkpoint_storage_open(cx, "before writer thread spawn")?;
         }
 
+        // [round-4 Q2] Resolve the two group-commit/condvar gates: the handle
+        // config field OR the moonshot env var. Both default off, so production
+        // stays on the legacy per-command + 1 ms-poll writer unless explicitly
+        // opted in; tests flip the config field for a deterministic A/B.
+        let group_commit_events = config.group_commit_events
+            || storage_env_flag_enabled(FT_MOONSHOT_GROUP_COMMIT_EVENTS_ENV);
+        let writer_blocking_recv = config.writer_blocking_recv
+            || storage_env_flag_enabled(FT_MOONSHOT_WRITER_BLOCKING_RECV_ENV);
+
         // Create bounded channel for write commands
         let (write_tx_raw, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
-        let write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
+        let writer_wakeup = writer_blocking_recv.then(|| Arc::new(WriterWakeup::new()));
+        let mut write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
+        write_tx.wakeup = writer_wakeup.clone();
         let queued_depth_for_writer = Arc::clone(&write_tx.queued_depth);
         let mmap_runtime_for_writer = mmap_runtime.clone();
+        let writer_wakeup_for_writer = writer_wakeup;
 
         // Spawn writer thread
         let writer_handle = thread::Builder::new()
@@ -1785,6 +1895,8 @@ impl StorageHandle {
                     &mut write_rx,
                     &mut mmap_mirror,
                     &queued_depth_for_writer,
+                    group_commit_events,
+                    writer_wakeup_for_writer.as_deref(),
                 );
             })
             .map_err(|e| {
@@ -8082,6 +8194,7 @@ fn dispatch_write_command_batch(
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
+    group_commit_events: bool,
 ) {
     let mut pending_io = HashMap::<u64, WriteCommand>::new();
 
@@ -8131,6 +8244,7 @@ fn dispatch_write_command_batch(
             mmap_mirror,
             segment_redactors,
             io_gate,
+            group_commit_events,
         ) {
             if fail_undispatched_write_commands(batch, message) {
                 *should_break = true;
@@ -8170,6 +8284,7 @@ fn dispatch_write_command_batch(
         mmap_mirror,
         segment_redactors,
         io_gate,
+        group_commit_events,
     ) {
         if fail_undispatched_write_commands(batch, message) {
             *should_break = true;
@@ -8187,8 +8302,10 @@ fn flush_storage_io_pending_commands(
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
     io_gate: &mut StorageIoWriterGate,
+    group_commit_events: bool,
 ) -> Option<String> {
     let mut pending_append_segments = Vec::new();
+    let mut pending_event_gap: Vec<PendingEventOrGap> = Vec::new();
 
     while !pending_io.is_empty() && !*should_break {
         let Some(dispatched) = io_gate.pop_next() else {
@@ -8202,6 +8319,7 @@ fn flush_storage_io_pending_commands(
                 std::mem::take(&mut pending_append_segments),
                 message.clone(),
             );
+            fail_pending_event_gap(std::mem::take(&mut pending_event_gap), message.clone());
             fail_pending_storage_io_commands(std::mem::take(pending_io), message);
             io_gate.reset_after_scheduler_loss();
             return Some(
@@ -8227,35 +8345,102 @@ fn flush_storage_io_pending_commands(
             "storage IO scheduler dispatching writer command"
         );
 
-        let cmd = match pending_append_segment_from_command(cmd) {
-            Ok(pending_append) => {
-                pending_append_segments.push(pending_append);
-                continue;
-            }
-            Err(cmd) => *cmd,
-        };
+        // Coalescing preserves the scheduler's exact dispatch order: a run of
+        // same-kind commands accumulates into one transaction, and any change of
+        // kind first flushes (commits) the in-flight group so its writes stay
+        // strictly before this command's. With `group_commit_events` off, only
+        // `Append` ever coalesces; every event/gap/other command takes the
+        // legacy raw path verbatim (the empty event/gap flushes are no-ops), so
+        // the gate-off statement stream is byte-identical to the prior code.
+        let kind = writer_coalesce_kind(&cmd, group_commit_events);
 
-        if let Some(message) = flush_append_segment_group_recovering(
-            backend,
-            &mut pending_append_segments,
-            mmap_mirror,
-            segment_redactors,
-        ) {
-            fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
-            io_gate.reset_after_panic();
-            return Some(message);
+        if !matches!(kind, WriterCoalesceKind::Append) {
+            if let Some(message) = flush_append_segment_group_recovering(
+                backend,
+                &mut pending_append_segments,
+                mmap_mirror,
+                segment_redactors,
+            ) {
+                // The flushed appends were already failed inside the flush; drop
+                // the still-undispatched `cmd` (closing its oneshot, matching the
+                // legacy fail path) and fail the rest.
+                fail_pending_event_gap(std::mem::take(&mut pending_event_gap), message.clone());
+                fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+                io_gate.reset_after_panic();
+                return Some(message);
+            }
+        }
+        if !matches!(kind, WriterCoalesceKind::EventGap) {
+            if let Some(message) = flush_event_gap_group_recovering(
+                backend,
+                &mut pending_event_gap,
+                mmap_mirror,
+                segment_redactors,
+            ) {
+                fail_pending_append_segments(
+                    std::mem::take(&mut pending_append_segments),
+                    message.clone(),
+                );
+                fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+                io_gate.reset_after_panic();
+                return Some(message);
+            }
         }
 
-        if let Some(message) = dispatch_write_command_raw_recovering(
-            backend,
-            cmd,
-            should_break,
-            mmap_mirror,
-            segment_redactors,
-        ) {
-            fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
-            io_gate.reset_after_panic();
-            return Some(message);
+        match kind {
+            WriterCoalesceKind::Append => match pending_append_segment_from_command(cmd) {
+                Ok(pending_append) => pending_append_segments.push(pending_append),
+                // `kind` already proved this is an append; the Err arm is
+                // unreachable, but dispatch defensively rather than panic.
+                Err(unexpected) => {
+                    if let Some(message) = dispatch_write_command_raw_recovering(
+                        backend,
+                        *unexpected,
+                        should_break,
+                        mmap_mirror,
+                        segment_redactors,
+                    ) {
+                        fail_pending_storage_io_commands(
+                            std::mem::take(pending_io),
+                            message.clone(),
+                        );
+                        io_gate.reset_after_panic();
+                        return Some(message);
+                    }
+                }
+            },
+            WriterCoalesceKind::EventGap => match pending_event_or_gap_from_command(cmd) {
+                Ok(pending_eg) => pending_event_gap.push(pending_eg),
+                Err(unexpected) => {
+                    if let Some(message) = dispatch_write_command_raw_recovering(
+                        backend,
+                        *unexpected,
+                        should_break,
+                        mmap_mirror,
+                        segment_redactors,
+                    ) {
+                        fail_pending_storage_io_commands(
+                            std::mem::take(pending_io),
+                            message.clone(),
+                        );
+                        io_gate.reset_after_panic();
+                        return Some(message);
+                    }
+                }
+            },
+            WriterCoalesceKind::Other => {
+                if let Some(message) = dispatch_write_command_raw_recovering(
+                    backend,
+                    cmd,
+                    should_break,
+                    mmap_mirror,
+                    segment_redactors,
+                ) {
+                    fail_pending_storage_io_commands(std::mem::take(pending_io), message.clone());
+                    io_gate.reset_after_panic();
+                    return Some(message);
+                }
+            }
         }
     }
 
@@ -8265,10 +8450,307 @@ fn flush_storage_io_pending_commands(
         mmap_mirror,
         segment_redactors,
     ) {
+        fail_pending_event_gap(std::mem::take(&mut pending_event_gap), message.clone());
+        io_gate.reset_after_panic();
+        return Some(message);
+    }
+    if let Some(message) = flush_event_gap_group_recovering(
+        backend,
+        &mut pending_event_gap,
+        mmap_mirror,
+        segment_redactors,
+    ) {
         io_gate.reset_after_panic();
         return Some(message);
     }
     None
+}
+
+/// Coalescing class for a writer command inside [`flush_storage_io_pending_commands`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriterCoalesceKind {
+    /// `AppendSegment` — always coalesced via the existing append group commit.
+    Append,
+    /// `RecordEvent`/`RecordGap` — coalesced only when `group_commit_events` is on.
+    EventGap,
+    /// Everything else — dispatched one-at-a-time on the legacy raw path.
+    Other,
+}
+
+fn writer_coalesce_kind(cmd: &WriteCommand, group_commit_events: bool) -> WriterCoalesceKind {
+    match cmd {
+        WriteCommand::AppendSegment { .. } => WriterCoalesceKind::Append,
+        WriteCommand::RecordEvent { .. } | WriteCommand::RecordGap { .. }
+            if group_commit_events =>
+        {
+            WriterCoalesceKind::EventGap
+        }
+        _ => WriterCoalesceKind::Other,
+    }
+}
+
+/// A `RecordEvent`/`RecordGap` writer command parked for group commit.
+///
+/// Mirrors [`PendingAppendSegmentWrite`]: the caller's oneshot is held until the
+/// shared `COMMIT` outcome is known, so a commit failure is never reported as
+/// `Ok`. A singleton group falls back to the byte-identical legacy raw dispatch.
+enum PendingEventOrGap {
+    Event {
+        event: StoredEvent,
+        respond: WriterResultResponder<i64>,
+    },
+    Gap {
+        pane_id: u64,
+        reason: String,
+        respond: WriterResultResponder<Option<Gap>>,
+    },
+}
+
+impl PendingEventOrGap {
+    fn into_write_command(self) -> WriteCommand {
+        match self {
+            PendingEventOrGap::Event { event, respond } => WriteCommand::RecordEvent {
+                event,
+                respond: respond.into_sender(),
+            },
+            PendingEventOrGap::Gap {
+                pane_id,
+                reason,
+                respond,
+            } => WriteCommand::RecordGap {
+                pane_id,
+                reason,
+                respond: respond.into_sender(),
+            },
+        }
+    }
+}
+
+fn pending_event_or_gap_from_command(
+    cmd: WriteCommand,
+) -> std::result::Result<PendingEventOrGap, Box<WriteCommand>> {
+    match cmd {
+        WriteCommand::RecordEvent { event, respond } => Ok(PendingEventOrGap::Event {
+            event,
+            respond: WriterResultResponder::new(respond),
+        }),
+        WriteCommand::RecordGap {
+            pane_id,
+            reason,
+            respond,
+        } => Ok(PendingEventOrGap::Gap {
+            pane_id,
+            reason,
+            respond: WriterResultResponder::new(respond),
+        }),
+        other => Err(Box::new(other)),
+    }
+}
+
+/// Per-command outcome captured inside the group transaction, returned only
+/// after `COMMIT` succeeds so callers never see a value that did not durably land.
+enum EventGapCommitResult {
+    Event(i64),
+    Gap(Option<Gap>),
+}
+
+fn flush_event_gap_group_recovering(
+    backend: &dyn StorageBackend,
+    pending_event_gap: &mut Vec<PendingEventOrGap>,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) -> Option<String> {
+    if pending_event_gap.is_empty() {
+        return None;
+    }
+
+    let mut group = std::mem::take(pending_event_gap);
+    if group.len() == 1 {
+        // A lone event/gap takes the legacy raw path verbatim: no BEGIN/COMMIT
+        // wrapper, byte-identical to the gate-off statement stream.
+        let pending = group.pop().expect("event/gap group length already checked");
+        let mut should_break = false;
+        return dispatch_write_command_raw_recovering(
+            backend,
+            pending.into_write_command(),
+            &mut should_break,
+            mmap_mirror,
+            segment_redactors,
+        );
+    }
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        event_gap_group_commit_backend(backend, &group, mmap_mirror, segment_redactors)
+    }));
+    match outcome {
+        Ok(result) => {
+            dispatch_event_gap_group_commit_result(result, group);
+            None
+        }
+        Err(payload) => {
+            STORAGE_WRITER_PANICS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            let message = format!(
+                "storage writer recovered from event/gap group commit panic: {}",
+                panic_payload_summary(payload.as_ref())
+            );
+            tracing::error!(
+                writer_panics_total = storage_writer_panics_total(),
+                error = %message,
+                "storage writer event/gap group commit panic recovered; failing grouped callers"
+            );
+            rollback_event_gap_group_best_effort(backend, "event/gap group panic");
+            fail_pending_event_gap(group, message.clone());
+            Some(message)
+        }
+    }
+}
+
+/// Run a run of `RecordEvent`/`RecordGap` commands inside one explicit
+/// transaction, calling the SAME per-command backends as the raw path so each
+/// statement, param (including per-command `now_ms()` for gaps), and `RETURNING`
+/// id is identical to gate-off — only the transaction (fsync) boundary widens.
+///
+/// The shared-`COMMIT` contract mirrors the append group: any per-command error
+/// or a `COMMIT` failure rolls back the whole group and is surfaced as `Err`, so
+/// no partial state is ever committed and no caller is told `Ok` for a write that
+/// did not land.
+fn event_gap_group_commit_backend(
+    backend: &dyn StorageBackend,
+    group: &[PendingEventOrGap],
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) -> Result<Vec<EventGapCommitResult>> {
+    if group.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    backend
+        .execute("BEGIN")
+        .map_err(|err| storage_backend_error("Begin event/gap group commit", err))?;
+
+    let result = event_gap_group_commit_inner(backend, group, mmap_mirror, segment_redactors);
+    match result {
+        Ok(results) => {
+            if let Err(err) = backend.execute("COMMIT") {
+                rollback_event_gap_group_best_effort(backend, "commit failure");
+                return Err(storage_backend_error("Commit event/gap group", err).into());
+            }
+            Ok(results)
+        }
+        Err(error) => {
+            rollback_event_gap_group_best_effort(backend, "event/gap failure");
+            Err(error)
+        }
+    }
+}
+
+fn event_gap_group_commit_inner(
+    backend: &dyn StorageBackend,
+    group: &[PendingEventOrGap],
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, SegmentPersistRedactor>,
+) -> Result<Vec<EventGapCommitResult>> {
+    let mut results = Vec::with_capacity(group.len());
+    for pending in group {
+        match pending {
+            PendingEventOrGap::Event { event, .. } => {
+                let id = record_event_backend(backend, event)?;
+                results.push(EventGapCommitResult::Event(id));
+            }
+            PendingEventOrGap::Gap {
+                pane_id, reason, ..
+            } => {
+                // Same pre-step the raw gap path runs (in-memory redactor drop,
+                // no DB write); keeps the persisted statement stream identical.
+                flush_segment_redactor_for_pane(backend, mmap_mirror, segment_redactors, *pane_id)?;
+                let gap = record_gap_backend(backend, *pane_id, reason)?;
+                results.push(EventGapCommitResult::Gap(gap));
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn dispatch_event_gap_group_commit_result(
+    result: Result<Vec<EventGapCommitResult>>,
+    group: Vec<PendingEventOrGap>,
+) {
+    match result {
+        Ok(results) => {
+            let pending_count = group.len();
+            let committed_count = results.len();
+            if committed_count != pending_count {
+                let message = format!(
+                    "storage event/gap group commit returned {committed_count} results for \
+                     {pending_count} pending commands"
+                );
+                tracing::error!(
+                    committed_count,
+                    pending_count,
+                    "storage writer event/gap group commit returned mismatched results; failing grouped callers"
+                );
+                fail_pending_event_gap(group, message);
+                return;
+            }
+
+            for (pending, committed) in group.into_iter().zip(results) {
+                match (pending, committed) {
+                    (PendingEventOrGap::Event { respond, .. }, EventGapCommitResult::Event(id)) => {
+                        respond.respond_best_effort(Ok(id));
+                    }
+                    (PendingEventOrGap::Gap { respond, .. }, EventGapCommitResult::Gap(gap)) => {
+                        respond.respond_best_effort(Ok(gap));
+                    }
+                    // Results are built in lockstep with `group`, so a kind
+                    // mismatch is impossible; fail closed rather than mis-route.
+                    (PendingEventOrGap::Event { respond, .. }, _) => {
+                        respond.respond_best_effort(Err(StorageError::Database(
+                            "event/gap group commit result kind mismatch".to_string(),
+                        )
+                        .into()));
+                    }
+                    (PendingEventOrGap::Gap { respond, .. }, _) => {
+                        respond.respond_best_effort(Err(StorageError::Database(
+                            "event/gap group commit result kind mismatch".to_string(),
+                        )
+                        .into()));
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            let message = format!("storage event/gap group commit failed: {error}");
+            tracing::warn!(
+                commands = group.len(),
+                error = %error,
+                "storage writer event/gap group commit failed; failing grouped callers"
+            );
+            fail_pending_event_gap(group, message);
+        }
+    }
+}
+
+fn fail_pending_event_gap(group: Vec<PendingEventOrGap>, message: String) {
+    for pending in group {
+        match pending {
+            PendingEventOrGap::Event { respond, .. } => {
+                respond.respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+            }
+            PendingEventOrGap::Gap { respond, .. } => {
+                respond.respond_best_effort(Err(StorageError::Database(message.clone()).into()));
+            }
+        }
+    }
+}
+
+fn rollback_event_gap_group_best_effort(backend: &dyn StorageBackend, cause: &str) {
+    if let Err(err) = backend.execute("ROLLBACK") {
+        tracing::error!(
+            cause,
+            error = %err,
+            "failed to roll back event/gap group transaction"
+        );
+    }
 }
 
 #[allow(dead_code)]
@@ -8755,6 +9237,8 @@ fn writer_loop(
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
     queued_depth: &AtomicUsize,
+    group_commit_events: bool,
+    writer_wakeup: Option<&WriterWakeup>,
 ) {
     let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
     let mut io_gate = StorageIoWriterGate::default();
@@ -8797,6 +9281,7 @@ fn writer_loop(
                     mmap_mirror,
                     &mut segment_redactors,
                     &mut io_gate,
+                    group_commit_events,
                 );
 
                 if should_break {
@@ -8804,8 +9289,16 @@ fn writer_loop(
                 }
             }
             Err(mpsc::RecvError::Empty) => {
-                // Park briefly to avoid busy-waiting under no-load.
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                // Park until the sender signals fresh work, or fall back to the
+                // legacy fixed 1 ms poll when `writer_blocking_recv` is off.
+                if let Some(wakeup) = writer_wakeup {
+                    wakeup.park_for_work(
+                        std::time::Duration::from_millis(WRITER_BLOCKING_RECV_PARK_MS),
+                        queued_depth,
+                    );
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             Err(mpsc::RecvError::Disconnected | mpsc::RecvError::Cancelled) => {
                 break 'main;
@@ -9116,9 +9609,17 @@ mod writer_io_scheduler_tests {
     fn writer_batch_group_commits_consecutive_append_segments_same_pane() {
         run_storage_async_test(async {
             let backend = crate::storage_backend_trait::MockBackend::new();
-            backend.enqueue_row_response(Some(vec!["0".to_string()]));
-            backend.enqueue_row_response(Some(vec!["101".to_string()]));
-            backend.enqueue_row_response(Some(vec!["102".to_string()]));
+            // FIFO of query_row_typed responses for the grouped append path. Each
+            // segment now also runs a best-effort `segment_embeddings` insert
+            // (ft-xx5cl) via `execute_typed` -> `query_row_typed`, which consumes
+            // one response per segment; the embedding rows are `None` (return
+            // value ignored). Order: next_seq, insert#1, embed#1, insert#2,
+            // embed#2 (the same-pane second next_seq is served from the cache).
+            backend.enqueue_row_response(Some(vec!["0".to_string()])); // next_seq
+            backend.enqueue_row_response(Some(vec!["101".to_string()])); // insert #1
+            backend.enqueue_row_response(None); // embed #1 (ignored)
+            backend.enqueue_row_response(Some(vec!["102".to_string()])); // insert #2
+            backend.enqueue_row_response(None); // embed #2 (ignored)
 
             let mut gate = StorageIoWriterGate::default();
             let mut should_break = false;
@@ -9149,6 +9650,7 @@ mod writer_io_scheduler_tests {
                 &mut mmap_mirror,
                 &mut segment_redactors,
                 &mut gate,
+                false,
             );
 
             assert!(!should_break);
@@ -9375,6 +9877,7 @@ mod writer_io_scheduler_tests {
                 &mut mmap_mirror,
                 &mut segment_redactors,
                 &mut gate,
+                false,
             );
 
             assert!(!should_break);
@@ -9436,6 +9939,7 @@ mod writer_io_scheduler_tests {
                 &mut mmap_mirror,
                 &mut segment_redactors,
                 &mut gate,
+                false,
             );
 
             assert!(!should_break);
@@ -9475,11 +9979,626 @@ mod writer_io_scheduler_tests {
                 &mut mmap_mirror,
                 &mut segment_redactors,
                 &mut gate,
+                false,
             );
             crate::runtime_async::oneshot_recv(shutdown_rx)
                 .await
                 .expect("writer should still process a later shutdown");
             assert!(should_break);
+        });
+    }
+
+    // ----------------------------------------------------------------------
+    // [round-4 Q2] group-commit widen (events/gaps) + condvar wake proofs.
+    //
+    // Byte-equivalence strategy: the coalesced path calls the SAME per-command
+    // backends (`record_event_backend` / `record_gap_backend`) the legacy raw
+    // path calls, so the persisted statement stream — SQL, params, insert order,
+    // and `RETURNING` ids — is identical; only the transaction (fsync) boundary
+    // widens, which a DB dump cannot observe. These tests pin (a) one explicit
+    // transaction around a multi-command run, (b) per-command result order, (c)
+    // crash-atomicity (any failure rolls the whole group back and fails every
+    // caller), (d) singleton == legacy raw path, and (e) a real-SQLite dump that
+    // is identical with the gate on vs off.
+    // ----------------------------------------------------------------------
+
+    fn sample_event(
+        pane_id: u64,
+        rule_id: &str,
+        detected_at: i64,
+        dedupe_key: Option<&str>,
+    ) -> StoredEvent {
+        StoredEvent {
+            id: 0,
+            pane_id,
+            rule_id: rule_id.to_string(),
+            agent_type: "unknown".to_string(),
+            event_type: "pattern".to_string(),
+            severity: "info".to_string(),
+            confidence: 0.9,
+            extracted: None,
+            matched_text: Some(format!("match-{rule_id}")),
+            segment_id: None,
+            detected_at,
+            dedupe_key: dedupe_key.map(str::to_string),
+            handled_at: None,
+            handled_by_workflow_id: None,
+            handled_status: None,
+        }
+    }
+
+    #[test]
+    fn event_gap_group_commit_uses_single_transaction_and_keeps_result_order() {
+        run_storage_async_test(async {
+            let backend = crate::storage_backend_trait::MockBackend::new();
+            // One INSERT...RETURNING id per event, in dispatch order.
+            backend.enqueue_row_response(Some(vec!["201".to_string()]));
+            backend.enqueue_row_response(Some(vec!["202".to_string()]));
+            backend.enqueue_row_response(Some(vec!["203".to_string()]));
+
+            let (tx1, rx1) = oneshot::channel();
+            let (tx2, rx2) = oneshot::channel();
+            let (tx3, rx3) = oneshot::channel();
+            let group = vec![
+                PendingEventOrGap::Event {
+                    event: sample_event(7, "r1", 1_700_000_000_000, Some("k1")),
+                    respond: WriterResultResponder::new(tx1),
+                },
+                PendingEventOrGap::Event {
+                    event: sample_event(7, "r2", 1_700_000_000_001, Some("k2")),
+                    respond: WriterResultResponder::new(tx2),
+                },
+                PendingEventOrGap::Event {
+                    event: sample_event(7, "r3", 1_700_000_000_002, Some("k3")),
+                    respond: WriterResultResponder::new(tx3),
+                },
+            ];
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+
+            let result = event_gap_group_commit_backend(
+                &backend,
+                &group,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+            )
+            .expect("event group commit should succeed");
+            dispatch_event_gap_group_commit_result(Ok(result), group);
+
+            let id1 = crate::runtime_async::oneshot_recv(rx1)
+                .await
+                .expect("first response")
+                .expect("first ok");
+            let id2 = crate::runtime_async::oneshot_recv(rx2)
+                .await
+                .expect("second response")
+                .expect("second ok");
+            let id3 = crate::runtime_async::oneshot_recv(rx3)
+                .await
+                .expect("third response")
+                .expect("third ok");
+            assert_eq!((id1, id2, id3), (201, 202, 203), "ids in submission order");
+
+            assert_eq!(
+                backend.executed(),
+                vec!["BEGIN".to_string(), "COMMIT".to_string()],
+                "grouped events must use exactly one explicit transaction"
+            );
+            let insert_count = backend
+                .observed_queries()
+                .iter()
+                .filter(|(sql, _)| sql.contains("INSERT INTO events"))
+                .count();
+            assert_eq!(insert_count, 3, "every grouped event inserts inside the txn");
+        });
+    }
+
+    #[test]
+    fn event_gap_group_commit_mixes_events_and_gaps_in_one_transaction() {
+        run_storage_async_test(async {
+            let backend = crate::storage_backend_trait::MockBackend::new();
+            backend.enqueue_row_response(Some(vec!["301".to_string()])); // event 1 id
+            backend.enqueue_row_response(Some(vec!["5".to_string()])); // gap MAX(seq)
+            backend.enqueue_row_response(Some(vec!["77".to_string()])); // gap id
+            backend.enqueue_row_response(Some(vec!["302".to_string()])); // event 2 id
+
+            let (tx1, rx1) = oneshot::channel();
+            let (gtx, grx) = oneshot::channel();
+            let (tx2, rx2) = oneshot::channel();
+            let group = vec![
+                PendingEventOrGap::Event {
+                    event: sample_event(7, "r1", 1_700_000_000_000, Some("k1")),
+                    respond: WriterResultResponder::new(tx1),
+                },
+                PendingEventOrGap::Gap {
+                    pane_id: 7,
+                    reason: "capture gap".to_string(),
+                    respond: WriterResultResponder::new(gtx),
+                },
+                PendingEventOrGap::Event {
+                    event: sample_event(7, "r2", 1_700_000_000_002, Some("k2")),
+                    respond: WriterResultResponder::new(tx2),
+                },
+            ];
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+
+            let result = event_gap_group_commit_backend(
+                &backend,
+                &group,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+            )
+            .expect("mixed group commit should succeed");
+            dispatch_event_gap_group_commit_result(Ok(result), group);
+
+            let id1 = crate::runtime_async::oneshot_recv(rx1)
+                .await
+                .expect("event1")
+                .expect("event1 ok");
+            let gap = crate::runtime_async::oneshot_recv(grx)
+                .await
+                .expect("gap")
+                .expect("gap ok")
+                .expect("gap recorded");
+            let id2 = crate::runtime_async::oneshot_recv(rx2)
+                .await
+                .expect("event2")
+                .expect("event2 ok");
+
+            assert_eq!(id1, 301);
+            assert_eq!(id2, 302);
+            assert_eq!(gap.id, 77);
+            assert_eq!(gap.seq_before, 5);
+            assert_eq!(gap.seq_after, 6);
+            assert_eq!(gap.reason, "capture gap");
+
+            assert_eq!(
+                backend.executed(),
+                vec!["BEGIN".to_string(), "COMMIT".to_string()],
+                "interleaved events+gaps share one transaction"
+            );
+        });
+    }
+
+    #[test]
+    fn event_gap_group_commit_mid_group_failure_rolls_back_and_fails_all() {
+        run_storage_async_test(async {
+            let backend = crate::storage_backend_trait::MockBackend::new();
+            backend.enqueue_row_response(Some(vec!["401".to_string()])); // event 1 ok
+            backend.enqueue_row_response(None); // event 2 -> no id -> Err
+
+            let (tx1, rx1) = oneshot::channel();
+            let (tx2, rx2) = oneshot::channel();
+            let group = vec![
+                PendingEventOrGap::Event {
+                    event: sample_event(9, "r1", 1_700_000_000_000, Some("k1")),
+                    respond: WriterResultResponder::new(tx1),
+                },
+                PendingEventOrGap::Event {
+                    event: sample_event(9, "r2", 1_700_000_000_001, Some("k2")),
+                    respond: WriterResultResponder::new(tx2),
+                },
+            ];
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+
+            let result = event_gap_group_commit_backend(
+                &backend,
+                &group,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+            );
+            assert!(result.is_err(), "a failed insert must abort the group");
+            assert_eq!(
+                backend.executed(),
+                vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+                "a mid-group failure must roll the whole transaction back"
+            );
+            dispatch_event_gap_group_commit_result(result, group);
+
+            // The first event "succeeded" in-transaction but the rollback undid
+            // it, so its caller is told the write failed — never a false Ok.
+            let first = crate::runtime_async::oneshot_recv(rx1).await.expect("rx1");
+            assert!(first.is_err(), "first grouped caller fails closed");
+            let second = crate::runtime_async::oneshot_recv(rx2).await.expect("rx2");
+            assert!(second.is_err(), "second grouped caller fails closed");
+        });
+    }
+
+    struct CommitFailBackend {
+        inner: crate::storage_backend_trait::MockBackend,
+    }
+
+    impl CommitFailBackend {
+        fn new() -> Self {
+            Self {
+                inner: crate::storage_backend_trait::MockBackend::new(),
+            }
+        }
+
+        fn executed(&self) -> Vec<String> {
+            self.inner.executed()
+        }
+    }
+
+    impl StorageBackend for CommitFailBackend {
+        fn execute(&self, sql: &str) -> std::result::Result<usize, BackendError> {
+            if sql.trim().eq_ignore_ascii_case("COMMIT") {
+                return Err(BackendError::Query("injected commit failure".to_string()));
+            }
+            self.inner.execute(sql)
+        }
+
+        fn execute_batch(&self, sql: &str) -> std::result::Result<(), BackendError> {
+            self.inner.execute_batch(sql)
+        }
+
+        fn set_busy_timeout(
+            &self,
+            timeout: std::time::Duration,
+        ) -> std::result::Result<(), BackendError> {
+            self.inner.set_busy_timeout(timeout)
+        }
+
+        fn query_scalar(&self, sql: &str) -> std::result::Result<Option<String>, BackendError> {
+            self.inner.query_scalar(sql)
+        }
+
+        fn begin_transaction(
+            &self,
+        ) -> std::result::Result<crate::storage_backend_trait::TransactionGuard<'_>, BackendError>
+        {
+            self.inner.begin_transaction()
+        }
+
+        fn user_version(&self) -> std::result::Result<u32, BackendError> {
+            self.inner.user_version()
+        }
+
+        fn set_user_version(&self, version: u32) -> std::result::Result<(), BackendError> {
+            self.inner.set_user_version(version)
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "commit_fail"
+        }
+
+        fn query_row_strings(
+            &self,
+            sql: &str,
+            params: &[&str],
+        ) -> std::result::Result<Option<Vec<String>>, BackendError> {
+            self.inner.query_row_strings(sql, params)
+        }
+
+        fn query_map_strings(
+            &self,
+            sql: &str,
+            params: &[&str],
+        ) -> std::result::Result<Vec<Vec<String>>, BackendError> {
+            self.inner.query_map_strings(sql, params)
+        }
+
+        fn execute_many(
+            &self,
+            sql: &str,
+            param_rows: &[Vec<ToSqlValue<'_>>],
+        ) -> std::result::Result<usize, BackendError> {
+            self.inner.execute_many(sql, param_rows)
+        }
+    }
+
+    #[test]
+    fn event_gap_group_commit_commit_failure_rolls_back_and_fails_all() {
+        run_storage_async_test(async {
+            let backend = CommitFailBackend::new();
+            backend
+                .inner
+                .enqueue_row_response(Some(vec!["501".to_string()]));
+            backend
+                .inner
+                .enqueue_row_response(Some(vec!["502".to_string()]));
+
+            let (tx1, rx1) = oneshot::channel();
+            let (tx2, rx2) = oneshot::channel();
+            let group = vec![
+                PendingEventOrGap::Event {
+                    event: sample_event(3, "r1", 1_700_000_000_000, Some("k1")),
+                    respond: WriterResultResponder::new(tx1),
+                },
+                PendingEventOrGap::Event {
+                    event: sample_event(3, "r2", 1_700_000_000_001, Some("k2")),
+                    respond: WriterResultResponder::new(tx2),
+                },
+            ];
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+
+            let result = event_gap_group_commit_backend(
+                &backend,
+                &group,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+            );
+            assert!(result.is_err(), "a COMMIT failure must surface as Err");
+            assert_eq!(
+                backend.executed(),
+                vec!["BEGIN".to_string(), "ROLLBACK".to_string()],
+                "a failed COMMIT must be followed by ROLLBACK, never a silent partial commit"
+            );
+            dispatch_event_gap_group_commit_result(result, group);
+
+            assert!(
+                crate::runtime_async::oneshot_recv(rx1)
+                    .await
+                    .expect("rx1")
+                    .is_err(),
+                "first caller fails closed on commit failure"
+            );
+            assert!(
+                crate::runtime_async::oneshot_recv(rx2)
+                    .await
+                    .expect("rx2")
+                    .is_err(),
+                "second caller fails closed on commit failure"
+            );
+        });
+    }
+
+    #[test]
+    fn event_gap_singleton_uses_legacy_raw_path() {
+        run_storage_async_test(async {
+            let backend = crate::storage_backend_trait::MockBackend::new();
+            backend.enqueue_row_response(Some(vec!["601".to_string()]));
+
+            let (tx, rx) = oneshot::channel();
+            let mut pending = vec![PendingEventOrGap::Event {
+                event: sample_event(4, "r1", 1_700_000_000_000, Some("k1")),
+                respond: WriterResultResponder::new(tx),
+            }];
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+
+            let message = flush_event_gap_group_recovering(
+                &backend,
+                &mut pending,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+            );
+            assert!(message.is_none(), "singleton dispatch should succeed");
+            let id = crate::runtime_async::oneshot_recv(rx)
+                .await
+                .expect("response")
+                .expect("ok");
+            assert_eq!(id, 601);
+            assert!(
+                backend.executed().is_empty(),
+                "a lone event must not open an explicit transaction (legacy raw path)"
+            );
+        });
+    }
+
+    #[test]
+    fn dispatch_batch_group_commit_events_coalesces_and_balances_transactions() {
+        run_storage_async_test(async {
+            let backend = crate::storage_backend_trait::MockBackend::new();
+            backend.enqueue_row_response(Some(vec!["701".to_string()]));
+            backend.enqueue_row_response(Some(vec!["702".to_string()]));
+            backend.enqueue_row_response(Some(vec!["703".to_string()]));
+
+            let mut gate = StorageIoWriterGate::default();
+            let mut should_break = false;
+            let mut mmap_mirror = None;
+            let mut segment_redactors = HashMap::<u64, SegmentPersistRedactor>::new();
+            let (tx1, rx1) = oneshot::channel();
+            let (tx2, rx2) = oneshot::channel();
+            let (tx3, rx3) = oneshot::channel();
+            let mut batch = VecDeque::new();
+            batch.push_back(WriteCommand::RecordEvent {
+                event: sample_event(7, "r1", 1_700_000_000_000, Some("k1")),
+                respond: tx1,
+            });
+            batch.push_back(WriteCommand::RecordEvent {
+                event: sample_event(7, "r2", 1_700_000_000_001, Some("k2")),
+                respond: tx2,
+            });
+            batch.push_back(WriteCommand::RecordEvent {
+                event: sample_event(7, "r3", 1_700_000_000_002, Some("k3")),
+                respond: tx3,
+            });
+
+            dispatch_write_command_batch(
+                &backend,
+                batch,
+                &mut should_break,
+                &mut mmap_mirror,
+                &mut segment_redactors,
+                &mut gate,
+                true,
+            );
+
+            assert!(!should_break);
+            let mut ids = vec![
+                crate::runtime_async::oneshot_recv(rx1)
+                    .await
+                    .expect("rx1")
+                    .expect("ok1"),
+                crate::runtime_async::oneshot_recv(rx2)
+                    .await
+                    .expect("rx2")
+                    .expect("ok2"),
+                crate::runtime_async::oneshot_recv(rx3)
+                    .await
+                    .expect("rx3")
+                    .expect("ok3"),
+            ];
+            ids.sort_unstable();
+            assert_eq!(ids, vec![701, 702, 703], "every event durably committed");
+
+            let executed = backend.executed();
+            let begins = executed.iter().filter(|s| *s == "BEGIN").count();
+            let commits = executed.iter().filter(|s| *s == "COMMIT").count();
+            assert_eq!(begins, commits, "transactions stay balanced");
+            assert!(begins >= 1, "the event run coalesced into a transaction");
+            assert!(
+                !executed.iter().any(|s| s == "ROLLBACK"),
+                "the happy path never rolls back"
+            );
+            let insert_count = backend
+                .observed_queries()
+                .iter()
+                .filter(|(sql, _)| sql.contains("INSERT INTO events"))
+                .count();
+            assert_eq!(insert_count, 3);
+        });
+    }
+
+    #[test]
+    fn group_commit_events_real_db_dump_matches_legacy() {
+        run_storage_async_test(async {
+            async fn run_workload(group_commit_events: bool) -> String {
+                let temp_dir = tempfile::tempdir().expect("tempdir");
+                let db_path = temp_dir.path().join("group_commit_events.db");
+                let db_path_str = db_path.to_string_lossy().to_string();
+                let config = StorageConfig {
+                    group_commit_events,
+                    ..StorageConfig::default()
+                };
+                let storage = StorageHandle::with_config(&db_path_str, config)
+                    .await
+                    .expect("open storage");
+                storage
+                    .upsert_pane(PaneRecord {
+                        pane_id: 1,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("group-commit".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1_700_000_000_000,
+                        last_seen_at: 1_700_000_000_000,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("upsert pane");
+
+                for i in 0..24_i64 {
+                    let event = StoredEvent {
+                        id: 0,
+                        pane_id: 1,
+                        rule_id: format!("rule-{i}"),
+                        agent_type: "unknown".to_string(),
+                        event_type: "pattern".to_string(),
+                        severity: "info".to_string(),
+                        confidence: 0.5 + (i as f64) / 100.0,
+                        extracted: None,
+                        matched_text: Some(format!("match-{i}")),
+                        segment_id: None,
+                        detected_at: 1_700_000_000_000 + i,
+                        dedupe_key: Some(format!("dedupe-{i}")),
+                        handled_at: None,
+                        handled_by_workflow_id: None,
+                        handled_status: None,
+                    };
+                    storage.record_event(event).await.expect("record event");
+                }
+
+                let events = storage
+                    .get_events(EventQuery {
+                        limit: Some(1000),
+                        ..EventQuery::default()
+                    })
+                    .await
+                    .expect("read events");
+                storage.shutdown().await.expect("shutdown");
+                serde_json::to_string(&events).expect("serialize events")
+            }
+
+            let legacy = run_workload(false).await;
+            let widened = run_workload(true).await;
+            assert_eq!(
+                legacy, widened,
+                "group-commit-events must produce a byte-identical event table dump"
+            );
+        });
+    }
+
+    #[test]
+    fn writer_blocking_recv_processes_writes_and_shuts_down() {
+        run_storage_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let db_path = temp_dir.path().join("blocking_recv.db");
+            let db_path_str = db_path.to_string_lossy().to_string();
+            let config = StorageConfig {
+                writer_blocking_recv: true,
+                group_commit_events: true,
+                ..StorageConfig::default()
+            };
+            let storage = StorageHandle::with_config(&db_path_str, config)
+                .await
+                .expect("open storage");
+            storage
+                .upsert_pane(PaneRecord {
+                    pane_id: 1,
+                    pane_uuid: None,
+                    domain: "local".to_string(),
+                    window_id: None,
+                    tab_id: None,
+                    title: Some("blocking-recv".to_string()),
+                    cwd: None,
+                    tty_name: None,
+                    first_seen_at: 1_700_000_000_000,
+                    last_seen_at: 1_700_000_000_000,
+                    observed: true,
+                    ignore_reason: None,
+                    last_decision_at: None,
+                })
+                .await
+                .expect("upsert pane");
+
+            for i in 0..16_i64 {
+                storage
+                    .append_segment(1, &format!("segment-{i}"), None)
+                    .await
+                    .expect("append segment");
+                let event = StoredEvent {
+                    id: 0,
+                    pane_id: 1,
+                    rule_id: format!("rule-{i}"),
+                    agent_type: "unknown".to_string(),
+                    event_type: "pattern".to_string(),
+                    severity: "info".to_string(),
+                    confidence: 0.7,
+                    extracted: None,
+                    matched_text: Some(format!("match-{i}")),
+                    segment_id: None,
+                    detected_at: 1_700_000_000_000 + i,
+                    dedupe_key: Some(format!("dedupe-{i}")),
+                    handled_at: None,
+                    handled_by_workflow_id: None,
+                    handled_status: None,
+                };
+                storage.record_event(event).await.expect("record event");
+            }
+
+            let segments = storage.get_segments(1, 1000).await.expect("read segments");
+            assert_eq!(segments.len(), 16, "condvar-park writer persisted all segments");
+            let events = storage
+                .get_events(EventQuery {
+                    limit: Some(1000),
+                    ..EventQuery::default()
+                })
+                .await
+                .expect("read events");
+            assert_eq!(events.len(), 16, "condvar-park writer persisted all events");
+            // Clean shutdown proves the Shutdown command notifies and wakes the
+            // parked writer rather than waiting out the park ceiling.
+            storage.shutdown().await.expect("shutdown");
         });
     }
 }
@@ -24153,6 +25272,8 @@ fn storage_handle_writer_queue_processes_all() {
             write_queue_size: 4,
             read_pool_size: DEFAULT_READ_POOL_MAX_PER_PATH,
             defer_fts_triggers: false,
+            group_commit_events: false,
+            writer_blocking_recv: false,
         };
         let storage = StorageHandle::with_config(&db_path_str, config)
             .await
