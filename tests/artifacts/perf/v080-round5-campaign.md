@@ -83,3 +83,13 @@ _(tick entries appended by the orchestrator tend-loop)_
   proof (validates B1 split-makes-it-fast + B2 bocpd) and E2's M6 bench locally (m6_lock_wait_evidence
   group). Tally: 6 beads closed (.5/.7/.10/.11/.13 + earlier), MEASURED M4/Q1/Q4 keep + M9/S3-FIFO
   default-off. Threads C done; A ~5 flags measured; B proof in flight (B4); D 4 ideas landing; E running.
+- 2026-06-19 tend#6 — THREAD E DONE: E2 ran the M6 evidence bench locally — reader lock-wait p95 under
+  6 writers at 200 panes is only 42→250ns (5.95× ratio but **sub-µs absolute, all 4 configs
+  above_noise=false**, ~3 orders below the 50µs bar); clone_then_scan even holds the lock LONGER than
+  scan_under_lock → M6 COW premise unjustified. M6 KILLED with hard evidence (negative-ledger, Form 1).
+  .16 closed. D2 (.12) + EV2 (.19) self-closed GREEN → Thread D: D1/D2/EV1(proof-pending)/EV2 done.
+  Stood-down panes reported CODE-DONE proof-pending (.4/.6/.8 banked). B4 core --lib + patterns trio
+  (Q5/Q6/M5) running. Will run consolidated bench-compile (.4/.6) AFTER B4 (avoid concurrent core-class
+  RCH truncation). Dispatched 2 more mined ideas: EV3 .21 (blocked/rank-select scrollback) → cod_1,
+  EV4 .22 (set-based FTS batcher) → cod_3. Q3 gate uses env::var_os().is_some() (empty-var=ON footgun)
+  → needs a forced-algorithm A/B, recorded for separate handling.

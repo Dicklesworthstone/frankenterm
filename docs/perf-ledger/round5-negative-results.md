@@ -56,6 +56,30 @@ hit-rate win that pays for it.)
 
 ---
 
-_(round-5 measured-no-win / reject / revert entries land below as A/B runs complete on the quiet host.
-M6 persistent COW grid stays governed by its round-4 entry until the E1 concurrent-search bench produces
-contention evidence; E2 will either escalate M6 or refresh that entry here with the measured numbers.)_
+### 2026-06-19 | M6 persistent COW scrollback grid — MEASURED not-justified, stays DEFERRED
+
+**Status:** evidence-based re-deferral (NOT attempted; the round-4 retry predicate is now MEASURED FALSE).
+E1 built the concurrent-search-while-streaming evidence harness
+(`crates/frankenterm-core/benches/m6_search_while_streaming.rs`, group `m6_lock_wait_evidence`); E2 ran
+it locally and read the per-pane `Arc<Mutex>` reader lock-wait under 6 background streaming writers.
+**Measurement (reader lock-wait p95, contended vs quiescent):**
+- 100 panes, scan-under-lock: 42ns → 291ns (6.9× ratio); 200 panes: 42ns → 250ns (5.95× ratio).
+- 100 panes, clone-then-scan: 125ns → 333ns (2.7×); 200 panes: 125ns → 291ns (2.3×).
+- **All 4 configs `above_noise: false`** — the bar is contended p95 ≥ 3× baseline AND ≥ 50µs; the ratio
+  clears 3× but the absolute contended p95 wait is only ~250-333 **nanoseconds**, ~3 orders of magnitude
+  below the 50µs threshold. Max-wait outliers reached ~0.5ms once but p95/p99 stay sub-10µs.
+- The per-pane mutex serializes access with negligible queueing. Notably the `clone_then_scan` strategy
+  HOLDS the lock LONGER (15-47µs) than `scan_under_lock` (3-15µs) — cloning the scrollback is more
+  expensive than scanning it under the lock, so M6's COW/snapshot-to-avoid-holding-the-lock premise does
+  not even pay off at this scale.
+**Verdict:** M6 (path-copying COW rope, ~2-4× memory overhead, large surface touching term + scrollback,
+collides with Q1/M4/M1) is **NOT justified by measured contention**. It stays deferred.
+**Retry-condition predicate (Form 1):** Retry only if a profiler attributes a clearly-above-noise share
+(contended reader lock-wait p95 ≥ 50µs, i.e. ≥3 orders above today's ~250ns) to scrollback read/render
+lock contention on a real high-pane-count search-while-streaming workload — not reproduced by this
+harness at 200 panes / 6 writers. Until then M6 is speculative.
+**Rollback:** n/a (never landed). Bench harness retained for future re-measurement.
+
+---
+
+_(round-5 measured-no-win / reject / revert entries land below as A/B runs complete on the quiet host.)_
