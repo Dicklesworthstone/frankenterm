@@ -33,12 +33,29 @@ const PRINT_BATCHING_ENV: &str = "FT_MOONSHOT_PARSER_PRINT_BATCHING";
 /// is `std`-only; `no_std` builds fall back to the compile-time feature.
 #[inline]
 fn default_print_batching() -> bool {
-    if cfg!(feature = "parser-print-batching") {
-        return true;
-    }
+    cfg!(feature = "parser-print-batching") || env_flag_truthy(PRINT_BATCHING_ENV)
+}
+
+/// Env gate for the Round-5 D2 table-driven CSI/OSC dispatch optimization
+/// (ft-round5-gauntlet-lw0s7.12). Default-OFF; see [`default_table_dispatch`].
+const TABLE_DISPATCH_ENV: &str = "FT_MOONSHOT_PARSER_TABLE_DISPATCH";
+
+/// Resolve the default `table_dispatch` setting for a freshly constructed
+/// [`Parser`]. Off unless the `parser-table-dispatch` feature is compiled in or
+/// the `FT_MOONSHOT_PARSER_TABLE_DISPATCH` env var is set truthy at run time.
+#[inline]
+fn default_table_dispatch() -> bool {
+    cfg!(feature = "parser-table-dispatch") || env_flag_truthy(TABLE_DISPATCH_ENV)
+}
+
+/// Shared truthy-env reader for the `FT_MOONSHOT_*` parser gates (mirrors the
+/// sibling storage/scrollback gates). The env read is `std`-only; `no_std`
+/// builds rely on the compile-time feature flags alone and always return false.
+#[inline]
+fn env_flag_truthy(_name: &str) -> bool {
     #[cfg(feature = "std")]
     {
-        if let Ok(value) = std::env::var(PRINT_BATCHING_ENV) {
+        if let Ok(value) = std::env::var(_name) {
             let value = value.trim();
             return value.eq_ignore_ascii_case("1")
                 || value.eq_ignore_ascii_case("on")
@@ -103,6 +120,12 @@ struct ParseState {
     get_tcap: Option<GetTcapBuilder>,
     #[cfg(feature = "tmux_cc")]
     tmux_state: Option<RefCell<crate::tmux_cc::Parser>>,
+    /// Round-5 D2 (ft-round5-gauntlet-lw0s7.12): when set, [`Performer`]'s
+    /// CSI/OSC dispatch uses the table-driven fast decoders ([`CSI::parse_fast`]
+    /// / [`OperatingSystemCommand::parse_fast`]) before the generic parser.
+    /// Default-OFF; lives on `ParseState` because the `VTActor` dispatch methods
+    /// (`csi_dispatch`/`osc_dispatch`) only have access to the parse state.
+    table_dispatch: bool,
 }
 
 const MAX_SHORT_DCS_BYTES: usize = 8 * 1024 * 1024;
@@ -132,9 +155,13 @@ impl Default for Parser {
 
 impl Parser {
     pub fn new() -> Self {
+        let state = ParseState {
+            table_dispatch: default_table_dispatch(),
+            ..Default::default()
+        };
         Self {
             state_machine: VTParser::new(),
-            state: RefCell::new(Default::default()),
+            state: RefCell::new(state),
             print_batching: default_print_batching(),
         }
     }
@@ -162,6 +189,29 @@ impl Parser {
     #[doc(hidden)]
     pub fn print_batching(&self) -> bool {
         self.print_batching
+    }
+
+    /// Enable or disable table-driven CSI/OSC fast dispatch (Round-5 D2,
+    /// ft-round5-gauntlet-lw0s7.12). Default is off unless the
+    /// `parser-table-dispatch` feature is enabled.
+    ///
+    /// When enabled, CSI and OSC sequences are first offered to the table-driven
+    /// fast decoders ([`CSI::parse_fast`] / `OperatingSystemCommand::parse_fast`),
+    /// which produce a byte-identical action stream for the common shapes and
+    /// fall back to the generic parser otherwise.
+    ///
+    /// Exposed `#[doc(hidden)]` for the A/B bench harness and the equivalence
+    /// test only; this is not part of the stable parser API.
+    #[doc(hidden)]
+    pub fn set_table_dispatch(&mut self, on: bool) {
+        self.state.borrow_mut().table_dispatch = on;
+    }
+
+    /// Returns whether table-driven CSI/OSC fast dispatch is enabled.
+    /// See [`Parser::set_table_dispatch`].
+    #[doc(hidden)]
+    pub fn table_dispatch(&self) -> bool {
+        self.state.borrow().table_dispatch
     }
 
     /// advance with tmux parser, bypass VTParse
@@ -556,11 +606,27 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     }
 
     fn osc_dispatch(&mut self, osc: &[&[u8]]) {
-        let osc = OperatingSystemCommand::parse(osc);
-        (self.callback)(Action::OperatingSystemCommand(Box::new(osc)));
+        // D2 (ft-round5-gauntlet-lw0s7.12): gated table-driven fast decoder.
+        let parsed = if self.state.table_dispatch {
+            OperatingSystemCommand::parse_fast(osc)
+        } else {
+            OperatingSystemCommand::parse(osc)
+        };
+        (self.callback)(Action::OperatingSystemCommand(Box::new(parsed)));
     }
 
     fn csi_dispatch(&mut self, params: &[CsiParam], parameters_truncated: bool, control: u8) {
+        // D2 (ft-round5-gauntlet-lw0s7.12): offer the sequence to the
+        // table-driven fast decoder first; it emits a byte-identical action
+        // stream for the common shapes (and emits nothing when it declines).
+        if self.state.table_dispatch {
+            let cb = &mut *self.callback;
+            if CSI::parse_fast(params, parameters_truncated, control as char, &mut |action| {
+                cb(Action::CSI(action));
+            }) {
+                return;
+            }
+        }
         for action in CSI::parse(params, parameters_truncated, control as char) {
             (self.callback)(Action::CSI(action));
         }

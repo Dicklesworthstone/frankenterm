@@ -69,9 +69,18 @@ docs = ["use_serde", "image", "tmux_cc", "kitty-shm"]
 # instead of one Action::Print per codepoint. Default-OFF; also toggleable at
 # runtime via Parser::set_print_batching for the A/B bench and equivalence test.
 parser-print-batching = []
+# [ft-round5-gauntlet-lw0s7.12] D2: when enabled, Parser CSI/OSC dispatch uses
+# the table-driven fast decoders (256-entry CSI final-byte table + direct OSC
+# numeric-code match) before the generic parser. Default-OFF; also toggleable at
+# runtime via Parser::set_table_dispatch / FT_MOONSHOT_PARSER_TABLE_DISPATCH.
+parser-table-dispatch = []
 
 [[bench]]
 name = "parser_print_batching"
+harness = false
+
+[[bench]]
+name = "csi_osc_dispatch"
 harness = false
 
 [dev-dependencies]

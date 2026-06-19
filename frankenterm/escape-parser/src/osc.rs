@@ -160,7 +160,22 @@ impl Display for Selection {
 
 impl OperatingSystemCommand {
     pub fn parse(osc: &[&[u8]]) -> Self {
-        Self::internal_parse(osc).unwrap_or_else(|err| {
+        Self::parse_impl(osc, false)
+    }
+
+    /// D2 table-driven fast dispatch (ft-round5-gauntlet-lw0s7.12): like
+    /// [`OperatingSystemCommand::parse`] but resolves common numeric OSC codes
+    /// via a direct byte-slice match instead of the `String` + HashMap lookup.
+    /// Byte-identical to `parse` (the fast match mirrors the canonical code
+    /// table and falls back to it for any non-fast code). `#[doc(hidden)]`:
+    /// exposed for the A/B bench and equivalence harness only.
+    #[doc(hidden)]
+    pub fn parse_fast(osc: &[&[u8]]) -> Self {
+        Self::parse_impl(osc, true)
+    }
+
+    fn parse_impl(osc: &[&[u8]], fast: bool) -> Self {
+        Self::internal_parse(osc, fast).unwrap_or_else(|err| {
             let mut vec = Vec::new();
             for slice in osc {
                 vec.push(slice.to_vec());
@@ -260,7 +275,7 @@ impl OperatingSystemCommand {
         ))
     }
 
-    fn internal_parse(osc: &[&[u8]]) -> Result<Self> {
+    fn internal_parse(osc: &[&[u8]], fast: bool) -> Result<Self> {
         ensure!(!osc.is_empty(), "no params");
         let p1str = String::from_utf8_lossy(osc[0]);
 
@@ -268,21 +283,34 @@ impl OperatingSystemCommand {
             bail!("zero length osc");
         }
 
-        // Ugh, this is to handle "OSC ltitle" which is a legacyish
-        // OSC for encoding a window title change request.  These days
-        // OSC 2 is preferred for this purpose, but we need to support
-        // generating and parsing the legacy form because it is the
-        // response for the CSI ReportWindowTitle.
-        // So, for non-numeric OSCs, we look up the prefix and use that.
-        // This only works if the non-numeric OSC code has length == 1.
-        let osc_code = if !p1str.chars().nth(0).unwrap().is_ascii_digit() && osc.len() == 1 {
-            let mut p1 = String::new();
-            p1.push(p1str.chars().nth(0).unwrap());
-            OperatingSystemCommandCode::from_code(&p1)
-        } else {
-            OperatingSystemCommandCode::from_code(&p1str)
-        }
-        .ok_or_else(|| format!("unknown code"))?;
+        // D2 fast path: resolve common numeric codes by direct byte match,
+        // skipping the String+HashMap lookup. The byte-slice keys mirror the
+        // canonical code table, so a hit yields the same variant as `from_code`.
+        // Anything not in the fast set (including the legacy non-numeric OSCs
+        // below) falls through to the generic resolution unchanged.
+        let osc_code = match fast
+            .then(|| OperatingSystemCommandCode::from_code_fast(osc[0]))
+            .flatten()
+        {
+            Some(code) => code,
+            None => {
+                // Ugh, this is to handle "OSC ltitle" which is a legacyish
+                // OSC for encoding a window title change request.  These days
+                // OSC 2 is preferred for this purpose, but we need to support
+                // generating and parsing the legacy form because it is the
+                // response for the CSI ReportWindowTitle.
+                // So, for non-numeric OSCs, we look up the prefix and use that.
+                // This only works if the non-numeric OSC code has length == 1.
+                if !p1str.chars().nth(0).unwrap().is_ascii_digit() && osc.len() == 1 {
+                    let mut p1 = String::new();
+                    p1.push(p1str.chars().nth(0).unwrap());
+                    OperatingSystemCommandCode::from_code(&p1)
+                } else {
+                    OperatingSystemCommandCode::from_code(&p1str)
+                }
+                .ok_or_else(|| format!("unknown code"))?
+            }
+        };
 
         macro_rules! single_string {
             ($variant:ident) => {{
@@ -557,6 +585,30 @@ impl OperatingSystemCommandCode {
 
     fn as_code(self) -> &'static str {
         OscMap::linear_search_variant(&self)
+    }
+}
+
+impl OperatingSystemCommandCode {
+    /// D2 fast path (ft-round5-gauntlet-lw0s7.12): resolve the numeric OSC code
+    /// directly from its raw bytes, mirroring the canonical decimal keys in the
+    /// OSC code table without building a `String` and hashing it. Returns `None`
+    /// for codes outside the fast set so the caller falls back to the generic
+    /// `from_code` lookup; each byte-slice pattern is an exact canonical key, so
+    /// a hit returns the same variant the table would (byte-identical).
+    fn from_code_fast(code: &[u8]) -> Option<Self> {
+        use OperatingSystemCommandCode::*;
+        Some(match code {
+            b"0" => SetIconNameAndWindowTitle,
+            b"1" => SetIconName,
+            b"2" => SetWindowTitle,
+            b"7" => SetCurrentWorkingDirectory,
+            b"8" => SetHyperlink,
+            b"9" => SystemNotification,
+            b"52" => ManipulateSelectionData,
+            b"133" => FinalTermSemanticPrompt,
+            b"1337" => ITermProprietary,
+            _ => return None,
+        })
     }
 }
 
@@ -1514,6 +1566,73 @@ mod test {
         assert_eq!(encode(&result), expected);
 
         result
+    }
+
+    /// D2 (ft-round5-gauntlet-lw0s7.12): the table-driven fast OSC decoder must
+    /// produce a byte-identical `OperatingSystemCommand` versus the generic
+    /// String+HashMap path for every fast code AND for codes/forms that must
+    /// fall back.
+    #[test]
+    fn d2_osc_fast_matches_generic() {
+        let cases: &[&[&[u8]]] = &[
+            // fast numeric codes
+            &[b"0", b"icon and window"],
+            &[b"1", b"icon name"],
+            &[b"2", b"window title"],
+            &[b"2", b"part one", b"part two"],
+            &[b"7", b"file://host/home/user"],
+            &[b"8", b"", b"https://example.com"],
+            &[b"9", b"a notification"],
+            &[b"9", b"4", b"1", b"42"],
+            &[b"52", b"c", b"aGVsbG8="],
+            &[b"133", b"A"],
+            &[b"1337", b"CurrentDir=/tmp"],
+            // codes NOT in the fast set -> generic path
+            &[b"4", b"0", b"#000000"],
+            &[b"10", b"#ffffff"],
+            &[b"104"],
+            &[b"110"],
+            &[b"22", b"pointer"],
+            &[b"l"],
+            &[b"L"],
+            &[b"532534523", b"hello"],
+            &[b"00", b"weird leading zero"], // "00" is not the "0" key
+            &[b"777", b"rxvt"],
+            &[b""],
+        ];
+        for osc in cases {
+            let generic = OperatingSystemCommand::parse(osc);
+            let fast = OperatingSystemCommand::parse_fast(osc);
+            assert_eq!(generic, fast, "OSC fast diverged for {osc:?}");
+        }
+    }
+
+    #[test]
+    fn d2_from_code_fast_mirrors_from_code() {
+        for code in [
+            &b"0"[..],
+            b"1",
+            b"2",
+            b"7",
+            b"8",
+            b"9",
+            b"52",
+            b"133",
+            b"1337",
+        ] {
+            let fast = OperatingSystemCommandCode::from_code_fast(code);
+            let generic =
+                OperatingSystemCommandCode::from_code(&String::from_utf8_lossy(code));
+            assert_eq!(fast, generic, "from_code_fast diverged for {code:?}");
+            assert!(fast.is_some());
+        }
+        // Codes outside the fast set must return None (forcing generic lookup).
+        for code in [&b"4"[..], b"10", b"104", b"00", b"777", b"l", b"x"] {
+            assert!(
+                OperatingSystemCommandCode::from_code_fast(code).is_none(),
+                "from_code_fast must decline {code:?}"
+            );
+        }
     }
 
     #[test]

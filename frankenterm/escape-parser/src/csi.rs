@@ -1724,6 +1724,35 @@ impl CSI {
             orig_params: params,
         }
     }
+
+    /// D2 table-driven fast dispatch (ft-round5-gauntlet-lw0s7.12).
+    ///
+    /// For common CSI shapes recognized by [`CSI_FAST_CLASS`], decode the
+    /// sequence directly and push each resulting [`CSI`] via `emit`, returning
+    /// `true`. For everything else return `false` and emit nothing, so the
+    /// caller falls back to the generic [`CSI::parse`] iterator. The emitted
+    /// action stream is guaranteed byte-identical to `CSI::parse(...).collect()`
+    /// for the handled shapes (verified by the equivalence corpus); the fast
+    /// path NEVER emits before it has committed to handling the sequence.
+    #[doc(hidden)]
+    pub fn parse_fast<E: FnMut(CSI)>(
+        params: &[CsiParam],
+        parameters_truncated: bool,
+        control: char,
+        emit: &mut E,
+    ) -> bool {
+        if parameters_truncated {
+            return false;
+        }
+        let idx = control as usize;
+        if idx >= 256 {
+            return false;
+        }
+        match CSI_FAST_CLASS[idx] {
+            CSI_FAST_SGR => sgr_fast(params, emit),
+            _ => false,
+        }
+    }
 }
 
 /// A little helper to convert i64 -> u8 if safe
@@ -2960,6 +2989,155 @@ pub enum SgrCode {
     BackgroundColor = 48,
 }
 
+/// D2 fast-dispatch class for a CSI final byte (ft-round5-gauntlet-lw0s7.12).
+/// `0` = no fast path (use the generic [`CSI::parse`]); `CSI_FAST_SGR` = route
+/// to [`sgr_fast`].
+const CSI_FAST_SGR: u8 = 1;
+
+/// 256-entry CSI final-byte dispatch table. Indexed by the final byte; the only
+/// fast-eligible final today is `m` (SGR), which is by far the most common CSI
+/// in real streams. The table is the extension point for adding more direct
+/// decoders (cursor/edit finals) later without touching the dispatch site.
+const CSI_FAST_CLASS: [u8; 256] = {
+    let mut table = [0u8; 256];
+    table[b'm' as usize] = CSI_FAST_SGR;
+    table
+};
+
+/// Map a single SGR integer code to its [`Sgr`] action for the fast path,
+/// mirroring the per-code arms of [`CSIParser::sgr`] EXACTLY. Returns `None` for
+/// the codes that consume a variable number of following parameters
+/// (`38`/`48`/`58` colour selectors) and for any integer that is not a known
+/// `SgrCode`, forcing a fall back to the generic parser. The `match` is
+/// exhaustive over `SgrCode`, so the compiler guarantees no variant is missed;
+/// the value mapping is verified byte-identical by the equivalence corpus.
+///
+/// Safe only when the caller guarantees no `:` sub-parameter follows (see
+/// [`sgr_fast`]): in that colon-free context `CSIParser::underline` always
+/// returns `Underline::Single` for code `4`, which this mirrors.
+fn sgr_simple(value: i64) -> Option<Sgr> {
+    let code: SgrCode = FromPrimitive::from_i64(value)?;
+    Some(match code {
+        // Variable-length colour selectors: defer to the generic parser.
+        SgrCode::ForegroundColor | SgrCode::BackgroundColor | SgrCode::UnderlineColor => {
+            return None;
+        }
+        SgrCode::Reset => Sgr::Reset,
+        SgrCode::IntensityBold => Sgr::Intensity(Intensity::Bold),
+        SgrCode::IntensityDim => Sgr::Intensity(Intensity::Half),
+        SgrCode::NormalIntensity => Sgr::Intensity(Intensity::Normal),
+        SgrCode::UnderlineOn => Sgr::Underline(Underline::Single),
+        SgrCode::UnderlineDouble => Sgr::Underline(Underline::Double),
+        SgrCode::UnderlineOff => Sgr::Underline(Underline::None),
+        SgrCode::ResetUnderlineColor => Sgr::UnderlineColor(ColorSpec::default()),
+        SgrCode::BlinkOn => Sgr::Blink(Blink::Slow),
+        SgrCode::RapidBlinkOn => Sgr::Blink(Blink::Rapid),
+        SgrCode::BlinkOff => Sgr::Blink(Blink::None),
+        SgrCode::ItalicOn => Sgr::Italic(true),
+        SgrCode::ItalicOff => Sgr::Italic(false),
+        SgrCode::VerticalAlignSuperScript => Sgr::VerticalAlign(VerticalAlign::SuperScript),
+        SgrCode::VerticalAlignSubScript => Sgr::VerticalAlign(VerticalAlign::SubScript),
+        SgrCode::VerticalAlignBaseLine => Sgr::VerticalAlign(VerticalAlign::BaseLine),
+        SgrCode::ForegroundBlack => Sgr::Foreground(AnsiColor::Black.into()),
+        SgrCode::ForegroundRed => Sgr::Foreground(AnsiColor::Maroon.into()),
+        SgrCode::ForegroundGreen => Sgr::Foreground(AnsiColor::Green.into()),
+        SgrCode::ForegroundYellow => Sgr::Foreground(AnsiColor::Olive.into()),
+        SgrCode::ForegroundBlue => Sgr::Foreground(AnsiColor::Navy.into()),
+        SgrCode::ForegroundMagenta => Sgr::Foreground(AnsiColor::Purple.into()),
+        SgrCode::ForegroundCyan => Sgr::Foreground(AnsiColor::Teal.into()),
+        SgrCode::ForegroundWhite => Sgr::Foreground(AnsiColor::Silver.into()),
+        SgrCode::ForegroundDefault => Sgr::Foreground(ColorSpec::Default),
+        SgrCode::ForegroundBrightBlack => Sgr::Foreground(AnsiColor::Grey.into()),
+        SgrCode::ForegroundBrightRed => Sgr::Foreground(AnsiColor::Red.into()),
+        SgrCode::ForegroundBrightGreen => Sgr::Foreground(AnsiColor::Lime.into()),
+        SgrCode::ForegroundBrightYellow => Sgr::Foreground(AnsiColor::Yellow.into()),
+        SgrCode::ForegroundBrightBlue => Sgr::Foreground(AnsiColor::Blue.into()),
+        SgrCode::ForegroundBrightMagenta => Sgr::Foreground(AnsiColor::Fuchsia.into()),
+        SgrCode::ForegroundBrightCyan => Sgr::Foreground(AnsiColor::Aqua.into()),
+        SgrCode::ForegroundBrightWhite => Sgr::Foreground(AnsiColor::White.into()),
+        SgrCode::BackgroundBlack => Sgr::Background(AnsiColor::Black.into()),
+        SgrCode::BackgroundRed => Sgr::Background(AnsiColor::Maroon.into()),
+        SgrCode::BackgroundGreen => Sgr::Background(AnsiColor::Green.into()),
+        SgrCode::BackgroundYellow => Sgr::Background(AnsiColor::Olive.into()),
+        SgrCode::BackgroundBlue => Sgr::Background(AnsiColor::Navy.into()),
+        SgrCode::BackgroundMagenta => Sgr::Background(AnsiColor::Purple.into()),
+        SgrCode::BackgroundCyan => Sgr::Background(AnsiColor::Teal.into()),
+        SgrCode::BackgroundWhite => Sgr::Background(AnsiColor::Silver.into()),
+        SgrCode::BackgroundDefault => Sgr::Background(ColorSpec::Default),
+        SgrCode::BackgroundBrightBlack => Sgr::Background(AnsiColor::Grey.into()),
+        SgrCode::BackgroundBrightRed => Sgr::Background(AnsiColor::Red.into()),
+        SgrCode::BackgroundBrightGreen => Sgr::Background(AnsiColor::Lime.into()),
+        SgrCode::BackgroundBrightYellow => Sgr::Background(AnsiColor::Yellow.into()),
+        SgrCode::BackgroundBrightBlue => Sgr::Background(AnsiColor::Blue.into()),
+        SgrCode::BackgroundBrightMagenta => Sgr::Background(AnsiColor::Fuchsia.into()),
+        SgrCode::BackgroundBrightCyan => Sgr::Background(AnsiColor::Aqua.into()),
+        SgrCode::BackgroundBrightWhite => Sgr::Background(AnsiColor::White.into()),
+        SgrCode::InverseOn => Sgr::Inverse(true),
+        SgrCode::InverseOff => Sgr::Inverse(false),
+        SgrCode::InvisibleOn => Sgr::Invisible(true),
+        SgrCode::InvisibleOff => Sgr::Invisible(false),
+        SgrCode::StrikeThroughOn => Sgr::StrikeThrough(true),
+        SgrCode::StrikeThroughOff => Sgr::StrikeThrough(false),
+        SgrCode::OverlineOn => Sgr::Overline(true),
+        SgrCode::OverlineOff => Sgr::Overline(false),
+        SgrCode::DefaultFont => Sgr::Font(Font::Default),
+        SgrCode::AltFont1 => Sgr::Font(Font::Alternate(1)),
+        SgrCode::AltFont2 => Sgr::Font(Font::Alternate(2)),
+        SgrCode::AltFont3 => Sgr::Font(Font::Alternate(3)),
+        SgrCode::AltFont4 => Sgr::Font(Font::Alternate(4)),
+        SgrCode::AltFont5 => Sgr::Font(Font::Alternate(5)),
+        SgrCode::AltFont6 => Sgr::Font(Font::Alternate(6)),
+        SgrCode::AltFont7 => Sgr::Font(Font::Alternate(7)),
+        SgrCode::AltFont8 => Sgr::Font(Font::Alternate(8)),
+        SgrCode::AltFont9 => Sgr::Font(Font::Alternate(9)),
+    })
+}
+
+/// Fast decoder for the SGR (`m`) final byte. Handles the strict canonical form
+/// — `Integer (';' Integer)*` with no leading/trailing/double `;`, no `:` / `?`
+/// / other intermediates — where every code maps via [`sgr_simple`]. In that
+/// form the generic parser yields exactly one `CSI::Sgr` per integer (each
+/// `advance_by(1)` consumes the code and its trailing `;`), which this
+/// reproduces. Empty params == `Sgr::Reset` (matching `CSIParser::sgr`). Any
+/// other shape returns `false` (after emitting nothing) so the caller falls
+/// back to the generic parser.
+fn sgr_fast<E: FnMut(CSI)>(params: &[CsiParam], emit: &mut E) -> bool {
+    if params.is_empty() {
+        emit(CSI::Sgr(Sgr::Reset));
+        return true;
+    }
+    // Pass 1: validate strict-canonical shape AND that every code is fast
+    // mappable, BEFORE emitting anything (so a fallback never double-emits).
+    let mut expect_int = true;
+    for p in params {
+        match p {
+            CsiParam::Integer(i) if expect_int => {
+                if sgr_simple(*i).is_none() {
+                    return false;
+                }
+                expect_int = false;
+            }
+            CsiParam::P(b';') if !expect_int => {
+                expect_int = true;
+            }
+            _ => return false,
+        }
+    }
+    if expect_int {
+        // Trailing `;` (ended expecting another integer): not canonical.
+        return false;
+    }
+    // Pass 2: emit. Shape validated above; every Integer maps.
+    for p in params {
+        if let CsiParam::Integer(i) = p {
+            if let Some(sgr) = sgr_simple(*i) {
+                emit(CSI::Sgr(sgr));
+            }
+        }
+    }
+    true
+}
+
 impl<'a> Iterator for CSIParser<'a> {
     type Item = CSI;
 
@@ -3004,6 +3182,103 @@ mod test {
             write!(res, "{}", s).unwrap();
         }
         String::from_utf8(res).unwrap()
+    }
+
+    /// D2: dispatch a CSI exactly as `Performer::csi_dispatch` does with the
+    /// table-dispatch gate on (fast path, falling back to generic), so the
+    /// result must equal the generic `CSI::parse(...).collect()`.
+    fn dispatch_fast(params: &[CsiParam], truncated: bool, control: char) -> Vec<CSI> {
+        let mut out = Vec::new();
+        let handled = CSI::parse_fast(params, truncated, control, &mut |csi| out.push(csi));
+        if handled {
+            out
+        } else {
+            assert!(out.is_empty(), "parse_fast emitted then declined");
+            CSI::parse(params, truncated, control).collect()
+        }
+    }
+
+    #[test]
+    fn d2_sgr_fast_matches_generic_all_single_codes() {
+        for code in -5i64..=300 {
+            let params = vec![CsiParam::Integer(code)];
+            let generic: Vec<CSI> = CSI::parse(&params, false, 'm').collect();
+            let fast = dispatch_fast(&params, false, 'm');
+            assert_eq!(generic, fast, "SGR single code {code} diverged");
+        }
+        // Empty params == reset.
+        let generic: Vec<CSI> = CSI::parse(&[], false, 'm').collect();
+        assert_eq!(generic, dispatch_fast(&[], false, 'm'), "SGR empty diverged");
+    }
+
+    #[test]
+    fn d2_sgr_fast_matches_generic_multi_and_fallback_shapes() {
+        let semi = CsiParam::P(b';');
+        let colon = CsiParam::P(b':');
+        let q = CsiParam::P(b'?');
+        let int = CsiParam::Integer;
+        let cases: Vec<Vec<CsiParam>> = vec![
+            // canonical multi (fast)
+            vec![int(0)],
+            vec![int(1), semi.clone(), int(31)],
+            vec![int(0), semi.clone(), int(1), semi.clone(), int(4), semi.clone(), int(7)],
+            vec![int(38), semi.clone(), int(5), semi.clone(), int(200)], // fg256 -> fallback
+            vec![int(48), semi.clone(), int(2), semi.clone(), int(1), semi.clone(), int(2), semi.clone(), int(3)],
+            vec![int(58), semi.clone(), int(5), semi.clone(), int(9)], // underline color -> fallback
+            vec![int(1), semi.clone(), int(99), semi.clone(), int(31)], // unknown code -> fallback
+            // non-canonical shapes (fallback)
+            vec![semi.clone(), int(4)],            // leading ;
+            vec![int(1), semi.clone()],            // trailing ;
+            vec![int(1), semi.clone(), semi.clone(), int(4)], // double ;
+            vec![int(4), colon.clone(), int(3)],   // colon subparam
+            vec![q.clone(), int(4)],               // ? prefix
+        ];
+        for params in cases {
+            let generic: Vec<CSI> = CSI::parse(&params, false, 'm').collect();
+            let fast = dispatch_fast(&params, false, 'm');
+            assert_eq!(generic, fast, "SGR shape diverged: {params:?}");
+        }
+    }
+
+    #[test]
+    fn d2_truncated_and_non_sgr_finals_fall_back() {
+        // Truncated never fast-paths.
+        assert!(!CSI::parse_fast(
+            &[CsiParam::Integer(1)],
+            true,
+            'm',
+            &mut |_| panic!("must not emit when truncated"),
+        ));
+        // Every non-'m' final byte must decline the fast path (today's table).
+        for control in 0x40u8..=0x7e {
+            if control == b'm' {
+                continue;
+            }
+            let params = vec![CsiParam::Integer(1)];
+            let handled = CSI::parse_fast(&params, false, control as char, &mut |_| {});
+            assert!(
+                !handled,
+                "control {:?} unexpectedly fast-pathed",
+                control as char
+            );
+            // And the dispatch still equals generic.
+            assert_eq!(
+                CSI::parse(&params, false, control as char).collect::<Vec<_>>(),
+                dispatch_fast(&params, false, control as char),
+            );
+        }
+    }
+
+    #[test]
+    fn d2_csi_fast_class_table_only_marks_sgr() {
+        for b in 0u16..=255 {
+            let expected = if b == b'm' as u16 {
+                CSI_FAST_SGR
+            } else {
+                0
+            };
+            assert_eq!(CSI_FAST_CLASS[b as usize], expected, "byte {b}");
+        }
     }
 
     #[test]
