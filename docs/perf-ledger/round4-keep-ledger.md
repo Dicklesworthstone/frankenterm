@@ -109,3 +109,33 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls âˆ
 **A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a profiler attributes a clearly-above-noise share to `locate_offset`/`tier_for_offset` on a deep-scrollback interactive-scroll workload (the O(pages) re-sum dominates only with hundreds of warm pages).
 **Baseline comparator:** per-call `warm.iter().sum()` + reverse linear page walk.
 **Rollback:** flag default-off; `git revert 6710e80f9`.
+
+### 2026-06-19 | M3 / cod_5 | GPU instanced SoA glyph quads
+
+**Status:** kept provisional (durable optimization, default-off env-gated; A/B quant pending)
+**Gate:** env `FT_MOONSHOT_INSTANCED_GLYPH_QUADS` (default off)
+**Commit:** 5ed94736c
+**Behavior-preservation:** pixel-golden render equivalence (SoA instanced == CPU AoS) across glyph/emoji/CJK/ligature corpus; pane-reported RCH-pass. NOTE: M3 committing unblocked the GUI v0.6.1 crash fix (same webgpu.rs file).
+**A/B verdict:** DEFERRED. Retry-condition (Form 5): do not retry from a cold read; use a quiet-host GPU frame-time A/B on the headless-render harness (CPU vertex-bandwidth win surfaces under glyph-dense frames).
+**Baseline comparator:** CPU 4-vert-per-glyph AoS builder.
+**Rollback:** env default-off; `git revert 5ed94736c`.
+
+### 2026-06-19 | M9 / cc_3 | Anti-windup PID fleet-memory de-escalation
+
+**Status:** kept provisional (durable optimization, default-off, monotone-safe; A/B quant pending)
+**Gate:** config `memory.dampening=pid` (default hysteresis)
+**Commit:** cfee3bd88
+**Behavior-preservation:** escalation stays bang-bang (instant safety); PID governs only de-escalation/reclaim-magnitude; monotone floor (never reclaims less than legacy at Critical/Emergency); fail-closed to fixed fractions on RSS NaN/stall; plant-ID stability cert (`fleet_memory_pid_dampening_cert.rs`); pane-reported RCH-pass.
+**A/B verdict:** DEFERRED. Retry-condition (Form 3): worth reconsidering when a memory-pressure replay shows evicted-bytes or tier-flap oscillation above the hysteresis baseline.
+**Baseline comparator:** fixed eviction fractions + count hysteresis.
+**Rollback:** config default hysteresis; `git revert cfee3bd88`.
+
+### 2026-06-19 | S3-FIFO (stretch) / cod_2 | Scan-resistant S3-FIFO eviction (lfucache)
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** config `cache.eviction=s3fifo` (default current fifo/lfu)
+**Commit:** 2c399af8c
+**Behavior-preservation:** cache policy only (never affects correctness, only hit-rate); default mode reproduces today's eviction order (golden); pane-reported.
+**A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if an access-trace bench shows s3fifo hit-rate above lfu at equal capacity by a Mann-Whitney-significant margin on a scan-heavy (one-hit-wonder) workload.
+**Baseline comparator:** LFU (u16 freq + decay).
+**Rollback:** config default fifo/lfu; `git revert 2c399af8c`.

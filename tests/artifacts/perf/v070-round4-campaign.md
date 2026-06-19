@@ -127,3 +127,11 @@ _(tick entries appended here by the operator tend-loop)_
   unwedge. HELD cc_1 + cod_4 idle this cycle (no new core builds into congested fleet; cc_1 staged for
   M4 CDC, cod_4 staged for the gui crash-fix after M3). In flight: cod_1 Q4/5/6, cod_2 S3-FIFO (lfucache),
   cod_3 M7 (retry), cod_5 M3 (gui, 55m), cc_2 Q2, cc_3 M9.
+- 2026-06-19 tend#5 — 3 commits landed + adjudicated (provisional keep): M3 SoA glyph 5ed94736c (cod_5),
+  M9 PID fleet-memory cfee3bd88 (cc_3), S3-FIFO 2c399af8c (cod_2). 8 ideas adjudicated total. Fleet
+  drained (60 slots free). M3 commit UNBLOCKED the gui crash fix -> dispatched cod_4 to apply it
+  (webgpu.rs:1175 from_display_and_window) + verify launch (HARD release gate). Dispatched cc_1 -> M4 CDC
+  (scrollback), cod_2 -> Shiryaev-Roberts (bocpd). HELD cod_5+cc_3 idle (cap concurrent core builds).
+  cod_1 over-rigorous on Q4 (~2h re-syncing a --no-default-features variant on the dirty tree, NOT
+  wedged) -> nudged to commit Q4 with the default proof + defer the edge-variant. In flight: cod_1 Q4/5/6,
+  cod_2 bocpd, cod_3 M7, cod_4 crash-fix, cc_1 M4, cc_2 Q2.
