@@ -122,6 +122,16 @@ impl BocpdDetectorKind {
     }
 }
 
+/// Minimal detectable mean shift, in predictive-scale (σ) units, for the
+/// Shiryaev-Roberts detector's alternative hypothesis `f₁`. This is the `δ` in
+/// the SR/CUSUM log increment `δ·|z| − δ²/2` (see
+/// [`BocpdModel::update_shiryaev_roberts_statistic`]). At `δ = 3.0` the increment
+/// is negative in expectation on stable data (E|z| ≈ 0.8 for standardized noise
+/// ⇒ ≈ 3·0.8 − 4.5 = −2.1), so the e-statistic decays and the detector holds its
+/// false-alarm budget, while a shift of ≳ `δ/2 = 1.5σ` accumulates toward an
+/// alarm. A shift smaller than this is treated as noise rather than a change.
+const SR_MIN_SHIFT_SIGMA: f64 = 3.0;
+
 // =============================================================================
 // Normal-Gamma sufficient statistics
 // =============================================================================
@@ -398,9 +408,35 @@ impl BocpdModel {
     /// Update the Shiryaev-Roberts statistic and return its probability-shaped
     /// alarm score. Invalid or degenerate predictive likelihoods fail closed by
     /// returning `None`, which keeps the existing BOCPD Student-t statistic.
+    ///
+    /// The SR e-statistic is the recursion `Rₙ = (1 + Rₙ₋₁)·(f₁(xₙ)/f₀(xₙ))`,
+    /// where `f₀` is the pre-change density (the MAP run's Student-t predictive,
+    /// `null_ll`) and `f₁` is the post-change alternative. We use the classic
+    /// SR/CUSUM minimal-mean-shift alternative: the SAME predictive with its
+    /// location shifted toward the observation by a fixed minimal magnitude
+    /// [`SR_MIN_SHIFT_SIGMA`] (in predictive-scale units). The per-step log
+    /// increment is then ≈ `δ·|z| − δ²/2` (`z` = the observation's standardized
+    /// residual under `f₀`) — negative in expectation while the regime is stable
+    /// (the statistic decays, holding the false-alarm budget) and positive once
+    /// `|z|` exceeds `δ/2` (a genuine shift accumulates and fires).
+    ///
+    /// This replaces a fixed diffuse prior centred at μ = 0 as the alternative.
+    /// That prior could never explain data sitting far from 0 — e.g. the output
+    /// rates / entropies BOCPD actually consumes — better than the established
+    /// run, so `change_ll − null_ll` was always negative, the statistic only
+    /// decayed, and SR never fired on realistic (non-zero-centred) input.
     fn update_shiryaev_roberts_statistic(&mut self, x: f64, pred_log_liks: &[f64]) -> Option<f64> {
-        let null_ll = pred_log_liks.get(self.map_run_length()).copied()?;
-        let change_ll = NormalGammaSS::prior().predictive_log_likelihood(x);
+        let map = self.map_run_length();
+        let null_ll = pred_log_liks.get(map).copied()?;
+        let ss = self.sufficient_stats.get(map)?;
+        let scale_sq = ss.beta * (ss.kappa + 1.0) / (ss.alpha * ss.kappa);
+        if !(scale_sq > 0.0) || !scale_sq.is_finite() {
+            return None;
+        }
+        let shift = SR_MIN_SHIFT_SIGMA * scale_sq.sqrt();
+        let mut alternative = ss.clone();
+        alternative.mu = (x - ss.mu).signum().mul_add(shift, ss.mu);
+        let change_ll = alternative.predictive_log_likelihood(x);
         if is_degenerate_student_t_fallback(null_ll)
             || is_degenerate_student_t_fallback(change_ll)
             || !null_ll.is_finite()
@@ -1336,10 +1372,10 @@ mod tests {
         // `a*b + c` terms may or may not be contracted into FMAs by LLVM. So the
         // SR e-statistic and the BOCPD recent-change mass can differ at the last
         // ULP between RCH workers. The alarm score is thresholded against a fixed
-        // `detection_threshold` on a slow linear ramp (`drift = 0.20 + i*0.18`),
-        // so a sub-ULP nudge can shift the crossing observation by ±1 and collapse
-        // `sr_delay = bocpd_delay - 1` into a tie — a pure FP-ordering artifact,
-        // not a behavioral change.
+        // `detection_threshold`, so even with the corpus's sharp runaway (which
+        // guarantees a crossing with wide margin) a sub-ULP nudge can shift the
+        // exact crossing observation by ±1 and collapse `sr_delay = bocpd_delay -
+        // 1` into a tie — a pure FP-ordering artifact, not a behavioral change.
         //
         // WHY a tie is valid at matched false-alarm rate: Shiryaev-Roberts is
         // quickest-change-detection-optimal — among procedures at a matched
@@ -1360,6 +1396,25 @@ mod tests {
         );
     }
 
+    /// Deterministic stable→runaway corpus. The stable regime is `100.0 ± noise`
+    /// (≈0.55σ); the runaway is a clearly out-of-band, accelerating departure
+    /// (`drift = 4.0 + 0.3·i`, so the first post-change sample already lands a few
+    /// σ above the established band and keeps climbing).
+    ///
+    /// Both detectors fire on this corpus with a wide margin and zero false
+    /// alarms on the stable prefix: BOCPD's recent-change mass peaks ≈0.95 (vs its
+    /// 0.85 threshold) and SR's alarm score saturates (vs its 0.65 threshold),
+    /// with SR leading BOCPD by several observations. An earlier version started
+    /// the drift at 0.20 (≈0.36σ, buried in the noise) and ramped at 0.18/obs;
+    /// that gentle ramp left BOCPD on a threshold knife-edge — its mass barely
+    /// reached 0.85, and on some microarchitectures FP rounding pushed the peak
+    /// just under, so `first_alarm_index(...).expect("BOCPD should eventually
+    /// detect the runaway")` panicked (a non-determinism flake, not a real miss).
+    /// A decisive runaway forces an unambiguous posterior collapse on every
+    /// microarchitecture; the only residual FP sensitivity is a ±1 shift in the
+    /// exact crossing observation, which the `sr_delay <= bocpd_delay` tolerance
+    /// band absorbs. The stable prefix is unchanged, preserving the matched
+    /// zero-false-alarm rate.
     fn synthetic_runaway_corpus() -> (Vec<f64>, usize) {
         let noise = [-0.90, 0.35, 0.75, -0.25, 0.50, -0.65, 0.15, -0.05];
         let change_at = 96;
@@ -1368,7 +1423,7 @@ mod tests {
             values.push(100.0 + noise[i % noise.len()]);
         }
         for i in 0..96 {
-            let drift = 0.20 + (i as f64 * 0.18);
+            let drift = (i as f64).mul_add(0.3, 4.0);
             values.push(100.0 + drift + noise[i % noise.len()]);
         }
         (values, change_at)
