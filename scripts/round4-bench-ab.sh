@@ -248,10 +248,15 @@ rch_cargo() {
 
 # Extract the RCH worker host from a captured log (best-effort).
 rch_worker_from_log() {
-    local logf="$1"
+    local logf="$1" w
     # Common RCH markers: "[RCH] remote vmiXXXX (Ns)" or "worker=<host>".
-    grep -oE '\[RCH\] remote [^ ]+' "${logf}" 2>/dev/null | tail -1 | awk '{print $3}' && return 0 || true
-    grep -oE 'worker=[^ ]+' "${logf}" 2>/dev/null | tail -1 | sed 's/worker=//' && return 0 || true
+    # NOTE: capture into a var and test emptiness so the fallbacks actually run.
+    # The `|| true` keeps each pipe substitution safe under `set -euo pipefail`
+    # when grep finds no match (grep exit 1 would otherwise abort the script).
+    w="$(grep -oE '\[RCH\] remote [^ ]+' "${logf}" 2>/dev/null | tail -1 | awk '{print $3}' || true)"
+    if [[ -n "${w}" ]]; then echo "${w}"; return 0; fi
+    w="$(grep -oE 'worker=[^ ]+' "${logf}" 2>/dev/null | tail -1 | sed 's/worker=//' || true)"
+    if [[ -n "${w}" ]]; then echo "${w}"; return 0; fi
     echo "unknown"
 }
 
@@ -484,7 +489,7 @@ if [[ "${DRY_RUN}" -ne 1 ]]; then
                 "${GATE_VAR}=${GATE_OFF}" \
                 cargo bench -p "${PACKAGE}" --bench "${BENCH}" --profile release-perf -- "${BENCH_FILTER}" \
                 >"${base_log}" 2>&1 || { tail -60 "${base_log}" >&2; die "baseline bench run failed"; }
-            grep -qiE '\[RCH\] local|no admissible workers|worker=null|running locally' "${base_log}" \
+            grep -qiE '\[RCH\] local|running locally|no admissible workers|worker=null|local fallback|RCH_FORCE_LOCAL' "${base_log}" \
                 && { tail -40 "${base_log}" >&2; die "RCH blocked — proof lane down (baseline)"; }
             snapshot_arm baseline "${target_dir}" "${base_log}" >/dev/null
             # Candidate arm: VAR=ON (same binary, same target dir, back-to-back).
@@ -493,7 +498,7 @@ if [[ "${DRY_RUN}" -ne 1 ]]; then
                 "${GATE_VAR}=${GATE_ON}" \
                 cargo bench -p "${PACKAGE}" --bench "${BENCH}" --profile release-perf -- "${BENCH_FILTER}" \
                 >"${cand_log}" 2>&1 || { tail -60 "${cand_log}" >&2; die "candidate bench run failed"; }
-            grep -qiE '\[RCH\] local|no admissible workers|worker=null|running locally' "${cand_log}" \
+            grep -qiE '\[RCH\] local|running locally|no admissible workers|worker=null|local fallback|RCH_FORCE_LOCAL' "${cand_log}" \
                 && { tail -40 "${cand_log}" >&2; die "RCH blocked — proof lane down (candidate)"; }
             snapshot_arm candidate "${target_dir}" "${cand_log}" >/dev/null
             ;;
