@@ -24,7 +24,7 @@ both from one run); `metric≠ns` = win is hit-rate/bytes/delay, adjudicate the 
 | Q1 prefix-sum | env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` | gate-toggle (deep-scroll) | scrollback_prefix_index/deep_scroll_locate_offset (8eef1f001) | **−96.9% / 32.5×** (3.09ms→95µs) cv~15% | KEEP default-off; default-on pending cv≤5 re-run |
 | Q2 group-commit+condvar | config storage.group_commit_events/writer_blocking_recv | gate-toggle (WAL burst) | A2W (.6) wire | _pending_ | _pending_ |
 | Q3 linear KMP overlap | config ingest.delta_linear_overlap | gate-toggle (box/emoji) | A2W (.6)/delta_extraction | _pending_ | _pending_ |
-| Q4 lazy captures | feature patterns-lazy-captures | gate-toggle (high-suppression) | existing pattern_detection_context | _pending_ | _pending_ |
+| Q4 lazy captures | feature patterns-lazy-captures | gate-toggle (high-suppression) | pattern_detection_context/with_context_dedup | **−2.01%** (18.34→17.97µs) cv **1.23%** clean (p=1.6e-13) | KEEP default-off (small clean win) |
 | Q5 Teddy prefilter | feature teddy-prefilter | gate-toggle (low-match) | A1P (.4) new | _pending_ | _pending_ |
 | Q6 fingerprint dedup | feature patterns-fingerprint-dedup | gate-toggle (key churn) | A1P (.4) new | _pending_ | _pending_ |
 | M1 ANSI DFA | feature ansi-dfa-table | gate-toggle (ANSI-dense) | A2W (.6)/simd_scan | _pending_ | _pending_ |

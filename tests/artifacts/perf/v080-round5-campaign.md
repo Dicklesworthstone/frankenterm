@@ -74,3 +74,12 @@ _(tick entries appended by the orchestrator tend-loop)_
   report green during the escape-parser transient (fail-closed discipline held). No new closes this tick
   (proofs RCH-blocked → now retrying). LEARNING: local A/Bs against the live dirty tree hit transient
   mid-commit races — retry, or run when the swarm is committing less.
+- 2026-06-19 tend#5 — Q4 re-run CLEAN: KEEP, −2.01% (18.34→17.97µs), cv 1.23% (Mac quieter), p=1.6e-13
+  (small clean win, default-off). .7 CLOSED → THREAD C DONE (cod_4: gui-check green RCH vmi1149989 +
+  LLDB launch ok; C1 socket-handoff timeout verified). EV1 committed (f53f624eb term bulk ASCII writer).
+  NEW dominant blocker: RCH **active_project_exclusion** (~3 ft jobs/project max) → 5-6 panes proving at
+  once get refused (all fail-closed correctly, code committed). Mitigation = CONSOLIDATE proofs: stood
+  down cod_1(.4)/cod_3(.6)/cod_5(.8) RCH retries; launched ONE B4 `cargo test -p frankenterm-core --lib`
+  proof (validates B1 split-makes-it-fast + B2 bocpd) and E2's M6 bench locally (m6_lock_wait_evidence
+  group). Tally: 6 beads closed (.5/.7/.10/.11/.13 + earlier), MEASURED M4/Q1/Q4 keep + M9/S3-FIFO
+  default-off. Threads C done; A ~5 flags measured; B proof in flight (B4); D 4 ideas landing; E running.
