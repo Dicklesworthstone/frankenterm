@@ -1534,11 +1534,30 @@ pub struct StorageConfig {
     /// Default: `50` (per the bead's "default 50MB" spec).
     #[serde(default = "default_scrollback_mmap_cap_mb")]
     pub scrollback_mmap_cap_mb: u32,
+
+    /// Cold-tier storage controls. Experiments under this table are default-off.
+    #[serde(default)]
+    pub cold: StorageColdConfig,
 }
 
 /// Default per-pane mmap scrollback cap (br-ft-z4u60 spec).
 const fn default_scrollback_mmap_cap_mb() -> u32 {
     50
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StorageColdConfig {
+    /// Default-off erasure layer for cold scrollback shards.
+    pub erasure: StorageColdErasureMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageColdErasureMode {
+    #[default]
+    Off,
+    Rs,
 }
 
 impl Default for StorageConfig {
@@ -1553,6 +1572,7 @@ impl Default for StorageConfig {
             read_pool_size: 4,
             retention_tiers: default_retention_tiers(),
             scrollback_mmap_cap_mb: default_scrollback_mmap_cap_mb(),
+            cold: StorageColdConfig::default(),
         }
     }
 }
@@ -8406,6 +8426,18 @@ retention_tiers = []
         let zero_cfg: StorageConfig = toml::from_str("scrollback_mmap_cap_mb = 0\n").unwrap();
         // 0 disables the cap per the field doc.
         assert_eq!(zero_cfg.scrollback_mmap_cap_mb, 0);
+    }
+
+    #[test]
+    fn storage_config_cold_erasure_rs_is_default_off_and_opt_in() {
+        let default_cfg: StorageConfig = toml::from_str("").unwrap();
+        assert_eq!(default_cfg.cold.erasure, StorageColdErasureMode::Off);
+
+        let custom_cfg: StorageConfig = toml::from_str("[cold]\nerasure = \"rs\"\n").unwrap();
+        assert_eq!(custom_cfg.cold.erasure, StorageColdErasureMode::Rs);
+
+        let full_cfg: Config = toml::from_str("[storage.cold]\nerasure = \"rs\"\n").unwrap();
+        assert_eq!(full_cfg.storage.cold.erasure, StorageColdErasureMode::Rs);
     }
 
     #[test]

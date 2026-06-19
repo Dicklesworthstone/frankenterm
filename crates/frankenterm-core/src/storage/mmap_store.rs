@@ -34,11 +34,20 @@ pub enum PaneStorageMode {
     SqliteFallback,
 }
 
+/// Default-off cold-tier erasure mode for mmap scrollback sidecars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColdErasureMode {
+    #[default]
+    Disabled,
+    ReedSolomon,
+}
+
 /// Configuration for the scrollback store.
 #[derive(Debug, Clone)]
 pub struct MmapStoreConfig {
     pub base_dir: PathBuf,
     pub sqlite_fallback_path: Option<PathBuf>,
+    pub cold_erasure: ColdErasureMode,
 }
 
 impl MmapStoreConfig {
@@ -47,6 +56,7 @@ impl MmapStoreConfig {
         Self {
             base_dir,
             sqlite_fallback_path: None,
+            cold_erasure: ColdErasureMode::Disabled,
         }
     }
 
@@ -54,6 +64,27 @@ impl MmapStoreConfig {
     pub fn with_sqlite_fallback(mut self, sqlite_fallback_path: PathBuf) -> Self {
         self.sqlite_fallback_path = Some(sqlite_fallback_path);
         self
+    }
+
+    #[must_use]
+    pub fn with_cold_erasure(mut self, mode: ColdErasureMode) -> Self {
+        self.cold_erasure = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cold_erasure_rs(mut self) -> Self {
+        self.cold_erasure = ColdErasureMode::ReedSolomon;
+        self
+    }
+}
+
+impl From<crate::config::StorageColdErasureMode> for ColdErasureMode {
+    fn from(value: crate::config::StorageColdErasureMode) -> Self {
+        match value {
+            crate::config::StorageColdErasureMode::Off => Self::Disabled,
+            crate::config::StorageColdErasureMode::Rs => Self::ReedSolomon,
+        }
     }
 }
 
@@ -70,6 +101,399 @@ pub enum MmapStoreError {
     OffsetOutOfBounds { offset: u64, len: u64 },
     #[error("numeric conversion overflow for {0}")]
     NumericOverflow(&'static str),
+    #[error("not enough erasure shards: have {have}, need {need}")]
+    InsufficientErasureShards { have: usize, need: usize },
+    #[error("erasure shard {index} failed CRC validation")]
+    ErasureShardCrcMismatch { index: u8 },
+    #[error("erasure payload failed CRC validation")]
+    ErasurePayloadCrcMismatch,
+    #[error("invalid erasure shard: {0}")]
+    InvalidErasureShard(String),
+}
+
+const COLD_ERASURE_DATA_SHARDS: usize = 3;
+const COLD_ERASURE_TOTAL_SHARDS: usize = 5;
+const COLD_ERASURE_VERSION: u8 = 1;
+const COLD_ERASURE_MAGIC: [u8; 8] = *b"FTRSLOG1";
+const COLD_ERASURE_HEADER_LEN: usize = 8 + 1 + 1 + 1 + 1 + 8 + 4 + 4 + 4;
+const GF_PRIM: u32 = 0x11d;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColdErasureShard {
+    index: u8,
+    original_len: u64,
+    payload_crc32: u32,
+    bytes: Vec<u8>,
+}
+
+struct GfTables {
+    exp: [u8; 512],
+    log: [u8; 256],
+}
+
+impl GfTables {
+    fn new() -> Self {
+        let mut tables = Self {
+            exp: [0; 512],
+            log: [0; 256],
+        };
+        let mut value = 1u32;
+        for idx in 0..255 {
+            tables.exp[idx] = value as u8;
+            tables.log[value as usize] = idx as u8;
+            value <<= 1;
+            if value & 0x100 != 0 {
+                value ^= GF_PRIM;
+            }
+        }
+        for idx in 255..512 {
+            tables.exp[idx] = tables.exp[idx - 255];
+        }
+        tables
+    }
+}
+
+fn gf_tables() -> &'static GfTables {
+    static TABLES: std::sync::OnceLock<GfTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(GfTables::new)
+}
+
+#[inline]
+fn gf_add(lhs: u8, rhs: u8) -> u8 {
+    lhs ^ rhs
+}
+
+#[inline]
+fn gf_mul(lhs: u8, rhs: u8) -> u8 {
+    if lhs == 0 || rhs == 0 {
+        return 0;
+    }
+    let tables = gf_tables();
+    let log_sum = tables.log[lhs as usize] as usize + tables.log[rhs as usize] as usize;
+    tables.exp[log_sum]
+}
+
+#[inline]
+fn gf_inv(value: u8) -> Result<u8, MmapStoreError> {
+    if value == 0 {
+        return Err(MmapStoreError::InvalidErasureShard(
+            "singular erasure matrix".to_string(),
+        ));
+    }
+    let tables = gf_tables();
+    Ok(tables.exp[(255 - tables.log[value as usize] as usize) % 255])
+}
+
+#[inline]
+fn gf_pow(value: u8, power: usize) -> u8 {
+    if power == 0 {
+        return 1;
+    }
+    if value == 0 {
+        return 0;
+    }
+    let tables = gf_tables();
+    tables.exp[(tables.log[value as usize] as usize * power) % 255]
+}
+
+fn cold_erasure_generator_row(index: u8) -> Result<[u8; COLD_ERASURE_DATA_SHARDS], MmapStoreError> {
+    let index_usize = usize::from(index);
+    if index_usize >= COLD_ERASURE_TOTAL_SHARDS {
+        return Err(MmapStoreError::InvalidErasureShard(format!(
+            "shard index {index} out of range"
+        )));
+    }
+    let mut row = [0u8; COLD_ERASURE_DATA_SHARDS];
+    if index_usize < COLD_ERASURE_DATA_SHARDS {
+        row[index_usize] = 1;
+        return Ok(row);
+    }
+
+    let eval = index - u8::try_from(COLD_ERASURE_DATA_SHARDS).unwrap_or(0) + 1;
+    for (column, coeff) in row.iter_mut().enumerate() {
+        *coeff = gf_pow(eval, column);
+    }
+    Ok(row)
+}
+
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn cold_erasure_encode(data: &[u8]) -> Result<Vec<ColdErasureShard>, MmapStoreError> {
+    let original_len =
+        u64::try_from(data.len()).map_err(|_| MmapStoreError::NumericOverflow("erasure_len"))?;
+    let chunk_size = data.len().div_ceil(COLD_ERASURE_DATA_SHARDS);
+    let padded_len = chunk_size.saturating_mul(COLD_ERASURE_DATA_SHARDS);
+    let mut padded = Vec::with_capacity(padded_len);
+    padded.extend_from_slice(data);
+    padded.resize(padded_len, 0);
+    let payload_crc32 = crc32_ieee(data);
+
+    let mut shards = Vec::with_capacity(COLD_ERASURE_TOTAL_SHARDS);
+    for index in 0..COLD_ERASURE_TOTAL_SHARDS {
+        let row = cold_erasure_generator_row(
+            u8::try_from(index).map_err(|_| MmapStoreError::NumericOverflow("shard_index"))?,
+        )?;
+        let mut bytes = vec![0u8; chunk_size];
+        for byte_offset in 0..chunk_size {
+            let mut acc = 0u8;
+            for column in 0..COLD_ERASURE_DATA_SHARDS {
+                let source = padded[column * chunk_size + byte_offset];
+                acc = gf_add(acc, gf_mul(row[column], source));
+            }
+            bytes[byte_offset] = acc;
+        }
+        shards.push(ColdErasureShard {
+            index: u8::try_from(index)
+                .map_err(|_| MmapStoreError::NumericOverflow("shard_index"))?,
+            original_len,
+            payload_crc32,
+            bytes,
+        });
+    }
+    Ok(shards)
+}
+
+fn cold_erasure_decode(shards: &[ColdErasureShard]) -> Result<Vec<u8>, MmapStoreError> {
+    if shards.len() < COLD_ERASURE_DATA_SHARDS {
+        return Err(MmapStoreError::InsufficientErasureShards {
+            have: shards.len(),
+            need: COLD_ERASURE_DATA_SHARDS,
+        });
+    }
+
+    let used = &shards[..COLD_ERASURE_DATA_SHARDS];
+    let shard_len = used[0].bytes.len();
+    let original_len = used[0].original_len;
+    let payload_crc32 = used[0].payload_crc32;
+    let mut seen = [false; COLD_ERASURE_TOTAL_SHARDS];
+    let mut matrix = [[0u8; COLD_ERASURE_DATA_SHARDS]; COLD_ERASURE_DATA_SHARDS];
+
+    for (row_index, shard) in used.iter().enumerate() {
+        let index = usize::from(shard.index);
+        if index >= COLD_ERASURE_TOTAL_SHARDS {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "shard index {} out of range",
+                shard.index
+            )));
+        }
+        if seen[index] {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "duplicate shard index {}",
+                shard.index
+            )));
+        }
+        seen[index] = true;
+        if shard.bytes.len() != shard_len {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "shard {} length {} != {shard_len}",
+                shard.index,
+                shard.bytes.len()
+            )));
+        }
+        if shard.original_len != original_len || shard.payload_crc32 != payload_crc32 {
+            return Err(MmapStoreError::InvalidErasureShard(
+                "erasure shard metadata mismatch".to_string(),
+            ));
+        }
+        matrix[row_index] = cold_erasure_generator_row(shard.index)?;
+    }
+
+    let inverse = invert_erasure_matrix(matrix)?;
+    let mut padded = vec![0u8; shard_len.saturating_mul(COLD_ERASURE_DATA_SHARDS)];
+    for byte_offset in 0..shard_len {
+        for original_column in 0..COLD_ERASURE_DATA_SHARDS {
+            let mut acc = 0u8;
+            for source_row in 0..COLD_ERASURE_DATA_SHARDS {
+                acc = gf_add(
+                    acc,
+                    gf_mul(
+                        inverse[original_column][source_row],
+                        used[source_row].bytes[byte_offset],
+                    ),
+                );
+            }
+            padded[original_column * shard_len + byte_offset] = acc;
+        }
+    }
+
+    let original_len = usize::try_from(original_len)
+        .map_err(|_| MmapStoreError::NumericOverflow("erasure_original_len"))?;
+    if original_len > padded.len() {
+        return Err(MmapStoreError::InvalidErasureShard(format!(
+            "original length {original_len} exceeds decoded payload {}",
+            padded.len()
+        )));
+    }
+    let decoded = padded[..original_len].to_vec();
+    if crc32_ieee(&decoded) != payload_crc32 {
+        return Err(MmapStoreError::ErasurePayloadCrcMismatch);
+    }
+    Ok(decoded)
+}
+
+fn invert_erasure_matrix(
+    matrix: [[u8; COLD_ERASURE_DATA_SHARDS]; COLD_ERASURE_DATA_SHARDS],
+) -> Result<[[u8; COLD_ERASURE_DATA_SHARDS]; COLD_ERASURE_DATA_SHARDS], MmapStoreError> {
+    let mut augmented = [[0u8; COLD_ERASURE_DATA_SHARDS * 2]; COLD_ERASURE_DATA_SHARDS];
+    for row in 0..COLD_ERASURE_DATA_SHARDS {
+        for column in 0..COLD_ERASURE_DATA_SHARDS {
+            augmented[row][column] = matrix[row][column];
+        }
+        augmented[row][COLD_ERASURE_DATA_SHARDS + row] = 1;
+    }
+
+    for column in 0..COLD_ERASURE_DATA_SHARDS {
+        let pivot = (column..COLD_ERASURE_DATA_SHARDS)
+            .find(|row| augmented[*row][column] != 0)
+            .ok_or_else(|| {
+                MmapStoreError::InvalidErasureShard("singular erasure matrix".to_string())
+            })?;
+        if pivot != column {
+            augmented.swap(column, pivot);
+        }
+
+        let pivot_inv = gf_inv(augmented[column][column])?;
+        for value in &mut augmented[column] {
+            *value = gf_mul(*value, pivot_inv);
+        }
+
+        let pivot_row = augmented[column];
+        for row in 0..COLD_ERASURE_DATA_SHARDS {
+            if row == column {
+                continue;
+            }
+            let factor = augmented[row][column];
+            if factor == 0 {
+                continue;
+            }
+            for (target, pivot_value) in augmented[row].iter_mut().zip(pivot_row.iter()) {
+                *target = gf_add(*target, gf_mul(factor, *pivot_value));
+            }
+        }
+    }
+
+    let mut inverse = [[0u8; COLD_ERASURE_DATA_SHARDS]; COLD_ERASURE_DATA_SHARDS];
+    for row in 0..COLD_ERASURE_DATA_SHARDS {
+        for column in 0..COLD_ERASURE_DATA_SHARDS {
+            inverse[row][column] = augmented[row][COLD_ERASURE_DATA_SHARDS + column];
+        }
+    }
+    Ok(inverse)
+}
+
+impl ColdErasureShard {
+    fn encode_bytes(&self) -> Result<Vec<u8>, MmapStoreError> {
+        let shard_len = u32::try_from(self.bytes.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("erasure_shard_len"))?;
+        let mut encoded = Vec::with_capacity(COLD_ERASURE_HEADER_LEN + self.bytes.len());
+        encoded.extend_from_slice(&COLD_ERASURE_MAGIC);
+        encoded.push(COLD_ERASURE_VERSION);
+        encoded.push(u8::try_from(COLD_ERASURE_DATA_SHARDS).unwrap_or(0));
+        encoded.push(u8::try_from(COLD_ERASURE_TOTAL_SHARDS).unwrap_or(0));
+        encoded.push(self.index);
+        encoded.extend_from_slice(&self.original_len.to_le_bytes());
+        encoded.extend_from_slice(&self.payload_crc32.to_le_bytes());
+        encoded.extend_from_slice(&crc32_ieee(&self.bytes).to_le_bytes());
+        encoded.extend_from_slice(&shard_len.to_le_bytes());
+        encoded.extend_from_slice(&self.bytes);
+        Ok(encoded)
+    }
+
+    fn decode_bytes(encoded: &[u8]) -> Result<Self, MmapStoreError> {
+        if encoded.len() < COLD_ERASURE_HEADER_LEN {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "short shard header: {} bytes",
+                encoded.len()
+            )));
+        }
+        if encoded[..8] != COLD_ERASURE_MAGIC {
+            return Err(MmapStoreError::InvalidErasureShard(
+                "bad shard magic".to_string(),
+            ));
+        }
+        let version = encoded[8];
+        if version != COLD_ERASURE_VERSION {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "unsupported shard version {version}"
+            )));
+        }
+        let k = encoded[9];
+        let n = encoded[10];
+        if usize::from(k) != COLD_ERASURE_DATA_SHARDS || usize::from(n) != COLD_ERASURE_TOTAL_SHARDS
+        {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "unsupported erasure geometry k={k} n={n}"
+            )));
+        }
+        let index = encoded[11];
+        if usize::from(index) >= COLD_ERASURE_TOTAL_SHARDS {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "shard index {index} out of range"
+            )));
+        }
+
+        let original_len = u64::from_le_bytes(
+            encoded[12..20]
+                .try_into()
+                .map_err(|_| MmapStoreError::InvalidErasureShard("bad length".to_string()))?,
+        );
+        let payload_crc32 = u32::from_le_bytes(
+            encoded[20..24]
+                .try_into()
+                .map_err(|_| MmapStoreError::InvalidErasureShard("bad payload crc".to_string()))?,
+        );
+        let shard_crc32 = u32::from_le_bytes(
+            encoded[24..28]
+                .try_into()
+                .map_err(|_| MmapStoreError::InvalidErasureShard("bad shard crc".to_string()))?,
+        );
+        let shard_len = u32::from_le_bytes(
+            encoded[28..32]
+                .try_into()
+                .map_err(|_| MmapStoreError::InvalidErasureShard("bad shard len".to_string()))?,
+        ) as usize;
+        let bytes = encoded[32..].to_vec();
+        if bytes.len() != shard_len {
+            return Err(MmapStoreError::InvalidErasureShard(format!(
+                "shard {index} length {} != header {shard_len}",
+                bytes.len()
+            )));
+        }
+        if crc32_ieee(&bytes) != shard_crc32 {
+            return Err(MmapStoreError::ErasureShardCrcMismatch { index });
+        }
+        Ok(Self {
+            index,
+            original_len,
+            payload_crc32,
+            bytes,
+        })
+    }
+}
+
+fn cold_erasure_shard_path(log_path: &Path, index: u8) -> Result<PathBuf, MmapStoreError> {
+    let mut path = log_path.to_path_buf();
+    let name = log_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            MmapStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "scrollback log path has no file name",
+            ))
+        })?;
+    path.set_file_name(format!("{name}.rs{index:02}"));
+    Ok(path)
 }
 
 /// In-memory per-pane index and file handle.
@@ -235,6 +659,63 @@ impl PaneFile {
         self.base_seq = 0;
         self.line_offsets.clear();
         Ok(())
+    }
+
+    fn read_all_bytes(&self) -> Result<Vec<u8>, MmapStoreError> {
+        let mut file = File::open(&self.log_path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn write_erasure_sidecars(&self) -> Result<(), MmapStoreError> {
+        let bytes = self.read_all_bytes()?;
+        let shards = cold_erasure_encode(&bytes)?;
+        for shard in shards {
+            let path = cold_erasure_shard_path(&self.log_path, shard.index)?;
+            let mut tmp_path = path.clone();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    MmapStoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "erasure shard path has no file name",
+                    ))
+                })?;
+            tmp_path.set_file_name(format!("{name}.tmp"));
+            {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp_path)?;
+                file.write_all(&shard.encode_bytes()?)?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, &path)?;
+        }
+        if let Some(dir) = self.log_path.parent() {
+            if let Ok(dir_handle) = File::open(dir) {
+                let _ = dir_handle.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_from_erasure_sidecars(&self) -> Result<Vec<u8>, MmapStoreError> {
+        let mut shards = Vec::new();
+        for index in 0..COLD_ERASURE_TOTAL_SHARDS {
+            let index =
+                u8::try_from(index).map_err(|_| MmapStoreError::NumericOverflow("shard_index"))?;
+            let path = cold_erasure_shard_path(&self.log_path, index)?;
+            match std::fs::read(&path) {
+                Ok(bytes) => shards.push(ColdErasureShard::decode_bytes(&bytes)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        cold_erasure_decode(&shards)
     }
 
     fn stale_prefix_bytes(&self) -> u64 {
@@ -495,6 +976,7 @@ pub struct MmapScrollbackStore {
     panes: HashMap<PaneId, PaneFile>,
     sqlite_fallback: Option<SqliteFallbackStore>,
     fallback_panes: HashSet<PaneId>,
+    cold_erasure: ColdErasureMode,
 }
 
 impl MmapScrollbackStore {
@@ -511,6 +993,7 @@ impl MmapScrollbackStore {
             panes: HashMap::new(),
             sqlite_fallback,
             fallback_panes: HashSet::new(),
+            cold_erasure: config.cold_erasure,
         })
     }
 
@@ -615,7 +1098,12 @@ impl MmapScrollbackStore {
             return Ok(false);
         }
 
-        pane.compact_retained_prefix()
+        pane.compact_retained_prefix().and_then(|compacted| {
+            if compacted && self.cold_erasure == ColdErasureMode::ReedSolomon {
+                pane.write_erasure_sidecars()?;
+            }
+            Ok(compacted)
+        })
     }
 
     pub fn tail_lines(&self, pane_id: PaneId, n: usize) -> Result<Vec<String>, MmapStoreError> {
@@ -696,8 +1184,37 @@ impl MmapScrollbackStore {
         if let Some(sqlite) = self.sqlite_fallback.as_ref() {
             sqlite.clear_pane(pane_id)?;
         }
+        if self.cold_erasure == ColdErasureMode::ReedSolomon {
+            if let Some(pane) = self.panes.get(&pane_id) {
+                pane.write_erasure_sidecars()?;
+            }
+        }
         self.fallback_panes.remove(&pane_id);
         Ok(())
+    }
+
+    pub fn refresh_pane_erasure_shards(&mut self, pane_id: PaneId) -> Result<bool, MmapStoreError> {
+        if self.cold_erasure != ColdErasureMode::ReedSolomon
+            || self.fallback_panes.contains(&pane_id)
+        {
+            return Ok(false);
+        }
+        let pane = self.pane_mut(pane_id)?;
+        pane.write_erasure_sidecars()?;
+        Ok(true)
+    }
+
+    pub fn recover_pane_bytes_from_erasure_shards(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Result<Option<Vec<u8>>, MmapStoreError> {
+        if self.cold_erasure != ColdErasureMode::ReedSolomon
+            || self.fallback_panes.contains(&pane_id)
+        {
+            return Ok(None);
+        }
+        let pane = self.pane_mut(pane_id)?;
+        pane.recover_from_erasure_sidecars().map(Some)
     }
 
     #[must_use]
@@ -803,6 +1320,8 @@ pub fn build_offsets_from_lengths(lengths: &[u64]) -> Vec<LineOffset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
 
     fn temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("create temp dir")
@@ -817,6 +1336,21 @@ mod tests {
         let config =
             MmapStoreConfig::new(dir.to_path_buf()).with_sqlite_fallback(db_path.to_path_buf());
         MmapScrollbackStore::new(config).expect("create hybrid store")
+    }
+
+    fn rs_store(dir: &Path) -> MmapScrollbackStore {
+        let config = MmapStoreConfig::new(dir.to_path_buf()).with_cold_erasure_rs();
+        MmapScrollbackStore::new(config).expect("create rs store")
+    }
+
+    fn erasure_sidecar_paths(dir: &Path, pane_id: PaneId) -> Vec<PathBuf> {
+        let log_path = dir.join(format!("{pane_id}.log"));
+        (0..COLD_ERASURE_TOTAL_SHARDS)
+            .map(|index| {
+                cold_erasure_shard_path(&log_path, u8::try_from(index).unwrap())
+                    .expect("sidecar path")
+            })
+            .collect()
     }
 
     // --- page_align_down ---
@@ -895,6 +1429,83 @@ mod tests {
             config.sqlite_fallback_path,
             Some(PathBuf::from("/tmp/test.db"))
         );
+    }
+
+    #[test]
+    fn config_cold_erasure_is_default_off_and_opt_in() {
+        let config = MmapStoreConfig::new(PathBuf::from("/tmp/test"));
+        assert_eq!(config.cold_erasure, ColdErasureMode::Disabled);
+
+        let config = MmapStoreConfig::new(PathBuf::from("/tmp/test")).with_cold_erasure_rs();
+        assert_eq!(config.cold_erasure, ColdErasureMode::ReedSolomon);
+    }
+
+    // --- Cold erasure codec ---
+
+    #[test]
+    fn rs_erasure_recovers_from_every_three_of_five_subset() {
+        let data = b"cold-tier scrollback retained bytes\nline two\n".to_vec();
+        let shards = cold_erasure_encode(&data).unwrap();
+
+        for a in 0..COLD_ERASURE_TOTAL_SHARDS {
+            for b in (a + 1)..COLD_ERASURE_TOTAL_SHARDS {
+                for c in (b + 1)..COLD_ERASURE_TOTAL_SHARDS {
+                    let survivors = vec![shards[a].clone(), shards[b].clone(), shards[c].clone()];
+                    let decoded = cold_erasure_decode(&survivors).unwrap();
+                    assert_eq!(decoded, data, "subset ({a}, {b}, {c}) failed");
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn rs_erasure_fuzz_recovers_after_dropping_up_to_parity(
+            data in proptest::collection::vec(any::<u8>(), 0..4096),
+            drop_count in 0usize..=2,
+            drop_offset in 0usize..COLD_ERASURE_TOTAL_SHARDS,
+        ) {
+            let shards = cold_erasure_encode(&data).unwrap();
+            let dropped: HashSet<usize> = (0..drop_count)
+                .map(|offset| (drop_offset + offset) % COLD_ERASURE_TOTAL_SHARDS)
+                .collect();
+            let survivors: Vec<_> = shards
+                .iter()
+                .enumerate()
+                .filter_map(|(index, shard)| (!dropped.contains(&index)).then_some(shard.clone()))
+                .collect();
+
+            prop_assert!(survivors.len() >= COLD_ERASURE_DATA_SHARDS);
+            let decoded = cold_erasure_decode(&survivors).unwrap();
+            prop_assert_eq!(decoded, data);
+        }
+    }
+
+    #[test]
+    fn rs_erasure_fewer_than_k_survivors_fails_closed() {
+        let shards = cold_erasure_encode(b"need at least k survivors").unwrap();
+        let err = cold_erasure_decode(&shards[..COLD_ERASURE_DATA_SHARDS - 1]).unwrap_err();
+        assert!(matches!(
+            err,
+            MmapStoreError::InsufficientErasureShards {
+                have: 2,
+                need: COLD_ERASURE_DATA_SHARDS
+            }
+        ));
+    }
+
+    #[test]
+    fn rs_erasure_corrupt_shard_crc_fails_closed() {
+        let shards = cold_erasure_encode(b"crc catches corrupted cold shard").unwrap();
+        let mut encoded = shards[3].encode_bytes().unwrap();
+        let last = encoded.last_mut().expect("non-empty shard encoding");
+        *last ^= 0x55;
+
+        let err = ColdErasureShard::decode_bytes(&encoded).unwrap_err();
+        assert!(matches!(
+            err,
+            MmapStoreError::ErasureShardCrcMismatch { index: 3 }
+        ));
     }
 
     // --- MmapStoreError display ---
@@ -1142,6 +1753,85 @@ mod tests {
             !dir.path().join("1.log.compact.tmp").exists(),
             "temp consumed by rename"
         );
+    }
+
+    #[test]
+    fn default_off_compaction_does_not_write_erasure_sidecars() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        for idx in 0..8 {
+            store.append_line(1, &format!("line-{idx}")).unwrap();
+        }
+        store.prune_before(1, 5).unwrap();
+        assert!(store.compact_pane_if_stale(1, 1).unwrap());
+
+        let raw = std::fs::read_to_string(dir.path().join("1.log")).unwrap();
+        assert_eq!(raw, "line-5\nline-6\nline-7\n");
+        for path in erasure_sidecar_paths(dir.path(), 1) {
+            assert!(
+                !path.exists(),
+                "default-off storage.cold.erasure must not write {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn rs_compaction_writes_recoverable_sidecars_for_retained_bytes() {
+        let dir = temp_dir();
+        let mut store = rs_store(dir.path());
+
+        for idx in 0..9 {
+            store
+                .append_line(1, &format!("row-{idx}-{}", "payload".repeat(idx + 1)))
+                .unwrap();
+        }
+        store.prune_before(1, 4).unwrap();
+        assert!(store.compact_pane_if_stale(1, 1).unwrap());
+
+        let raw = std::fs::read(dir.path().join("1.log")).unwrap();
+        let paths = erasure_sidecar_paths(dir.path(), 1);
+        assert_eq!(paths.len(), COLD_ERASURE_TOTAL_SHARDS);
+        for path in &paths {
+            assert!(path.exists(), "missing erasure sidecar {}", path.display());
+        }
+
+        // Simulate loss of two sidecars without deleting files: use a mixed
+        // 3-of-5 survivor set that includes data and parity shards.
+        let survivors = [0usize, 3, 4]
+            .into_iter()
+            .map(|index| {
+                let bytes = std::fs::read(&paths[index]).unwrap();
+                ColdErasureShard::decode_bytes(&bytes).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let recovered = cold_erasure_decode(&survivors).unwrap();
+        assert_eq!(recovered, raw);
+        assert_eq!(
+            store.recover_pane_bytes_from_erasure_shards(1).unwrap(),
+            Some(raw)
+        );
+    }
+
+    #[test]
+    fn rs_refresh_is_explicit_and_off_hot_append_path() {
+        let dir = temp_dir();
+        let mut store = rs_store(dir.path());
+
+        store.append_line(1, "hot-path-line").unwrap();
+        for path in erasure_sidecar_paths(dir.path(), 1) {
+            assert!(
+                !path.exists(),
+                "append path must not synchronously encode erasure sidecar {}",
+                path.display()
+            );
+        }
+
+        assert!(store.refresh_pane_erasure_shards(1).unwrap());
+        let raw = std::fs::read(dir.path().join("1.log")).unwrap();
+        let recovered = store.recover_pane_bytes_from_erasure_shards(1).unwrap();
+        assert_eq!(recovered, Some(raw));
     }
 
     #[test]
