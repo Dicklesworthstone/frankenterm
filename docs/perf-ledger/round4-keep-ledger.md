@@ -56,4 +56,36 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls �
 
 ## Entries
 
-_None yet — round-4 campaign opening. The first kept candidate lands here._
+> Provisional-keep policy (noisy shared RCH workers, ~11min builds): correctness is rigorously
+> RCH-proven per idea and every change is **default-off**, so enabling is safe and shipping is zero-risk.
+> A/B *quantification* (for any default-on promotion) is tracked here with a grep-able retry predicate and
+> run in consolidated batches; an idea is only reverted if A/B shows a regression on a default-on path.
+
+### 2026-06-19 | Q3 / cc_3 | Linear KMP overlap match in ingest.extract_delta
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** config `ingest.delta_linear_overlap` (default false)
+**Commit:** 2bebc40d0
+**Behavior-preservation:** KMP single-pass overlap == quadratic-overlap `DeltaResult` (incl reason strings) equivalence proptest over random + box-drawing + emoji-boundary fuzz; pane-reported RCH-pass.
+**A/B verdict:** DEFERRED. Retry-condition (Form 5): do not retry from a cold read; use a quiet-host env-toggle `delta_extraction` bench (build-once back-to-back, common-first-byte / box-drawing workload where the O(n^2) candidate loop dominates) instead.
+**Baseline comparator:** nested memchr + per-candidate slice compare (O(n^2) worst case).
+**Rollback:** flag default-off; `git revert 2bebc40d0`.
+
+### 2026-06-19 | ft-perf-gate driver / cod_3 | Round-4 perf-gate driver (SPRT + conformal)
+
+**Status:** kept (durable infra) — Form 6 structural-not-numerical
+**Gate:** `FT_PERF_GATE_MODE={fixed|sprt|anytime}` (default fixed = bit-identical) + `FT_PERF_GATE_BANDS={fixed|conformal}` (default fixed)
+**Commit:** a819e28b0
+**Behavior-preservation:** default `fixed` bit-identical to legacy gate; conformal clamped `min(band, baseline*1.10)` (monotone-tighter, only ever adds rejections); OC-curve (false-reject<=alpha, false-accept<=beta) + flat-median/inflated-p999 unit tests; pane-reported RCH-pass.
+**A/B verdict:** N/A — harness infra, not a runtime perf change.
+**Rollback:** default `fixed` mode; `git revert a819e28b0`.
+
+### 2026-06-19 | M2 / cod_5 | Succinct RLE cell attrs + ft-dkfiy byte-equiv gap closed
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** feature `succinct_attrs` (default off)
+**Commit:** 2e2f729dc (termwiz scrollback equivalence gate) atop the round-3 succinct scaffold
+**Behavior-preservation:** per-column `attr(col)` == AoS byte-equivalence — the previously-MISSING default-vs-succinct test is now added, closing the ft-dkfiy gap (termwiz no longer runs fewer tests under the feature); RCH remote hz2 PASS.
+**A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if a warm/cold scrollback memory bench shows attr-store RSS or cache-miss share above noise on a deep-scrollback workload.
+**Baseline comparator:** AoS `Vec<CellAttributes>` per cell.
+**Rollback:** feature default-off; `git revert 2e2f729dc`.

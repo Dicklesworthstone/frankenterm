@@ -31,9 +31,15 @@ with retry-condition predicate). Code-first → batch-bench → keep/revert (mat
 | `release-perf` profile (thin-LTO, opt=3, frame-pointers via RUSTFLAGS) | DONE (Cargo.toml) |
 | Negative-evidence ledger + keep ledger | DONE (docs/perf-ledger/round4-*.md) |
 | `scripts/round4-bench-ab.sh` A/B driver (2 arms same run window → verdict via check_bench_stats.py + ft-perf-gate) | in progress |
-| SPRT early-stop driver wiring `FT_PERF_GATE_MODE={fixed\|sprt\|anytime}` (sprt.rs exists) | pending |
-| Conformal band wiring `FT_PERF_GATE_BANDS={fixed\|conformal}` (conformal.rs exists) | pending |
-| Round-3 backfill (quantify 8 moonshots) + close ft-dkfiy byte-equiv gap | pending |
+| SPRT early-stop driver wiring `FT_PERF_GATE_MODE={fixed\|sprt\|anytime}` (sprt.rs exists) | DONE a819e28b0 (cod_3) |
+| Conformal band wiring `FT_PERF_GATE_BANDS={fixed\|conformal}` (conformal.rs exists) | DONE a819e28b0 (cod_3) |
+| Round-3 backfill (quantify 8 moonshots) | in progress (cod_2, gui env-A/B running) |
+| ft-dkfiy succinct byte-equiv gap | DONE 2e2f729dc (cod_5, part of M2) |
+
+## RELEASE GATES (Phase 3 — must pass before v0.7.0)
+- **GUI v0.6.1 startup crash**: the shipped /Applications/FrankenTerm.app v0.6.1 crashes instantly on
+  launch (operator restored v0.5.0 to work). v0.7.0 GUI MUST launch cleanly — investigate + fix the crash
+  before cutting the release. Crashing bundle preserved at /Applications/FrankenTerm.app.bak-0.6.1-crashing-*.
 
 Note: `ft-perf-gate` already ships `sprt.rs`, `conformal.rs`, `regime_shift.rs` as a library; Phase 0 wires
 them into a CLI driver, it does not re-derive the math. `check_bench_stats.py` already ports Mann-Whitney +
@@ -83,3 +89,16 @@ tracked `ft-odrq7` data-loss window); min-plus end-to-end capture→storage late
 _(tick entries appended here by the operator tend-loop)_
 
 - 2026-06-19 — campaign opened; Phase 0 foundation laid (profile, ledgers, this doc).
+- 2026-06-19 tend#1 — wave-1 dispatched to 8 panes; strong WIP (patterns.rs Q4-6, ingest.rs Q3
+  +proptest, scrollback_tiers.rs Q1, storage.rs Q2, simd_scan.rs+build.rs M1 DFA, ft-perf-gate
+  SPRT/conformal, cell M2 +succinct_attrs_equivalence test). BLOCKER fixed: RCH canonical-path
+  mkdir failed on ubuntu-user ovh workers (ovh-a/ovh-b) — drained them (10 root workers remain);
+  fail-closed discipline held (no local fallback). Re-nudged failed panes; all resumed on root
+  workers. cc_3 Q3 ~done → nudged to commit. No commits landed yet.
+- 2026-06-19 tend#2 — 3 commits landed + adjudicated (provisional keep, default-off, correctness
+  RCH-proven): Q3 linear KMP overlap (2bebc40d0, cc_3), ft-perf-gate SPRT/conformal driver (a819e28b0,
+  cod_3, durable infra), M2 succinct attrs + ft-dkfiy gap closed (2e2f729dc, cod_5). Keep-ledger updated.
+  Freed panes 0.2/0.4/0.7 → dispatched M7 poll-cadence (tailer.rs), M3 GUI SoA glyph (gui), M9 PID
+  fleet-memory (fleet_memory_controller.rs). Still grinding: cod_1 Q4/5/6 (patterns.rs), cod_4 M1 DFA
+  (simd_scan+build.rs), cc_1 Q1 (scrollback_tiers), cc_2 Q2 (storage), cod_2 round-3 gui backfill.
+  Recorded GUI v0.6.1 startup-crash as a hard Phase-3 release gate.
