@@ -305,6 +305,7 @@ mod test {
     use crate::shapecache::{GlyphPosition, ShapedInfo};
     use crate::utilsprites::RenderMetrics;
     use config::{FontAttributes, TextStyle};
+    use euclid::num::Zero;
     use frankenterm_font::shaper::{GlyphInfo, PresentationWidth};
     use frankenterm_font::units::PixelLength;
     use frankenterm_font::{FontConfiguration, LoadedFont};
