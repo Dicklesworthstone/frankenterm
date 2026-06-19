@@ -695,6 +695,10 @@ harness = false
 name = "atlas_tiered_swap_frame_loop"
 harness = false
 
+[[bench]]
+name = "m6_search_while_streaming"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
