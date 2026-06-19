@@ -971,6 +971,190 @@ pub struct EvictionTarget {
     pub pages_to_evict: usize,
 }
 
+// =============================================================================
+// M9 — PID reclaim-magnitude dampening (alien-artifact-coding)
+// =============================================================================
+
+/// Reclaim-magnitude dampening strategy for fleet scrollback eviction (M9).
+///
+/// Gate: `memory.dampening` — default [`MemoryDampening::Hysteresis`] (the legacy
+/// fixed per-tier retained fractions). Set to [`MemoryDampening::Pid`] to engage
+/// the discrete-time anti-windup PID that smooths de-escalation while keeping
+/// escalation bang-bang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryDampening {
+    /// Legacy fixed per-tier retained fractions (Elevated 75%, Critical 25%,
+    /// Emergency 0%). Deterministic; the shipping default.
+    #[default]
+    Hysteresis,
+    /// Discrete-time anti-windup PID governs the fleet-wide reclaim magnitude
+    /// toward an RSS-headroom setpoint, smoothing de-escalation. Fails closed to
+    /// the legacy fractions on a missing/non-finite/stalled RSS sample.
+    Pid,
+}
+
+/// Configuration for the M9 PID reclaim-magnitude dampener.
+///
+/// The default gains are derived by pole placement on the nominal first-order
+/// headroom plant `h[k+1] = 0.7·h[k] + 0.3·u[k]` (closed-loop poles 0.70, 0.65)
+/// and certified to GM ≥ 6 dB, PM ≥ 30°, zero overshoot, zero steady-state error
+/// by the `fleet_memory_pid_dampening_cert` proof. Because `dampening` defaults
+/// to [`MemoryDampening::Hysteresis`], the PID path is inert unless explicitly
+/// enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PidDampeningConfig {
+    /// Gate: which reclaim-magnitude strategy to use.
+    pub dampening: MemoryDampening,
+    /// Target RSS headroom fraction (setpoint / reference), in `[0, 1]`.
+    pub setpoint_headroom: f64,
+    /// Proportional gain.
+    pub kp: f64,
+    /// Integral gain (per evaluation cycle; `dt = 1`).
+    pub ki: f64,
+    /// Derivative gain (per evaluation cycle; `dt = 1`).
+    pub kd: f64,
+    /// Output (reclaim fraction) clamp lower bound.
+    pub out_min: f64,
+    /// Output (reclaim fraction) clamp upper bound.
+    pub out_max: f64,
+    /// Consecutive identical finite RSS samples before the sensor is declared
+    /// stalled and the controller fails closed to the legacy fixed fractions.
+    pub stall_threshold: u32,
+}
+
+impl Default for PidDampeningConfig {
+    fn default() -> Self {
+        Self {
+            dampening: MemoryDampening::Hysteresis,
+            setpoint_headroom: 0.25,
+            // Pole-placement design on h[k+1]=0.7h+0.3u, poles {0.70, 0.65}:
+            //   Kp = (0.7 - 0.455)/0.3 = 49/60,  Ki = (0.35/0.3) - Kp = 0.35.
+            kp: 49.0 / 60.0,
+            ki: 0.35,
+            kd: 0.0,
+            out_min: 0.0,
+            out_max: 1.0,
+            stall_threshold: 8,
+        }
+    }
+}
+
+/// Discrete-time anti-windup PID that governs scrollback reclaim MAGNITUDE
+/// toward an RSS-headroom setpoint (M9). Stateful across evaluation cycles; the
+/// integrator and derivative memory persist so de-escalation is smooth.
+///
+/// Anti-windup combines conditional integration (the integrator is frozen when
+/// it would deepen output saturation) with a hard bound on the integral term so
+/// `Ki·I` can never exceed the output span. The controller is linear in its
+/// unsaturated region; the closed-loop stability certificate is computed on that
+/// small-signal model.
+#[derive(Debug, Clone)]
+pub struct PidReclaimController {
+    integral: f64,
+    prev_error: f64,
+    have_prev: bool,
+    last_sample: f64,
+    stall_count: u32,
+}
+
+impl PidReclaimController {
+    /// Create a fresh controller with zeroed integrator and no history.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            integral: 0.0,
+            prev_error: 0.0,
+            have_prev: false,
+            last_sample: f64::NAN,
+            stall_count: 0,
+        }
+    }
+
+    /// Reset integrator, derivative memory, and stall state. Called on full
+    /// de-escalation (return to `Normal`) so the next episode starts cold.
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Current integrator value (for telemetry / tests).
+    #[must_use]
+    pub fn integral(&self) -> f64 {
+        self.integral
+    }
+
+    /// Compute the reclaim fraction in `[out_min, out_max]` for this cycle, or
+    /// `None` to **fail closed** (the `headroom` sample is missing, non-finite,
+    /// or the sensor has stalled), in which case the caller uses the legacy
+    /// fixed fraction.
+    ///
+    /// `headroom` is the measured RSS headroom fraction (process variable). The
+    /// error is `setpoint − headroom`, so a positive error (headroom below the
+    /// setpoint) drives the reclaim fraction up.
+    pub fn reclaim_fraction(
+        &mut self,
+        headroom: Option<f64>,
+        cfg: &PidDampeningConfig,
+    ) -> Option<f64> {
+        let h = headroom?;
+        if !h.is_finite() {
+            // Sensor fault: do NOT integrate garbage; fail closed.
+            self.stall_count = 0;
+            return None;
+        }
+
+        // Stall detection: an identical finite sample repeating for too long is
+        // treated as a wedged sensor. Freeze the integrator and fail closed.
+        if self.have_prev && (h - self.last_sample).abs() <= f64::EPSILON {
+            self.stall_count = self.stall_count.saturating_add(1);
+        } else {
+            self.stall_count = 0;
+        }
+        self.last_sample = h;
+        if self.stall_count >= cfg.stall_threshold {
+            return None;
+        }
+
+        let dt = 1.0_f64;
+        let error = cfg.setpoint_headroom - h;
+        let derivative = if self.have_prev {
+            (error - self.prev_error) / dt
+        } else {
+            0.0
+        };
+
+        // Anti-windup via conditional integration: tentatively integrate, then
+        // back off if the tentative output is saturated in the same direction.
+        let proposed_integral = self.integral + error * dt;
+        let unsaturated =
+            cfg.kp * error + cfg.ki * proposed_integral + cfg.kd * derivative;
+        let saturating_up = unsaturated > cfg.out_max && error > 0.0;
+        let saturating_down = unsaturated < cfg.out_min && error < 0.0;
+        if !(saturating_up || saturating_down) {
+            self.integral = proposed_integral;
+        }
+        // Hard bound: keep |Ki·I| within the output span regardless.
+        if cfg.ki.abs() > f64::EPSILON {
+            let integral_bound = (cfg.out_max - cfg.out_min) / cfg.ki.abs();
+            self.integral = self.integral.clamp(-integral_bound, integral_bound);
+        }
+
+        let output = (cfg.kp * error + cfg.ki * self.integral + cfg.kd * derivative)
+            .clamp(cfg.out_min, cfg.out_max);
+
+        self.prev_error = error;
+        self.have_prev = true;
+        Some(output)
+    }
+}
+
+impl Default for PidReclaimController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Orchestrates fleet-wide scrollback eviction decisions.
 ///
 /// Given the current fleet pressure tier and per-pane scrollback info,
@@ -1038,20 +1222,7 @@ impl FleetScrollbackOrchestrator {
         // Determine eviction aggressiveness based on tier using exact integer
         // ratios; fleet totals may be large enough that f64 loses bytes/pages.
         let (target_retained_numerator, target_retained_denominator, max_pane_numerator) =
-            match tier {
-                // br-ft-4l0lk: structurally unreachable — the function's
-                // early-exit guard above (`if tier == FleetPressureTier::Normal
-                // { return None; }`) ensures Normal never reaches this match.
-                // The named message surfaces the invariant if a future refactor
-                // ever moves or removes the guard.
-                FleetPressureTier::Normal => unreachable!(
-                    "FleetPressureTier::Normal handled by early-exit guard \
-                 above; this match arm is structurally unreachable"
-                ),
-                FleetPressureTier::Elevated => (3, 4, 1), // retain 75%, up to 50% per pane
-                FleetPressureTier::Critical => (1, 4, 2), // retain 25%, full per pane
-                FleetPressureTier::Emergency => (0, 1, 2), // evict everything
-            };
+            Self::tier_eviction_ratios(tier);
 
         let fleet_warm_bytes_target = floor_fraction_usize(
             fleet_warm_bytes,
@@ -1059,6 +1230,50 @@ impl FleetScrollbackOrchestrator {
             target_retained_denominator,
         );
 
+        self.build_eviction_plan(
+            tier,
+            panes,
+            fleet_warm_bytes,
+            fleet_warm_bytes_target,
+            max_pane_numerator,
+        )
+    }
+
+    /// Fixed legacy per-tier eviction ratios:
+    /// `(target_retained_numerator, target_retained_denominator, max_pane_numerator)`.
+    ///
+    /// Shared by the legacy [`Self::plan_eviction`] and the M9 PID path
+    /// [`Self::plan_eviction_damped`] so the PID arm reuses the *same* per-pane
+    /// safety cap (`max_pane_numerator`) and the *same* legacy retained-fraction
+    /// floor — only the fleet-wide reclaim MAGNITUDE is replaced by the PID.
+    fn tier_eviction_ratios(tier: FleetPressureTier) -> (usize, usize, usize) {
+        match tier {
+            // br-ft-4l0lk: structurally unreachable — both callers early-exit on
+            // `tier == FleetPressureTier::Normal` before reaching this match. The
+            // named message surfaces the invariant if a future refactor ever
+            // moves or removes those guards.
+            FleetPressureTier::Normal => unreachable!(
+                "FleetPressureTier::Normal handled by early-exit guard \
+                 in the caller; this match arm is structurally unreachable"
+            ),
+            FleetPressureTier::Elevated => (3, 4, 1), // retain 75%, up to 50% per pane
+            FleetPressureTier::Critical => (1, 4, 2), // retain 25%, full per pane
+            FleetPressureTier::Emergency => (0, 1, 2), // evict everything
+        }
+    }
+
+    /// Shared targeting kernel: given the fleet warm total, the desired retained
+    /// target, and the per-pane cap, score panes (idle-first, then warm-bytes
+    /// descending) and build the per-pane eviction plan. Byte-identical between
+    /// the legacy and PID paths — only `fleet_warm_bytes_target` differs.
+    fn build_eviction_plan(
+        &mut self,
+        tier: FleetPressureTier,
+        panes: &[PaneScrollbackInfo],
+        fleet_warm_bytes: usize,
+        fleet_warm_bytes_target: usize,
+        max_pane_numerator: usize,
+    ) -> Option<EvictionPlan> {
         // Score each pane for eviction priority.
         // Lower score = higher eviction priority (evict first).
         // Idle panes (no activity delta) get priority, then sort by warm bytes desc.
@@ -1129,6 +1344,95 @@ impl FleetScrollbackOrchestrator {
                 fleet_warm_bytes_target,
             })
         }
+    }
+
+    /// M9 moonshot: produce an eviction plan whose fleet-wide reclaim MAGNITUDE
+    /// is governed by a discrete-time anti-windup PID driving the measured
+    /// RSS-`headroom` fraction toward `cfg.setpoint_headroom`, instead of the
+    /// legacy fixed per-tier fractions.
+    ///
+    /// Gate: `cfg.dampening` (default [`MemoryDampening::Hysteresis`]). Behavior:
+    ///
+    /// * **Default-off / fail-closed** — when `cfg.dampening != Pid`, or the PID
+    ///   fails closed (RSS sample `None`, non-finite, or a stalled sensor), this
+    ///   delegates to the byte-identical legacy [`Self::plan_eviction`] / legacy
+    ///   fixed-fraction target.
+    /// * **Smooth de-escalation** — at `Elevated` the PID may reclaim *less* than
+    ///   the legacy fraction (down to zero), tapering eviction as headroom
+    ///   recovers.
+    /// * **Escalation stays bang-bang (monotone floor)** — at `Critical` and
+    ///   `Emergency` the reclaim magnitude is floored at the legacy fraction, so
+    ///   the PID can only ask for *more*, never less. Safety is never dampened.
+    ///
+    /// The default gains are pole-placement-certified (GM ≥ 6 dB, PM ≥ 30°, zero
+    /// overshoot) against the nominal first-order headroom plant — see the
+    /// `fleet_memory_pid_dampening_cert` proof.
+    pub fn plan_eviction_damped(
+        &mut self,
+        tier: FleetPressureTier,
+        panes: &[PaneScrollbackInfo],
+        rss_headroom: Option<f64>,
+        pid: &mut PidReclaimController,
+        cfg: &PidDampeningConfig,
+    ) -> Option<EvictionPlan> {
+        // Default-off: only the explicit PID mode diverges from legacy.
+        if cfg.dampening != MemoryDampening::Pid {
+            return self.plan_eviction(tier, panes);
+        }
+
+        if tier == FleetPressureTier::Normal {
+            // Full de-escalation: relax controller state so the next pressure
+            // episode starts cold rather than carrying a stale integrator.
+            pid.reset();
+            self.update_activity(panes);
+            return None;
+        }
+
+        let fleet_warm_bytes = panes
+            .iter()
+            .fold(0usize, |total, pane| total.saturating_add(pane.warm_bytes));
+        if fleet_warm_bytes == 0 {
+            self.update_activity(panes);
+            return None;
+        }
+
+        let (target_retained_numerator, target_retained_denominator, max_pane_numerator) =
+            Self::tier_eviction_ratios(tier);
+        let legacy_target = floor_fraction_usize(
+            fleet_warm_bytes,
+            target_retained_numerator,
+            target_retained_denominator,
+        );
+
+        // PID governs reclaim magnitude; fail closed to the legacy target.
+        let fleet_warm_bytes_target = match pid.reclaim_fraction(rss_headroom, cfg) {
+            Some(reclaim_fraction) => {
+                // reclaim fraction -> retained-bytes target (lower target = more reclaim).
+                #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+                let reclaim_bytes = ((fleet_warm_bytes as f64) * reclaim_fraction)
+                    .round()
+                    .clamp(0.0, fleet_warm_bytes as f64) as usize;
+                let pid_target = fleet_warm_bytes - reclaim_bytes;
+                match tier {
+                    // Monotone floor: never reclaim LESS than legacy at the
+                    // dangerous tiers — escalation is instant/bang-bang.
+                    FleetPressureTier::Critical | FleetPressureTier::Emergency => {
+                        pid_target.min(legacy_target)
+                    }
+                    // Elevated: smooth de-escalation permitted (reclaim <= legacy ok).
+                    _ => pid_target,
+                }
+            }
+            None => legacy_target,
+        };
+
+        self.build_eviction_plan(
+            tier,
+            panes,
+            fleet_warm_bytes,
+            fleet_warm_bytes_target,
+            max_pane_numerator,
+        )
     }
 
     fn update_activity(&mut self, panes: &[PaneScrollbackInfo]) {
