@@ -139,3 +139,13 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls âˆ
 **A/B verdict:** DEFERRED. Retry-condition (Form 7): retry only if an access-trace bench shows s3fifo hit-rate above lfu at equal capacity by a Mann-Whitney-significant margin on a scan-heavy (one-hit-wonder) workload.
 **Baseline comparator:** LFU (u16 freq + decay).
 **Rollback:** config default fifo/lfu; `git revert 2c399af8c`.
+
+### 2026-06-19 | Q2 / cc_2 | Group-commit widen (events/gaps) + condvar writer wake
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** config `storage.group_commit_events` + `storage.writer_blocking_recv` (default false)
+**Commit:** dd3511fa7
+**Behavior-preservation:** golden identical final DB dump + per-command result order; crash-atomicity (partial batch all-or-nothing); pane-reported RCH-pass.
+**A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a write-replay bench attributes above-noise fsync/park cost at ~200-pane sustained write load (the 1ms park + per-event autocommit dominates only under burst).
+**Baseline comparator:** 1ms try_recv park + per-event autocommit.
+**Rollback:** config defaults false; `git revert dd3511fa7`.

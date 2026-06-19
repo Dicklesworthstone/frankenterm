@@ -135,3 +135,12 @@ _(tick entries appended here by the operator tend-loop)_
   cod_1 over-rigorous on Q4 (~2h re-syncing a --no-default-features variant on the dirty tree, NOT
   wedged) -> nudged to commit Q4 with the default proof + defer the edge-variant. In flight: cod_1 Q4/5/6,
   cod_2 bocpd, cod_3 M7, cod_4 crash-fix, cc_1 M4, cc_2 Q2.
+- 2026-06-19 tend#6 — Q2 group-commit landed + provisional-keep (dd3511fa7, cc_2). 9 ideas adjudicated.
+  META-BLOCKER IDENTIFIED: RCH syncs the whole DIRTY TREE, so cod_2's mid-edit bocpd.rs (missing
+  update_shiryaev_roberts_statistic) broke frankenterm-core compilation and FAILED cod_1's unrelated Q4
+  proof (exit 101) — dirty-tree cross-contamination (ft-ch3nm). MITIGATION: commit code-first FAST to keep
+  the tree compiling; reduce concurrent core editors. ACTIONS: cancelled wedged M7 build #...536 (55m,
+  3rd wedge); nudged cod_1 -> commit Q4 code-first (proof deferred, blocked by sibling contamination not
+  Q4) then Q5/Q6; nudged cod_2 -> get bocpd.rs COMPILING immediately + commit. HELD cod_5/cc_2/cc_3 idle
+  to drain core-WIP contamination before dispatching M5/M8/etc. cod_4 GUI crash-fix applied (webgpu.rs)
+  + verifying compile (~27m, gui type-check passed, awaiting final RCH exit).
