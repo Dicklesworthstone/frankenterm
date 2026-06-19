@@ -237,6 +237,10 @@ name = "pattern_detection"
 harness = false
 
 [[bench]]
+name = "round5_patterns_a1"
+harness = false
+
+[[bench]]
 name = "delta_extraction"
 harness = false
 
