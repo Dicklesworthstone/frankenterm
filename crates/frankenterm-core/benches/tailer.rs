@@ -9,10 +9,11 @@
 //! - timeout wrapper overhead on a ready future
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::hint::black_box;
 use std::pin::Pin;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -41,6 +42,10 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         name: "tailer/timeout_overhead",
         budget: "runtime_async timeout wrapper overhead on already-ready futures",
     },
+    bench_common::BenchBudget {
+        name: "tailer/capture_cadence_round5",
+        budget: "round-5 M7 cadence A/B via FT_MOONSHOT_INGEST_CADENCE_MODEL=predictive",
+    },
 ];
 
 type PaneFuture<'a> = Pin<Box<dyn Future<Output = frankenterm_core::Result<String>> + Send + 'a>>;
@@ -62,6 +67,50 @@ impl PaneTextSource for FixedPayloadSource {
     fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
         let payload = Arc::clone(&self.payload);
         Box::pin(async move { Ok((*payload).clone()) })
+    }
+}
+
+#[derive(Clone)]
+struct BurstPayloadSource {
+    calls_by_pane: Arc<Mutex<HashMap<u64, usize>>>,
+    stable_calls_per_generation: usize,
+    filler: Arc<String>,
+}
+
+impl BurstPayloadSource {
+    fn new(stable_calls_per_generation: usize, payload_size: usize) -> Self {
+        Self {
+            calls_by_pane: Arc::new(Mutex::new(HashMap::new())),
+            stable_calls_per_generation: stable_calls_per_generation.max(1),
+            filler: Arc::new("z".repeat(payload_size)),
+        }
+    }
+}
+
+impl PaneTextSource for BurstPayloadSource {
+    type Fut<'a> = PaneFuture<'a>;
+
+    fn get_text(&self, pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+        let generation = {
+            let mut calls = match self.calls_by_pane.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let entry = calls.entry(pane_id).or_insert(0);
+            let generation = *entry / self.stable_calls_per_generation;
+            *entry += 1;
+            generation
+        };
+        let filler = Arc::clone(&self.filler);
+        Box::pin(async move {
+            let mut text = String::with_capacity(filler.len() + 64);
+            let _ = write!(
+                &mut text,
+                "pane={pane_id} generation={generation} capture-cadence-round5 "
+            );
+            text.push_str(&filler);
+            Ok(text)
+        })
     }
 }
 
@@ -150,6 +199,70 @@ async fn run_capture_round(payload: Arc<String>, pane_count: u64, max_concurrent
     }
 
     delivered
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CadenceWorkloadSummary {
+    events_sent: u64,
+    no_change_captures: u64,
+    scheduler_throttle_events: u64,
+}
+
+async fn run_capture_cadence_workload(pane_count: u64, rounds: usize) -> CadenceWorkloadSummary {
+    let source = Arc::new(BurstPayloadSource::new(4, 256));
+    let (tx, mut rx) = mpsc::channel((pane_count as usize).saturating_mul(4).max(64));
+    let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+    let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    {
+        let mut guard = cursors.write().await;
+        for pane_id in 1..=pane_count {
+            guard.insert(pane_id, PaneCursor::new(pane_id));
+        }
+    }
+
+    let mut supervisor = TailerSupervisor::new(
+        TailerConfig {
+            min_interval: Duration::from_micros(100),
+            max_interval: Duration::from_micros(900),
+            backoff_multiplier: 1.5,
+            max_concurrent: 16,
+            send_timeout: Duration::from_millis(50),
+            capture_timeout: Duration::from_millis(50),
+            ..Default::default()
+        },
+        tx,
+        cursors,
+        registry,
+        shutdown,
+        source,
+    );
+    supervisor.sync_tailers(&make_panes(pane_count));
+
+    let mut delivered = 0usize;
+    for _ in 0..rounds {
+        runtime_async::sleep(Duration::from_micros(150)).await;
+        let mut poll_tasks = TailerPollTaskSet::new();
+        supervisor.spawn_ready(&mut poll_tasks);
+        while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+            supervisor.handle_poll_result(pane_id, outcome);
+        }
+
+        let expected_events = supervisor.metrics().events_sent as usize;
+        while delivered < expected_events {
+            if runtime_async::mpsc_recv_option(&mut rx).await.is_none() {
+                break;
+            }
+            delivered += 1;
+        }
+    }
+
+    CadenceWorkloadSummary {
+        events_sent: supervisor.metrics().events_sent,
+        no_change_captures: supervisor.metrics().no_change_captures,
+        scheduler_throttle_events: supervisor.scheduler_metrics().throttle_events,
+    }
 }
 
 fn bench_single_capture_round(c: &mut Criterion) {
@@ -243,6 +356,26 @@ fn bench_timeout_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_capture_cadence_round5(c: &mut Criterion) {
+    let runtime = build_runtime();
+    let mut group = c.benchmark_group("tailer/capture_cadence_round5");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(1));
+
+    group.bench_function("burst_64_panes", |b| {
+        b.iter(|| {
+            let summary = runtime.block_on(run_capture_cadence_workload(64, 24));
+            black_box(std::env::var("FT_MOONSHOT_INGEST_CADENCE_MODEL").ok());
+            black_box(summary.events_sent);
+            black_box(summary.no_change_captures);
+            black_box(summary.scheduler_throttle_events);
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("tailer", BUDGETS);
     Criterion::default().configure_from_args()
@@ -255,6 +388,7 @@ criterion_group!(
         bench_single_capture_round,
         bench_concurrent_capture_round,
         bench_capture_event_channel,
-        bench_timeout_overhead
+        bench_timeout_overhead,
+        bench_capture_cadence_round5
 );
 criterion_main!(benches);

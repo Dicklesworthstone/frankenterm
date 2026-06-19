@@ -31,6 +31,10 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         name: "simd_scan_chunked_stateful",
         budget: "stateful chunked SIMD scan should beat scalar by >2x on dense ASCII logs",
     },
+    bench_common::BenchBudget {
+        name: "simd_scan_ansi_dfa_table_round5",
+        budget: "round-5 M1 ANSI-dense A/B via feature ansi-dfa-table",
+    },
 ];
 
 fn payload_plain(size: usize) -> Vec<u8> {
@@ -54,9 +58,15 @@ fn payload_ansi_heavy(size: usize) -> Vec<u8> {
     while out.len() < size {
         let remaining = size - out.len();
         let copy_len = CHUNK.len().min(remaining);
-        out.extend_from_slice(&CHUNK[..copy_len]);
+        if let Some(bytes) = CHUNK.get(..copy_len) {
+            out.extend_from_slice(bytes);
+        }
     }
     out
+}
+
+const fn ansi_dfa_table_enabled() -> bool {
+    cfg!(feature = "ansi-dfa-table")
 }
 
 fn payload_binary_like(size: usize) -> Vec<u8> {
@@ -288,6 +298,23 @@ fn bench_chunked_stateful_scan(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_ansi_dfa_table_round5(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simd_scan_ansi_dfa_table_round5");
+    let payload = payload_ansi_heavy(2 * 1024 * 1024);
+    group.throughput(Throughput::Bytes(payload.len() as u64));
+
+    group.bench_function("ansi_dense_2m", |b| {
+        b.iter(|| {
+            let metrics = scan_newlines_and_ansi(black_box(&payload));
+            black_box(ansi_dfa_table_enabled());
+            black_box(metrics.ansi_byte_count);
+            black_box(metrics.newline_count);
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("simd_scan", BUDGETS);
     Criterion::default().configure_from_args()
@@ -296,6 +323,11 @@ fn bench_config() -> Criterion {
 criterion_group!(
     name = benches;
     config = bench_config();
-    targets = bench_newline_scan, bench_ansi_heavy_scan, bench_mixed_payload_scan, bench_chunked_stateful_scan
+    targets =
+        bench_newline_scan,
+        bench_ansi_heavy_scan,
+        bench_mixed_payload_scan,
+        bench_chunked_stateful_scan,
+        bench_ansi_dfa_table_round5
 );
 criterion_main!(benches);

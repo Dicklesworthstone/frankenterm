@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::cx::{Cx, for_request};
 use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder};
-use frankenterm_core::storage::{PaneRecord, StorageHandle, StoredEvent};
+use frankenterm_core::storage::{PaneRecord, StorageConfig, StorageHandle, StoredEvent};
 use serde::Serialize;
 use serde_json::json;
 use tempfile::TempDir;
@@ -25,11 +25,62 @@ const EVENT_COUNT: usize = 10_000;
 const EVENTS_PER_SECOND: usize = 100;
 const EVENT_INTERVAL_MS: i64 = 1_000 / EVENTS_PER_SECOND as i64;
 const BASE_TS_MS: i64 = 1_777_300_000_000;
+const ROUND5_BURST_PANES: u64 = 200;
+const ROUND5_BURST_EVENTS: usize = 4_000;
+const ROUND5_WAL_MODE_ENV: &str = "FT_ROUND5_WAL_GROUP_COMMIT_MODE";
 
-const BUDGETS: &[bench_common::BenchBudget] = &[bench_common::BenchBudget {
-    name: "wal_checkpoint_sustained_write/write_10k_events_checkpoint",
-    budget: "10k logical 100/sec event writes report p99 write latency and WAL checkpoint pause",
-}];
+const BUDGETS: &[bench_common::BenchBudget] = &[
+    bench_common::BenchBudget {
+        name: "wal_checkpoint_sustained_write/write_10k_events_checkpoint",
+        budget: "10k logical 100/sec event writes report p99 write latency and WAL checkpoint pause",
+    },
+    bench_common::BenchBudget {
+        name: "wal_group_commit_round5/sustained_burst_200_panes",
+        budget: "round-5 Q2/M8 200-pane event burst toggled by FT_ROUND5_WAL_GROUP_COMMIT_MODE",
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Round5WalMode {
+    Fixed,
+    Q2,
+    Adaptive,
+}
+
+impl Round5WalMode {
+    fn from_env() -> Self {
+        match std::env::var(ROUND5_WAL_MODE_ENV) {
+            Ok(value) if value.eq_ignore_ascii_case("q2") => Self::Q2,
+            Ok(value) if value.eq_ignore_ascii_case("adaptive") => Self::Adaptive,
+            _ => Self::Fixed,
+        }
+    }
+
+    fn storage_config(self) -> StorageConfig {
+        let mut config = StorageConfig::default();
+        match self {
+            Self::Fixed => {}
+            Self::Q2 => {
+                config.group_commit_events = true;
+                config.writer_blocking_recv = true;
+            }
+            Self::Adaptive => {
+                config.group_commit_events = true;
+                config.writer_blocking_recv = true;
+                config.group_commit_adaptive = true;
+            }
+        }
+        config
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Q2 => "q2",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
 
 struct Workload {
     _dir: TempDir,
@@ -98,8 +149,8 @@ fn pane_record(pane_id: u64) -> PaneRecord {
     }
 }
 
-fn stored_event(index: usize) -> StoredEvent {
-    let pane_id = (index as u64 % PANE_COUNT) + 1;
+fn stored_event_for(index: usize, pane_count: u64, workload: &'static str) -> StoredEvent {
+    let pane_id = (index as u64 % pane_count) + 1;
     StoredEvent {
         id: 0,
         pane_id,
@@ -117,10 +168,10 @@ fn stored_event(index: usize) -> StoredEvent {
             "event_index": index,
             "pane_id": pane_id,
             "logical_rate_per_second": EVENTS_PER_SECOND,
-            "workload": "wal_checkpoint_sustained_write"
+            "workload": workload
         })),
         matched_text: Some(format!(
-            "pane={pane_id} event={index} sustained WAL checkpoint benchmark capture payload"
+            "pane={pane_id} event={index} {workload} WAL benchmark capture payload"
         )),
         segment_id: None,
         detected_at: BASE_TS_MS + (index as i64 * EVENT_INTERVAL_MS),
@@ -131,27 +182,47 @@ fn stored_event(index: usize) -> StoredEvent {
     }
 }
 
+fn stored_event(index: usize) -> StoredEvent {
+    stored_event_for(index, PANE_COUNT, "wal_checkpoint_sustained_write")
+}
+
 fn percentile_us(values: &mut [u128], percentile: usize) -> u128 {
     if values.is_empty() {
         return 0;
     }
     values.sort_unstable();
     let index = ((values.len() - 1) * percentile) / 100;
-    values[index]
+    values
+        .get(index)
+        .copied()
+        .or_else(|| values.last().copied())
+        .unwrap_or(0)
 }
 
 fn setup_workload(rt: &Runtime, cx: &Cx) -> Workload {
+    setup_workload_with_config(
+        rt,
+        cx,
+        PANE_COUNT,
+        "wal-checkpoint.db",
+        StorageConfig::default(),
+    )
+}
+
+fn setup_workload_with_config(
+    rt: &Runtime,
+    cx: &Cx,
+    pane_count: u64,
+    db_name: &str,
+    config: StorageConfig,
+) -> Workload {
     let dir = tempfile::tempdir().expect("create WAL benchmark temp dir");
-    let db_path = dir
-        .path()
-        .join("wal-checkpoint.db")
-        .to_string_lossy()
-        .to_string();
+    let db_path = dir.path().join(db_name).to_string_lossy().to_string();
     let storage = rt.block_on(async {
-        let storage = StorageHandle::new_with_cx(cx, &db_path)
+        let storage = StorageHandle::with_config_with_cx(cx, &db_path, config)
             .await
             .expect("create benchmark storage");
-        for pane_id in 1..=PANE_COUNT {
+        for pane_id in 1..=pane_count {
             storage
                 .upsert_pane_with_cx(cx, pane_record(pane_id))
                 .await
@@ -165,6 +236,59 @@ fn setup_workload(rt: &Runtime, cx: &Cx) -> Workload {
         db_path,
         storage,
     }
+}
+
+fn run_event_burst_workload(
+    rt: &Runtime,
+    cx: &Cx,
+    workload: Workload,
+    event_count: usize,
+    pane_count: u64,
+    workload_name: &'static str,
+) -> WorkloadSummary {
+    rt.block_on(async {
+        let mut write_latencies_us = Vec::with_capacity(event_count);
+
+        for index in 0..event_count {
+            let start = Instant::now();
+            workload
+                .storage
+                .record_event_with_cx(cx, stored_event_for(index, pane_count, workload_name))
+                .await
+                .expect("record benchmark event");
+            write_latencies_us.push(start.elapsed().as_micros());
+        }
+
+        let checkpoint_start = Instant::now();
+        let checkpoint = workload
+            .storage
+            .checkpoint_with_cx(cx)
+            .await
+            .expect("checkpoint benchmark storage");
+        let checkpoint_pause_us = checkpoint_start.elapsed().as_micros();
+
+        workload
+            .storage
+            .shutdown_with_cx(cx)
+            .await
+            .expect("shutdown benchmark storage");
+
+        black_box(&workload.db_path);
+
+        let max_write_us = write_latencies_us.iter().copied().max().unwrap_or_default();
+        let warmup_skip = EVENTS_PER_SECOND.min(write_latencies_us.len());
+        let steady_state_p99_write_us = write_latencies_us
+            .get_mut(warmup_skip..)
+            .map_or(0, |steady| percentile_us(steady, 99));
+
+        WorkloadSummary {
+            events_written: event_count,
+            steady_state_p99_write_us,
+            max_write_us,
+            checkpoint_pause_us,
+            wal_pages: checkpoint.wal_pages,
+        }
+    })
 }
 
 fn run_workload(rt: &Runtime, cx: &Cx, workload: Workload) -> WorkloadSummary {
@@ -201,7 +325,9 @@ fn run_workload(rt: &Runtime, cx: &Cx, workload: Workload) -> WorkloadSummary {
 
         let max_write_us = write_latencies_us.iter().copied().max().unwrap_or_default();
         let warmup_skip = EVENTS_PER_SECOND.min(write_latencies_us.len());
-        let steady_state_p99_write_us = percentile_us(&mut write_latencies_us[warmup_skip..], 99);
+        let steady_state_p99_write_us = write_latencies_us
+            .get_mut(warmup_skip..)
+            .map_or(0, |steady| percentile_us(steady, 99));
 
         WorkloadSummary {
             events_written: EVENT_COUNT,
@@ -228,6 +354,50 @@ fn bench_wal_checkpoint_sustained_write(c: &mut Criterion) {
             |workload| {
                 let summary = run_workload(&rt, &cx, workload);
                 assert_eq!(summary.events_written, EVENT_COUNT);
+                black_box(summary.steady_state_p99_write_us);
+                black_box(summary.max_write_us);
+                black_box(summary.checkpoint_pause_us);
+                black_box(summary.wal_pages);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
+fn bench_round5_group_commit_burst(c: &mut Criterion) {
+    let rt = runtime();
+    let cx = for_request();
+    let mode = Round5WalMode::from_env();
+    let mut group = c.benchmark_group("wal_group_commit_round5");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(1));
+    group.throughput(Throughput::Elements(ROUND5_BURST_EVENTS as u64));
+
+    group.bench_function("sustained_burst_200_panes", |b| {
+        b.iter_batched(
+            || {
+                setup_workload_with_config(
+                    &rt,
+                    &cx,
+                    ROUND5_BURST_PANES,
+                    "round5-wal-group-commit.db",
+                    mode.storage_config(),
+                )
+            },
+            |workload| {
+                let summary = run_event_burst_workload(
+                    &rt,
+                    &cx,
+                    workload,
+                    ROUND5_BURST_EVENTS,
+                    ROUND5_BURST_PANES,
+                    "round5_wal_group_commit_burst",
+                );
+                black_box(mode.as_str());
+                black_box(summary.events_written);
                 black_box(summary.steady_state_p99_write_us);
                 black_box(summary.max_write_us);
                 black_box(summary.checkpoint_pause_us);
@@ -275,6 +445,6 @@ fn emit_baseline_summary() {
 criterion_group! {
     name = benches;
     config = bench_config();
-    targets = bench_wal_checkpoint_sustained_write
+    targets = bench_wal_checkpoint_sustained_write, bench_round5_group_commit_burst
 }
 criterion_main!(benches);
