@@ -64,3 +64,13 @@ _(tick entries appended by the orchestrator tend-loop)_
   Launched M9+S3-FIFO local bench (warm-target reuse). Nudged cod_3 (.6 WAL wedged 1h20m → cancel+lighter
   proof), cod_4 (.7 → final gui compile-check), cc_1 (.9 → wrap+2x flake proof). dcg-angle-bracket
   gotcha: tmux send-keys messages must avoid <...> placeholders (read as shell redirects).
+- 2026-06-19 tend#4 — EV2 (.19, 85f3867e6 agent-sharded patterns) + D2 (.12, 702df4a72 CSI/OSC table)
+  committed. Q4 local A/B FAILED on a TRANSIENT mid-commit race (cc_2 was committing D2's
+  escape-parser Cargo.toml during Q4's candidate build → manifest referenced a not-yet-present bench);
+  tree is consistent now → Q4 re-launched. RCH fleet DEGRADED (7/12 healthy): cancelled stale build
+  29894135561322622 (= cod_3's 1h50m wedge on vmi1293453) + drained vmi1293453 + ovh-a + ovh-b
+  (telemetry-dead / disk-critical / canonical-mkdir-fail). 6 healthy workers, 28 slots free. Nudged
+  cod_1(.4)/cod_3(.6)/cod_4(.7)/cod_5(.8) to cancel+retry on fresh workers. cod_4 correctly REFUSED to
+  report green during the escape-parser transient (fail-closed discipline held). No new closes this tick
+  (proofs RCH-blocked → now retrying). LEARNING: local A/Bs against the live dirty tree hit transient
+  mid-commit races — retry, or run when the swarm is committing less.
