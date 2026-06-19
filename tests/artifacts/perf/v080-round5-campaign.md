@@ -104,3 +104,13 @@ _(tick entries appended by the orchestrator tend-loop)_
   (.4/.6) once it frees the core-build slot. Key honest finding: algorithmic wins (Q1 32×, M4 19×)
   deliver; systems-moonshots (Q5/Q6/M5/M9/S3-FIFO/M6) largely do not — exactly what the gauntlet exists
   to surface. Approaching release: pending B4 green + EV1/EV3/EV4 proofs, then Thread F v0.8.0.
+- 2026-06-19 tend#8 (RELEASE PREP) — B4 full `core --lib` RCH run TIMED OUT at 3600s SSH — on COMPILE,
+  not tests (replay/tantivy/core compile alone exceeds the 1h SSH window). This is the SAME pre-existing
+  infra limit v0.7.0 shipped under (round-4 scorecard), NOT a round-5 regression; B1's mTLS split is the
+  structural fix for the slow-TEST lane (separate from the compile-time SSH ceiling). Launched a TARGETED
+  bocpd RCH proof (B2 validation). FOUND scattered uncommitted off-bead work (session_resume +213 +
+  proptests, agent_provider +10, status_bar +33, distributed +5, dynamic −1) — real RULE-1.5 fix work by
+  panes, NOT fmt churn → must NOT release from this tree. Broadcast a QUIESCE FREEZE to all 8 panes
+  (commit code-first + STOP). Release plan: settle tree → verify HEAD compiles → bump 0.7.0→0.8.0 → build
+  9 assets (darwin local + linux trj) → gh release. Thread A deliverable COMPLETE (19 adjudicated, 0
+  promotions); Thread B code deliverable (B1 split) shipped, full-run-in-one-SSH is a round-6 infra item.
