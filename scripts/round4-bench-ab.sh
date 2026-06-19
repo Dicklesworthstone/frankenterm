@@ -45,6 +45,7 @@ GATE=""
 BASELINE_REF=""
 CANDIDATE_REF=""
 DRY_RUN=0
+LOCAL=0
 # Keep-gate thresholds (mirror round4-negative-results.md rules 8 + 10).
 CV_MAX_PCT="${CV_MAX_PCT:-5.0}"
 ALPHA="${ALPHA:-0.05}"
@@ -98,6 +99,9 @@ OPTIONS:
   --alpha <a>           Mann-Whitney significance level (default 0.05).
   --regression-pct <p>  check_bench_stats.py regression threshold (default 10).
   --improve-pct <p>     Min mean speedup %% to count as a KEEP win (default 2).
+  --local               Run BOTH bench arms on THIS host (no RCH). Quiet-host A/B for
+                        relative deltas (round-5 operator choice). Correctness PROOFS
+                        still require RCH-remote/fail-closed; this flag is bench-only.
   --dry-run             Skip RCH/cargo entirely. Validate arg parsing and run
                         the comparator against synthetic distribution JSONLs so
                         the wiring can be smoke-tested with no remote workers.
@@ -147,6 +151,7 @@ while [[ $# -gt 0 ]]; do
         --regression-pct) REGRESSION_PCT="${2:?}"; shift 2;;
         --improve-pct) IMPROVE_PCT="${2:?}"; shift 2;;
         --dry-run) DRY_RUN=1; shift;;
+        --local) LOCAL=1; shift;;
         -h|--help) usage; exit 0;;
         *) die "unknown argument: $1 (try --help)";;
     esac
@@ -198,6 +203,18 @@ esac
 # Explicit cross-commit ref A/B overrides any gate mode when both refs imply it.
 if [[ -n "${BASELINE_REF}" && "${GATE_MODE}" != "gitref" ]]; then
     GATE_MODE="gitref"
+fi
+
+# LOCAL mode (quiet-host A/B on THIS machine; round-5 operator choice). Empties the RCH
+# prefix so both bench arms run on the local host back-to-back. This is valid for RELATIVE
+# A/B deltas ONLY — correctness PROOFS still go RCH-remote/fail-closed per AGENTS.md. The
+# RCH-blocked grep guards remain in place but are inert locally (clean cargo output carries
+# no "[RCH] local"/"no admissible workers"/etc. markers, so they never false-trigger).
+# Requires bash >= 4.4 for safe empty-array expansion under `set -u` (this repo's hosts run
+# bash 5.x; the shebang is /usr/bin/env bash).
+if [[ "${LOCAL}" -eq 1 ]]; then
+    RCH_PREFIX=()
+    info "LOCAL mode: bench arms run on THIS host (no RCH). Relative A/B only; NOT a correctness proof."
 fi
 
 # ---------------------------------------------------------------------------
