@@ -1455,9 +1455,9 @@ mod tests {
     }
 
     #[cfg(feature = "distributed")]
-    use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+    use asupersync::io::AsyncReadExt;
     #[cfg(feature = "distributed")]
-    use asupersync::net::{TcpListener, TcpStream};
+    use asupersync::net::TcpListener;
     #[cfg(feature = "distributed")]
     use proptest::prelude::*;
     #[cfg(feature = "distributed")]
@@ -1485,6 +1485,7 @@ sJkfmGf1F0WhXlOzalTz
 -----END CERTIFICATE-----
 ";
     #[cfg(feature = "distributed")]
+    #[allow(dead_code)]
     const CA_CERT_ALT: &str = "-----BEGIN CERTIFICATE-----\nMIIDIzCCAgugAwIBAgIUZEO9mhldKaM+vYQlBxRzbx4NDOYwDQYJKoZIhvcNAQEL\nBQAwGTEXMBUGA1UEAwwOd2EtdGVzdC1jYS1hbHQwHhcNMjYwMTMxMTk1MTIwWhcN\nMjYwMzAyMTk1MTIwWjAZMRcwFQYDVQQDDA53YS10ZXN0LWNhLWFsdDCCASIwDQYJ\nKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKfmzBFOOLB68UYCpAkvLuFebPm8vi5g\nFOAFTNA15bSOOHV1NAidEnvRxRr1BBbSeZDkiL3ucCaApMWZUfceOY+qkbiRSQdv\nLWRLt8b4UhuU/jV5wYbVrLaQ6+v6AneVMAHEdto3rcth/lZH/snRGzkReFF+uWG2\nat+GcyGHGQkpseK6bYaE/NgjawVqU4UdCf9OlgFHdrbKKjpnOwULv2t6THeqv36X\nm0G2m6aaFLG/23VWA/l0wKHP2slpBcLizZEwuQL4vY3SQYEI9Iw53tb8fh6hEANj\n9scTDoyW0AO/KSH8adPnX6KoJg6c2I7jkWXxbBlVXJtU9wfkd1D0RikCAwEAAaNj\nMGEwHQYDVR0OBBYEFBmwJJCWc0HPjfJkWiOq0/9038ySMB8GA1UdIwQYMBaAFBmw\nJJCWc0HPjfJkWiOq0/9038ySMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQD\nAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQB0s7vQNAudWKupjWP97II5X31y8GUKKgAh\nQqoCl9OUhqTvmaWLSj1d4+8YSO6F34ZW0QNuHQZ/6gzuHIyLpaOUC2V/PMaFuC3O\nZJv3K/udxXsMH2otFo4iT0FFFUigFynXu/0//iD850/g6jHk8YMLeOGWZQkDKOae\nTlfh3IYE7kWZQUBUYPzuLZc4gYvPYVMdIfY8+5IPxOJxC7brFrViRMcbp4xW7Jfu\nkZz8vfzmY+hjQFgOsdcFVzQenRtTxr8eMdowJ++phHJs4gtQyEY15+zkYpg7B5iZ\nIX6nxMJcVfMJb4OPECWPjjwJTPSH8yiIOmw24/dbJZ4ZKjcpP3FH\n-----END CERTIFICATE-----\n";
     #[cfg(feature = "distributed")]
     const SERVER_CERT: &str = "-----BEGIN CERTIFICATE-----
@@ -1538,6 +1539,7 @@ ukR51Vo2Dv5OO1Iz1PTzmMk=
 -----END PRIVATE KEY-----
 ";
     #[cfg(feature = "distributed")]
+    #[allow(dead_code)]
     const CLIENT_CERT: &str = "-----BEGIN CERTIFICATE-----
 MIIDDzCCAfegAwIBAgIUSSJw3sCpNmZ66bOs6sC3RcilA7YwDQYJKoZIhvcNAQEL
 BQAwFTETMBEGA1UEAwwKd2EtdGVzdC1jYTAeFw0yNjAzMjEwOTAwNDNaFw0zNjAz
@@ -1559,6 +1561,7 @@ XFOF5qMyV38UeVHu1E1E1rAe/g==
 -----END CERTIFICATE-----
 ";
     #[cfg(feature = "distributed")]
+    #[allow(dead_code)]
     const CLIENT_KEY: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCxo7fcuURK0Rqk
 Y3QPNbRI0PcJWh4VVjqU2mWx0FmQpAkf8GtgwOh8SCb1Q4DlotfIPqiT3UicFLz4

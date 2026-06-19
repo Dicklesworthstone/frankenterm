@@ -88,13 +88,13 @@ fn signed_cert(
 
 impl TestPki {
     fn new() -> TestResult<Self> {
-        let (ca_params, ca_key, ca_cert) = ca_cert("ft-test-ca")?;
+        let (ca_params, ca_key, ca_certificate) = ca_cert("ft-test-ca")?;
         let (_alt_ca_params, _alt_ca_key, alt_ca_cert) = ca_cert("ft-test-alt-ca")?;
         let server = signed_cert(&ca_params, &ca_key, "localhost", &["localhost"])?;
         let client = signed_cert(&ca_params, &ca_key, "wa-client", &["wa-client"])?;
 
         Ok(Self {
-            ca: write_pem(&ca_cert.pem())?,
+            ca: write_pem(&ca_certificate.pem())?,
             alt_ca: write_pem(&alt_ca_cert.pem())?,
             server_cert: write_pem(&server.cert_pem)?,
             server_key: write_pem(&server.key_pem)?,
