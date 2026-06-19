@@ -1,12 +1,12 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
-    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
+    CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry, default_color_map,
 };
-use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use crate::{ClipboardSelection, DCS, Position, ST, TerminalState, VisibleRowIndex};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+    Cell, CellAttributes, SemanticType, grapheme_column_width, is_white_space_grapheme,
 };
 use frankenterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -16,7 +16,7 @@ use frankenterm_escape_parser::osc::{
     ITermUnicodeVersionOp, Selection,
 };
 use frankenterm_escape_parser::{
-    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
+    Action, CSI, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand,
 };
 use log::{debug, error};
 use num_traits::FromPrimitive;
@@ -25,7 +25,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
 use termwiz::input::KeyboardEncoding;
-use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use url::Url;
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
@@ -38,6 +38,14 @@ pub(crate) struct Performer<'a> {
 #[cfg(test)]
 static FORCE_SCALAR_PRINTABLE_ASCII_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static BULK_ASCII_ROW_WRITE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+static BULK_ASCII_ROW_WRITE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl<'a> Deref for Performer<'a> {
     type Target = TerminalState;
@@ -176,6 +184,30 @@ impl<'a> Performer<'a> {
         }
     }
 
+    #[inline]
+    fn bulk_ascii_row_write_enabled() -> bool {
+        #[cfg(test)]
+        match BULK_ASCII_ROW_WRITE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE")
+                .map(|value| {
+                    let value = value.trim();
+                    !value.is_empty()
+                        && value != "0"
+                        && !value.eq_ignore_ascii_case("false")
+                        && !value.eq_ignore_ascii_case("off")
+                        && !value.eq_ignore_ascii_case("no")
+                })
+                .unwrap_or(false)
+        });
+        *ENABLED
+    }
+
     #[cfg(any(
         test,
         all(target_pointer_width = "64", not(feature = "bench-scalar-vte-scan"))
@@ -238,11 +270,18 @@ impl<'a> Performer<'a> {
 
         let y = self.cursor.y;
         let pen = self.pen.clone();
-        let screen = self.screen_mut();
-        for (offset, _) in text.bytes().enumerate() {
-            let x = start_x + offset;
-            let grapheme = &text[offset..offset + 1];
-            screen.set_cell_grapheme(x, y, grapheme, 1, pen.clone(), seqno);
+        if Self::bulk_ascii_row_write_enabled() {
+            #[cfg(test)]
+            BULK_ASCII_ROW_WRITE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.screen_mut()
+                .set_ascii_cell_run(start_x, y, text, pen, seqno);
+        } else {
+            let screen = self.screen_mut();
+            for (offset, _) in text.bytes().enumerate() {
+                let x = start_x + offset;
+                let grapheme = &text[offset..offset + 1];
+                screen.set_cell_grapheme(x, y, grapheme, 1, pen.clone(), seqno);
+            }
         }
 
         let next_x = start_x + text.len();
@@ -1558,6 +1597,24 @@ mod tests {
         }
     }
 
+    struct BulkAsciiRowWriteOverride;
+
+    impl BulkAsciiRowWriteOverride {
+        fn set(force_bulk: bool) -> Self {
+            BULK_ASCII_ROW_WRITE_TEST_OVERRIDE.store(
+                if force_bulk { 2 } else { 1 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Self
+        }
+    }
+
+    impl Drop for BulkAsciiRowWriteOverride {
+        fn drop(&mut self) {
+            BULK_ASCII_ROW_WRITE_TEST_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn gate_corpus() -> Vec<(&'static str, Vec<u8>)> {
         let mut cases = vec![
             ("pure_ascii_short", b"simple printable ascii run".to_vec()),
@@ -1684,6 +1741,14 @@ mod tests {
         parser.parse_as_vec(bytes)
     }
 
+    fn render_actions_with_bulk_ascii_row_write(
+        actions: Vec<Action>,
+        force_bulk: bool,
+    ) -> TerminalSnapshot {
+        let _bulk_override = BulkAsciiRowWriteOverride::set(force_bulk);
+        render_actions(actions)
+    }
+
     #[test]
     fn parser_print_batching_terminal_effects_match_scalar() {
         for (name, bytes) in gate_corpus() {
@@ -1697,6 +1762,46 @@ mod tests {
             // printable-bearing corpus entries (otherwise the gate is vacuous);
             // we only assert render equality above, which holds for all entries.
         }
+    }
+
+    #[test]
+    fn parser_print_batching_bulk_ascii_row_write_matches_scalar_over_wrap_margins_attrs() {
+        let mut cases = gate_corpus();
+        cases.push(("exact_right_edge_wrap", vec![b'w'; 80]));
+        cases.push(("attrs_exact_right_edge_then_wrap", {
+            let mut bytes = b"\x1b[1;31m".to_vec();
+            bytes.extend(std::iter::repeat(b'r').take(80));
+            bytes.extend_from_slice(b"\x1b[0mZ");
+            bytes
+        }));
+        cases.push((
+            "left_right_margin_exact_wrap",
+            b"\x1b[?69h\x1b[5;12smargins!\x1b[0mZ".to_vec(),
+        ));
+        cases.push((
+            "insert_mode_fallback",
+            b"\x1b[4hinsert\x1b[4lplain".to_vec(),
+        ));
+        cases.push(("charset_fallback", b"\x1b(0abc\x1b(Btail".to_vec()));
+
+        let mut total_bulk_hits = 0;
+        for (name, bytes) in cases {
+            let scalar =
+                render_actions_with_bulk_ascii_row_write(parse_with_batching(&bytes, true), false);
+            BULK_ASCII_ROW_WRITE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+            let bulk =
+                render_actions_with_bulk_ascii_row_write(parse_with_batching(&bytes, true), true);
+            let bulk_hits = BULK_ASCII_ROW_WRITE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            total_bulk_hits += bulk_hits;
+            assert_eq!(
+                scalar, bulk,
+                "bulk ASCII row writer diverged from scalar terminal render for {name}"
+            );
+        }
+        assert!(
+            total_bulk_hits > 0,
+            "bulk ASCII row writer was not exercised by the oracle corpus"
+        );
     }
 
     #[test]
