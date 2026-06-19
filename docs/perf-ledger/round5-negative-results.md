@@ -20,6 +20,21 @@ promotion. Only a measured **regression on a default-on path** triggers an actua
 
 ## Entries
 
+### 2026-06-19 | Q1 prefix-sum — default-ON promotion BLOCKED on cv (the win itself is real, 32.5×)
+
+**Status:** cv-blocked-for-promotion (NOT a reject — the optimization is a measured 32.5× win, kept
+default-off; see round5-keep-ledger.md). The blocker is purely the keep-gate rule-8 cv threshold for an
+auto-promotion to default-on.
+**Measurement:** −96.92% (3.09ms→95µs), p=0, but candidate cv=15.2% / baseline cv=20.6% > 5% (Mac not
+quiet — concurrent swarm + tend). Distributions are non-overlapping so the win is unambiguous.
+**Retry-condition predicate (Form 5):** Do not promote Q1 to default-on from this noisy reading; re-run
+the `scrollback_prefix_index` env A/B on a genuinely quiet Mac (swarm idle / converged) plus a
+shallow-scrollback non-regression bench, and promote only once candidate cv≤5 AND the shallow case is
+non-regressed. Until then Q1 ships default-off (zero-risk) with this 32.5× deep-scroll evidence on record.
+**Rollback:** n/a (default-off, never promoted).
+
+---
+
 _(round-5 measured-no-win / reject / revert entries land below as A/B runs complete on the quiet host.
 M6 persistent COW grid stays governed by its round-4 entry until the E1 concurrent-search bench produces
 contention evidence; E2 will either escalate M6 or refresh that entry here with the measured numbers.)_

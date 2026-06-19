@@ -53,3 +53,14 @@ _(tick entries appended by the orchestrator tend-loop)_
   (cod_2's proof was green against it) but cod_3's ingest/storage still uncommitted → contamination
   watch. cod_1 (.4 retry), cod_5 (.8 retry), cc_1 (.9 bocpd, "PASS=false" diag — watch), cc_2 (.10 D1
   conformance proof), cc_3 (.11 E1 M6 proof) all working. Flagged possible mis-scoped CLI main.rs edit.
+- 2026-06-19 tend#3 — Q1 MEASURED: **32.5× speedup** (locate_offset 3.09ms→95µs deep-scroll), but
+  cv~15-20% (Mac not quiet during swarm) so auto-REJECTed on rule 8; distributions non-overlapping →
+  unambiguous real win → KEEP default-off, default-ON promotion deferred to a quiet-Mac cv≤5 re-run
+  (Form 5, recorded). Closed .10 (D1, green), .11 (E1, green), .13 (D3 mining → 4 EV candidates), plus
+  .5 earlier = 5 beads closed. cc_1 found+fixed a REAL round-4 bug: SR detector was dead on
+  non-zero-centered data (8c8142ef3). cod_4 VERIFIED the GUI launches (WebGPU/Metal, no crash → C1
+  works). New-idea beads created from D3: EV1 .18 (term ASCII bulk row writer, performer.rs:221) →
+  cod_2; EV2 .19 (agent-sharded pattern automata, patterns.rs:4319) → cc_3; cc_2 → D2 .12 (CSI/OSC).
+  Launched M9+S3-FIFO local bench (warm-target reuse). Nudged cod_3 (.6 WAL wedged 1h20m → cancel+lighter
+  proof), cod_4 (.7 → final gui compile-check), cc_1 (.9 → wrap+2x flake proof). dcg-angle-bracket
+  gotcha: tmux send-keys messages must avoid <...> placeholders (read as shell redirects).

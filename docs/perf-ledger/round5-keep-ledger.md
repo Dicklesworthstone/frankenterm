@@ -21,7 +21,7 @@ both from one run); `metric≠ns` = win is hit-rate/bytes/delay, adjudicate the 
 
 | Flag | Gate | A/B shape | Bench source | Quantified delta | Verdict |
 |---|---|---|---|---|---|
-| Q1 prefix-sum | env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` | gate-toggle (deep-scroll) | scrollback_prefix_index/deep_scroll_locate_offset (8eef1f001) | _running (local env A/B)_ | _pending_ |
+| Q1 prefix-sum | env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` | gate-toggle (deep-scroll) | scrollback_prefix_index/deep_scroll_locate_offset (8eef1f001) | **−96.9% / 32.5×** (3.09ms→95µs) cv~15% | KEEP default-off; default-on pending cv≤5 re-run |
 | Q2 group-commit+condvar | config storage.group_commit_events/writer_blocking_recv | gate-toggle (WAL burst) | A2W (.6) wire | _pending_ | _pending_ |
 | Q3 linear KMP overlap | config ingest.delta_linear_overlap | gate-toggle (box/emoji) | A2W (.6)/delta_extraction | _pending_ | _pending_ |
 | Q4 lazy captures | feature patterns-lazy-captures | gate-toggle (high-suppression) | existing pattern_detection_context | _pending_ | _pending_ |
@@ -59,6 +59,23 @@ TUI-redraw-heavy capture") is **satisfied** by the 19.00x here. **KEEP default-o
 NOT promoted to default-on — it is the right default-off opt-in for distributed / bandwidth-constrained
 deployments. (benign `error: unclosed table` malformed-fixture warning in the log precedes success.)
 **Rollback:** config default-off; `git revert` of the round-4 codec commit (do not — it is off).
+
+### 2026-06-19 | Q1 seqlock scrollback prefix-sum — MEASURED 32.5×, KEEP default-off (promotion cv-blocked)
+
+**Bench:** `scrollback_prefix_index/deep_scroll_locate_offset`, env A/B `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX`
+(build-once), local Mac, release-perf. Log `/tmp/ft-r5-bench-logs/q1-scrollback.log`.
+**Measurement:** locate_offset on a deep-scrollback workload (hundreds of warm pages):
+**3 086 704 ns → 95 049 ns = −96.92%, 32.5× speedup**, p_value_mw=0 (≪α). The O(pages) per-call
+`warm.iter().sum()` linear walk collapses to the O(log) prefix index exactly as designed.
+**Caveat:** candidate cv=15.2%, baseline cv=20.6% — both exceed keep-gate rule 8 (cv≤5), because the Mac
+was NOT quiet (concurrent 8-pane swarm + orchestrator tend). The script auto-REJECTed on cv. BUT the two
+distributions are **orders of magnitude apart** (baseline ~3.09ms ± 20% vs candidate ~95µs ± 15% never
+overlap), so the win is unambiguous and far beyond noise — this is the large-effect case the cv rule was
+not written to veto. **Verdict: KEEP default-off** (the win only materializes at deep-scroll depth; the
+index has maintenance cost in the common shallow case, so default-off is correct). **Default-ON promotion
+is deferred** pending (a) a cv≤5 re-run on a genuinely quiet Mac (swarm idle) and (b) a shallow-case
+non-regression check. Recorded as a promotion-blocker in round5-negative-results.md (Form 5).
+**Rollback:** env default-off; n/a (not promoted).
 
 ## Promotions / reverts (filled as A/B runs land)
 
