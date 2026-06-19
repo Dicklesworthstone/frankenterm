@@ -856,6 +856,9 @@ native-wezterm = []
 # zero-sized no-op (no overhead). Enable for MT8 keep-gate attribution + capturing
 # a `.bench-history` baseline. (gauntlet FND-002)
 hot-path-metrics = []
+# Round-4 M1 experiment: build-script-generated ANSI scanner DFA table.
+# Default OFF; orchestrator enables this explicitly for A/B proof.
+ansi-dfa-table = []
 # Test/fuzz-only feature: exposes private parsers (e.g. native_events::
 # decode_wire_event_for_fuzz) so the frankenterm-fuzz crate can target
 # them without leaking the wire-format surface to production builds.

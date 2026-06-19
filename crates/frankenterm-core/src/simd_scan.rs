@@ -64,6 +64,13 @@ pub enum StringPhase {
     SawEsc,
 }
 
+#[cfg(feature = "ansi-dfa-table")]
+const ANSI_DFA_STATE_COUNT: usize = 6;
+#[cfg(feature = "ansi-dfa-table")]
+const ANSI_DFA_BYTE_COUNT: usize = 256;
+#[cfg(feature = "ansi-dfa-table")]
+include!(concat!(env!("OUT_DIR"), "/ansi_dfa_table.rs"));
+
 /// Cross-chunk scan carry state.
 ///
 /// This allows callers that process output in chunks to preserve parser state
@@ -96,6 +103,7 @@ impl OutputScanState {
 
 /// [ft-nk6u9] Is this byte a C1 string introducer (the char after ESC
 /// that opens OSC / DCS / SOS / PM / APC)?
+#[cfg(any(not(feature = "ansi-dfa-table"), test))]
 #[inline]
 pub(crate) fn is_string_intro_byte(b: u8) -> bool {
     // 0x50 = 'P' (DCS), 0x58 = 'X' (SOS), 0x5D = ']' (OSC),
@@ -131,6 +139,7 @@ pub(crate) fn is_string_intro_byte(b: u8) -> bool {
 ///   * `\` (0x5c) is the final half of an ST; count, exit escape+string.
 ///   * `ESC` — stay in SawEsc (another ESC seen, still waiting for `\`).
 ///   * Anything else — treat as part of the body, drop back to Body.
+#[cfg(any(not(feature = "ansi-dfa-table"), test))]
 #[inline]
 pub(crate) fn ansi_state_step(b: u8, in_escape: &mut bool, string_phase: &mut StringPhase) -> bool {
     if b == 0x1b {
@@ -187,6 +196,55 @@ pub(crate) fn ansi_state_step(b: u8, in_escape: &mut bool, string_phase: &mut St
         }
     }
     true
+}
+
+#[cfg(feature = "ansi-dfa-table")]
+#[inline]
+fn ansi_dfa_encode_state(in_escape: bool, string_phase: StringPhase) -> usize {
+    let phase = match string_phase {
+        StringPhase::None => 0,
+        StringPhase::Body => 1,
+        StringPhase::SawEsc => 2,
+    };
+    (phase << 1) | usize::from(in_escape)
+}
+
+#[cfg(feature = "ansi-dfa-table")]
+#[inline]
+fn ansi_dfa_decode_state(state: usize) -> (bool, StringPhase) {
+    let in_escape = state & 1 != 0;
+    let string_phase = match state >> 1 {
+        0 => StringPhase::None,
+        1 => StringPhase::Body,
+        2 => StringPhase::SawEsc,
+        _ => unreachable!("ANSI DFA table encodes only six states"),
+    };
+    (in_escape, string_phase)
+}
+
+#[cfg(feature = "ansi-dfa-table")]
+#[inline]
+fn ansi_state_step_table(b: u8, in_escape: &mut bool, string_phase: &mut StringPhase) -> bool {
+    let state = ansi_dfa_encode_state(*in_escape, *string_phase);
+    let entry = ANSI_DFA_TABLE[state * ANSI_DFA_BYTE_COUNT + usize::from(b)];
+    let next_state = usize::from(entry >> 1);
+    let (next_in_escape, next_string_phase) = ansi_dfa_decode_state(next_state);
+    *in_escape = next_in_escape;
+    *string_phase = next_string_phase;
+    entry & 1 != 0
+}
+
+#[inline]
+fn ansi_state_step_for_scan(b: u8, in_escape: &mut bool, string_phase: &mut StringPhase) -> bool {
+    #[cfg(feature = "ansi-dfa-table")]
+    {
+        ansi_state_step_table(b, in_escape, string_phase)
+    }
+
+    #[cfg(not(feature = "ansi-dfa-table"))]
+    {
+        ansi_state_step(b, in_escape, string_phase)
+    }
 }
 
 /// Scan output bytes for newline and ANSI escape density metrics.
@@ -252,7 +310,7 @@ fn scan_newlines_and_ansi_memchr(bytes: &[u8]) -> OutputScanMetrics {
     let mut in_escape = false;
     let mut string_phase = StringPhase::None;
     for &b in &bytes[first_esc..] {
-        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
+        if ansi_state_step_for_scan(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
         }
     }
@@ -292,7 +350,7 @@ fn scan_newlines_and_ansi_memchr_with_state(
     let mut string_phase = state.string_phase;
     let mut pending_utf8 = state.pending_utf8_continuations;
     for &b in bytes {
-        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
+        if ansi_state_step_for_scan(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
         }
 
@@ -336,7 +394,7 @@ pub(crate) fn scan_newlines_and_ansi_scalar(bytes: &[u8]) -> OutputScanMetrics {
 
         // [ft-nk6u9] Unified state machine handles CSI, single-char
         // C1, and string-introducer C1 (OSC/DCS/SOS/PM/APC) correctly.
-        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
+        if ansi_state_step_for_scan(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
         }
     }
@@ -365,7 +423,7 @@ fn scan_newlines_and_ansi_scalar_with_state(
 
         // [ft-nk6u9] Same unified step as the batch path so the stateful
         // scanner stays in lockstep with the non-stateful reference.
-        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
+        if ansi_state_step_for_scan(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
         }
 
@@ -419,6 +477,158 @@ fn update_utf8_pending(pending: &mut u8, byte: u8) {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[cfg(feature = "ansi-dfa-table")]
+    fn ansi_dfa_states() -> [(bool, StringPhase); ANSI_DFA_STATE_COUNT] {
+        [
+            (false, StringPhase::None),
+            (true, StringPhase::None),
+            (false, StringPhase::Body),
+            (true, StringPhase::Body),
+            (false, StringPhase::SawEsc),
+            (true, StringPhase::SawEsc),
+        ]
+    }
+
+    #[cfg(feature = "ansi-dfa-table")]
+    fn scan_newlines_and_ansi_fsm_reference_with_state(
+        bytes: &[u8],
+        state: &mut OutputScanState,
+    ) -> OutputScanMetrics {
+        let mut newline_count = 0usize;
+        let mut ansi_byte_count = 0usize;
+        let mut in_escape = state.in_escape;
+        let mut string_phase = state.string_phase;
+        let mut pending_utf8 = state.pending_utf8_continuations;
+
+        for &b in bytes {
+            if b == b'\n' {
+                newline_count += 1;
+            }
+
+            if ansi_state_step(b, &mut in_escape, &mut string_phase) {
+                ansi_byte_count += 1;
+            }
+
+            update_utf8_pending(&mut pending_utf8, b);
+        }
+
+        state.in_escape = in_escape;
+        state.string_phase = string_phase;
+        state.pending_utf8_continuations = pending_utf8;
+
+        OutputScanMetrics {
+            newline_count,
+            ansi_byte_count,
+        }
+    }
+
+    #[cfg(feature = "ansi-dfa-table")]
+    fn ansi_dfa_fuzz_payload(mut seed: u64, len: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(len);
+        for idx in 0..len {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mixed = ((seed >> 32) as u8) ^ (idx as u8).rotate_left(1);
+            bytes.push(match mixed & 0x0f {
+                0 => 0x1b,
+                1 => b'[',
+                2 => b']',
+                3 => b'P',
+                4 => b'\\',
+                5 => 0x07,
+                6 => b'\n',
+                7 => 0x80,
+                _ => mixed,
+            });
+        }
+        bytes
+    }
+
+    #[cfg(feature = "ansi-dfa-table")]
+    #[test]
+    fn ansi_dfa_table_matches_fsm_for_every_state_and_byte() {
+        for (initial_index, (initial_in_escape, initial_phase)) in
+            ansi_dfa_states().into_iter().enumerate()
+        {
+            assert_eq!(
+                ansi_dfa_encode_state(initial_in_escape, initial_phase),
+                initial_index
+            );
+
+            for byte in 0..=u8::MAX {
+                let mut fsm_in_escape = initial_in_escape;
+                let mut fsm_phase = initial_phase;
+                let fsm_count = ansi_state_step(byte, &mut fsm_in_escape, &mut fsm_phase);
+
+                let mut table_in_escape = initial_in_escape;
+                let mut table_phase = initial_phase;
+                let table_count =
+                    ansi_state_step_table(byte, &mut table_in_escape, &mut table_phase);
+
+                assert_eq!(
+                    (table_count, table_in_escape, table_phase),
+                    (fsm_count, fsm_in_escape, fsm_phase),
+                    "DFA diverged for state {initial_index}, byte 0x{byte:02x}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "ansi-dfa-table")]
+    #[test]
+    fn ansi_dfa_chunk_fuzz_byte_counts_match_fsm_reference() {
+        let mut corpus = vec![
+            Vec::new(),
+            b"plain text only\nsecond line".to_vec(),
+            b"\x1b[31mred\x1b[0m\n".to_vec(),
+            b"\x1b]0;title\x07body\x1bPpayload\x1b\\tail".to_vec(),
+            b"\x1b]52;c;YWJj\x1b\\\n\x1b^private\x07".to_vec(),
+            (0..=u8::MAX).collect::<Vec<_>>(),
+            vec![0x1b; 257],
+        ];
+
+        for seed in [0x1, 0x5eed, 0xdead_beef, 0xdec0_de55, 0x1234_5678_9abc_def0] {
+            for len in [0, 1, 2, 3, 7, 8, 15, 31, 64, 127, 255, 511, 1024] {
+                corpus.push(ansi_dfa_fuzz_payload(seed, len));
+            }
+        }
+
+        for bytes in corpus {
+            for chunk_size in [1, 2, 3, 5, 8, 13, 21, 64, 255, bytes.len().max(1)] {
+                let mut dfa_state = OutputScanState::default();
+                let mut fsm_state = OutputScanState::default();
+                let mut dfa_total = OutputScanMetrics::default();
+                let mut fsm_total = OutputScanMetrics::default();
+
+                for chunk in bytes.chunks(chunk_size) {
+                    let dfa_metrics = scan_newlines_and_ansi_with_state(chunk, &mut dfa_state);
+                    let fsm_metrics =
+                        scan_newlines_and_ansi_fsm_reference_with_state(chunk, &mut fsm_state);
+
+                    assert_eq!(
+                        dfa_metrics, fsm_metrics,
+                        "DFA chunk metrics diverged for chunk size {chunk_size}"
+                    );
+                    assert_eq!(
+                        dfa_state, fsm_state,
+                        "DFA chunk state diverged for chunk size {chunk_size}"
+                    );
+
+                    dfa_total.newline_count += dfa_metrics.newline_count;
+                    dfa_total.ansi_byte_count += dfa_metrics.ansi_byte_count;
+                    fsm_total.newline_count += fsm_metrics.newline_count;
+                    fsm_total.ansi_byte_count += fsm_metrics.ansi_byte_count;
+                }
+
+                assert_eq!(
+                    dfa_total, fsm_total,
+                    "DFA total metrics diverged for chunk size {chunk_size}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn plain_text_has_zero_ansi_density() {
