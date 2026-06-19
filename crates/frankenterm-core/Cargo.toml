@@ -859,6 +859,14 @@ hot-path-metrics = []
 # Round-4 M1 experiment: build-script-generated ANSI scanner DFA table.
 # Default OFF; orchestrator enables this explicitly for A/B proof.
 ansi-dfa-table = []
+# Round-4 patterns experiments (Q4 lazy captures / Q5 Teddy prefilter / Q6 fingerprint
+# dedup / M5 MPHF anchor dispatch). Default OFF; enabled explicitly for A/B proof. Declared
+# here (round-4 cross-review M-1) so they are reachable via `cargo --features`; the
+# `#![allow(unexpected_cfgs)]` in patterns.rs predates these and is retained defensively.
+patterns-lazy-captures = []
+teddy-prefilter = []
+patterns-fingerprint-dedup = []
+patterns-mphf-dispatch = []
 # Test/fuzz-only feature: exposes private parsers (e.g. native_events::
 # decode_wire_event_for_fuzz) so the frankenterm-fuzz crate can target
 # them without leaking the wire-format surface to production builds.
