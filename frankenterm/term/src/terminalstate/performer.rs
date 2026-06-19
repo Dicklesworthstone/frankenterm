@@ -1666,6 +1666,59 @@ mod tests {
         }
     }
 
+    /// Round-5 D1 (ft-round5-gauntlet-lw0s7.10): the parser printable-run
+    /// batching optimization emits `Action::PrintString` for ground-state
+    /// printable runs instead of one `Action::Print` per codepoint. The
+    /// rendered terminal must be byte-identical either way: a `PrintString`
+    /// and the equivalent `Print` sequence both accumulate into the print
+    /// buffer before `flush_print`.
+    fn render_actions(actions: Vec<Action>) -> TerminalSnapshot {
+        let mut term = make_terminal();
+        term.perform_actions(actions);
+        snapshot_terminal(&term)
+    }
+
+    fn parse_with_batching(bytes: &[u8], on: bool) -> Vec<Action> {
+        let mut parser = Parser::new();
+        parser.set_print_batching(on);
+        parser.parse_as_vec(bytes)
+    }
+
+    #[test]
+    fn parser_print_batching_terminal_effects_match_scalar() {
+        for (name, bytes) in gate_corpus() {
+            let scalar = render_actions(parse_with_batching(&bytes, false));
+            let batched = render_actions(parse_with_batching(&bytes, true));
+            assert_eq!(
+                scalar, batched,
+                "print-batching diverged from scalar terminal render for {name}"
+            );
+            // The batched action stream must actually differ from scalar on
+            // printable-bearing corpus entries (otherwise the gate is vacuous);
+            // we only assert render equality above, which holds for all entries.
+        }
+    }
+
+    #[test]
+    fn parser_print_batching_chunked_terminal_effects_match_scalar() {
+        for (name, bytes) in gate_corpus() {
+            // Reference: scalar, whole buffer.
+            let reference = render_actions(parse_with_batching(&bytes, false));
+            for split in 0..=bytes.len() {
+                let mut parser = Parser::new();
+                parser.set_print_batching(true);
+                let mut actions = Vec::new();
+                parser.parse(&bytes[..split], |a| actions.push(a));
+                parser.parse(&bytes[split..], |a| actions.push(a));
+                let chunked = render_actions(actions);
+                assert_eq!(
+                    chunked, reference,
+                    "chunked print-batching diverged from scalar render for {name} at split {split}"
+                );
+            }
+        }
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn swar_prefix_scan_matches_scalar_on_every_gate_stream_suffix() {

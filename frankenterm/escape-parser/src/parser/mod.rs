@@ -20,6 +20,35 @@ use sixel::SixelBuilder;
 const MAX_TCAP_NAMES: usize = 512;
 const MAX_TCAP_CURRENT_BYTES: usize = 1_048_576;
 
+/// Env gate for the Round-5 D1 printable-run batching optimization
+/// (ft-round5-gauntlet-lw0s7.10). Truthy values turn it on for newly
+/// constructed parsers, which is how the term/event_bus A/B is driven without
+/// touching the (non-owned) `Terminal` construction site. Default-OFF.
+const PRINT_BATCHING_ENV: &str = "FT_MOONSHOT_PARSER_PRINT_BATCHING";
+
+/// Resolve the default `print_batching` setting for a freshly constructed
+/// [`Parser`]. Off unless the `parser-print-batching` feature is compiled in or
+/// the `FT_MOONSHOT_PARSER_PRINT_BATCHING` env var is set truthy at run time
+/// (mirrors the sibling `FT_MOONSHOT_*` storage/scrollback gates). The env read
+/// is `std`-only; `no_std` builds fall back to the compile-time feature.
+#[inline]
+fn default_print_batching() -> bool {
+    if cfg!(feature = "parser-print-batching") {
+        return true;
+    }
+    #[cfg(feature = "std")]
+    {
+        if let Ok(value) = std::env::var(PRINT_BATCHING_ENV) {
+            let value = value.trim();
+            return value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes");
+        }
+    }
+    false
+}
+
 #[derive(Default)]
 struct GetTcapBuilder {
     current: Vec<u8>,
@@ -87,6 +116,12 @@ const MAX_SHORT_DCS_BYTES: usize = 8 * 1024 * 1024;
 pub struct Parser {
     state_machine: VTParser,
     state: RefCell<ParseState>,
+    /// Round-5 D1 (ft-round5-gauntlet-lw0s7.10): when set, [`Parser::parse`]
+    /// coalesces maximal ground-state printable UTF-8 runs into a single
+    /// `Action::PrintString` instead of emitting one `Action::Print(char)` per
+    /// codepoint. Default-OFF; flipped on by the `parser-print-batching`
+    /// feature or at runtime via [`Parser::set_print_batching`].
+    print_batching: bool,
 }
 
 impl Default for Parser {
@@ -100,7 +135,33 @@ impl Parser {
         Self {
             state_machine: VTParser::new(),
             state: RefCell::new(Default::default()),
+            print_batching: default_print_batching(),
         }
+    }
+
+    /// Enable or disable ground-state printable-run coalescing (Round-5 D1,
+    /// ft-round5-gauntlet-lw0s7.10). Default is off unless the
+    /// `parser-print-batching` feature is enabled.
+    ///
+    /// When enabled, contiguous printable codepoints parsed in the VT *Ground*
+    /// state are emitted as one `Action::PrintString` rather than a `Print`
+    /// per codepoint. The action stream is otherwise byte-identical: every
+    /// non-print action, and the rendered terminal state, is unchanged (a
+    /// `PrintString("ab")` and a `Print('a'), Print('b')` pair drive the
+    /// terminal performer identically — both accumulate into its print buffer).
+    ///
+    /// Exposed `#[doc(hidden)]` for the A/B bench harness and the equivalence
+    /// test only; this is not part of the stable parser API.
+    #[doc(hidden)]
+    pub fn set_print_batching(&mut self, on: bool) {
+        self.print_batching = on;
+    }
+
+    /// Returns whether ground-state printable-run coalescing is enabled.
+    /// See [`Parser::set_print_batching`].
+    #[doc(hidden)]
+    pub fn print_batching(&self) -> bool {
+        self.print_batching
     }
 
     /// advance with tmux parser, bypass VTParse
@@ -139,11 +200,75 @@ impl Parser {
             return;
         }
 
+        if self.print_batching {
+            self.parse_ground_batched(bytes, &mut callback);
+            return;
+        }
+
         let mut perform = Performer {
             callback: &mut callback,
             state: &mut self.state.borrow_mut(),
         };
         self.state_machine.parse(bytes, &mut perform);
+    }
+
+    /// Streaming fast path for [`Parser::parse`] that coalesces maximal
+    /// ground-state printable runs into one `Action::PrintString`.
+    ///
+    /// Correctness rests on a single invariant: a run scanned by
+    /// [`scan_printable_run`] consists only of codepoints that, fed to the VT
+    /// state machine while it is in the Ground state, emit exactly one
+    /// `Action::Print` *and leave the machine in Ground*. The machine is
+    /// therefore in Ground both before and after the run, so skipping the
+    /// state machine for those bytes cannot desynchronise its internal state
+    /// (`utf8_parser` is in its reset state whenever `is_ground()` holds).
+    /// Every non-batchable byte — controls, ESC/CSI/OSC/DCS sequences,
+    /// incomplete or invalid UTF-8, and C1 controls encoded as UTF-8 — is fed
+    /// to the real state machine via `parse_byte`, so the emitted action stream
+    /// is identical to the scalar path modulo print coalescing, including
+    /// across chunk boundaries (an incomplete trailing multibyte sequence is
+    /// deferred to the scalar path, which correctly parks in `Utf8Sequence`).
+    fn parse_ground_batched<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: &mut F) {
+        // Runs shorter than this stay on the scalar path: a one-codepoint
+        // `PrintString` would allocate a `String` where `Print(char)` does not,
+        // which would regress control-sequence-heavy streams.
+        const MIN_BATCH_CHARS: usize = 2;
+
+        let n = bytes.len();
+        let mut i = 0;
+        while i < n {
+            if self.state_machine.is_ground() {
+                let (run_end, char_count) = scan_printable_run(bytes, i);
+                if char_count >= MIN_BATCH_CHARS {
+                    // `scan_printable_run` only extends across complete, valid
+                    // UTF-8, so the slice is guaranteed valid UTF-8.
+                    debug_assert!(core::str::from_utf8(&bytes[i..run_end]).is_ok());
+                    if let Ok(s) = core::str::from_utf8(&bytes[i..run_end]) {
+                        callback(Action::PrintString(s.to_string()));
+                        i = run_end;
+                        continue;
+                    }
+                }
+            }
+
+            // Scalar segment: feed bytes through the real state machine until we
+            // exhaust the input or reach a ground-state batchable boundary.
+            let mut state = self.state.borrow_mut();
+            let mut perform = Performer {
+                callback: &mut *callback,
+                state: &mut state,
+            };
+            while i < n {
+                if self.state_machine.is_ground() {
+                    let (_run_end, char_count) = scan_printable_run(bytes, i);
+                    if char_count >= MIN_BATCH_CHARS {
+                        break;
+                    }
+                }
+                self.state_machine.parse_byte(bytes[i], &mut perform);
+                i += 1;
+            }
+        }
     }
 
     /// A specialized version of the parser that halts after recognizing the
@@ -228,6 +353,76 @@ fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
     } else {
         false
     }
+}
+
+/// Scan the maximal run of *ground-state-printable* bytes starting at `start`.
+///
+/// A codepoint belongs to the run iff feeding its bytes to the VT state machine
+/// while it is in the Ground state would emit exactly one `Action::Print` and
+/// leave the machine in Ground. The ground-state transition table
+/// (`vtparse::transitions::ground`) prints `0x20..=0x7f` directly and routes
+/// UTF-8 leads (`0xc2..=0xf4`) through `Utf8Sequence`, which prints the decoded
+/// codepoint *unless* the special C1 case fires for a decoded value
+/// `0x80..=0x9f` (see `VTParser::next_utf8`). The only multibyte sequences that
+/// decode into that range are `0xC2 0x80..=0x9F`; every other complete, valid
+/// sequence prints. (Multibyte encodings can never decode below `0x80`, so
+/// controls and ASCII are unaffected.)
+///
+/// The run STOPS — leaving the byte(s) to the scalar `parse_byte` path — at the
+/// first of:
+///   * a C0 control or `ESC` (`0x00..=0x1f`),
+///   * `DEL` (`0x7f`) — this fork prints it, but it is excluded for clarity;
+///     deferring it to the scalar path is still byte-identical,
+///   * a raw C1 byte / invalid UTF-8 lead / stray continuation
+///     (`0x80..=0xc1`, `0xf5..=0xff`),
+///   * an incomplete multibyte sequence at the end of `bytes` (preserves
+///     cross-chunk streaming: the scalar path parks the machine in
+///     `Utf8Sequence` to await the next chunk),
+///   * an invalid multibyte sequence (rejected by `core::str::from_utf8`,
+///     covering overlong forms and surrogates), and
+///   * the C1-via-UTF-8 sequence `0xC2 0x80..=0x9F`.
+///
+/// Returns `(end_index, char_count)`, where `bytes[start..end_index]` is
+/// guaranteed valid UTF-8 and `char_count` is the number of codepoints in it.
+fn scan_printable_run(bytes: &[u8], start: usize) -> (usize, usize) {
+    let n = bytes.len();
+    let mut i = start;
+    let mut chars = 0usize;
+    while i < n {
+        let b = bytes[i];
+        if (0x20..=0x7e).contains(&b) {
+            i += 1;
+            chars += 1;
+            continue;
+        }
+        let seq_len = match b {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            // C0/C1/DEL/invalid lead/stray continuation: stop the run.
+            _ => break,
+        };
+        if i + seq_len > n {
+            // Incomplete multibyte sequence at the buffer boundary: defer to the
+            // scalar path so the state machine parks in `Utf8Sequence`.
+            break;
+        }
+        // C1-via-UTF-8 guard: `0xC2 0x80..=0x9F` decodes to U+0080..U+009F,
+        // which vtparse executes as a C1 control rather than printing.
+        if b == 0xc2 && matches!(bytes[i + 1], 0x80..=0x9f) {
+            break;
+        }
+        match core::str::from_utf8(&bytes[i..i + seq_len]) {
+            Ok(_) => {
+                i += seq_len;
+                chars += 1;
+            }
+            // Invalid encoding (bad continuation, overlong, surrogate): defer to
+            // the scalar path, which emits the replacement char per vtparse.
+            Err(_) => break,
+        }
+    }
+    (i, chars)
 }
 
 impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
@@ -599,6 +794,85 @@ mod test {
             actions
         );
         assert_eq!(encode(&actions), "hello");
+    }
+
+    #[test]
+    fn scan_printable_run_boundaries() {
+        // Pure ASCII printable run, stops at first control.
+        assert_eq!(scan_printable_run(b"abc\n", 0), (3, 3));
+        // DEL terminates the run.
+        assert_eq!(scan_printable_run(b"ab\x7fc", 0), (2, 2));
+        // ESC terminates the run.
+        assert_eq!(scan_printable_run(b"ab\x1b[m", 0), (2, 2));
+        // 2-byte UTF-8 (é) counts as one char.
+        assert_eq!(scan_printable_run(b"a\xc3\xa9b", 0), (4, 3));
+        // Latin-1 NBSP (U+00A0) prints in ground -> batchable.
+        assert_eq!(scan_printable_run(b"a\xc2\xa0b", 0), (4, 3));
+        // 3-byte (€) and 4-byte (🚀) sequences.
+        assert_eq!(scan_printable_run("€".as_bytes(), 0), (3, 1));
+        assert_eq!(scan_printable_run("🚀".as_bytes(), 0), (4, 1));
+        // C1-via-UTF-8 (0xC2 0x9B == U+009B == CSI) stops the run immediately.
+        assert_eq!(scan_printable_run(b"\xc2\x9bx", 0), (0, 0));
+        assert_eq!(scan_printable_run(b"ab\xc2\x9bx", 0), (2, 2));
+        // The 0x9F/0xA0 boundary: 0x9F is C1 (stop), 0xA0 prints.
+        assert_eq!(scan_printable_run(b"\xc2\x9f", 0), (0, 0));
+        assert_eq!(scan_printable_run(b"\xc2\xa0", 0), (2, 1));
+        // Incomplete trailing multibyte sequence is deferred (not consumed).
+        assert_eq!(scan_printable_run(b"ab\xe2\x82", 0), (2, 2));
+        assert_eq!(scan_printable_run(b"ab\xc3", 0), (2, 2));
+        // Invalid encodings stop the run.
+        assert_eq!(scan_printable_run(b"a\xffb", 0), (1, 1));
+        assert_eq!(scan_printable_run(b"a\xc0\x80b", 0), (1, 1)); // overlong NUL
+        assert_eq!(scan_printable_run(b"a\xc2Zb", 0), (1, 1)); // bad continuation
+        // Raw C1 / stray continuation bytes are not run material.
+        assert_eq!(scan_printable_run(b"\x80\x81", 0), (0, 0));
+        // Empty / fully-consumed.
+        assert_eq!(scan_printable_run(b"", 0), (0, 0));
+        assert_eq!(scan_printable_run(b"abc", 3), (3, 0));
+    }
+
+    #[test]
+    fn batched_parse_matches_scalar_modulo_coalescing() {
+        // Helper: coalesce Print/PrintString runs so the two modes compare.
+        fn norm(actions: Vec<Action>) -> Vec<Action> {
+            let mut out = Vec::new();
+            let mut pending = String::new();
+            for a in actions {
+                match a {
+                    Action::Print(c) => pending.push(c),
+                    Action::PrintString(s) => pending.push_str(&s),
+                    other => {
+                        if !pending.is_empty() {
+                            out.push(Action::PrintString(std::mem::take(&mut pending)));
+                        }
+                        out.push(other);
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                out.push(Action::PrintString(pending));
+            }
+            out
+        }
+
+        let inputs: &[&[u8]] = &[
+            b"hello world",
+            b"\x1b[1mbold\x1b[0m tail",
+            "café €1 \u{1f680} 日本\x1b[31mred\x1b[0m".as_bytes(),
+            b"ab\xc2\x9b31mcd",
+            b"\x1b]0;title\x07body\xff\xc3\xa9",
+        ];
+        for bytes in inputs {
+            let mut scalar = Parser::new();
+            scalar.set_print_batching(false);
+            let scalar_actions = norm(scalar.parse_as_vec(bytes));
+
+            let mut batched = Parser::new();
+            batched.set_print_batching(true);
+            let batched_actions = norm(batched.parse_as_vec(bytes));
+
+            assert_eq!(scalar_actions, batched_actions, "diverged for {bytes:?}");
+        }
     }
 
     #[test]

@@ -64,6 +64,15 @@ image = ["sha2", "frankenterm-blob-leases"]
 # feature (which already pulls tmux_cc + std via use_serde) uses.
 tmux_cc = ["dep:pest", "dep:pest_derive", "std"]
 docs = ["use_serde", "image", "tmux_cc", "kitty-shm"]
+# [ft-round5-gauntlet-lw0s7.10] D1: when enabled, Parser::parse coalesces
+# maximal ground-state printable UTF-8 runs into one Action::PrintString
+# instead of one Action::Print per codepoint. Default-OFF; also toggleable at
+# runtime via Parser::set_print_batching for the A/B bench and equivalence test.
+parser-print-batching = []
+
+[[bench]]
+name = "parser_print_batching"
+harness = false
 
 [dev-dependencies]
 criterion.workspace = true
