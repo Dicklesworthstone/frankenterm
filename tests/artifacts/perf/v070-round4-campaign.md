@@ -38,8 +38,19 @@ with retry-condition predicate). Code-first → batch-bench → keep/revert (mat
 
 ## RELEASE GATES (Phase 3 — must pass before v0.7.0)
 - **GUI v0.6.1 startup crash**: the shipped /Applications/FrankenTerm.app v0.6.1 crashes instantly on
-  launch (operator restored v0.5.0 to work). v0.7.0 GUI MUST launch cleanly — investigate + fix the crash
-  before cutting the release. Crashing bundle preserved at /Applications/FrankenTerm.app.bak-0.6.1-crashing-*.
+  launch (operator restored v0.5.0 to work). v0.7.0 GUI MUST launch cleanly. Crashing bundle preserved at
+  /Applications/FrankenTerm.app.bak-0.6.1-crashing-*.
+  ROOT CAUSE (cod_4 diagnosis 2026-06-19, regression commit 581971fe9): wgpu-29 migration in
+  crates/frankenterm-gui/src/termwindow/webgpu.rs:1171 creates the instance via
+  InstanceDescriptor::new_without_display_handle() + surface via SurfaceTargetUnsafe::from_window(&handle),
+  which in wgpu 29 yields "No DisplayHandle is available to create this surface" -> mux window creation
+  fails -> Lua startup hook spawns into missing window_id 1 -> app terminates. Repro needs the bundle's
+  FRANKENTERM_LUA_CONFIG=1 env (without it the binary reaches painting).
+  FIX (one line, webgpu.rs:1175): SurfaceTargetUnsafe::from_display_and_window(&handle, &handle) (RawHandlePair
+  already impls both HasDisplayHandle + HasWindowHandle); or InstanceDescriptor::new_with_display_handle(...).
+  SECONDARY (separate, harden after): main.rs:778 no-args startup can hang handing off to the restored
+  v0.5.0 socket before creating a window — fail-fast harden.
+  STATUS: fix blocked on cod_5 finishing M3 (both touch gui/webgpu.rs); apply right after M3 commits.
 
 Note: `ft-perf-gate` already ships `sprt.rs`, `conformal.rs`, `regime_shift.rs` as a library; Phase 0 wires
 them into a CLI driver, it does not re-derive the math. `check_bench_stats.py` already ports Mann-Whitney +
@@ -109,3 +120,10 @@ _(tick entries appended here by the operator tend-loop)_
   cod_4 -> GUI v0.6.1 crash investigation (release gate, diagnosis). Still grinding: cod_1 Q4/5/6
   (patterns.rs, 56m on RCH), cod_3 M7 (tailer), cod_5 M3 (gui SoA, heavy), cc_1 Q1 (scrollback+proptest),
   cc_2 Q2 (storage), cc_3 M9 (fleet_memory+cert). 4 ideas adjudicated (Q3, ft-perf-gate, M2, M1).
+- 2026-06-19 tend#4 — Q1 seqlock prefix-sum landed + provisional-keep (6710e80f9, cc_1). 5 ideas
+  adjudicated. cod_4 delivered the GUI v0.6.1 crash ROOT CAUSE (wgpu-29 display-handle regression
+  581971fe9, one-line fix at webgpu.rs:1175 — see RELEASE GATES; fix queued behind cod_5 M3). Fleet
+  congestion: 2 core builds wedged 48m (stale-progress); cancelled RCH-flagged #...523 (cod_3 M7) to
+  unwedge. HELD cc_1 + cod_4 idle this cycle (no new core builds into congested fleet; cc_1 staged for
+  M4 CDC, cod_4 staged for the gui crash-fix after M3). In flight: cod_1 Q4/5/6, cod_2 S3-FIFO (lfucache),
+  cod_3 M7 (retry), cod_5 M3 (gui, 55m), cc_2 Q2, cc_3 M9.

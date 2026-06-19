@@ -99,3 +99,13 @@ clean A/B shows no real win). One clean number existed at ship: SWAR ft-p8vls âˆ
 **A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a profiler attributes a clearly-above-noise share to the scalar `ansi_state_step` loop on an ANSI-dense workload (TUI/vim capture); current scan benches may not isolate the branch-mispredict cost.
 **Baseline comparator:** per-byte scalar match-based `ansi_state_step` FSM.
 **Rollback:** feature default-off; `git revert 6d2d02f7e`.
+
+### 2026-06-19 | Q1 / cc_1 | Seqlock warm-tier prefix-sum (scrollback locate O(pages)->O(log))
+
+**Status:** kept provisional (durable optimization, default-off; A/B quant pending)
+**Gate:** config `scrollback.prefix_index` (default false)
+**Commit:** 6710e80f9
+**Behavior-preservation:** indexed == linear `ScrollbackLocationHint` equivalence proptest over random push/evict + 10k offsets (`proptest_scrollback_prefix_index.rs`); pane-reported RCH-pass.
+**A/B verdict:** DEFERRED. Retry-condition (Form 1): retry only if a profiler attributes a clearly-above-noise share to `locate_offset`/`tier_for_offset` on a deep-scrollback interactive-scroll workload (the O(pages) re-sum dominates only with hundreds of warm pages).
+**Baseline comparator:** per-call `warm.iter().sum()` + reverse linear page walk.
+**Rollback:** flag default-off; `git revert 6710e80f9`.
