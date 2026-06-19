@@ -12115,12 +12115,12 @@ fn next_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-/// Per-thread scan-byte accounting for [`redact_segment_for_persistence`].
-///
-/// The ft-gkh4p perf-regression tests use these to assert that the
-/// straddle-detection scan never re-reads the chunk past the span budget (the
-/// redundant second full scan that motivated the bead). Compiled out — and
-/// reduced to inlined no-ops at the call sites — in non-test builds.
+// Per-thread scan-byte accounting for `redact_segment_for_persistence`.
+//
+// The ft-gkh4p perf-regression tests use these to assert that the
+// straddle-detection scan never re-reads the chunk past the span budget (the
+// redundant second full scan that motivated the bead). Compiled out — and
+// reduced to inlined no-ops at the call sites — in non-test builds.
 #[cfg(test)]
 thread_local! {
     static SEGMENT_REDACT_DETECT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

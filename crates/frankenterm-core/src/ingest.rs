@@ -2085,15 +2085,15 @@ pub struct OutputCache {
     misses: u64,
 }
 
-/// Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
-/// `lru_order` tokens *examined* during LRU maintenance (eviction skip-loop +
-/// compaction retain). The amortized-O(1) refresh contract is that this total
-/// grows linearly with the number of cache operations, not as
-/// `operations * capacity` (the cost of the old O(n) position-scan refresh).
-/// A pure refresh below the compaction threshold examines zero tokens.
-///
-/// Thread-local + `cfg(test)`: zero production overhead, and each test (its own
-/// thread) sees only its own counts despite parallel test execution.
+// Perf-regression instrumentation (ft-zo4hw / ft-wo323): number of
+// `lru_order` tokens *examined* during LRU maintenance (eviction skip-loop +
+// compaction retain). The amortized-O(1) refresh contract is that this total
+// grows linearly with the number of cache operations, not as
+// `operations * capacity` (the cost of the old O(n) position-scan refresh).
+// A pure refresh below the compaction threshold examines zero tokens.
+//
+// Thread-local + `cfg(test)`: zero production overhead, and each test (its own
+// thread) sees only its own counts despite parallel test execution.
 #[cfg(test)]
 thread_local! {
     static OUTPUT_CACHE_LRU_MAINTENANCE_STEPS: std::cell::Cell<u64> =
