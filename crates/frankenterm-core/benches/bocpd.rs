@@ -75,6 +75,7 @@ fn bench_single_update(c: &mut Criterion) {
                 detection_threshold: 0.5,
                 min_observations: 10,
                 max_run_length: 100,
+                ..Default::default()
             });
             // Stable regime (low values)
             for i in 0..30 {

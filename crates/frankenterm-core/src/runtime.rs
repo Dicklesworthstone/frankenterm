@@ -6472,6 +6472,7 @@ mod tests {
             detection_threshold: 0.5,
             min_observations: 10,
             max_run_length: 100,
+            ..Default::default()
         });
         let mut last_capture_at = HashMap::new();
         let mut captured_at = 0;

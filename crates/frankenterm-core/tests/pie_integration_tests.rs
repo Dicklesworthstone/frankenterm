@@ -34,6 +34,7 @@ fn bocpd_change_triggers_classifier_update() {
         detection_threshold: 0.3,
         min_observations: 10,
         max_run_length: 100,
+        ..Default::default()
     });
 
     let mut classifier = BayesianClassifier::new(LedgerConfig::default());
@@ -349,6 +350,7 @@ fn full_pipeline_pane_lifecycle() {
         detection_threshold: 0.3,
         min_observations: 5,
         max_run_length: 50,
+        ..Default::default()
     });
     let mut classifier = BayesianClassifier::new(LedgerConfig {
         min_observations: 3,

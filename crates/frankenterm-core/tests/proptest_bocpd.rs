@@ -37,6 +37,7 @@ fn arb_bocpd_config() -> impl Strategy<Value = BocpdConfig> {
                 detection_threshold,
                 min_observations,
                 max_run_length,
+                ..Default::default()
             },
         )
 }
@@ -161,6 +162,7 @@ proptest! {
             detection_threshold: 0.7,
             min_observations: 5,
             max_run_length: 50,
+            ..Default::default()
         };
         let mut model = BocpdModel::new(config);
 
@@ -206,6 +208,7 @@ proptest! {
             detection_threshold: 0.7,
             min_observations: 20,
             max_run_length: 200,
+            ..Default::default()
         };
         let mut model = BocpdModel::new(config);
 
@@ -248,6 +251,7 @@ proptest! {
             detection_threshold: 0.5,
             min_observations: 5,
             max_run_length: 100,
+            ..Default::default()
         };
         let mut model = BocpdModel::new(config);
 
@@ -366,6 +370,7 @@ proptest! {
             detection_threshold: 0.5,
             min_observations: 5,
             max_run_length: 100,
+            ..Default::default()
         };
         let mut model = BocpdModel::new(config);
         let mut prev_count = 0u64;
@@ -483,6 +488,7 @@ proptest! {
             detection_threshold: 0.5,
             min_observations: min_obs,
             max_run_length: 100,
+            ..Default::default()
         };
         let mut model = BocpdModel::new(config);
 
@@ -528,6 +534,7 @@ proptest! {
             detection_threshold: 0.5,
             min_observations: 5,
             max_run_length: 100,
+            ..Default::default()
         };
         let mut model = BocpdModel::new(config);
 
@@ -552,6 +559,7 @@ proptest! {
             detection_threshold: 0.5,
             min_observations: 5,
             max_run_length: max_run,
+            ..Default::default()
         };
         let mut model = BocpdModel::new(config);
 
@@ -630,6 +638,7 @@ proptest! {
             detection_threshold: 0.5,
             min_observations: 5,
             max_run_length: 100,
+            ..Default::default()
         };
         let mut manager = BocpdManager::new(config);
         let mut prev_total = 0u64;

@@ -79,6 +79,13 @@ pub struct BocpdConfig {
     pub min_observations: usize,
     /// Maximum run length to track (truncation for performance).
     pub max_run_length: usize,
+    /// Change detector family. Defaults to Adams-MacKay BOCPD.
+    #[serde(
+        default,
+        alias = "detector_kind",
+        skip_serializing_if = "BocpdDetectorKind::is_bocpd"
+    )]
+    pub detector: BocpdDetectorKind,
 }
 
 impl Default for BocpdConfig {
@@ -88,7 +95,30 @@ impl Default for BocpdConfig {
             detection_threshold: 0.7,
             min_observations: 20,
             max_run_length: 200,
+            detector: BocpdDetectorKind::Bocpd,
         }
+    }
+}
+
+/// Change detector used to turn the Student-t predictive stream into alarms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BocpdDetectorKind {
+    /// Adams-MacKay Bayesian online changepoint detection.
+    Bocpd,
+    /// Shiryaev-Roberts quickest-change e-statistic.
+    ShiryaevRoberts,
+}
+
+impl Default for BocpdDetectorKind {
+    fn default() -> Self {
+        Self::Bocpd
+    }
+}
+
+impl BocpdDetectorKind {
+    fn is_bocpd(&self) -> bool {
+        matches!(self, Self::Bocpd)
     }
 }
 
@@ -191,6 +221,8 @@ pub struct BocpdModel {
     run_length_log_probs: Vec<f64>,
     /// Sufficient statistics for each run length.
     sufficient_stats: Vec<NormalGammaSS>,
+    /// Shiryaev-Roberts e-statistic for the alternate quickest-change detector.
+    shiryaev_roberts_statistic: f64,
     /// Total observations processed.
     observation_count: u64,
     /// Total change-points detected.
@@ -235,6 +267,7 @@ impl BocpdModel {
             config,
             run_length_log_probs,
             sufficient_stats,
+            shiryaev_roberts_statistic: 0.0,
             observation_count: 0,
             change_point_count: 0,
             change_alarm_latched: false,
@@ -254,6 +287,14 @@ impl BocpdModel {
         for ss in &self.sufficient_stats {
             pred_log_liks.push(ss.predictive_log_likelihood(x));
         }
+        let shiryaev_roberts_alarm = if matches!(
+            self.config.detector,
+            BocpdDetectorKind::ShiryaevRoberts
+        ) {
+            self.update_shiryaev_roberts_statistic(x, &pred_log_liks)
+        } else {
+            None
+        };
 
         // Step 2: Compute growth probabilities (log-space)
         // Clamp hazard_rate to avoid ln(0) = -inf which propagates NaN
@@ -325,7 +366,12 @@ impl BocpdModel {
         // observations after a shift and would fire on every one of them — a
         // snapshot storm across a large fleet.
         if self.observation_count as usize >= self.config.min_observations {
-            let mass = self.recent_change_mass();
+            let mass = match self.config.detector {
+                BocpdDetectorKind::Bocpd => self.recent_change_mass(),
+                BocpdDetectorKind::ShiryaevRoberts => {
+                    shiryaev_roberts_alarm.unwrap_or_else(|| self.recent_change_mass())
+                }
+            };
             let threshold = self.config.detection_threshold;
             // Hysteresis gap: de-assert well below the fire threshold so noise
             // near the threshold cannot chatter fire/rearm/fire.
@@ -337,6 +383,9 @@ impl BocpdModel {
             } else if mass >= threshold {
                 self.change_alarm_latched = true;
                 self.change_point_count = self.change_point_count.saturating_add(1);
+                if matches!(self.config.detector, BocpdDetectorKind::ShiryaevRoberts) {
+                    self.shiryaev_roberts_statistic = 0.0;
+                }
                 return Some(ChangePoint {
                     observation_index: self.observation_count,
                     posterior_probability: mass,
@@ -346,6 +395,59 @@ impl BocpdModel {
         }
 
         None
+    }
+
+    /// Update the Shiryaev-Roberts statistic and return its probability-shaped
+    /// alarm score. Invalid or degenerate predictive likelihoods fail closed by
+    /// returning `None`, which keeps the existing BOCPD Student-t statistic.
+    fn update_shiryaev_roberts_statistic(
+        &mut self,
+        x: f64,
+        pred_log_liks: &[f64],
+    ) -> Option<f64> {
+        let null_ll = pred_log_liks.get(self.map_run_length()).copied()?;
+        let change_ll = NormalGammaSS::prior().predictive_log_likelihood(x);
+        if is_degenerate_student_t_fallback(null_ll)
+            || is_degenerate_student_t_fallback(change_ll)
+            || !null_ll.is_finite()
+            || !change_ll.is_finite()
+        {
+            return None;
+        }
+
+        let log_lr = (change_ll - null_ll).clamp(-50.0, 50.0);
+        let likelihood_ratio = log_lr.exp();
+        let statistic = (1.0 + self.shiryaev_roberts_statistic) * likelihood_ratio;
+        self.shiryaev_roberts_statistic = if statistic.is_finite() {
+            statistic.min(1.0e12)
+        } else {
+            1.0e12
+        };
+        Some(self.shiryaev_roberts_alarm_score())
+    }
+
+    /// Anytime-valid false-alarm boundary for the SR e-statistic.
+    ///
+    /// The boundary spends the configured false-alarm budget across the hazard
+    /// horizon: a stricter `detection_threshold` and a lower hazard both raise
+    /// the e-value required to fire.
+    fn shiryaev_roberts_boundary(&self) -> f64 {
+        let h = self.config.hazard_rate.clamp(1.0e-10, 1.0 - 1.0e-10);
+        let false_alarm_alpha =
+            ((1.0 - self.config.detection_threshold) * h / self.config.detection_threshold)
+                .clamp(1.0e-12, 0.5);
+        1.0 / false_alarm_alpha
+    }
+
+    /// Convert the SR e-statistic into the same `[0, 1]` alarm scale that the
+    /// Schmitt trigger uses for BOCPD recent-change mass.
+    fn shiryaev_roberts_alarm_score(&self) -> f64 {
+        let boundary = self.shiryaev_roberts_boundary();
+        if !boundary.is_finite() || boundary <= 0.0 {
+            return 0.0;
+        }
+        (self.shiryaev_roberts_statistic / boundary * self.config.detection_threshold)
+            .clamp(0.0, 1.0)
     }
 
     /// Run-length window (in observations) that counts as "recent" for the
@@ -406,7 +508,10 @@ impl BocpdModel {
     /// therefore useless as a change alarm (ft-ia05b). Always in `[0.0, 1.0]`.
     #[must_use]
     pub fn change_point_probability(&self) -> f64 {
-        self.recent_change_mass()
+        match self.config.detector {
+            BocpdDetectorKind::Bocpd => self.recent_change_mass(),
+            BocpdDetectorKind::ShiryaevRoberts => self.shiryaev_roberts_alarm_score(),
+        }
     }
 
     /// Total observations processed.
@@ -463,7 +568,7 @@ impl std::fmt::Debug for BocpdModel {
 pub struct ChangePoint {
     /// Index of the observation where the change was detected.
     pub observation_index: u64,
-    /// Posterior probability P(rₜ=0).
+    /// Probability-shaped alarm score that crossed the configured threshold.
     pub posterior_probability: f64,
     /// MAP run length before the change.
     pub map_run_length: usize,
@@ -805,6 +910,10 @@ fn log_sum_exp(log_values: &[f64]) -> f64 {
     max + sum.ln()
 }
 
+fn is_degenerate_student_t_fallback(log_likelihood: f64) -> bool {
+    (log_likelihood - (-100.0)).abs() < f64::EPSILON
+}
+
 /// Stirling's approximation for ln(Γ(x)) — sufficient for our quantile needs.
 ///
 /// Uses the Lanczos approximation for better accuracy.
@@ -985,6 +1094,7 @@ mod tests {
             detection_threshold: 0.5,
             min_observations: 10,
             max_run_length: 100,
+            detector: BocpdDetectorKind::Bocpd,
         });
 
         // Regime 1: a stable regime. The run length grows and the
@@ -1040,6 +1150,7 @@ mod tests {
             detection_threshold: 0.5,
             min_observations: 10,
             max_run_length: 100,
+            detector: BocpdDetectorKind::Bocpd,
         });
 
         // A stable regime: the recent-change mass must decay well BELOW the
@@ -1107,6 +1218,7 @@ mod tests {
             detection_threshold: 0.7,
             min_observations: 10,
             max_run_length: 200,
+            detector: BocpdDetectorKind::Bocpd,
         });
 
         // Stable data: all same value
@@ -1121,6 +1233,139 @@ mod tests {
             false_alarms <= 2,
             "too many false alarms on stable data: {false_alarms}"
         );
+    }
+
+    #[test]
+    fn default_detector_matches_explicit_bocpd_on_golden_trace() {
+        let default_config = BocpdConfig {
+            hazard_rate: 0.02,
+            detection_threshold: 0.55,
+            min_observations: 12,
+            max_run_length: 80,
+            ..Default::default()
+        };
+        let explicit_config = BocpdConfig {
+            detector: BocpdDetectorKind::Bocpd,
+            ..default_config.clone()
+        };
+        let trace = [
+            10.0, 10.2, 9.8, 10.1, 9.9, 10.0, 10.1, 9.9, 10.2, 9.8, 10.0, 10.1, 10.0, 10.1,
+            9.9, 10.0, 80.0, 80.2, 79.8, 80.1, 80.0, 79.9, 80.1, 80.0,
+        ];
+        let mut default_model = BocpdModel::new(default_config);
+        let mut explicit_model = BocpdModel::new(explicit_config);
+
+        for x in trace {
+            let default_cp = default_model.update(x).map(|cp| {
+                (
+                    cp.observation_index,
+                    cp.posterior_probability.to_bits(),
+                    cp.map_run_length,
+                )
+            });
+            let explicit_cp = explicit_model.update(x).map(|cp| {
+                (
+                    cp.observation_index,
+                    cp.posterior_probability.to_bits(),
+                    cp.map_run_length,
+                )
+            });
+
+            assert_eq!(default_cp, explicit_cp);
+            assert_eq!(default_model.map_run_length(), explicit_model.map_run_length());
+            assert_eq!(
+                default_model.change_point_probability().to_bits(),
+                explicit_model.change_point_probability().to_bits()
+            );
+            assert_eq!(
+                default_model.run_length_posterior(),
+                explicit_model.run_length_posterior()
+            );
+        }
+    }
+
+    #[test]
+    fn shiryaev_roberts_detects_runaway_sooner_at_matched_false_alarm_rate() {
+        let (corpus, change_at) = synthetic_runaway_corpus();
+        let stable_prefix = &corpus[..change_at];
+        let bocpd_config = BocpdConfig {
+            hazard_rate: 0.01,
+            detection_threshold: 0.85,
+            min_observations: 32,
+            max_run_length: 160,
+            detector: BocpdDetectorKind::Bocpd,
+        };
+        let sr_config = BocpdConfig {
+            hazard_rate: 0.02,
+            detection_threshold: 0.65,
+            min_observations: 32,
+            max_run_length: 160,
+            detector: BocpdDetectorKind::ShiryaevRoberts,
+        };
+
+        let bocpd_false_alarms = alarm_count(bocpd_config.clone(), stable_prefix);
+        let sr_false_alarms = alarm_count(sr_config.clone(), stable_prefix);
+        assert_eq!(
+            bocpd_false_alarms, sr_false_alarms,
+            "synthetic stable corpus must match detector false-alarm counts"
+        );
+        assert_eq!(
+            bocpd_false_alarms, 0,
+            "stable prefix should have no false alarms"
+        );
+
+        let bocpd_index = first_alarm_index(bocpd_config, &corpus)
+            .expect("BOCPD should eventually detect the runaway");
+        let sr_index = first_alarm_index(sr_config, &corpus)
+            .expect("SR should detect the runaway");
+        assert!(
+            bocpd_index >= change_at && sr_index >= change_at,
+            "both alarms should occur after the synthetic change point: \
+             change_at={change_at}, bocpd_index={bocpd_index}, sr_index={sr_index}"
+        );
+
+        let bocpd_delay = bocpd_index - change_at + 1;
+        let sr_delay = sr_index - change_at + 1;
+        assert!(
+            sr_delay < bocpd_delay,
+            "SR should reduce runaway detection delay at matched false alarms: \
+             sr_delay={sr_delay}, bocpd_delay={bocpd_delay}"
+        );
+    }
+
+    fn synthetic_runaway_corpus() -> (Vec<f64>, usize) {
+        let noise = [-0.90, 0.35, 0.75, -0.25, 0.50, -0.65, 0.15, -0.05];
+        let change_at = 96;
+        let mut values = Vec::with_capacity(change_at + 96);
+        for i in 0..change_at {
+            values.push(100.0 + noise[i % noise.len()]);
+        }
+        for i in 0..96 {
+            let drift = 0.20 + (i as f64 * 0.18);
+            values.push(100.0 + drift + noise[i % noise.len()]);
+        }
+        (values, change_at)
+    }
+
+    fn alarm_count(config: BocpdConfig, values: &[f64]) -> usize {
+        let mut model = BocpdModel::new(config);
+        let mut count = 0;
+        for &value in values {
+            if model.update(value).is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn first_alarm_index(config: BocpdConfig, values: &[f64]) -> Option<usize> {
+        let mut model = BocpdModel::new(config);
+        for (index, &value) in values.iter().enumerate() {
+            if model.update(value).is_some() {
+                return Some(index);
+            }
+        }
+        None
     }
 
     #[test]
@@ -1427,6 +1672,7 @@ mod tests {
         assert!((config.detection_threshold - 0.7).abs() < 1e-10);
         assert_eq!(config.min_observations, 20);
         assert_eq!(config.max_run_length, 200);
+        assert_eq!(config.detector, BocpdDetectorKind::Bocpd);
     }
 
     #[test]
@@ -1435,6 +1681,37 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: BocpdConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.max_run_length, 200);
+    }
+
+    #[test]
+    fn config_default_json_golden_omits_detector_gate() {
+        let json = serde_json::to_string(&BocpdConfig::default()).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hazard_rate":0.005,"detection_threshold":0.7,"min_observations":20,"max_run_length":200}"#
+        );
+    }
+
+    #[test]
+    fn config_shiryaev_roberts_detector_is_opt_in() {
+        let config: BocpdConfig = serde_json::from_str(r#"{"detector":"shiryaev_roberts"}"#)
+            .expect("shiryaev_roberts detector should parse");
+        assert_eq!(config.detector, BocpdDetectorKind::ShiryaevRoberts);
+
+        let alias_config: BocpdConfig =
+            serde_json::from_str(r#"{"detector_kind":"shiryaev_roberts"}"#)
+                .expect("detector_kind alias should parse");
+        assert_eq!(alias_config.detector, BocpdDetectorKind::ShiryaevRoberts);
+
+        let json = serde_json::to_string(&BocpdConfig {
+            detector: BocpdDetectorKind::ShiryaevRoberts,
+            ..BocpdConfig::default()
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""detector":"shiryaev_roberts""#),
+            "explicit SR gate should serialize, got {json}"
+        );
     }
 
     // -- Change-point event serde ---------------------------------------------
@@ -1651,6 +1928,7 @@ mod tests {
             detection_threshold: 0.3,
             min_observations: 5,
             max_run_length: 50,
+            detector: BocpdDetectorKind::Bocpd,
         });
 
         let mut total_detections = 0u64;
@@ -1861,6 +2139,7 @@ mod tests {
             detection_threshold: 0.3,
             min_observations: 5,
             max_run_length: 50,
+            detector: BocpdDetectorKind::Bocpd,
         });
 
         // Feed stable data to two panes to get past warmup
@@ -2046,6 +2325,7 @@ mod tests {
             detection_threshold: 0.3,
             min_observations: 5,
             max_run_length: 50,
+            detector: BocpdDetectorKind::Bocpd,
         });
 
         // Regime 1: stable low values
@@ -2237,6 +2517,7 @@ mod tests {
         );
         assert_eq!(config.min_observations, 20);
         assert_eq!(config.max_run_length, 200);
+        assert_eq!(config.detector, BocpdDetectorKind::Bocpd);
     }
 
     #[test]
@@ -2247,6 +2528,7 @@ mod tests {
         assert!((config.detection_threshold - 0.7).abs() < 1e-10);
         assert_eq!(config.min_observations, 20);
         assert_eq!(config.max_run_length, 200);
+        assert_eq!(config.detector, BocpdDetectorKind::Bocpd);
     }
 
     // -- PaneChangePoint with features serde ----------------------------------
