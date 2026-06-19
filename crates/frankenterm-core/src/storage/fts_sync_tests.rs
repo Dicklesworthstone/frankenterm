@@ -59,15 +59,27 @@ fn sync_fts_on_startup_test(
 /// Helper to insert a test segment directly
 fn insert_test_segment(conn: &Connection, pane_id: u64, seq: u64, content: &str) {
     let now = now_ms();
+    insert_test_segment_with_zone_at(conn, pane_id, seq, content, now, None);
+}
+
+fn insert_test_segment_with_zone_at(
+    conn: &Connection,
+    pane_id: u64,
+    seq: u64,
+    content: &str,
+    captured_at: i64,
+    zone_type: Option<&str>,
+) {
     conn.execute(
-        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at, zone_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             pane_id as i64,
             seq as i64,
             content,
             content.len() as i64,
-            now
+            captured_at,
+            zone_type
         ],
     )
     .unwrap();
@@ -206,6 +218,104 @@ fn fts_match_count(conn: &Connection, match_token: &str) -> i64 {
     .unwrap()
 }
 
+#[derive(Debug, PartialEq)]
+struct FtsSearchProjection {
+    pane_id: u64,
+    seq: u64,
+    content: String,
+    snippet: Option<String>,
+    highlight: Option<String>,
+    score_bits: u64,
+}
+
+fn fts_search_projection(
+    conn: &mut Connection,
+    query: &str,
+    options: &SearchOptions,
+) -> Result<Vec<FtsSearchProjection>> {
+    with_fts_backend(conn, |backend| {
+        search_fts_with_snippets_backend(backend, query, options).map(|results| {
+            results
+                .into_iter()
+                .map(|result| FtsSearchProjection {
+                    pane_id: result.segment.pane_id,
+                    seq: result.segment.seq,
+                    content: result.segment.content,
+                    snippet: result.snippet,
+                    highlight: result.highlight,
+                    score_bits: result.score.to_bits(),
+                })
+                .collect()
+        })
+    })
+}
+
+fn sync_all_panes_for_test(
+    conn: &mut Connection,
+    config: &FtsSyncConfig,
+    insert_select_batch: bool,
+) -> Result<u64> {
+    with_fts_backend(conn, |backend| {
+        let mut total_indexed = 0u64;
+        for pane_id in panes_needing_fts_sync_backend(backend)? {
+            let (indexed, _) =
+                sync_fts_for_pane_backend_with_mode(backend, pane_id, config, insert_select_batch)?;
+            total_indexed = total_indexed.saturating_add(indexed);
+        }
+        Ok(total_indexed)
+    })
+}
+
+fn seed_insert_select_oracle_fixture(conn: &Connection) {
+    apply_defer_fts_triggers(conn);
+    insert_test_pane(conn, 1);
+    insert_test_pane(conn, 2);
+
+    let base = 1_700_000_000_000i64;
+    let rows = [
+        (
+            1,
+            0,
+            "needle alpha prompt transcript",
+            base + 10,
+            Some("prompt"),
+        ),
+        (
+            1,
+            1,
+            "needle beta output transcript",
+            base + 20,
+            Some("output"),
+        ),
+        (1, 2, "control row without match", base + 30, Some("output")),
+        (
+            2,
+            0,
+            "needle gamma output transcript",
+            base + 40,
+            Some("output"),
+        ),
+        (
+            2,
+            1,
+            "needle delta prompt transcript",
+            base + 50,
+            Some("prompt"),
+        ),
+        (
+            1,
+            3,
+            "needle epsilon output transcript",
+            base + 60,
+            Some("output"),
+        ),
+    ];
+
+    for (pane_id, seq, content, captured_at, zone_type) in rows {
+        insert_test_segment_with_zone_at(conn, pane_id, seq, content, captured_at, zone_type);
+    }
+}
+
 /// Helper: exercise the StorageConfig.defer_fts_triggers path
 /// directly on a Connection. Mirrors the DROP TRIGGER block in
 /// StorageHandle::with_config so the test exercises the same
@@ -329,6 +439,157 @@ fn fts_deferred_mode_catchup_indexes_all_segments() {
         "second catchup must see no new work (progress is resumable)"
     );
     assert_eq!(fts_match_count(&conn, "content"), 500);
+}
+
+#[test]
+fn insert_select_batch_matches_per_row_search_snippet_order_filters() {
+    let mut oracle = Connection::open_in_memory().unwrap();
+    initialize_schema(&oracle).unwrap();
+    seed_insert_select_oracle_fixture(&oracle);
+
+    let mut actual = Connection::open_in_memory().unwrap();
+    initialize_schema(&actual).unwrap();
+    seed_insert_select_oracle_fixture(&actual);
+
+    let config = FtsSyncConfig {
+        batch_size: 2,
+        max_batch_bytes: 128,
+        commit_progress: true,
+    };
+
+    let oracle_indexed = sync_all_panes_for_test(&mut oracle, &config, false).unwrap();
+    let actual_indexed = sync_all_panes_for_test(&mut actual, &config, true).unwrap();
+    assert_eq!(actual_indexed, oracle_indexed);
+    assert_eq!(actual_indexed, 6);
+
+    let base = 1_700_000_000_000i64;
+    let search_cases = [
+        SearchOptions {
+            limit: Some(10),
+            highlight_prefix: Some("[[".to_string()),
+            highlight_suffix: Some("]]".to_string()),
+            snippet_max_tokens: Some(6),
+            ..SearchOptions::default()
+        },
+        SearchOptions {
+            pane_id: Some(1),
+            limit: Some(10),
+            highlight_prefix: Some("[[".to_string()),
+            highlight_suffix: Some("]]".to_string()),
+            snippet_max_tokens: Some(6),
+            ..SearchOptions::default()
+        },
+        SearchOptions {
+            zone_type: Some("output".to_string()),
+            limit: Some(10),
+            highlight_prefix: Some("[[".to_string()),
+            highlight_suffix: Some("]]".to_string()),
+            snippet_max_tokens: Some(6),
+            ..SearchOptions::default()
+        },
+        SearchOptions {
+            since: Some(base + 15),
+            until: Some(base + 45),
+            limit: Some(10),
+            highlight_prefix: Some("[[".to_string()),
+            highlight_suffix: Some("]]".to_string()),
+            snippet_max_tokens: Some(6),
+            ..SearchOptions::default()
+        },
+        SearchOptions {
+            pane_id: Some(1),
+            zone_type: Some("output".to_string()),
+            since: Some(base + 15),
+            until: Some(base + 65),
+            limit: Some(10),
+            highlight_prefix: Some("[[".to_string()),
+            highlight_suffix: Some("]]".to_string()),
+            snippet_max_tokens: Some(6),
+            ..SearchOptions::default()
+        },
+    ];
+
+    for options in search_cases {
+        let expected = fts_search_projection(&mut oracle, "needle", &options).unwrap();
+        let actual = fts_search_projection(&mut actual, "needle", &options).unwrap();
+        assert_eq!(
+            actual, expected,
+            "set-based FTS catch-up must match the per-row oracle for options {options:?}"
+        );
+    }
+}
+
+#[test]
+fn insert_select_batch_resumes_after_crash_progress_restart() {
+    let mut oracle = Connection::open_in_memory().unwrap();
+    initialize_schema(&oracle).unwrap();
+    seed_insert_select_oracle_fixture(&oracle);
+
+    let mut restarted = Connection::open_in_memory().unwrap();
+    initialize_schema(&restarted).unwrap();
+    seed_insert_select_oracle_fixture(&restarted);
+
+    let config = FtsSyncConfig {
+        batch_size: 2,
+        max_batch_bytes: 128,
+        commit_progress: true,
+    };
+
+    assert_eq!(
+        sync_all_panes_for_test(&mut oracle, &config, false).unwrap(),
+        6
+    );
+
+    with_fts_backend(&mut restarted, |backend| {
+        let first_batch = insert_fts_entries_select_batch_backend(
+            backend,
+            1,
+            0,
+            config.batch_size,
+            true,
+            config.max_batch_bytes,
+        )?
+        .expect("pane 1 first set-based batch must select rows");
+        assert_eq!(first_batch.indexed_count, 2);
+        assert_eq!(first_batch.max_seq, 1);
+
+        upsert_fts_pane_progress_backend(
+            backend,
+            &FtsPaneProgress {
+                pane_id: 1,
+                last_indexed_seq: first_batch.max_seq,
+                indexed_count: first_batch.indexed_count,
+                last_indexed_at: now_ms(),
+            },
+        )
+    })
+    .unwrap();
+
+    let resumed = sync_all_panes_for_test(&mut restarted, &config, true).unwrap();
+    assert_eq!(
+        resumed, 4,
+        "restart must resume after committed max_seq and index the remaining rows"
+    );
+
+    let pane_one_progress = get_fts_pane_progress_test(&mut restarted, 1)
+        .unwrap()
+        .expect("pane 1 progress should survive restart");
+    assert_eq!(pane_one_progress.last_indexed_seq, 3);
+    assert_eq!(pane_one_progress.indexed_count, 4);
+
+    let options = SearchOptions {
+        limit: Some(10),
+        highlight_prefix: Some("[[".to_string()),
+        highlight_suffix: Some("]]".to_string()),
+        snippet_max_tokens: Some(6),
+        ..SearchOptions::default()
+    };
+    let expected = fts_search_projection(&mut oracle, "needle", &options).unwrap();
+    let actual = fts_search_projection(&mut restarted, "needle", &options).unwrap();
+    assert_eq!(
+        actual, expected,
+        "crash-progress restart must finish with the same searchable corpus as the per-row oracle"
+    );
 }
 
 /// [ft-7do6c] The seq=0 off-by-one: a fresh pane's FIRST segment

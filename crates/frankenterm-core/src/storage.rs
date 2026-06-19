@@ -18586,6 +18586,14 @@ const FTS_INDEX_VERSION: u32 = 1;
 /// forced full rebuild. This leaves an explicit "must rebuild" marker instead
 /// of silently trusting a partially rebuilt index.
 const FTS_INDEX_REBUILD_PENDING_VERSION: u32 = 0;
+const FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV: &str = "FT_MOONSHOT_FTS_INSERT_SELECT_BATCH";
+
+#[derive(Debug, Clone, Copy)]
+struct FtsInsertSelectBatchOutcome {
+    fetched_count: usize,
+    indexed_count: u64,
+    max_seq: u64,
+}
 
 fn fts_index_state_from_backend_cells(row: &[SqlCell]) -> Result<FtsIndexState> {
     let reader = CellRowReader::new(row);
@@ -18837,10 +18845,177 @@ fn insert_fts_entry_backend(backend: &dyn StorageBackend, segment: &Segment) -> 
     Ok(())
 }
 
+fn fts_insert_select_batch_enabled() -> bool {
+    storage_env_flag_enabled(FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV)
+}
+
+fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str {
+    if include_from_zero {
+        "WITH limited AS (
+             SELECT id, seq, content, content_len,
+                    ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
+                    SUM(content_len) OVER (
+                        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_bytes
+             FROM output_segments
+             WHERE pane_id = ?1
+             ORDER BY seq
+             LIMIT ?3
+         ),
+         selected AS (
+             SELECT id, seq, content
+             FROM limited
+             WHERE batch_ordinal = 1 OR running_bytes <= ?4
+         )
+         SELECT
+             (SELECT COUNT(*) FROM limited) AS fetched_count,
+             (SELECT COUNT(*) FROM selected) AS indexed_count,
+             (SELECT MAX(seq) FROM selected) AS max_seq"
+    } else {
+        "WITH limited AS (
+             SELECT id, seq, content, content_len,
+                    ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
+                    SUM(content_len) OVER (
+                        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_bytes
+             FROM output_segments
+             WHERE pane_id = ?1 AND seq > ?2
+             ORDER BY seq
+             LIMIT ?3
+         ),
+         selected AS (
+             SELECT id, seq, content
+             FROM limited
+             WHERE batch_ordinal = 1 OR running_bytes <= ?4
+         )
+         SELECT
+             (SELECT COUNT(*) FROM limited) AS fetched_count,
+             (SELECT COUNT(*) FROM selected) AS indexed_count,
+             (SELECT MAX(seq) FROM selected) AS max_seq"
+    }
+}
+
+fn fts_insert_select_batch_sql(include_from_zero: bool) -> &'static str {
+    if include_from_zero {
+        "WITH limited AS (
+             SELECT id, seq, content, content_len,
+                    ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
+                    SUM(content_len) OVER (
+                        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_bytes
+             FROM output_segments
+             WHERE pane_id = ?1
+             ORDER BY seq
+             LIMIT ?3
+         )
+         INSERT INTO output_segments_fts(rowid, content)
+         SELECT id, content
+         FROM limited
+         WHERE batch_ordinal = 1 OR running_bytes <= ?4
+         ORDER BY seq"
+    } else {
+        "WITH limited AS (
+             SELECT id, seq, content, content_len,
+                    ROW_NUMBER() OVER (ORDER BY seq) AS batch_ordinal,
+                    SUM(content_len) OVER (
+                        ORDER BY seq ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_bytes
+             FROM output_segments
+             WHERE pane_id = ?1 AND seq > ?2
+             ORDER BY seq
+             LIMIT ?3
+         )
+         INSERT INTO output_segments_fts(rowid, content)
+         SELECT id, content
+         FROM limited
+         WHERE batch_ordinal = 1 OR running_bytes <= ?4
+         ORDER BY seq"
+    }
+}
+
+fn insert_fts_entries_select_batch_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    last_indexed_seq: u64,
+    limit: usize,
+    include_from_zero: bool,
+    max_batch_bytes: usize,
+) -> Result<Option<FtsInsertSelectBatchOutcome>> {
+    let pane_id = u64_to_i64(pane_id, "output_segments.pane_id")?;
+    let last_indexed_seq = u64_to_i64(last_indexed_seq, "output_segments.seq")?;
+    let limit = usize_to_i64(limit, "FTS sync batch_size")?;
+    let max_batch_bytes = usize_to_i64(max_batch_bytes, "FTS sync max_batch_bytes")?;
+    let params = [
+        ToSqlValue::Integer(pane_id),
+        ToSqlValue::Integer(last_indexed_seq),
+        ToSqlValue::Integer(limit),
+        ToSqlValue::Integer(max_batch_bytes),
+    ];
+
+    let summary_row = backend
+        .query_row_cells(
+            fts_insert_select_batch_summary_sql(include_from_zero),
+            &params,
+        )
+        .map_err(|err| storage_backend_error("Failed to query set-based FTS batch", err))?
+        .ok_or_else(|| {
+            StorageError::Database("set-based FTS batch summary returned no row".to_string())
+        })?;
+    let reader = CellRowReader::new(&summary_row);
+    let fetched_count_u64 = reader
+        .i64(0)
+        .and_then(|value| backend_i64_to_u64(value, "set-based FTS fetched_count"))
+        .map_err(|err| storage_backend_error("Failed to parse set-based FTS fetched_count", err))?;
+    let fetched_count = usize::try_from(fetched_count_u64).map_err(|_| {
+        StorageError::Database(format!(
+            "set-based FTS fetched_count {fetched_count_u64} exceeds usize range"
+        ))
+    })?;
+    let indexed_count = reader
+        .i64(1)
+        .and_then(|value| backend_i64_to_u64(value, "set-based FTS indexed_count"))
+        .map_err(|err| storage_backend_error("Failed to parse set-based FTS indexed_count", err))?;
+    if indexed_count == 0 {
+        return Ok(None);
+    }
+    let max_seq_i64 = reader
+        .optional_i64(2)
+        .map_err(|err| storage_backend_error("Failed to parse set-based FTS max_seq", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "set-based FTS batch selected rows without a max_seq".to_string(),
+            )
+        })?;
+    let max_seq = backend_i64_to_u64(max_seq_i64, "set-based FTS max_seq")
+        .map_err(|err| storage_backend_error("Failed to parse set-based FTS max_seq", err))?;
+
+    execute_typed(
+        backend,
+        fts_insert_select_batch_sql(include_from_zero),
+        &params,
+    )
+    .map_err(|err| storage_backend_error("Failed to insert set-based FTS batch", err))?;
+
+    Ok(Some(FtsInsertSelectBatchOutcome {
+        fetched_count,
+        indexed_count,
+        max_seq,
+    }))
+}
+
 fn sync_fts_for_pane_backend(
     backend: &dyn StorageBackend,
     pane_id: u64,
     config: &FtsSyncConfig,
+) -> Result<(u64, u64)> {
+    sync_fts_for_pane_backend_with_mode(backend, pane_id, config, fts_insert_select_batch_enabled())
+}
+
+fn sync_fts_for_pane_backend_with_mode(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    config: &FtsSyncConfig,
+    insert_select_batch: bool,
 ) -> Result<(u64, u64)> {
     let now = now_ms();
     let progress = get_fts_pane_progress_backend(backend, pane_id)?;
@@ -18853,6 +19028,39 @@ fn sync_fts_for_pane_backend(
 
     loop {
         let include_from_zero = !had_prior_progress && total_indexed == 0;
+        if insert_select_batch {
+            let Some(outcome) = insert_fts_entries_select_batch_backend(
+                backend,
+                pane_id,
+                max_seq,
+                config.batch_size,
+                include_from_zero,
+                config.max_batch_bytes,
+            )?
+            else {
+                break;
+            };
+
+            total_indexed = total_indexed.saturating_add(outcome.indexed_count);
+            indexed_count = indexed_count.saturating_add(outcome.indexed_count);
+            max_seq = outcome.max_seq;
+
+            if config.commit_progress {
+                let new_progress = FtsPaneProgress {
+                    pane_id,
+                    last_indexed_seq: max_seq,
+                    indexed_count,
+                    last_indexed_at: now,
+                };
+                upsert_fts_pane_progress_backend(backend, &new_progress)?;
+            }
+
+            if outcome.fetched_count < config.batch_size {
+                break;
+            }
+            continue;
+        }
+
         let segments = get_unindexed_segments_backend(
             backend,
             pane_id,
