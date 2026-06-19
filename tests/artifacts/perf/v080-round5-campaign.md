@@ -93,3 +93,14 @@ _(tick entries appended by the orchestrator tend-loop)_
   RCH truncation). Dispatched 2 more mined ideas: EV3 .21 (blocked/rank-select scrollback) → cod_1,
   EV4 .22 (set-based FTS batcher) → cod_3. Q3 gate uses env::var_os().is_some() (empty-var=ON footgun)
   → needs a forced-algorithm A/B, recorded for separate handling.
+- 2026-06-19 tend#7 (CONVERGE) — patterns trio MEASURED (clean cv): Q5 teddy +0.5% (noise, no win), Q6
+  fingerprint-dedup +8.8% SLOWER, M5 MPHF +69% SLOWER — all default-off, recorded with per-flag Form-7
+  predicates (NONE promotable; good thing they were default-off). THREAD A fully adjudicated: all 19
+  round-4 flags have verdicts (3 measured keeps Q1/M4/Q4; 5 measured no-win/regression Q5/Q6/M5/M9/
+  S3-FIFO; M6 killed; 8 default-off+Form7; 3 no-A/B structural) → **0 default-on promotions** (round-4
+  flags confirmed appropriately default-off). 6 NEW round-5 ideas landed default-off (D1/D2/EV1/EV2/EV3 +
+  EV4 in progress). EV3 committed (f026fa808). B4 core --lib STILL building on RCH (~50min+, slow but
+  progressing — full --lib compile is huge); will close .8/.9/.15 + run consolidated bench-compile
+  (.4/.6) once it frees the core-build slot. Key honest finding: algorithmic wins (Q1 32×, M4 19×)
+  deliver; systems-moonshots (Q5/Q6/M5/M9/S3-FIFO/M6) largely do not — exactly what the gauntlet exists
+  to surface. Approaching release: pending B4 green + EV1/EV3/EV4 proofs, then Thread F v0.8.0.

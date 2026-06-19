@@ -82,4 +82,56 @@ harness at 200 panes / 6 writers. Until then M6 is speculative.
 
 ---
 
-_(round-5 measured-no-win / reject / revert entries land below as A/B runs complete on the quiet host.)_
+### 2026-06-19 | Q5 Teddy / Q6 fingerprint-dedup / M5 MPHF-dispatch — MEASURED no-win or REGRESSION
+
+**Status:** measured-no-win (Q5) + measured-regression (Q6, M5). All three round-4 patterns "moonshots"
+stay default-off (zero-risk, round-4 correctness-proven); NONE promoted — and good thing, because two
+REGRESS on their designed workloads. Bench `crates/frankenterm-core/benches/round5_patterns_a1.rs`,
+local Mac, release-perf, clean cv (per-arm ranges <0.5%). One baseline build (no features) + one candidate
+build (teddy+fingerprint+mphf); per-group cfg-gated so each comparison is valid.
+**Measurement (baseline → candidate):**
+- **Q5 teddy_low_match/512_chunks: 109.97µs → 110.55µs (+0.5%)** — within noise, NO win. The Teddy SIMD
+  packed-literal prefilter neither helps nor hurts on this workload (its overhead ≈ the regex it skips).
+- **Q6 fingerprint_dedup_churn/6144_keys_x2: 86.68ms → 94.29ms (+8.8% SLOWER)** — the 64-bit fingerprint
+  + O(1) ring-LRU is slower than `HashMap<String>` + O(n) retain at this key count/churn.
+- **M5 mphf_chatty_anchor_routing/192_anchors_x24: 310.59µs → 524.97µs (+69% SLOWER)** — the minimal
+  perfect-hash anchor→bitset lookup costs MORE per probe than the `HashMap` route at 192 anchors.
+**Retry-condition predicates (Form 7, one per flag):**
+- Q5: retry only if a pattern-detection bench on a TRULY low-match-rate chunk stream (≫90% chunks with no
+  required literal of any rule) shows Teddy rejecting above noise — this 512-chunk corpus is not low-match
+  enough for the prefilter to pay for itself.
+- Q6: retry only if a dedup workload with far higher per-key String-alloc pressure / key cardinality than
+  6144 keys shows the O(1) ring-LRU beating HashMap+O(n)-retain by a Mann-Whitney-significant margin.
+- M5: retry only if an anchor table FAR larger than 192 (where HashMap probe + collision cost actually
+  dominates) shows MPHF routing winning — at 192 anchors the HashMap is faster, so MPHF is net cost.
+**Rollback:** n/a (all default-off, never promoted; correctness proofs retained).
+
+### 2026-06-19 | Q2/Q3/M1/M2/M3/M7/M8/SR — adjudicated default-off, quantification deferred (Form 7)
+
+**Status:** default-off, not heavily re-run this round (converge decision). Each is either a quality-metric
+flag whose win is NOT a wall-clock ns number (so the existing ns benches can't adjudicate it — same class as
+M9/S3-FIFO), a 2-build feature deferred to a focused run, or a gate with a measurement footgun. All ship
+default-off (zero-risk, round-4 correctness-proven). Per-flag retry predicate (Form 7 unless noted):
+- **Q2 group-commit + M8 adaptive M/G/1:** win = reduced fsync/park cost at ~200-pane sustained WAL burst.
+  Retry only if a write-replay bench reports fsync-count / writer-wait below the 1ms-park+autocommit (resp.
+  fixed-128) baseline at high service-time CV. (macOS fsync timing is unreliable for this — prefer a Linux
+  worker run.)
+- **M7 predictive cadence:** win = captures reduced ≥15% at non-regressed p95 capture-latency. Retry only on
+  a recorded pane-output trace replay (not a microbench).
+- **M2 succinct attrs:** win = attr-store RSS / cache-miss share on a deep-scrollback workload. Retry only if
+  a warm/cold scrollback memory bench shows it above noise (RSS metric, not ns).
+- **M3 SoA glyph quads:** win = GPU vertex-bandwidth at glyph-dense frames. Retry on a headless gui
+  frame-time A/B (the RCH workers lack GUI libs for the bench link; run locally on a GUI-capable host).
+- **SR (Shiryaev-Roberts):** **a real correctness bug was FIXED this round** (detector was dead on
+  non-zero-centered data, 8c8142ef3) — that is a kept correctness improvement, not a perf flag. The perf
+  comparison (lower detection-delay at matched ARL0) retry: only on a synthetic-changepoint ARL0/ARL1 corpus.
+- **Q3 linear KMP overlap:** win = avoided O(n²) on adversarial common-first-byte / box-drawing input. Its
+  env gate reads `env::var_os().is_some()` (empty-but-set = ON), so the build-once env A/B can't express the
+  OFF arm; retry with a forced-algorithm A/B via the `#[doc(hidden)]` forced-overlap API on adversarial input.
+- **M1 ANSI DFA:** win = branchless table on an ANSI-dense (TUI/vim) capture. Retry with a focused
+  feature A/B (`ansi-dfa-table`) on the `simd_scan` ANSI-heavy workload (2-build; converge-deferred here).
+**Rollback:** n/a (all default-off).
+
+---
+
+_(further round-5 measured-no-win / reject / revert entries land below.)_
