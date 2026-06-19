@@ -2400,6 +2400,92 @@ impl std::fmt::Debug for EngineIndex {
     }
 }
 
+/// One per-agent Aho-Corasick shard over a *subset* of the global anchor set.
+///
+/// Part of the `FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX` moonshot (round5
+/// EV2, default-OFF). A shard's patterns are the global anchor indices relevant
+/// to one agent (its own rules + WezTerm infrastructure rules), kept in
+/// ascending *global* order so per-shard pattern ids stay monotonic in global
+/// ids. [`AgentShard::pattern_to_global_anchor`] maps every shard pattern back
+/// to its global anchor index, so candidate collection reuses the global
+/// `anchor_rule_buckets` / dispatch and the global `compiled_rules` ordering
+/// verbatim.
+struct AgentShard {
+    matcher: AhoCorasick,
+    /// `pattern_to_global_anchor[shard_pattern_id]` = global anchor index.
+    pattern_to_global_anchor: Vec<usize>,
+}
+
+/// Per-agent anchor shards keyed by agent type.
+///
+/// Equivalence to the global automaton is structural, not approximate: a rule
+/// applies to agent `A` iff all of its anchors are in `A`'s shard, so it
+/// matches in the shard exactly when it matches globally. Because shard
+/// patterns preserve global anchor ordering and map back to global indices, the
+/// post-collection sort, first-anchor fallback, regex evaluation, spans and
+/// dedup are byte-identical to the global path — and the existing
+/// `rule_agent_type_applies` filter still runs to drop shared-anchor
+/// other-agent rules. Proven by the `agent_sharded_index_matches_global_oracle`
+/// property test.
+struct AgentShardedIndex {
+    shards: HashMap<AgentType, AgentShard>,
+}
+
+impl AgentShardedIndex {
+    /// Known agent panes worth sharding. `Unknown` always uses the global
+    /// index (it is the conservative "all rules apply" fallback).
+    const SHARDED_AGENTS: [AgentType; 4] = [
+        AgentType::Codex,
+        AgentType::ClaudeCode,
+        AgentType::Gemini,
+        AgentType::Wezterm,
+    ];
+
+    fn build(index: &EngineIndex) -> Self {
+        let mut shards = HashMap::new();
+        for agent in Self::SHARDED_AGENTS {
+            // Global anchor indices whose bucket holds at least one rule that
+            // applies to `agent`. Iterating the bucket vec in order keeps
+            // `globals` ascending, preserving global pattern ordering.
+            let mut globals: Vec<usize> = Vec::new();
+            for (g, bucket) in index.anchor_rule_buckets.iter().enumerate() {
+                let relevant = bucket.iter().any(|&ri| {
+                    PatternEngine::rule_agent_type_applies(
+                        index.compiled_rules[ri].def.agent_type,
+                        agent,
+                    )
+                });
+                if relevant {
+                    globals.push(g);
+                }
+            }
+            if globals.is_empty() {
+                // No anchors can fire for this agent → leave the shard absent
+                // so the runtime falls back to the (equally empty-result)
+                // global path rather than constructing an empty matcher.
+                continue;
+            }
+            let matcher = AhoCorasick::builder()
+                .build(globals.iter().map(|&g| index.anchor_list[g].as_str()))
+                // Anchors were already validated when the global matcher was
+                // built; a subset of them must also build.
+                .expect("agent shard matcher builds from already-validated anchors");
+            shards.insert(
+                agent,
+                AgentShard {
+                    matcher,
+                    pattern_to_global_anchor: globals,
+                },
+            );
+        }
+        Self { shards }
+    }
+
+    fn shard_for(&self, agent: AgentType) -> Option<&AgentShard> {
+        self.shards.get(&agent)
+    }
+}
+
 #[cfg(test)]
 fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     build_engine_index_with_pack_lookup(rules, |_| None::<&'static str>)
@@ -4058,6 +4144,23 @@ fn builtin_wezterm_pack() -> PatternPack {
     )
 }
 
+/// Read the default state of the agent-sharded pattern index moonshot
+/// (`FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX`, round5 EV2). Default-OFF; any of
+/// `1` / `true` / `on` / `yes` (case-insensitive, trimmed) enables it. Read
+/// once per engine construction.
+fn agent_sharded_index_enabled_from_env() -> bool {
+    std::env::var("FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX")
+        .ok()
+        .map(|raw| {
+            let v = raw.trim();
+            v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
 /// Pattern engine for detecting agent state transitions
 pub struct PatternEngine {
     /// Merged rule library
@@ -4068,6 +4171,14 @@ pub struct PatternEngine {
     quick_reject_enabled: bool,
     /// Operational telemetry counters (atomic for concurrent access)
     telemetry: PatternTelemetry,
+    /// `FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX` (default-OFF, round5 EV2):
+    /// when on, known-agent panes scan a per-agent anchor shard instead of the
+    /// global automaton. Read once at construction; the `#[doc(hidden)]`
+    /// `set_agent_sharded_index_enabled` seam overrides it for benches/tests.
+    agent_sharded_index: bool,
+    /// Per-agent shards, lazily built on first known-agent detect when the gate
+    /// is on. Empty/untouched when the gate is off (zero default-path cost).
+    agent_shards: OnceLock<AgentShardedIndex>,
 }
 
 impl Default for PatternEngine {
@@ -4088,6 +4199,8 @@ impl PatternEngine {
             index: OnceLock::new(),
             quick_reject_enabled: true,
             telemetry: PatternTelemetry::new(),
+            agent_sharded_index: agent_sharded_index_enabled_from_env(),
+            agent_shards: OnceLock::new(),
         }
     }
 
@@ -4111,6 +4224,8 @@ impl PatternEngine {
             index: OnceLock::new(),
             quick_reject_enabled: config.quick_reject_enabled,
             telemetry: PatternTelemetry::new(),
+            agent_sharded_index: agent_sharded_index_enabled_from_env(),
+            agent_shards: OnceLock::new(),
         })
     }
 
@@ -4125,6 +4240,8 @@ impl PatternEngine {
             index: OnceLock::new(),
             quick_reject_enabled,
             telemetry: PatternTelemetry::new(),
+            agent_sharded_index: agent_sharded_index_enabled_from_env(),
+            agent_shards: OnceLock::new(),
         };
         engine
             .index
@@ -4147,6 +4264,38 @@ impl PatternEngine {
             build_engine_index_for_library(&self.library)
                 .expect("pattern engine must compile for builtin packs")
         })
+    }
+
+    /// Whether the agent-sharded pattern index (round5 EV2,
+    /// `FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX`) is active for this engine.
+    /// `#[doc(hidden)]` introspector for benches / A-B drivers.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn agent_sharded_index_enabled(&self) -> bool {
+        self.agent_sharded_index
+    }
+
+    /// Force the agent-sharded pattern index on/off, bypassing the env gate.
+    /// `#[doc(hidden)]` test/bench seam (round5 EV2): the production default
+    /// stays env-gated default-OFF. Resets the lazily-built shard cache so a
+    /// subsequent first-use rebuild reflects the new setting.
+    #[doc(hidden)]
+    pub fn set_agent_sharded_index_enabled(&mut self, enabled: bool) {
+        self.agent_sharded_index = enabled;
+        self.agent_shards = OnceLock::new();
+    }
+
+    /// Per-agent anchor shards, lazily built on first use when the gate is on.
+    /// Returns `None` (so callers use the global automaton) when the gate is
+    /// off — the default — which keeps shard construction off the default path.
+    fn agent_shards(&self) -> Option<&AgentShardedIndex> {
+        if !self.agent_sharded_index {
+            return None;
+        }
+        Some(
+            self.agent_shards
+                .get_or_init(|| AgentShardedIndex::build(self.index())),
+        )
     }
 
     /// Detect patterns in text
@@ -4312,12 +4461,27 @@ impl PatternEngine {
             return Vec::new();
         }
 
-        let Some(matcher) = index.anchor_matcher.as_ref() else {
-            return Vec::new();
-        };
+        // EV2 (FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX, default-OFF): a
+        // known-agent pane scans only its per-agent anchor shard; Unknown (and
+        // the default-off path) fall back to the global automaton. The shard
+        // maps back to global anchor/rule indices, so the downstream agent
+        // filter, sort, regex evaluation, spans and dedup are unchanged.
+        let agent_shard = context
+            .agent_type
+            .filter(|agent| *agent != AgentType::Unknown)
+            .and_then(|agent| {
+                self.agent_shards()
+                    .and_then(|shards| shards.shard_for(agent))
+            });
 
-        let (mut indices, matched_anchor_by_rule) =
-            Self::collect_candidate_rules(index, &input_text, matcher);
+        let (mut indices, matched_anchor_by_rule) = if let Some(shard) = agent_shard {
+            Self::collect_candidate_rules_sharded(index, &input_text, shard)
+        } else {
+            let Some(matcher) = index.anchor_matcher.as_ref() else {
+                return Vec::new();
+            };
+            Self::collect_candidate_rules(index, &input_text, matcher)
+        };
 
         if indices.is_empty() {
             return Vec::new();
@@ -4798,6 +4962,41 @@ impl PatternEngine {
             };
 
             let anchor_match = (anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                if matched_anchor_by_rule[idx].is_none() {
+                    candidate_rules.push(idx);
+                    matched_anchor_by_rule[idx] = Some(anchor_match);
+                }
+            }
+        }
+
+        (candidate_rules, matched_anchor_by_rule)
+    }
+
+    /// Candidate collection over a per-agent [`AgentShard`] (round5 EV2).
+    ///
+    /// Identical to [`collect_candidate_rules`] except the matcher scans only
+    /// the agent's anchor subset; each shard pattern id is mapped back to its
+    /// global anchor index so `anchor_rule_indices` and the returned global
+    /// rule / anchor indices match the global path verbatim. The caller's
+    /// `rule_agent_type_applies` filter still drops shared-anchor other-agent
+    /// rules, so the final detection stream is byte-identical to the global
+    /// automaton for the same agent.
+    fn collect_candidate_rules_sharded(
+        index: &EngineIndex,
+        text: &str,
+        shard: &AgentShard,
+    ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
+
+        for matched in shard.matcher.find_overlapping_iter(text) {
+            let global_anchor_idx = shard.pattern_to_global_anchor[matched.pattern().as_usize()];
+            let Some(rule_indices) = Self::anchor_rule_indices(index, global_anchor_idx) else {
+                continue;
+            };
+
+            let anchor_match = (global_anchor_idx, (matched.start(), matched.end()));
             for &idx in rule_indices {
                 if matched_anchor_by_rule[idx].is_none() {
                     candidate_rules.push(idx);
@@ -5372,6 +5571,192 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+
+    // ── round5 EV2: agent-sharded pattern index oracle equivalence ──────
+
+    /// Assert two detection streams are byte-identical field-by-field.
+    fn assert_detections_eq(
+        oracle: &[Detection],
+        sharded: &[Detection],
+        text: &str,
+        agent: AgentType,
+    ) {
+        assert_eq!(
+            oracle.len(),
+            sharded.len(),
+            "detection COUNT differs for agent {agent:?} on input {text:?}\n  oracle={oracle:#?}\n  sharded={sharded:#?}"
+        );
+        for (o, s) in oracle.iter().zip(sharded.iter()) {
+            assert_eq!(o.rule_id, s.rule_id, "rule_id/order differs (agent {agent:?}, input {text:?})");
+            assert_eq!(o.agent_type, s.agent_type, "agent_type differs for {}", o.rule_id);
+            assert_eq!(o.event_type, s.event_type, "event_type differs for {}", o.rule_id);
+            assert_eq!(o.severity, s.severity, "severity differs for {}", o.rule_id);
+            assert!(
+                (o.confidence - s.confidence).abs() < f64::EPSILON,
+                "confidence differs for {}: {} vs {}",
+                o.rule_id, o.confidence, s.confidence
+            );
+            assert_eq!(o.extracted, s.extracted, "extracted captures differ for {} (input {text:?})", o.rule_id);
+            assert_eq!(o.matched_text, s.matched_text, "matched_text differs for {} (input {text:?})", o.rule_id);
+            assert_eq!(o.span, s.span, "span differs for {} (input {text:?})", o.rule_id);
+        }
+    }
+
+    /// Two engines built from the default packs: one with the agent-sharded
+    /// index forced OFF (the oracle = global automaton), one forced ON.
+    fn sharded_oracle_engines() -> (PatternEngine, PatternEngine) {
+        let mut oracle = PatternEngine::new();
+        oracle.set_agent_sharded_index_enabled(false);
+        let mut sharded = PatternEngine::new();
+        sharded.set_agent_sharded_index_enabled(true);
+        assert!(!oracle.agent_sharded_index_enabled());
+        assert!(sharded.agent_sharded_index_enabled());
+        (oracle, sharded)
+    }
+
+    /// Split `s` into two halves at a UTF-8 char boundary at/after the midpoint.
+    fn split_at_char_boundary(s: &str) -> (&str, &str) {
+        let mut mid = s.len() / 2;
+        while mid < s.len() && !s.is_char_boundary(mid) {
+            mid += 1;
+        }
+        s.split_at(mid)
+    }
+
+    /// Deterministic xorshift64 PRNG — reproducible, no external dep.
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// Exhaustive single-segment oracle test: every real builtin anchor, every
+    /// agent. The sharded path must return a byte-identical detection stream.
+    #[test]
+    fn agent_sharded_index_matches_global_oracle() {
+        let agents = [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+            AgentType::Unknown,
+        ];
+
+        // Harvest the real anchor corpus from the compiled global index so the
+        // test exercises every shard boundary, not a hand-picked subset.
+        let probe = PatternEngine::new();
+        let anchors: Vec<String> = probe.index().anchor_list.clone();
+        assert!(!anchors.is_empty(), "builtin packs must contribute anchors");
+
+        // Corpus: each anchor alone; anchor padded with noise; doubled anchor;
+        // cross-agent anchor pairs concatenated (the collect-then-filter case
+        // the shard must reproduce exactly); plus negatives.
+        let mut corpus: Vec<String> = Vec::new();
+        for a in &anchors {
+            corpus.push(a.clone());
+            corpus.push(format!("noise prefix {a} noise suffix"));
+            corpus.push(format!("{a} {a}"));
+        }
+        for pair in anchors.chunks(2) {
+            if let [first, second] = pair {
+                corpus.push(format!("{first} middle {second}"));
+            }
+        }
+        corpus.push("nothing matches here, just plain text 0123456789".to_string());
+        corpus.push(String::new());
+
+        let (oracle_engine, sharded_engine) = sharded_oracle_engines();
+
+        for text in &corpus {
+            for &agent in &agents {
+                let mut oracle_ctx = DetectionContext::with_agent_type(agent);
+                let mut sharded_ctx = DetectionContext::with_agent_type(agent);
+                let oracle = oracle_engine.detect_with_context(text, &mut oracle_ctx);
+                let sharded = sharded_engine.detect_with_context(text, &mut sharded_ctx);
+                assert_detections_eq(&oracle, &sharded, text, agent);
+            }
+        }
+    }
+
+    /// Cross-segment (tail-buffer) + dedup parity: feed a multi-segment
+    /// sequence through persistent contexts and compare each call's output.
+    #[test]
+    fn agent_sharded_index_matches_global_oracle_cross_segment() {
+        let probe = PatternEngine::new();
+        let anchors: Vec<String> = probe.index().anchor_list.clone();
+        let (oracle_engine, sharded_engine) = sharded_oracle_engines();
+
+        for agent in [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+        ] {
+            let mut oracle_ctx = DetectionContext::with_agent_type(agent);
+            let mut sharded_ctx = DetectionContext::with_agent_type(agent);
+
+            // Split anchors across segment boundaries so the tail buffer must
+            // stitch them; then repeat the whole stream to exercise dedup.
+            let mut segments: Vec<String> = Vec::new();
+            for a in anchors.iter().take(48) {
+                if a.len() >= 2 {
+                    let (head, tail) = split_at_char_boundary(a);
+                    segments.push(format!("lead {head}"));
+                    segments.push(format!("{tail} trail"));
+                } else {
+                    segments.push(format!("x{a}x"));
+                }
+            }
+            let repeat = segments.clone();
+            segments.extend(repeat);
+
+            for seg in &segments {
+                let oracle = oracle_engine.detect_with_context(seg, &mut oracle_ctx);
+                let sharded = sharded_engine.detect_with_context(seg, &mut sharded_ctx);
+                assert_detections_eq(&oracle, &sharded, seg, agent);
+            }
+        }
+    }
+
+    /// Randomized property test: thousands of pseudo-random texts mixing real
+    /// anchors with printable-ASCII noise, every agent, single engine pair.
+    #[test]
+    fn agent_sharded_index_matches_global_oracle_randomized() {
+        let (oracle_engine, sharded_engine) = sharded_oracle_engines();
+        let anchors: Vec<String> = oracle_engine.index().anchor_list.clone();
+        let agents = [
+            AgentType::Codex,
+            AgentType::ClaudeCode,
+            AgentType::Gemini,
+            AgentType::Wezterm,
+            AgentType::Unknown,
+        ];
+
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..3000 {
+            let agent = agents[(xorshift(&mut state) as usize) % agents.len()];
+            let token_count = (xorshift(&mut state) as usize) % 6;
+            let mut text = String::new();
+            for _ in 0..token_count {
+                let a = &anchors[(xorshift(&mut state) as usize) % anchors.len()];
+                text.push_str(a);
+                let noise_len = (xorshift(&mut state) as usize) % 12;
+                for _ in 0..noise_len {
+                    // Printable ASCII 0x20..=0x7d.
+                    let c = b' '.wrapping_add((xorshift(&mut state) as u8) % 94);
+                    text.push(c as char);
+                }
+            }
+            let mut oracle_ctx = DetectionContext::with_agent_type(agent);
+            let mut sharded_ctx = DetectionContext::with_agent_type(agent);
+            let oracle = oracle_engine.detect_with_context(&text, &mut oracle_ctx);
+            let sharded = sharded_engine.detect_with_context(&text, &mut sharded_ctx);
+            assert_detections_eq(&oracle, &sharded, &text, agent);
+        }
+    }
 
     #[test]
     fn engine_can_be_created() {
