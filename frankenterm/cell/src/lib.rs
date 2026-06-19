@@ -200,10 +200,19 @@ impl AttributeRuns {
     /// Append `count` cells carrying `attrs`, coalescing with the trailing run
     /// when the attributes are identical (the common case for terminal text).
     pub fn push(&mut self, attrs: &CellAttributes, count: u32) {
+        self.push_len(attrs, count as usize);
+    }
+
+    /// Append `count` cells carrying `attrs`, coalescing with the trailing run.
+    ///
+    /// This is the warm/cold scrollback-facing entry point: callers that
+    /// already have a materialized line or screen dump use native `usize`
+    /// lengths, while the older `push(u32)` convenience wrapper remains for
+    /// compact call sites.
+    pub fn push_len(&mut self, attrs: &CellAttributes, count: usize) {
         if count == 0 {
             return;
         }
-        let count = count as usize;
         if let Some(last) = self.runs.last_mut() {
             if last.attrs == *attrs {
                 last.run_len = last.run_len.saturating_add(count);
@@ -216,6 +225,33 @@ impl AttributeRuns {
             run_len: count,
         });
         self.len = self.len.saturating_add(count);
+    }
+
+    /// Build succinct runs from an AoS/per-column attribute dump.
+    ///
+    /// This is the byte-equivalence doorway for warm/cold scrollback: the
+    /// source of truth remains the per-column [`CellAttributes`] sequence, and
+    /// the run store must answer every column with the same attributes.
+    pub fn from_per_cell(attrs: &[CellAttributes]) -> Self {
+        let mut runs = Self::with_run_capacity(attrs.len());
+        for attr in attrs {
+            runs.push_len(attr, 1);
+        }
+        runs
+    }
+
+    /// Build succinct runs from materialized screen cells.
+    pub fn from_cells(cells: &[Cell]) -> Self {
+        let mut runs = Self::with_run_capacity(cells.len());
+        for cell in cells {
+            runs.push_len(cell.attrs(), 1);
+        }
+        runs
+    }
+
+    /// Iterate the encoded runs as `(attrs, run_len)` pairs.
+    pub fn runs(&self) -> impl Iterator<Item = (&CellAttributes, usize)> {
+        self.runs.iter().map(|run| (&run.attrs, run.run_len))
     }
 
     /// Attributes at logical cell index `idx`, or `None` if out of range.
@@ -336,7 +372,51 @@ mod succinct_attrs_tests {
         for (i, want) in oracle.iter().enumerate() {
             assert_eq!(r.get(i), Some(want), "mismatch at cell {i}");
         }
-        assert_eq!(r.to_per_cell(), oracle, "round-trip must reproduce the oracle");
+        assert_eq!(
+            r.to_per_cell(),
+            oracle,
+            "round-trip must reproduce the oracle"
+        );
+    }
+
+    #[test]
+    fn screen_dump_constructors_match_per_column_oracle() {
+        let spec: [(CellAttributes, u32); 5] = [
+            (plain(), 4),
+            (reversed(), 2),
+            (plain(), 1),
+            (reversed(), 3),
+            (plain(), 5),
+        ];
+        let mut oracle = Vec::new();
+        for (attrs, count) in &spec {
+            for _ in 0..*count {
+                oracle.push(attrs.clone());
+            }
+        }
+        let cells = oracle
+            .iter()
+            .cloned()
+            .map(Cell::blank_with_attrs)
+            .collect::<Vec<_>>();
+
+        for runs in [
+            AttributeRuns::from_per_cell(&oracle),
+            AttributeRuns::from_cells(&cells),
+        ] {
+            assert_eq!(runs.len(), oracle.len());
+            assert_eq!(runs.to_per_cell(), oracle);
+            assert_eq!(runs.get(oracle.len()), None);
+            for (col, want) in oracle.iter().enumerate() {
+                assert_eq!(runs.get(col), Some(want), "mismatch at column {col}");
+            }
+        }
+
+        let run_lengths = AttributeRuns::from_per_cell(&oracle)
+            .runs()
+            .map(|(_, len)| len)
+            .collect::<Vec<_>>();
+        assert_eq!(run_lengths.as_slice(), [4, 2, 1, 3, 5]);
     }
 }
 
