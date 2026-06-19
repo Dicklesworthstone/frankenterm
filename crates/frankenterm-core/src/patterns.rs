@@ -368,6 +368,21 @@ impl Detection {
             }),
         )
     }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn dedup_fingerprint(&self) -> u128 {
+        dedup_fingerprint_from_parts(
+            &self.rule_id,
+            self.extracted.as_object().map_or_else(Vec::new, |obj| {
+                obj.iter()
+                    .map(|(name, value)| DedupFingerprintPart {
+                        name: name.as_str(),
+                        value: DedupFingerprintValue::Json(value),
+                    })
+                    .collect()
+            }),
+        )
+    }
 }
 
 /// Render one `name:value` part of a dedup key for a string value.
@@ -387,6 +402,122 @@ fn dedup_key_part(name: &str, value: &str) -> String {
 fn build_dedup_key(rule_id: &str, mut extracted_parts: Vec<String>) -> String {
     extracted_parts.sort();
     format!("{rule_id}:{}", extracted_parts.join("|"))
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+#[derive(Clone, Copy)]
+enum DedupFingerprintValue<'a> {
+    String(&'a str),
+    Json(&'a serde_json::Value),
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+#[derive(Clone, Copy)]
+struct DedupFingerprintPart<'a> {
+    name: &'a str,
+    value: DedupFingerprintValue<'a>,
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+const DEDUP_FINGERPRINT_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+const DEDUP_FINGERPRINT_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_update(mut hash: u128, bytes: &[u8]) -> u128 {
+    for &byte in bytes {
+        hash ^= u128::from(byte);
+        hash = hash.wrapping_mul(DEDUP_FINGERPRINT_PRIME);
+    }
+    hash
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_separator(hash: u128, separator: u8) -> u128 {
+    dedup_fingerprint_update(hash, &[separator])
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_from_key(key: &str) -> u128 {
+    dedup_fingerprint_update(
+        dedup_fingerprint_separator(DEDUP_FINGERPRINT_OFFSET, 0x01),
+        key.as_bytes(),
+    )
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_from_parts(rule_id: &str, mut parts: Vec<DedupFingerprintPart<'_>>) -> u128 {
+    parts.sort_by(|left, right| {
+        left.name
+            .cmp(right.name)
+            .then_with(|| dedup_fingerprint_value_cmp(left.value, right.value))
+    });
+
+    let mut hash = dedup_fingerprint_separator(DEDUP_FINGERPRINT_OFFSET, 0x02);
+    hash = dedup_fingerprint_update(hash, rule_id.as_bytes());
+    hash = dedup_fingerprint_separator(hash, 0xff);
+    for part in parts {
+        hash = dedup_fingerprint_update(hash, part.name.as_bytes());
+        hash = dedup_fingerprint_separator(hash, b':');
+        hash = dedup_fingerprint_update_value(hash, part.value);
+        hash = dedup_fingerprint_separator(hash, b'|');
+    }
+    hash
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_value_cmp(
+    left: DedupFingerprintValue<'_>,
+    right: DedupFingerprintValue<'_>,
+) -> std::cmp::Ordering {
+    if let (Some(left), Some(right)) = (
+        dedup_fingerprint_string_value(left),
+        dedup_fingerprint_string_value(right),
+    ) {
+        left.cmp(right)
+    } else {
+        dedup_fingerprint_json_sort_key(left).cmp(&dedup_fingerprint_json_sort_key(right))
+    }
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_string_value(value: DedupFingerprintValue<'_>) -> Option<&str> {
+    match value {
+        DedupFingerprintValue::String(value) => Some(value),
+        DedupFingerprintValue::Json(serde_json::Value::String(value)) => Some(value.as_str()),
+        DedupFingerprintValue::Json(_) => None,
+    }
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_json_sort_key(value: DedupFingerprintValue<'_>) -> String {
+    match value {
+        DedupFingerprintValue::String(value) => value.to_string(),
+        DedupFingerprintValue::Json(serde_json::Value::String(value)) => value.to_string(),
+        DedupFingerprintValue::Json(value) => value.to_string(),
+    }
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+fn dedup_fingerprint_update_value(hash: u128, value: DedupFingerprintValue<'_>) -> u128 {
+    match value {
+        DedupFingerprintValue::String(value) => {
+            let mut hash = dedup_fingerprint_separator(hash, b's');
+            hash = dedup_fingerprint_update(hash, value.as_bytes());
+            hash
+        }
+        DedupFingerprintValue::Json(serde_json::Value::String(value)) => {
+            let mut hash = dedup_fingerprint_separator(hash, b's');
+            hash = dedup_fingerprint_update(hash, value.as_bytes());
+            hash
+        }
+        DedupFingerprintValue::Json(value) => {
+            let mut hash = dedup_fingerprint_separator(hash, b'j');
+            hash = dedup_fingerprint_update(hash, value.to_string().as_bytes());
+            hash
+        }
+    }
 }
 
 #[cfg(test)]
@@ -458,6 +589,19 @@ pub struct DetectionContext {
     seen_order: VecDeque<(String, u64)>,
     /// Monotonic recency counter stamping `seen_order` tokens.
     seen_generation: u64,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    /// Fingerprint-indexed dedup table for the default-off Q6 path.
+    seen_fingerprints: HashMap<u128, usize>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    /// Fixed-node LRU list storage. Live nodes are linked by index; free nodes
+    /// are reused so refresh and eviction stay O(1) without retain scans.
+    fingerprint_nodes: Vec<FingerprintSeenNode>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fingerprint_free: Vec<usize>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fingerprint_head: Option<usize>,
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fingerprint_tail: Option<usize>,
     /// Time-to-live for deduplication (default: 5 minutes)
     pub ttl: Duration,
     /// Tail buffer from previous detection (for cross-segment matching)
@@ -470,6 +614,16 @@ pub struct DetectionContext {
 struct SeenEntry {
     last_seen: Instant,
     generation: u64,
+}
+
+#[cfg(feature = "patterns-fingerprint-dedup")]
+#[derive(Debug, Clone)]
+struct FingerprintSeenNode {
+    fingerprint: u128,
+    last_seen: Instant,
+    prev: Option<usize>,
+    next: Option<usize>,
+    occupied: bool,
 }
 
 impl Default for DetectionContext {
@@ -495,6 +649,16 @@ impl DetectionContext {
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
             seen_generation: 0,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            seen_fingerprints: HashMap::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_nodes: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_free: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_head: None,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_tail: None,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
         }
@@ -509,6 +673,16 @@ impl DetectionContext {
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
             seen_generation: 0,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            seen_fingerprints: HashMap::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_nodes: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_free: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_head: None,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_tail: None,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
         }
@@ -523,6 +697,16 @@ impl DetectionContext {
             seen_keys: HashMap::new(),
             seen_order: VecDeque::new(),
             seen_generation: 0,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            seen_fingerprints: HashMap::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_nodes: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_free: Vec::new(),
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_head: None,
+            #[cfg(feature = "patterns-fingerprint-dedup")]
+            fingerprint_tail: None,
             ttl: Self::DEFAULT_TTL,
             tail_buffer: String::new(),
         }
@@ -535,43 +719,55 @@ impl DetectionContext {
 
     /// Mark a detection as seen, returning true if it was new (or expired)
     pub fn mark_seen(&mut self, detection: &Detection) -> bool {
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.mark_seen_fingerprint(detection.dedup_fingerprint());
+        }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
         self.mark_seen_key(detection.dedup_key())
     }
 
     fn mark_seen_key(&mut self, key: String) -> bool {
-        let now = Instant::now();
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.mark_seen_fingerprint(dedup_fingerprint_from_key(&key));
+        }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+        {
+            let now = Instant::now();
 
-        // Check if seen and valid (not expired)
-        if let Some(entry) = self.seen_keys.get(&key) {
-            if now.duration_since(entry.last_seen) < self.ttl {
-                return false;
+            // Check if seen and valid (not expired)
+            if let Some(entry) = self.seen_keys.get(&key) {
+                if now.duration_since(entry.last_seen) < self.ttl {
+                    return false;
+                }
             }
+
+            // New or expired key: (re)insert with a fresh recency generation. The
+            // key's prior `seen_order` token (if any) becomes stale and is dropped
+            // lazily on eviction/compaction — no O(n) string position-scan per mark
+            // (ft-zo4hw). The HASH map still holds at most one entry per key, so
+            // re-marking an expired key never inflates `seen_count`.
+            let is_new_key = !self.seen_keys.contains_key(&key);
+
+            // Enforce capacity only when adding a genuinely new key.
+            if is_new_key && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
+                self.evict_oldest_seen();
+            }
+
+            let generation = self.next_seen_generation();
+            self.seen_keys.insert(
+                key.clone(),
+                SeenEntry {
+                    last_seen: now,
+                    generation,
+                },
+            );
+            // Push to back of order for LRU-style eviction.
+            self.seen_order.push_back((key, generation));
+            self.compact_seen_order_if_needed();
+            true
         }
-
-        // New or expired key: (re)insert with a fresh recency generation. The
-        // key's prior `seen_order` token (if any) becomes stale and is dropped
-        // lazily on eviction/compaction — no O(n) string position-scan per mark
-        // (ft-zo4hw). The HASH map still holds at most one entry per key, so
-        // re-marking an expired key never inflates `seen_count`.
-        let is_new_key = !self.seen_keys.contains_key(&key);
-
-        // Enforce capacity only when adding a genuinely new key.
-        if is_new_key && self.seen_keys.len() >= Self::MAX_SEEN_KEYS {
-            self.evict_oldest_seen();
-        }
-
-        let generation = self.next_seen_generation();
-        self.seen_keys.insert(
-            key.clone(),
-            SeenEntry {
-                last_seen: now,
-                generation,
-            },
-        );
-        // Push to back of order for LRU-style eviction.
-        self.seen_order.push_back((key, generation));
-        self.compact_seen_order_if_needed();
-        true
     }
 
     /// Next monotonic recency generation (wraps defensively; unreachable in
@@ -621,16 +817,152 @@ impl DetectionContext {
     /// Check if a detection has been seen before and is unexpired
     #[must_use]
     pub fn is_seen(&self, detection: &Detection) -> bool {
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.is_seen_fingerprint(detection.dedup_fingerprint());
+        }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
         self.is_seen_key(&detection.dedup_key())
     }
 
     #[must_use]
     fn is_seen_key(&self, key: &str) -> bool {
-        if let Some(entry) = self.seen_keys.get(key) {
-            Instant::now().duration_since(entry.last_seen) < self.ttl
-        } else {
-            false
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.is_seen_fingerprint(dedup_fingerprint_from_key(key));
         }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+        {
+            if let Some(entry) = self.seen_keys.get(key) {
+                Instant::now().duration_since(entry.last_seen) < self.ttl
+            } else {
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn mark_seen_fingerprint(&mut self, fingerprint: u128) -> bool {
+        let now = Instant::now();
+
+        if let Some(slot) = self.seen_fingerprints.get(&fingerprint).copied() {
+            let Some(node) = self.fingerprint_nodes.get(slot) else {
+                self.seen_fingerprints.remove(&fingerprint);
+                return self.insert_new_fingerprint(fingerprint, now);
+            };
+            if !node.occupied {
+                self.seen_fingerprints.remove(&fingerprint);
+                return self.insert_new_fingerprint(fingerprint, now);
+            }
+            if now.duration_since(node.last_seen) < self.ttl {
+                return false;
+            }
+            self.fingerprint_nodes[slot].last_seen = now;
+            self.move_fingerprint_to_tail(slot);
+            return true;
+        }
+
+        self.insert_new_fingerprint(fingerprint, now)
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn insert_new_fingerprint(&mut self, fingerprint: u128, now: Instant) -> bool {
+        if self.seen_fingerprints.len() >= Self::MAX_SEEN_KEYS {
+            self.evict_oldest_fingerprint();
+        }
+
+        let slot = if let Some(slot) = self.fingerprint_free.pop() {
+            self.fingerprint_nodes[slot] = FingerprintSeenNode {
+                fingerprint,
+                last_seen: now,
+                prev: None,
+                next: None,
+                occupied: true,
+            };
+            slot
+        } else {
+            let slot = self.fingerprint_nodes.len();
+            self.fingerprint_nodes.push(FingerprintSeenNode {
+                fingerprint,
+                last_seen: now,
+                prev: None,
+                next: None,
+                occupied: true,
+            });
+            slot
+        };
+
+        self.seen_fingerprints.insert(fingerprint, slot);
+        self.push_fingerprint_tail(slot);
+        true
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn is_seen_fingerprint(&self, fingerprint: u128) -> bool {
+        let Some(slot) = self.seen_fingerprints.get(&fingerprint).copied() else {
+            return false;
+        };
+        let Some(node) = self.fingerprint_nodes.get(slot) else {
+            return false;
+        };
+        node.occupied && Instant::now().duration_since(node.last_seen) < self.ttl
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn evict_oldest_fingerprint(&mut self) {
+        let Some(slot) = self.fingerprint_head else {
+            return;
+        };
+        record_detection_dedup_steps(1);
+        let fingerprint = self.fingerprint_nodes[slot].fingerprint;
+        self.unlink_fingerprint(slot);
+        self.seen_fingerprints.remove(&fingerprint);
+        self.fingerprint_nodes[slot].occupied = false;
+        self.fingerprint_free.push(slot);
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn move_fingerprint_to_tail(&mut self, slot: usize) {
+        if self.fingerprint_tail == Some(slot) {
+            return;
+        }
+        self.unlink_fingerprint(slot);
+        self.push_fingerprint_tail(slot);
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn unlink_fingerprint(&mut self, slot: usize) {
+        let prev = self.fingerprint_nodes[slot].prev;
+        let next = self.fingerprint_nodes[slot].next;
+
+        if let Some(prev) = prev {
+            self.fingerprint_nodes[prev].next = next;
+        } else {
+            self.fingerprint_head = next;
+        }
+
+        if let Some(next) = next {
+            self.fingerprint_nodes[next].prev = prev;
+        } else {
+            self.fingerprint_tail = prev;
+        }
+
+        self.fingerprint_nodes[slot].prev = None;
+        self.fingerprint_nodes[slot].next = None;
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn push_fingerprint_tail(&mut self, slot: usize) {
+        self.fingerprint_nodes[slot].prev = self.fingerprint_tail;
+        self.fingerprint_nodes[slot].next = None;
+
+        if let Some(tail) = self.fingerprint_tail {
+            self.fingerprint_nodes[tail].next = Some(slot);
+        } else {
+            self.fingerprint_head = Some(slot);
+        }
+
+        self.fingerprint_tail = Some(slot);
     }
 
     /// Clear the set of seen detections and the tail buffer.
@@ -641,12 +973,25 @@ impl DetectionContext {
     pub fn clear_seen(&mut self) {
         self.seen_keys.clear();
         self.seen_order.clear();
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            self.seen_fingerprints.clear();
+            self.fingerprint_nodes.clear();
+            self.fingerprint_free.clear();
+            self.fingerprint_head = None;
+            self.fingerprint_tail = None;
+        }
         self.tail_buffer.clear();
     }
 
     /// Get the number of seen detections
     #[must_use]
     pub fn seen_count(&self) -> usize {
+        #[cfg(feature = "patterns-fingerprint-dedup")]
+        {
+            return self.seen_fingerprints.len();
+        }
+        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
         self.seen_keys.len()
     }
 }
@@ -3748,7 +4093,42 @@ impl PatternEngine {
                         continue;
                     }
 
-                    #[cfg(feature = "patterns-lazy-captures")]
+                    #[cfg(all(
+                        feature = "patterns-lazy-captures",
+                        feature = "patterns-fingerprint-dedup"
+                    ))]
+                    {
+                        let dedup_fingerprint =
+                            Self::dedup_fingerprint_from_captures(&rule.id, compiled, &captures);
+                        if context.is_seen_fingerprint(dedup_fingerprint) {
+                            continue;
+                        }
+
+                        let extracted = Self::extract_captures(compiled, &captures);
+                        let matched_text = captures.get(0).map_or_else(
+                            || fallback_anchor.to_string(),
+                            |m| m.as_str().to_string(),
+                        );
+
+                        record_detect_with_context_materialization();
+                        context.mark_seen_fingerprint(dedup_fingerprint);
+                        result.push(Detection {
+                            rule_id: rule.id.clone(),
+                            agent_type: rule.agent_type,
+                            event_type: rule.event_type.clone(),
+                            severity: rule.severity,
+                            confidence: 0.95,
+                            extracted: serde_json::Value::Object(extracted),
+                            matched_text,
+                            span,
+                        });
+                        emitted_matches += 1;
+                    }
+
+                    #[cfg(all(
+                        feature = "patterns-lazy-captures",
+                        not(feature = "patterns-fingerprint-dedup")
+                    ))]
                     {
                         let dedup_key =
                             Self::dedup_key_from_captures(&rule.id, compiled, &captures);
@@ -3796,14 +4176,28 @@ impl PatternEngine {
                         };
 
                         record_detect_with_context_materialization();
-                        let dedup_key = detection.dedup_key();
-                        if context.is_seen_key(&dedup_key) {
-                            continue;
-                        }
+                        #[cfg(feature = "patterns-fingerprint-dedup")]
+                        {
+                            let dedup_fingerprint = detection.dedup_fingerprint();
+                            if context.is_seen_fingerprint(dedup_fingerprint) {
+                                continue;
+                            }
 
-                        context.mark_seen_key(dedup_key);
-                        result.push(detection);
-                        emitted_matches += 1;
+                            context.mark_seen_fingerprint(dedup_fingerprint);
+                            result.push(detection);
+                            emitted_matches += 1;
+                        }
+                        #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+                        {
+                            let dedup_key = detection.dedup_key();
+                            if context.is_seen_key(&dedup_key) {
+                                continue;
+                            }
+
+                            context.mark_seen_key(dedup_key);
+                            result.push(detection);
+                            emitted_matches += 1;
+                        }
                     }
                 }
             } else {
@@ -3811,24 +4205,48 @@ impl PatternEngine {
                     continue;
                 }
 
-                let dedup_key = build_dedup_key(&rule.id, Vec::new());
-                if context.is_seen_key(&dedup_key) {
-                    continue;
-                }
+                #[cfg(feature = "patterns-fingerprint-dedup")]
+                {
+                    let dedup_fingerprint = dedup_fingerprint_from_parts(&rule.id, Vec::new());
+                    if context.is_seen_fingerprint(dedup_fingerprint) {
+                        continue;
+                    }
 
-                record_detect_with_context_materialization();
-                context.mark_seen_key(dedup_key);
-                result.push(Detection {
-                    rule_id: rule.id.clone(),
-                    agent_type: rule.agent_type,
-                    event_type: rule.event_type.clone(),
-                    severity: rule.severity,
-                    confidence: 0.6,
-                    extracted: serde_json::Value::Object(serde_json::Map::new()),
-                    matched_text: fallback_anchor.to_string(),
-                    span: fallback_span,
-                });
-                emitted_matches += 1;
+                    record_detect_with_context_materialization();
+                    context.mark_seen_fingerprint(dedup_fingerprint);
+                    result.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: fallback_anchor.to_string(),
+                        span: fallback_span,
+                    });
+                    emitted_matches += 1;
+                }
+                #[cfg(not(feature = "patterns-fingerprint-dedup"))]
+                {
+                    let dedup_key = build_dedup_key(&rule.id, Vec::new());
+                    if context.is_seen_key(&dedup_key) {
+                        continue;
+                    }
+
+                    record_detect_with_context_materialization();
+                    context.mark_seen_key(dedup_key);
+                    result.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.6,
+                        extracted: serde_json::Value::Object(serde_json::Map::new()),
+                        matched_text: fallback_anchor.to_string(),
+                        span: fallback_span,
+                    });
+                    emitted_matches += 1;
+                }
             }
         }
 
@@ -4190,6 +4608,24 @@ impl PatternEngine {
             }
         }
         build_dedup_key(rule_id, parts)
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    fn dedup_fingerprint_from_captures(
+        rule_id: &str,
+        compiled: &CompiledRule,
+        captures: &fancy_regex::Captures<'_>,
+    ) -> u128 {
+        let mut parts = Vec::with_capacity(compiled.capture_names.len());
+        for name in &compiled.capture_names {
+            if let Some(value) = captures.name(name) {
+                parts.push(DedupFingerprintPart {
+                    name: name.as_str(),
+                    value: DedupFingerprintValue::String(value.as_str()),
+                });
+            }
+        }
+        dedup_fingerprint_from_parts(rule_id, parts)
     }
 
     fn trace_gates_skeleton() -> Vec<TraceGate> {
@@ -9596,6 +10032,80 @@ rules:
             );
             assert_eq!(traces.len(), traced.len());
         }
+    }
+
+    #[cfg(feature = "patterns-fingerprint-dedup")]
+    #[test]
+    fn fingerprint_dedup_matches_string_key_oracle_and_uses_o1_lru() {
+        let rule_id = "codex.fingerprint_dedup";
+        let anchor = "FP_DEDUP";
+        let regex = r"FP_DEDUP code=(?P<code>\d+) name=(?P<name>[A-Za-z_]+)";
+        let text = concat!(
+            "prefix FP_DEDUP code=7 name=alpha\n",
+            "FP_DEDUP code=7 name=alpha\n",
+            "FP_DEDUP code=8 name=beta suffix"
+        );
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        let direct = engine.detect(text);
+        assert_eq!(direct.len(), 3);
+        let mut seen_keys = HashSet::new();
+        let string_key_oracle = direct
+            .iter()
+            .filter(|detection| seen_keys.insert(detection.dedup_key()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut context = DetectionContext::new();
+        let fingerprint_detections = engine.detect_with_context(text, &mut context);
+        assert_eq!(
+            detection_fingerprints(&fingerprint_detections),
+            detection_fingerprints(&string_key_oracle),
+            "fingerprint dedup must emit the same first-seen detections as the string-key oracle"
+        );
+        assert_eq!(context.seen_count(), string_key_oracle.len());
+        assert_eq!(context.seen_keys.len(), 0);
+
+        let repeat = engine.detect_with_context(text, &mut context);
+        assert!(
+            repeat.is_empty(),
+            "fingerprint path must drop already-seen detections"
+        );
+
+        let mut churn = DetectionContext::new();
+        reset_detection_dedup_maintenance_steps();
+        let churn_count = DetectionContext::MAX_SEEN_KEYS * 8;
+        for i in 0..churn_count {
+            assert!(churn.mark_seen_fingerprint(0xfeed_0000_u128 + i as u128));
+        }
+        assert_eq!(churn.seen_count(), DetectionContext::MAX_SEEN_KEYS);
+        assert_eq!(
+            churn.fingerprint_nodes.len(),
+            DetectionContext::MAX_SEEN_KEYS,
+            "fingerprint LRU must reuse slots instead of growing past capacity"
+        );
+        assert!(churn.fingerprint_free.is_empty());
+        assert!(
+            detection_dedup_maintenance_steps() <= churn_count as u64,
+            "fingerprint eviction must stay one O(1) step per overflow insert"
+        );
+
+        let mut expired = DetectionContext::new();
+        expired.set_ttl(Duration::ZERO);
+        for _ in 0..(DetectionContext::MAX_SEEN_KEYS * 4) {
+            assert!(expired.mark_seen_fingerprint(0xfeed_dead_beef));
+        }
+        assert_eq!(expired.seen_count(), 1);
+        assert_eq!(
+            expired
+                .fingerprint_nodes
+                .iter()
+                .filter(|node| node.occupied)
+                .count(),
+            1,
+            "refreshing one expired fingerprint must not leak duplicate live nodes"
+        );
+        assert_eq!(expired.fingerprint_nodes.len(), 1);
     }
 
     #[cfg(feature = "patterns-lazy-captures")]
