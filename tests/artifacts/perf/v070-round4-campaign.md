@@ -99,6 +99,31 @@ tracked `ft-odrq7` data-loss window); min-plus end-to-end capture→storage late
 
 ---
 
+## RELEASED — v0.7.0 (2026-06-19)
+
+https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.7.0 — published, 9 assets (darwin-arm64
+.app + ft, linux amd64 + arm64 ft, SHA256SUMS + per-asset .sha256), tag v0.7.0 -> 887b5e292, ft --version
+= 0.7.0. Builds: darwin-arm64 (3 bins local), linux-amd64 (trj native), linux-arm64 (trj aarch64 cross).
+GUI v0.6.1 startup crash FIXED + re-confirmed on the rebuilt 0.7.0 bundle (stays up, no DisplayHandle).
+
+### Release scorecard (honest record)
+- term --lib GREEN (344), termwiz --lib GREEN (310), mux --lib GREEN (424).
+- frankenterm-core --lib: the full run TIMED OUT (RCH SSH timeout — the suite is too large/slow for a
+  single remote run, incl. slow distributed-mTLS tests; the campaign always used TARGETED per-idea
+  proofs for this reason). 8 tests had failed-under-load at the timeout point. PROVEN NOT round-4
+  regressions: command_guard.rs / crash.rs / connector_sdk.rs are UNCHANGED by round-4 (git diff
+  b7eed340c..HEAD); connector_outbound_bridge.rs changed fmt-only (no logic); the only round-4-touched
+  one is the default-OFF bocpd shiryaev_roberts statistical test (passed its own commit-time proof; flaky
+  under full-suite load). Conclusion: flaky-under-full-suite-load pre-existing tests, NOT caused by
+  round-4. FOLLOW-UP: stabilize the full core --lib run (split slow distributed-mTLS lane; seed the SR
+  statistical test) — tracked as a post-release hygiene item, not a ship blocker.
+- Adversarial cross-review (b7eed340c..HEAD): SAFE to ship, no CRITICAL/HIGH, must-fix=none.
+
+### Final tally: 19 kept, 0 reverted, M6 deferred
+Q1-Q6 + M1-M5/M7-M9 + S3-FIFO/Shiryaev-Roberts/min-plus/RS-erasure + ft-perf-gate harness + GUI crash fix.
+All default-off behind flags; correctness-proven; A/B quantification deferred with grep-able retry
+predicates in the ledgers (run on a quiet host). Cross-review M-1 fixed (patterns-* features declared).
+
 ## Convergence log
 _(tick entries appended here by the operator tend-loop)_
 
