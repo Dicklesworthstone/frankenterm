@@ -203,6 +203,8 @@ frankenterm-core-fleet = { path = "../frankenterm-core-fleet" }
 # fixture (test_fixtures/lab_runtime.rs). Dev-only — production
 # code uses the fixture's function form directly.
 frankenterm-core-test-macros = { path = "../frankenterm-core-test-macros" }
+# Round-5 S3-FIFO bench only; production cache defaults stay unchanged.
+lfucache = { workspace = true }
 
 # Benchmarks
 [[bench]]
@@ -610,6 +612,18 @@ name = "lfu_cache_bench"
 harness = false
 
 [[bench]]
+name = "scrollback_prefix_index"
+harness = false
+
+[[bench]]
+name = "memory_pid_dampening"
+harness = false
+
+[[bench]]
+name = "lfucache_s3fifo"
+harness = false
+
+[[bench]]
 name = "interval_tree_bench"
 harness = false
 
@@ -812,6 +826,11 @@ required-features = ["recorder-lexical"]
 name = "tantivy_search_integration"
 path = "tests/tantivy_search_integration.rs"
 required-features = ["recorder-lexical"]
+
+[[test]]
+name = "integration_distributed_tls"
+path = "tests/integration_distributed_tls.rs"
+required-features = ["distributed"]
 
 [features]
 # Everything is on by default — ft is a standalone terminal platform with no feature gates.
