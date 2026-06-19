@@ -2104,10 +2104,271 @@ impl AnchorMatchBucket {
 const BLOOM_FALSE_POSITIVE_RATE: f64 =
     crate::tuning_config::PatternsTuning::DEFAULT_BLOOM_FALSE_POSITIVE_RATE;
 
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_EMPTY_DISPLACEMENT: usize = usize::MAX;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_BUILD_SEED_ATTEMPTS: usize = 256;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_DISPLACEMENT_FACTOR: usize = 128;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+const MPHF_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+#[derive(Debug, Clone)]
+struct MphfAnchorDispatch {
+    base: MphfAnchorBase,
+    /// Mutable delta route for future hot-reloaded anchors. The round-4 M5
+    /// experiment keeps the shipped pack immutable in `base`; hot reload can
+    /// append here without rebuilding the MPHF.
+    overflow: HashMap<String, Vec<usize>>,
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+#[derive(Debug, Clone)]
+struct MphfAnchorBase {
+    seed: u64,
+    bucket_displacements: Vec<usize>,
+    slots: Vec<Option<MphfAnchorSlot>>,
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+#[derive(Debug, Clone)]
+struct MphfAnchorSlot {
+    anchor: String,
+    rule_indices: Vec<usize>,
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+impl MphfAnchorDispatch {
+    fn build(anchor_list: &[String], anchor_rule_buckets: &[Vec<usize>]) -> Result<Self> {
+        if anchor_list.len() != anchor_rule_buckets.len() {
+            return Err(PatternError::InvalidRule(format!(
+                "anchor dispatch build saw {} anchors but {} route buckets",
+                anchor_list.len(),
+                anchor_rule_buckets.len()
+            ))
+            .into());
+        }
+
+        let overflow = HashMap::new();
+        if anchor_list.is_empty() {
+            return Ok(Self {
+                base: MphfAnchorBase::empty(),
+                overflow,
+            });
+        }
+
+        for attempt in 0..MPHF_BUILD_SEED_ATTEMPTS {
+            let seed = mphf_seed_for_attempt(attempt);
+            if let Some(base) = MphfAnchorBase::try_build(seed, anchor_list, anchor_rule_buckets) {
+                let dispatch = Self { base, overflow };
+                dispatch.validate_routes(anchor_list, anchor_rule_buckets)?;
+                return Ok(dispatch);
+            }
+        }
+
+        Err(PatternError::InvalidRule(format!(
+            "failed to build collision-free MPHF anchor dispatch for {} anchors after {} seeds",
+            anchor_list.len(),
+            MPHF_BUILD_SEED_ATTEMPTS
+        ))
+        .into())
+    }
+
+    fn rule_indices(&self, anchor: &str) -> Option<&[usize]> {
+        self.base
+            .rule_indices(anchor)
+            .or_else(|| self.overflow.get(anchor).map(Vec::as_slice))
+    }
+
+    fn validate_routes(
+        &self,
+        anchor_list: &[String],
+        anchor_rule_buckets: &[Vec<usize>],
+    ) -> Result<()> {
+        let mut used_slots = HashSet::with_capacity(anchor_list.len());
+        for (anchor_idx, anchor) in anchor_list.iter().enumerate() {
+            let Some(slot_idx) = self.base.slot_index(anchor) else {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch missed anchor {anchor_idx}: {anchor:?}"
+                ))
+                .into());
+            };
+            if !used_slots.insert(slot_idx) {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch collision at slot {slot_idx} for anchor {anchor:?}"
+                ))
+                .into());
+            }
+
+            let Some(rule_indices) = self.rule_indices(anchor) else {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch has no route for anchor {anchor_idx}: {anchor:?}"
+                ))
+                .into());
+            };
+            if rule_indices != anchor_rule_buckets[anchor_idx].as_slice() {
+                return Err(PatternError::InvalidRule(format!(
+                    "MPHF anchor dispatch route mismatch for anchor {anchor_idx}: {anchor:?}"
+                ))
+                .into());
+            }
+        }
+
+        if used_slots.len() != anchor_list.len() {
+            return Err(PatternError::InvalidRule(format!(
+                "MPHF anchor dispatch mapped {} unique slots for {} anchors",
+                used_slots.len(),
+                anchor_list.len()
+            ))
+            .into());
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+impl MphfAnchorBase {
+    fn empty() -> Self {
+        Self {
+            seed: 0,
+            bucket_displacements: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+
+    fn try_build(
+        seed: u64,
+        anchor_list: &[String],
+        anchor_rule_buckets: &[Vec<usize>],
+    ) -> Option<Self> {
+        let slot_count = anchor_list.len();
+        let mut buckets = vec![Vec::<usize>::new(); slot_count];
+        for (anchor_idx, anchor) in anchor_list.iter().enumerate() {
+            buckets[mphf_bucket_index(anchor, seed, slot_count)].push(anchor_idx);
+        }
+
+        let mut bucket_order: Vec<usize> = (0..slot_count).collect();
+        bucket_order.sort_by(|left, right| {
+            buckets[*right]
+                .len()
+                .cmp(&buckets[*left].len())
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut bucket_displacements = vec![MPHF_EMPTY_DISPLACEMENT; slot_count];
+        let mut slots = vec![None; slot_count];
+        let displacement_limit = slot_count
+            .saturating_mul(MPHF_DISPLACEMENT_FACTOR)
+            .max(1024);
+
+        for bucket_idx in bucket_order {
+            let bucket = &buckets[bucket_idx];
+            if bucket.is_empty() {
+                continue;
+            }
+
+            let mut chosen = None;
+            'displacement: for displacement in 0..displacement_limit {
+                let mut proposed_slots = Vec::with_capacity(bucket.len());
+                for &anchor_idx in bucket {
+                    let slot_idx =
+                        mphf_slot_index(&anchor_list[anchor_idx], seed, displacement, slot_count);
+                    if slots[slot_idx].is_some() || proposed_slots.contains(&slot_idx) {
+                        continue 'displacement;
+                    }
+                    proposed_slots.push(slot_idx);
+                }
+                chosen = Some((displacement, proposed_slots));
+                break;
+            }
+
+            let (displacement, proposed_slots) = chosen?;
+            bucket_displacements[bucket_idx] = displacement;
+            for (&anchor_idx, slot_idx) in bucket.iter().zip(proposed_slots) {
+                slots[slot_idx] = Some(MphfAnchorSlot {
+                    anchor: anchor_list[anchor_idx].clone(),
+                    rule_indices: anchor_rule_buckets[anchor_idx].clone(),
+                });
+            }
+        }
+
+        if slots.iter().any(Option::is_none) {
+            return None;
+        }
+
+        Some(Self {
+            seed,
+            bucket_displacements,
+            slots,
+        })
+    }
+
+    fn rule_indices(&self, anchor: &str) -> Option<&[usize]> {
+        let slot_idx = self.slot_index(anchor)?;
+        self.slots
+            .get(slot_idx)
+            .and_then(Option::as_ref)
+            .map(|slot| slot.rule_indices.as_slice())
+    }
+
+    fn slot_index(&self, anchor: &str) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let bucket_idx = mphf_bucket_index(anchor, self.seed, self.bucket_displacements.len());
+        let displacement = self.bucket_displacements[bucket_idx];
+        if displacement == MPHF_EMPTY_DISPLACEMENT {
+            return None;
+        }
+        let slot_idx = mphf_slot_index(anchor, self.seed, displacement, self.slots.len());
+        let slot = self.slots.get(slot_idx).and_then(Option::as_ref)?;
+        (slot.anchor == anchor).then_some(slot_idx)
+    }
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_seed_for_attempt(attempt: usize) -> u64 {
+    0x9e37_79b9_7f4a_7c15_u64.wrapping_mul((attempt as u64).wrapping_add(1))
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_bucket_index(anchor: &str, seed: u64, bucket_count: usize) -> usize {
+    (mphf_hash(anchor, seed ^ 0xa24b_aed4_963e_e407) as usize) % bucket_count
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_slot_index(anchor: &str, seed: u64, displacement: usize, slot_count: usize) -> usize {
+    let slot_seed = seed
+        ^ 0x9fb2_1c65_1e98_df25
+        ^ (displacement as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (mphf_hash(anchor, slot_seed) as usize) % slot_count
+}
+
+#[cfg(feature = "patterns-mphf-dispatch")]
+fn mphf_hash(anchor: &str, seed: u64) -> u64 {
+    let mut hash = MPHF_HASH_OFFSET ^ seed.rotate_left(17);
+    for &byte in anchor.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(MPHF_HASH_PRIME);
+    }
+    hash ^= (anchor.len() as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    hash
+}
+
 struct EngineIndex {
     compiled_rules: Vec<CompiledRule>,
     anchor_list: Vec<String>,
     anchor_rule_buckets: Vec<Vec<usize>>,
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    anchor_dispatch: MphfAnchorDispatch,
     anchor_matcher: Option<AhoCorasick>,
     #[cfg(feature = "teddy-prefilter")]
     teddy_prefilter: Option<packed::Searcher>,
@@ -2132,8 +2393,10 @@ impl std::fmt::Debug for EngineIndex {
         debug
             .field("quick_bytes", &self.quick_bytes.len())
             .field("bloom", &self.bloom.is_some())
-            .field("anchor_lengths", &self.anchor_lengths)
-            .finish()
+            .field("anchor_lengths", &self.anchor_lengths);
+        #[cfg(feature = "patterns-mphf-dispatch")]
+        debug.field("anchor_dispatch", &self.anchor_dispatch.base.slots.len());
+        debug.finish()
     }
 }
 
@@ -2261,10 +2524,15 @@ where
         .collect();
     anchor_lengths.sort_unstable();
 
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    let anchor_dispatch = MphfAnchorDispatch::build(&anchor_list, &anchor_rule_buckets)?;
+
     Ok(EngineIndex {
         compiled_rules,
         anchor_list,
         anchor_rule_buckets,
+        #[cfg(feature = "patterns-mphf-dispatch")]
+        anchor_dispatch,
         anchor_matcher,
         #[cfg(feature = "teddy-prefilter")]
         teddy_prefilter,
@@ -4521,10 +4789,10 @@ impl PatternEngine {
             }
 
             let anchor_idx = matched.pattern().as_usize();
-            let Some(rule_indices) = index.anchor_rule_buckets.get(anchor_idx) else {
+            let Some(rule_indices) = Self::anchor_rule_indices(index, anchor_idx) else {
                 #[cfg(test)]
                 {
-                    eprintln!("detect: pattern {anchor_idx} not found in anchor_rule_buckets");
+                    eprintln!("detect: pattern {anchor_idx} not found in anchor dispatch");
                 }
                 continue;
             };
@@ -4552,7 +4820,7 @@ impl PatternEngine {
 
         for matched in matcher.find_overlapping_iter(text) {
             let anchor_idx = matched.pattern().as_usize();
-            let Some(rule_indices) = index.anchor_rule_buckets.get(anchor_idx) else {
+            let Some(rule_indices) = Self::anchor_rule_indices(index, anchor_idx) else {
                 continue;
             };
 
@@ -4567,6 +4835,19 @@ impl PatternEngine {
         }
 
         (candidate_rules, matched_anchors_by_rule)
+    }
+
+    fn anchor_rule_indices(index: &EngineIndex, anchor_idx: usize) -> Option<&[usize]> {
+        #[cfg(feature = "patterns-mphf-dispatch")]
+        {
+            let anchor = index.anchor_list.get(anchor_idx)?;
+            return index.anchor_dispatch.rule_indices(anchor);
+        }
+
+        #[cfg(not(feature = "patterns-mphf-dispatch"))]
+        {
+            index.anchor_rule_buckets.get(anchor_idx).map(Vec::as_slice)
+        }
     }
 
     #[cfg(feature = "teddy-prefilter")]
@@ -10032,6 +10313,118 @@ rules:
             );
             assert_eq!(traces.len(), traced.len());
         }
+    }
+
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    fn collect_candidate_rules_hashmap_oracle(
+        index: &EngineIndex,
+        text: &str,
+        matcher: &AhoCorasick,
+    ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
+        let mut candidate_rules = Vec::new();
+        let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
+
+        for matched in matcher.find_overlapping_iter(text) {
+            let anchor_idx = matched.pattern().as_usize();
+            let Some(rule_indices) = index.anchor_rule_buckets.get(anchor_idx) else {
+                continue;
+            };
+
+            let anchor_match = (anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                if matched_anchor_by_rule[idx].is_none() {
+                    candidate_rules.push(idx);
+                    matched_anchor_by_rule[idx] = Some(anchor_match);
+                }
+            }
+        }
+
+        (candidate_rules, matched_anchor_by_rule)
+    }
+
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    fn assert_mphf_route_matches_hashmap_oracle(
+        index: &EngineIndex,
+        matcher: &AhoCorasick,
+        text: &str,
+        label: &str,
+    ) {
+        let (mphf_indices, mphf_anchors) =
+            PatternEngine::collect_candidate_rules(index, text, matcher);
+        let (oracle_indices, oracle_anchors) =
+            collect_candidate_rules_hashmap_oracle(index, text, matcher);
+        assert_eq!(
+            mphf_indices, oracle_indices,
+            "candidate rule order diverged for {label}"
+        );
+        assert_eq!(
+            mphf_anchors, oracle_anchors,
+            "matched anchor fallback diverged for {label}"
+        );
+    }
+
+    #[cfg(feature = "patterns-mphf-dispatch")]
+    #[test]
+    fn mphf_anchor_dispatch_matches_hashmap_route_oracle() {
+        let engine = PatternEngine::new();
+        let index = engine.index();
+        let matcher = index
+            .anchor_matcher
+            .as_ref()
+            .expect("builtin rules must build an anchor matcher");
+
+        index
+            .anchor_dispatch
+            .validate_routes(&index.anchor_list, &index.anchor_rule_buckets)
+            .expect("MPHF dispatch must be collision-free over the full anchor keyset");
+        assert_eq!(
+            index.anchor_dispatch.base.slots.len(),
+            index.anchor_list.len(),
+            "MPHF base must use exactly one slot per immutable anchor"
+        );
+
+        for (anchor_idx, anchor) in index.anchor_list.iter().enumerate() {
+            assert_eq!(
+                PatternEngine::anchor_rule_indices(index, anchor_idx)
+                    .expect("MPHF dispatch must route every Aho anchor"),
+                index.anchor_rule_buckets[anchor_idx].as_slice(),
+                "route bucket diverged for anchor {anchor_idx}: {anchor:?}"
+            );
+
+            let text = format!("prefix\n{anchor}\nsuffix");
+            assert_mphf_route_matches_hashmap_oracle(
+                index,
+                matcher,
+                &text,
+                &format!("single anchor {anchor_idx}: {anchor:?}"),
+            );
+        }
+
+        let full_anchor_corpus = index
+            .anchor_list
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_mphf_route_matches_hashmap_oracle(
+            index,
+            matcher,
+            &full_anchor_corpus,
+            "full anchor corpus",
+        );
+
+        let conformance_corpus = concat!(
+            "You've hit your usage limit, try again at 3pm.\n",
+            "Usage limit reached for all Pro models. Please wait before continuing.\n",
+            "ERROR code 42\nREADY_OK\nLIMIT_NOW window_a\n",
+            "mux server connection lost - please reconnect"
+        );
+        assert_mphf_route_matches_hashmap_oracle(
+            index,
+            matcher,
+            conformance_corpus,
+            "mixed conformance corpus",
+        );
     }
 
     #[cfg(feature = "patterns-fingerprint-dedup")]
