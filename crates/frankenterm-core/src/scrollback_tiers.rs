@@ -81,14 +81,15 @@ impl ScrollbackConfig {
 
 /// Backing store for a compressed warm page.
 ///
-/// An instance is uniformly one variant: a `cdc_dedup`-off scrollback only ever
-/// builds [`PageData::Plain`] pages, an on scrollback only [`PageData::Cdc`]
-/// pages. The default (off) representation is byte-for-byte the legacy
-/// standalone-zstd blob, so the legacy path is unchanged.
+/// An instance is normally uniform by enabled storage gate. The default (all
+/// gates off) representation is byte-for-byte the legacy standalone-zstd blob,
+/// so the legacy path is unchanged.
 #[derive(Debug, Clone)]
 enum PageData {
     /// Legacy: a standalone zstd blob of the page's raw `lines_to_bytes` buffer.
     Plain(Vec<u8>),
+    /// EV3: independently compressed line blocks plus rank/select sidecar.
+    Blocked(BlockedPage),
     /// M4: ordered chunk ids (the "recipe") resolved against the shared
     /// content-addressed [`CdcStore`]. The page owns no bytes directly; its
     /// chunks live (deduplicated, zstd-compressed) in the store.
@@ -122,10 +123,11 @@ pub enum ScrollbackTier {
 }
 
 /// Page-level metadata retained after a page is evicted to the cold tier.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ColdPageMeta {
     page_index: u64,
     line_count: usize,
+    blocks: Option<LineBlockIndex>,
 }
 
 /// Concrete location hint for resolving a scrollback offset.
@@ -221,6 +223,199 @@ pub struct TieredScrollback {
     /// [`Self::new_with_options`]) is enabled. Default **off**; the off path is
     /// byte-for-byte the legacy standalone-zstd page.
     cdc: Option<CdcStore>,
+    /// EV3 (round-5 gauntlet): split warm pages into independently compressed
+    /// line blocks with a rank/select sidecar, and retain that sidecar after
+    /// cold eviction so a target-line lookup can fetch only the target block.
+    /// Default **off**.
+    blocked_page_index: bool,
+}
+
+// =============================================================================
+// EV3: blocked warm/cold pages
+// =============================================================================
+
+/// Lines per independently compressed EV3 block.
+const BLOCKED_PAGE_LINES_PER_BLOCK: usize = 16;
+
+#[derive(Debug, Clone)]
+struct LineBlockIndex {
+    /// First line number for each block, ordered oldest→newest within the page.
+    first_lines: Vec<u32>,
+    /// Raw byte offset of each block in the legacy full-page `lines_to_bytes`
+    /// buffer. This sidecar lets line lookup select a block while preserving an
+    /// integrity check that the blocks tile the same raw buffer as legacy.
+    raw_offsets: Vec<u32>,
+    /// Raw byte length for each block.
+    raw_lens: Vec<u32>,
+    /// Number of lines in each block.
+    line_counts: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LineBlockSelection {
+    block_index: usize,
+    first_line: usize,
+    line_count: usize,
+}
+
+impl LineBlockIndex {
+    fn from_block_raws(block_raws: &[Vec<u8>], block_line_counts: &[usize]) -> Option<Self> {
+        if block_raws.len() != block_line_counts.len() {
+            return None;
+        }
+
+        let mut first_lines = Vec::with_capacity(block_raws.len());
+        let mut raw_offsets = Vec::with_capacity(block_raws.len());
+        let mut raw_lens = Vec::with_capacity(block_raws.len());
+        let mut line_counts = Vec::with_capacity(block_raws.len());
+        let mut next_line = 0usize;
+        let mut next_raw_offset = 0usize;
+
+        for (raw, &line_count) in block_raws.iter().zip(block_line_counts) {
+            if line_count == 0 || line_count > u16::MAX as usize {
+                return None;
+            }
+            first_lines.push(u32::try_from(next_line).ok()?);
+            raw_offsets.push(u32::try_from(next_raw_offset).ok()?);
+            raw_lens.push(u32::try_from(raw.len()).ok()?);
+            line_counts.push(u16::try_from(line_count).ok()?);
+            next_line = next_line.checked_add(line_count)?;
+            next_raw_offset = next_raw_offset.checked_add(raw.len())?;
+        }
+
+        Some(Self {
+            first_lines,
+            raw_offsets,
+            raw_lens,
+            line_counts,
+        })
+    }
+
+    fn line_count(&self) -> usize {
+        match (self.first_lines.last(), self.line_counts.last()) {
+            (Some(&first), Some(&count)) => first as usize + count as usize,
+            _ => 0,
+        }
+    }
+
+    fn select(&self, line_index: usize) -> Option<LineBlockSelection> {
+        let i = self
+            .first_lines
+            .partition_point(|&first| first as usize <= line_index)
+            .checked_sub(1)?;
+        let first_line = self.first_lines[i] as usize;
+        let line_count = self.line_counts[i] as usize;
+        if line_index < first_line + line_count {
+            Some(LineBlockSelection {
+                block_index: i,
+                first_line,
+                line_count,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn is_tight_for_raw_len(&self, raw_len: usize) -> bool {
+        if self.first_lines.len() != self.raw_offsets.len()
+            || self.first_lines.len() != self.raw_lens.len()
+            || self.first_lines.len() != self.line_counts.len()
+        {
+            return false;
+        }
+
+        let mut expected_line = 0usize;
+        let mut expected_raw = 0usize;
+        for (((&first, &raw_offset), &raw_len_block), &line_count) in self
+            .first_lines
+            .iter()
+            .zip(&self.raw_offsets)
+            .zip(&self.raw_lens)
+            .zip(&self.line_counts)
+        {
+            let first = first as usize;
+            let raw_offset = raw_offset as usize;
+            let raw_len_block = raw_len_block as usize;
+            let line_count = line_count as usize;
+            if line_count == 0 || first != expected_line || raw_offset != expected_raw {
+                return false;
+            }
+            let Some(next_line) = expected_line.checked_add(line_count) else {
+                return false;
+            };
+            let Some(next_raw) = expected_raw.checked_add(raw_len_block) else {
+                return false;
+            };
+            expected_line = next_line;
+            expected_raw = next_raw;
+        }
+        expected_raw == raw_len
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlockedPage {
+    index: LineBlockIndex,
+    blocks: Vec<Vec<u8>>,
+}
+
+impl BlockedPage {
+    fn from_lines(lines: &[String], compressor: &ByteCompressor) -> Option<Self> {
+        let mut block_raws = Vec::new();
+        let mut block_line_counts = Vec::new();
+
+        for block in lines.chunks(BLOCKED_PAGE_LINES_PER_BLOCK) {
+            let raw = lines_to_bytes(block);
+            block_line_counts.push(block.len());
+            block_raws.push(raw);
+        }
+
+        let index = LineBlockIndex::from_block_raws(&block_raws, &block_line_counts)?;
+        let blocks = block_raws
+            .iter()
+            .map(|raw| compressor.compress(raw))
+            .collect();
+        Some(Self { index, blocks })
+    }
+
+    fn compressed_len(&self) -> usize {
+        self.blocks.iter().map(Vec::len).sum()
+    }
+
+    fn decode_all(&self, compressor: &ByteCompressor) -> Option<Vec<String>> {
+        let mut lines = Vec::with_capacity(self.index.line_count());
+        let mut raw_len = 0usize;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let raw = compressor.decompress(block).ok()?;
+            if raw.len() != self.index.raw_lens.get(i).copied()? as usize {
+                return None;
+            }
+            raw_len = raw_len.checked_add(raw.len())?;
+            let block_lines = bytes_to_lines(&raw);
+            if block_lines.len() != self.index.line_counts.get(i).copied()? as usize {
+                return None;
+            }
+            lines.extend(block_lines);
+        }
+        if !self.index.is_tight_for_raw_len(raw_len) {
+            return None;
+        }
+        Some(lines)
+    }
+
+    fn decode_line(&self, line_index: usize, compressor: &ByteCompressor) -> Option<String> {
+        let selection = self.index.select(line_index)?;
+        let block = self.blocks.get(selection.block_index)?;
+        let raw = compressor.decompress(block).ok()?;
+        if raw.len() != self.index.raw_lens.get(selection.block_index).copied()? as usize {
+            return None;
+        }
+        let block_lines = bytes_to_lines(&raw);
+        if block_lines.len() != selection.line_count {
+            return None;
+        }
+        block_lines.get(line_index - selection.first_line).cloned()
+    }
 }
 
 // =============================================================================
@@ -521,15 +716,17 @@ impl TieredScrollback {
     /// first, so a zero `page_size` is clamped instead of degrading the
     /// tier-migration loop.
     ///
-    /// The Q1 prefix-index and M4 CDC-dedup fast paths default **off**; each is
-    /// enabled only when its `FT_MOONSHOT_SCROLLBACK_*` env gate is set (see
-    /// [`Self::new_with_options`] for a deterministic, env-free opt-in).
+    /// The Q1 prefix-index, M4 CDC-dedup, and EV3 blocked-page fast paths
+    /// default **off**; each is enabled only when its
+    /// `FT_MOONSHOT_SCROLLBACK_*` env gate is set (see
+    /// [`Self::new_with_all_options`] for a deterministic, env-free opt-in).
     #[must_use]
     pub fn new(config: ScrollbackConfig) -> Self {
-        Self::new_with_options(
+        Self::new_with_all_options(
             config,
             prefix_index_enabled_from_env(),
             cdc_dedup_enabled_from_env(),
+            blocked_page_index_enabled_from_env(),
         )
     }
 
@@ -545,7 +742,12 @@ impl TieredScrollback {
     /// use [`Self::new_with_options`] to choose both gates explicitly.
     #[must_use]
     pub fn new_with_prefix_index(config: ScrollbackConfig, prefix_index: bool) -> Self {
-        Self::new_with_options(config, prefix_index, cdc_dedup_enabled_from_env())
+        Self::new_with_all_options(
+            config,
+            prefix_index,
+            cdc_dedup_enabled_from_env(),
+            blocked_page_index_enabled_from_env(),
+        )
     }
 
     /// Create a tiered scrollback, explicitly choosing both round-4 gates.
@@ -563,6 +765,34 @@ impl TieredScrollback {
     /// env vars through [`Self::new`].
     #[must_use]
     pub fn new_with_options(config: ScrollbackConfig, prefix_index: bool, cdc_dedup: bool) -> Self {
+        Self::new_with_all_options(config, prefix_index, cdc_dedup, false)
+    }
+
+    /// Create a tiered scrollback with EV3 blocked-page indexing explicitly set.
+    ///
+    /// `blocked_page_index = false` is the default behavior: warm pages are the
+    /// legacy standalone zstd blob unless another explicit storage gate is
+    /// enabled. `true` stores each warm page as compressed line blocks plus a
+    /// rank/select sidecar; full-page decode and line lookup remain
+    /// byte-identical.
+    #[must_use]
+    pub fn new_with_blocked_page_index(config: ScrollbackConfig, blocked_page_index: bool) -> Self {
+        Self::new_with_all_options(
+            config,
+            prefix_index_enabled_from_env(),
+            false,
+            blocked_page_index,
+        )
+    }
+
+    /// Create a tiered scrollback, explicitly choosing every moonshot gate.
+    #[must_use]
+    pub fn new_with_all_options(
+        config: ScrollbackConfig,
+        prefix_index: bool,
+        cdc_dedup: bool,
+        blocked_page_index: bool,
+    ) -> Self {
         let config = config.sanitized();
         let compressor = ByteCompressor::new(config.compression);
         Self {
@@ -584,11 +814,12 @@ impl TieredScrollback {
             } else {
                 None
             },
-            cdc: if cdc_dedup {
+            cdc: if cdc_dedup && !blocked_page_index {
                 Some(CdcStore::default())
             } else {
                 None
             },
+            blocked_page_index,
         }
     }
 
@@ -644,6 +875,26 @@ impl TieredScrollback {
         self.decode_page(page)
     }
 
+    /// Decode a single line from a warm page hint.
+    ///
+    /// With EV3 blocked pages enabled, only the target line's compressed block
+    /// is decompressed. Legacy/CDC pages fall back to the full-page decode.
+    #[must_use]
+    pub fn warm_line(&self, hint: &ScrollbackLocationHint) -> Option<String> {
+        let ScrollbackLocationHint::Warm {
+            page_offset_from_newest,
+            line_index_in_page,
+            ..
+        } = hint
+        else {
+            return None;
+        };
+        let page = self
+            .warm
+            .get(self.warm.len().checked_sub(1 + page_offset_from_newest)?)?;
+        self.decode_page_line(page, *line_index_in_page)
+    }
+
     /// Decode a warm page back into its lines, reconstructing the raw
     /// `lines_to_bytes` buffer from either the standalone zstd blob (legacy) or
     /// the CDC recipe against the shared chunk store (M4). The decoded bytes are
@@ -653,6 +904,13 @@ impl TieredScrollback {
     fn decode_page(&self, page: &CompressedPage) -> Option<Vec<String>> {
         let raw = match &page.data {
             PageData::Plain(data) => self.compressor.decompress(data).ok()?,
+            PageData::Blocked(blocked) => {
+                let lines = blocked.decode_all(&self.compressor)?;
+                if lines.len() != page.line_count {
+                    return None;
+                }
+                return Some(lines);
+            }
             PageData::Cdc(recipe) => self.cdc.as_ref()?.reconstruct(recipe, &self.compressor)?,
         };
         let lines = bytes_to_lines(&raw);
@@ -660,6 +918,16 @@ impl TieredScrollback {
             return None;
         }
         Some(lines)
+    }
+
+    fn decode_page_line(&self, page: &CompressedPage, line_index: usize) -> Option<String> {
+        if line_index >= page.line_count {
+            return None;
+        }
+        match &page.data {
+            PageData::Blocked(blocked) => blocked.decode_line(line_index, &self.compressor),
+            _ => self.decode_page(page)?.get(line_index).cloned(),
+        }
     }
 
     /// Number of lines currently in the hot tier.
@@ -902,6 +1170,15 @@ impl TieredScrollback {
             .map(|cdc| (cdc.chunks.len(), cdc.total_compressed))
     }
 
+    /// Diagnostic: is EV3 blocked-page indexing enabled for newly flushed warm
+    /// pages? Hidden from public docs; exposed for byte-equivalence proof code
+    /// and A/B benches.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn blocked_page_index_active(&self) -> bool {
+        self.blocked_page_index
+    }
+
     /// Evict up to `count` warm pages to cold tier (proportional eviction).
     ///
     /// Evicts oldest pages first. Returns the number of pages actually evicted.
@@ -1004,9 +1281,40 @@ impl TieredScrollback {
         match hint {
             ScrollbackLocationHint::Cold {
                 page_index,
+                page_offset_from_newest,
                 line_index_in_page,
                 ..
             } => {
+                if let Some(selection) = self.select_cold_line_block(
+                    *page_index,
+                    *page_offset_from_newest,
+                    *line_index_in_page,
+                ) {
+                    let block = retriever.retrieve_line_block(
+                        *page_index,
+                        selection.block_index,
+                        selection.first_line,
+                        selection.line_count,
+                    )?;
+                    if block.page_index != *page_index
+                        || block.block_index != selection.block_index
+                        || block.first_line != selection.first_line
+                        || block.lines.len() != selection.line_count
+                    {
+                        return Err(ColdRetrievalError::DecompressionFailed {
+                            page_index: *page_index,
+                            reason: "cold line block invariant mismatch".to_string(),
+                        });
+                    }
+                    return block
+                        .lines
+                        .get(*line_index_in_page - selection.first_line)
+                        .cloned()
+                        .ok_or(ColdRetrievalError::PageNotFound {
+                            page_index: *page_index,
+                        });
+                }
+
                 let data = retriever.retrieve_page(*page_index)?;
                 data.lines.get(*line_index_in_page).cloned().ok_or(
                     ColdRetrievalError::PageNotFound {
@@ -1016,6 +1324,21 @@ impl TieredScrollback {
             }
             _ => Err(ColdRetrievalError::PageNotFound { page_index: 0 }),
         }
+    }
+
+    fn select_cold_line_block(
+        &self,
+        page_index: u64,
+        page_offset_from_newest: usize,
+        line_index_in_page: usize,
+    ) -> Option<LineBlockSelection> {
+        let meta = self
+            .cold
+            .get(self.cold.len().checked_sub(1 + page_offset_from_newest)?)?;
+        if meta.page_index != page_index {
+            return None;
+        }
+        meta.blocks.as_ref()?.select(line_index_in_page)
     }
 
     /// Retrieve a full cold page via a [`ColdTierRetriever`].
@@ -1068,11 +1391,17 @@ impl TieredScrollback {
         let raw = lines_to_bytes(&page_lines);
         let uncompressed_size = raw.len();
 
-        // Build the page backing: legacy standalone zstd blob, or M4 CDC dedup
-        // into the shared content-addressed store. Both add only the bytes new
-        // to this instance to `warm_bytes`.
+        // Build the page backing. EV3 blocked pages take precedence when their
+        // gate is on; otherwise the existing CDC/plain representations are
+        // unchanged. Each arm records only bytes owned by this instance in
+        // `warm_bytes`.
         let compressor = &self.compressor;
-        let (data, added_compressed) = if let Some(cdc) = self.cdc.as_mut() {
+        let (data, added_compressed) = if self.blocked_page_index {
+            let blocked = BlockedPage::from_lines(&page_lines, compressor)
+                .expect("non-empty page should produce a blocked representation");
+            let len = blocked.compressed_len();
+            (PageData::Blocked(blocked), len)
+        } else if let Some(cdc) = self.cdc.as_mut() {
             let (recipe, added) = cdc.intern_page(&raw, compressor);
             (PageData::Cdc(recipe), added)
         } else {
@@ -1111,8 +1440,13 @@ impl TieredScrollback {
         // Release this page's storage. A Plain page owns its blob; a CDC page
         // drops chunk references and frees only chunks that reach zero refs
         // (chunks still shared by resident warm pages stay).
+        let blocks = match &page.data {
+            PageData::Blocked(blocked) => Some(blocked.index.clone()),
+            _ => None,
+        };
         let freed = match &page.data {
             PageData::Plain(data) => data.len(),
+            PageData::Blocked(blocked) => blocked.compressed_len(),
             PageData::Cdc(recipe) => self
                 .cdc
                 .as_mut()
@@ -1126,6 +1460,7 @@ impl TieredScrollback {
         self.cold.push_back(ColdPageMeta {
             page_index: page.page_index,
             line_count: page.line_count,
+            blocks,
         });
 
         // Prefix index: the caller already popped the warm front; mirror it and
@@ -1163,6 +1498,14 @@ fn prefix_index_enabled_from_env() -> bool {
 /// the existing `FT_MOONSHOT_*` gating convention.
 fn cdc_dedup_enabled_from_env() -> bool {
     env_flag_enabled("FT_MOONSHOT_SCROLLBACK_CDC_DEDUP")
+}
+
+/// Whether the EV3 blocked-page index gate is enabled via the environment.
+///
+/// Default **off**: only `1`/`true`/`yes`/`on` (case-insensitive) on
+/// `FT_MOONSHOT_SCROLLBACK_BLOCKED_PAGE_INDEX` enable blocked warm/cold pages.
+fn blocked_page_index_enabled_from_env() -> bool {
+    env_flag_enabled("FT_MOONSHOT_SCROLLBACK_BLOCKED_PAGE_INDEX")
 }
 
 /// Shared truthiness parse for the `FT_MOONSHOT_SCROLLBACK_*` gates.
@@ -1222,6 +1565,19 @@ pub struct ColdPageData {
     pub lines: Vec<String>,
 }
 
+/// Result of retrieving one line block from a cold page.
+#[derive(Debug, Clone)]
+pub struct ColdLineBlockData {
+    /// The stable page index that was requested.
+    pub page_index: u64,
+    /// Zero-based block index within the page.
+    pub block_index: usize,
+    /// First page-local line represented by this block.
+    pub first_line: usize,
+    /// Lines from the block, ordered oldest to newest.
+    pub lines: Vec<String>,
+}
+
 /// Trait for backends that can serve cold-tier scrollback page reads.
 ///
 /// Implementations fetch page data from the capture pipeline's storage
@@ -1241,6 +1597,35 @@ pub struct ColdPageData {
 pub trait ColdTierRetriever: Send + Sync {
     /// Retrieve a single cold page by its stable page index.
     fn retrieve_page(&self, page_index: u64) -> Result<ColdPageData, ColdRetrievalError>;
+
+    /// Retrieve one block from a cold page.
+    ///
+    /// Backends that persist EV3 blocked pages should override this to fetch and
+    /// decompress only the requested block. The default implementation preserves
+    /// source compatibility and correctness by slicing the legacy full-page
+    /// result, so old retrievers continue to work even when the scrollback
+    /// instance has a block sidecar.
+    fn retrieve_line_block(
+        &self,
+        page_index: u64,
+        block_index: usize,
+        first_line: usize,
+        line_count: usize,
+    ) -> Result<ColdLineBlockData, ColdRetrievalError> {
+        let page = self.retrieve_page(page_index)?;
+        let end = first_line
+            .checked_add(line_count)
+            .ok_or(ColdRetrievalError::PageNotFound { page_index })?;
+        if end > page.lines.len() {
+            return Err(ColdRetrievalError::PageNotFound { page_index });
+        }
+        Ok(ColdLineBlockData {
+            page_index,
+            block_index,
+            first_line,
+            lines: page.lines[first_line..end].to_vec(),
+        })
+    }
 }
 
 /// A no-op cold tier retriever that always returns `PageNotFound`.
@@ -2051,6 +2436,101 @@ mod tests {
         }
     }
 
+    struct BlockAwareColdRetriever {
+        pages: std::collections::HashMap<u64, Vec<String>>,
+        full_page_calls: std::sync::atomic::AtomicUsize,
+        block_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BlockAwareColdRetriever {
+        fn new() -> Self {
+            Self {
+                pages: std::collections::HashMap::new(),
+                full_page_calls: std::sync::atomic::AtomicUsize::new(0),
+                block_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn insert(&mut self, page_index: u64, lines: Vec<String>) {
+            self.pages.insert(page_index, lines);
+        }
+
+        fn full_page_calls(&self) -> usize {
+            self.full_page_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn block_calls(&self) -> usize {
+            self.block_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl ColdTierRetriever for BlockAwareColdRetriever {
+        fn retrieve_page(&self, page_index: u64) -> Result<ColdPageData, ColdRetrievalError> {
+            self.full_page_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.pages
+                .get(&page_index)
+                .cloned()
+                .map(|lines| ColdPageData { page_index, lines })
+                .ok_or(ColdRetrievalError::PageNotFound { page_index })
+        }
+
+        fn retrieve_line_block(
+            &self,
+            page_index: u64,
+            block_index: usize,
+            first_line: usize,
+            line_count: usize,
+        ) -> Result<ColdLineBlockData, ColdRetrievalError> {
+            self.block_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let page = self
+                .pages
+                .get(&page_index)
+                .ok_or(ColdRetrievalError::PageNotFound { page_index })?;
+            let end = first_line
+                .checked_add(line_count)
+                .ok_or(ColdRetrievalError::PageNotFound { page_index })?;
+            if end > page.len() {
+                return Err(ColdRetrievalError::PageNotFound { page_index });
+            }
+            Ok(ColdLineBlockData {
+                page_index,
+                block_index,
+                first_line,
+                lines: page[first_line..end].to_vec(),
+            })
+        }
+    }
+
+    fn insert_page_fixture(
+        retriever: &mut impl PageFixtureInserter,
+        page_index: u64,
+        page_size: usize,
+        all_lines: &[String],
+    ) {
+        let start = page_index as usize * page_size;
+        let end = start.saturating_add(page_size).min(all_lines.len());
+        retriever.insert_page(page_index, all_lines[start..end].to_vec());
+    }
+
+    trait PageFixtureInserter {
+        fn insert_page(&mut self, page_index: u64, lines: Vec<String>);
+    }
+
+    impl PageFixtureInserter for MockColdRetriever {
+        fn insert_page(&mut self, page_index: u64, lines: Vec<String>) {
+            self.insert(page_index, lines);
+        }
+    }
+
+    impl PageFixtureInserter for BlockAwareColdRetriever {
+        fn insert_page(&mut self, page_index: u64, lines: Vec<String>) {
+            self.insert(page_index, lines);
+        }
+    }
+
     #[test]
     fn null_retriever_returns_page_not_found() {
         let retriever = NullColdRetriever;
@@ -2354,6 +2834,191 @@ mod tests {
         (0..sb.warm_page_count())
             .map(|i| sb.warm_page_lines(i).expect("warm page must decode"))
             .collect()
+    }
+
+    fn ev3_corpus() -> Vec<String> {
+        let mut lines = Vec::new();
+        for i in 0..180usize {
+            lines.push(match i % 9 {
+                0 => format!("ascii printable line {i:04}"),
+                1 => format!("utf8 café 漢字 🚀 line {i}"),
+                2 => format!("embedded\nnewline\npayload {i}"),
+                3 => String::new(),
+                4 => "x".repeat(512 + i % 17),
+                5 => format!("prompt redraw >>> {} <<<", i % 5),
+                6 => format!("\tleading\tand trailing spaces {i}   "),
+                7 => format!("json-ish {{\"i\":{i},\"ok\":true}}"),
+                _ => format!("line block boundary candidate {i}"),
+            });
+        }
+        lines
+    }
+
+    #[test]
+    fn blocked_page_index_gate_defaults_off() {
+        if std::env::var_os("FT_MOONSHOT_SCROLLBACK_BLOCKED_PAGE_INDEX").is_none() {
+            let sb = TieredScrollback::new(small_config());
+            assert!(
+                !sb.blocked_page_index_active(),
+                "blocked page index must default off"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_warm_pages_decode_byte_identical_to_legacy() {
+        let config = ScrollbackConfig {
+            hot_lines: 24,
+            page_size: 37,
+            warm_max_bytes: usize::MAX,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: false,
+        };
+        let mut blocked =
+            TieredScrollback::new_with_all_options(config.clone(), false, false, true);
+        let mut legacy = TieredScrollback::new_with_all_options(config, false, false, false);
+        assert!(blocked.blocked_page_index_active());
+        assert!(!legacy.blocked_page_index_active());
+
+        let corpus = ev3_corpus();
+        for line in corpus {
+            blocked.push_line(line.clone());
+            legacy.push_line(line);
+        }
+
+        assert!(blocked.warm_page_count() > 0);
+        assert_eq!(blocked.hot_len(), legacy.hot_len());
+        assert_eq!(blocked.warm_page_count(), legacy.warm_page_count());
+        assert_eq!(blocked.total_line_count(), legacy.total_line_count());
+        assert_eq!(warm_dump(&blocked), warm_dump(&legacy));
+
+        let total = blocked.total_line_count() as usize;
+        for offset in 0..total {
+            let blocked_hint = blocked.locate_offset(offset);
+            let legacy_hint = legacy.locate_offset(offset);
+            assert_eq!(
+                blocked_hint, legacy_hint,
+                "blocked page index must preserve locate_offset at {offset}"
+            );
+            if let Some(hint @ ScrollbackLocationHint::Warm { .. }) = blocked_hint {
+                let legacy_line = match legacy_hint.unwrap() {
+                    ScrollbackLocationHint::Warm {
+                        page_offset_from_newest,
+                        line_index_in_page,
+                        ..
+                    } => legacy
+                        .warm_page_lines(page_offset_from_newest)
+                        .unwrap()
+                        .remove(line_index_in_page),
+                    _ => unreachable!("hints were equal and blocked hint was warm"),
+                };
+                assert_eq!(
+                    blocked.warm_line(&hint).as_deref(),
+                    Some(legacy_line.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_cold_line_uses_target_block_and_matches_legacy() {
+        let config = ScrollbackConfig {
+            hot_lines: 24,
+            page_size: 37,
+            warm_max_bytes: 1,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: true,
+        };
+        let mut blocked =
+            TieredScrollback::new_with_all_options(config.clone(), false, false, true);
+        let mut legacy =
+            TieredScrollback::new_with_all_options(config.clone(), false, false, false);
+        let corpus = ev3_corpus();
+        for line in &corpus {
+            blocked.push_line(line.clone());
+            legacy.push_line(line.clone());
+        }
+
+        assert!(
+            blocked.cold_page_count() > 0,
+            "fixture must reach cold tier"
+        );
+        assert_eq!(blocked.total_line_count(), legacy.total_line_count());
+        assert_eq!(blocked.cold_line_count(), legacy.cold_line_count());
+        assert_eq!(blocked.cold_page_count(), legacy.cold_page_count());
+
+        let mut legacy_retriever = MockColdRetriever::new();
+        let mut blocked_retriever = BlockAwareColdRetriever::new();
+        for page in 0..blocked.cold_page_count() {
+            insert_page_fixture(
+                &mut legacy_retriever,
+                page,
+                config.page_size,
+                corpus.as_slice(),
+            );
+            insert_page_fixture(
+                &mut blocked_retriever,
+                page,
+                config.page_size,
+                corpus.as_slice(),
+            );
+        }
+
+        let total = blocked.total_line_count() as usize;
+        let mut checked = 0usize;
+        for offset in 0..total {
+            let Some(blocked_hint @ ScrollbackLocationHint::Cold { .. }) =
+                blocked.locate_offset(offset)
+            else {
+                continue;
+            };
+            let legacy_hint = legacy.locate_offset(offset).unwrap();
+            assert_eq!(
+                blocked_hint, legacy_hint,
+                "blocked cold location must match legacy at {offset}"
+            );
+            assert_eq!(
+                blocked.cold_line(&blocked_hint, &blocked_retriever),
+                legacy.cold_line(&legacy_hint, &legacy_retriever),
+                "cold_line must be byte-identical at offset {offset}"
+            );
+            checked += 1;
+        }
+
+        assert!(checked > BLOCKED_PAGE_LINES_PER_BLOCK);
+        assert_eq!(
+            blocked_retriever.full_page_calls(),
+            0,
+            "blocked cold_line must not fall back to full-page retrieval"
+        );
+        assert_eq!(blocked_retriever.block_calls(), checked);
+    }
+
+    #[test]
+    fn blocked_page_corruption_fails_closed() {
+        let config = ScrollbackConfig {
+            hot_lines: 24,
+            page_size: 37,
+            warm_max_bytes: usize::MAX,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: false,
+        };
+        let mut sb = TieredScrollback::new_with_all_options(config, false, false, true);
+        for line in ev3_corpus() {
+            sb.push_line(line);
+        }
+        assert!(sb.warm_page_count() > 0);
+
+        let page = sb.warm.back_mut().expect("fixture should have warm pages");
+        let PageData::Blocked(blocked) = &mut page.data else {
+            panic!("fixture should use blocked page data");
+        };
+        blocked.index.raw_lens[0] = blocked.index.raw_lens[0].saturating_add(1);
+
+        assert!(
+            sb.warm_page_lines(0).is_none(),
+            "corrupt blocked sidecar must reject the page"
+        );
     }
 
     #[test]
