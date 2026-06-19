@@ -589,8 +589,15 @@ strip = true        # Remove debug symbols (size-optimized CLI release; deadlock
 debug = false       # No debuginfo in release artifacts
 
 [profile.release-perf]
+# Round-4 gauntlet A/B profile. NEVER bench on `--release` (opt-level="z", size-optimized):
+# size-opt distorts hot-loop codegen and invalidates any perf claim (keep-gate rule 3).
+# Use thin LTO (not the shipped fat `lto=true`) so each A/B arm rebuilds fast on RCH workers;
+# relative before/after deltas stay valid because both arms use the identical profile.
+# Frame pointers (set via RUSTFLAGS="-C force-frame-pointers=yes" in the bench-AB driver) keep
+# flamegraphs attributable. opt-level=3 + codegen-units=1 (inherited) for representative codegen.
 inherits = "release"
 opt-level = 3
+lto = "thin"
 debug = "line-tables-only"
 strip = "none"
 
