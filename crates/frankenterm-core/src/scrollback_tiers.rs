@@ -192,6 +192,89 @@ pub struct TieredScrollback {
     activity_counter: u64,
     /// Estimated total uncompressed bytes evicted to cold tier (for memory reporting).
     cold_uncompressed_bytes: u64,
+    /// Seqlock-style version counter for the warm/cold prefix index. Bumped on
+    /// every structural mutation of the warm/cold deques (flush, evict, clear);
+    /// republished into [`PrefixIndex::seq`] so a reader can detect a torn /
+    /// stale snapshot and fail closed to the linear walk.
+    prefix_seq: u64,
+    /// Q1 (round-4 gauntlet): incrementally-maintained cumulative line-count
+    /// prefix over the warm/cold pages, enabling `O(log pages)` resolution in
+    /// [`Self::locate_offset`] / [`Self::tier_for_offset`] via binary search
+    /// instead of the `O(pages)` re-sum + linear walk. `None` unless the
+    /// `scrollback.prefix_index` gate (env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX`,
+    /// or [`Self::new_with_prefix_index`]) is enabled. Default **off**.
+    prefix: Option<PrefixIndex>,
+}
+
+/// Incrementally-maintained cumulative line-count prefix over the warm and cold
+/// page deques, published behind a seqlock-style version counter
+/// ([`TieredScrollback::prefix_seq`]).
+///
+/// Both `warm_cum` and `cold_cum` store **absolute** global end positions — the
+/// cumulative line count from the very first line ever flushed out of the hot
+/// tier (global line 0) up to and including each page. Because the coordinates
+/// are absolute they survive `pop_front` (warm→cold eviction) without any
+/// rebase: the surviving entries keep their values and only the front entry is
+/// dropped. That is what keeps both push-back (flush) and pop-front (evict)
+/// `O(1)` while leaving the arrays monotone and binary-searchable.
+///
+/// # Seqlock discipline
+///
+/// `TieredScrollback` is externally serialized (the pane event loop owns it), so
+/// this is the single-threaded analog of a seqlock: the owner bumps
+/// `prefix_seq` and republishes it into [`Self::seq`] after each structural
+/// mutation; a reader that observes `seq != prefix_seq` (or a length mismatch
+/// against the live deques) treats the snapshot as torn and falls back to the
+/// deterministic linear walk. With correct maintenance the check always passes,
+/// so the binary-search path is taken — the guard is fail-closed insurance, not
+/// the steady state.
+#[derive(Debug, Default)]
+struct PrefixIndex {
+    /// Absolute global end position of each warm page, oldest→newest. Parallel
+    /// to [`TieredScrollback::warm`]; strictly increasing (pages are non-empty).
+    warm_cum: VecDeque<u64>,
+    /// Absolute global end position of each cold page, oldest→newest. Parallel
+    /// to [`TieredScrollback::cold`]. Cold only ever grows, so `cold_cum.back()`
+    /// is also the running total of lines evicted to cold.
+    cold_cum: VecDeque<u64>,
+    /// Seqlock version this snapshot was last published at.
+    seq: u64,
+}
+
+impl PrefixIndex {
+    /// Absolute global coordinate of the warm/cold boundary (== total cold lines).
+    fn cold_total(&self) -> u64 {
+        self.cold_cum.back().copied().unwrap_or(0)
+    }
+
+    /// Total lines ever flushed out of hot (== global coordinate ceiling).
+    fn flushed_total(&self) -> u64 {
+        self.warm_cum
+            .back()
+            .copied()
+            .unwrap_or_else(|| self.cold_total())
+    }
+
+    /// Lines currently resident in the warm tier.
+    fn warm_lines(&self) -> u64 {
+        self.flushed_total() - self.cold_total()
+    }
+
+    /// Seqlock + structural consistency check against the live deques.
+    fn is_consistent(&self, warm_len: usize, cold_len: usize, expected_seq: u64) -> bool {
+        self.seq == expected_seq
+            && self.warm_cum.len() == warm_len
+            && self.cold_cum.len() == cold_len
+    }
+}
+
+/// Outcome of the gated indexed resolution path.
+enum IndexedLocate {
+    /// The prefix index was active and consistent; this is the authoritative
+    /// answer (`None` = offset beyond all flushed lines).
+    Resolved(Option<ScrollbackLocationHint>),
+    /// The index is disabled or failed its seqlock check — use the linear walk.
+    Fallback,
 }
 
 /// Snapshot of scrollback tier statistics for telemetry/diagnostics.
@@ -223,8 +306,28 @@ impl TieredScrollback {
     /// The configuration is passed through [`ScrollbackConfig::sanitized`]
     /// first, so a zero `page_size` is clamped instead of degrading the
     /// tier-migration loop.
+    ///
+    /// The Q1 prefix-index fast path defaults **off**; it is enabled only when
+    /// the `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` env gate is set (see
+    /// [`Self::new_with_prefix_index`] for a deterministic, env-free opt-in).
     #[must_use]
     pub fn new(config: ScrollbackConfig) -> Self {
+        Self::new_with_prefix_index(config, prefix_index_enabled_from_env())
+    }
+
+    /// Create a tiered scrollback, explicitly choosing the Q1 prefix-index gate.
+    ///
+    /// `prefix_index = false` is the default behavior (legacy linear walk).
+    /// `true` enables the incrementally-maintained cumulative line-count prefix
+    /// + binary-search resolution in [`Self::locate_offset`] /
+    /// [`Self::tier_for_offset`]. Observable behavior is identical either way
+    /// (proven byte-equivalent); the flag only changes the resolution cost.
+    ///
+    /// This constructor is the env-race-free entry point used by property
+    /// proofs and the A/B bench harness; production toggles the same gate via
+    /// the `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` env var through [`Self::new`].
+    #[must_use]
+    pub fn new_with_prefix_index(config: ScrollbackConfig, prefix_index: bool) -> Self {
         let config = config.sanitized();
         let compressor = ByteCompressor::new(config.compression);
         Self {
@@ -240,6 +343,12 @@ impl TieredScrollback {
             cold_page_count: 0,
             activity_counter: 0,
             cold_uncompressed_bytes: 0,
+            prefix_seq: 0,
+            prefix: if prefix_index {
+                Some(PrefixIndex::default())
+            } else {
+                None
+            },
         }
     }
 
@@ -336,12 +445,39 @@ impl TieredScrollback {
             return ScrollbackTier::Hot;
         }
 
+        // Q1 indexed fast path (gated; fail-closed to the linear sum below).
+        if let Some(tier) = self.tier_for_offset_indexed(offset_from_end, hot_len) {
+            return tier;
+        }
+
         let warm_lines: usize = self.warm.iter().map(|p| p.line_count).sum();
         if offset_from_end < hot_len + warm_lines {
             return ScrollbackTier::Warm;
         }
 
         ScrollbackTier::Cold
+    }
+
+    /// Indexed (`O(1)`) tier classification, or `None` to fall back to the
+    /// linear sum. Mirrors [`Self::tier_for_offset`] exactly, including its
+    /// "everything beyond warm is Cold" convention (no upper bound check).
+    ///
+    /// Caller guarantees `offset_from_end >= hot_len`.
+    fn tier_for_offset_indexed(
+        &self,
+        offset_from_end: usize,
+        hot_len: usize,
+    ) -> Option<ScrollbackTier> {
+        let idx = self.prefix.as_ref()?;
+        if !idx.is_consistent(self.warm.len(), self.cold.len(), self.prefix_seq) {
+            return None;
+        }
+        let remaining = (offset_from_end - hot_len) as u64;
+        if remaining < idx.warm_lines() {
+            Some(ScrollbackTier::Warm)
+        } else {
+            Some(ScrollbackTier::Cold)
+        }
     }
 
     /// Resolve an offset-from-end into a concrete tier/page/line location hint.
@@ -355,6 +491,13 @@ impl TieredScrollback {
             return Some(ScrollbackLocationHint::Hot {
                 line_index: hot_len - 1 - offset_from_end,
             });
+        }
+
+        // Q1 indexed fast path (gated; fail-closed to the linear walk below).
+        if let IndexedLocate::Resolved(result) =
+            self.locate_warm_cold_indexed(offset_from_end, hot_len)
+        {
+            return result;
         }
 
         let mut remaining = offset_from_end - hot_len;
@@ -385,6 +528,76 @@ impl TieredScrollback {
         None
     }
 
+    /// Indexed resolution of a warm/cold offset via binary search over the
+    /// absolute cumulative prefix, or [`IndexedLocate::Fallback`] when the gate
+    /// is off or the seqlock check fails.
+    ///
+    /// Produces hints byte-identical to the linear walk in
+    /// [`Self::locate_offset`]. Caller guarantees `offset_from_end >= hot_len`.
+    ///
+    /// The warm/cold pages occupy contiguous, *stable* ranges in a global line
+    /// numbering (line 0 = first line ever flushed): cold owns
+    /// `[0, cold_total)` and warm owns `[cold_total, flushed_total)`. An offset
+    /// counted backward from the newest flushed line maps to the global
+    /// coordinate `target = flushed_total - 1 - remaining`, and the containing
+    /// page is found by a single `partition_point` over the monotone cumulative
+    /// ends.
+    fn locate_warm_cold_indexed(
+        &self,
+        offset_from_end: usize,
+        hot_len: usize,
+    ) -> IndexedLocate {
+        let Some(idx) = self.prefix.as_ref() else {
+            return IndexedLocate::Fallback;
+        };
+        if !idx.is_consistent(self.warm.len(), self.cold.len(), self.prefix_seq) {
+            return IndexedLocate::Fallback;
+        }
+
+        let remaining = (offset_from_end - hot_len) as u64;
+        let flushed_total = idx.flushed_total();
+        if remaining >= flushed_total {
+            // Beyond every flushed line — exactly the linear walk's `None`.
+            return IndexedLocate::Resolved(None);
+        }
+        let target = flushed_total - 1 - remaining;
+
+        let hint = if target >= idx.cold_total() {
+            // Warm tier: first page whose absolute end exceeds `target`.
+            let i = idx.warm_cum.partition_point(|&end| end <= target);
+            let page = &self.warm[i];
+            let start = idx.warm_cum[i] - page.line_count as u64;
+            ScrollbackLocationHint::Warm {
+                page_index: page.page_index,
+                page_offset_from_newest: self.warm.len() - 1 - i,
+                line_index_in_page: (target - start) as usize,
+                page_line_count: page.line_count,
+            }
+        } else {
+            // Cold tier.
+            let j = idx.cold_cum.partition_point(|&end| end <= target);
+            let page = &self.cold[j];
+            let start = idx.cold_cum[j] - page.line_count as u64;
+            ScrollbackLocationHint::Cold {
+                page_index: page.page_index,
+                page_offset_from_newest: self.cold.len() - 1 - j,
+                line_index_in_page: (target - start) as usize,
+                page_line_count: page.line_count,
+            }
+        };
+        IndexedLocate::Resolved(Some(hint))
+    }
+
+    /// Bump the seqlock version and republish it into the prefix index. Call
+    /// after every structural mutation of the warm/cold deques so the index's
+    /// `seq` tracks the live `prefix_seq`.
+    fn republish_prefix_seq(&mut self) {
+        self.prefix_seq = self.prefix_seq.wrapping_add(1);
+        if let Some(idx) = self.prefix.as_mut() {
+            idx.seq = self.prefix_seq;
+        }
+    }
+
     /// Take a snapshot of the scrollback tier statistics.
     #[must_use]
     pub fn snapshot(&self) -> ScrollbackTierSnapshot {
@@ -406,6 +619,21 @@ impl TieredScrollback {
     #[must_use]
     pub fn activity_counter(&self) -> u64 {
         self.activity_counter
+    }
+
+    /// Diagnostic: is the Q1 prefix index enabled **and** currently passing its
+    /// seqlock + structural consistency check — i.e., is offset resolution
+    /// taking the binary-search fast path? `false` when the gate is off or the
+    /// index has fallen back to the linear walk. Hidden from the public docs;
+    /// exposed so the byte-equivalence proof / A/B bench can assert the fast
+    /// path is genuinely exercised rather than silently falling back.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn prefix_index_active(&self) -> bool {
+        self.prefix
+            .as_ref()
+            .map(|idx| idx.is_consistent(self.warm.len(), self.cold.len(), self.prefix_seq))
+            .unwrap_or(false)
     }
 
     /// Evict up to `count` warm pages to cold tier (proportional eviction).
@@ -485,6 +713,11 @@ impl TieredScrollback {
         self.next_page_index = 0;
         self.activity_counter = 0;
         self.cold_uncompressed_bytes = 0;
+        if let Some(idx) = self.prefix.as_mut() {
+            idx.warm_cum.clear();
+            idx.cold_cum.clear();
+        }
+        self.republish_prefix_seq();
     }
 
     /// Retrieve a line from the cold tier via a [`ColdTierRetriever`].
@@ -580,6 +813,16 @@ impl TieredScrollback {
         self.warm_bytes += compressed_size;
         self.warm.push_back(page);
 
+        // Prefix index: append the new warm page's absolute global end
+        // (previous flushed_total + this page's lines). Done before the cap
+        // enforcement below so the per-page eviction sees a consistent index.
+        let cold_total = self.cold_line_count;
+        if let Some(idx) = self.prefix.as_mut() {
+            let new_end = idx.warm_cum.back().copied().unwrap_or(cold_total) + line_count as u64;
+            idx.warm_cum.push_back(new_end);
+        }
+        self.republish_prefix_seq();
+
         // Enforce warm cap
         if self.config.cold_eviction_enabled {
             self.enforce_warm_cap();
@@ -595,6 +838,16 @@ impl TieredScrollback {
             page_index: page.page_index,
             line_count: page.line_count,
         });
+
+        // Prefix index: the caller already popped the warm front; mirror it and
+        // append the cold page's absolute end (== running cold line total).
+        // Absolute coordinates make this rebase-free for the surviving entries.
+        let cold_total = self.cold_line_count;
+        if let Some(idx) = self.prefix.as_mut() {
+            idx.warm_cum.pop_front();
+            idx.cold_cum.push_back(cold_total);
+        }
+        self.republish_prefix_seq();
     }
 }
 
@@ -602,6 +855,25 @@ impl Default for TieredScrollback {
     fn default() -> Self {
         Self::new(ScrollbackConfig::default())
     }
+}
+
+/// Whether the Q1 `scrollback.prefix_index` gate is enabled via the environment.
+///
+/// Default **off**: only `1`/`true`/`yes`/`on` (case-insensitive) on
+/// `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` enable the indexed resolution path,
+/// mirroring the existing `FT_MOONSHOT_*` gating convention. Anything else
+/// (unset, empty, `0`, `false`, …) leaves the deterministic linear walk active.
+fn prefix_index_enabled_from_env() -> bool {
+    std::env::var("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
 }
 
 // =============================================================================
@@ -1615,5 +1887,175 @@ mod tests {
             let back: ColdRetrievalError = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(*err, back);
         }
+    }
+
+    // ── Q1: seqlock warm-tier prefix-sum byte-equivalence ───────────────
+
+    /// Deterministic xorshift64 PRNG (no external dep; reproducible).
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn prefix_index_matches_linear_walk_property() {
+        // Q1 (round-4 gauntlet): the gated binary-search resolution of
+        // `locate_offset` / `tier_for_offset` must be byte-identical to the
+        // deterministic linear walk over random push/evict histories and a
+        // 10k-offset sweep. `indexed` runs with the prefix index ON; `linear`
+        // is the same op stream with it OFF (legacy path). Identical op streams
+        // ⇒ identical tier structure, so any divergence is the index's fault.
+        let config = ScrollbackConfig {
+            hot_lines: 12,
+            page_size: 4,
+            warm_max_bytes: 400, // tight cap → real warm + cold structure
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: true,
+        };
+
+        let mut indexed = TieredScrollback::new_with_prefix_index(config.clone(), true);
+        let mut linear = TieredScrollback::new_with_prefix_index(config, false);
+        assert!(indexed.prefix_index_active());
+        assert!(!linear.prefix_index_active());
+
+        let mut rng = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut counter = 0usize;
+        let mut produced_warm = false;
+        let mut produced_cold = false;
+
+        for round in 0..400u64 {
+            match xorshift(&mut rng) % 12 {
+                0 => {
+                    let n = (xorshift(&mut rng) % 3 + 1) as usize;
+                    assert_eq!(indexed.evict_warm_pages(n), linear.evict_warm_pages(n));
+                }
+                1 if round > 20 => {
+                    indexed.evict_all_warm();
+                    linear.evict_all_warm();
+                }
+                2 => {
+                    let target = (xorshift(&mut rng) % 300) as usize;
+                    assert_eq!(
+                        indexed.evict_warm_to_target(target),
+                        linear.evict_warm_to_target(target)
+                    );
+                }
+                _ => {
+                    let batch = (xorshift(&mut rng) % 6 + 1) as usize;
+                    for _ in 0..batch {
+                        let s = format!("r{round}-l{counter}-{}", xorshift(&mut rng) % 1000);
+                        indexed.push_line(s.clone());
+                        linear.push_line(s);
+                        counter += 1;
+                    }
+                }
+            }
+
+            // Structural parity must hold at every step.
+            assert_eq!(indexed.hot_len(), linear.hot_len());
+            assert_eq!(indexed.warm_page_count(), linear.warm_page_count());
+            assert_eq!(indexed.cold_page_count(), linear.cold_page_count());
+            assert_eq!(indexed.total_line_count(), linear.total_line_count());
+            produced_warm |= indexed.warm_page_count() > 0;
+            produced_cold |= indexed.cold_page_count() > 0;
+
+            // The indexed instance must keep resolving via the prefix index.
+            assert!(
+                indexed.prefix_index_active(),
+                "prefix index must stay live + consistent (round {round})"
+            );
+
+            // Spot-check a slice of offsets each round (boundaries + interior +
+            // out-of-range tail).
+            let total = indexed.total_line_count() as usize;
+            let span = total + 8;
+            for _ in 0..40 {
+                let o = (xorshift(&mut rng) as usize) % span;
+                assert_eq!(
+                    indexed.locate_offset(o),
+                    linear.locate_offset(o),
+                    "locate_offset mismatch at offset {o} (round {round})"
+                );
+                assert_eq!(
+                    indexed.tier_for_offset(o),
+                    linear.tier_for_offset(o),
+                    "tier_for_offset mismatch at offset {o} (round {round})"
+                );
+            }
+        }
+
+        let total = indexed.total_line_count() as usize;
+        assert!(produced_warm, "test must exercise the warm tier");
+        assert!(produced_cold, "test must exercise the cold tier");
+        assert!(total > 0);
+
+        // Exhaustive sweep over every offset 0..total plus an out-of-range tail.
+        for o in 0..total + 16 {
+            assert_eq!(
+                indexed.locate_offset(o),
+                linear.locate_offset(o),
+                "exhaustive locate_offset mismatch at {o}"
+            );
+            assert_eq!(
+                indexed.tier_for_offset(o),
+                linear.tier_for_offset(o),
+                "exhaustive tier_for_offset mismatch at {o}"
+            );
+        }
+
+        // 10k randomized offsets over the final structure (assignment mandate).
+        let span = total + 16;
+        for _ in 0..10_000 {
+            let o = (xorshift(&mut rng) as usize) % span;
+            assert_eq!(
+                indexed.locate_offset(o),
+                linear.locate_offset(o),
+                "10k-sweep locate_offset mismatch at {o}"
+            );
+            assert_eq!(
+                indexed.tier_for_offset(o),
+                linear.tier_for_offset(o),
+                "10k-sweep tier_for_offset mismatch at {o}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_index_env_gate_defaults_off() {
+        // `new()` honors the env gate; with the var unset the index is off and
+        // the legacy walk is used. (Proof runs with the gate default-off.)
+        // Guard against a polluted env so the assertion is meaningful.
+        if std::env::var_os("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX").is_none() {
+            let sb = TieredScrollback::new(small_config());
+            assert!(!sb.prefix_index_active(), "prefix index must default off");
+        }
+    }
+
+    #[test]
+    fn prefix_index_survives_clear_and_reuse() {
+        let mut indexed = TieredScrollback::new_with_prefix_index(small_config(), true);
+        let mut linear = TieredScrollback::new_with_prefix_index(small_config(), false);
+        for i in 0..120 {
+            indexed.push_line(line(i));
+            linear.push_line(line(i));
+        }
+        indexed.clear();
+        linear.clear();
+        assert!(indexed.prefix_index_active());
+        // Refill after clear: index must rebuild cleanly and stay equivalent.
+        for i in 0..80 {
+            indexed.push_line(line(i));
+            linear.push_line(line(i));
+        }
+        let total = indexed.total_line_count() as usize;
+        for o in 0..total + 4 {
+            assert_eq!(indexed.locate_offset(o), linear.locate_offset(o));
+            assert_eq!(indexed.tier_for_offset(o), linear.tier_for_offset(o));
+        }
+        assert!(indexed.prefix_index_active());
     }
 }
