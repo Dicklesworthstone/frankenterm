@@ -126,16 +126,12 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
 // results ledger. The fleet is `Vec<Arc<Mutex<PaneScrollback>>>`, mirroring
 // the per-pane `Arc<Mutex<Terminal>>` sharing the real mux uses.
 
-#[derive(Clone)]
-struct ScrollLine {
-    seq: u64,
-    text: String,
-}
-
 struct PaneScrollback {
-    lines: VecDeque<ScrollLine>,
+    /// The hot tier: one heap-allocated `String` per captured line. The
+    /// per-line allocation is what makes [`snapshot`](Self::snapshot)'s deep
+    /// clone O(n) work — the exact cost M6's copy-on-write rope targets.
+    lines: VecDeque<String>,
     cap: usize,
-    next_seq: u64,
 }
 
 impl PaneScrollback {
@@ -143,7 +139,6 @@ impl PaneScrollback {
         Self {
             lines: VecDeque::with_capacity(cap),
             cap,
-            next_seq: 0,
         }
     }
 
@@ -153,19 +148,17 @@ impl PaneScrollback {
         if self.lines.len() >= self.cap {
             self.lines.pop_front();
         }
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.lines.push_back(ScrollLine { seq, text });
+        self.lines.push_back(text);
     }
 
     /// Count matching lines (the "search read" workload), scanned in place.
     fn search(&self, query: &str) -> usize {
-        self.lines.iter().filter(|l| l.text.contains(query)).count()
+        self.lines.iter().filter(|l| l.contains(query)).count()
     }
 
     /// Deep snapshot of the hot tier — clones every line `String`. This is the
     /// O(n) clone cost M6's copy-on-write rope would collapse to O(1).
-    fn snapshot(&self) -> VecDeque<ScrollLine> {
+    fn snapshot(&self) -> VecDeque<String> {
         self.lines.clone()
     }
 }
@@ -276,7 +269,7 @@ fn search_pass_clean(fleet: &Fleet, strat: Strategy) -> usize {
                     let guard = pane.lock().unwrap();
                     guard.snapshot()
                 };
-                matches += snap.iter().filter(|l| l.text.contains(QUERY)).count();
+                matches += snap.iter().filter(|l| l.contains(QUERY)).count();
             }
         }
     }
@@ -319,7 +312,7 @@ fn search_pass_instrumented(fleet: &Fleet, strat: Strategy) -> PassResult {
                 let snap = guard.snapshot();
                 let hold = h.elapsed(); // clone cost
                 drop(guard);
-                matches += snap.iter().filter(|l| l.text.contains(QUERY)).count();
+                matches += snap.iter().filter(|l| l.contains(QUERY)).count();
                 waits.push(wait.as_nanos() as f64);
                 holds.push(hold.as_nanos() as f64);
             }
