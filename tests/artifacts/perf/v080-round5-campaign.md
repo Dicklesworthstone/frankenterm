@@ -34,3 +34,14 @@ _(tick entries appended by the orchestrator tend-loop)_
   dispatched: 8 panes claimed beads .4–.11 (A1 patterns/scroll-mem benches, A2 storage/tailer/simd
   wiring, GUI M3+C1, B1 mTLS split, B2 bocpd, D1 parser batching, E1 search bench). First local bench
   (M4 codec cdc_dedup) launched on the Mac to validate the local pipeline + capture M4's dedup_ratio.
+- 2026-06-19 tend#1 — strong wave-1: 7 commits landed (A1P patterns benches cb44b1c86, A2W storage/
+  tailer/simd benches c177f11b1, B2 bocpd SR-stabilize+bench 9ce81ca73, E1 M6 evidence harness
+  eb382bcaa, D1 parser print-batching 6f1ddc447, B1 mTLS test split b1ac293e1, + spine e6751fab8).
+  M4 MEASURED locally: 19.00x dedup, KEEP default-off (metric≠ns, see keep-ledger). Local A/B pipeline
+  validated end-to-end on the Mac. CONTAMINATION (ft-ch3nm) flagged by cod_1(.4)+cod_5(.8): a sibling
+  untracked escape-parser test blocked their RCH proofs — but it was ALREADY committed in D1
+  (6f1ddc447); the BLOCKED reports predate the commit → root cleared. Remaining dirty core-src
+  (cod_3 ingest.rs/storage.rs doc-hidden bench setters, uncommitted) compiles (cod_3's own proof is
+  progressing) → nudged cod_3 to commit code-first, cod_1+cod_5 to retry. cod_2 (scroll/mem benches),
+  cc_1 (bocpd --lib), cc_2 (D1 proof), cc_3 (E1 M6 proof), cod_4 (gui M3+C1) working; several on slow
+  remote core builds (25-29min, not RED). No beads closed yet (proofs pending — no close without green).

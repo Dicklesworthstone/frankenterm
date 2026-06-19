@@ -30,7 +30,7 @@ both from one run); `metric≠ns` = win is hit-rate/bytes/delay, adjudicate the 
 | M1 ANSI DFA | feature ansi-dfa-table | gate-toggle (ANSI-dense) | A2W (.6)/simd_scan | _pending_ | _pending_ |
 | M2 succinct attrs | feature succinct_attrs | gate-toggle (deep-scroll RSS) | existing cell/attribute_storage | _pending_ | _pending_ |
 | M3 SoA glyph quads | env FT_MOONSHOT_INSTANCED_GLYPH_QUADS | gate-toggle (glyph-dense frame) | GUI (.7) new | _pending_ | _pending_ |
-| M4 CDC dedup | config scrollback.cdc_dedup (codec opt-in) | baked-ids + metric≠ns (dedup_ratio) | existing codec/cdc_dedup | _running (local)_ | _pending_ |
+| M4 CDC dedup | config scrollback.cdc_dedup (codec opt-in) | baked-ids + metric≠ns (dedup_ratio) | existing codec/cdc_dedup | **19.00x dedup** (412KB→21.7KB); enc 299µs/412KB (1.38GB/s), dec 43µs | KEEP default-off (measured; see entry) |
 | M5 MPHF dispatch | feature patterns-mphf-dispatch | gate-toggle (high-AC-hit) | A1P (.4) new | _pending_ | _pending_ |
 | M7 predictive cadence | config ingest.cadence_model=predictive | gate-toggle + metric≠ns (captures) | A2W (.6)/tailer | _pending_ | _pending_ |
 | M8 adaptive M/G/1 | config storage.group_commit=adaptive | gate-toggle (WAL CV-high burst) | A2W (.6) wire | _pending_ | _pending_ |
@@ -40,6 +40,25 @@ both from one run); `metric≠ns` = win is hit-rate/bytes/delay, adjudicate the 
 | min-plus latency cert | config telemetry.latency_envelope | no-A/B (Form 6 observability) | — | N/A | confirm structural |
 | RS cold-tier erasure | config storage.cold.erasure=rs | no-A/B (Form 6 robustness) | — | N/A | confirm structural |
 | ft-perf-gate driver | env FT_PERF_GATE_MODE/BANDS | no-A/B (Form 6 harness) | — | N/A | confirm structural |
+
+## Quantified results — round-4 flags (measured on the quiet Mac)
+
+### 2026-06-19 | M4 CDC dedup (codec) — MEASURED, KEEP default-off
+
+**Bench:** `frankenterm/codec/benches/cdc_dedup.rs` (Criterion), groups `cdc_dedup_encode`/`_decode`.
+Run local (release-perf, frame-pointers), `/tmp/ft-r5-bench-logs/m4-cdc-codec.log`.
+**Corpus:** 96 redundant mux-output frames (shared header/body/prompt — the real CDC target shape).
+**Measurement:** input 412 032 B → encoded 21 688 B → **wire_ratio 0.0526 = 19.00x dedup**.
+- encode: `off_identity_copy` 10.79µs vs `on_cdc` 298.92µs (≈1.38 GB/s CDC encode of the 412KB corpus).
+- decode: `off_identity_copy` 11.08µs vs `on_cdc` 43.03µs.
+**Adjudication (metric≠ns):** the `off` arm is a raw `clone` (a no-op, NOT a real alternative). The
+real comparison is **19x fewer wire bytes** for ~299µs encode — clearly worth it on redundant mux
+output. The round-4 Form-7 retry predicate ("retry if page-redundancy above threshold on a
+TUI-redraw-heavy capture") is **satisfied** by the 19.00x here. **KEEP default-off** (config opt-in): the
+19x is corpus-specific to highly-redundant output; on low-redundancy data CDC is net CPU cost, so it is
+NOT promoted to default-on — it is the right default-off opt-in for distributed / bandwidth-constrained
+deployments. (benign `error: unclosed table` malformed-fixture warning in the log precedes success.)
+**Rollback:** config default-off; `git revert` of the round-4 codec commit (do not — it is off).
 
 ## Promotions / reverts (filled as A/B runs land)
 
