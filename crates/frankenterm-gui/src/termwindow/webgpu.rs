@@ -1172,7 +1172,9 @@ impl WebGpuState {
         descriptor.backends = backends;
         let instance = wgpu::Instance::new(descriptor);
         let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&handle)?)?
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_display_and_window(
+                &handle, &handle,
+            )?)?
         };
 
         let mut adapter: Option<wgpu::Adapter> = None;
