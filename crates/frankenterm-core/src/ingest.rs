@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::hash::Hash;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1798,6 +1799,43 @@ fn hash_text(text: &str) -> u64 {
 /// it finds the largest overlap where a suffix of `previous` matches a prefix of `current`.
 #[must_use]
 pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
+    extract_delta_with_overlap_mode(previous, current, overlap_size, delta_linear_overlap_enabled())
+}
+
+/// Q3 moonshot gate env var (`ingest.delta_linear_overlap`, default false).
+///
+/// Mirrors the existing `FT_MOONSHOT_*` knobs (e.g.
+/// `FT_MOONSHOT_INSTANCED_GLYPH_QUADS`). When *set* (any value, incl. empty),
+/// [`extract_delta`] runs the single-pass KMP overlap search; when *unset*
+/// (the shipping default) it runs the legacy nested-memchr quadratic search.
+const FT_MOONSHOT_DELTA_LINEAR_OVERLAP: &str = "FT_MOONSHOT_DELTA_LINEAR_OVERLAP";
+
+static DELTA_LINEAR_OVERLAP_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os(FT_MOONSHOT_DELTA_LINEAR_OVERLAP).is_some());
+
+/// Whether the `ingest.delta_linear_overlap` Q3 moonshot gate is enabled
+/// (default `false`). Read once from `FT_MOONSHOT_DELTA_LINEAR_OVERLAP`.
+#[must_use]
+pub fn delta_linear_overlap_enabled() -> bool {
+    *DELTA_LINEAR_OVERLAP_ENABLED
+}
+
+/// Test/bench entry point: run [`extract_delta`]'s logic with the overlap-search
+/// algorithm forced, bypassing the `ingest.delta_linear_overlap` gate. This lets
+/// the equivalence property test drive both arms in a single process.
+///
+/// `linear == false` is the shipping default (legacy quadratic nested-memchr
+/// search); `linear == true` is the Q3 single-pass KMP search. The two are proven
+/// byte-equivalent (identical [`DeltaResult`], including `reason` strings) for all
+/// `&str` inputs — see `proptest_ingest_delta_linear_overlap_equivalence`.
+#[doc(hidden)]
+#[must_use]
+pub fn extract_delta_with_overlap_mode(
+    previous: &str,
+    current: &str,
+    overlap_size: usize,
+    linear: bool,
+) -> DeltaResult {
     // FND-002 / MT8: per-frame self-time (no-op unless `hot-path-metrics`).
     let _hpt = crate::hot_path_metrics::HotPathTimer::start("ingest.extract_delta");
     if previous == current {
@@ -1847,6 +1885,33 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
     }
     let search_window = &previous[search_start..];
 
+    // Q3 moonshot (gate `ingest.delta_linear_overlap`, default off): a single-pass
+    // KMP longest-suffix(search_window)/prefix(current) match replaces the legacy
+    // nested-memchr + per-candidate slice-compare below. Both select the *same*
+    // maximal overlap length on valid UTF-8 (proof in `kmp_longest_overlap`), so the
+    // resulting `DeltaResult` — including every `reason` string — is byte-identical.
+    if linear {
+        return match kmp_longest_overlap(search_window.as_bytes(), current.as_bytes()) {
+            Some(overlap_len) => {
+                // `overlap_len` is always a `current` char boundary for a true
+                // byte-border (see `kmp_longest_overlap`), so this slice never panics.
+                let delta = &current[overlap_len..];
+                if delta.is_empty() {
+                    DeltaResult::Gap {
+                        reason: "content_changed_without_append".to_string(),
+                        content: current.to_string(),
+                    }
+                } else {
+                    DeltaResult::Content(delta.to_string())
+                }
+            }
+            None => DeltaResult::Gap {
+                reason: "overlap_not_found".to_string(),
+                content: current.to_string(),
+            },
+        };
+    }
+
     // Safety: current is known not to be empty from check above
     let first_char = current.as_bytes()[0];
 
@@ -1884,6 +1949,69 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
         reason: "overlap_not_found".to_string(),
         content: current.to_string(),
     }
+}
+
+/// Single-pass longest-suffix(`text`)/prefix(`pattern`) overlap length, computed
+/// with the Knuth–Morris–Pratt prefix-function. Returns the largest `L >= 1` such
+/// that `text[text.len() - L..] == pattern[..L]` (byte equality), or `None` when no
+/// non-empty overlap exists. Here `text` is the bounded `search_window` (a suffix of
+/// `previous`) and `pattern` is `current`.
+///
+/// Cost is `O(text.len() + min(text.len(), pattern.len()))` — a single forward pass —
+/// replacing the legacy `for pos in memchr_iter(..) { slice_compare }` loop whose worst
+/// case is `O(text.len() * pattern.len())` when the first byte repeats across the window.
+///
+/// # Byte-equivalence to the quadratic search
+///
+/// For valid UTF-8 inputs this returns *exactly* the overlap length the legacy loop
+/// selects, so the two `extract_delta` arms are observably identical:
+///
+/// * The legacy loop returns the first (smallest-`pos`, i.e. largest-`overlap_len`)
+///   memchr hit whose `search_window[pos..] == current[..overlap_len]`. That is the
+///   maximal byte-border — exactly what KMP's final automaton state encodes.
+/// * The loop's two char-boundary guards never exclude a true byte-border: the matched
+///   first byte is `current[0]`, always a UTF-8 *leading* byte, so `pos` lands on a
+///   `search_window` char boundary; and `current[..L]` shares its bytes with the valid
+///   `search_window[pos..]` suffix, so `current[..L]` is itself valid UTF-8 — i.e. `L`
+///   is a `current` char boundary. Both guards are therefore always satisfied for a real
+///   match, and the accepted set equals the set of byte-borders.
+fn kmp_longest_overlap(text: &[u8], pattern: &[u8]) -> Option<usize> {
+    // A border cannot exceed either operand; clamp the pattern to that bound. Any
+    // prefix of `current` long enough to be a suffix of `text` is `<= text.len()`.
+    let cap = text.len().min(pattern.len());
+    if cap == 0 {
+        return None;
+    }
+    let pat = &pattern[..cap];
+
+    // KMP prefix-function (failure links) of the clamped pattern.
+    let mut fail = vec![0usize; cap];
+    let mut k = 0usize;
+    for i in 1..cap {
+        while k > 0 && pat[i] != pat[k] {
+            k = fail[k - 1];
+        }
+        if pat[i] == pat[k] {
+            k += 1;
+        }
+        fail[i] = k;
+    }
+
+    // Stream `text` through the automaton. After the final byte, `state` is the length
+    // of the longest prefix of `pat` that is a suffix of `text` — the maximal overlap.
+    // The `state == cap` guard short-circuits before indexing `pat[cap]` (out of bounds)
+    // and falls back via the failure link, mirroring KMP occurrence resumption.
+    let mut state = 0usize;
+    for &b in text {
+        while state > 0 && (state == cap || pat[state] != b) {
+            state = fail[state - 1];
+        }
+        if state < cap && pat[state] == b {
+            state += 1;
+        }
+    }
+
+    if state == 0 { None } else { Some(state) }
 }
 
 // =============================================================================
