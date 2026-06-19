@@ -7,6 +7,9 @@ use config::HsbTransform;
 use frankenterm_core::instanced_cell::{
     CellAttributes, CellInstance, CursorFlags, INSTANCE_BYTES_PER_CELL,
 };
+use frankenterm_gui::glyph_quad_staging::{
+    GlyphQuadSoaBuffers, GlyphQuadStagingVertex, visit_expanded_glyph_quad_soa_vertices,
+};
 use window::bitmaps::TextureRect;
 use window::color::LinearRgba;
 
@@ -600,6 +603,30 @@ pub trait QuadAllocator {
 pub trait TripleLayerQuadAllocatorTrait {
     fn allocate(&mut self, layer_num: usize) -> anyhow::Result<QuadImpl<'_>>;
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]);
+
+    fn extend_with_glyph_quad_soa(&mut self, layer_num: usize, buffers: GlyphQuadSoaBuffers<'_>) {
+        if buffers.is_empty() {
+            return;
+        }
+
+        let mut vertices = Vec::with_capacity(buffers.len() * VERTICES_PER_CELL);
+        visit_expanded_glyph_quad_soa_vertices(buffers, |vertex| {
+            vertices.push(vertex_from_glyph_quad_staging(vertex));
+        });
+        self.extend_with(layer_num, &vertices);
+    }
+}
+
+fn vertex_from_glyph_quad_staging(vertex: GlyphQuadStagingVertex) -> Vertex {
+    Vertex {
+        position: vertex.position,
+        tex: vertex.tex,
+        fg_color: vertex.fg_color,
+        alt_color: vertex.alt_color,
+        hsv: vertex.hsv,
+        has_color: vertex.has_color,
+        mix_value: vertex.mix_value,
+    }
 }
 
 /// We prefer to allocate a quad at a time for HeapQuadAllocator
@@ -776,6 +803,13 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
         match self {
             Self::Gpu(b) => b.extend_with(layer_num, vertices),
             Self::Heap(h) => h.extend_with(layer_num, vertices),
+        }
+    }
+
+    fn extend_with_glyph_quad_soa(&mut self, layer_num: usize, buffers: GlyphQuadSoaBuffers<'_>) {
+        match self {
+            Self::Gpu(b) => b.extend_with_glyph_quad_soa(layer_num, buffers),
+            Self::Heap(h) => h.extend_with_glyph_quad_soa(layer_num, buffers),
         }
     }
 }

@@ -64,8 +64,7 @@ pub mod glyph_quad_staging {
             return false;
         }
 
-        cfg!(feature = "headless-render")
-            || std::env::var_os(FT_MOONSHOT_INSTANCED_GLYPH_QUADS).is_some()
+        std::env::var_os(FT_MOONSHOT_INSTANCED_GLYPH_QUADS).is_some()
     });
 
     #[must_use]
@@ -145,7 +144,7 @@ pub mod glyph_quad_staging {
             self.positions.is_empty()
         }
 
-        fn assert_consistent_lengths(&self) {
+        pub fn assert_consistent_lengths(&self) {
             let len = self.len();
             assert_eq!(self.tex_rects.len(), len, "tex rect staging length");
             assert_eq!(self.fg_colors.len(), len, "fg color staging length");

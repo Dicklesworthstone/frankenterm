@@ -1,4 +1,4 @@
-use crate::quad::{TripleLayerQuadAllocatorTrait, VERTICES_PER_CELL, Vertex};
+use crate::quad::{TripleLayerQuadAllocatorTrait, Vertex};
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, HsbTransform, WebGpuPowerPreference};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
@@ -24,7 +24,6 @@ use frankenterm_core::wayland_direct_scanout::{
 use frankenterm_gui::glyph_quad_staging::{
     GlyphQuadSoaBuffers, GlyphQuadStagingInstance, GlyphQuadStagingVertex,
     moonshot_instanced_glyph_quads_enabled as lib_moonshot_instanced_glyph_quads_enabled,
-    visit_expanded_glyph_quad_soa_vertices,
 };
 use std::cell::RefCell;
 use std::fmt;
@@ -43,10 +42,9 @@ const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runtime gate for the ft-3r0yk SoA glyph-quad experiment.
 ///
-/// `input_to_photon` is a `headless-render` bench, so that feature exercises the
-/// risky path centrally. Default GUI builds keep the classic direct-quad path
-/// unless explicitly opted in, and the disable env var gives operators an
-/// immediate fallback without a rebuild.
+/// Default GUI and headless-render builds keep the classic direct-quad path
+/// unless explicitly opted in through the env gate. The disable env var gives
+/// operators an immediate fallback without a rebuild.
 #[must_use]
 pub fn moonshot_instanced_glyph_quads_enabled() -> bool {
     lib_moonshot_instanced_glyph_quads_enabled()
@@ -147,38 +145,28 @@ impl GlyphQuadSoaBatch {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.positions.len()
-    }
-
-    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
 
-    pub fn extend_layer_as_expanded_vertices(
-        &self,
-        layers: &mut impl TripleLayerQuadAllocatorTrait,
-        layer_num: usize,
-    ) {
+    fn buffers(&self) -> GlyphQuadSoaBuffers<'_> {
+        GlyphQuadSoaBuffers {
+            positions: &self.positions,
+            tex_rects: &self.tex_rects,
+            fg_colors: &self.fg_colors,
+            alt_colors: &self.alt_colors,
+            hsv: &self.hsv,
+            has_color: &self.has_color,
+            mix_values: &self.mix_values,
+        }
+    }
+
+    pub fn extend_layer(&self, layers: &mut impl TripleLayerQuadAllocatorTrait, layer_num: usize) {
         if self.is_empty() {
             return;
         }
 
-        let mut vertices = Vec::with_capacity(self.len() * VERTICES_PER_CELL);
-        visit_expanded_glyph_quad_soa_vertices(
-            GlyphQuadSoaBuffers {
-                positions: &self.positions,
-                tex_rects: &self.tex_rects,
-                fg_colors: &self.fg_colors,
-                alt_colors: &self.alt_colors,
-                hsv: &self.hsv,
-                has_color: &self.has_color,
-                mix_values: &self.mix_values,
-            },
-            |vertex| vertices.push(vertex.into()),
-        );
-        layers.extend_with(layer_num, &vertices);
+        layers.extend_with_glyph_quad_soa(layer_num, self.buffers());
     }
 }
 
@@ -619,6 +607,54 @@ pub struct ShaderUniform {
     // sampler2D atlas_linear_sampler;
 }
 
+const GLYPH_QUAD_INSTANCE_POSITION_ATTRIBS: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![0 => Float32x4];
+const GLYPH_QUAD_INSTANCE_TEX_ATTRIBS: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![1 => Float32x4];
+const GLYPH_QUAD_INSTANCE_FG_ATTRIBS: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![2 => Float32x4];
+const GLYPH_QUAD_INSTANCE_ALT_ATTRIBS: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![3 => Float32x4];
+const GLYPH_QUAD_INSTANCE_HSV_ATTRIBS: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![4 => Float32x3];
+const GLYPH_QUAD_INSTANCE_HAS_COLOR_ATTRIBS: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![5 => Float32];
+const GLYPH_QUAD_INSTANCE_MIX_VALUE_ATTRIBS: [wgpu::VertexAttribute; 1] =
+    wgpu::vertex_attr_array![6 => Float32];
+
+fn glyph_quad_instance_buffer_layouts() -> [wgpu::VertexBufferLayout<'static>; 7] {
+    [
+        glyph_quad_instance_buffer_layout::<[f32; 4]>(&GLYPH_QUAD_INSTANCE_POSITION_ATTRIBS),
+        glyph_quad_instance_buffer_layout::<[f32; 4]>(&GLYPH_QUAD_INSTANCE_TEX_ATTRIBS),
+        glyph_quad_instance_buffer_layout::<[f32; 4]>(&GLYPH_QUAD_INSTANCE_FG_ATTRIBS),
+        glyph_quad_instance_buffer_layout::<[f32; 4]>(&GLYPH_QUAD_INSTANCE_ALT_ATTRIBS),
+        glyph_quad_instance_buffer_layout::<[f32; 3]>(&GLYPH_QUAD_INSTANCE_HSV_ATTRIBS),
+        glyph_quad_instance_buffer_layout::<f32>(&GLYPH_QUAD_INSTANCE_HAS_COLOR_ATTRIBS),
+        glyph_quad_instance_buffer_layout::<f32>(&GLYPH_QUAD_INSTANCE_MIX_VALUE_ATTRIBS),
+    ]
+}
+
+fn glyph_quad_instance_buffer_layout<T>(
+    attributes: &'static [wgpu::VertexAttribute],
+) -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<T>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes,
+    }
+}
+
+pub struct WebGpuGlyphQuadInstanceBuffers {
+    pub positions: wgpu::Buffer,
+    pub tex_rects: wgpu::Buffer,
+    pub fg_colors: wgpu::Buffer,
+    pub alt_colors: wgpu::Buffer,
+    pub hsv: wgpu::Buffer,
+    pub has_color: wgpu::Buffer,
+    pub mix_values: wgpu::Buffer,
+    pub instance_count: u32,
+}
+
 pub struct WebGpuState {
     pub adapter_info: wgpu::AdapterInfo,
     pub downlevel_caps: wgpu::DownlevelCapabilities,
@@ -628,6 +664,7 @@ pub struct WebGpuState {
     pub config: RefCell<wgpu::SurfaceConfiguration>,
     pub dimensions: RefCell<Dimensions>,
     pub render_pipeline: wgpu::RenderPipeline,
+    pub glyph_quad_instance_render_pipeline: Option<wgpu::RenderPipeline>,
     shader_uniform_buffer: wgpu::Buffer,
     shader_uniform_bind_group: wgpu::BindGroup,
     #[allow(dead_code)]
@@ -1436,6 +1473,48 @@ impl WebGpuState {
             cache: None,
         });
 
+        let glyph_quad_instance_render_pipeline =
+            moonshot_instanced_glyph_quads_enabled().then(|| {
+                let glyph_quad_instance_buffer_layouts = glyph_quad_instance_buffer_layouts();
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Instanced Glyph Quad Render Pipeline"),
+                    layout: Some(&render_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_instanced_glyph_main"),
+                        buffers: &glyph_quad_instance_buffer_layouts,
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: 1,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    multiview_mask: None,
+                    cache: None,
+                })
+            });
+
         Ok(Self {
             adapter_info,
             downlevel_caps,
@@ -1445,6 +1524,7 @@ impl WebGpuState {
             config: RefCell::new(config),
             dimensions: RefCell::new(dimensions),
             render_pipeline,
+            glyph_quad_instance_render_pipeline,
             shader_uniform_buffer,
             shader_uniform_bind_group,
             handle,
@@ -1458,6 +1538,60 @@ impl WebGpuState {
     pub fn update_uniform(&self, uniform: ShaderUniform) {
         self.queue
             .write_buffer(&self.shader_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    pub fn create_glyph_quad_instance_buffers(
+        &self,
+        buffers: GlyphQuadSoaBuffers<'_>,
+    ) -> Option<WebGpuGlyphQuadInstanceBuffers> {
+        if buffers.is_empty() {
+            return None;
+        }
+
+        buffers.assert_consistent_lengths();
+        let instance_count = u32::try_from(buffers.len()).expect("glyph instance count fits u32");
+
+        Some(WebGpuGlyphQuadInstanceBuffers {
+            positions: self.create_glyph_quad_instance_buffer(
+                "Glyph Quad Instance Positions",
+                buffers.positions,
+            ),
+            tex_rects: self.create_glyph_quad_instance_buffer(
+                "Glyph Quad Instance Texture Rects",
+                buffers.tex_rects,
+            ),
+            fg_colors: self.create_glyph_quad_instance_buffer(
+                "Glyph Quad Instance FG Colors",
+                buffers.fg_colors,
+            ),
+            alt_colors: self.create_glyph_quad_instance_buffer(
+                "Glyph Quad Instance Alt Colors",
+                buffers.alt_colors,
+            ),
+            hsv: self.create_glyph_quad_instance_buffer("Glyph Quad Instance HSV", buffers.hsv),
+            has_color: self.create_glyph_quad_instance_buffer(
+                "Glyph Quad Instance Has Color",
+                buffers.has_color,
+            ),
+            mix_values: self.create_glyph_quad_instance_buffer(
+                "Glyph Quad Instance Mix Values",
+                buffers.mix_values,
+            ),
+            instance_count,
+        })
+    }
+
+    fn create_glyph_quad_instance_buffer<T: bytemuck::Pod>(
+        &self,
+        label: &'static str,
+        values: &[T],
+    ) -> wgpu::Buffer {
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                usage: wgpu::BufferUsages::VERTEX,
+                contents: bytemuck::cast_slice(values),
+            })
     }
 
     pub fn shader_uniform_bind_group(&self) -> &wgpu::BindGroup {

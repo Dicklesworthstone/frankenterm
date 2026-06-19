@@ -10,6 +10,16 @@ struct VertexInput {
     @location(6) mix_value: f32,
 };
 
+struct GlyphQuadInstanceInput {
+    @location(0) position: vec4<f32>,
+    @location(1) tex: vec4<f32>,
+    @location(2) fg_color: vec4<f32>,
+    @location(3) alt_color: vec4<f32>,
+    @location(4) hsv: vec3<f32>,
+    @location(5) has_color: f32,
+    @location(6) mix_value: f32,
+};
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex: vec2<f32>,
@@ -82,6 +92,31 @@ fn vs_main(
     out.has_color = model.has_color;
     out.fg_color = mix(model.fg_color, model.alt_color, model.mix_value);
     out.clip_position = uniforms.projection * vec4<f32>(model.position, 0.0, 1.0);
+    return out;
+}
+
+@vertex
+fn vs_instanced_glyph_main(
+    model: GlyphQuadInstanceInput,
+    @builtin(vertex_index) vertex_index: u32,
+) -> VertexOutput {
+    let is_right = vertex_index == 1u || vertex_index == 3u;
+    let is_bottom = vertex_index >= 2u;
+    let position = vec2<f32>(
+        select(model.position.x, model.position.z, is_right),
+        select(model.position.y, model.position.w, is_bottom),
+    );
+    let tex = vec2<f32>(
+        select(model.tex.x, model.tex.y, is_right),
+        select(model.tex.z, model.tex.w, is_bottom),
+    );
+
+    var out: VertexOutput;
+    out.tex = tex;
+    out.hsv = model.hsv;
+    out.has_color = model.has_color;
+    out.fg_color = mix(model.fg_color, model.alt_color, model.mix_value);
+    out.clip_position = uniforms.projection * vec4<f32>(position, 0.0, 1.0);
     return out;
 }
 

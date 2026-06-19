@@ -150,6 +150,27 @@ impl crate::TermWindow {
         for layer in render_state.layers.borrow().iter() {
             for idx in 0..3 {
                 let vb = &layer.vb.borrow()[idx];
+                {
+                    let glyph_instances = vb.current_glyph_quad_instances();
+                    if !glyph_instances.is_empty() {
+                        if let (Some(glyph_quad_instance_render_pipeline), Some(instance_buffers)) = (
+                            webgpu.glyph_quad_instance_render_pipeline.as_ref(),
+                            webgpu.create_glyph_quad_instance_buffers(glyph_instances.buffers()),
+                        ) {
+                            render_pass.set_pipeline(glyph_quad_instance_render_pipeline);
+                            render_pass.set_vertex_buffer(0, instance_buffers.positions.slice(..));
+                            render_pass.set_vertex_buffer(1, instance_buffers.tex_rects.slice(..));
+                            render_pass.set_vertex_buffer(2, instance_buffers.fg_colors.slice(..));
+                            render_pass.set_vertex_buffer(3, instance_buffers.alt_colors.slice(..));
+                            render_pass.set_vertex_buffer(4, instance_buffers.hsv.slice(..));
+                            render_pass.set_vertex_buffer(5, instance_buffers.has_color.slice(..));
+                            render_pass.set_vertex_buffer(6, instance_buffers.mix_values.slice(..));
+                            render_pass.draw(0..4, 0..instance_buffers.instance_count);
+                            render_pass.set_pipeline(&webgpu.render_pipeline);
+                        }
+                    }
+                }
+
                 let (vertex_count, index_count) = vb.vertex_index_count();
                 if vertex_count > 0 {
                     let mut vertices = vb.current_vb_mut();

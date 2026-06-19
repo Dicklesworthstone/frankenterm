@@ -757,7 +757,7 @@ impl crate::TermWindow {
         }
 
         if let Some(glyph_quad_batch) = glyph_quad_batch {
-            glyph_quad_batch.extend_layer_as_expanded_vertices(layers, 1);
+            glyph_quad_batch.extend_layer(layers, 1);
         }
 
         if let Some(overlay_images) = overlay_images {

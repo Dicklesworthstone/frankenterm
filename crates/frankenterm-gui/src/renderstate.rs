@@ -13,6 +13,9 @@ use ::window::*;
 use anyhow::Context;
 use frankenterm_core::{atlas_tier_doctor::TierSwapDoctorReport, atlas_tiered_swap::MemoryBudget};
 use frankenterm_font::FontConfiguration;
+use frankenterm_gui::glyph_quad_staging::{
+    GlyphQuadSoaBuffers, GlyphQuadStagingVertex, visit_expanded_glyph_quad_soa_vertices,
+};
 use frankenterm_gui::owner_last_guard::OwnerLastGuardedMapping;
 use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryInto;
@@ -268,6 +271,61 @@ pub struct MappedQuads<'a> {
     mapping: MappedVertexBuffer,
     next: RefMut<'a, usize>,
     capacity: usize,
+    glyph_quad_instances: RefMut<'a, WebGpuGlyphQuadSoaStaging>,
+}
+
+#[derive(Debug, Default)]
+pub struct WebGpuGlyphQuadSoaStaging {
+    positions: Vec<[f32; 4]>,
+    tex_rects: Vec<[f32; 4]>,
+    fg_colors: Vec<[f32; 4]>,
+    alt_colors: Vec<[f32; 4]>,
+    hsv: Vec<[f32; 3]>,
+    has_color: Vec<f32>,
+    mix_values: Vec<f32>,
+}
+
+impl WebGpuGlyphQuadSoaStaging {
+    fn clear(&mut self) {
+        self.positions.clear();
+        self.tex_rects.clear();
+        self.fg_colors.clear();
+        self.alt_colors.clear();
+        self.hsv.clear();
+        self.has_color.clear();
+        self.mix_values.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.positions.len()
+    }
+
+    pub fn buffers(&self) -> GlyphQuadSoaBuffers<'_> {
+        GlyphQuadSoaBuffers {
+            positions: &self.positions,
+            tex_rects: &self.tex_rects,
+            fg_colors: &self.fg_colors,
+            alt_colors: &self.alt_colors,
+            hsv: &self.hsv,
+            has_color: &self.has_color,
+            mix_values: &self.mix_values,
+        }
+    }
+
+    fn extend_from_buffers(&mut self, buffers: GlyphQuadSoaBuffers<'_>) {
+        buffers.assert_consistent_lengths();
+        self.positions.extend_from_slice(buffers.positions);
+        self.tex_rects.extend_from_slice(buffers.tex_rects);
+        self.fg_colors.extend_from_slice(buffers.fg_colors);
+        self.alt_colors.extend_from_slice(buffers.alt_colors);
+        self.hsv.extend_from_slice(buffers.hsv);
+        self.has_color.extend_from_slice(buffers.has_color);
+        self.mix_values.extend_from_slice(buffers.mix_values);
+    }
 }
 
 pub struct WebGpuMappedVertexBuffer {
@@ -397,9 +455,41 @@ impl<'a> QuadAllocator for MappedQuads<'a> {
     }
 }
 
+impl MappedQuads<'_> {
+    pub fn extend_with_glyph_quad_soa(&mut self, buffers: GlyphQuadSoaBuffers<'_>) {
+        if buffers.is_empty() {
+            return;
+        }
+
+        if matches!(self.mapping, MappedVertexBuffer::WebGpu(_)) && *self.next == 0 {
+            self.glyph_quad_instances.extend_from_buffers(buffers);
+            return;
+        }
+
+        let mut vertices = Vec::with_capacity(buffers.len() * VERTICES_PER_CELL);
+        visit_expanded_glyph_quad_soa_vertices(buffers, |vertex| {
+            vertices.push(vertex_from_glyph_quad_staging(vertex));
+        });
+        self.extend_with(&vertices);
+    }
+}
+
+fn vertex_from_glyph_quad_staging(vertex: GlyphQuadStagingVertex) -> Vertex {
+    Vertex {
+        position: vertex.position,
+        tex: vertex.tex,
+        fg_color: vertex.fg_color,
+        alt_color: vertex.alt_color,
+        hsv: vertex.hsv,
+        has_color: vertex.has_color,
+        mix_value: vertex.mix_value,
+    }
+}
+
 pub struct TripleVertexBuffer {
     pub index: RefCell<usize>,
     pub bufs: RefCell<[VertexBuffer; 3]>,
+    glyph_quad_instances: RefCell<[WebGpuGlyphQuadSoaStaging; 3]>,
     pub indices: IndexBuffer,
     pub capacity: usize,
     pub next_quad: RefCell<usize>,
@@ -455,6 +545,9 @@ unsafe impl<'a, T: ?Sized + ::window::glium::buffer::Content + 'static> ExtendSt
 impl TripleVertexBuffer {
     pub fn clear_quad_allocation(&self) {
         *self.next_quad.borrow_mut() = 0;
+        for instances in self.glyph_quad_instances.borrow_mut().iter_mut() {
+            instances.clear();
+        }
     }
 
     pub fn need_more_quads(&self) -> Option<usize> {
@@ -472,6 +565,15 @@ impl TripleVertexBuffer {
     }
 
     pub fn map(&self) -> MappedQuads<'_> {
+        let index = *self.index.borrow();
+        let mut glyph_quad_instances = unsafe {
+            RefMut::map(self.glyph_quad_instances.borrow_mut(), |instances| {
+                &mut instances[index]
+            })
+            .extend_lifetime()
+        };
+        glyph_quad_instances.clear();
+
         let mut bufs = self.current_vb_mut();
 
         // To map the vertex buffer, we need to hold a mutable reference to
@@ -512,6 +614,7 @@ impl TripleVertexBuffer {
             mapping,
             next: self.next_quad.borrow_mut(),
             capacity: self.capacity,
+            glyph_quad_instances,
         }
     }
 
@@ -519,6 +622,13 @@ impl TripleVertexBuffer {
         let index = *self.index.borrow();
         let bufs = self.bufs.borrow_mut();
         unsafe { RefMut::map(bufs, |bufs| &mut bufs[index]).extend_lifetime() }
+    }
+
+    pub fn current_glyph_quad_instances(&self) -> Ref<'_, WebGpuGlyphQuadSoaStaging> {
+        let index = *self.index.borrow();
+        Ref::map(self.glyph_quad_instances.borrow(), |instances| {
+            &instances[index]
+        })
     }
 
     pub fn next_index(&self) {
@@ -609,6 +719,9 @@ impl RenderLayer {
                 context.allocate_vertex_buffer(num_quads, &verts)?,
                 context.allocate_vertex_buffer(num_quads, &verts)?,
             ]),
+            glyph_quad_instances: RefCell::new(std::array::from_fn(|_| {
+                WebGpuGlyphQuadSoaStaging::default()
+            })),
             capacity: num_quads,
             indices: context.allocate_index_buffer(&indices)?,
             next_quad: RefCell::new(0),
@@ -632,6 +745,10 @@ impl TripleLayerQuadAllocatorTrait for BorrowedLayers {
 
     fn extend_with(&mut self, layer_num: usize, vertices: &[Vertex]) {
         self.layers[layer_num].extend_with(vertices)
+    }
+
+    fn extend_with_glyph_quad_soa(&mut self, layer_num: usize, buffers: GlyphQuadSoaBuffers<'_>) {
+        self.layers[layer_num].extend_with_glyph_quad_soa(buffers)
     }
 }
 
