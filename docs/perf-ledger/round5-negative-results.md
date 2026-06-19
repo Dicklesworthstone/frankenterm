@@ -35,6 +35,27 @@ non-regressed. Until then Q1 ships default-off (zero-risk) with this 32.5× deep
 
 ---
 
+### 2026-06-19 | M9 PID fleet-memory + S3-FIFO eviction — bench measures compute, NOT the quality metric
+
+**Status:** measured-no-win-on-current-bench (both stay default-off, zero-risk; NOT reverted). The
+round-5 benches (8eef1f001) measure the controller/eviction **compute cost**, not the **quality metric**
+each flag exists to improve, so neither can be adjudicated as a win yet.
+**Measurement:** M9 `memory_pid_dampening`: hysteresis 87.6µs vs pid 78.6µs (PID compute −10% — but its
+purpose is reduced evicted-bytes / reclaim oscillation, which the bench does not capture). S3-FIFO
+`lfucache_s3fifo`: lfu 2.64ms vs s3fifo 5.09ms (S3-FIFO is **2× the per-op compute cost** — and its
+purpose, scan-resistant hit-rate at equal capacity, is not captured). The bench `budget` strings name
+the intended `pressure_replay` / `scan_heavy_hit_rate` outcomes but the bench bodies only time the ops.
+**Retry-condition predicate (Form 7):** Retry only if a bench reports the actual QUALITY metric on the
+right workload above the legacy baseline by a Mann-Whitney-significant margin — for S3-FIFO, **hit-rate
+at equal capacity on a scan-heavy one-hit-wonder access trace** above LFU; for M9, **elevated-tier
+evicted-bytes and reclaim-target oscillation on a memory-pressure replay** below the hysteresis baseline.
+Until such a quality-metric bench exists (tracked as a P3 follow-up bead), both flags ship default-off on
+their round-4 correctness proofs. (S3-FIFO's 2× compute cost makes default-on actively wrong absent a
+hit-rate win that pays for it.)
+**Rollback:** n/a (default-off, never promoted).
+
+---
+
 _(round-5 measured-no-win / reject / revert entries land below as A/B runs complete on the quiet host.
 M6 persistent COW grid stays governed by its round-4 entry until the E1 concurrent-search bench produces
 contention evidence; E2 will either escalate M6 or refresh that entry here with the measured numbers.)_

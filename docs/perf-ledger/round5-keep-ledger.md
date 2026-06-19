@@ -34,8 +34,8 @@ both from one run); `metric≠ns` = win is hit-rate/bytes/delay, adjudicate the 
 | M5 MPHF dispatch | feature patterns-mphf-dispatch | gate-toggle (high-AC-hit) | A1P (.4) new | _pending_ | _pending_ |
 | M7 predictive cadence | config ingest.cadence_model=predictive | gate-toggle + metric≠ns (captures) | A2W (.6)/tailer | _pending_ | _pending_ |
 | M8 adaptive M/G/1 | config storage.group_commit=adaptive | gate-toggle (WAL CV-high burst) | A2W (.6) wire | _pending_ | _pending_ |
-| M9 PID fleet-memory | config memory.dampening=pid | metric≠ns (evicted-bytes/flap) | A1S (.5) new | _pending_ | _pending_ |
-| S3-FIFO eviction | config cache.eviction=s3fifo | metric≠ns (hit-rate) | A1S (.5) new | _pending_ | _pending_ |
+| M9 PID fleet-memory | config memory.dampening=pid | metric≠ns (evicted-bytes/flap) | memory_pid_dampening (8eef1f001) | compute −10% (87.6→78.6µs); **quality metric not captured by bench** | default-off; needs evicted-bytes bench (Form 7) |
+| S3-FIFO eviction | config cache.eviction=s3fifo | metric≠ns (hit-rate) | lfucache_s3fifo (8eef1f001) | compute **2× LFU** (2.64→5.09ms); **hit-rate not captured** | default-off; needs hit-rate bench (Form 7) |
 | Shiryaev-Roberts | config bocpd.detector=shiryaev_roberts | metric≠ns (detection delay/ARL) | B2 (.9) wire | _pending_ | _pending_ |
 | min-plus latency cert | config telemetry.latency_envelope | no-A/B (Form 6 observability) | — | N/A | confirm structural |
 | RS cold-tier erasure | config storage.cold.erasure=rs | no-A/B (Form 6 robustness) | — | N/A | confirm structural |
