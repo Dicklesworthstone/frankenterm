@@ -138,3 +138,23 @@ _(tick entries appended by the orchestrator tend-loop)_
   FrankenTerm-darwin-arm64.app.tar.xz (34M) + ft-darwin-arm64.tar.xz (10M) + ft-linux-amd64.tar.xz (16M)
   in /tmp/ft-v080-release. Awaiting arm64 → scp + tarball → SHA256SUMS → gh release create v0.8.0.
   LEARNING: trj has a global CARGO_TARGET_DIR; cross + host builds MUST use separate target dirs.
+
+## CONVERGENCE — v0.8.0 RELEASED (2026-06-20)
+
+https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.8.0 — published, tag/commit 310534f5d.
+Assets: darwin-arm64 (FrankenTerm.app + ft) + linux-amd64 (ft) + per-asset .sha256 + SHA256SUMS, all
+checksum-verified; install.sh asset names match. **ft-linux-arm64 deferred** to a follow-up `gh release
+upload` (cross-build crawling on a load-42 shared trj — shipped the ready platforms rather than block).
+
+**Final scorecard — 19 round-4 flags adjudicated, 0 default-on promotions:**
+- KEEP-measured (default-off): Q1 **32.5×** deep-scroll, M4 **19×** dedup, Q4 +2% clean.
+- No-win/regression (default-off): Q5 +0.5%, Q6 +8.8% slower, M5 +69% slower, M9 compute-only, S3-FIFO 2× cost.
+- M6 **KILLED** with measured sub-µs lock-contention evidence.
+- Default-off+Form7: Q2/Q3/M1/M2/M3/M7/M8/SR (SR also got a real correctness bug fixed).
+- Structural no-A/B: min-plus, RS-erasure, ft-perf-gate.
+
+**6 new default-off optimizations** (D1/D2/EV1-EV4) + hygiene (GUI hang, mTLS test split, SR detector bug).
+Threads A/B/C/D/E/F all done. Round-6 follow-ups: attach ft-linux-arm64 asset; prove-pending EV1 .18/EV3
+.21/EV4 .22 + .6 storage benches; quality-metric benches (M9/S3-FIFO/etc.); promote Q1 after a quiet-Mac
+cv≤5 re-run. Honest headline: **algorithmic wins (Q1/M4) deliver; systems-moonshots largely do not — and
+we know because we measured.**

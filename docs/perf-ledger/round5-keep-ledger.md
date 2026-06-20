@@ -115,3 +115,12 @@ proofs (the ROI lift vs round-4: these are fresh, not re-measurements):
 - **EV3** blocked/rank-select scrollback pages (`f026fa808`, .21) — succinct offset sidecar.
 - **EV4** set-based FTS catch-up batcher (.22, in progress) — INSERT…SELECT deferred-FTS sync.
 _(A/B quantification of the new ideas is a round-6 item — they ship default-off + byte-equiv-proven.)_
+
+## CONVERGENCE — v0.8.0 RELEASED 2026-06-20 (tag 310534f5d)
+
+19 round-4 flags adjudicated, **0 default-on promotions** (confirmed appropriately default-off); 3 measured
+keeps (Q1 32.5×, M4 19×, Q4 +2%); 5 measured no-win/regression (Q5/Q6/M5/M9/S3-FIFO); M6 killed with
+evidence; 8 default-off+Form7; 3 structural. 6 new default-off ideas (D1/D2/EV1-EV4) + GUI/mTLS/bocpd
+hygiene. Released darwin-arm64 + linux-amd64 (ft-linux-arm64 to follow). See
+[`round5-negative-results.md`](round5-negative-results.md) +
+[`../../tests/artifacts/perf/v080-round5-campaign.md`](../../tests/artifacts/perf/v080-round5-campaign.md).
