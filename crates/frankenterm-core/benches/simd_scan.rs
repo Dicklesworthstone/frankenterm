@@ -88,6 +88,27 @@ fn payload_binary_like(size: usize) -> Vec<u8> {
     out
 }
 
+fn payload_mixed_moderate(size: usize) -> Vec<u8> {
+    // Realistic agent/CLI output: plain text with ONE inline ANSI color span per
+    // line (a colored status word) — moderate ANSI density (~12% ESC bytes),
+    // between plain (0%) and the vim-saturated `payload_ansi_heavy` (~40%+). This
+    // is the B0 "representative-mixed" shape: real agent panes are moderate-ANSI,
+    // not escape-saturated.
+    const PREFIX: &[u8] = b"build ";
+    const COLORED: &[u8] = b"\x1b[32mOK\x1b[0m"; // green "OK" (9 ANSI bytes)
+    const BODY: &[u8] = b" module compiled in 17ms, 0 warnings, cache hit ratio 0.94";
+
+    let mut out = Vec::with_capacity(size);
+    while out.len() < size {
+        out.extend_from_slice(PREFIX);
+        out.extend_from_slice(COLORED);
+        out.extend_from_slice(BODY);
+        out.push(b'\n');
+    }
+    out.truncate(size);
+    out
+}
+
 fn payload_dense_logs(size: usize) -> Vec<u8> {
     // Mostly-ASCII operator logs with frequent newlines and sparse ANSI tags.
     const LINE_PREFIX: &[u8] = b"2026-02-24T09:15:42.123Z INFO pane=42 ";
@@ -300,17 +321,35 @@ fn bench_chunked_stateful_scan(c: &mut Criterion) {
 
 fn bench_ansi_dfa_table_round5(c: &mut Criterion) {
     let mut group = c.benchmark_group("simd_scan_ansi_dfa_table_round5");
-    let payload = payload_ansi_heavy(2 * 1024 * 1024);
-    group.throughput(Throughput::Bytes(payload.len() as u64));
 
-    group.bench_function("ansi_dense_2m", |b| {
-        b.iter(|| {
-            let metrics = scan_newlines_and_ansi(black_box(&payload));
-            black_box(ansi_dfa_table_enabled());
-            black_box(metrics.ansi_byte_count);
-            black_box(metrics.newline_count);
+    // Density × frame-size matrix for the M1 ANSI-DFA-table A/B. The feature gates
+    // `scan_newlines_and_ansi`'s impl (baseline SIMD/SWAR+FSM vs DFA-table lookup),
+    // so each id is one A/B point. `ansi_dense_*` = vim-saturated worst case;
+    // `mixed_moderate_*` = realistic agent output (B0 representative-mixed). The
+    // `*_10k` sizes match the ~10KB realistic per-captured-segment frame (B0
+    // ~9.8µs); the `*_2m` sizes are size-matched throughput stressors.
+    const SAT_2M: usize = 2 * 1024 * 1024;
+    const REALISTIC_10K: usize = 10 * 1024;
+
+    let cases: [(&str, Vec<u8>); 5] = [
+        ("ansi_dense_2m", payload_ansi_heavy(SAT_2M)),
+        ("mixed_moderate_2m", payload_mixed_moderate(SAT_2M)),
+        ("ansi_dense_10k", payload_ansi_heavy(REALISTIC_10K)),
+        ("mixed_moderate_10k", payload_mixed_moderate(REALISTIC_10K)),
+        ("plain_10k", payload_plain(REALISTIC_10K)),
+    ];
+
+    for (id, payload) in &cases {
+        group.throughput(Throughput::Bytes(payload.len() as u64));
+        group.bench_function(*id, |b| {
+            b.iter(|| {
+                let metrics = scan_newlines_and_ansi(black_box(payload));
+                black_box(ansi_dfa_table_enabled());
+                black_box(metrics.ansi_byte_count);
+                black_box(metrics.newline_count);
+            });
         });
-    });
+    }
 
     group.finish();
 }
