@@ -114,3 +114,12 @@ _(tick entries appended by the orchestrator tend-loop)_
   (commit code-first + STOP). Release plan: settle tree → verify HEAD compiles → bump 0.7.0→0.8.0 → build
   9 assets (darwin local + linux trj) → gh release. Thread A deliverable COMPLETE (19 adjudicated, 0
   promotions); Thread B code deliverable (B1 split) shipped, full-run-in-one-SSH is a round-6 infra item.
+- 2026-06-19 tend#10 (RELEASE BUILDING) — BOTH gates GREEN: compile gate `Finished` 3m44s no real errors
+  (tree + folded-in Codex WIP compiles); bocpd B2 proof 88 passed/0 failed on RCH vmi1227854 (validates
+  the SR bug fix + that full --lib COMPILES). Closed .8 (B1 split), .9 (B2 bocpd), .4 (patterns benches).
+  Operator chose INCLUDE the foreign Codex-upgrade WIP → committed fe1ce4141 (compiles green). Bumped
+  0.7.0→0.8.0 (310534f5d), pushed main + master. Launched all 3 release build lanes: darwin-arm64 local
+  (3 bins, fat-LTO ~3h) + linux amd64 native (trj) + linux arm64 cross (trj, aarch64-linux-gnu-gcc). trj
+  pulled clean to v0.8.0 (stashed its .beads churn). Threads A/B/C/D/E DONE; F building. Remaining proof-
+  pending (non-blocking, default-off): .6 storage benches, EV1 .18/EV3 .21/EV4 .22. Next: harvest builds
+  → assemble 9 assets → gh release v0.8.0 → verify → memory.
