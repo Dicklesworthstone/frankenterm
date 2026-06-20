@@ -107,3 +107,17 @@ _(tick entries appended by the orchestrator tend-loop)_
   C2 lane-split marked code-done/proof-deferred (tree compiles; RCH stalls are infra, not a release
   blocker). Q1 default-on proof still compiling (cold core build, vmi1152480). scan_pipeline flagged for
   dead-code removal (hygiene, not perf).
+- 2026-06-20 tend#5 — **M1 ANSI-DFA REGRESSION (2nd flagship refuted).** cc_2: the branchless DFA table is
+  SLOWER than the existing vectorized SWAR scan on the live simd_scan/BOCPD ANSI frame; a serial table
+  can't beat vectorization → negative-results Form-7. **Thread B new-mining is exhausted** (B1 dead-code,
+  M1 regression, Q3 below-gate, M3 no-win, Bloom low-EV) — confirming the hot paths are mature (round-5
+  finding holds). **Term-path A/Bs (cod_2) adjudicated:** `.13` clustered ASCII line materialization
+  **−77.43% = 4.43× CERTIFIED KEEP** (the profiled bulk-ASCII idea paid off), D1 parser-batch 1.47× +
+  EV1 row-writer 1.16× (small clean wins, low-cv term benches), D2 CSI/OSC table 1.04% no-win. **Q1
+  promotion SAFE:** the two `--lib` failures (wezterm CLI-blindness telemetry, session_restore replay) are
+  UNRELATED to prefix_index — mux-telemetry + antigravity-tree contamination (the ft-ch3nm meta-blocker,
+  same class as round-5's full-lib failures); targeted `proptest_scrollback_prefix_index` proof running for
+  clean confirmation. cod_5 closed C2 code-done/proof-deferred. cod_1 re-running EV3/adaptive-CDC A/Bs
+  locally; cc_1 reporting `detect_with_context` profile. **CERTIFIED ROUND-6 WINS:** Q1 20× (default-on),
+  EV4 6-14× (default-on cand), .13 4.43× (default-on cand) + D1/EV1 small. Approaching v0.9.0 cut (arm64
+  build deferred to the bumped release commit).

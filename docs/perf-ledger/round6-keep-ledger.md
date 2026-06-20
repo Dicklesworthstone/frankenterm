@@ -81,6 +81,27 @@ check + a lower-cv re-run on dc01bd950's clean bench.
 
 **Rollback:** env default-off; `git revert`.
 
+### 2026-06-20 | ft-p4vzl.13 / .7 | Term-path dense-ASCII A/B — .13 clustered-line 4.43× KEEP; D1 1.47×, EV1 1.16× (small clean)
+
+**Status:** KEEP (.13 large-effect; D1/EV1 small clean wins). Default-off; term benches have clean cv (~1-1.3%).
+
+**Measurements (local Mac, `term_parser_ab/terminal/dense_ascii_rows`):**
+- **.13 clustered ASCII line materialization (`FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND`): −77.43% = 4.43×**
+  — large-effect KEEP. Avoids per-byte `Cell::new`/`set_cell_impl`/`ClusteredLine::append` for a
+  contiguous width-1 ASCII run with stable attrs (targets `flush_print` 1.64%, B0 gate-cleared).
+- **D1 parser printable-run batching: −32.19% = 1.47×** — real small-moderate win (clean cv).
+- **EV1 bulk-ASCII row writer: −13.98% = 1.16×** — small clean win.
+- (D2 CSI/OSC table: −4.25% = no win → round6-negative-results.md.)
+
+**Behavior-preservation:** byte-equivalence oracles (cod_2): .13 cluster-run == per-cell materialization
+(RCH green vmi1227854); D1 `parse_as_vec` equivalence; EV1 row-fill golden.
+
+**A/B verdict:** .13 KEEP (4.43× ≥2×); D1/EV1 small clean keeps. They stack on the term-render dense-ASCII
+path. **Default-on candidate:** .13 (+ D1/EV1 stack) for the moonshot-recommended set — byte-equivalent
+term-render dense-ASCII win — pending a mixed-content render non-regression check.
+
+**Rollback:** feature/env default-off; `git revert`.
+
 ---
 
 _(Further KEEP-and-promote entries land above this line with a full same-run-window proof card. Flags that

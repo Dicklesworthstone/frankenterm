@@ -137,4 +137,23 @@ realistic CPU hot-frame list.
 `webgpu.rs:1545` attributes ≥0.5% frame-time to vertex-buffer create/bind/upload (discrete-GPU backend, or
 far higher glyph-per-frame density than this bench).
 
+### 2026-06-20 | ft-p4vzl M1 | ANSI-DFA branchless table (simd_scan) — measured REGRESSION
+
+**Status:** measured-regression (cc_2, 809180c6d density×size matrix). On the LIVE `simd_scan` ANSI scan
+(called per captured segment via BOCPD, `runtime.rs:3758`), the branchless DFA-table `ansi_state_step_table`
+is SLOWER than the existing `ansi_state_step` (baseline mean 2.03 ms, cv 12%; candidate slower across the
+density×frame-size matrix). A serial state-table cannot beat the vectorized SWAR marker-scan the current
+code already uses. B0's "ANSI byte processing dominates the capture scan" insight is real, but the existing
+scan is already well-optimized — this win class is exhausted. Default-off (feature `ansi-dfa-table`).
+**Retry (Form 7):** retry only on a target where the SIMD/SWAR vectorized scan path is unavailable (a
+serial table only wins when vectorization is absent).
+
+### 2026-06-20 | ft-p4vzl.7 | D2 table-driven CSI/OSC dispatch — no win (1.04×)
+
+**Status:** within-noise no-win. `term_parser_ab/terminal/csi_osc_heavy`: −4.25% = 1.04× — below the 2× bar
+and small. The 256-entry CSI table + OSC fast decoder does not beat the existing match-based dispatch at
+this escape-sequence density. Default-off (`FT_MOONSHOT_PARSER_TABLE_DISPATCH`).
+**Retry (Form 7):** retry only if a CSI/OSC-saturated workload (far higher escape density than this bench)
+shows the table dispatch above noise; at this density the match dispatch is as fast.
+
 _(round-6 measured-no-win / reject / revert entries land below, one per the rejected-entry template.)_
