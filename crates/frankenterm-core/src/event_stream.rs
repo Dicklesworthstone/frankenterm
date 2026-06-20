@@ -591,7 +591,7 @@ impl EventWaiter {
         // on — looping on could time out forever on a one-shot condition whose
         // event was in the dropped window. Mirrors the ft-ubuw2 StreamItem::Gap.
         enum WaitRecvOutcome {
-            Matched(Event),
+            Matched(Box<Event>),
             Lagged(u64),
             Ended,
         }
@@ -604,14 +604,16 @@ impl EventWaiter {
                         match subscriber.recv_cx(cx).await {
                             Ok(event) => {
                                 if filter.matches_event(&event) && tracker.check(&event) {
-                                    return WaitRecvOutcome::Matched(event);
+                                    return WaitRecvOutcome::Matched(Box::new(event));
                                 }
                             }
                             Err(crate::events::RecvError::Lagged { missed_count }) => {
                                 return WaitRecvOutcome::Lagged(missed_count);
                             }
-                            Err(crate::events::RecvError::Cancelled)
-                            | Err(crate::events::RecvError::Closed) => {
+                            Err(
+                                crate::events::RecvError::Cancelled
+                                | crate::events::RecvError::Closed,
+                            ) => {
                                 return WaitRecvOutcome::Ended;
                             }
                         }
@@ -621,14 +623,15 @@ impl EventWaiter {
                     match subscriber.recv_cx(cx).await {
                         Ok(event) => {
                             if filter.matches_event(&event) && condition.matches(&event) {
-                                return WaitRecvOutcome::Matched(event);
+                                return WaitRecvOutcome::Matched(Box::new(event));
                             }
                         }
                         Err(crate::events::RecvError::Lagged { missed_count }) => {
                             return WaitRecvOutcome::Lagged(missed_count);
                         }
-                        Err(crate::events::RecvError::Cancelled)
-                        | Err(crate::events::RecvError::Closed) => {
+                        Err(
+                            crate::events::RecvError::Cancelled | crate::events::RecvError::Closed,
+                        ) => {
                             return WaitRecvOutcome::Ended;
                         }
                     }
@@ -638,7 +641,7 @@ impl EventWaiter {
 
         match crate::runtime_async::timeout_with_cx(cx, timeout, recv_loop).await {
             Ok(WaitRecvOutcome::Matched(event)) => WaitResult::Matched {
-                event: Box::new(event),
+                event,
                 elapsed_ms: start.elapsed().as_millis() as u64,
             },
             // No silent gaps: a lag means the awaited event may have been dropped,

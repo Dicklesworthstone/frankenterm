@@ -1126,8 +1126,11 @@ impl PidReclaimController {
 
         // Anti-windup via conditional integration: tentatively integrate, then
         // back off if the tentative output is saturated in the same direction.
-        let proposed_integral = self.integral + error * dt;
-        let unsaturated = cfg.kp * error + cfg.ki * proposed_integral + cfg.kd * derivative;
+        let proposed_integral = error.mul_add(dt, self.integral);
+        let unsaturated = cfg.kd.mul_add(
+            derivative,
+            cfg.ki.mul_add(proposed_integral, cfg.kp * error),
+        );
         let saturating_up = unsaturated > cfg.out_max && error > 0.0;
         let saturating_down = unsaturated < cfg.out_min && error < 0.0;
         if !(saturating_up || saturating_down) {
@@ -1139,7 +1142,9 @@ impl PidReclaimController {
             self.integral = self.integral.clamp(-integral_bound, integral_bound);
         }
 
-        let output = (cfg.kp * error + cfg.ki * self.integral + cfg.kd * derivative)
+        let output = cfg
+            .kd
+            .mul_add(derivative, cfg.ki.mul_add(self.integral, cfg.kp * error))
             .clamp(cfg.out_min, cfg.out_max);
 
         self.prev_error = error;

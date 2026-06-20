@@ -556,7 +556,7 @@ fn gear_table() -> &'static [u64; 256] {
     TABLE.get_or_init(|| {
         let mut t = [0u64; 256];
         let mut s = 0x2545_F491_4F6C_DD1D_u64;
-        for slot in t.iter_mut() {
+        for slot in &mut t {
             s ^= s << 13;
             s ^= s >> 7;
             s ^= s << 17;
@@ -735,8 +735,8 @@ impl TieredScrollback {
     /// `prefix_index = false` is the default behavior (legacy linear walk).
     /// `true` enables the incrementally-maintained cumulative line-count prefix
     /// + binary-search resolution in [`Self::locate_offset`] /
-    /// [`Self::tier_for_offset`]. Observable behavior is identical either way
-    /// (proven byte-equivalent); the flag only changes the resolution cost.
+    ///   [`Self::tier_for_offset`]. Observable behavior is identical either way
+    ///   (proven byte-equivalent); the flag only changes the resolution cost.
     ///
     /// CDC dedup is taken from the `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` env gate;
     /// use [`Self::new_with_options`] to choose both gates explicitly.

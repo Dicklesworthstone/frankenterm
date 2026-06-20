@@ -117,6 +117,8 @@ impl Default for BocpdDetectorKind {
 }
 
 impl BocpdDetectorKind {
+    // Serde's `skip_serializing_if` callback receives `&T`.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn is_bocpd(&self) -> bool {
         matches!(self, Self::Bocpd)
     }
@@ -430,7 +432,8 @@ impl BocpdModel {
         let null_ll = pred_log_liks.get(map).copied()?;
         let ss = self.sufficient_stats.get(map)?;
         let scale_sq = ss.beta * (ss.kappa + 1.0) / (ss.alpha * ss.kappa);
-        if !(scale_sq > 0.0) || !scale_sq.is_finite() {
+        if scale_sq.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) || !scale_sq.is_finite()
+        {
             return None;
         }
         let shift = SR_MIN_SHIFT_SIGMA * scale_sq.sqrt();

@@ -1854,15 +1854,17 @@ impl ConnectorOutboundBridge {
                     .with_timestamp_ms(now_ms)
                     .with_action(event.source, action.action_kind);
                     match classifier.classify_event(&canonical) {
-                        Ok(classified) => {
+                        Ok(classified_event) => {
                             let decision = match classifier.find_policy(&action.target_connector) {
-                                Some(policy) => classifier.ingestion_decision(&classified, policy),
+                                Some(policy) => {
+                                    classifier.ingestion_decision(&classified_event, policy)
+                                }
                                 None => IngestionDecision::Accept,
                             };
                             if matches!(decision, IngestionDecision::AcceptRedacted) {
                                 let redacted = classifier.redact_event_with_decision(
                                     &canonical,
-                                    &classified,
+                                    &classified_event,
                                     decision.clone(),
                                 );
                                 Some((decision, Some(redacted.event.payload)))
@@ -1878,8 +1880,8 @@ impl ConnectorOutboundBridge {
             };
             match classification {
                 None
-                | Some((IngestionDecision::Accept, _))
-                | Some((IngestionDecision::AcceptRedacted, None)) => {}
+                | Some((IngestionDecision::Accept | IngestionDecision::AcceptRedacted, None)) => {}
+                Some((IngestionDecision::Accept, Some(_))) => {}
                 Some((IngestionDecision::AcceptRedacted, Some(redacted_payload))) => {
                     action.params = redacted_payload;
                 }

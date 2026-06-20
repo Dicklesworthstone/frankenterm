@@ -368,15 +368,19 @@ fn invert_erasure_matrix(
         }
 
         let pivot_row = augmented[column];
-        for row in 0..COLD_ERASURE_DATA_SHARDS {
+        for (row, row_values) in augmented
+            .iter_mut()
+            .enumerate()
+            .take(COLD_ERASURE_DATA_SHARDS)
+        {
             if row == column {
                 continue;
             }
-            let factor = augmented[row][column];
+            let factor = row_values[column];
             if factor == 0 {
                 continue;
             }
-            for (target, pivot_value) in augmented[row].iter_mut().zip(pivot_row.iter()) {
+            for (target, pivot_value) in row_values.iter_mut().zip(pivot_row.iter()) {
                 *target = gf_add(*target, gf_mul(factor, *pivot_value));
             }
         }

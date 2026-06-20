@@ -193,12 +193,12 @@ impl LatencyEnvelopeCertificate {
         stages: Vec<StageServiceCurve>,
     ) -> Result<Self, LatencyEnvelopeError> {
         let composed_service = compose_stage_services(&stages)?;
-        let end_to_end_bound_ms = delay_bound(arrival, composed_service).ok_or(
+        let end_to_end_bound_ms = delay_bound(arrival, composed_service).ok_or_else(|| {
             LatencyEnvelopeError::UnstablePipeline {
                 arrival_rate: arrival.rate(),
                 service_rate: composed_service.rate(),
-            },
-        )?;
+            }
+        })?;
 
         Ok(Self {
             arrival,
@@ -478,7 +478,10 @@ pub fn adversarial_arrival_replay(
 
     let mut burst_watermark = 0.0_f64;
     let mut burst_remaining = burst;
-    while burst_remaining > REPLAY_EPSILON_MS {
+    loop {
+        if burst_remaining <= REPLAY_EPSILON_MS {
+            break;
+        }
         let work = burst_remaining.min(unit_work);
         burst_watermark += work;
         burst_remaining -= work;
@@ -516,7 +519,7 @@ fn sample_with_delay(
     capture_at_ms: f64,
     delay_ms: f64,
 ) -> Result<LatencyEnvelopeSample, LatencyEnvelopeError> {
-    let storage_at_ms = capture_at_ms + delay_ms * 0.5;
+    let storage_at_ms = delay_ms.mul_add(0.5, capture_at_ms);
     let index_at_ms = capture_at_ms + delay_ms;
     LatencyEnvelopeSample::new(capture_at_ms, storage_at_ms, index_at_ms)
 }

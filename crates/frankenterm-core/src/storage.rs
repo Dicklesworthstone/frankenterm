@@ -1247,7 +1247,10 @@ impl AdaptiveGroupCommitController {
         }
         // Service-time squared coefficient of variation (P-K variability term).
         let scv = {
-            let var = (self.service_m2 - self.service_mean * self.service_mean).max(0.0);
+            let var = self
+                .service_mean
+                .mul_add(-self.service_mean, self.service_m2)
+                .max(0.0);
             if self.service_mean > 0.0 {
                 (var / (self.service_mean * self.service_mean)).clamp(0.0, ADAPTIVE_SCV_CAP)
             } else {
@@ -1255,7 +1258,7 @@ impl AdaptiveGroupCommitController {
             }
         };
         // Pollaczek-Khinchine M/G/1 mean queue wait.
-        let wq = (rho / (1.0 - rho)) * ((1.0 + scv) / 2.0) * svc;
+        let wq = (rho / (1.0 - rho)) * f64::midpoint(1.0, scv) * svc;
         // Linger no longer than the queue's own wait, and never beyond the park.
         let park_secs = self.park.as_secs_f64();
         let linger_secs = if wq.is_finite() {
@@ -1266,7 +1269,7 @@ impl AdaptiveGroupCommitController {
         let linger = std::time::Duration::from_secs_f64(linger_secs);
         // Little's law: the command that opened the batch plus expected arrivals
         // during the linger window. Clamp to [1, WRITER_BATCH_CAP].
-        let expected = 1.0 + lambda * linger_secs;
+        let expected = lambda.mul_add(linger_secs, 1.0);
         let batch_target = if expected.is_finite() {
             (expected.round() as i64).clamp(1, WRITER_BATCH_CAP as i64) as usize
         } else {
@@ -1314,10 +1317,11 @@ impl AdaptiveGroupCommitController {
             self.service_m2 = svc_per_cmd * svc_per_cmd;
         } else {
             let a = ADAPTIVE_EWMA_ALPHA;
-            self.arrival_rate = a * lambda_sample + (1.0 - a) * self.arrival_rate;
-            self.service_per_cmd = a * svc_per_cmd + (1.0 - a) * self.service_per_cmd;
-            self.service_mean = a * svc_per_cmd + (1.0 - a) * self.service_mean;
-            self.service_m2 = a * (svc_per_cmd * svc_per_cmd) + (1.0 - a) * self.service_m2;
+            let retain = 1.0 - a;
+            self.arrival_rate = retain.mul_add(self.arrival_rate, a * lambda_sample);
+            self.service_per_cmd = retain.mul_add(self.service_per_cmd, a * svc_per_cmd);
+            self.service_mean = retain.mul_add(self.service_mean, a * svc_per_cmd);
+            self.service_m2 = retain.mul_add(self.service_m2, a * (svc_per_cmd * svc_per_cmd));
         }
         self.samples = self.samples.saturating_add(1);
     }
@@ -2095,7 +2099,7 @@ impl StorageHandle {
         let (write_tx_raw, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
         let writer_wakeup = writer_blocking_recv.then(|| Arc::new(WriterWakeup::new()));
         let mut write_tx = WriteCommandSender::new(write_tx_raw, config.write_queue_size);
-        write_tx.wakeup = writer_wakeup.clone();
+        write_tx.wakeup.clone_from(&writer_wakeup);
         let queued_depth_for_writer = Arc::clone(&write_tx.queued_depth);
         let mmap_runtime_for_writer = mmap_runtime.clone();
         let writer_wakeup_for_writer = writer_wakeup;
@@ -8713,7 +8717,7 @@ fn writer_coalesce_kind(cmd: &WriteCommand, group_commit_events: bool) -> Writer
 /// `Ok`. A singleton group falls back to the byte-identical legacy raw dispatch.
 enum PendingEventOrGap {
     Event {
-        event: StoredEvent,
+        event: Box<StoredEvent>,
         respond: WriterResultResponder<i64>,
     },
     Gap {
@@ -8727,7 +8731,7 @@ impl PendingEventOrGap {
     fn into_write_command(self) -> WriteCommand {
         match self {
             PendingEventOrGap::Event { event, respond } => WriteCommand::RecordEvent {
-                event,
+                event: *event,
                 respond: respond.into_sender(),
             },
             PendingEventOrGap::Gap {
@@ -8748,7 +8752,7 @@ fn pending_event_or_gap_from_command(
 ) -> std::result::Result<PendingEventOrGap, Box<WriteCommand>> {
     match cmd {
         WriteCommand::RecordEvent { event, respond } => Ok(PendingEventOrGap::Event {
-            event,
+            event: Box::new(event),
             respond: WriterResultResponder::new(respond),
         }),
         WriteCommand::RecordGap {
@@ -10329,15 +10333,15 @@ mod writer_io_scheduler_tests {
             let (tx3, rx3) = oneshot::channel();
             let group = vec![
                 PendingEventOrGap::Event {
-                    event: sample_event(7, "r1", 1_700_000_000_000, Some("k1")),
+                    event: Box::new(sample_event(7, "r1", 1_700_000_000_000, Some("k1"))),
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Event {
-                    event: sample_event(7, "r2", 1_700_000_000_001, Some("k2")),
+                    event: Box::new(sample_event(7, "r2", 1_700_000_000_001, Some("k2"))),
                     respond: WriterResultResponder::new(tx2),
                 },
                 PendingEventOrGap::Event {
-                    event: sample_event(7, "r3", 1_700_000_000_002, Some("k3")),
+                    event: Box::new(sample_event(7, "r3", 1_700_000_000_002, Some("k3"))),
                     respond: WriterResultResponder::new(tx3),
                 },
             ];
@@ -10398,7 +10402,7 @@ mod writer_io_scheduler_tests {
             let (tx2, rx2) = oneshot::channel();
             let group = vec![
                 PendingEventOrGap::Event {
-                    event: sample_event(7, "r1", 1_700_000_000_000, Some("k1")),
+                    event: Box::new(sample_event(7, "r1", 1_700_000_000_000, Some("k1"))),
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Gap {
@@ -10407,7 +10411,7 @@ mod writer_io_scheduler_tests {
                     respond: WriterResultResponder::new(gtx),
                 },
                 PendingEventOrGap::Event {
-                    event: sample_event(7, "r2", 1_700_000_000_002, Some("k2")),
+                    event: Box::new(sample_event(7, "r2", 1_700_000_000_002, Some("k2"))),
                     respond: WriterResultResponder::new(tx2),
                 },
             ];
@@ -10463,11 +10467,11 @@ mod writer_io_scheduler_tests {
             let (tx2, rx2) = oneshot::channel();
             let group = vec![
                 PendingEventOrGap::Event {
-                    event: sample_event(9, "r1", 1_700_000_000_000, Some("k1")),
+                    event: Box::new(sample_event(9, "r1", 1_700_000_000_000, Some("k1"))),
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Event {
-                    event: sample_event(9, "r2", 1_700_000_000_001, Some("k2")),
+                    event: Box::new(sample_event(9, "r2", 1_700_000_000_001, Some("k2"))),
                     respond: WriterResultResponder::new(tx2),
                 },
             ];
@@ -10595,11 +10599,11 @@ mod writer_io_scheduler_tests {
             let (tx2, rx2) = oneshot::channel();
             let group = vec![
                 PendingEventOrGap::Event {
-                    event: sample_event(3, "r1", 1_700_000_000_000, Some("k1")),
+                    event: Box::new(sample_event(3, "r1", 1_700_000_000_000, Some("k1"))),
                     respond: WriterResultResponder::new(tx1),
                 },
                 PendingEventOrGap::Event {
-                    event: sample_event(3, "r2", 1_700_000_000_001, Some("k2")),
+                    event: Box::new(sample_event(3, "r2", 1_700_000_000_001, Some("k2"))),
                     respond: WriterResultResponder::new(tx2),
                 },
             ];
@@ -10645,7 +10649,7 @@ mod writer_io_scheduler_tests {
 
             let (tx, rx) = oneshot::channel();
             let mut pending = vec![PendingEventOrGap::Event {
-                event: sample_event(4, "r1", 1_700_000_000_000, Some("k1")),
+                event: Box::new(sample_event(4, "r1", 1_700_000_000_000, Some("k1"))),
                 respond: WriterResultResponder::new(tx),
             }];
             let mut mmap_mirror = None;

@@ -2067,7 +2067,7 @@ impl ObservationRuntime {
                             new = new_config.retention_tiers.len(),
                             "Retention tiers updated"
                         );
-                        retention_tiers = new_config.retention_tiers.clone();
+                        retention_tiers.clone_from(&new_config.retention_tiers);
                     }
                     if new_config.retention_max_mb != retention_max_mb {
                         info!(
