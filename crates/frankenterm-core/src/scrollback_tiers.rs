@@ -25,7 +25,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::byte_compression::{ByteCompressor, CompressionLevel};
 
@@ -220,9 +220,16 @@ pub struct TieredScrollback {
     /// chunks across pages (repeated prompts/redraws) are stored once,
     /// refcounted, and freed on eviction. `None` unless the
     /// `scrollback.cdc_dedup` gate (env `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP`, or
-    /// [`Self::new_with_options`]) is enabled. Default **off**; the off path is
+    /// [`Self::new_with_options`]) is enabled. The env gate also accepts
+    /// `adaptive`/`auto` to probe early pages and enable CDC only when
+    /// redundancy clears the cheap threshold. Default **off**; the off path is
     /// byte-for-byte the legacy standalone-zstd page.
     cdc: Option<CdcStore>,
+    /// CDC policy for future warm-page flushes. Kept separate from `cdc` so
+    /// adaptive mode can start without allocating the chunk store and create it
+    /// only after the probe decides the corpus is redundant enough.
+    cdc_mode: CdcDedupMode,
+    cdc_adaptive: CdcAdaptiveProbe,
     /// EV3 (round-5 gauntlet): split warm pages into independently compressed
     /// line blocks with a rank/select sidecar, and retain that sidecar after
     /// cold eviction so a target-line lookup can fetch only the target block.
@@ -547,6 +554,100 @@ impl CdcStore {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdcDedupMode {
+    Off,
+    Always,
+    Adaptive,
+}
+
+/// Number of flushed warm pages sampled before adaptive CDC makes its decision.
+const CDC_ADAPTIVE_PROBE_PAGES: usize = 8;
+/// Avoid enabling from a tiny one-page sample.
+const CDC_ADAPTIVE_MIN_PAGES: usize = 4;
+/// Enable CDC when sampled raw bytes are at least this many percent of unique
+/// chunk bytes. 150 means the probe observed roughly 1.5x or better redundancy.
+const CDC_ADAPTIVE_RATIO_THRESHOLD_X100: u64 = 150;
+
+#[derive(Debug, Default)]
+struct CdcAdaptiveProbe {
+    sampled_pages: usize,
+    raw_bytes: usize,
+    unique_chunk_bytes: usize,
+    seen_chunks: HashSet<u128>,
+    decision_made: bool,
+    enabled: bool,
+}
+
+/// Diagnostic snapshot for the M4 adaptive CDC probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdcAdaptiveSnapshot {
+    /// Number of flushed pages sampled.
+    pub sampled_pages: usize,
+    /// Raw `lines_to_bytes` bytes sampled.
+    pub raw_bytes: usize,
+    /// Bytes represented by unique sampled CDC chunks.
+    pub unique_chunk_bytes: usize,
+    /// `raw_bytes / unique_chunk_bytes * 100`, or `0` before any unique bytes.
+    pub ratio_x100: u64,
+    /// Whether the adaptive probe has made its final decision.
+    pub decision_made: bool,
+    /// Whether the final decision is to encode subsequent pages with CDC.
+    pub enabled: bool,
+}
+
+impl CdcAdaptiveProbe {
+    fn observe_page(&mut self, raw: &[u8]) -> bool {
+        if self.decision_made {
+            return self.enabled;
+        }
+
+        self.sampled_pages = self.sampled_pages.saturating_add(1);
+        self.raw_bytes = self.raw_bytes.saturating_add(raw.len());
+
+        for (start, end) in cdc_chunk_bounds(raw) {
+            let chunk = &raw[start..end];
+            if self.seen_chunks.insert(content_key_128(chunk)) {
+                self.unique_chunk_bytes = self.unique_chunk_bytes.saturating_add(chunk.len());
+            }
+        }
+
+        if self.sampled_pages >= CDC_ADAPTIVE_MIN_PAGES
+            && self.sampled_pages >= CDC_ADAPTIVE_PROBE_PAGES
+        {
+            self.decision_made = true;
+            self.enabled = self.ratio_x100() >= CDC_ADAPTIVE_RATIO_THRESHOLD_X100;
+            self.seen_chunks.clear();
+            self.seen_chunks.shrink_to_fit();
+        }
+
+        self.enabled
+    }
+
+    fn ratio_x100(&self) -> u64 {
+        if self.unique_chunk_bytes == 0 {
+            return 0;
+        }
+        ((self.raw_bytes as u128 * 100) / self.unique_chunk_bytes as u128).min(u64::MAX as u128)
+            as u64
+    }
+
+    fn snapshot(&self) -> CdcAdaptiveSnapshot {
+        CdcAdaptiveSnapshot {
+            sampled_pages: self.sampled_pages,
+            raw_bytes: self.raw_bytes,
+            unique_chunk_bytes: self.unique_chunk_bytes,
+            ratio_x100: self.ratio_x100(),
+            decision_made: self.decision_made,
+            enabled: self.enabled,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Deterministic 256-entry Gear table for content-defined chunking.
 ///
 /// Built once from a fixed xorshift seed so chunk boundaries — and therefore
@@ -722,10 +823,10 @@ impl TieredScrollback {
     /// [`Self::new_with_all_options`] for a deterministic, env-free opt-in).
     #[must_use]
     pub fn new(config: ScrollbackConfig) -> Self {
-        Self::new_with_all_options(
+        Self::new_with_cdc_mode(
             config,
             prefix_index_enabled_from_env(),
-            cdc_dedup_enabled_from_env(),
+            cdc_dedup_mode_from_env(),
             blocked_page_index_enabled_from_env(),
         )
     }
@@ -742,10 +843,10 @@ impl TieredScrollback {
     /// use [`Self::new_with_options`] to choose both gates explicitly.
     #[must_use]
     pub fn new_with_prefix_index(config: ScrollbackConfig, prefix_index: bool) -> Self {
-        Self::new_with_all_options(
+        Self::new_with_cdc_mode(
             config,
             prefix_index,
-            cdc_dedup_enabled_from_env(),
+            cdc_dedup_mode_from_env(),
             blocked_page_index_enabled_from_env(),
         )
     }
@@ -766,6 +867,16 @@ impl TieredScrollback {
     #[must_use]
     pub fn new_with_options(config: ScrollbackConfig, prefix_index: bool, cdc_dedup: bool) -> Self {
         Self::new_with_all_options(config, prefix_index, cdc_dedup, false)
+    }
+
+    /// Create a tiered scrollback with adaptive CDC explicitly enabled.
+    ///
+    /// Hidden diagnostic/test entry point for the round-6 M4 promotion work.
+    /// Production uses the same mode via `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP=adaptive`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_adaptive_cdc(config: ScrollbackConfig, prefix_index: bool) -> Self {
+        Self::new_with_cdc_mode(config, prefix_index, CdcDedupMode::Adaptive, false)
     }
 
     /// Create a tiered scrollback with EV3 blocked-page indexing explicitly set.
@@ -793,8 +904,27 @@ impl TieredScrollback {
         cdc_dedup: bool,
         blocked_page_index: bool,
     ) -> Self {
+        let cdc_mode = if cdc_dedup {
+            CdcDedupMode::Always
+        } else {
+            CdcDedupMode::Off
+        };
+        Self::new_with_cdc_mode(config, prefix_index, cdc_mode, blocked_page_index)
+    }
+
+    fn new_with_cdc_mode(
+        config: ScrollbackConfig,
+        prefix_index: bool,
+        cdc_mode: CdcDedupMode,
+        blocked_page_index: bool,
+    ) -> Self {
         let config = config.sanitized();
         let compressor = ByteCompressor::new(config.compression);
+        let cdc_mode = if blocked_page_index {
+            CdcDedupMode::Off
+        } else {
+            cdc_mode
+        };
         Self {
             config,
             compressor,
@@ -814,11 +944,13 @@ impl TieredScrollback {
             } else {
                 None
             },
-            cdc: if cdc_dedup && !blocked_page_index {
+            cdc: if cdc_mode == CdcDedupMode::Always {
                 Some(CdcStore::default())
             } else {
                 None
             },
+            cdc_mode,
+            cdc_adaptive: CdcAdaptiveProbe::default(),
             blocked_page_index,
         }
     }
@@ -1170,6 +1302,16 @@ impl TieredScrollback {
             .map(|cdc| (cdc.chunks.len(), cdc.total_compressed))
     }
 
+    /// Diagnostic: M4 adaptive CDC probe state, or `None` when the instance is
+    /// not in adaptive mode. Hidden from public docs; exposed so the proof and
+    /// A/B benches can assert when the cheap redundancy probe stayed off or
+    /// crossed the auto-enable threshold.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cdc_adaptive_snapshot(&self) -> Option<CdcAdaptiveSnapshot> {
+        (self.cdc_mode == CdcDedupMode::Adaptive).then(|| self.cdc_adaptive.snapshot())
+    }
+
     /// Diagnostic: is EV3 blocked-page indexing enabled for newly flushed warm
     /// pages? Hidden from public docs; exposed for byte-equivalence proof code
     /// and A/B benches.
@@ -1263,6 +1405,7 @@ impl TieredScrollback {
         if let Some(cdc) = self.cdc.as_mut() {
             cdc.clear();
         }
+        self.cdc_adaptive.reset();
         self.republish_prefix_seq();
     }
 
@@ -1376,6 +1519,14 @@ impl TieredScrollback {
 
     // ── Internal ──────────────────────────────────────────────────────
 
+    fn should_use_cdc_for_page(&mut self, raw: &[u8]) -> bool {
+        match self.cdc_mode {
+            CdcDedupMode::Off => false,
+            CdcDedupMode::Always => true,
+            CdcDedupMode::Adaptive => self.cdc_adaptive.observe_page(raw),
+        }
+    }
+
     /// Flush the oldest `page_size` lines from hot tier into a compressed warm page.
     fn flush_hot_page(&mut self) {
         let page_size = self.config.page_size;
@@ -1395,16 +1546,19 @@ impl TieredScrollback {
         // gate is on; otherwise the existing CDC/plain representations are
         // unchanged. Each arm records only bytes owned by this instance in
         // `warm_bytes`.
-        let compressor = &self.compressor;
         let (data, added_compressed) = if self.blocked_page_index {
+            let compressor = &self.compressor;
             let blocked = BlockedPage::from_lines(&page_lines, compressor)
                 .expect("non-empty page should produce a blocked representation");
             let len = blocked.compressed_len();
             (PageData::Blocked(blocked), len)
-        } else if let Some(cdc) = self.cdc.as_mut() {
+        } else if self.should_use_cdc_for_page(&raw) {
+            let compressor = &self.compressor;
+            let cdc = self.cdc.get_or_insert_with(CdcStore::default);
             let (recipe, added) = cdc.intern_page(&raw, compressor);
             (PageData::Cdc(recipe), added)
         } else {
+            let compressor = &self.compressor;
             let compressed = compressor.compress(&raw);
             let len = compressed.len();
             (PageData::Plain(compressed), len)
@@ -1491,13 +1645,31 @@ fn prefix_index_enabled_from_env() -> bool {
     env_flag_enabled("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX")
 }
 
-/// Whether the M4 `scrollback.cdc_dedup` gate is enabled via the environment.
+/// M4 `scrollback.cdc_dedup` mode selected via the environment.
 ///
-/// Default **off**: only `1`/`true`/`yes`/`on` (case-insensitive) on
-/// `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` enable CDC dedup of warm pages, mirroring
-/// the existing `FT_MOONSHOT_*` gating convention.
-fn cdc_dedup_enabled_from_env() -> bool {
-    env_flag_enabled("FT_MOONSHOT_SCROLLBACK_CDC_DEDUP")
+/// Default **off**. Existing truthy values (`1`/`true`/`yes`/`on`) preserve the
+/// round-5 always-on CDC behavior, while `adaptive`/`auto`/`probe` enable the
+/// round-6 cheap redundancy probe before allocating the CDC store.
+fn cdc_dedup_mode_from_env() -> CdcDedupMode {
+    if ft_moonshot_all_enabled() {
+        return CdcDedupMode::Always;
+    }
+    std::env::var("FT_MOONSHOT_SCROLLBACK_CDC_DEDUP")
+        .ok()
+        .map(|v| {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("adaptive")
+                || v.eq_ignore_ascii_case("auto")
+                || v.eq_ignore_ascii_case("probe")
+            {
+                CdcDedupMode::Adaptive
+            } else if env_flag_value_enabled(v) {
+                CdcDedupMode::Always
+            } else {
+                CdcDedupMode::Off
+            }
+        })
+        .unwrap_or(CdcDedupMode::Off)
 }
 
 /// Whether the EV3 blocked-page index gate is enabled via the environment.
@@ -1515,21 +1687,28 @@ fn blocked_page_index_enabled_from_env() -> bool {
 /// routed through this helper enables at once. Default-off / revert-safe — with
 /// no env set, behavior is unchanged.
 fn env_flag_enabled(var: &str) -> bool {
-    fn is_truthy(v: &str) -> bool {
-        let v = v.trim();
-        v == "1"
-            || v.eq_ignore_ascii_case("true")
-            || v.eq_ignore_ascii_case("yes")
-            || v.eq_ignore_ascii_case("on")
-    }
-    if std::env::var("FT_MOONSHOT_ALL")
-        .ok()
-        .map(|v| is_truthy(&v))
-        .unwrap_or(false)
-    {
+    if ft_moonshot_all_enabled() {
         return true;
     }
-    std::env::var(var).ok().map(|v| is_truthy(&v)).unwrap_or(false)
+    std::env::var(var)
+        .ok()
+        .map(|v| env_flag_value_enabled(&v))
+        .unwrap_or(false)
+}
+
+fn ft_moonshot_all_enabled() -> bool {
+    std::env::var("FT_MOONSHOT_ALL")
+        .ok()
+        .map(|v| env_flag_value_enabled(&v))
+        .unwrap_or(false)
+}
+
+fn env_flag_value_enabled(v: &str) -> bool {
+    let v = v.trim();
+    v == "1"
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("yes")
+        || v.eq_ignore_ascii_case("on")
 }
 
 // =============================================================================
@@ -3019,11 +3198,19 @@ mod tests {
         }
         assert!(sb.warm_page_count() > 0);
 
-        let page = sb.warm.back_mut().expect("fixture should have warm pages");
-        let PageData::Blocked(blocked) = &mut page.data else {
-            panic!("fixture should use blocked page data");
+        let Some(page) = sb.warm.back_mut() else {
+            assert!(false, "fixture should have warm pages");
+            return;
         };
-        blocked.index.raw_lens[0] = blocked.index.raw_lens[0].saturating_add(1);
+        let PageData::Blocked(blocked) = &mut page.data else {
+            assert!(false, "fixture should use blocked page data");
+            return;
+        };
+        let Some(first_raw_len) = blocked.index.raw_lens.first_mut() else {
+            assert!(false, "fixture should have at least one block");
+            return;
+        };
+        *first_raw_len = (*first_raw_len).saturating_add(1);
 
         assert!(
             sb.warm_page_lines(0).is_none(),
@@ -3156,6 +3343,107 @@ mod tests {
         );
     }
 
+    fn low_redundancy_line(i: usize) -> String {
+        let mut x = (i as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0xD1B5_4A32_D192_ED03);
+        let mut out = format!("unique-scrollback-line-{i:05}:");
+        for _ in 0..48 {
+            out.push(' ');
+            out.push_str(&format!("{x:016x}"));
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+        }
+        out
+    }
+
+    fn repeated_cdc_line(i: usize) -> String {
+        format!(
+            "redraw-slot-{} :: {} :: stable prompt block :: {}",
+            i % 8,
+            "TERM-RENDER-STATE ".repeat(24),
+            "same-bytes-across-pages ".repeat(16)
+        )
+    }
+
+    #[test]
+    fn cdc_adaptive_stays_plain_for_low_redundancy() {
+        let config = ScrollbackConfig {
+            hot_lines: 8,
+            page_size: 8,
+            warm_max_bytes: usize::MAX,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: false,
+        };
+        let mut adaptive = TieredScrollback::new_with_adaptive_cdc(config.clone(), false);
+        let mut legacy = TieredScrollback::new_with_options(config, false, false);
+
+        for i in 0..240usize {
+            let line = low_redundancy_line(i);
+            adaptive.push_line(line.clone());
+            legacy.push_line(line);
+        }
+
+        let snapshot = adaptive
+            .cdc_adaptive_snapshot()
+            .expect("adaptive mode should expose a probe snapshot");
+        assert!(snapshot.decision_made, "probe must make a final decision");
+        assert!(
+            !snapshot.enabled,
+            "low-redundancy corpus should stay on plain pages: {snapshot:?}"
+        );
+        assert!(
+            adaptive.cdc_stats().is_none(),
+            "adaptive mode must not allocate CDC store when probe rejects"
+        );
+        assert_eq!(warm_dump(&adaptive), warm_dump(&legacy));
+        assert_eq!(
+            adaptive.warm_total_bytes(),
+            legacy.warm_total_bytes(),
+            "rejected adaptive mode should keep the legacy plain representation"
+        );
+    }
+
+    #[test]
+    fn cdc_adaptive_enables_on_redundant_pages() {
+        let config = ScrollbackConfig {
+            hot_lines: 8,
+            page_size: 8,
+            warm_max_bytes: usize::MAX,
+            compression: CompressionLevel::Fast,
+            cold_eviction_enabled: false,
+        };
+        let mut adaptive = TieredScrollback::new_with_adaptive_cdc(config.clone(), false);
+        let mut legacy = TieredScrollback::new_with_options(config, false, false);
+
+        for i in 0..640usize {
+            let line = repeated_cdc_line(i);
+            adaptive.push_line(line.clone());
+            legacy.push_line(line);
+        }
+
+        let snapshot = adaptive
+            .cdc_adaptive_snapshot()
+            .expect("adaptive mode should expose a probe snapshot");
+        assert!(snapshot.decision_made, "probe must make a final decision");
+        assert!(
+            snapshot.enabled,
+            "redundant corpus should auto-enable CDC: {snapshot:?}"
+        );
+        assert!(
+            adaptive.cdc_stats().is_some(),
+            "adaptive mode should allocate CDC store after accepting"
+        );
+        assert_eq!(warm_dump(&adaptive), warm_dump(&legacy));
+        assert!(
+            adaptive.warm_total_bytes() < legacy.warm_total_bytes(),
+            "adaptive CDC should shrink redundant warm bytes: adaptive={} legacy={}",
+            adaptive.warm_total_bytes(),
+            legacy.warm_total_bytes()
+        );
+    }
+
     /// Resident (warm oldest→newest, then hot) lines, decoded.
     fn resident_lines(sb: &TieredScrollback) -> Vec<String> {
         let mut out = Vec::new();
@@ -3219,6 +3507,10 @@ mod tests {
         if std::env::var_os("FT_MOONSHOT_SCROLLBACK_CDC_DEDUP").is_none() {
             let sb = TieredScrollback::new(small_config());
             assert!(sb.cdc_stats().is_none(), "cdc dedup must default off");
+            assert!(
+                sb.cdc_adaptive_snapshot().is_none(),
+                "adaptive CDC must also default off"
+            );
         }
     }
 }

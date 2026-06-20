@@ -616,6 +616,14 @@ name = "scrollback_prefix_index"
 harness = false
 
 [[bench]]
+name = "scrollback_cdc_adaptive"
+harness = false
+
+[[bench]]
+name = "scrollback_ev3_cold_line"
+harness = false
+
+[[bench]]
 name = "memory_pid_dampening"
 harness = false
 
