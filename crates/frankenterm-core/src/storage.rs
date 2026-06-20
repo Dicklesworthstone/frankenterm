@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
@@ -18602,6 +18602,11 @@ const FTS_INDEX_VERSION: u32 = 1;
 /// of silently trusting a partially rebuilt index.
 const FTS_INDEX_REBUILD_PENDING_VERSION: u32 = 0;
 const FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV: &str = "FT_MOONSHOT_FTS_INSERT_SELECT_BATCH";
+const FTS_INSERT_SELECT_BATCH_OVERRIDE_INHERIT: u8 = 0;
+const FTS_INSERT_SELECT_BATCH_OVERRIDE_DISABLED: u8 = 1;
+const FTS_INSERT_SELECT_BATCH_OVERRIDE_ENABLED: u8 = 2;
+static FTS_INSERT_SELECT_BATCH_OVERRIDE_FOR_BENCH: AtomicU8 =
+    AtomicU8::new(FTS_INSERT_SELECT_BATCH_OVERRIDE_INHERIT);
 
 #[derive(Debug, Clone, Copy)]
 struct FtsInsertSelectBatchOutcome {
@@ -18861,7 +18866,21 @@ fn insert_fts_entry_backend(backend: &dyn StorageBackend, segment: &Segment) -> 
 }
 
 fn fts_insert_select_batch_enabled() -> bool {
-    storage_env_flag_enabled(FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV)
+    match FTS_INSERT_SELECT_BATCH_OVERRIDE_FOR_BENCH.load(AtomicOrdering::Relaxed) {
+        FTS_INSERT_SELECT_BATCH_OVERRIDE_DISABLED => false,
+        FTS_INSERT_SELECT_BATCH_OVERRIDE_ENABLED => true,
+        _ => storage_env_flag_enabled(FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV),
+    }
+}
+
+#[doc(hidden)]
+pub fn set_fts_insert_select_batch_override_for_bench(enabled: Option<bool>) {
+    let value = match enabled {
+        Some(false) => FTS_INSERT_SELECT_BATCH_OVERRIDE_DISABLED,
+        Some(true) => FTS_INSERT_SELECT_BATCH_OVERRIDE_ENABLED,
+        None => FTS_INSERT_SELECT_BATCH_OVERRIDE_INHERIT,
+    };
+    FTS_INSERT_SELECT_BATCH_OVERRIDE_FOR_BENCH.store(value, AtomicOrdering::Relaxed);
 }
 
 fn fts_insert_select_batch_summary_sql(include_from_zero: bool) -> &'static str {
