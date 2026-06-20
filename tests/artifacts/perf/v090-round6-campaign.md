@@ -42,3 +42,34 @@ _(tick entries appended by the orchestrator tend-loop)_
 
 - 2026-06-20 — campaign opened. Beads DB healthy (orphaned write.lock cleared). Round-6 ledgers + this
   record + marching orders authored. Swarm alive (8 panes; cod idle post-round-5, cc context-heavy → /clear).
+- 2026-06-20 tend#1 — strong wave-1: 7 commits. B0 profiling harness + A5 quality-metric harness landed
+  (cc_3, f84382411); adaptive-CDC + Q1 shallow-arm + EV3 cold-line benches (cod_1, 27a1c063a); Q3 KMP
+  forced-A/B bench (cc_2, 2b3265e16); SoA GPU frame bench (cod_4, 8e137a2ec); term/parser A/B benches
+  (cod_2, eb5839016); C2 native-events lane split (cod_5, edb754945). **FLAGSHIP B1 REFUTED with hard
+  evidence** (cc_1, 0a6574848): the marching-orders target (scan_pipeline `trigger_data_buffer` re-scan)
+  is DEAD CODE (0 non-test refs → 0% self-time); the live cross-chunk path `detect_with_context` re-scans
+  only a bounded 2048 B tail (sub-µs, prefilter-gated); the streaming-AC lever is infeasible with
+  aho-corasick (no resumable LeftmostFirst API). Negative-ledger Form-1 entry + evidence bench landed.
+  RCH-E410s across cod_2/cod_3/cod_5 were TRANSIENT mid-commit races (files now committed; cc_3's core
+  build compiles past manifest resolution on hz2 → confirms RCH syncs the untracked antigravity files
+  too) → rerouted those panes to retry. cod_4's GUI bench can't build on RCH (RCH-E307 x11-xcb absent,
+  known round-5 limit) → reassigned to the local Mac GUI stack. 12/12 RCH workers healthy. B4 audit
+  (cod_5) flagged a real residual: native push still starts the legacy capture supervisor +
+  `TailerSupervisor::spawn_ready` 10 ms scan — profile-gate via B0 before filing a child bead. Launched
+  the Q1 promotion A/B locally (deep ≥2× polarity check + shallow non-regression gate; /tmp/ft-r6-q1-ab.log).
+  Doc reality-gap: README §Cross-chunk-subtlety (1828-1830) describes the dead `trigger_data_buffer` as
+  the production cross-chunk engine — the live engine is `detect_with_context`'s `tail_buffer`.
+- 2026-06-20 tend#2 — **Q1 PROMOTED to default-on** (headline): local A/B cleared the gate —
+  `deep_scroll_locate_offset` **20.18×** (−95.04%, cv 1.43%, p=0) AND `shallow_hot_locate_offset`
+  **+0.72%** (non-regression, < 3% ratchet); cv≤5 this run so no longer cv-blocked. Keep-card landed
+  (round6-keep-ledger.md); cod_1 dispatched to flip `scrollback.prefix_index` default false→true + RCH
+  equivalence proof. Wave-2 commits: B0 gate-robustness fix (cc_3 1568a9d74), EV4 deferred-FTS bench
+  (cod_3 3bf7b0630), Q3 common-case guard arm (cc_2 c33668fcc), GUI bench WGPU-29 compile fix (cod_4
+  579f29622). cod_2 DONE .7 (term_parser_ab green on vmi1149989); B1 closed (cc_1, refuted). **INFRA:**
+  broken ovh workers (display-named `yto`/`fmd`, the round-5 "ovh-a/ovh-b") kept being selected
+  (canonical-mkdir topology fail; cc_1 ate a 20m cold build pinned to one) — the daemon `disable` API
+  rejects the display names (registry mismatch), but they are priority-80 vs contabo 90-100 / hz 110, so
+  retry-to-reroute is the mitigation. cod_5 rerouted to retry; cod_2/cod_4/cc_1 sent to profile-gated B5
+  mining (cod_4 target: per-frame GPU buffer create/bind screen_line.rs:464→draw.rs:158→webgpu.rs:1545;
+  cc_1: Bloom quick-reject anchor_lengths inner loop). B0 flamegraphs still building (cc_3). NEXT: run
+  local A/Bs on term_parser/SoA/Q3/EV4/EV3/adaptive-CDC benches as RCH frees + B0 lands → seed B5.
