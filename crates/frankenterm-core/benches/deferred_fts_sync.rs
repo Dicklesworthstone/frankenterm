@@ -29,12 +29,17 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         name: "deferred_fts_sync/insert_select_batch",
         budget: "expected faster than per_segment_insert by reducing per-row Rust/SQLite round trips",
     },
+    bench_common::BenchBudget {
+        name: "deferred_fts_sync/env_gate",
+        budget: "A/B harness arm: FT_MOONSHOT_FTS_INSERT_SELECT_BATCH off vs on",
+    },
 ];
 
 #[derive(Clone, Copy)]
 enum SyncMode {
     PerSegmentInsert,
     InsertSelectBatch,
+    EnvGate,
 }
 
 impl SyncMode {
@@ -42,11 +47,16 @@ impl SyncMode {
         match self {
             Self::PerSegmentInsert => "per_segment_insert",
             Self::InsertSelectBatch => "insert_select_batch",
+            Self::EnvGate => "env_gate",
         }
     }
 
-    fn insert_select_enabled(self) -> bool {
-        matches!(self, Self::InsertSelectBatch)
+    fn forced_insert_select_enabled(self) -> Option<bool> {
+        match self {
+            Self::PerSegmentInsert => Some(false),
+            Self::InsertSelectBatch => Some(true),
+            Self::EnvGate => None,
+        }
     }
 }
 
@@ -160,9 +170,9 @@ fn bench_sync_mode(c: &mut Criterion, mode: SyncMode) {
                 let mut total = Duration::ZERO;
                 for iteration in 0..iters {
                     let workload = rt.block_on(prepare_workload(bench_mode, iteration));
-                    set_fts_insert_select_batch_override_for_bench(Some(
-                        bench_mode.insert_select_enabled(),
-                    ));
+                    set_fts_insert_select_batch_override_for_bench(
+                        bench_mode.forced_insert_select_enabled(),
+                    );
                     let started = Instant::now();
                     let result = rt
                         .block_on(workload.storage.sync_fts(sync_config()))
@@ -188,6 +198,7 @@ fn bench_sync_mode(c: &mut Criterion, mode: SyncMode) {
 fn bench_deferred_fts_sync(c: &mut Criterion) {
     bench_sync_mode(c, SyncMode::PerSegmentInsert);
     bench_sync_mode(c, SyncMode::InsertSelectBatch);
+    bench_sync_mode(c, SyncMode::EnvGate);
     bench_common::emit_bench_artifacts("deferred_fts_sync", BUDGETS);
 }
 
