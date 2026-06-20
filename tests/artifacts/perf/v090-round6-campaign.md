@@ -73,3 +73,21 @@ _(tick entries appended by the orchestrator tend-loop)_
   mining (cod_4 target: per-frame GPU buffer create/bind screen_line.rs:464→draw.rs:158→webgpu.rs:1545;
   cc_1: Bloom quick-reject anchor_lengths inner loop). B0 flamegraphs still building (cc_3). NEXT: run
   local A/Bs on term_parser/SoA/Q3/EV4/EV3/adaptive-CDC benches as RCH frees + B0 lands → seed B5.
+- 2026-06-20 tend#3 — **B0 flamegraphs landed (c3995e26f, docs/perf-ledger/round6-profile-targets.md) —
+  the mining gate is open and reshapes Thread B.** Realistic hot-frame ranking: `scan_pipeline.process`
+  **72.47%** (driven by ANSI/escape byte processing — 4.9× on ANSI-dense, NOT trigger density),
+  `redactor.redact` 22.16% (pre-rejected, already-optimal), `scrollback.warm_line` zstd-**DECODE** 5.18%
+  (eligible); `extract_delta` 0.177% and `locate_offset` 0.006% BELOW gate. Consequences: (a) **M1
+  ANSI-DFA's round-4 retry predicate is now SATISFIED** → cc_2 assigned the M1 feature A/B (highest-EV
+  remaining, on the 72% frame); (b) **Q3 KMP is below-gate** → robustness-only, NOT a perf promotion
+  (negative-results); (c) **Q1 locate is realistically a tail-latency win** (decode `warm_line`, not
+  locate, is the deep-scroll cost) — promotion KEPT (byte-equiv, +0.72% negligible) but annotated; the
+  higher-EV deep-scroll levers are EV3/M4 on `warm_line` decode. Q1 default-on flip committed (3ed4be224);
+  equivalence proof relaunched by orchestrator (cod_1's wedged on the asupersync fetch). **A5 quality
+  harness adjudicated the round-5 unmeasurables:** S3-FIFO CONDITIONAL (+77.4% scan-resistance hit-rate /
+  −64.2% phase-shift → workload-gated default-off), M9-PID TIE (identical evicted-bytes, 0 oscillation →
+  no benefit, default-off). cod_4 GPU: M3 no realistic win on Metal (buffer path below threshold, readback
+  dominates) → default-off + Form-1. cod_2 filed + now implementing ft-p4vzl.13 (bulk ASCII line
+  materialization, flush_print 1.64% gate-cleared). EV4 proven (cod_3, hz1). cod_1/cod_3 running
+  EV3/CDC/EV4 A/Bs; cc_1 pivoting from low-EV Bloom-vs-AC to the ANSI scan frame. Ledgers updated:
+  Q3/S3-FIFO/M9/M3 → negative-results, Q1 B0-nuance → keep-ledger.

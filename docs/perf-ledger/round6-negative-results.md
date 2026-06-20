@@ -94,4 +94,47 @@ noted for the orchestrator: README §"Cross-chunk subtlety" (lines 1828-1830) de
 
 ---
 
+### 2026-06-20 | ft-p4vzl.3 | B2 Q3 KMP linear-overlap — BELOW the realistic gate (robustness, not perf)
+
+**Status:** below-gate. B0 (round6-profile-targets.md) measures `ingest.extract_delta` at 24 ns/call =
+**0.177%** realistic fleet self-time — below the ≥0.5% gate (keep-gate rule 9). cc_2's forced A/B
+(doc-hidden `extract_delta_with_overlap_mode`, `delta_adversarial_overlap` group) shows KMP wins on the
+adversarial repeated-first-byte O(n²) worst case, but that frame does not move the realistic needle.
+**Treat Q3 as correctness/robustness hardening of the worst-case overlap path, NOT a throughput win — do
+NOT promote on perf grounds.** Default-off (config `ingest.delta_linear_overlap`).
+**Retry (Form 7):** revisit only if a workload drives `extract_delta` overlap matching above 0.5%
+realistic self-time (pathological near-duplicate captures at very high pane count).
+
+### 2026-06-20 | lw0s7.20 | S3-FIFO eviction — CONDITIONAL (default-off, workload-gated)
+
+**Status:** workload-conditional (A5 deterministic quality harness; round6-profile-targets.md). hit-rate
+@cap128: scan-resistance one-hit-wonder **+77.4%** (0.090→0.160, WIN); phase-shift migrating-hot-set
+**−64.2%** (0.708→0.253, REGRESSION). Plus round-5's ~2× per-op compute. **Not a blanket default —
+default-off with an exact promotion condition: enable only for confirmed scan-heavy, low-recency access
+patterns.**
+**Retry (Form 7):** promote only behind a workload classifier that confirms scan-heavy/low-recency; never blanket default-on.
+
+### 2026-06-20 | lw0s7.20 | M9 PID fleet-memory dampening — TIE (no captured quality benefit)
+
+**Status:** tie (A5 quality harness). 52-cycle / 192-pane sawtooth pressure replay: total evicted bytes
+identical (173 805 568 both arms), reclaim-target oscillation 0 for both. M9's claimed quality benefit
+(fewer evicted bytes / less oscillation) does NOT manifest; round-5's compute −10% buys no captured win.
+Default-off.
+**Retry (Form 7):** revisit only if a band-edge replay (drives `fleet_warm_bytes_target` above-then-below
+a fixed band, inducing ≥1 hysteresis direction change) shows PID with strictly fewer direction changes
+and/or evicted bytes than hysteresis.
+
+### 2026-06-20 | ft-p4vzl.4 | M3 SoA instanced glyph quads — no realistic win on Apple Metal (profiling)
+
+**Status:** measured-no-win (cod_4 GPU profiling). On the glyph-dense SoA bench the per-frame buffer
+create/bind path (`create_glyph_quad_instance_buffers` → `set_vertex_buffer`×7 → draw) samples BELOW
+threshold: `setVertexProgramBuffer` 1/7044, `drawPrimitives` 13/7044 main-thread samples. The dominant
+sampled cost is Metal readback/wait + render-pass/command-buffer machinery, NOT vertex-buffer bandwidth.
+The SoA layout premise (vertex-bandwidth win) does not materialize on the Apple Metal backend at this
+glyph density. Default-off (env `FT_MOONSHOT_INSTANCED_GLYPH_QUADS`); no GPU frame appears in the B0
+realistic CPU hot-frame list.
+**Retry (Form 1):** retry only if a live-render profiling scenario reaching `draw.rs:158` →
+`webgpu.rs:1545` attributes ≥0.5% frame-time to vertex-buffer create/bind/upload (discrete-GPU backend, or
+far higher glyph-per-frame density than this bench).
+
 _(round-6 measured-no-win / reject / revert entries land below, one per the rejected-entry template.)_

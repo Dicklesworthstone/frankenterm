@@ -50,6 +50,13 @@ Promotion gate satisfied. The 20× (vs round-5's 32.5×) reflects host/tree vari
 
 **Rollback:** set config default back to false / `git revert` the default-flip commit; env override remains.
 
+**B0 realism note (round6-profile-targets.md):** `locate_offset` is only **0.006%** of realistic fleet
+self-time — the realistic deep-scroll cost is the zstd page **decode** (`warm_line`, 5.18%), not the
+locate. Q1's 20-32× is a **tail-latency win at extreme scroll depth**, not a fleet-CPU win. Kept default-on
+because it is byte-equivalent and the shallow common-case cost is negligible (+0.72% of a 0.006% frame),
+but its realistic ceiling is small. The higher-EV deep-scroll levers target `warm_line` decode:
+**EV3** (blocked single-line decode) and **M4** (CDC shared-chunk reconstruction).
+
 ---
 
 _(Further KEEP-and-promote entries land above this line with a full same-run-window proof card. Flags that
