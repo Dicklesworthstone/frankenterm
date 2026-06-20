@@ -7,7 +7,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage, VecStorageIter};
-use crate::{Change, SequenceNo, SEQ_ZERO};
+use crate::{Change, SEQ_ZERO, SequenceNo};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -1749,8 +1749,8 @@ impl MemoizedWrapPointCache {
     }
 
     fn insert(&mut self, key: MemoizedWrapPointCacheKey, entry: MemoizedWrapPointCacheEntry) {
-        if self.entries.contains_key(&key) {
-            self.entries.insert(key, entry);
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = entry;
             return;
         }
 
@@ -2785,8 +2785,7 @@ mod tests {
             memoized_wrap_point_cache_hits_for_test() > hits_before_mutated_hit,
             "second wrap of mutated content+width must hit its new memoized entry"
         );
-        let mutated_hit_entry =
-            cached_wrap_entry_for_test(&line, width, cost_model, "mutated hit");
+        let mutated_hit_entry = cached_wrap_entry_for_test(&line, width, cost_model, "mutated hit");
 
         memoized_wrap_point_cache_clear_for_test();
         let mutated_recomputed = line.clone().wrap_with_report(width, 8, cost_model);

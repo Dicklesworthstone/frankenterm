@@ -11,8 +11,9 @@ use std::fmt::Debug;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::rc::Rc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheEvictionPolicy {
+    #[default]
     Lfu,
     S3Fifo,
 }
@@ -25,12 +26,6 @@ impl CacheEvictionPolicy {
             "s3fifo" | "s3-fifo" | "wtinylfu" | "w-tinylfu" => Some(Self::S3Fifo),
             _ => None,
         }
-    }
-}
-
-impl Default for CacheEvictionPolicy {
-    fn default() -> Self {
-        Self::Lfu
     }
 }
 
@@ -377,9 +372,9 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
     }
 
     fn s3_has_main_credit(&self) -> bool {
-        self.recency_index.iter().any(|entry| {
-            *entry.s3_segment.borrow() == S3Segment::Main && *entry.freq.borrow() > 0
-        })
+        self.recency_index
+            .iter()
+            .any(|entry| *entry.s3_segment.borrow() == S3Segment::Main && *entry.freq.borrow() > 0)
     }
 
     fn s3_should_reject_scan_candidate(&self, ghost_hit: bool) -> bool {
@@ -578,12 +573,11 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         } else {
             S3Segment::Main
         };
-        let initial_freq =
-            if self.eviction_policy == CacheEvictionPolicy::S3Fifo && ghost_hit {
-                1
-            } else {
-                0
-            };
+        let initial_freq = if self.eviction_policy == CacheEvictionPolicy::S3Fifo && ghost_hit {
+            1
+        } else {
+            0
+        };
         let entry = Rc::new(Entry {
             key: k,
             value: v,

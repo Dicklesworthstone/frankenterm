@@ -1297,8 +1297,8 @@ impl Screen {
     }
 
     fn insert_rewrap_line_cache(&mut self, key: WrapLineCacheKey, cached: CachedWrappedLine) {
-        if self.rewrap_line_cache.contains_key(&key) {
-            self.rewrap_line_cache.insert(key, cached);
+        if let Some(existing) = self.rewrap_line_cache.get_mut(&key) {
+            *existing = cached;
             return;
         }
 
