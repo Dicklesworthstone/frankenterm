@@ -55,16 +55,17 @@ zstd.workspace = true
 asupersync = { workspace = true, features = ["tls"] }
 
 [features]
-# Round-5 "everything-on" test-build convenience: enables the compile-time
-# moonshot optimizations (Q4 lazy-captures, Q5 Teddy, Q6 fingerprint-dedup,
-# M1 ANSI-DFA, M5 MPHF). Pair with FT_MOONSHOT_ALL=1 at runtime for the
-# env/config-gated optimizations. Default-OFF; not part of `default`.
+# Round-5 test-build convenience: enables the compile-time moonshot optimizations
+# that measured as WINS or neutral — Q4 lazy-captures, Q5 Teddy, M1 ANSI-DFA.
+# DELIBERATELY EXCLUDES the two measured REGRESSIONS: Q6 fingerprint-dedup
+# (+8.8% slower) and M5 MPHF dispatch (+69% slower) — see docs/perf-ledger/
+# round5-negative-results.md. Pair with FT_MOONSHOT_ALL=1 at runtime for the
+# env/config-gated optimizations (all wins/neutral, no regressions in that set).
+# Default-OFF; not part of `default`.
 moonshot-all = [
     "frankenterm-core/ansi-dfa-table",
     "frankenterm-core/patterns-lazy-captures",
     "frankenterm-core/teddy-prefilter",
-    "frankenterm-core/patterns-fingerprint-dedup",
-    "frankenterm-core/patterns-mphf-dispatch",
 ]
 # Everything is on by default — ft is a standalone terminal platform with no feature gates.
 default = [
@@ -76,6 +77,7 @@ default = [
     "metrics",
     "native-wezterm",
     "semantic-search",
+    "session-resume",
     "subprocess-bridge",
     "sync",
     "ftui",
@@ -103,6 +105,7 @@ subprocess-bridge = ["frankenterm-core/subprocess-bridge"]
 sync = ["frankenterm-core/sync"]
 asupersync-runtime = ["frankenterm-core/asupersync-runtime"]
 semantic-search = ["frankenterm-core/semantic-search"]
+session-resume = ["frankenterm-core/session-resume"]
 redis-session = ["frankenterm-core/redis-session"]
 jemalloc = ["dep:frankenterm-alloc", "frankenterm-alloc/jemalloc"]
 
