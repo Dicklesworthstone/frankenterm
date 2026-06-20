@@ -231,6 +231,43 @@ fn adversarial_repeated_run(w: usize) -> (String, String, usize) {
     (previous, current, w)
 }
 
+/// Build a *benign* sliding-window overlap pair for window `w` — the common
+/// scrollback-capture shape the gate must NOT regress. `current` begins with a
+/// genuine suffix of `previous` made of *varied* terminal lines, so `current[0]`
+/// is a rare byte in the window and the legacy loop's first `memchr` hit
+/// (pos 0 = largest overlap) is the real match: a single SIMD `memcmp`. KMP, by
+/// contrast, always pays its `O(pattern)` prefix-function build, so it is
+/// expected to *lose* here — the measurement that turns "KMP wins" into the
+/// correct nuanced recommendation (gate/adaptive, not static default-on).
+fn benign_sliding_window(w: usize) -> (String, String, usize) {
+    // Varied realistic lines, comfortably longer than the window.
+    let previous = generate_content(w / 25 + 200);
+    let mut start = previous.len().saturating_sub(w);
+    while start < previous.len() && !previous.is_char_boundary(start) {
+        start += 1;
+    }
+    // current = a real tail of `previous` (the still-visible region) + new
+    // lines. Not a pure append of all of `previous`, so the append fast path is
+    // skipped and the overlap search actually runs.
+    let shared = &previous[start..];
+    let current = format!("{shared}{}", generate_content(10));
+
+    let quad = extract_delta_with_overlap_mode(&previous, &current, w, false);
+    let kmp = extract_delta_with_overlap_mode(&previous, &current, w, true);
+    assert!(
+        matches!(
+            (&quad, &kmp),
+            (
+                frankenterm_core::ingest::DeltaResult::Content(a),
+                frankenterm_core::ingest::DeltaResult::Content(b),
+            ) if a == b
+        ),
+        "benign arms disagree at w={w}: quad={quad:?} kmp={kmp:?}"
+    );
+
+    (previous, current, w)
+}
+
 /// Q3 forced A/B: legacy quadratic (gate OFF) vs KMP linear (gate ON) overlap
 /// search on adversarial repeated-first-byte input, driven through the
 /// `#[doc(hidden)]` [`extract_delta_with_overlap_mode`] entry point.
@@ -267,6 +304,41 @@ fn bench_adversarial_overlap_ab(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("kmp_linear", w),
             &(prev, curr, overlap),
+            |b, (prev, curr, overlap)| {
+                b.iter(|| {
+                    black_box(extract_delta_with_overlap_mode(
+                        black_box(prev),
+                        black_box(curr),
+                        *overlap,
+                        true,
+                    ))
+                });
+            },
+        );
+
+        // Common-case guard rail: a benign sliding-window overlap, where legacy's
+        // single SIMD memcmp at pos 0 is expected to beat KMP's fixed
+        // preprocessing. If KMP also wins (or ties) here, a static default-on is
+        // safe; if legacy wins, the gate should stay off / go adaptive.
+        let (bprev, bcurr, boverlap) = benign_sliding_window(w);
+        group.throughput(Throughput::Bytes(bcurr.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("benign_legacy", w),
+            &(bprev.clone(), bcurr.clone(), boverlap),
+            |b, (prev, curr, overlap)| {
+                b.iter(|| {
+                    black_box(extract_delta_with_overlap_mode(
+                        black_box(prev),
+                        black_box(curr),
+                        *overlap,
+                        false,
+                    ))
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("benign_kmp", w),
+            &(bprev, bcurr, boverlap),
             |b, (prev, curr, overlap)| {
                 b.iter(|| {
                     black_box(extract_delta_with_overlap_mode(
