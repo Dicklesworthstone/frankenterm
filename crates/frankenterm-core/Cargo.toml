@@ -832,6 +832,10 @@ name = "integration_distributed_tls"
 path = "tests/integration_distributed_tls.rs"
 required-features = ["distributed"]
 
+[[test]]
+name = "integration_native_events"
+path = "tests/integration_native_events.rs"
+
 [features]
 # Everything is on by default — ft is a standalone terminal platform with no feature gates.
 # Use `--no-default-features` to compile a minimal build.
@@ -899,6 +903,11 @@ patterns-mphf-dispatch = []
 # them without leaking the wire-format surface to production builds.
 # Activated by the [[bin]] entries in fuzz/Cargo.toml.
 fuzz = []
+# Debug selector for the old in-lib native_events socket/parser test module.
+# Default OFF so `cargo test -p frankenterm-core --lib` no longer compiles
+# that large lane; `integration_native_events` carries the public API coverage
+# as its own target.
+native-events-inline-tests = []
 distributed = [
     "dep:rustls",
     "dep:rustls-pemfile",

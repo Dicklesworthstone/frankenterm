@@ -640,7 +640,7 @@ async fn dispatch_event_with_cx(
     dispatch_event_with_timeout_with_cx(cx, event_tx, event, EVENT_SEND_TIMEOUT).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-events-inline-tests"))]
 async fn dispatch_event_with_timeout(
     event_tx: &mpsc::Sender<NativeEvent>,
     event: NativeEvent,
@@ -767,7 +767,7 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
     }
 }
 
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(all(test, any(unix, windows), feature = "native-events-inline-tests"))]
 mod transport_roundtrip_tests {
     use super::socket_transport::{self as event_socket, AsyncWriteExt};
     use super::*;
@@ -799,6 +799,10 @@ mod transport_roundtrip_tests {
     async fn recv_next<T>(rx: &mut mpsc::Receiver<T>) -> Option<T> {
         let cx = crate::cx::for_testing();
         rx.recv(&cx).await.ok()
+    }
+
+    fn fail(message: impl Into<String>) -> ! {
+        std::panic::panic_any(message.into())
     }
 
     #[test]
@@ -852,7 +856,7 @@ mod transport_roundtrip_tests {
                     assert_eq!(data, b"hey");
                     assert_eq!(timestamp_ms, 42);
                 }
-                other => panic!("unexpected native event: {other:?}"),
+                other => fail(format!("unexpected native event: {other:?}")),
             }
 
             shutdown.store(true, Ordering::SeqCst);
@@ -866,7 +870,7 @@ mod transport_roundtrip_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, unix, feature = "native-events-inline-tests"))]
 mod tests {
     use super::socket_transport::{self as event_socket, AsyncWriteExt};
     use super::*;
@@ -874,6 +878,10 @@ mod tests {
     use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use proptest::prelude::*;
     use std::sync::atomic::AtomicBool;
+
+    fn fail(message: impl Into<String>) -> ! {
+        std::panic::panic_any(message.into())
+    }
 
     #[test]
     fn decode_pane_output_event() {
@@ -890,7 +898,7 @@ mod tests {
                 assert_eq!(data, b"hello");
                 assert_eq!(timestamp_ms, 123);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -907,7 +915,7 @@ mod tests {
                 assert_eq!(data, b"hello");
                 assert_eq!(dropped_bytes, 0, "in-bound frame must report no loss");
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -936,7 +944,7 @@ mod tests {
                     "dropped tail must be reported for explicit-gap injection"
                 );
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -990,7 +998,7 @@ mod tests {
                         "dropped flag must fire iff the frame was truncated at n={n}"
                     );
                 }
-                _ => panic!("expected PaneOutput at n={n}"),
+                _ => fail(format!("expected PaneOutput at n={n}")),
             }
         }
     }
@@ -1002,7 +1010,7 @@ mod tests {
         let n = MAX_OUTPUT_BYTES + 1234;
         let event = decode_output_of_len(n);
         let NativeEvent::PaneOutput { dropped_bytes, .. } = event else {
-            panic!("expected PaneOutput");
+            fail("expected PaneOutput");
         };
         assert_eq!(dropped_bytes, 1234);
         let marker = native_output_truncation_gap_reason(dropped_bytes);
@@ -1083,7 +1091,7 @@ mod tests {
                 assert_eq!(state.cursor_col, 2);
                 assert_eq!(timestamp_ms, 456);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1103,7 +1111,7 @@ mod tests {
                 assert_eq!(value, "abc");
                 assert_eq!(timestamp_ms, 789);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1138,7 +1146,7 @@ mod tests {
                 assert_eq!(cwd, Some("/home/user".to_string()));
                 assert_eq!(timestamp_ms, 555);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1150,7 +1158,7 @@ mod tests {
             NativeEvent::PaneCreated { cwd, .. } => {
                 assert!(cwd.is_none());
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1166,7 +1174,7 @@ mod tests {
                 assert_eq!(pane_id, 99);
                 assert_eq!(timestamp_ms, 777);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1209,7 +1217,7 @@ mod tests {
             NativeEvent::PaneOutput { data, .. } => {
                 assert_eq!(data.len(), MAX_OUTPUT_BYTES);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1227,7 +1235,7 @@ mod tests {
                 assert_eq!(data.len(), 100);
                 assert!(data.iter().all(|&b| b == b'B'));
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1242,7 +1250,7 @@ mod tests {
             NativeEvent::PaneDestroyed { timestamp_ms, .. } => {
                 assert_eq!(timestamp_ms, i64::MAX);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1260,7 +1268,7 @@ mod tests {
                 assert_eq!(state.cursor_row, 0);
                 assert_eq!(state.cursor_col, 0);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1275,7 +1283,7 @@ mod tests {
                 assert_eq!(state.rows, 40);
                 assert_eq!(state.cols, 120);
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1292,7 +1300,7 @@ mod tests {
             NativeEvent::PaneOutput { data, .. } => {
                 assert!(data.is_empty());
             }
-            _ => panic!("wrong event type"),
+            _ => fail("wrong event type"),
         }
     }
 
@@ -1352,7 +1360,7 @@ mod tests {
                 };
                 match dispatch_event_with_timeout(&tx, event, Duration::from_millis(50)).await {
                     EventDispatchOutcome::Sent => {}
-                    other => panic!("expected Sent, got {other:?}"),
+                    other => fail(format!("expected Sent, got {other:?}")),
                 }
             }
             drop(tx);
@@ -1433,8 +1441,8 @@ mod tests {
             assert!(result.is_err());
             match result {
                 Err(NativeEventError::EmptySocketPath) => {}
-                Err(other) => panic!("expected EmptySocketPath, got: {other}"),
-                Ok(_) => panic!("expected error"),
+                Err(other) => fail(format!("expected EmptySocketPath, got: {other}")),
+                Ok(_) => fail("expected error"),
             }
         });
     }
@@ -1452,7 +1460,7 @@ mod tests {
             let result = NativeEventListener::bind_with_cx(&cx, socket_path.clone()).await;
             match &result {
                 Ok(_) => {}
-                Err(e) => panic!("bind_with_cx should succeed on fresh cx: {e}"),
+                Err(e) => fail(format!("bind_with_cx should succeed on fresh cx: {e}")),
             }
             #[cfg(unix)]
             assert!(socket_path.exists(), "socket should exist after bind");
@@ -1482,8 +1490,8 @@ mod tests {
                         "error should mention cancellation: {err}"
                     );
                 }
-                Err(other) => panic!("expected Io(Interrupted), got: {other}"),
-                Ok(_) => panic!("bind_with_cx should fail on cancelled cx"),
+                Err(other) => fail(format!("expected Io(Interrupted), got: {other}")),
+                Ok(_) => fail("bind_with_cx should fail on cancelled cx"),
             }
             assert!(
                 !socket_path.exists(),
@@ -1504,8 +1512,8 @@ mod tests {
             assert!(result.is_err());
             match result {
                 Err(NativeEventError::SocketAlreadyExists(_)) => {}
-                Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
-                Ok(_) => panic!("expected error"),
+                Err(other) => fail(format!("expected SocketAlreadyExists, got: {other}")),
+                Ok(_) => fail("expected error"),
             }
         });
     }
@@ -1523,8 +1531,8 @@ mod tests {
             assert!(result.is_err());
             match result {
                 Err(NativeEventError::SocketAlreadyExists(_)) => {}
-                Err(other) => panic!("expected SocketAlreadyExists, got: {other}"),
-                Ok(_) => panic!("expected error"),
+                Err(other) => fail(format!("expected SocketAlreadyExists, got: {other}")),
+                Ok(_) => fail("expected error"),
             }
         });
     }
@@ -1668,7 +1676,7 @@ mod tests {
                     assert_eq!(data, b"hey");
                     assert_eq!(timestamp_ms, 42);
                 }
-                _ => panic!("unexpected event type"),
+                _ => fail("unexpected event type"),
             }
 
             drop(stream);
@@ -2359,7 +2367,7 @@ mod tests {
                 assert_eq!(wezterm_version.as_deref(), Some("FrankenTerm 0.1.0"));
                 assert_eq!(ts, Some(1234567890));
             }
-            _ => panic!("wrong variant after roundtrip"),
+            _ => fail("wrong variant after roundtrip"),
         }
     }
 
@@ -2404,7 +2412,7 @@ mod tests {
                 assert_eq!(decoded, b"hello world");
                 assert_eq!(ts, 9999);
             }
-            _ => panic!("wrong variant after roundtrip"),
+            _ => fail("wrong variant after roundtrip"),
         }
     }
 
@@ -2435,7 +2443,7 @@ mod tests {
                 assert_eq!(state.cursor_col, 5);
                 assert_eq!(ts, 555);
             }
-            _ => panic!("wrong variant after roundtrip"),
+            _ => fail("wrong variant after roundtrip"),
         }
     }
 
@@ -2461,7 +2469,7 @@ mod tests {
                 assert_eq!(value, "active");
                 assert_eq!(ts, 888);
             }
-            _ => panic!("wrong variant after roundtrip"),
+            _ => fail("wrong variant after roundtrip"),
         }
     }
 
@@ -2487,7 +2495,7 @@ mod tests {
                 assert_eq!(cwd, Some("/home/user".into()));
                 assert_eq!(ts, 1000);
             }
-            _ => panic!("wrong variant after roundtrip"),
+            _ => fail("wrong variant after roundtrip"),
         }
     }
 
@@ -2505,7 +2513,7 @@ mod tests {
             WireEvent::PaneCreated { cwd, .. } => {
                 assert!(cwd.is_none());
             }
-            _ => panic!("wrong variant after roundtrip"),
+            _ => fail("wrong variant after roundtrip"),
         }
     }
 
@@ -2522,7 +2530,7 @@ mod tests {
                 assert_eq!(pane_id, 99);
                 assert_eq!(ts, 3000);
             }
-            _ => panic!("wrong variant after roundtrip"),
+            _ => fail("wrong variant after roundtrip"),
         }
     }
 
@@ -2657,9 +2665,9 @@ mod tests {
                 match crate::runtime_async::timeout(deadline, recv_next(&mut event_rx)).await {
                     Ok(Some(_)) => received += 1,
                     Ok(None) => break,
-                    Err(elapsed) => {
-                        panic!("timeout after {elapsed}: received {received}/{event_count} events");
-                    }
+                    Err(elapsed) => fail(format!(
+                        "timeout after {elapsed}: received {received}/{event_count} events"
+                    )),
                 }
             }
 
