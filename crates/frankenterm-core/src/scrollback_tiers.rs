@@ -211,9 +211,9 @@ pub struct TieredScrollback {
     /// Q1 (round-4 gauntlet): incrementally-maintained cumulative line-count
     /// prefix over the warm/cold pages, enabling `O(log pages)` resolution in
     /// [`Self::locate_offset`] / [`Self::tier_for_offset`] via binary search
-    /// instead of the `O(pages)` re-sum + linear walk. `None` unless the
-    /// `scrollback.prefix_index` gate (env `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX`,
-    /// or [`Self::new_with_prefix_index`]) is enabled. Default **off**.
+    /// instead of the `O(pages)` re-sum + linear walk. Default **on** after Q1
+    /// promotion; `None` only when the env override or
+    /// [`Self::new_with_prefix_index`] explicitly selects the legacy path.
     prefix: Option<PrefixIndex>,
     /// M4 (round-4 gauntlet): shared content-addressed chunk store for
     /// content-defined-chunking dedup of warm pages before zstd. Identical
@@ -817,10 +817,11 @@ impl TieredScrollback {
     /// first, so a zero `page_size` is clamped instead of degrading the
     /// tier-migration loop.
     ///
-    /// The Q1 prefix-index, M4 CDC-dedup, and EV3 blocked-page fast paths
-    /// default **off**; each is enabled only when its
-    /// `FT_MOONSHOT_SCROLLBACK_*` env gate is set (see
-    /// [`Self::new_with_all_options`] for a deterministic, env-free opt-in).
+    /// The promoted Q1 prefix-index fast path defaults **on** and remains
+    /// controllable with `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX=0` for A/B
+    /// fallback. M4 CDC-dedup and EV3 blocked-page fast paths still default
+    /// **off** and require their `FT_MOONSHOT_SCROLLBACK_*` env gate (see
+    /// [`Self::new_with_all_options`] for deterministic, env-free selection).
     #[must_use]
     pub fn new(config: ScrollbackConfig) -> Self {
         Self::new_with_cdc_mode(
@@ -833,9 +834,9 @@ impl TieredScrollback {
 
     /// Create a tiered scrollback, explicitly choosing the Q1 prefix-index gate.
     ///
-    /// `prefix_index = false` is the default behavior (legacy linear walk).
-    /// `true` enables the incrementally-maintained cumulative line-count prefix
-    /// + binary-search resolution in [`Self::locate_offset`] /
+    /// `prefix_index = false` requests the legacy linear walk. `true` enables
+    /// the promoted incrementally-maintained cumulative line-count prefix +
+    /// binary-search resolution in [`Self::locate_offset`] /
     ///   [`Self::tier_for_offset`]. Observable behavior is identical either way
     ///   (proven byte-equivalent); the flag only changes the resolution cost.
     ///
@@ -1635,14 +1636,19 @@ impl Default for TieredScrollback {
     }
 }
 
-/// Whether the Q1 `scrollback.prefix_index` gate is enabled via the environment.
+/// Whether the promoted Q1 `scrollback.prefix_index` path is enabled.
 ///
-/// Default **off**: only `1`/`true`/`yes`/`on` (case-insensitive) on
-/// `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX` enable the indexed resolution path,
-/// mirroring the existing `FT_MOONSHOT_*` gating convention. Anything else
-/// (unset, empty, `0`, `false`, …) leaves the deterministic linear walk active.
+/// Default **on** after the round-6 Q1 promotion. `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX`
+/// remains the A/B override: truthy values enable the indexed path, while unset
+/// defaults on and empty/`0`/`false` values force the deterministic linear walk.
 fn prefix_index_enabled_from_env() -> bool {
-    env_flag_enabled("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX")
+    if ft_moonshot_all_enabled() {
+        return true;
+    }
+    std::env::var("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX")
+        .ok()
+        .map(|v| env_flag_value_enabled(&v))
+        .unwrap_or(true)
 }
 
 /// M4 `scrollback.cdc_dedup` mode selected via the environment.
@@ -2982,13 +2988,13 @@ mod tests {
     }
 
     #[test]
-    fn prefix_index_env_gate_defaults_off() {
-        // `new()` honors the env gate; with the var unset the index is off and
-        // the legacy walk is used. (Proof runs with the gate default-off.)
-        // Guard against a polluted env so the assertion is meaningful.
+    fn prefix_index_env_gate_defaults_on() {
+        // `new()` honors the env gate; with the var unset the promoted index is
+        // active by default. Guard against a polluted env so the assertion is
+        // meaningful.
         if std::env::var_os("FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX").is_none() {
             let sb = TieredScrollback::new(small_config());
-            assert!(!sb.prefix_index_active(), "prefix index must default off");
+            assert!(sb.prefix_index_active(), "prefix index must default on");
         }
     }
 
