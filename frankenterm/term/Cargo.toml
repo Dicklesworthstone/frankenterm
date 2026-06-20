@@ -52,6 +52,10 @@ serde_json.workspace = true
 name = "byte_to_grid"
 harness = false
 
+[[bench]]
+name = "term_parser_ab"
+harness = false
+
 [dependencies.termwiz]
 workspace = true
 features = ["use_image"]
