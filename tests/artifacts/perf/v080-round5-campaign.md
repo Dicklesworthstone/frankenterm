@@ -130,3 +130,11 @@ _(tick entries appended by the orchestrator tend-loop)_
   /tmp/ft-v080-release. trj linux: amd64 fat-LTO RUNNING (v0.8.0 crates), arm64 queued behind it on the
   shared build lock (serialized ~1-2h total). Asset template (from v0.7.0): 4 .tar.xz + 4 .sha256 +
   SHA256SUMS. Awaiting linux bins → scp → tarballs → gh release create v0.8.0.
+- 2026-06-19 tend#12 (ASSEMBLY) — linux amd64 DONE (44m51s, ft 0.8.0 ELF x86-64; trj global
+  CARGO_TARGET_DIR=/data/tmp/cargo-target so bins land there, not target/). arm64 cross FAILED on the
+  shared target dir (E0463 can't-find-crate frankenterm_core for aarch64 — host/cross artifact collision)
+  → RELAUNCHED arm64 in ISOLATED CARGO_TARGET_DIR=/data/tmp/cargo-target-arm64 (PID 2476289, ~45min).
+  3 of 4 tarballs staged + layout-verified vs v0.7.0 (each ft-*.tar.xz = `ft` at root, app = FrankenTerm.app/):
+  FrankenTerm-darwin-arm64.app.tar.xz (34M) + ft-darwin-arm64.tar.xz (10M) + ft-linux-amd64.tar.xz (16M)
+  in /tmp/ft-v080-release. Awaiting arm64 → scp + tarball → SHA256SUMS → gh release create v0.8.0.
+  LEARNING: trj has a global CARGO_TARGET_DIR; cross + host builds MUST use separate target dirs.
