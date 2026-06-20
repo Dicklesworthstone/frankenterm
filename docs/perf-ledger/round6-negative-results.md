@@ -34,4 +34,64 @@ These lost at real sizes in round 4/5; grep round4+round5-negative-results.md be
 
 ## Entries
 
+### 2026-06-20 | ft-p4vzl.2 | B1 incremental cross-chunk Aho-Corasick (kill trigger_data_buffer re-scan) — FLAGSHIP
+
+**Status:** no-bounded-micro-lever — the named target is dead code; the real production analog has no feasible streaming-AC lever and no profiled hot-frame attribution.
+
+**Gate (intended):** a new `FT_MOONSHOT_*` env gate (never created — implementation did not proceed past the profile-first gate).
+
+**Profile attribution:** 0% — the named frame is unreachable. The marching-orders B1 target is the
+`scan_pipeline::ChunkedPipelineState::flush` re-scan of the accumulated `trigger_data_buffer`
+(README §"Cross-chunk subtlety", lines 1828-1830). Repo-wide grep proof:
+`ScanPipeline` / `ChunkedPipelineState` / `TriggerScanner` / `scan_pipeline::` / `pattern_trigger::`
+have **zero** non-test, non-bench, non-doc references across `crates/` + vendored `frankenterm/`
+(0 lines). That whole-window re-scan is exercised only by unit tests and benches → 0% self-time on any
+realistic workload → cannot clear the >=0.5% profile-first gate.
+
+**Real production path (the only cross-chunk re-scan that ships):** `PatternEngine::detect_with_context`
+(`patterns.rs:4423`), driven per pane segment from `runtime.rs:3748`
+(`detect_with_context(bounded_segment.content, &mut ctx)`). Cross-segment handling is NOT a whole-window
+re-scan: it prepends a bounded `DetectionContext::tail_buffer` (`MAX_TAIL_SIZE` =
+`PatternsTuning::DEFAULT_MAX_TAIL_SIZE_BYTES` = **2048 B**) to each new segment and re-scans only that
+tail; segments are capped at `IngestTuning::DEFAULT_MAX_PERSIST_SEGMENT_BYTES` = **64 KiB**. The common
+no-match case is rejected by `quick_reject` before Aho-Corasick runs at all, so the steady-state
+"double-work" is at most a 2048-byte prefilter re-scan per segment (<=~3% extra bytes at the 64 KiB cap;
+worst-case relative overhead only for tiny <256 B segments where the absolute cost is sub-µs and
+prefilter-bound).
+
+**Feasibility of the proposed lever (streaming AC state across chunks):** infeasible with the
+`aho-corasick` crate — there is no resumable `MatchKind::LeftmostFirst` stream API (`stream_find_iter`
+is `MatchKind::Standard`-only). LeftmostFirst requires unbounded lookahead across the boundary, which is
+exactly *why* both the (dead) scan_pipeline and the (live) `detect_with_context` use an overlap/tail
+re-scan. Carrying automaton state would require a hand-rolled LeftmostFirst automaton — a
+custom-structure rewrite (pre-rejected risk class) with a large byte-equivalence-bug surface, against a
+re-scan that the prefilter already makes sub-µs.
+
+**Measurement (focused, evidence bench):** `pattern_detection::b1_cross_chunk_rescan` — committed
+isolation bench (this commit). Two arms over an identical non-matching segment stream:
+`tail_overlap` (`detect_with_context`, prod path) vs `no_tail` (`detect`, no cross-segment tail), across
+128 B (worst-case relative) and 8 KiB (typical) segment regimes. Run on a quiet host to confirm the
+tail-overlap overhead is far below the round-6 >=2x certifiable bar.
+
+**Behavior-preservation:** N/A — no optimization landed; the only code added is a measurement bench and
+this ledger entry.
+
+**A/B verdict:** not run — candidate did not pass the profile-first gate (dead-code target + infeasible
+lever). No default flipped.
+
+**Retry-condition predicate (Form 1):** retry only if the B0 flamegraph (ft-p4vzl.1) attributes a
+clearly-above-noise share (>=0.5% self-time) to the `detect_with_context` tail-overlap re-scan on the
+high-pane realistic-render workload AND a resumable LeftmostFirst-equivalent scan becomes available
+(crate support or an equivalence-proven minimal automaton). Until both hold, the bounded 2048-byte
+prefilter-gated tail is the correct design.
+
+**Rollback:** N/A (no optimization landed; flag never created). Evidence bench + ledger entry only.
+
+**Sibling references:** ft-p4vzl.1 (B0 profiling gate), ft-p4vzl (round-6 epic). Adjacent reality-gap
+noted for the orchestrator: README §"Cross-chunk subtlety" (lines 1828-1830) describes the dead-code
+`trigger_data_buffer` mechanism as though it were the production cross-chunk engine; the live engine is
+`detect_with_context`'s `tail_buffer`.
+
+---
+
 _(round-6 measured-no-win / reject / revert entries land below, one per the rejected-entry template.)_

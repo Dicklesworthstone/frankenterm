@@ -4,8 +4,11 @@
 //! - Quick reject no-match: **< 1µs** for typical non-matching text
 //! - Pattern detection (typical corpus): **p50 < 1ms**, **p99 < 5ms**
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+};
 use frankenterm_core::patterns::{DetectionContext, PatternEngine};
+use std::fmt::Write as _;
 
 mod bench_common;
 
@@ -29,6 +32,13 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "lazy_init_warm_detect",
         budget: "< 5ms (index already compiled)",
+    },
+    bench_common::BenchBudget {
+        name: "b1_cross_chunk_rescan",
+        budget: "tail-overlap re-scan overhead far below the round-6 >=2x bar \
+                 (production cross-chunk path is detect_with_context's bounded \
+                 2048-byte tail, prefilter-gated; the named trigger_data_buffer \
+                 whole-window re-scan is dead code — ft-p4vzl.2)",
     },
 ];
 
@@ -192,6 +202,107 @@ fn bench_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// B1 (ft-p4vzl.2) evidence bench — quantify the *production* cross-chunk
+/// Aho-Corasick re-scan overhead.
+///
+/// FINDING (the load-bearing reason B1 does not proceed to implementation):
+/// the flagship target named in the round-6 marching orders —
+/// `scan_pipeline::ChunkedPipelineState::flush` re-scanning the accumulated
+/// `trigger_data_buffer` (README §"Cross-chunk subtlety", lines 1828-1830) —
+/// is **dead code**. `ScanPipeline` / `ChunkedPipelineState` /
+/// `TriggerScanner` have ZERO production callers repo-wide (only tests +
+/// benches reference them), so that whole-window re-scan has 0% self-time on
+/// any realistic workload and cannot clear the >=0.5% profile-first gate.
+///
+/// The *real* production cross-chunk detection path is
+/// [`PatternEngine::detect_with_context`] (driven per pane segment from
+/// `runtime.rs`). Its cross-segment handling is NOT a whole-window re-scan:
+/// it prepends a bounded `DetectionContext::tail_buffer` (<= 2048 B; segments
+/// are capped at 64 KiB) to each new segment, re-scanning only that tail, and
+/// the common no-match case is rejected by `quick_reject` before Aho-Corasick
+/// even runs. Carrying a streaming LeftmostFirst automaton across chunks is
+/// also infeasible with the `aho-corasick` crate (no resumable LeftmostFirst
+/// stream API — which is precisely why the overlap-re-scan design exists).
+///
+/// This bench isolates that tail-overlap re-scan cost so a quiet-host A/B can
+/// confirm it is far below the round-6 >=2x certifiable bar. Two arms over an
+/// identical non-matching segment stream (steady-state pane chatter — the
+/// dominant case):
+///   - `tail_overlap` — `detect_with_context` (tail re-scan active, prod path)
+///   - `no_tail`      — `detect` (no cross-segment tail; counterfactual floor)
+/// across a small (128 B, worst-case *relative* overhead since the 2048 B tail
+/// dwarfs the segment) and large (8 KiB, typical bulk) segment regime. The
+/// wall-clock ratio between the arms is the tail-overlap overhead.
+fn chatty_no_match_stream(seg_bytes: usize, count: usize) -> Vec<String> {
+    // Realistic non-matching pane chatter — contains no anchor strings, so
+    // every scan is handled by quick_reject (the steady-state common case).
+    let filler = "heartbeat ok; compile queue steady; tokens sampled; no banner here. ";
+    let mut segments = Vec::with_capacity(count);
+    for idx in 0..count {
+        let mut seg = String::with_capacity(seg_bytes + 24);
+        while seg.len() < seg_bytes {
+            let _ = write!(seg, "seg{idx} {filler}");
+        }
+        seg.truncate(seg_bytes.max(1)); // ASCII-only filler → byte truncation is char-safe
+        seg.push('\n');
+        segments.push(seg);
+    }
+    segments
+}
+
+fn bench_b1_cross_chunk_rescan(c: &mut Criterion) {
+    let engine = PatternEngine::new();
+    let _ = engine.detect("warmup");
+
+    let mut group = c.benchmark_group("b1_cross_chunk_rescan");
+    for &seg_bytes in &[128usize, 8192usize] {
+        // ~512 KiB of streamed segments per regime.
+        let count = (512 * 1024 / seg_bytes).max(8);
+        let segments = chatty_no_match_stream(seg_bytes, count);
+        let total_bytes: usize = segments.iter().map(String::len).sum();
+        group.throughput(Throughput::Bytes(total_bytes as u64));
+
+        // Arm A — production cross-chunk path (bounded tail-overlap re-scan).
+        group.bench_with_input(
+            BenchmarkId::new("tail_overlap", format!("{seg_bytes}B")),
+            &segments,
+            |b, segments| {
+                b.iter_batched(
+                    || {
+                        let mut ctx = DetectionContext::new();
+                        ctx.pane_id = Some(1);
+                        ctx
+                    },
+                    |mut ctx| {
+                        let mut hits = 0usize;
+                        for seg in segments {
+                            hits += engine.detect_with_context(seg, &mut ctx).len();
+                        }
+                        hits
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        // Arm B — no cross-segment tail (counterfactual lower bound).
+        group.bench_with_input(
+            BenchmarkId::new("no_tail", format!("{seg_bytes}B")),
+            &segments,
+            |b, segments| {
+                b.iter(|| {
+                    let mut hits = 0usize;
+                    for seg in segments {
+                        hits += engine.detect(seg).len();
+                    }
+                    hits
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_lazy_init(c: &mut Criterion) {
     let mut group = c.benchmark_group("pattern_lazy_init");
 
@@ -235,6 +346,7 @@ criterion_group!(
         bench_pattern_detection,
         bench_detection_with_context,
         bench_throughput,
+        bench_b1_cross_chunk_rescan,
         bench_lazy_init
 );
 criterion_main!(benches);
