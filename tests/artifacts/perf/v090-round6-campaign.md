@@ -121,3 +121,14 @@ _(tick entries appended by the orchestrator tend-loop)_
   locally; cc_1 reporting `detect_with_context` profile. **CERTIFIED ROUND-6 WINS:** Q1 20× (default-on),
   EV4 6-14× (default-on cand), .13 4.43× (default-on cand) + D1/EV1 small. Approaching v0.9.0 cut (arm64
   build deferred to the bumped release commit).
+- 2026-06-20 tend#6 — **THREAD C STARTED: v0.9.0 cut in progress.** Q1 proptest GREEN (`test result: ok.
+  1 passed` — default-on equivalence confirmed; the earlier `--lib` failures were definitively
+  antigravity/mux-telemetry contamination, NOT Q1). cc_1: `detect_with_context` is optimal except a
+  low-EV quick_reject-vs-ac_direct A/B (filed ft-ui1xn, non-blocking). EV3 + adaptive-CDC: default-off
+  proof-deferred (RCH asupersync stalls + local release-LTO link issue; zero-risk). Closed proven beads
+  (.1/.4/.5/.7/.8/.13 + .2/.3). **RELEASE:** bumped workspace 0.8.0→0.9.0 (055bca9b0), tagged v0.9.0 +
+  retroactively v0.8.0 (already on remote at 310534f5d), pushed main+master+v0.9.0. Builds from the CLEAN
+  tag (excludes the uncommitted antigravity work — ships exactly the committed round-6 state): linux
+  amd64+arm64 launched on trj (PID 574227, clears the long-missing ft-linux-arm64 asset); darwin-arm64
+  ft+gui+mux+.app delegated to cod_4 via a clean clone. NEXT: harvest builds → assemble 9 assets +
+  SHA256SUMS → gh release create v0.9.0 → verify install.sh + GUI smoke → round-6 memory + final scorecard.
