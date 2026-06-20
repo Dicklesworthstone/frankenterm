@@ -194,6 +194,10 @@ impl<'a> Performer<'a> {
         }
 
         static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build).
+            if std::env::var_os("FT_MOONSHOT_ALL").is_some() {
+                return true;
+            }
             std::env::var("FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE")
                 .map(|value| {
                     let value = value.trim();

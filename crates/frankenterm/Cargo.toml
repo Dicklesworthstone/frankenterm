@@ -55,6 +55,17 @@ zstd.workspace = true
 asupersync = { workspace = true, features = ["tls"] }
 
 [features]
+# Round-5 "everything-on" test-build convenience: enables the compile-time
+# moonshot optimizations (Q4 lazy-captures, Q5 Teddy, Q6 fingerprint-dedup,
+# M1 ANSI-DFA, M5 MPHF). Pair with FT_MOONSHOT_ALL=1 at runtime for the
+# env/config-gated optimizations. Default-OFF; not part of `default`.
+moonshot-all = [
+    "frankenterm-core/ansi-dfa-table",
+    "frankenterm-core/patterns-lazy-captures",
+    "frankenterm-core/teddy-prefilter",
+    "frankenterm-core/patterns-fingerprint-dedup",
+    "frankenterm-core/patterns-mphf-dispatch",
+]
 # Everything is on by default — ft is a standalone terminal platform with no feature gates.
 default = [
     "browser",

@@ -64,7 +64,10 @@ pub mod glyph_quad_staging {
             return false;
         }
 
+        // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build)
+        // enables every FT_MOONSHOT_* gate at once (explicit disable still wins).
         std::env::var_os(FT_MOONSHOT_INSTANCED_GLYPH_QUADS).is_some()
+            || std::env::var_os("FT_MOONSHOT_ALL").is_some()
     });
 
     #[must_use]

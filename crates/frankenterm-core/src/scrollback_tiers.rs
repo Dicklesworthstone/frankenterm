@@ -1509,17 +1509,27 @@ fn blocked_page_index_enabled_from_env() -> bool {
 }
 
 /// Shared truthiness parse for the `FT_MOONSHOT_SCROLLBACK_*` gates.
+///
+/// Honors the `FT_MOONSHOT_ALL` master switch (round-5 "everything-on" test
+/// builds): when `FT_MOONSHOT_ALL` is set truthy, every `FT_MOONSHOT_*` gate
+/// routed through this helper enables at once. Default-off / revert-safe — with
+/// no env set, behavior is unchanged.
 fn env_flag_enabled(var: &str) -> bool {
-    std::env::var(var)
+    fn is_truthy(v: &str) -> bool {
+        let v = v.trim();
+        v == "1"
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("yes")
+            || v.eq_ignore_ascii_case("on")
+    }
+    if std::env::var("FT_MOONSHOT_ALL")
         .ok()
-        .map(|v| {
-            let v = v.trim();
-            v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-        })
+        .map(|v| is_truthy(&v))
         .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::var(var).ok().map(|v| is_truthy(&v)).unwrap_or(false)
 }
 
 // =============================================================================

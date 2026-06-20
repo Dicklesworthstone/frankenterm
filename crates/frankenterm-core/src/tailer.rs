@@ -58,6 +58,11 @@ static POLL_CADENCE_MODEL: OnceLock<PollCadenceModel> = OnceLock::new();
 
 fn configured_poll_cadence_model() -> PollCadenceModel {
     *POLL_CADENCE_MODEL.get_or_init(|| {
+        // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build):
+        // forces the predictive renewal/hazard cadence model on.
+        if std::env::var_os("FT_MOONSHOT_ALL").is_some() {
+            return PollCadenceModel::Predictive;
+        }
         if let Ok(value) = std::env::var(FT_MOONSHOT_INGEST_CADENCE_MODEL) {
             if value.eq_ignore_ascii_case("predictive") {
                 return PollCadenceModel::Predictive;

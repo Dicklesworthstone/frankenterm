@@ -1815,8 +1815,12 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
 /// (the shipping default) it runs the legacy nested-memchr quadratic search.
 const FT_MOONSHOT_DELTA_LINEAR_OVERLAP: &str = "FT_MOONSHOT_DELTA_LINEAR_OVERLAP";
 
-static DELTA_LINEAR_OVERLAP_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os(FT_MOONSHOT_DELTA_LINEAR_OVERLAP).is_some());
+static DELTA_LINEAR_OVERLAP_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build) enables
+    // every FT_MOONSHOT_* gate at once. Default-off / revert-safe.
+    std::env::var_os(FT_MOONSHOT_DELTA_LINEAR_OVERLAP).is_some()
+        || std::env::var_os("FT_MOONSHOT_ALL").is_some()
+});
 
 /// Whether the `ingest.delta_linear_overlap` Q3 moonshot gate is enabled
 /// (default `false`). Read once from `FT_MOONSHOT_DELTA_LINEAR_OVERLAP`.

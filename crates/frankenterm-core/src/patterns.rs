@@ -4149,6 +4149,10 @@ fn builtin_wezterm_pack() -> PatternPack {
 /// `1` / `true` / `on` / `yes` (case-insensitive, trimmed) enables it. Read
 /// once per engine construction.
 fn agent_sharded_index_enabled_from_env() -> bool {
+    // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build).
+    if std::env::var_os("FT_MOONSHOT_ALL").is_some() {
+        return true;
+    }
     std::env::var("FT_MOONSHOT_PATTERNS_AGENT_SHARDED_INDEX")
         .ok()
         .map(|raw| {

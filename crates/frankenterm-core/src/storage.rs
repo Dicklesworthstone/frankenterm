@@ -1090,7 +1090,18 @@ const FT_MOONSHOT_GROUP_COMMIT_ADAPTIVE_ENV: &str = "FT_MOONSHOT_GROUP_COMMIT_AD
 const WRITER_BLOCKING_RECV_PARK_MS: u64 = 25;
 
 /// Read a boolean moonshot/tuning env flag using the shared truthy vocabulary.
+///
+/// Honors the `FT_MOONSHOT_ALL` master switch (round-5 "everything-on" test
+/// builds): when `FT_MOONSHOT_ALL` is truthy, every `FT_MOONSHOT_*` gate routed
+/// through this helper enables at once. Default-off / revert-safe.
 fn storage_env_flag_enabled(name: &str) -> bool {
+    if std::env::var("FT_MOONSHOT_ALL")
+        .ok()
+        .map(|value| env_value_is_truthy(&value))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     std::env::var(name)
         .ok()
         .map(|value| env_value_is_truthy(&value))
