@@ -4289,6 +4289,19 @@ impl PatternEngine {
         self.agent_shards = OnceLock::new();
     }
 
+    /// Force the Bloom quick-reject prefilter on/off, bypassing config.
+    /// `#[doc(hidden)]` bench / A-B seam (ft-p4vzl B5 candidate): lets a bench
+    /// compare the default-ON prefilter against Aho-Corasick-direct
+    /// (`quick_reject` disabled) on an *identical* pack set. Disabling is
+    /// byte-equivalent for `detect()` output — a Bloom filter has no false
+    /// negatives, so `quick_reject` never rejects a text the exact anchor
+    /// matcher would match; it only short-circuits guaranteed non-matches.
+    /// The production default stays ON via `new()` / `config`.
+    #[doc(hidden)]
+    pub fn set_quick_reject_enabled(&mut self, enabled: bool) {
+        self.quick_reject_enabled = enabled;
+    }
+
     /// Per-agent anchor shards, lazily built on first use when the gate is on.
     /// Returns `None` (so callers use the global automaton) when the gate is
     /// off — the default — which keeps shard construction off the default path.

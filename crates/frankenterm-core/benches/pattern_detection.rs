@@ -40,6 +40,13 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
                  2048-byte tail, prefilter-gated; the named trigger_data_buffer \
                  whole-window re-scan is dead code — ft-p4vzl.2)",
     },
+    bench_common::BenchBudget {
+        name: "quick_reject_vs_ac_direct",
+        budget: "ac_direct (quick_reject disabled) should beat quick_reject_on \
+                 on realistic no-match text — the Bloom prefilter does ~15 SipHash \
+                 window-hashes/byte + 32 memchr sweeps to avoid one exact AC pass \
+                 that is already built and does zero hashing (ft-p4vzl B5 candidate)",
+    },
 ];
 
 /// Typical shell output that shouldn't match any patterns.
@@ -303,6 +310,52 @@ fn bench_b1_cross_chunk_rescan(c: &mut Criterion) {
     group.finish();
 }
 
+/// B5 candidate (ft-p4vzl, found during ft-p4vzl.2) — the default-ON Bloom
+/// `quick_reject` prefilter vs Aho-Corasick-direct on realistic no-match text.
+///
+/// EVIDENCE (`patterns.rs::quick_reject_with_index`): the prefilter sweeps the
+/// whole text once per distinct anchor first-byte (builtin packs: 32 distinct
+/// first-bytes → 32 memchr sweeps) and, for every byte-hit, Bloom-checks every
+/// distinct *global* anchor length (25 lengths) even though only ~2.59 lengths
+/// belong to that first-byte (9.6x inner-loop waste). The 32 first-bytes
+/// include nearly every common English letter, so realistic no-match output
+/// hits the inner loop on ~67% of byte positions → ~14.8 SipHash window-hashes
+/// PER INPUT BYTE (~970k hashes for a 64 KiB segment), on top of 32 full memchr
+/// sweeps — all to avoid a single exact Aho-Corasick pass that is ALREADY built
+/// (`index.anchor_matcher`) and does zero hashing.
+///
+/// `set_quick_reject_enabled(false)` makes `detect()` skip the prefilter and go
+/// straight to the AC matcher. Byte-equivalent: a Bloom filter has no false
+/// negatives, so `quick_reject` never rejects a text the AC matcher would match;
+/// disabling it only runs the exact matcher on more inputs → identical output.
+/// Arms (one run, compare IDs):
+///   - `quick_reject_on` — current default (Bloom prefilter then AC)
+///   - `ac_direct`       — `quick_reject` disabled (AC matcher only)
+fn bench_quick_reject_vs_ac_direct(c: &mut Criterion) {
+    let on = PatternEngine::new();
+    let _ = on.detect("warmup");
+    let mut off = PatternEngine::new();
+    off.set_quick_reject_enabled(false);
+    let _ = off.detect("warmup");
+
+    let mut group = c.benchmark_group("quick_reject_vs_ac_direct");
+    for size_kb in [1usize, 4, 16, 64] {
+        let content = large_output(size_kb);
+        group.throughput(Throughput::Bytes(content.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("quick_reject_on", format!("{size_kb}KB")),
+            &content,
+            |b, content| b.iter(|| on.detect(content)),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("ac_direct", format!("{size_kb}KB")),
+            &content,
+            |b, content| b.iter(|| off.detect(content)),
+        );
+    }
+    group.finish();
+}
+
 fn bench_lazy_init(c: &mut Criterion) {
     let mut group = c.benchmark_group("pattern_lazy_init");
 
@@ -347,6 +400,7 @@ criterion_group!(
         bench_detection_with_context,
         bench_throughput,
         bench_b1_cross_chunk_rescan,
+        bench_quick_reject_vs_ac_direct,
         bench_lazy_init
 );
 criterion_main!(benches);
