@@ -7,15 +7,23 @@
 //! - Should scale reasonably with content size up to typical pane buffers (~100KB)
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::ingest::extract_delta;
+use frankenterm_core::ingest::{extract_delta, extract_delta_with_overlap_mode};
 use std::fmt::Write;
+use std::hint::black_box;
 
 mod bench_common;
 
-const BUDGETS: &[bench_common::BenchBudget] = &[bench_common::BenchBudget {
-    name: "delta_extraction",
-    budget: "p50 < 200µs, p99 < 1ms (typical overlap sizes)",
-}];
+const BUDGETS: &[bench_common::BenchBudget] = &[
+    bench_common::BenchBudget {
+        name: "delta_extraction",
+        budget: "p50 < 200µs, p99 < 1ms (typical overlap sizes)",
+    },
+    bench_common::BenchBudget {
+        name: "delta_adversarial_overlap",
+        budget: "Q3 forced A/B: KMP (linear) overlap should beat legacy memchr (quadratic) \
+                 by >=2x on repeated-first-byte input where the O(n^2) scan dominates",
+    },
+];
 
 /// Default overlap window size from RuntimeConfig.
 const DEFAULT_OVERLAP_SIZE: usize = 4096;
@@ -170,6 +178,111 @@ fn bench_large_content(c: &mut Criterion) {
     group.finish();
 }
 
+/// Build the Q3 adversarial repeated-first-byte pair for a given overlap window
+/// `w`, returning `(previous, current, overlap_size)`.
+///
+/// Shape (analysis pinned by `proptest_ingest_delta_linear_overlap_equivalence`'s
+/// `arb_repeated_run_pair`): `previous` is `w` copies of a single byte — the
+/// realistic terminal case of a run of padding spaces / box-drawing / separator
+/// dashes filling the overlap window. `current` is the *same* run with its
+/// divergence char planted at index `w/2`, so it shares `current[0]` with the
+/// window (every window byte is a `memchr` hit) but only overlaps at the back
+/// half:
+///
+/// * Legacy arm: `memchr` yields all `w` positions; for each of the `~w/2`
+///   positions whose candidate overlap still spans the divergence char, the
+///   slice compare agrees for `~w/2` bytes before failing — `O(w^2/4)` work
+///   before the first real match at `overlap_len = w/2`.
+/// * KMP arm: a single forward pass, `O(w)`.
+///
+/// Both arms return the identical `DeltaResult::Content(current[w/2..])`; the
+/// bench asserts that equality at setup so the two IDs can never silently
+/// measure different work. `current.len() == previous.len() == w` keeps the
+/// pure-append fast path (`current.len() > previous.len()`) out of the picture
+/// so the overlap search actually runs.
+fn adversarial_repeated_run(w: usize) -> (String, String, usize) {
+    const RUN_BYTE: char = ' '; // padding spaces are the most common real-world run
+    const DIVERGE: char = 'X';
+
+    let previous: String = std::iter::repeat(RUN_BYTE).take(w).collect();
+    let split = w / 2;
+    let mut current = String::with_capacity(w);
+    current.extend(std::iter::repeat(RUN_BYTE).take(split));
+    current.push(DIVERGE);
+    current.extend(std::iter::repeat(RUN_BYTE).take(w - split - 1));
+    debug_assert_eq!(current.len(), w);
+
+    // Setup-time guard: both arms must agree, else the A/B is comparing apples
+    // to oranges. (Proven for all inputs by the equivalence proptest; re-checked
+    // here on the exact benched payload.)
+    let quad = extract_delta_with_overlap_mode(&previous, &current, w, false);
+    let kmp = extract_delta_with_overlap_mode(&previous, &current, w, true);
+    assert!(
+        matches!(
+            (&quad, &kmp),
+            (
+                frankenterm_core::ingest::DeltaResult::Content(a),
+                frankenterm_core::ingest::DeltaResult::Content(b),
+            ) if a == b
+        ),
+        "Q3 adversarial arms disagree at w={w}: quad={quad:?} kmp={kmp:?}"
+    );
+
+    (previous, current, w)
+}
+
+/// Q3 forced A/B: legacy quadratic (gate OFF) vs KMP linear (gate ON) overlap
+/// search on adversarial repeated-first-byte input, driven through the
+/// `#[doc(hidden)]` [`extract_delta_with_overlap_mode`] entry point.
+///
+/// This bypasses the `FT_MOONSHOT_DELTA_LINEAR_OVERLAP` env gate — whose
+/// `env::var_os().is_some()` parse makes the build-once env A/B unable to express
+/// the OFF arm (empty-but-set = ON) — so both arms are reachable in a single run.
+/// Stable IDs `legacy_quadratic`/`kmp_linear` per window let the orchestrator
+/// read the ratio directly; the ratio should grow ~linearly with `w` (the
+/// O(n^2) vs O(n) signature).
+fn bench_adversarial_overlap_ab(c: &mut Criterion) {
+    let mut group = c.benchmark_group("delta_adversarial_overlap");
+
+    // 4096 is the shipping DEFAULT_OVERLAP_SIZE; 1024/2048 expose the quadratic
+    // scaling (legacy time should ~4x per doubling, KMP ~2x).
+    for w in [1024usize, 2048, 4096] {
+        let (prev, curr, overlap) = adversarial_repeated_run(w);
+
+        group.throughput(Throughput::Bytes(curr.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("legacy_quadratic", w),
+            &(prev.clone(), curr.clone(), overlap),
+            |b, (prev, curr, overlap)| {
+                b.iter(|| {
+                    black_box(extract_delta_with_overlap_mode(
+                        black_box(prev),
+                        black_box(curr),
+                        *overlap,
+                        false,
+                    ))
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("kmp_linear", w),
+            &(prev, curr, overlap),
+            |b, (prev, curr, overlap)| {
+                b.iter(|| {
+                    black_box(extract_delta_with_overlap_mode(
+                        black_box(prev),
+                        black_box(curr),
+                        *overlap,
+                        true,
+                    ))
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("delta_extraction", BUDGETS);
     Criterion::default().configure_from_args()
@@ -184,6 +297,7 @@ criterion_group!(
         bench_truncation,
         bench_overlap_sizes,
         bench_first_capture,
-        bench_large_content
+        bench_large_content,
+        bench_adversarial_overlap_ab
 );
 criterion_main!(benches);
