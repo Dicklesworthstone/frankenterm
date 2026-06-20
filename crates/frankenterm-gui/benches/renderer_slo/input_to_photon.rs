@@ -365,11 +365,11 @@ impl GlyphQuadGpuBench {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("glyph quad frame bench pipeline layout"),
                 bind_group_layouts: &[
-                    &uniform_bind_group_layout,
-                    &texture_bind_group_layout,
-                    &texture_bind_group_layout,
+                    Some(&uniform_bind_group_layout),
+                    Some(&texture_bind_group_layout),
+                    Some(&texture_bind_group_layout),
                 ],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let render_pipeline = create_glyph_quad_render_pipeline(
