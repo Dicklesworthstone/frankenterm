@@ -123,3 +123,10 @@ _(tick entries appended by the orchestrator tend-loop)_
   pulled clean to v0.8.0 (stashed its .beads churn). Threads A/B/C/D/E DONE; F building. Remaining proof-
   pending (non-blocking, default-off): .6 storage benches, EV1 .18/EV3 .21/EV4 .22. Next: harvest builds
   → assemble 9 assets → gh release v0.8.0 → verify → memory.
+- 2026-06-19 tend#11 (PACKAGING) — darwin-arm64 build DONE (7m50s; ft 0.8.0 (310534f5d) Mach-O arm64 +
+  gui 41M + mux 12M verified). FrankenTerm.app v0.8.0 built (create-macos-bundle.sh --skip-build, ad-hoc
+  signed); GUI SMOKE PASSED (12s run, exit 124, NO DisplayHandle/panic → round-4 GUI fix holds in the
+  release binary). Staged darwin assets: ft-darwin-arm64.tar.xz + FrankenTerm-darwin-arm64.app.tar.xz in
+  /tmp/ft-v080-release. trj linux: amd64 fat-LTO RUNNING (v0.8.0 crates), arm64 queued behind it on the
+  shared build lock (serialized ~1-2h total). Asset template (from v0.7.0): 4 .tar.xz + 4 .sha256 +
+  SHA256SUMS. Awaiting linux bins → scp → tarballs → gh release create v0.8.0.
