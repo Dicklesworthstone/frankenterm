@@ -57,6 +57,30 @@ because it is byte-equivalent and the shallow common-case cost is negligible (+0
 but its realistic ceiling is small. The higher-EV deep-scroll levers target `warm_line` decode:
 **EV3** (blocked single-line decode) and **M4** (CDC shared-chunk reconstruction).
 
+### 2026-06-20 | ft-p4vzl.8 / lw0s7.22 | EV4 set-based FTS catch-up batcher — KEEP (large-effect; default-on candidate)
+
+**Status:** KEEP (durable throughput/bandwidth win, default-off). Certifiable large-effect despite high cv.
+
+**Gate:** env `FT_MOONSHOT_FTS_INSERT_SELECT_BATCH`. cod_3 added an env-gated same-ID bench arm
+(dc01bd950) for a cleaner low-cv re-run.
+
+**Measurement (local Mac, `deferred_fts_sync`, INSERT…SELECT batch vs per-segment insert):** throughput
+180.6 Kelem/s ON; **speedup mean 9.12×, p50 14.12×, p95 6.01×.** Candidate cv 66.14% (FTS insert
+cold/warm variance) so the driver auto-REJECTed on cv rule 8 — **but the win is ≥6× at every percentile
+(p95 6.01×), non-overlapping, far beyond the 2× certifiable bar.** This is the large-effect case the cv
+rule does not veto (same class as round-5 Q1/M4).
+
+**Behavior-preservation:** byte-equiv FTS index content (set-based INSERT…SELECT == per-segment inserts);
+cod_3 oracle + RCH-green `insert_select_batch` lib test on hz1.
+
+**A/B verdict:** KEEP (≥6× at p95). **Default-on candidate** — the deferred-FTS catch-up is a background
+sync with no common-case downside (same operation, batched). Promote pending a small-batch non-regression
+check + a lower-cv re-run on dc01bd950's clean bench.
+
+**Pattern applied:** set-based bulk SQL (INSERT…SELECT) replacing per-row roundtrips.
+
+**Rollback:** env default-off; `git revert`.
+
 ---
 
 _(Further KEEP-and-promote entries land above this line with a full same-run-window proof card. Flags that

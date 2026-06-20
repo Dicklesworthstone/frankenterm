@@ -91,3 +91,19 @@ _(tick entries appended by the orchestrator tend-loop)_
   materialization, flush_print 1.64% gate-cleared). EV4 proven (cod_3, hz1). cod_1/cod_3 running
   EV3/CDC/EV4 A/Bs; cc_1 pivoting from low-EV Bloom-vs-AC to the ANSI scan frame. Ledgers updated:
   Q3/S3-FIFO/M9/M3 → negative-results, Q1 B0-nuance → keep-ledger.
+- 2026-06-20 tend#4 — **CRITICAL CORRECTION + EV4 win.** cc_1 flagged (grep-confirmed) that B0's #1 frame
+  `scan_pipeline.process` (72%) is DEAD CODE — zero production callers; the runtime capture loop uses
+  `detect_with_context` (runtime.rs:3748). BUT the ANSI-byte work B0 measured IS live: the same `simd_scan`
+  ANSI scan (`scan_newlines_and_ansi`) runs per captured segment via BOCPD (`runtime.rs:3758
+  observe_bocpd_segment_for_runtime` → bocpd.rs:652/1746). So B0 mislabeled the FRAME (dead scan_pipeline
+  wrapper vs live bocpd→simd_scan) but the ANSI-scan cost is real → **M1 ANSI-DFA targets a LIVE hot frame
+  → valid** (averted a B1-style dead-code optimization; corrected round6-profile-targets.md, 72% is now an
+  upper bound). Redirected cc_1 → profile the real `detect_with_context` frame; cc_2 → finish M1 + report
+  at REALISTIC mixed-ANSI density (not only saturated). **EV4 CERTIFIED KEEP** (cod_3): set-based FTS
+  INSERT…SELECT batch = mean 9.12× / p50 14.12× / **p95 6.01×** — ≥6× at every percentile (non-overlapping;
+  cv 66% is FTS cold/warm variance the large-effect win overrides); default-on candidate (background
+  catch-up, no common-case downside). cod_2 DONE .13 (clustered-ASCII-run-append, RCH green vmi1227854) →
+  running its A/B + term_parser A/B. cod_1 reporting EV3/adaptive-CDC A/B from existing artifacts. cod_5:
+  C2 lane-split marked code-done/proof-deferred (tree compiles; RCH stalls are infra, not a release
+  blocker). Q1 default-on proof still compiling (cold core build, vmi1152480). scan_pipeline flagged for
+  dead-code removal (hygiene, not perf).

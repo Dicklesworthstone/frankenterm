@@ -51,6 +51,22 @@ trigger-saturated = 9 747 ns (≈ mixed). The scan's cost is driven by **ANSI /
 escape byte processing**, *not* trigger density — trigger-saturation barely
 moves it.
 
+### ⚠️ CORRECTION (tend#4, 2026-06-20): frame #1 is mislabeled — the work is live, the wrapper is dead
+
+`scan_pipeline.process` (frame #1, weighted 72%) is a **dead-code wrapper**: `ScanPipeline` has zero
+production callers (only `lib.rs` `pub mod` + its own unit tests; the runtime capture loop uses
+`detect_with_context`). **HOWEVER the ANSI-byte-processing cost it measures is real and live** — the same
+`simd_scan` ANSI scan (`scan_newlines_and_ansi` / `ansi_state_step`) is called **per captured segment** in
+production by BOCPD (`runtime.rs:3758 observe_bocpd_segment_for_runtime` → `bocpd.rs:652/1746`). So:
+- Read frame #1 as **`simd_scan` ANSI scan via BOCPD (live, per-capture)**, not the dead scan_pipeline
+  wrapper. The 72% weight uses the fictional scan_pipeline call model → treat it as an **upper bound** on
+  the live ANSI-scan share until the BOCPD-scan path is weighted directly.
+- **M1 ANSI-DFA (`ansi-dfa-table`, simd_scan) targets this LIVE path → valid.** Adjudicate cc_2's M1 A/B
+  at REALISTIC (mixed) ANSI density (~9.8 µs/call), not only ANSI-saturated (47 µs).
+- `scan_pipeline` itself is dead code (hygiene: a removal candidate; not a perf item).
+- The other live per-capture frame is **`detect_with_context`** (`runtime.rs:3748`, patterns.rs) — cc_1 is
+  profiling it for patterns-path levers.
+
 ### What the gate says about the round-6 candidate ideas
 
 - **B1 — incremental cross-chunk Aho-Corasick (cc_1, FLAGSHIP) — CONFIRMED
