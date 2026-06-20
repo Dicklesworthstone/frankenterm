@@ -6,9 +6,11 @@
 //!
 //! Feature-gated behind `session-resume`.
 
+use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -28,10 +30,18 @@ pub enum AgentProvider {
     ClaudeCode,
     Codex,
     Gemini,
+    Antigravity,
     Grok,
     /// Provider not in the known set.
     Other(String),
 }
+
+/// Required Antigravity model pin for native resume commands.
+pub const ANTIGRAVITY_MODEL: &str = "Gemini 3.1 Pro (High)";
+
+/// Native Antigravity conversation database location relative to a home dir.
+pub const ANTIGRAVITY_CONVERSATIONS_RELATIVE_DIR: [&str; 3] =
+    [".gemini", "antigravity-cli", "conversations"];
 
 impl AgentProvider {
     /// The casr CLI slug for this provider.
@@ -40,6 +50,7 @@ impl AgentProvider {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
             Self::Grok => "grok",
             Self::Other(s) => s,
         }
@@ -51,8 +62,23 @@ impl AgentProvider {
             "claude-code" | "cc" => Self::ClaudeCode,
             "codex" | "cod" => Self::Codex,
             "gemini" | "gmi" => Self::Gemini,
+            "agy" | "antigravity" | "antigravity-cli" => Self::Antigravity,
             "grok" => Self::Grok,
             other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Native provider resume command for providers that do not go through casr.
+    pub fn native_resume_command(&self, session_id: &str) -> Option<Vec<String>> {
+        match self {
+            Self::Antigravity => Some(vec![
+                "agy".to_string(),
+                "--conversation".to_string(),
+                session_id.to_string(),
+                "--model".to_string(),
+                ANTIGRAVITY_MODEL.to_string(),
+            ]),
+            _ => None,
         }
     }
 }
@@ -191,11 +217,37 @@ impl SessionResumer {
     ///
     /// Calls `casr list --json` and parses the output.
     pub fn discover_sessions(&self) -> Result<Vec<CasrListEntry>, SessionResumeError> {
+        self.discover_sessions_with_native_antigravity(
+            discover_current_home_antigravity_conversations(),
+        )
+    }
+
+    /// Discover sessions using an explicit home directory for native provider scans.
+    ///
+    /// This is useful for tests and automation that need deterministic provider
+    /// fixtures without mutating process-wide `HOME`.
+    pub fn discover_sessions_in_home(
+        &self,
+        home_dir: &Path,
+    ) -> Result<Vec<CasrListEntry>, SessionResumeError> {
+        self.discover_sessions_with_native_antigravity(
+            discover_antigravity_conversations_from_home(home_dir),
+        )
+    }
+
+    fn discover_sessions_with_native_antigravity<I>(
+        &self,
+        native_antigravity_sessions: I,
+    ) -> Result<Vec<CasrListEntry>, SessionResumeError>
+    where
+        I: IntoIterator<Item = CasrListEntry>,
+    {
         info!(session_resume = true, "discovering sessions via casr list");
 
         let output = self.run_casr(&["list", "--json"])?;
-        let entries: Vec<CasrListEntry> = serde_json::from_str(&output)
+        let mut entries: Vec<CasrListEntry> = serde_json::from_str(&output)
             .map_err(|e| SessionResumeError::ParseError(e.to_string()))?;
+        append_deduped_native_antigravity_sessions(&mut entries, native_antigravity_sessions);
 
         info!(
             session_resume = true,
@@ -582,6 +634,154 @@ pub fn discover_sessions_failopen(config: &SessionResumeConfig) -> Vec<CasrListE
     }
 }
 
+/// Return the native Antigravity conversations directory for a home directory.
+pub fn antigravity_conversations_dir(home_dir: &Path) -> PathBuf {
+    ANTIGRAVITY_CONVERSATIONS_RELATIVE_DIR
+        .iter()
+        .fold(home_dir.to_path_buf(), |path, component| {
+            path.join(component)
+        })
+}
+
+/// Discover native Antigravity conversations under a testable home directory.
+///
+/// The Antigravity CLI stores one SQLite database per conversation at
+/// `~/.gemini/antigravity-cli/conversations/<uuid>.db`; that filename stem is
+/// the id accepted by `agy --conversation <uuid>`.
+pub fn discover_antigravity_conversations_from_home(home_dir: &Path) -> Vec<CasrListEntry> {
+    discover_antigravity_conversations_in_dir(&antigravity_conversations_dir(home_dir))
+}
+
+/// Discover native Antigravity conversations under an explicit conversations dir.
+pub fn discover_antigravity_conversations_in_dir(conversations_dir: &Path) -> Vec<CasrListEntry> {
+    let dir_entries = match fs::read_dir(conversations_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            warn!(
+                session_resume = true,
+                provider = "agy",
+                path = %conversations_dir.display(),
+                error = %err,
+                "failed to read Antigravity conversations directory"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut entries = Vec::new();
+    for dir_entry in dir_entries {
+        let dir_entry = match dir_entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(
+                    session_resume = true,
+                    provider = "agy",
+                    path = %conversations_dir.display(),
+                    error = %err,
+                    "failed to read Antigravity conversation directory entry"
+                );
+                continue;
+            }
+        };
+        let path = dir_entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("db") {
+            continue;
+        }
+
+        let Some(session_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+
+        let started_at = dir_entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(system_time_to_epoch_millis);
+        let resume_command = AgentProvider::Antigravity
+            .native_resume_command(&session_id)
+            .unwrap_or_default();
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "discovery_source".to_string(),
+            serde_json::json!("antigravity_conversations_db"),
+        );
+        extra.insert(
+            "native_resume_command".to_string(),
+            serde_json::json!(resume_command),
+        );
+        extra.insert(
+            "model_name".to_string(),
+            serde_json::json!(ANTIGRAVITY_MODEL),
+        );
+
+        entries.push(CasrListEntry {
+            session_id,
+            provider: Some(AgentProvider::Antigravity.slug().to_string()),
+            title: Some("Antigravity conversation".to_string()),
+            messages: 0,
+            workspace: None,
+            started_at,
+            path: Some(path.display().to_string()),
+            extra,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.session_id
+            .cmp(&right.session_id)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    entries
+}
+
+/// Discover Antigravity conversations under the process HOME, if available.
+pub fn discover_current_home_antigravity_conversations() -> Vec<CasrListEntry> {
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    discover_antigravity_conversations_from_home(&home)
+}
+
+fn append_deduped_native_antigravity_sessions<I>(entries: &mut Vec<CasrListEntry>, native: I)
+where
+    I: IntoIterator<Item = CasrListEntry>,
+{
+    let mut seen = entries
+        .iter()
+        .map(|entry| {
+            (
+                provider_from_list_entry(entry).slug().to_string(),
+                entry.session_id.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+
+    for entry in native {
+        let key = (
+            provider_from_list_entry(&entry).slug().to_string(),
+            entry.session_id.clone(),
+        );
+        if seen.insert(key) {
+            entries.push(entry);
+        }
+    }
+}
+
+fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
 /// Map a casr provider slug to an [`AgentProvider`].
 pub fn provider_from_list_entry(entry: &CasrListEntry) -> AgentProvider {
     match &entry.provider {
@@ -626,6 +826,7 @@ mod tests {
             AgentProvider::ClaudeCode,
             AgentProvider::Codex,
             AgentProvider::Gemini,
+            AgentProvider::Antigravity,
             AgentProvider::Grok,
             AgentProvider::Other("custom".into()),
         ];
@@ -641,6 +842,15 @@ mod tests {
         assert_eq!(AgentProvider::from_slug("cc"), AgentProvider::ClaudeCode);
         assert_eq!(AgentProvider::from_slug("cod"), AgentProvider::Codex);
         assert_eq!(AgentProvider::from_slug("gmi"), AgentProvider::Gemini);
+        assert_eq!(AgentProvider::from_slug("agy"), AgentProvider::Antigravity);
+        assert_eq!(
+            AgentProvider::from_slug("antigravity"),
+            AgentProvider::Antigravity
+        );
+        assert_eq!(
+            AgentProvider::from_slug("antigravity-cli"),
+            AgentProvider::Antigravity
+        );
     }
 
     #[test]
@@ -974,6 +1184,7 @@ mod tests {
             AgentProvider::ClaudeCode,
             AgentProvider::Codex,
             AgentProvider::Gemini,
+            AgentProvider::Antigravity,
             AgentProvider::Grok,
             AgentProvider::Other("x".into()),
         ];

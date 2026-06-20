@@ -21,7 +21,7 @@
 </div>
 
 <div align="center">
-  <img src="assets/demo-full.gif" alt="ft full scenario — 5-minute walkthrough of a 10-pane cc/cod/gmi swarm with real rate-limit detection, workflow auto-handling, search recovery, and mission orchestration">
+  <img src="assets/demo-full.gif" alt="ft full scenario — 5-minute walkthrough of a 10-pane cc/cod/agy swarm with real rate-limit detection, workflow auto-handling, search recovery, and mission orchestration">
   <br>
   <em>5-minute swarm scenario — 10 live agents, real detections, no mocks
   (<a href="scripts/demo-full.tape">scripts/demo-full.tape</a>).</em>

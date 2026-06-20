@@ -34,6 +34,8 @@ pub enum AgentProvider {
     Factory,
     /// Google Gemini CLI
     Gemini,
+    /// Google Antigravity CLI
+    Antigravity,
     /// GitHub Copilot (CLI and editor integration)
     GithubCopilot,
     /// xAI Grok CLI
@@ -188,6 +190,7 @@ impl AgentProvider {
             Self::Devin => "Devin",
             Self::Factory => "Factory",
             Self::Gemini => "Gemini",
+            Self::Antigravity => "Antigravity",
             Self::GithubCopilot => "GitHub Copilot",
             Self::Grok => "Grok",
             Self::Opencode => "OpenCode",
@@ -207,6 +210,7 @@ impl AgentProvider {
             Self::Devin => "devin",
             Self::Factory => "factory",
             Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
             Self::GithubCopilot => "github-copilot",
             Self::Grok => "grok",
             Self::Opencode => "opencode",
@@ -236,6 +240,7 @@ impl AgentProvider {
             "devin" => Self::Devin,
             "factory" | "factory-droid" => Self::Factory,
             "gemini" | "gemini-cli" => Self::Gemini,
+            "agy" | "antigravity" | "antigravity-cli" => Self::Antigravity,
             "github-copilot" | "copilot" | "gh-copilot" => Self::GithubCopilot,
             "grok" | "grok-cli" => Self::Grok,
             "opencode" | "open-code" => Self::Opencode,
@@ -278,6 +283,7 @@ impl AgentProvider {
             AgentProvider::Devin,
             AgentProvider::Factory,
             AgentProvider::Gemini,
+            AgentProvider::Antigravity,
             AgentProvider::GithubCopilot,
             AgentProvider::Grok,
             AgentProvider::Opencode,
@@ -301,6 +307,9 @@ fn process_name_candidates(normalized: &str) -> Vec<AgentProvider> {
     }
     if normalized.contains("gemini") {
         candidates.push(AgentProvider::Gemini);
+    }
+    if normalized == "agy" || normalized.contains("antigravity") {
+        candidates.push(AgentProvider::Antigravity);
     }
     if normalized.contains("cursor") {
         candidates.push(AgentProvider::Cursor);
@@ -337,6 +346,7 @@ fn binary_name_candidates(normalized: &str) -> Vec<AgentProvider> {
         "claude" | "claude-code" | "claude_code" => vec![AgentProvider::Claude],
         "codex" | "codex-cli" => vec![AgentProvider::Codex],
         "gemini" | "gemini-cli" => vec![AgentProvider::Gemini],
+        "agy" | "antigravity" | "antigravity-cli" => vec![AgentProvider::Antigravity],
         "cursor" => vec![AgentProvider::Cursor],
         "windsurf" => vec![AgentProvider::Windsurf],
         "cline" => vec![AgentProvider::Cline],

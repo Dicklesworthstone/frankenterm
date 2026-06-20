@@ -3,6 +3,9 @@
 //! Requires `--features session-resume`.
 
 use std::collections::HashMap;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
@@ -20,6 +23,7 @@ fn arb_agent_provider() -> impl Strategy<Value = AgentProvider> {
         Just(AgentProvider::ClaudeCode),
         Just(AgentProvider::Codex),
         Just(AgentProvider::Gemini),
+        Just(AgentProvider::Antigravity),
         Just(AgentProvider::Grok),
         "[a-z-]{1,20}".prop_map(AgentProvider::Other),
     ]
@@ -69,6 +73,220 @@ fn arb_list_entry() -> impl Strategy<Value = CasrListEntry> {
         })
 }
 
+fn path_has_component(path: &str, component: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|part| part.as_os_str().to_str() == Some(component))
+}
+
+#[test]
+fn antigravity_discovery_lists_only_conversation_db_files() {
+    let temp = tempfile::tempdir().expect("temp home");
+    let home = temp.path();
+    let conversations = antigravity_conversations_dir(home);
+    fs::create_dir_all(&conversations).expect("create agy conversations dir");
+
+    let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+    fs::write(
+        conversations.join(format!("{conversation_id}.db")),
+        b"sqlite",
+    )
+    .expect("write agy db fixture");
+    fs::write(conversations.join("not-a-conversation.sqlite"), b"sqlite")
+        .expect("write non-db fixture");
+    fs::create_dir_all(conversations.join("directory.db")).expect("create db-named directory");
+
+    let entries = discover_antigravity_conversations_from_home(home);
+
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.session_id, conversation_id);
+    assert_eq!(entry.provider.as_deref(), Some("agy"));
+    assert_eq!(provider_from_list_entry(entry), AgentProvider::Antigravity);
+    assert_eq!(
+        entry.extra.get("model_name"),
+        Some(&json!(ANTIGRAVITY_MODEL))
+    );
+    assert_eq!(
+        entry.extra.get("native_resume_command"),
+        Some(&json!([
+            "agy",
+            "--conversation",
+            conversation_id,
+            "--model",
+            ANTIGRAVITY_MODEL
+        ]))
+    );
+}
+
+#[test]
+fn antigravity_discovery_is_disjoint_from_legacy_gemini_tmp_chats() {
+    let temp = tempfile::tempdir().expect("temp home");
+    let home = temp.path();
+    let conversations = antigravity_conversations_dir(home);
+    fs::create_dir_all(&conversations).expect("create agy conversations dir");
+    fs::write(
+        conversations.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.db"),
+        b"sqlite",
+    )
+    .expect("write agy db fixture");
+
+    let legacy_gmi_chats = home
+        .join(".gemini")
+        .join("tmp")
+        .join("legacy-hash")
+        .join("chats");
+    fs::create_dir_all(&legacy_gmi_chats).expect("create legacy gmi chats dir");
+    fs::write(legacy_gmi_chats.join("session-legacy.json"), b"{}")
+        .expect("write legacy gmi fixture");
+
+    let entries = discover_antigravity_conversations_from_home(home);
+
+    assert_eq!(entries.len(), 1);
+    let discovered_path = entries[0].path.as_deref().expect("agy entry path");
+    assert!(discovered_path.contains("antigravity-cli"));
+    assert!(!discovered_path.contains("legacy-hash"));
+    assert!(!entries.iter().any(|entry| {
+        entry
+            .path
+            .as_deref()
+            .is_some_and(|path| path.contains("session-legacy.json"))
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_e2e_fixture_merges_casr_and_native_sessions_without_cross_listing() {
+    let temp = tempfile::tempdir().expect("temp home");
+    let home = temp.path();
+
+    let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+    let conversations = antigravity_conversations_dir(home);
+    fs::create_dir_all(&conversations).expect("create agy conversations dir");
+    fs::write(
+        conversations.join(format!("{conversation_id}.db")),
+        b"sqlite",
+    )
+    .expect("write agy db fixture");
+
+    let legacy_session_id = "session-legacy";
+    let legacy_gmi_chats = home
+        .join(".gemini")
+        .join("tmp")
+        .join("legacy-hash")
+        .join("chats");
+    fs::create_dir_all(&legacy_gmi_chats).expect("create legacy gmi chats dir");
+    let legacy_gmi_path = legacy_gmi_chats.join(format!("{legacy_session_id}.json"));
+    fs::write(&legacy_gmi_path, b"{}").expect("write legacy gmi fixture");
+
+    let casr_payload = json!([
+        {
+            "session_id": legacy_session_id,
+            "provider": "gemini",
+            "title": "legacy Gemini CLI session",
+            "messages": 1,
+            "workspace": null,
+            "started_at": null,
+            "path": legacy_gmi_path.display().to_string(),
+        }
+    ])
+    .to_string();
+    let fake_casr = temp.path().join("fake-casr");
+    fs::write(
+        &fake_casr,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"list\" ] && [ \"$2\" = \"--json\" ]; then\n\
+             cat <<'JSON'\n\
+             {casr_payload}\n\
+             JSON\n\
+             exit 0\n\
+             fi\n\
+             echo \"unexpected fake casr args: $*\" >&2\n\
+             exit 42\n"
+        ),
+    )
+    .expect("write fake casr fixture");
+    fs::set_permissions(&fake_casr, fs::Permissions::from_mode(0o755))
+        .expect("make fake casr executable");
+
+    let resumer = SessionResumer::new(SessionResumeConfig {
+        casr_binary: fake_casr.display().to_string(),
+        working_dir: None,
+        timeout_secs: 5,
+        dry_run: false,
+    });
+    let entries = resumer
+        .discover_sessions_in_home(home)
+        .expect("fake casr plus native agy discovery succeeds");
+
+    for entry in &entries {
+        let provider = provider_from_list_entry(entry);
+        let resume_command = provider.native_resume_command(&entry.session_id);
+        eprintln!(
+            "agy-e2e discovered provider={} uuid={} path={} resume_command={:?}",
+            provider.slug(),
+            entry.session_id,
+            entry.path.as_deref().unwrap_or("<none>"),
+            resume_command
+        );
+    }
+
+    assert_eq!(entries.len(), 2);
+    let agy_entry = entries
+        .iter()
+        .find(|entry| provider_from_list_entry(entry) == AgentProvider::Antigravity)
+        .expect("agy entry discovered");
+    let legacy_gmi_entry = entries
+        .iter()
+        .find(|entry| provider_from_list_entry(entry) == AgentProvider::Gemini)
+        .expect("legacy gmi entry preserved from casr");
+
+    assert_eq!(agy_entry.session_id, conversation_id);
+    assert_eq!(agy_entry.provider.as_deref(), Some("agy"));
+    let agy_path = agy_entry.path.as_deref().expect("agy path");
+    assert!(path_has_component(agy_path, "antigravity-cli"));
+    assert!(agy_path.ends_with(&format!("{conversation_id}.db")));
+    assert!(!path_has_component(agy_path, "legacy-hash"));
+    assert_eq!(
+        agy_entry.extra.get("native_resume_command"),
+        Some(&json!([
+            "agy",
+            "--conversation",
+            conversation_id,
+            "--model",
+            ANTIGRAVITY_MODEL
+        ]))
+    );
+
+    let assembled_resume_command = AgentProvider::Antigravity
+        .native_resume_command(conversation_id)
+        .expect("agy resume command");
+    eprintln!(
+        "agy-e2e assembled_resume_command={}",
+        assembled_resume_command.join(" ")
+    );
+    assert_eq!(
+        assembled_resume_command,
+        vec![
+            "agy".to_string(),
+            "--conversation".to_string(),
+            conversation_id.to_string(),
+            "--model".to_string(),
+            ANTIGRAVITY_MODEL.to_string(),
+        ]
+    );
+
+    assert_eq!(legacy_gmi_entry.session_id, legacy_session_id);
+    assert_eq!(legacy_gmi_entry.provider.as_deref(), Some("gemini"));
+    let legacy_path = legacy_gmi_entry.path.as_deref().expect("legacy gmi path");
+    assert!(path_has_component(legacy_path, ".gemini"));
+    assert!(path_has_component(legacy_path, "tmp"));
+    assert!(path_has_component(legacy_path, "legacy-hash"));
+    assert!(legacy_path.ends_with(&format!("{legacy_session_id}.json")));
+    assert!(!path_has_component(legacy_path, "antigravity-cli"));
+}
+
 // ---------------------------------------------------------------------------
 // Properties
 // ---------------------------------------------------------------------------
@@ -96,7 +314,11 @@ proptest! {
     #[test]
     fn agent_provider_other_preserves_slug(slug in "[a-z]{5,15}") {
         prop_assume!(
-            slug != "claude" && slug != "codex" && slug != "gemini" && slug != "grok"
+            slug != "claude"
+                && slug != "codex"
+                && slug != "gemini"
+                && slug != "grok"
+                && slug != "antigravity"
         );
         let provider = AgentProvider::Other(slug.clone());
         prop_assert_eq!(provider.slug(), slug.as_str());
@@ -297,12 +519,28 @@ proptest! {
         prop_assert_eq!(AgentProvider::from_slug("cc"), AgentProvider::ClaudeCode);
         prop_assert_eq!(AgentProvider::from_slug("cod"), AgentProvider::Codex);
         prop_assert_eq!(AgentProvider::from_slug("gmi"), AgentProvider::Gemini);
+        prop_assert_eq!(AgentProvider::from_slug("gemini"), AgentProvider::Gemini);
+        prop_assert_eq!(AgentProvider::from_slug("agy"), AgentProvider::Antigravity);
+        prop_assert_eq!(
+            AgentProvider::from_slug("antigravity"),
+            AgentProvider::Antigravity
+        );
+        prop_assert_eq!(
+            AgentProvider::from_slug("antigravity-cli"),
+            AgentProvider::Antigravity
+        );
     }
 
     // 22. AgentProvider Other slug is preserved
     #[test]
     fn agent_provider_other_slug_preserved(s in "[a-z]{5,20}") {
-        prop_assume!(s != "claude" && s != "codex" && s != "gemini" && s != "grok");
+        prop_assume!(
+            s != "claude"
+                && s != "codex"
+                && s != "gemini"
+                && s != "grok"
+                && s != "antigravity"
+        );
         let p = AgentProvider::from_slug(&s);
         if let AgentProvider::Other(ref inner) = p {
             prop_assert_eq!(inner, &s);
@@ -386,5 +624,34 @@ proptest! {
             "s", "t", &source, vec![], vec![],
         );
         prop_assert_eq!(export.session.source_path, source);
+    }
+
+    // 31. Antigravity native resume command is model pinned
+    #[test]
+    fn antigravity_native_resume_command_is_model_pinned(session_id in "[a-z0-9-]{1,64}") {
+        let command = AgentProvider::Antigravity
+            .native_resume_command(&session_id)
+            .expect("antigravity must have a native resume command");
+        prop_assert_eq!(
+            command,
+            vec![
+                "agy".to_string(),
+                "--conversation".to_string(),
+                session_id,
+                "--model".to_string(),
+                ANTIGRAVITY_MODEL.to_string(),
+            ]
+        );
+    }
+
+    // 32. Non-Antigravity providers do not get Antigravity's pinned command
+    #[test]
+    fn only_antigravity_has_native_resume_command(provider in prop_oneof![
+        Just(AgentProvider::ClaudeCode),
+        Just(AgentProvider::Codex),
+        Just(AgentProvider::Gemini),
+        Just(AgentProvider::Grok),
+    ]) {
+        prop_assert!(provider.native_resume_command("session").is_none());
     }
 }

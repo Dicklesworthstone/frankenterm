@@ -9,7 +9,7 @@
 #
 # The script is a thin glue layer over `ft` subcommands the
 # operator has already shipped. It does not stage the swarm
-# itself (real cc/cod/gmi accounts are required and per-operator),
+# itself (real cc/cod/agy accounts are required and per-operator),
 # but every other Acceptance item is mechanically checkable.
 #
 # Usage:

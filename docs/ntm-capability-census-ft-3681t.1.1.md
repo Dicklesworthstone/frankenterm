@@ -75,7 +75,7 @@ These are the upstream files that most directly justify the capability census
 | Command | Aliases | Purpose |
 |---------|---------|---------|
 | `create` | `cnt` | Create empty tmux session with N panes |
-| `spawn` | `sat` | Create session and launch specific agent mix (--cc=N --cod=N --gmi=N) |
+| `spawn` | `sat` | Create session and launch specific agent mix (--cc=N --cod=N --agy=N) |
 | `quick` | `qps` | Full project scaffolding + git init + spawn |
 | `attach` | `rnt` | Attach to session (create if missing) |
 | `list` | `lnt` | List all tmux sessions with agent counts |
@@ -87,7 +87,7 @@ These are the upstream files that most directly justify the capability census
 | Command | Aliases | Purpose |
 |---------|---------|---------|
 | `add` | `ant` | Add more agents to running session |
-| `send` | `bp` | Broadcast prompt to agents by type (--cc/--cod/--gmi/--all) |
+| `send` | `bp` | Broadcast prompt to agents by type (--cc/--cod/--agy/--all) |
 | `interrupt` | `int` | Send Ctrl+C to all agent panes |
 | `scale` | | Adjust agent count dynamically |
 

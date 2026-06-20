@@ -32,7 +32,7 @@ catch common omissions.
    - Tour: `vhs scripts/demo.tape` → `assets/demo.gif` (ft-jjvxg).
      Synthetic; renders against any built `ft` binary.
    - Full scenario: stage the 10-pane NTM swarm per ft-xl2kc.1's
-     runbook (4× cc / 3× cod / 3× gmi, drive ~3 min so it hits
+     runbook (4× cc / 3× cod / 3× agy, drive ~3 min so it hits
      ≥1 real rate limit + ≥1 workflow auto-detect), then
      `vhs scripts/demo-full.tape` → `assets/demo-full.gif`
      (ft-xl2kc). The recording reads live `ft status` /

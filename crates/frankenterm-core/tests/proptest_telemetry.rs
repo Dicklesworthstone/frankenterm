@@ -952,6 +952,7 @@ proptest! {
             histogram_buckets: buckets,
             per_process_metrics: true,
             mux_server_pid: 0,
+            ..TelemetryConfig::default()
         };
 
         prop_assert!(config.sample_interval > std::time::Duration::ZERO);

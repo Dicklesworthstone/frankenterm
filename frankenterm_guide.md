@@ -1,6 +1,6 @@
 # FrankenTerm (ft): A Comprehensive Guide to Automating AI Coding Agent Fleets
 
-> **Purpose**: A complete technical guide for building `frankenterm` (`ft`), a high-performance Rust CLI tool for orchestrating fleets of AI coding agents (Claude Code, Codex CLI, Gemini CLI) across distributed WezTerm multiplexer sessions.
+> **Purpose**: A complete technical guide for building `frankenterm` (`ft`), a high-performance Rust CLI tool for orchestrating fleets of AI coding agents (Claude Code, Codex CLI, Antigravity CLI, and legacy Gemini CLI sessions) across distributed WezTerm multiplexer sessions.
 
 > **Note**: ft removed the Lua `update-status` hook in v0.2.0 due to performance overhead. Prefer
 > `wezterm cli list` polling, user-var signaling, and escape-sequence detection instead.
@@ -65,7 +65,7 @@
 │     (macOS)     │      │  (dev-server)   │      │   (staging)     │
 │                 │      │                 │      │                 │
 │ ┌─────┐ ┌─────┐│      │ ┌─────┐ ┌─────┐│      │ ┌─────┐ ┌─────┐│
-│ │ cc  │ │ cod ││      │ │ cc  │ │ gmi ││      │ │ cod │ │ cc  ││
+│ │ cc  │ │ cod ││      │ │ cc  │ │ agy ││      │ │ cod │ │ cc  ││
 │ └─────┘ └─────┘│      │ └─────┘ └─────┘│      │ └─────┘ └─────┘│
 └─────────────────┘      └─────────────────┘      └─────────────────┘
 ```
@@ -1108,7 +1108,7 @@ impl PatternDetector {
         // Codex patterns
         Self::add_codex_patterns(&mut literals, &mut literal_to_pattern, &mut regex_patterns);
         
-        // Gemini CLI patterns
+        // Google CLI patterns (Antigravity plus legacy Gemini/gmi)
         Self::add_gemini_patterns(&mut literals, &mut literal_to_pattern, &mut regex_patterns);
         
         let literal_matcher = AhoCorasickBuilder::new()
@@ -1502,9 +1502,9 @@ impl HandleUsageLimits {
     }
     
     async fn handle_gemini(&self, ctx: WorkflowContext) -> Result<String> {
-        // Gemini CLI specific handling
+        // Antigravity/legacy Gemini CLI specific handling
         // Uses /auth command
-        todo!("Implement Gemini account rotation")
+        todo!("Implement Antigravity/legacy Gemini account rotation")
     }
 }
 
@@ -2667,7 +2667,7 @@ skills/
 └── patterns/
     ├── claude_code.md           # Claude Code specific patterns
     ├── codex.md                 # Codex CLI specific patterns
-    └── gemini.md                # Gemini CLI specific patterns
+    └── gemini.md                # Google CLI patterns (Antigravity plus legacy Gemini/gmi)
 ```
 
 ### 15.2 Example AGENTS.md

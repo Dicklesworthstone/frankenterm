@@ -696,9 +696,9 @@ The key to all of this is that we do not want to do this in the usual, brittle, 
 
 So basically we would have these various discrete workflows like 
 
-handle_usage_limits -> (cc, cod, gmi) 
+handle_usage_limits -> (cc, cod, agy; legacy gmi for old Gemini CLI sessions)
 
-handle_compaction ->  (cc, cod, gmi) 
+handle_compaction ->  (cc, cod, agy; legacy gmi for old Gemini CLI sessions)
 
 where each of those is a different workflow but use shared code wherever possible and abstract things like the patterns used to detect; for patterns, we can use super fast rust simd regex and/or ast-grep library (my project /dp/destructive_git_commands has amazing examples of how to do this very efficiently in rust).
 

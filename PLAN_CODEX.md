@@ -8,7 +8,7 @@
 
 ## 0) What this plan is (and isn’t)
 
-This document is a **single, comprehensive build plan** for `ft`: a Rust-first swarm-native terminal platform and control plane for AI coding agents (Claude Code, Codex CLI, Gemini CLI, and future agents), with a current compatibility bridge to existing WezTerm mux deployments.
+This document is a **single, comprehensive build plan** for `ft`: a Rust-first swarm-native terminal platform and control plane for AI coding agents (Claude Code, Codex CLI, Antigravity CLI, and legacy Gemini CLI sessions), with a current compatibility bridge to existing WezTerm mux deployments.
 
 It is deliberately:
 - **Deterministic** (no timing-based “sendkeys” automation).
@@ -38,8 +38,8 @@ Build ft into a **high-reliability swarm-native terminal platform** for agent fl
    - Prefer backend adapter abstractions (currently WezTerm CLI + mux protocol).
    - Use Lua IPC / OSC user-vars for low-latency signaling where the compatibility bridge supports it.
 5. **Workflows** are explicit, agent-specific, testable state machines:
-   - `handle_usage_limits` (cc/cod/gmi)
-   - `handle_compaction` (cc/cod/gmi)
+   - `handle_usage_limits` (cc/cod/agy)
+   - `handle_compaction` (cc/cod/agy)
    - Additional workflows evolve, but these are foundational.
 6. `ft` must have **agent-first “robot mode”** (JSON/Markdown, token-efficient, quick-start when no args).
 7. Integrate existing tooling:
@@ -236,7 +236,7 @@ From JE’s examples (minimum set):
   - session end block: `Token usage: total=... input=... (+ ... cached) output=... (reasoning ...)`
   - resume hint: `codex resume <uuid>`
   - device auth prompt: device code `XXXX-YYYYY` + URL
-- Gemini CLI:
+- Antigravity CLI (`agy`; legacy Gemini CLI/gmi sessions stay resumable):
   - usage limit reached
   - session summary including session id
   - model indicator: `Responding with gemini-...`
@@ -262,7 +262,7 @@ Key output of the engine:
 ### 6.3 Pattern packs (how we scale beyond the first 20 rules)
 
 Define a “pack” system:
-- `core.codex`, `core.claude_code`, `core.gemini`
+- `core.codex`, `core.claude_code`, `core.gemini` (Google CLI signals: Antigravity plus legacy Gemini/gmi)
 - `core.wezterm` (mux/server diagnostics)
 - `org.local` (user custom rules)
 
@@ -312,7 +312,7 @@ Workflows are explicit step machines:
 
 ### 7.3 Foundational workflows
 
-#### A) `handle_compaction` (cc/cod/gmi)
+#### A) `handle_compaction` (cc/cod/agy)
 
 Trigger: compaction detected for that agent.
 
@@ -322,7 +322,7 @@ Steps:
    - “Reread AGENTS.md so it’s still fresh in your mind.”
 3. Record workflow result (event handled, prompt sent, confirmation pattern seen if available).
 
-#### B) `handle_usage_limits` (cc/cod/gmi)
+#### B) `handle_usage_limits` (cc/cod/agy)
 
 Trigger: usage limit reached (or “critical warning” if configured).
 
@@ -917,7 +917,7 @@ Suggested minimum rules:
 | `claude.usage.warning` | (pack evolves) | (pack evolves) | `usage.warning` |
 | `claude.usage.reached` | (pack evolves) | (pack evolves) | `usage.reached` |
 
-### C.3 Gemini (`core.gemini`)
+### C.3 Google CLI (`core.gemini`)
 
 | rule_id | anchors | extraction | event_type |
 |---|---|---|---|

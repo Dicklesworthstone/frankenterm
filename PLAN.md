@@ -179,7 +179,7 @@ A6     → pane locking mechanism
 │     (macOS)     │             │  (dev-server)   │             │   (staging)     │
 │                 │             │                 │             │                 │
 │ ┌─────┐ ┌─────┐ │             │ ┌─────┐ ┌─────┐ │             │ ┌─────┐ ┌─────┐ │
-│ │ cc  │ │ cod │ │             │ │ cc  │ │ gmi │ │             │ │ cod │ │ cc  │ │
+│ │ cc  │ │ cod │ │             │ │ cc  │ │ agy │ │             │ │ cod │ │ cc  │ │
 │ └─────┘ └─────┘ │             │ └─────┘ └─────┘ │             │ └─────┘ └─────┘ │
 └─────────────────┘             └─────────────────┘             └─────────────────┘
 ```
@@ -1402,7 +1402,7 @@ Patterns are organized into "packs" for scalability and maintainability:
 ```
 core.codex         # Codex CLI patterns
 core.claude_code   # Claude Code patterns
-core.gemini        # Gemini CLI patterns
+core.gemini        # Google CLI patterns (Antigravity plus legacy Gemini/gmi)
 core.wezterm       # Compatibility backend bridge diagnostics (current: WezTerm mux/server)
 org.local          # User custom rules
 ```
@@ -4532,7 +4532,7 @@ See Section 5.2 for the complete schema. Key tables:
 | `claude.usage.warning` | (evolves) | (evolves) | `usage.warning` |
 | `claude.usage.reached` | (evolves) | (evolves) | `usage.reached` |
 
-#### C.3 Gemini (`core.gemini`)
+#### C.3 Google CLI (`core.gemini`)
 
 | rule_id | anchors | extraction | event_type |
 |---------|---------|------------|------------|

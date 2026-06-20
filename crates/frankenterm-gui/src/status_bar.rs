@@ -22,6 +22,7 @@ pub struct StatusTileContext {
     pub codex_agents: u16,
     pub claude_agents: u16,
     pub gemini_agents: u16,
+    pub antigravity_agents: u16,
     pub fleet_memory_tier: String,
     pub session_cost_usd: f64,
     pub network_bytes_per_sec: u64,
@@ -39,6 +40,7 @@ impl Default for StatusTileContext {
             codex_agents: 0,
             claude_agents: 0,
             gemini_agents: 0,
+            antigravity_agents: 0,
             fleet_memory_tier: "Normal".to_string(),
             session_cost_usd: 0.0,
             network_bytes_per_sec: 0,
@@ -152,8 +154,8 @@ impl BuiltInStatusTile {
             Self::Session => ctx.session_name.clone(),
             Self::Panes => format!("{}/{}", ctx.active_pane_index, ctx.pane_count),
             Self::Agents => format!(
-                "cod:{} cc:{} gmi:{}",
-                ctx.codex_agents, ctx.claude_agents, ctx.gemini_agents
+                "cod:{} cc:{} gmi:{} agy:{}",
+                ctx.codex_agents, ctx.claude_agents, ctx.gemini_agents, ctx.antigravity_agents
             ),
             Self::FleetMemory => ctx.fleet_memory_tier.clone(),
             Self::Cost => format!("${:.2}", ctx.session_cost_usd),
@@ -239,8 +241,8 @@ impl StatusTile for BuiltInStatusTile {
             Self::Session => format!("session {}", ctx.session_name),
             Self::Panes => format!("pane {} of {}", ctx.active_pane_index, ctx.pane_count),
             Self::Agents => format!(
-                "agents codex {}, claude {}, gemini {}",
-                ctx.codex_agents, ctx.claude_agents, ctx.gemini_agents
+                "agents codex {}, claude {}, gemini {}, antigravity {}",
+                ctx.codex_agents, ctx.claude_agents, ctx.gemini_agents, ctx.antigravity_agents
             ),
             Self::FleetMemory => format!("fleet memory {}", ctx.fleet_memory_tier),
             Self::Cost => format!("session cost {:.2} dollars", ctx.session_cost_usd),
@@ -351,6 +353,7 @@ mod tests {
             codex_agents: 4,
             claude_agents: 3,
             gemini_agents: 2,
+            antigravity_agents: 1,
             fleet_memory_tier: "Elevated".to_string(),
             session_cost_usd: 42.37,
             network_bytes_per_sec: 65_536,
@@ -415,6 +418,26 @@ mod tests {
         assert_eq!(ids.len(), BuiltInStatusTile::ALL.len());
         assert_eq!(sources.len(), BuiltInStatusTile::ALL.len());
         validate_tile_specs(&specs).unwrap();
+    }
+
+    #[test]
+    fn agents_tile_renders_antigravity_segment() {
+        let ctx = StatusTileContext {
+            codex_agents: 1,
+            claude_agents: 2,
+            gemini_agents: 3,
+            antigravity_agents: 4,
+            ..StatusTileContext::default()
+        };
+
+        assert_eq!(
+            BuiltInStatusTile::Agents.rendered_label(&ctx),
+            "cod:1 cc:2 gmi:3 agy:4"
+        );
+        assert_eq!(
+            BuiltInStatusTile::Agents.accessibility_label(&ctx),
+            "agents codex 1, claude 2, gemini 3, antigravity 4"
+        );
     }
 
     #[test]
@@ -514,6 +537,7 @@ mod tests {
             0_u16..=512,
             0_u16..=512,
             0_u16..=512,
+            0_u16..=512,
             arb_status_label(24),
             0_u64..=1_000_000,
             0_u64..=100_000_000_000,
@@ -528,6 +552,7 @@ mod tests {
                     codex_agents,
                     claude_agents,
                     gemini_agents,
+                    antigravity_agents,
                     fleet_memory_tier,
                     session_cost_cents,
                     network_bytes_per_sec,
@@ -541,6 +566,7 @@ mod tests {
                     codex_agents,
                     claude_agents,
                     gemini_agents,
+                    antigravity_agents,
                     fleet_memory_tier,
                     session_cost_usd: session_cost_cents as f64 / 100.0,
                     network_bytes_per_sec,
@@ -618,6 +644,7 @@ mod tests {
                 codex_agents: 5,
                 claude_agents: 2,
                 gemini_agents: 1,
+                antigravity_agents: 3,
                 fleet_memory_tier: "High".to_string(),
                 session_cost_usd: 19.25,
                 network_bytes_per_sec: 12_048,
@@ -632,6 +659,7 @@ mod tests {
                 codex_agents: 13,
                 claude_agents: 8,
                 gemini_agents: 5,
+                antigravity_agents: 3,
                 fleet_memory_tier: "Elevated".to_string(),
                 session_cost_usd: 123.45,
                 network_bytes_per_sec: 987_654,
@@ -733,6 +761,7 @@ mod tests {
             codex_agents: 6,
             claude_agents: 4,
             gemini_agents: 2,
+            antigravity_agents: 1,
             fleet_memory_tier: "Elevated".to_string(),
             session_cost_usd: 84.20,
             network_bytes_per_sec: 250_000,

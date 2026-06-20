@@ -413,7 +413,7 @@ README is text-heavy. No animated demo of a 50-pane swarm running through real w
 A picture is worth 1000 words; a 90-second VHS recording of ft observing a multi-agent swarm is worth 10,000. This is a marketing gap, but it's also a *credibility* gap — claiming "swarm-native" without showing the swarm makes evaluators skeptical.
 
 ### Bridge actions
-1. Script a realistic 5-minute scenario: 10 panes running cc/cod/gmi, ft watches, a rate limit hits, ft detects + emits event, a workflow auto-handles, search recovers a past error, mission orchestrates a recovery.
+1. Script a realistic 5-minute scenario: 10 panes running cc/cod/agy, ft watches, a rate limit hits, ft detects + emits event, a workflow auto-handles, search recovers a past error, mission orchestrates a recovery.
 2. Record via vhs (`scripts/demo.tape`).
 3. Embed in README as both GIF and asciinema link.
 4. Re-record per major release.

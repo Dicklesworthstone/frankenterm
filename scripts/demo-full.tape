@@ -4,7 +4,7 @@
 # Parent: ft-jjvxg (BR-RC-DEMO — tour tape shipped at scripts/demo.tape).
 #
 # Purpose: 5-minute README-embedded GIF showing FrankenTerm driving a
-# 10-pane swarm of cc/cod/gmi agents through realistic work, with `ft`
+# 10-pane swarm of cc/cod/agy agents through realistic work, with `ft`
 # observing rate limits, auto-handling them via workflows, recovering
 # past errors via search, and orchestrating a mission.
 #
@@ -17,7 +17,7 @@
 #
 # How to render (operator):
 #   1. Stage the swarm (see ft-xl2kc.1 runbook):
-#        ntm session new --weighted "cc=4,cod=3,gmi=3" --workspace ft-demo
+#        ntm session new --weighted "cc=4,cod=3,agy=3" --workspace ft-demo
 #        # Drive the swarm through ~3 minutes of real work so it hits
 #        # at least one rate limit and produces ≥1 ft auto-detect event.
 #   2. Confirm `ft status` shows ≥1 detection ready to demo.
@@ -45,7 +45,7 @@ Set BorderRadius 8
 Type "# FrankenTerm full scenario — observing a 10-pane agent swarm"
 Sleep 2s
 Enter
-Type "# 4× cc · 3× cod · 3× gmi · staged via NTM"
+Type "# 4× cc · 3× cod · 3× agy · staged via NTM"
 Sleep 1500ms
 Enter
 Sleep 500ms

@@ -17,6 +17,7 @@ fn arb_known_provider() -> impl Strategy<Value = AgentProvider> {
         Just(AgentProvider::Devin),
         Just(AgentProvider::Factory),
         Just(AgentProvider::Gemini),
+        Just(AgentProvider::Antigravity),
         Just(AgentProvider::GithubCopilot),
         Just(AgentProvider::Grok),
         Just(AgentProvider::Opencode),
@@ -42,6 +43,9 @@ fn arb_known_binary_name() -> impl Strategy<Value = (&'static str, AgentProvider
         Just(("codex-cli", AgentProvider::Codex)),
         Just(("gemini", AgentProvider::Gemini)),
         Just(("gemini-cli", AgentProvider::Gemini)),
+        Just(("agy", AgentProvider::Antigravity)),
+        Just(("antigravity", AgentProvider::Antigravity)),
+        Just(("antigravity-cli", AgentProvider::Antigravity)),
         Just(("cursor", AgentProvider::Cursor)),
         Just(("windsurf", AgentProvider::Windsurf)),
         Just(("cline", AgentProvider::Cline)),
@@ -65,6 +69,8 @@ fn arb_known_process_name() -> impl Strategy<Value = (String, AgentProvider)> {
         Just(("claude-code".to_string(), AgentProvider::Claude)),
         Just(("my-codex-agent".to_string(), AgentProvider::Codex)),
         Just(("gemini-cli-v2".to_string(), AgentProvider::Gemini)),
+        Just(("agy".to_string(), AgentProvider::Antigravity)),
+        Just(("antigravity-cli".to_string(), AgentProvider::Antigravity)),
         Just(("cursor-helper".to_string(), AgentProvider::Cursor)),
         Just(("windsurf-main".to_string(), AgentProvider::Windsurf)),
         Just(("cline-worker".to_string(), AgentProvider::Cline)),
@@ -229,10 +235,10 @@ proptest! {
         prop_assert_eq!(provider, cloned);
     }
 
-    // 20. all_known count is 12
+    // 20. all_known count is 13
     #[test]
     fn all_known_count(_dummy in 0..1u8) {
-        prop_assert_eq!(AgentProvider::all_known().len(), 12);
+        prop_assert_eq!(AgentProvider::all_known().len(), 13);
     }
 
     // 21. all_known slugs are all unique
@@ -284,6 +290,7 @@ proptest! {
         Just(AgentProvider::Windsurf),
         Just(AgentProvider::Cline),
         Just(AgentProvider::GithubCopilot),
+        Just(AgentProvider::Antigravity),
     ]) {
         let agent_type = provider.to_agent_type();
         let is_unknown = matches!(agent_type, frankenterm_core::patterns::AgentType::Unknown);
@@ -310,7 +317,17 @@ proptest! {
         prop_assert_eq!(AgentProvider::from_slug(alias), AgentProvider::GithubCopilot);
     }
 
-    // 28. Two different Unknown strings are not equal
+    // 28. from_slug known aliases for Antigravity
+    #[test]
+    fn from_slug_alias_antigravity(alias in prop_oneof![
+        Just("agy"),
+        Just("antigravity"),
+        Just("antigravity-cli"),
+    ]) {
+        prop_assert_eq!(AgentProvider::from_slug(alias), AgentProvider::Antigravity);
+    }
+
+    // 29. Two different Unknown strings are not equal
     #[test]
     fn unknown_different_strings_not_equal(
         a in "[a-z]{5,10}",
@@ -321,7 +338,7 @@ proptest! {
         prop_assert_ne!(pa, pb);
     }
 
-    // 29. from_process_name with prefix+suffix still detects agent
+    // 30. from_process_name with prefix+suffix still detects agent
     #[test]
     fn from_process_name_embedded(
         prefix in "[0-9]{1,5}",
@@ -332,7 +349,7 @@ proptest! {
         prop_assert_eq!(result, Some(AgentProvider::Claude));
     }
 
-    // 30. serde roundtrip with arbitrary provider (known + unknown)
+    // 31. serde roundtrip with arbitrary provider (known + unknown)
     #[test]
     fn any_provider_serde_roundtrip(provider in arb_provider()) {
         let json_str = serde_json::to_string(&provider).unwrap();
