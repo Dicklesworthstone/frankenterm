@@ -132,3 +132,27 @@ _(tick entries appended by the orchestrator tend-loop)_
   amd64+arm64 launched on trj (PID 574227, clears the long-missing ft-linux-arm64 asset); darwin-arm64
   ft+gui+mux+.app delegated to cod_4 via a clean clone. NEXT: harvest builds → assemble 9 assets +
   SHA256SUMS → gh release create v0.9.0 → verify install.sh + GUI smoke → round-6 memory + final scorecard.
+
+## CONVERGENCE — v0.9.0 RELEASED (2026-06-20)
+
+https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.9.0 — published, tag/commit `055bca9b0`.
+Assets (all clean-stamped `0.9.0 (055bca9b0)` + SHA-256 checksummed): darwin-arm64 (`ft` + `FrankenTerm.app`),
+linux-amd64 (`ft`), **linux-arm64 (`ft`)** — the long-missing arm64 asset (deferred since v0.8.0) is now
+included. install.sh asset names match. Built from the clean tag (excludes the in-flight antigravity tree).
+
+**Final scorecard — Threads A+B converged:**
+- **Certified wins:** Q1 seqlock prefix-sum **20.18×** (deep-scroll locate; PROMOTED default-on, proptest-green,
+  shallow non-regressed +0.72%); EV4 set-based FTS catch-up **6–14×** (p95 6.0×); .13 clustered ASCII line
+  materialization **4.43×** (dense-ASCII term render); D1 parser printable-run batch 1.47×; EV1 bulk-ASCII row
+  writer 1.16× (all default-off opt-in except Q1).
+- **Refuted with evidence:** B1 incremental cross-chunk Aho-Corasick (target was DEAD CODE — scan_pipeline
+  unwired); M1 ANSI-DFA table (regression vs the existing vectorized SWAR scan); Q3 KMP overlap (below the 0.5%
+  realistic-self-time gate — robustness only); D2 CSI/OSC table (no win); M3 SoA glyph quads (no win on Apple
+  Metal); S3-FIFO (workload-conditional +77%/−64%); M9 PID memory (tie).
+- **B0 correction (the round's sharpest lesson):** the profiler's #1 frame `scan_pipeline.process` (72%) was
+  DEAD CODE; the same ANSI work is live via `simd_scan` called per-capture by BOCPD (`runtime.rs:3758`). cc_1's
+  dead-code check averted a B1-repeat and correctly re-aimed M1 (which then measured as a regression anyway).
+
+**Honest headline:** profiled algorithmic complexity-class + bandwidth wins deliver (Q1 20×, EV4 6–14×, .13
+4.43×); systems-micro-moonshots and dead-frame targets don't — and round-6 proved it fast (2 flagships refuted
+before wasting implementation). Threads A/B/C/D all done.
