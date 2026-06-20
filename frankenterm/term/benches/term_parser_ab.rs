@@ -4,6 +4,7 @@
 //! runner should build once and run the same binary with these env gates
 //! toggled per arm:
 //! - EV1: `FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE`
+//! - B5: `FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND`
 //! - D1: `FT_MOONSHOT_PARSER_PRINT_BATCHING`
 //! - D2: `FT_MOONSHOT_PARSER_TABLE_DISPATCH`
 //!
@@ -29,6 +30,7 @@ const SAMPLE_COUNT: usize = 51;
 const WARMUP_SAMPLES: usize = 8;
 
 const BULK_ASCII_ROW_WRITE_ENV: &str = "FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE";
+const ASCII_CLUSTER_RUN_APPEND_ENV: &str = "FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND";
 const PARSER_PRINT_BATCHING_ENV: &str = "FT_MOONSHOT_PARSER_PRINT_BATCHING";
 const PARSER_TABLE_DISPATCH_ENV: &str = "FT_MOONSHOT_PARSER_TABLE_DISPATCH";
 const MOONSHOT_ALL_ENV: &str = "FT_MOONSHOT_ALL";
@@ -77,6 +79,10 @@ fn env_flag_truthy(name: &str) -> bool {
 
 fn term_bulk_ascii_row_write_enabled() -> bool {
     std::env::var_os(MOONSHOT_ALL_ENV).is_some() || env_flag_truthy(BULK_ASCII_ROW_WRITE_ENV)
+}
+
+fn term_ascii_cluster_run_append_enabled() -> bool {
+    std::env::var_os(MOONSHOT_ALL_ENV).is_some() || env_flag_truthy(ASCII_CLUSTER_RUN_APPEND_ENV)
 }
 
 fn dense_ascii_rows_payload() -> &'static [u8] {
@@ -196,6 +202,7 @@ fn measure_payload(label: &str, lane: &str, payload: &[u8], drive: fn(&[u8]) -> 
         "tags": {
             "bead": "ft-p4vzl.7",
             "ev1_bulk_ascii_row_write": term_bulk_ascii_row_write_enabled(),
+            "b5_ascii_cluster_run_append": term_ascii_cluster_run_append_enabled(),
             "d1_parser_print_batching": env_flag_truthy(PARSER_PRINT_BATCHING_ENV),
             "d2_parser_table_dispatch": env_flag_truthy(PARSER_TABLE_DISPATCH_ENV),
             "ft_moonshot_all": std::env::var_os(MOONSHOT_ALL_ENV).is_some()

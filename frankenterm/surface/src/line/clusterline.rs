@@ -249,6 +249,50 @@ impl ClusteredLine {
         self.len = self.len.saturating_add(u32::from(cell_width));
     }
 
+    pub fn append_ascii_run(&mut self, text: &str, attrs: CellAttributes) {
+        debug_assert!(text.is_ascii());
+        if text.is_empty() {
+            return;
+        }
+
+        const MAX_CLUSTER_CELL_WIDTH: usize = u16::MAX as usize;
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let appended_to_last = match self.clusters.last_mut() {
+                Some(cluster) if cluster.attrs == attrs => {
+                    let available =
+                        MAX_CLUSTER_CELL_WIDTH.saturating_sub(cluster.cell_width as usize);
+                    if available == 0 {
+                        0
+                    } else {
+                        let take = remaining.len().min(available);
+                        cluster.cell_width += take as u16;
+                        take
+                    }
+                }
+                _ => 0,
+            };
+
+            if appended_to_last > 0 {
+                remaining = &remaining[appended_to_last..];
+                continue;
+            }
+
+            let take = remaining.len().min(MAX_CLUSTER_CELL_WIDTH);
+            self.clusters.push(Cluster {
+                cell_width: take as u16,
+                attrs: attrs.clone(),
+            });
+            remaining = &remaining[take..];
+        }
+
+        self.text.push_str(text);
+        self.last_cell_width = NonZeroU8::new(1);
+        self.len = self
+            .len
+            .saturating_add(text.len().min(u32::MAX as usize) as u32);
+    }
+
     pub fn append(&mut self, cell: Cell) {
         let cell_width = Self::normalize_cell_width(cell.width());
         let new_cluster = match self.clusters.last() {

@@ -1,12 +1,12 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
-    CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry, default_color_map,
+    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
-use crate::{ClipboardSelection, DCS, Position, ST, TerminalState, VisibleRowIndex};
+use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::{
-    Cell, CellAttributes, SemanticType, grapheme_column_width, is_white_space_grapheme,
+    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
 use frankenterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -16,7 +16,7 @@ use frankenterm_escape_parser::osc::{
     ITermUnicodeVersionOp, Selection,
 };
 use frankenterm_escape_parser::{
-    Action, CSI, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand,
+    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
 };
 use log::{debug, error};
 use num_traits::FromPrimitive;
@@ -25,7 +25,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
 use termwiz::input::KeyboardEncoding;
-use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
+use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
@@ -1566,6 +1566,7 @@ mod tests {
     struct LineSnapshot {
         text: String,
         wrapped: bool,
+        seqno: usize,
         cells: Vec<(String, usize, CellAttributes)>,
     }
 
@@ -1616,6 +1617,21 @@ mod tests {
     impl Drop for BulkAsciiRowWriteOverride {
         fn drop(&mut self) {
             BULK_ASCII_ROW_WRITE_TEST_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct AsciiClusterRunAppendOverride;
+
+    impl AsciiClusterRunAppendOverride {
+        fn set(force_bulk_append: bool) -> Self {
+            crate::screen::set_ascii_cluster_run_append_test_override(Some(force_bulk_append));
+            Self
+        }
+    }
+
+    impl Drop for AsciiClusterRunAppendOverride {
+        fn drop(&mut self) {
+            crate::screen::set_ascii_cluster_run_append_test_override(None);
         }
     }
 
@@ -1681,6 +1697,7 @@ mod tests {
         LineSnapshot {
             text: line.as_str().to_string(),
             wrapped: line.last_cell_was_wrapped(),
+            seqno: line.current_seqno(),
             cells: line
                 .visible_cells()
                 .map(|cell| (cell.str().to_string(), cell.width(), cell.attrs().clone()))
@@ -1750,6 +1767,16 @@ mod tests {
         force_bulk: bool,
     ) -> TerminalSnapshot {
         let _bulk_override = BulkAsciiRowWriteOverride::set(force_bulk);
+        let _cluster_override = AsciiClusterRunAppendOverride::set(false);
+        render_actions(actions)
+    }
+
+    fn render_actions_with_ascii_cluster_run_append(
+        actions: Vec<Action>,
+        force_bulk_append: bool,
+    ) -> TerminalSnapshot {
+        let _bulk_override = BulkAsciiRowWriteOverride::set(true);
+        let _cluster_override = AsciiClusterRunAppendOverride::set(force_bulk_append);
         render_actions(actions)
     }
 
@@ -1805,6 +1832,51 @@ mod tests {
         assert!(
             total_bulk_hits > 0,
             "bulk ASCII row writer was not exercised by the oracle corpus"
+        );
+    }
+
+    #[test]
+    fn parser_print_batching_ascii_cluster_run_append_matches_per_cell_materialization() {
+        let mut cases = gate_corpus();
+        cases.push(("dense_ascii_line", vec![b'd'; 96]));
+        cases.push(("exact_right_edge_wrap", vec![b'w'; 80]));
+        cases.push(("attrs_exact_right_edge_then_wrap", {
+            let mut bytes = b"\x1b[1;31m".to_vec();
+            bytes.extend(std::iter::repeat(b'r').take(80));
+            bytes.extend_from_slice(b"\x1b[0mZ");
+            bytes
+        }));
+        cases.push((
+            "left_right_margin_exact_wrap",
+            b"\x1b[?69h\x1b[5;12smargins!\x1b[0mZ".to_vec(),
+        ));
+        cases.push((
+            "insert_mode_fallback",
+            b"\x1b[4hinsert\x1b[4lplain".to_vec(),
+        ));
+        cases.push(("charset_fallback", b"\x1b(0abc\x1b(Btail".to_vec()));
+
+        let mut total_cluster_hits = 0;
+        for (name, bytes) in cases {
+            let per_cell = render_actions_with_ascii_cluster_run_append(
+                parse_with_batching(&bytes, true),
+                false,
+            );
+            crate::screen::reset_ascii_cluster_run_append_hits();
+            let bulk_append = render_actions_with_ascii_cluster_run_append(
+                parse_with_batching(&bytes, true),
+                true,
+            );
+            let cluster_hits = crate::screen::ascii_cluster_run_append_hits();
+            total_cluster_hits += cluster_hits;
+            assert_eq!(
+                per_cell, bulk_append,
+                "ASCII cluster-run append diverged from per-cell materialization for {name}"
+            );
+        }
+        assert!(
+            total_cluster_hits > 0,
+            "ASCII cluster-run append was not exercised by the oracle corpus"
         );
     }
 

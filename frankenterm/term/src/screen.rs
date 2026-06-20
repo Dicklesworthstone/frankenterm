@@ -2,16 +2,16 @@
 use super::*;
 use crate::config::BidiMode;
 use crossbeam::thread;
-use frankenterm_surface::SequenceNo;
 use frankenterm_surface::line::{
     LineWrapScorecard as MonospaceLineWrapScorecard, LineWrapWidthPrefixScratch,
     MonospaceKpCostModel, MonospaceWrapMode,
 };
+use frankenterm_surface::SequenceNo;
 use log::{debug, warn};
-use std::collections::{HashMap, VecDeque, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
 
@@ -113,6 +113,65 @@ const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
 const COLD_SCROLLBACK_BACKLOG_DEPTH_CAP: usize = 1_048_576;
 const SCROLLBACK_WARM_MAX_BYTES_CAP: usize = 1024 * 1024 * 1024;
 const LAST_GOOD_FRAME_MAX_BYTES_MULTIPLIER: usize = 4;
+const ASCII_CLUSTER_RUN_APPEND_ENV: &str = "FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND";
+
+#[cfg(test)]
+static ASCII_CLUSTER_RUN_APPEND_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+static ASCII_CLUSTER_RUN_APPEND_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_ascii_cluster_run_append_test_override(force: Option<bool>) {
+    ASCII_CLUSTER_RUN_APPEND_TEST_OVERRIDE.store(
+        match force {
+            Some(false) => 1,
+            Some(true) => 2,
+            None => 0,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn reset_ascii_cluster_run_append_hits() {
+    ASCII_CLUSTER_RUN_APPEND_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn ascii_cluster_run_append_hits() -> usize {
+    ASCII_CLUSTER_RUN_APPEND_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn moonshot_env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty()
+                && value != "0"
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("off")
+                && !value.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(false)
+}
+
+fn ascii_cluster_run_append_enabled() -> bool {
+    #[cfg(test)]
+    match ASCII_CLUSTER_RUN_APPEND_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FT_MOONSHOT_ALL").is_some()
+            || moonshot_env_truthy(ASCII_CLUSTER_RUN_APPEND_ENV)
+    });
+    *ENABLED
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LastGoodFrameTransition {
@@ -2660,6 +2719,13 @@ impl Screen {
         self.invalidate_last_good_frame(LastGoodFrameTransition::ContentMutation, Some(seqno));
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
+        if ascii_cluster_run_append_enabled()
+            && line.append_ascii_cell_run(x, text, attr.clone(), seqno)
+        {
+            #[cfg(test)]
+            ASCII_CLUSTER_RUN_APPEND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         for (offset, byte) in text.bytes().enumerate() {
             line.set_cell(x + offset, Cell::new(char::from(byte), attr.clone()), seqno);
         }
@@ -3505,7 +3571,11 @@ impl Screen {
 fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Range<PhysRowIndex> {
     let start = r1.start.max(r2.start);
     let end = r1.end.min(r2.end);
-    if end > start { start..end } else { 0..0 }
+    if end > start {
+        start..end
+    } else {
+        0..0
+    }
 }
 
 #[cfg(test)]
@@ -4400,18 +4470,14 @@ mod tests {
         let logical_lines = screen.rebuild_logical_lines_from_physical(2);
         let logical_count = logical_lines.len();
         let viewport_plan = screen.build_viewport_reflow_plan_for_current_snapshot(logical_count);
-        assert!(
-            viewport_plan
-                .batches
-                .iter()
-                .any(|batch| batch.priority == ReflowBatchPriority::Viewport)
-        );
-        assert!(
-            viewport_plan
-                .batches
-                .iter()
-                .any(|batch| batch.priority == ReflowBatchPriority::ColdScrollback)
-        );
+        assert!(viewport_plan
+            .batches
+            .iter()
+            .any(|batch| batch.priority == ReflowBatchPriority::Viewport));
+        assert!(viewport_plan
+            .batches
+            .iter()
+            .any(|batch| batch.priority == ReflowBatchPriority::ColdScrollback));
 
         let full_scan_plan = ViewportReflowPlan::full_scan(logical_count);
         let mut viewport_screen = screen.clone();
@@ -4490,11 +4556,10 @@ mod tests {
         );
 
         assert!(plan.covers_each_logical_line_once(logical_count));
-        assert!(
-            plan.batches
-                .iter()
-                .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES)
-        );
+        assert!(plan
+            .batches
+            .iter()
+            .all(|batch| batch.logical_range.len() <= MAX_REFLOW_BATCH_LOGICAL_LINES));
         assert_eq!(
             plan.batches
                 .first()
@@ -4742,10 +4807,8 @@ mod tests {
     #[test]
     fn last_good_frame_rollback_tracks_missing_snapshot_failures() {
         let mut screen = test_screen(2, 2, 96);
-        assert!(
-            !screen
-                .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation)
-        );
+        assert!(!screen
+            .rollback_to_last_good_frame(2, LastGoodFrameRollbackCause::ResizeCommitValidation));
         assert_eq!(screen.last_good_frame_lifecycle.rollback_count, 0);
         assert_eq!(
             screen

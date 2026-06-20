@@ -7,7 +7,7 @@ use crate::line::clusterline::ClusteredLine;
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{HyperlinkCellMatch, VecStorage, VecStorageIter};
-use crate::{Change, SEQ_ZERO, SequenceNo};
+use crate::{Change, SequenceNo, SEQ_ZERO};
 use alloc::borrow::Cow;
 #[cfg(feature = "appdata")]
 use alloc::sync::{Arc, Weak};
@@ -1074,6 +1074,41 @@ impl Line {
         }
 
         self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+    }
+
+    /// Assign a contiguous width-1 ASCII run when it can be represented as a
+    /// single append to clustered storage. Returns false if the caller must
+    /// fall back to the normal per-cell assignment path.
+    pub fn append_ascii_cell_run(
+        &mut self,
+        idx: usize,
+        text: &str,
+        attr: CellAttributes,
+        seqno: SequenceNo,
+    ) -> bool {
+        debug_assert!(text.is_ascii());
+        if text.is_empty() {
+            return true;
+        }
+        if !text.is_ascii() || checked_materialized_end(idx, text.len()).is_none() {
+            return false;
+        }
+
+        let CellStorage::C(cl) = &mut self.cells else {
+            return false;
+        };
+        if idx != cl.len() {
+            return false;
+        }
+
+        if attr.hyperlink().is_some() {
+            self.bits |= LineBits::HAS_HYPERLINK;
+        }
+        cl.append_ascii_run(text, attr);
+        self.invalidate_implicit_hyperlinks(seqno);
+        self.invalidate_zones();
+        self.update_last_change_seqno(seqno);
+        true
     }
 
     pub fn set_cell_clearing_image_placements(
