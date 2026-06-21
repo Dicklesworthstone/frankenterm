@@ -58,3 +58,32 @@ Machine-readable profile output:
 ```json
 {"schema":"round7.new_axis.profile.v1","gate_share":0.005,"avg_dirty_wal_bytes":4738032,"frames":[{"frame":"scan_pipeline.process","location":"scan_pipeline.rs:528","workload":"round6 denominator: capture scan","candidate":false,"mean_ns":11175.35,"calls_per_min":11520,"realistic_self_ns":128740080,"share":0.552903,"gate_pass":true,"notes":"denominator"},{"frame":"bocpd.observe_text_chunk","location":"runtime.rs:3758 -> bocpd.rs:844","workload":"per-capture BOCPD segment observation","candidate":true,"mean_ns":5776.51,"calls_per_min":11520,"realistic_self_ns":66545342,"share":0.285794,"gate_pass":true,"notes":"quality ARL metric deferred"},{"frame":"redactor.redact","location":"redactor.rs:690","workload":"round6 denominator: outbound read redaction","candidate":false,"mean_ns":7284.43,"calls_per_min":3840,"realistic_self_ns":27972211,"share":0.120133,"gate_pass":true,"notes":"denominator"},{"frame":"storage.wal_recovery_dirty","location":"storage.rs:1647","workload":"startup WAL-dirty DB","candidate":true,"mean_ns":8214318.67,"calls_per_min":1,"realistic_self_ns":8214319,"share":0.035278,"gate_pass":true,"notes":"startup dirty contrast"},{"frame":"events.event_bus_publish","location":"events.rs:1280","workload":"burst pattern detection fanout","candidate":true,"mean_ns":1333.61,"calls_per_min":960,"realistic_self_ns":1280264,"share":0.005498,"gate_pass":true,"notes":"live via runtime/ipc/bridge publishers"},{"frame":"storage.wal_recovery_clean","location":"storage.rs:1647","workload":"startup clean DB","candidate":true,"mean_ns":91597.33,"calls_per_min":1,"realistic_self_ns":91597,"share":0.000393,"gate_pass":false,"notes":"startup clean contrast"}]}
 ```
+
+## WAL-Recovery Feasibility Verdict (cod_4 tend)
+
+Verdict: **feasible bounded Rust lever exists**. `check_and_recover_wal` already checks whether
+`<db>-wal` / `<db>-journal` exists, but the current writer-open path still runs
+`PRAGMA quick_check` and `PRAGMA wal_checkpoint(PASSIVE)` on every open. The clean case is below
+gate (`0.039%`), but the dirty case pays the checkpoint cost even for a modest WAL
+(`4.7 MB` average in the round-7 harness, `3.528%` self-time). This is not a speculative
+algorithmic rewrite: SQLite WAL durability does not require checkpoint-on-open for a valid WAL;
+open/read semantics replay the WAL as needed, while checkpointing is maintenance/compaction work.
+
+Implementation lever for round 8: before issuing `PRAGMA wal_checkpoint(PASSIVE)`, conservatively
+estimate WAL frames from the WAL file header/metadata. If there is no rollback journal, `quick_check`
+is healthy, and the estimated frame count is `<= WAL_RECOVERY_THRESHOLD`, skip startup checkpoint and
+let normal operation/periodic maintenance handle it. If the WAL is above threshold, the header is
+unreadable/invalid, a rollback journal exists, or any probe is ambiguous, fall back to the current
+checkpoint behavior. This preserves the current corruption fail-closed path and keeps the existing
+large-WAL truncate behavior bounded.
+
+Rejected levers:
+
+- Replacing `PASSIVE` with `TRUNCATE` everywhere would likely increase blocking/fsync work and is not
+  correctness-preserving under active readers.
+- Incremental checkpointing at startup has no clear Rust-side win without moving the work to a later
+  maintenance path; it still asks SQLite to do the same WAL I/O.
+- Skipping `quick_check` would weaken the current corruption detection contract and is not admissible
+  for this lever.
+
+Round-8 follow-up bead: `ft-yjihu.1`.
