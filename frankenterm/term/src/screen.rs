@@ -113,6 +113,7 @@ const REFLOW_OVERSCAN_ROW_CAP: usize = 256;
 const COLD_SCROLLBACK_BACKLOG_DEPTH_CAP: usize = 1_048_576;
 const SCROLLBACK_WARM_MAX_BYTES_CAP: usize = 1024 * 1024 * 1024;
 const LAST_GOOD_FRAME_MAX_BYTES_MULTIPLIER: usize = 4;
+const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
 const ASCII_CLUSTER_RUN_APPEND_ENV: &str = "FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND";
 
 #[cfg(test)]
@@ -145,17 +146,21 @@ pub(crate) fn ascii_cluster_run_append_hits() -> usize {
     ASCII_CLUSTER_RUN_APPEND_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn moonshot_env_truthy(name: &str) -> bool {
+fn moonshot_env_falsey(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
             let value = value.trim();
-            !value.is_empty()
-                && value != "0"
-                && !value.eq_ignore_ascii_case("false")
-                && !value.eq_ignore_ascii_case("off")
-                && !value.eq_ignore_ascii_case("no")
+            value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no")
         })
         .unwrap_or(false)
+}
+
+fn moonshot_recommended_enabled() -> bool {
+    !moonshot_env_falsey(MOONSHOT_RECOMMENDED_ENV)
 }
 
 fn ascii_cluster_run_append_enabled() -> bool {
@@ -167,8 +172,10 @@ fn ascii_cluster_run_append_enabled() -> bool {
     }
 
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var_os("FT_MOONSHOT_ALL").is_some()
-            || moonshot_env_truthy(ASCII_CLUSTER_RUN_APPEND_ENV)
+        // Round-7 promotion: this flag is part of the recommended dense-ASCII
+        // term-render stack and is default-on, with both set-wide and per-flag
+        // falsey escape hatches.
+        moonshot_recommended_enabled() && !moonshot_env_falsey(ASCII_CLUSTER_RUN_APPEND_ENV)
     });
     *ENABLED
 }

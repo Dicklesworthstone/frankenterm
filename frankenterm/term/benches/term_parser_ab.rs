@@ -1,11 +1,14 @@
 //! Round-6 term/parser A/B throughput harness for ft-p4vzl.7.
 //!
-//! The bench intentionally leaves all moonshot gates default-off. The campaign
-//! runner should build once and run the same binary with these env gates
-//! toggled per arm:
+//! The Round-7 recommended term-render gates default on together. The campaign
+//! runner can disable the whole recommended set with `FT_MOONSHOT_RECOMMENDED=0`
+//! or disable individual recommended gates with their own falsey env value:
+//! - recommended set: `FT_MOONSHOT_RECOMMENDED`
 //! - EV1: `FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE`
 //! - B5: `FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND`
 //! - D1: `FT_MOONSHOT_PARSER_PRINT_BATCHING`
+//!
+//! D2 remains opt-in and is toggled independently:
 //! - D2: `FT_MOONSHOT_PARSER_TABLE_DISPATCH`
 //!
 //! Dense ASCII rows exercise D1 and the full terminal EV1 row writer. CSI/OSC
@@ -29,6 +32,7 @@ use serde_json::json;
 const SAMPLE_COUNT: usize = 51;
 const WARMUP_SAMPLES: usize = 8;
 
+const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
 const BULK_ASCII_ROW_WRITE_ENV: &str = "FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE";
 const ASCII_CLUSTER_RUN_APPEND_ENV: &str = "FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND";
 const PARSER_PRINT_BATCHING_ENV: &str = "FT_MOONSHOT_PARSER_PRINT_BATCHING";
@@ -77,12 +81,34 @@ fn env_flag_truthy(name: &str) -> bool {
     }
 }
 
+fn env_flag_falsey(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+        }
+        Err(_) => false,
+    }
+}
+
+fn moonshot_recommended_enabled() -> bool {
+    !env_flag_falsey(MOONSHOT_RECOMMENDED_ENV)
+}
+
 fn term_bulk_ascii_row_write_enabled() -> bool {
-    std::env::var_os(MOONSHOT_ALL_ENV).is_some() || env_flag_truthy(BULK_ASCII_ROW_WRITE_ENV)
+    moonshot_recommended_enabled() && !env_flag_falsey(BULK_ASCII_ROW_WRITE_ENV)
 }
 
 fn term_ascii_cluster_run_append_enabled() -> bool {
-    std::env::var_os(MOONSHOT_ALL_ENV).is_some() || env_flag_truthy(ASCII_CLUSTER_RUN_APPEND_ENV)
+    moonshot_recommended_enabled() && !env_flag_falsey(ASCII_CLUSTER_RUN_APPEND_ENV)
+}
+
+fn parser_print_batching_enabled() -> bool {
+    moonshot_recommended_enabled() && !env_flag_falsey(PARSER_PRINT_BATCHING_ENV)
 }
 
 fn dense_ascii_rows_payload() -> &'static [u8] {
@@ -203,8 +229,9 @@ fn measure_payload(label: &str, lane: &str, payload: &[u8], drive: fn(&[u8]) -> 
             "bead": "ft-p4vzl.7",
             "ev1_bulk_ascii_row_write": term_bulk_ascii_row_write_enabled(),
             "b5_ascii_cluster_run_append": term_ascii_cluster_run_append_enabled(),
-            "d1_parser_print_batching": env_flag_truthy(PARSER_PRINT_BATCHING_ENV),
+            "d1_parser_print_batching": parser_print_batching_enabled(),
             "d2_parser_table_dispatch": env_flag_truthy(PARSER_TABLE_DISPATCH_ENV),
+            "ft_moonshot_recommended": moonshot_recommended_enabled(),
             "ft_moonshot_all": std::env::var_os(MOONSHOT_ALL_ENV).is_some()
         }
     });

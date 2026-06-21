@@ -20,20 +20,24 @@ use sixel::SixelBuilder;
 const MAX_TCAP_NAMES: usize = 512;
 const MAX_TCAP_CURRENT_BYTES: usize = 1_048_576;
 
+/// Set-wide escape hatch for the Round-7 moonshot-recommended default-on set.
+/// Falsey values disable promoted recommended gates while leaving unrelated
+/// moonshots alone.
+const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
+
 /// Env gate for the Round-5 D1 printable-run batching optimization
-/// (ft-round5-gauntlet-lw0s7.10). Truthy values turn it on for newly
-/// constructed parsers, which is how the term/event_bus A/B is driven without
-/// touching the (non-owned) `Terminal` construction site. Default-OFF.
+/// (ft-round5-gauntlet-lw0s7.10). Round-7 promotes this to default-ON as part
+/// of the dense-ASCII term-render stack; falsey values disable it for newly
+/// constructed parsers.
 const PRINT_BATCHING_ENV: &str = "FT_MOONSHOT_PARSER_PRINT_BATCHING";
 
 /// Resolve the default `print_batching` setting for a freshly constructed
-/// [`Parser`]. Off unless the `parser-print-batching` feature is compiled in or
-/// the `FT_MOONSHOT_PARSER_PRINT_BATCHING` env var is set truthy at run time
-/// (mirrors the sibling `FT_MOONSHOT_*` storage/scrollback gates). The env read
-/// is `std`-only; `no_std` builds fall back to the compile-time feature.
+/// [`Parser`]. On unless `FT_MOONSHOT_RECOMMENDED` or
+/// `FT_MOONSHOT_PARSER_PRINT_BATCHING` is set falsey. The env read is
+/// `std`-only; `no_std` builds use the promoted default.
 #[inline]
 fn default_print_batching() -> bool {
-    cfg!(feature = "parser-print-batching") || env_flag_truthy(PRINT_BATCHING_ENV)
+    !env_flag_falsey(MOONSHOT_RECOMMENDED_ENV) && !env_flag_falsey(PRINT_BATCHING_ENV)
 }
 
 /// Env gate for the Round-5 D2 table-driven CSI/OSC dispatch optimization
@@ -61,6 +65,22 @@ fn env_flag_truthy(_name: &str) -> bool {
                 || value.eq_ignore_ascii_case("on")
                 || value.eq_ignore_ascii_case("true")
                 || value.eq_ignore_ascii_case("yes");
+        }
+    }
+    false
+}
+
+#[inline]
+fn env_flag_falsey(_name: &str) -> bool {
+    #[cfg(feature = "std")]
+    {
+        if let Ok(value) = std::env::var(_name) {
+            let value = value.trim();
+            return value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no");
         }
     }
     false
@@ -287,7 +307,7 @@ impl Parser {
         let n = bytes.len();
         let mut i = 0;
         while i < n {
-            if self.state_machine.is_ground() {
+            if can_start_printable_run(bytes[i]) && self.state_machine.is_ground() {
                 let (run_end, char_count) = scan_printable_run(bytes, i);
                 if char_count >= MIN_BATCH_CHARS {
                     // `scan_printable_run` only extends across complete, valid
@@ -309,7 +329,7 @@ impl Parser {
                 state: &mut state,
             };
             while i < n {
-                if self.state_machine.is_ground() {
+                if can_start_printable_run(bytes[i]) && self.state_machine.is_ground() {
                     let (_run_end, char_count) = scan_printable_run(bytes, i);
                     if char_count >= MIN_BATCH_CHARS {
                         break;
@@ -434,6 +454,11 @@ fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
 ///
 /// Returns `(end_index, char_count)`, where `bytes[start..end_index]` is
 /// guaranteed valid UTF-8 and `char_count` is the number of codepoints in it.
+#[inline]
+fn can_start_printable_run(byte: u8) -> bool {
+    matches!(byte, 0x20..=0x7e) || byte >= 0xc2
+}
+
 fn scan_printable_run(bytes: &[u8], start: usize) -> (usize, usize) {
     let n = bytes.len();
     let mut i = start;
@@ -621,9 +646,14 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         // stream for the common shapes (and emits nothing when it declines).
         if self.state.table_dispatch {
             let cb = &mut *self.callback;
-            if CSI::parse_fast(params, parameters_truncated, control as char, &mut |action| {
-                cb(Action::CSI(action));
-            }) {
+            if CSI::parse_fast(
+                params,
+                parameters_truncated,
+                control as char,
+                &mut |action| {
+                    cb(Action::CSI(action));
+                },
+            ) {
                 return;
             }
         }

@@ -28,6 +28,9 @@ use termwiz::input::KeyboardEncoding;
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 
+const MOONSHOT_RECOMMENDED_ENV: &str = "FT_MOONSHOT_RECOMMENDED";
+const BULK_ASCII_ROW_WRITE_ENV: &str = "FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE";
+
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
 /// the terminal state and the embedding/host terminal interface
 pub(crate) struct Performer<'a> {
@@ -46,6 +49,23 @@ static BULK_ASCII_ROW_WRITE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 =
 #[cfg(test)]
 static BULK_ASCII_ROW_WRITE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+fn moonshot_env_falsey(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            value.is_empty()
+                || value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(false)
+}
+
+fn moonshot_recommended_enabled() -> bool {
+    !moonshot_env_falsey(MOONSHOT_RECOMMENDED_ENV)
+}
 
 impl<'a> Deref for Performer<'a> {
     type Target = TerminalState;
@@ -194,20 +214,9 @@ impl<'a> Performer<'a> {
         }
 
         static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            // FT_MOONSHOT_ALL master switch (round-5 "everything-on" test build).
-            if std::env::var_os("FT_MOONSHOT_ALL").is_some() {
-                return true;
-            }
-            std::env::var("FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE")
-                .map(|value| {
-                    let value = value.trim();
-                    !value.is_empty()
-                        && value != "0"
-                        && !value.eq_ignore_ascii_case("false")
-                        && !value.eq_ignore_ascii_case("off")
-                        && !value.eq_ignore_ascii_case("no")
-                })
-                .unwrap_or(false)
+            // Round-7 promotion: EV1 is part of the recommended dense-ASCII
+            // term-render stack and remains independently escapable.
+            moonshot_recommended_enabled() && !moonshot_env_falsey(BULK_ASCII_ROW_WRITE_ENV)
         });
         *ENABLED
     }
