@@ -3870,6 +3870,14 @@ enum RobotCommands {
         command: RobotAgentsCommands,
     },
 
+    /// Cross-agent session-resume discovery and execution
+    #[cfg(feature = "session-resume")]
+    #[command(visible_aliases = ["sessions", "resume-session"])]
+    SessionResume {
+        #[command(subcommand)]
+        command: RobotSessionResumeCommands,
+    },
+
     /// Account management commands (list, refresh, pick preview)
     Accounts {
         #[command(subcommand)]
@@ -4731,6 +4739,56 @@ enum RobotAgentsCommands {
         /// Where to place generated config files
         #[arg(long, value_enum, default_value_t = RobotAgentConfigScope::Project)]
         scope: RobotAgentConfigScope,
+    },
+}
+
+/// Robot session-resume subcommands.
+#[cfg(feature = "session-resume")]
+#[derive(Subcommand)]
+enum RobotSessionResumeCommands {
+    /// List resumable sessions across providers
+    List {
+        /// Restrict output to a provider slug or alias, e.g. agy, antigravity, gmi, gemini
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Read provider session fixtures from this HOME instead of process HOME
+        #[arg(long)]
+        home: Option<PathBuf>,
+
+        /// Path to casr for legacy providers
+        #[arg(long, default_value = "casr")]
+        casr_binary: String,
+
+        /// Timeout for casr/native resume subprocesses
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+
+    /// Resume one session through its provider-specific command
+    Resume {
+        /// Session id from `ft robot session-resume list`
+        session_id: String,
+
+        /// Provider slug or alias, e.g. agy, antigravity, gmi, gemini
+        #[arg(long)]
+        provider: String,
+
+        /// Show the exact resume command without executing it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Read provider session fixtures from this HOME instead of process HOME
+        #[arg(long)]
+        home: Option<PathBuf>,
+
+        /// Path to casr for legacy providers
+        #[arg(long, default_value = "casr")]
+        casr_binary: String,
+
+        /// Timeout for casr/native resume subprocesses
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
     },
 }
 
@@ -6691,6 +6749,15 @@ const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
 const ROBOT_ERR_RESOURCE_WHAT_IF: &str = "robot.resource.what_if_error";
 const ROBOT_ERR_COORDINATION_RISK: &str = "robot.coordination_risk_unavailable";
 const ROBOT_ERR_AGENT_MAIL_OUTBOX: &str = "robot.agent_mail_outbox_unavailable";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME: &str = "robot.session_resume.error";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME_NOT_FOUND: &str = "robot.session_resume.session_not_found";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME_NATIVE_PROVIDER_NOT_FOUND: &str =
+    "robot.session_resume.native_provider_not_found";
+#[cfg(feature = "session-resume")]
+const ROBOT_ERR_SESSION_RESUME_SUBPROCESS: &str = "robot.session_resume.subprocess_error";
 const ROBOT_ERR_INCIDENT_NOT_FOUND: &str = "robot.incident.not_found";
 const ROBOT_ERR_INCIDENT_SOURCE_UNAVAILABLE: &str = "robot.incident.source_unavailable";
 const ROBOT_ERR_INCIDENT_DAG: &str = "robot.incident.dag_error";
@@ -12456,6 +12523,505 @@ struct RobotAgentsDetectData {
     refresh: bool,
     installed_agents: Vec<frankenterm_core::agent_correlator::InstalledAgentInventoryEntry>,
     summary: RobotAgentInventorySummary,
+}
+
+#[cfg(feature = "session-resume")]
+const ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION: &str = "ft.robot.session_resume.list.v1";
+#[cfg(feature = "session-resume")]
+const ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION: &str = "ft.robot.session_resume.resume.v1";
+
+#[cfg(feature = "session-resume")]
+#[derive(Debug, serde::Serialize)]
+struct RobotSessionResumeListData {
+    schema_version: &'static str,
+    provider_filter: Option<String>,
+    home: Option<String>,
+    casr_binary: String,
+    sessions: Vec<RobotSessionResumeEntry>,
+    count: usize,
+    warnings: Vec<String>,
+}
+
+#[cfg(feature = "session-resume")]
+#[derive(Debug, serde::Serialize)]
+struct RobotSessionResumeEntry {
+    provider: String,
+    session_id: String,
+    title: Option<String>,
+    messages: usize,
+    workspace: Option<String>,
+    started_at: Option<i64>,
+    source_path: Option<String>,
+    resume_kind: String,
+    native_resume_command: Option<Vec<String>>,
+    model_name: Option<String>,
+    metadata: BTreeMap<String, serde_json::Value>,
+}
+
+#[cfg(feature = "session-resume")]
+#[derive(Debug, serde::Serialize)]
+struct RobotSessionResumeResumeData {
+    schema_version: &'static str,
+    provider: String,
+    session_id: String,
+    source_path: Option<String>,
+    resume_kind: String,
+    dry_run: bool,
+    command_argv: Vec<String>,
+    command_display: String,
+    model_name: Option<String>,
+    native_execution: Option<RobotSessionResumeNativeExecution>,
+    casr_resume: Option<frankenterm_core::casr_types::CasrResumeOutput>,
+}
+
+#[cfg(feature = "session-resume")]
+#[derive(Debug, serde::Serialize)]
+struct RobotSessionResumeNativeExecution {
+    exit_code: i32,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_home(home: Option<PathBuf>) -> Option<PathBuf> {
+    home.or_else(|| {
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_config(
+    casr_binary: String,
+    timeout_secs: u64,
+    dry_run: bool,
+) -> frankenterm_core::session_resume::SessionResumeConfig {
+    frankenterm_core::session_resume::SessionResumeConfig {
+        casr_binary,
+        working_dir: None,
+        timeout_secs,
+        dry_run,
+    }
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_provider(
+    provider: Option<&str>,
+) -> Option<frankenterm_core::session_resume::AgentProvider> {
+    provider.map(frankenterm_core::session_resume::AgentProvider::from_slug)
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_entry_matches_provider(
+    entry: &frankenterm_core::casr_types::CasrListEntry,
+    provider: &frankenterm_core::session_resume::AgentProvider,
+) -> bool {
+    frankenterm_core::session_resume::provider_from_list_entry(entry).slug() == provider.slug()
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_metadata(
+    extra: &HashMap<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    extra
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_native_command(
+    entry: &frankenterm_core::casr_types::CasrListEntry,
+) -> Option<Vec<String>> {
+    entry
+        .extra
+        .get("native_resume_command")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_model_name(
+    entry: &frankenterm_core::casr_types::CasrListEntry,
+) -> Option<String> {
+    entry
+        .extra
+        .get("model_name")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_entry(
+    entry: frankenterm_core::casr_types::CasrListEntry,
+) -> RobotSessionResumeEntry {
+    let provider = frankenterm_core::session_resume::provider_from_list_entry(&entry)
+        .slug()
+        .to_string();
+    let native_resume_command = robot_session_resume_native_command(&entry);
+    let resume_kind = if native_resume_command.is_some() {
+        "native"
+    } else {
+        "casr"
+    }
+    .to_string();
+    let model_name = robot_session_resume_model_name(&entry);
+    let metadata = robot_session_resume_metadata(&entry.extra);
+
+    RobotSessionResumeEntry {
+        provider,
+        session_id: entry.session_id,
+        title: entry.title,
+        messages: entry.messages,
+        workspace: entry.workspace,
+        started_at: entry.started_at,
+        source_path: entry.path,
+        resume_kind,
+        native_resume_command,
+        model_name,
+        metadata,
+    }
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_command_display(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if arg.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':' | b'=')
+            }) {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_error_response<T>(
+    err: frankenterm_core::session_resume::SessionResumeError,
+    elapsed_ms: u64,
+) -> RobotResponse<T> {
+    use frankenterm_core::session_resume::SessionResumeError;
+
+    match err {
+        SessionResumeError::CasrNotFound(message) => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME,
+            format!("casr is unavailable for legacy session resume: {message}"),
+            Some("Install casr or pass --casr-binary for legacy gmi/gemini sessions.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::NativeProviderNotFound {
+            provider_slug,
+            binary,
+            message,
+        } => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_NATIVE_PROVIDER_NOT_FOUND,
+            format!("native provider {provider_slug} is unavailable: {message}"),
+            Some(format!(
+                "Install `{binary}` and ensure it is on PATH; frankenterm will not substitute another provider."
+            )),
+            elapsed_ms,
+        ),
+        SessionResumeError::InvalidNativeSessionId { reason, .. } => {
+            RobotResponse::error_with_code(
+                ROBOT_ERR_INVALID_ARGS,
+                reason,
+                Some("Use the UUID shown by `ft robot session-resume list --provider agy`.".to_string()),
+                elapsed_ms,
+            )
+        }
+        SessionResumeError::SessionNotFound(session_id) => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_NOT_FOUND,
+            format!("session {session_id:?} was not found for the requested provider"),
+            Some("Run `ft robot session-resume list --provider <provider>` and use one of the returned session_id values.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::SubprocessFailed { code, stderr } => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME_SUBPROCESS,
+            format!(
+                "session-resume subprocess failed with exit {}: {}",
+                code.unwrap_or(-1),
+                stderr
+            ),
+            None,
+            elapsed_ms,
+        ),
+        SessionResumeError::NonPinnedNativeModel {
+            required_model, ..
+        } => RobotResponse::error_with_code(
+            ROBOT_ERR_INVALID_ARGS,
+            format!("Antigravity resume must use the pinned model {required_model:?}"),
+            Some("Do not override the Antigravity model pin.".to_string()),
+            elapsed_ms,
+        ),
+        SessionResumeError::Timeout => RobotResponse::error_with_code(
+            ROBOT_ERR_TIMEOUT,
+            "session-resume command timed out",
+            Some("Increase --timeout-secs only when the target command is expected to run that long.".to_string()),
+            elapsed_ms,
+        ),
+        other => RobotResponse::error_with_code(
+            ROBOT_ERR_SESSION_RESUME,
+            other.to_string(),
+            None,
+            elapsed_ms,
+        ),
+    }
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_discover_entries(
+    provider_filter: Option<&frankenterm_core::session_resume::AgentProvider>,
+    home: Option<&Path>,
+    casr_binary: &str,
+    timeout_secs: u64,
+) -> Result<
+    (
+        Vec<frankenterm_core::casr_types::CasrListEntry>,
+        Vec<String>,
+    ),
+    frankenterm_core::session_resume::SessionResumeError,
+> {
+    use frankenterm_core::session_resume::AgentProvider;
+
+    let mut warnings = Vec::new();
+    if matches!(provider_filter, Some(AgentProvider::Antigravity)) {
+        let entries = home
+            .map(frankenterm_core::session_resume::discover_antigravity_conversations_from_home)
+            .unwrap_or_default();
+        return Ok((entries, warnings));
+    }
+
+    let config = robot_session_resume_config(casr_binary.to_string(), timeout_secs, false);
+    let resumer = frankenterm_core::session_resume::SessionResumer::new(config);
+    let mut entries = match home {
+        Some(home) => resumer.discover_sessions_in_home(home),
+        None => resumer.discover_sessions(),
+    };
+
+    if let Err(error) = &entries {
+        if provider_filter.is_some() {
+            return Err(error.clone());
+        }
+        warnings.push(format!(
+            "casr discovery failed ({error}); returning native Antigravity sessions only"
+        ));
+        entries = Ok(home
+            .map(frankenterm_core::session_resume::discover_antigravity_conversations_from_home)
+            .unwrap_or_else(
+                frankenterm_core::session_resume::discover_current_home_antigravity_conversations,
+            ));
+    }
+
+    let mut entries = entries?;
+    if let Some(provider) = provider_filter {
+        entries.retain(|entry| robot_session_resume_entry_matches_provider(entry, provider));
+    }
+    entries.sort_by(|left, right| {
+        let left_provider = frankenterm_core::session_resume::provider_from_list_entry(left)
+            .slug()
+            .to_string();
+        let right_provider = frankenterm_core::session_resume::provider_from_list_entry(right)
+            .slug()
+            .to_string();
+        left_provider
+            .cmp(&right_provider)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok((entries, warnings))
+}
+
+#[cfg(feature = "session-resume")]
+fn build_robot_session_resume_list_data(
+    provider: Option<String>,
+    home: Option<PathBuf>,
+    casr_binary: String,
+    timeout_secs: u64,
+) -> Result<RobotSessionResumeListData, frankenterm_core::session_resume::SessionResumeError> {
+    let provider_filter = robot_session_resume_provider(provider.as_deref());
+    let resolved_home = robot_session_resume_home(home);
+    let (entries, warnings) = robot_session_resume_discover_entries(
+        provider_filter.as_ref(),
+        resolved_home.as_deref(),
+        &casr_binary,
+        timeout_secs,
+    )?;
+    let sessions = entries
+        .into_iter()
+        .map(robot_session_resume_entry)
+        .collect::<Vec<_>>();
+    let count = sessions.len();
+
+    Ok(RobotSessionResumeListData {
+        schema_version: ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION,
+        provider_filter: provider_filter.map(|provider| provider.slug().to_string()),
+        home: resolved_home.map(|path| path.display().to_string()),
+        casr_binary,
+        sessions,
+        count,
+        warnings,
+    })
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_output_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+#[cfg(feature = "session-resume")]
+fn robot_session_resume_run_native(
+    plan: &frankenterm_core::session_resume::NativeResumePlan,
+    timeout_secs: u64,
+) -> Result<RobotSessionResumeNativeExecution, frankenterm_core::session_resume::SessionResumeError>
+{
+    use frankenterm_core::session_resume::SessionResumeError;
+
+    let mut child = std::process::Command::new(&plan.binary)
+        .args(plan.argv.iter().skip(1))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| SessionResumeError::SubprocessFailed {
+            code: None,
+            stderr: format!("failed to spawn {}: {error}", plan.binary),
+        })?;
+
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs.max(1)))
+        .unwrap_or_else(Instant::now);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let output = child.wait_with_output().map_err(|error| {
+                    SessionResumeError::SubprocessFailed {
+                        code: None,
+                        stderr: format!("failed to collect {} output: {error}", plan.binary),
+                    }
+                })?;
+                let exit_code = output.status.code().unwrap_or(-1);
+                if !output.status.success() {
+                    return Err(SessionResumeError::SubprocessFailed {
+                        code: output.status.code(),
+                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    });
+                }
+                return Ok(RobotSessionResumeNativeExecution {
+                    exit_code,
+                    stdout: robot_session_resume_output_text(&output.stdout),
+                    stderr: robot_session_resume_output_text(&output.stderr),
+                });
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SessionResumeError::Timeout);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                return Err(SessionResumeError::SubprocessFailed {
+                    code: None,
+                    stderr: format!("failed while waiting for {}: {error}", plan.binary),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(feature = "session-resume")]
+fn build_robot_session_resume_resume_data(
+    session_id: String,
+    provider: String,
+    dry_run: bool,
+    home: Option<PathBuf>,
+    casr_binary: String,
+    timeout_secs: u64,
+) -> Result<RobotSessionResumeResumeData, frankenterm_core::session_resume::SessionResumeError> {
+    use frankenterm_core::session_resume::AgentProvider;
+
+    let provider = frankenterm_core::session_resume::AgentProvider::from_slug(&provider);
+    let resolved_home = robot_session_resume_home(home);
+    let (entries, _) = robot_session_resume_discover_entries(
+        Some(&provider),
+        resolved_home.as_deref(),
+        &casr_binary,
+        timeout_secs,
+    )?;
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.session_id == session_id)
+        .ok_or_else(|| {
+            frankenterm_core::session_resume::SessionResumeError::SessionNotFound(
+                session_id.clone(),
+            )
+        })?;
+    let source_path = entry.path.clone();
+
+    if provider == AgentProvider::Antigravity {
+        let plan = provider
+            .checked_native_resume_plan(&session_id)?
+            .expect("Antigravity has a native resume plan");
+        plan.require_binary_available_in_path(None)?;
+        let native_execution = if dry_run {
+            None
+        } else {
+            Some(robot_session_resume_run_native(&plan, timeout_secs)?)
+        };
+        return Ok(RobotSessionResumeResumeData {
+            schema_version: ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION,
+            provider: provider.slug().to_string(),
+            session_id,
+            source_path,
+            resume_kind: "native".to_string(),
+            dry_run,
+            command_argv: plan.argv.clone(),
+            command_display: robot_session_resume_command_display(&plan.argv),
+            model_name: plan.model_name.clone(),
+            native_execution,
+            casr_resume: None,
+        });
+    }
+
+    let command_argv = {
+        let mut argv = vec![
+            casr_binary.clone(),
+            "resume".to_string(),
+            session_id.clone(),
+            "--target".to_string(),
+            provider.slug().to_string(),
+            "--json".to_string(),
+        ];
+        if dry_run {
+            argv.push("--dry-run".to_string());
+        }
+        argv
+    };
+    let config = robot_session_resume_config(casr_binary, timeout_secs, dry_run);
+    let resumer = frankenterm_core::session_resume::SessionResumer::new(config);
+    let casr_resume = resumer.resume_session(&session_id, &provider)?;
+
+    Ok(RobotSessionResumeResumeData {
+        schema_version: ROBOT_SESSION_RESUME_RESUME_SCHEMA_VERSION,
+        provider: provider.slug().to_string(),
+        session_id,
+        source_path,
+        resume_kind: "casr".to_string(),
+        dry_run,
+        command_display: robot_session_resume_command_display(&command_argv),
+        command_argv,
+        model_name: robot_session_resume_model_name(&entry),
+        native_execution: None,
+        casr_resume: Some(casr_resume),
+    })
 }
 
 fn build_robot_agent_inventory_summary(
@@ -19268,7 +19834,7 @@ mod robot_context_backend_tests {
         let report = expect_context_ok(robot_context_report_data(
             &db_path,
             7,
-            (budget * 85 / 100), // 85% -> red
+            budget * 85 / 100, // 85% -> red
             5,
         ));
         assert_eq!(report["action"].as_str(), Some("report"));
@@ -23125,6 +23691,16 @@ fn build_robot_help() -> RobotHelp {
                 name: "agents configure",
                 description: "Generate or preview FrankenTerm agent config files",
             },
+            #[cfg(feature = "session-resume")]
+            RobotCommandInfo {
+                name: "session-resume list",
+                description: "List cross-agent resumable sessions including agy and legacy gmi",
+            },
+            #[cfg(feature = "session-resume")]
+            RobotCommandInfo {
+                name: "session-resume resume",
+                description: "Resume a session with provider-specific argv and Antigravity model pinning",
+            },
             RobotCommandInfo {
                 name: "workflow run",
                 description: "Run a workflow by name on a pane",
@@ -23548,6 +24124,27 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 examples: vec![
                     "ft robot agents configure --dry-run",
                     "ft robot agents configure --agent codex --scope global",
+                ],
+            },
+            #[cfg(feature = "session-resume")]
+            QuickStartCommand {
+                name: "session-resume list",
+                args: "[--provider <slug>] [--home <path>] [--casr-binary <path>]",
+                summary: "List resumable agent sessions, including native agy conversations and legacy gmi sessions",
+                examples: vec![
+                    "ft robot session-resume list --provider agy",
+                    "ft robot session-resume list --provider gmi",
+                    "ft robot --format toon session-resume list",
+                ],
+            },
+            #[cfg(feature = "session-resume")]
+            QuickStartCommand {
+                name: "session-resume resume",
+                args: "<session_id> --provider <slug> [--dry-run] [--home <path>] [--casr-binary <path>]",
+                summary: "Resume a selected session with provider-specific argv and fail-closed Antigravity model pinning",
+                examples: vec![
+                    "ft robot session-resume resume 123e4567-e89b-12d3-a456-426614174000 --provider agy --dry-run",
+                    "ft robot session-resume resume session-legacy-gmi --provider gmi --dry-run",
                 ],
             },
             QuickStartCommand {
@@ -31562,6 +32159,47 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let response = handle_robot_incident_command(&command, elapsed_ms(start));
                     print_robot_response(&response, format, stats)?;
                 }
+                #[cfg(feature = "session-resume")]
+                RobotCommands::SessionResume { command } => match command {
+                    RobotSessionResumeCommands::List {
+                        provider,
+                        home,
+                        casr_binary,
+                        timeout_secs,
+                    } => {
+                        let response = match build_robot_session_resume_list_data(
+                            provider,
+                            home,
+                            casr_binary,
+                            timeout_secs,
+                        ) {
+                            Ok(data) => RobotResponse::success(data, elapsed_ms(start)),
+                            Err(err) => robot_session_resume_error_response(err, elapsed_ms(start)),
+                        };
+                        print_robot_response(&response, format, stats)?;
+                    }
+                    RobotSessionResumeCommands::Resume {
+                        session_id,
+                        provider,
+                        dry_run,
+                        home,
+                        casr_binary,
+                        timeout_secs,
+                    } => {
+                        let response = match build_robot_session_resume_resume_data(
+                            session_id,
+                            provider,
+                            dry_run,
+                            home,
+                            casr_binary,
+                            timeout_secs,
+                        ) {
+                            Ok(data) => RobotResponse::success(data, elapsed_ms(start)),
+                            Err(err) => robot_session_resume_error_response(err, elapsed_ms(start)),
+                        };
+                        print_robot_response(&response, format, stats)?;
+                    }
+                },
                 RobotCommands::Perf { command } => {
                     let payload = match command {
                         RobotPerfCommands::SloStatus { slo } => {
@@ -31593,6 +32231,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         RobotCommands::Attention { .. } => unreachable!("handled above"),
                         RobotCommands::Rehearsal { .. } => unreachable!("handled above"),
                         RobotCommands::Incidents { .. } => unreachable!("handled above"),
+                        #[cfg(feature = "session-resume")]
+                        RobotCommands::SessionResume { .. } => unreachable!("handled above"),
                         RobotCommands::Perf { .. } => unreachable!("handled above"),
                         RobotCommands::AgentMailOutbox { .. } => unreachable!("handled above"),
                         RobotCommands::State {
@@ -82025,6 +82665,131 @@ A  docs/new-proof.md\n";
             },
             _ => panic!("expected Robot command"),
         }
+    }
+
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn cli_robot_session_resume_list_parses_provider_aliases() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "--format",
+            "toon",
+            "session-resume",
+            "list",
+            "--provider",
+            "antigravity-cli",
+            "--home",
+            "/tmp/ft-agy-home",
+            "--casr-binary",
+            "/tmp/fake-casr",
+            "--timeout-secs",
+            "7",
+        ])
+        .expect("robot session-resume list should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot {
+                format,
+                command: Some(RobotCommands::SessionResume { command }),
+                ..
+            }) => {
+                assert_eq!(format, Some(RobotOutputFormat::Toon));
+                match command {
+                    RobotSessionResumeCommands::List {
+                        provider,
+                        home,
+                        casr_binary,
+                        timeout_secs,
+                    } => {
+                        assert_eq!(provider.as_deref(), Some("antigravity-cli"));
+                        assert_eq!(home, Some(PathBuf::from("/tmp/ft-agy-home")));
+                        assert_eq!(casr_binary, "/tmp/fake-casr");
+                        assert_eq!(timeout_secs, 7);
+                    }
+                    _ => panic!("expected RobotSessionResumeCommands::List"),
+                }
+            }
+            _ => panic!("expected RobotCommands::SessionResume"),
+        }
+    }
+
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn cli_robot_session_resume_resume_parses_dry_run_and_legacy_gmi() {
+        let cli = Cli::try_parse_from([
+            "ft",
+            "robot",
+            "resume-session",
+            "resume",
+            "session-legacy-gmi",
+            "--provider",
+            "gmi",
+            "--dry-run",
+        ])
+        .expect("robot session-resume resume alias should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot {
+                command: Some(RobotCommands::SessionResume { command }),
+                ..
+            }) => match command {
+                RobotSessionResumeCommands::Resume {
+                    session_id,
+                    provider,
+                    dry_run,
+                    ..
+                } => {
+                    assert_eq!(session_id, "session-legacy-gmi");
+                    assert_eq!(provider, "gmi");
+                    assert!(dry_run);
+                }
+                _ => panic!("expected RobotSessionResumeCommands::Resume"),
+            },
+            _ => panic!("expected RobotCommands::SessionResume"),
+        }
+    }
+
+    #[cfg(feature = "session-resume")]
+    #[test]
+    fn robot_session_resume_list_data_reads_native_agy_without_casr() {
+        use std::fs;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+        let conversations = temp_dir
+            .path()
+            .join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&conversations).expect("create conversations dir");
+        fs::write(conversations.join(format!("{conversation_id}.db")), b"SQLite fixture")
+            .expect("write db fixture");
+
+        let data = build_robot_session_resume_list_data(
+            Some("agy".to_string()),
+            Some(temp_dir.path().to_path_buf()),
+            "/missing/casr".to_string(),
+            1,
+        )
+        .expect("agy listing should not require casr");
+
+        assert_eq!(data.schema_version, ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION);
+        assert_eq!(data.provider_filter.as_deref(), Some("agy"));
+        assert_eq!(data.count, 1);
+        assert!(data.warnings.is_empty());
+        let entry = &data.sessions[0];
+        assert_eq!(entry.provider, "agy");
+        assert_eq!(entry.session_id, conversation_id);
+        assert_eq!(entry.resume_kind, "native");
+        assert_eq!(
+            entry.native_resume_command.as_ref().expect("native argv"),
+            &vec![
+                "agy".to_string(),
+                "--conversation".to_string(),
+                conversation_id.to_string(),
+                "--model".to_string(),
+                frankenterm_core::session_resume::ANTIGRAVITY_MODEL.to_string(),
+            ]
+        );
     }
 
     #[test]
