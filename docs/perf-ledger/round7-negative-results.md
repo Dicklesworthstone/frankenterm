@@ -31,3 +31,45 @@ Grep round{4,5,6}-negative-results.md before any pattern touches these.
 
 _(round-7 measured-no-win / reject / revert / liveness-refute entries land below, one per the
 rejected-entry template, each closed with exactly one of the 8 retry-condition forms.)_
+
+### 2026-06-21 | ft-ykde4 | EV3 blocked/rank-select single-line scrollback decode
+
+**Status:** rejected (refuted-on-liveness)
+
+**Gate:** env `FT_MOONSHOT_SCROLLBACK_BLOCKED_PAGE_INDEX` (default off)
+
+**Profile attribution:** Round-6 B0 attributed `scrollback.warm_line` at 5.18% on the synthetic
+deep-scroll decode harness, but round-7 caller tracing found no non-test production caller of the
+single-line decode API.
+
+**Measurement (focused):** Not run for promotion: `scrollback_ev3_cold_line` exercises the
+single-line `cold_line` bench surface, but that surface is bench/test-only in the production
+checkout.
+
+**Measurement (broad):** Not applicable; no production request path reaches the EV3 single-line
+decode lever.
+
+**Behavior-preservation:** pass — the EV3 byte-equivalence/proptest substrate remains shipped
+behind its default-off gate; this entry only rejects promoting or further optimizing the dead
+single-line path.
+
+**Liveness evidence:** `rg -n "warm_line\(|cold_line\(|decode_page_line\(" crates/frankenterm-core/src
+crates/frankenterm-core/benches crates/frankenterm-core/tests tests frankenterm -g '*.rs'`
+finds only the API definitions in `scrollback_tiers.rs`, in-file `#[cfg(test)]` uses after
+`scrollback_tiers.rs:1897`, the `scrollback_ev3_cold_line` bench, the
+`round6_profile_realistic_workloads` test harness, and `fleet_memory_controller.rs:2001` inside
+that file's `#[cfg(test)] mod tests` starting at `fleet_memory_controller.rs:1499`. No non-test
+production caller invokes `warm_line`, `cold_line`, or `decode_page_line`.
+
+**A/B verdict:** reject — liveness gate failed before A/B. Production scrollback reads that ask for
+whole pages still go through `warm_page_lines` -> `decode_page` (`scrollback_tiers.rs:1004-1008`),
+so EV3's target-block decode does not participate.
+
+**Retry-condition predicate:** Retry only if a profiler attributes a clearly-above-noise share to
+`TieredScrollback::warm_line` or `TieredScrollback::cold_line` on a non-test production deep-scroll
+or cold-history readback workload.
+
+**Rollback:** flag stays default-off
+
+**Sibling references:** ft-ykde4; adaptive-M4 RSS adjudication remains pending on ft-6aban
+(`tests/round7_rss_harness.rs`).
