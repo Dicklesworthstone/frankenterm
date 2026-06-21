@@ -10,7 +10,7 @@
 
 | Flag | Pane / bead | Gate-structure | OFF-path preserved | Byte-equiv proof | Verdict |
 |---|---|---|---|---|---|
-| EV4 set-based FTS | cod_3 / ft-uvjfr | ✅ own fn `fts_insert_select_batch_enabled_from_env` default-on; shared helper untouched | ✅ `=0`/`false`/`off` → off, == baseline | ✅ `round7_fts_promote.rs` | **ENDORSE** |
+| EV4 set-based FTS | cod_3 / ft-uvjfr | ✅ own fn `fts_insert_select_batch_enabled_from_env` default-on; shared helper untouched | ✅ `=0`/`false`/`off` → off, == baseline | ✅ `round7_fts_promote.rs` (oracle sound; fresh solo RCH green pending) | **PASS (landed 8318c5514)** |
 | .13 clustered-ASCII | cod_2 / ft-97g96 | ✅ `moonshot_recommended_enabled() && !moonshot_env_falsey(ENV)` | ✅ `=0` → off, == baseline | ✅ `..ascii_cluster_run_append_matches_per_cell_materialization` (cluster_hits>0) | **ENDORSE (landed 5c2d995eb, RCH green)** |
 | EV1 bulk-ASCII | cod_2 / ft-97g96 | ✅ same pattern, BULK_ASCII_ROW_WRITE_ENV | ✅ `=0` → off | ✅ `..bulk_ascii_row_write_matches_scalar..` (bulk_hits>0) | **ENDORSE (landed 5c2d995eb, RCH green)** |
 | D1 print-batching | cod_2 / ft-97g96 | ✅ `default_print_batching()` default-on, dual falsey hatch | ✅ `=0` → off, == old default-off | ✅ chunked all-splits + escape-parser `parser_print_batching_equivalence.rs` | **ENDORSE (landed 5c2d995eb, RCH green)** |
@@ -35,6 +35,17 @@ No promotion is missing a byte-equivalence proof. No gate restructure changes OF
   byte-budget splitting. Non-vacuity guards: segments_indexed=6, panes_processed=2, searches.len()=4,
   second_sync.segments_indexed=0. Feature `asupersync-runtime` IS default-on → proof runs for real.
 - cc_1's keep-ledger card (2026-06-21) matches this independent review.
+- **LANDED 8318c5514 — verified against committed blobs. PASS.** Gate `_ =>` arm routes to the new
+  fn; `storage_env_flag_enabled` byte-for-byte unchanged (single-line repoint, 1 deletion). Cargo.toml
+  adds `[[test]] round7_fts_promote required-features=["asupersync-runtime"]` — correct (feature is
+  default-on → runs under default `cargo test`; the entry only lets cargo skip it cleanly under
+  `--no-default-features`). Oracle assertions intact (gate_enabled both arms, sync/second_sync/searches
+  byte-equiv incl `score.to_bits()`, non-vacuity 6/2/0/4). **Caveat:** commit message marks the fresh
+  full-core RCH re-proof "pending/optional" (deferred to avoid concurrent-core-build truncation, per
+  [[concurrent-rch-core-builds-truncate-2026-06-14]]). Underlying EV4 path was RCH-green round-6
+  (dc01bd950); the NEW round7_fts_promote oracle should get one SOLO fail-closed RCH green before final
+  certification. Correctness PASS by inspection + sound oracle; green-run is a process follow-up, not a
+  code defect.
 
 ## Term-render stack (.13 / EV1 / D1) — review (ENDORSE pending RCH green)
 - **Oracle design (performer.rs inline #[cfg(test)]):** ON vs OFF rendered from the SAME parsed
