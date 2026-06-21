@@ -741,6 +741,11 @@ path = "tests/proptest_session_resume.rs"
 required-features = ["session-resume"]
 
 [[test]]
+name = "e2e_antigravity_session_resume_script"
+path = "tests/e2e_antigravity_session_resume_script.rs"
+required-features = ["session-resume"]
+
+[[test]]
 name = "proptest_disk_pressure"
 path = "tests/proptest_disk_pressure.rs"
 required-features = ["disk-pressure"]
