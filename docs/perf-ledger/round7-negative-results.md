@@ -73,3 +73,38 @@ or cold-history readback workload.
 
 **Sibling references:** ft-ykde4; adaptive-M4 RSS adjudication remains pending on ft-6aban
 (`tests/round7_rss_harness.rs`).
+
+### 2026-06-21 | ft-8cpho / ft-ui1xn | quick_reject Bloom prefilter vs AC-direct A/B
+
+**Status:** blocked (RCH-E410 dependency-closure)
+
+**Gate:** production `PatternEngine::quick_reject_enabled` remains default-on. The A/B harness uses
+the bench-only `PatternEngine::set_quick_reject_enabled(false)` arm to measure `ac_direct`; no
+production default was changed.
+
+**Profile attribution:** ft-ui1xn remains a candidate from static path evidence: `quick_reject` runs
+before the exact Aho-Corasick matcher on the no-match-dominant `detect()` / `detect_with_context()`
+path. The round-7 A/B did not reach Cargo, so it produced no new timing attribution.
+
+**Measurement (focused):** Attempted remote-only Criterion A/B:
+`RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 CARGO_NET_GIT_FETCH_WITH_CLI=true rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-8cpho-pattern-ab-$(date +%s) cargo bench -p frankenterm-core --bench pattern_detection quick_reject_vs_ac_direct -- --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot --quiet`.
+RCH selected remote worker `hz1`, job `j-29895646634836025`, synced the tree, then failed closed
+before Cargo with `RCH-E410`: missing source entrypoint
+`crates/frankenterm-core/tests/round7_fts_promote.rs`. No local fallback was run or counted.
+
+**Measurement (broad):** Not run; focused A/B blocked before Cargo execution.
+
+**Behavior-preservation:** not executed in this run. The shipped seam remains byte-equivalence-safe
+by construction: disabling `quick_reject` only skips a Bloom prefilter and runs the exact matcher on
+more inputs.
+
+**A/B verdict:** blocked — no performance verdict. `quick_reject` remains default-on and `ac_direct`
+promotion remains unproven.
+
+**Retry-condition predicate (Form 8):** Blocked until ft-uvjfr lands a tracked
+`crates/frankenterm-core/tests/round7_fts_promote.rs` source file or removes the corresponding
+Cargo test entry so RCH dependency closure can reach Cargo; track as `ft-uvjfr`.
+
+**Rollback:** no code landed; flag stays default-on in production
+
+**Sibling references:** ft-ui1xn, ft-8cpho, ft-uvjfr
