@@ -52,8 +52,17 @@ fn battery() -> Vec<(String, Vec<u8>)> {
 
     // --- SGR: multi-code canonical combos (fast path multi-yield) ---
     for combo in [
-        "0", "1;31", "0;1;4;7", "31;42", "1;3;4;5;7;9", "39;49", "53;55",
-        "73;74;75", "90;101", "22;23;24;25", "10;11;12;13;14",
+        "0",
+        "1;31",
+        "0;1;4;7",
+        "31;42",
+        "1;3;4;5;7;9",
+        "39;49",
+        "53;55",
+        "73;74;75",
+        "90;101",
+        "22;23;24;25",
+        "10;11;12;13;14",
     ] {
         push(
             &format!("sgr_combo_{}", combo.replace(';', "_")),
@@ -71,17 +80,40 @@ fn battery() -> Vec<(String, Vec<u8>)> {
     push("sgr_bg_256", b"\x1b[48;5;12m".to_vec());
     push("sgr_underline_colon", b"\x1b[4:3m".to_vec());
     push("sgr_underline_color", b"\x1b[58;5;9m".to_vec());
-    push("sgr_fancy_underline", b"\x1b[4:0;4:1;4:2;4:3;4:4;4:5m".to_vec());
+    push(
+        "sgr_fancy_underline",
+        b"\x1b[4:0;4:1;4:2;4:3;4:4;4:5m".to_vec(),
+    );
     push("sgr_question", b"\x1b[?4m".to_vec());
     push("sgr_unknown_code", b"\x1b[1;99;31m".to_vec());
-    push("sgr_truecolor_then_plain", b"\x1b[38:2::128:64:192mw".to_vec());
+    push(
+        "sgr_truecolor_then_plain",
+        b"\x1b[38:2::128:64:192mw".to_vec(),
+    );
 
     // --- Non-SGR CSI (always generic; confirm gate doesn't disturb them) ---
     for seq in [
-        "\x1b[H", "\x1b[2J", "\x1b[1;1H", "\x1b[10A", "\x1b[5B", "\x1b[3C",
-        "\x1b[2D", "\x1b[K", "\x1b[2K", "\x1b[?1h", "\x1b[?25l", "\x1b[?1006h",
-        "\x1b[6n", "\x1b[!p", "\x1b[1 q", "\x1b[3;4r", "\x1b[>4;2m", "\x1b[<0;1;1M",
-        "\x1b[=c", "\x1b[?2026$p", "\x1b[1;2;3;4;5;6*y",
+        "\x1b[H",
+        "\x1b[2J",
+        "\x1b[1;1H",
+        "\x1b[10A",
+        "\x1b[5B",
+        "\x1b[3C",
+        "\x1b[2D",
+        "\x1b[K",
+        "\x1b[2K",
+        "\x1b[?1h",
+        "\x1b[?25l",
+        "\x1b[?1006h",
+        "\x1b[6n",
+        "\x1b[!p",
+        "\x1b[1 q",
+        "\x1b[3;4r",
+        "\x1b[>4;2m",
+        "\x1b[<0;1;1M",
+        "\x1b[=c",
+        "\x1b[?2026$p",
+        "\x1b[1;2;3;4;5;6*y",
     ] {
         push(&format!("csi_{}", sanitize(seq)), seq.as_bytes().to_vec());
     }
@@ -101,7 +133,10 @@ fn battery() -> Vec<(String, Vec<u8>)> {
     push("osc_52_selection", b"\x1b]52;c;aGVsbG8=\x07".to_vec());
     push("osc_133_prompt", b"\x1b]133;A\x07".to_vec());
     push("osc_1337_iterm", b"\x1b]1337;CurrentDir=/tmp\x07".to_vec());
-    push("osc_emoji_title", "\x1b]0;\u{1f915}\x07".as_bytes().to_vec());
+    push(
+        "osc_emoji_title",
+        "\x1b]0;\u{1f915}\x07".as_bytes().to_vec(),
+    );
 
     // --- OSC: codes NOT in the fast set (generic path) ---
     push("osc_4_color", b"\x1b]4;0;#000000\x07".to_vec());
@@ -116,20 +151,17 @@ fn battery() -> Vec<(String, Vec<u8>)> {
     push("osc_st_terminated", b"\x1b]0;via ST\x1b\\".to_vec());
 
     // --- Mixed kitchen sink ---
-    push(
-        "kitchen_sink",
-        {
-            let mut v = Vec::new();
-            v.extend_from_slice(b"\x1b]0;title\x07");
-            v.extend_from_slice(b"plain \x1b[1;31mred bold\x1b[0m text ");
-            v.extend_from_slice("café €1 \u{1f680}".as_bytes());
-            v.extend_from_slice(b"\x1b[2J\x1b[H");
-            v.extend_from_slice(b"\x1b]8;;http://x.y\x07link\x1b]8;;\x07");
-            v.extend_from_slice(b"\x1b[38;5;200mfg256\x1b[0m\r\n");
-            v.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd");
-            v
-        },
-    );
+    push("kitchen_sink", {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"\x1b]0;title\x07");
+        v.extend_from_slice(b"plain \x1b[1;31mred bold\x1b[0m text ");
+        v.extend_from_slice("café €1 \u{1f680}".as_bytes());
+        v.extend_from_slice(b"\x1b[2J\x1b[H");
+        v.extend_from_slice(b"\x1b]8;;http://x.y\x07link\x1b]8;;\x07");
+        v.extend_from_slice(b"\x1b[38;5;200mfg256\x1b[0m\r\n");
+        v.extend_from_slice(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd");
+        v
+    });
 
     cases
 }
@@ -147,8 +179,8 @@ fn sanitize(s: &str) -> String {
 }
 
 fn corpus_inputs() -> Vec<(String, Vec<u8>)> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/terminal-conformance");
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/terminal-conformance");
     let mut out = Vec::new();
     for sub in ["transcripts", "minimized"] {
         let dir = root.join(sub);

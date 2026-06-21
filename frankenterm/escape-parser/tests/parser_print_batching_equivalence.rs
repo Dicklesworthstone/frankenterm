@@ -61,7 +61,10 @@ fn battery() -> Vec<(&'static str, Vec<u8>)> {
         ("empty", b"".to_vec()),
         ("single_ascii", b"x".to_vec()),
         ("two_ascii", b"ab".to_vec()),
-        ("pure_ascii", b"the quick brown fox jumps over 0123456789".to_vec()),
+        (
+            "pure_ascii",
+            b"the quick brown fox jumps over 0123456789".to_vec(),
+        ),
         ("ascii_run_long", vec![b'q'; 300]),
         ("ascii_with_c0", b"abc\r\ndef\tghi\x08jkl\x07mno".to_vec()),
         ("only_controls", b"\r\n\t\x08\x07\x00\x01\x1f".to_vec()),
@@ -72,7 +75,10 @@ fn battery() -> Vec<(&'static str, Vec<u8>)> {
         ("latin1_accents", "café déjà ñ über".as_bytes().to_vec()),
         // 2/3/4-byte UTF-8.
         ("utf8_euro", "10€ 20€".as_bytes().to_vec()),
-        ("utf8_emoji", "rocket \u{1f680} done \u{1f4a9}".as_bytes().to_vec()),
+        (
+            "utf8_emoji",
+            "rocket \u{1f680} done \u{1f4a9}".as_bytes().to_vec(),
+        ),
         ("utf8_cjk", "日本語テキスト".as_bytes().to_vec()),
         ("combining_marks", b"a\xcc\x81e\xcc\x80".to_vec()),
         // C1 control encoded as UTF-8: 0xC2 0x9B == U+009B == CSI.
@@ -100,30 +106,36 @@ fn battery() -> Vec<(&'static str, Vec<u8>)> {
         ("incomplete_4byte_tail", b"ab\xf0\x9f\x9a".to_vec()),
         ("invalid_f5_lead", b"ab\xf5\x80\x80\x80cd".to_vec()),
         // Escape / CSI / OSC heavy (the "neutral" path).
-        ("sgr_heavy", b"\x1b[1m\x1b[31m\x1b[4m\x1b[0m\x1b[2J\x1b[H".to_vec()),
-        ("sgr_with_text", b"\x1b[1mbold\x1b[0m normal \x1b[31mred\x1b[0m".to_vec()),
+        (
+            "sgr_heavy",
+            b"\x1b[1m\x1b[31m\x1b[4m\x1b[0m\x1b[2J\x1b[H".to_vec(),
+        ),
+        (
+            "sgr_with_text",
+            b"\x1b[1mbold\x1b[0m normal \x1b[31mred\x1b[0m".to_vec(),
+        ),
         ("osc_title", b"\x1b]0;my title\x07body text".to_vec()),
-        ("osc8_hyperlink", b"\x1b]8;;http://example.com\x07link\x1b]8;;\x07".to_vec()),
+        (
+            "osc8_hyperlink",
+            b"\x1b]8;;http://example.com\x07link\x1b]8;;\x07".to_vec(),
+        ),
         ("esc_only", b"\x1bH\x1b%H\x1bc".to_vec()),
         ("dcs_decrqss", b"\x1bP$qm\x1b\\after".to_vec()),
         ("tmux_title_escape", b"\x1bktitle\x1b\\rest".to_vec()),
         // Mixed everything in one stream.
-        (
-            "kitchen_sink",
-            {
-                let mut v = Vec::new();
-                v.extend_from_slice(b"plain ascii ");
-                v.extend_from_slice("café €1 \u{1f600} ".as_bytes());
-                v.extend_from_slice(b"\x1b[1mbold\x1b[0m\r\n");
-                v.extend_from_slice(b"tab\there\x07bell ");
-                v.extend_from_slice(b"\x1b]0;title\x07more text");
-                v.extend_from_slice(b"\xc2\x9bquasi-csi");
-                v.extend_from_slice("日本".as_bytes());
-                v.push(0xff); // stray invalid byte
-                v.extend_from_slice(b"end");
-                v
-            },
-        ),
+        ("kitchen_sink", {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"plain ascii ");
+            v.extend_from_slice("café €1 \u{1f600} ".as_bytes());
+            v.extend_from_slice(b"\x1b[1mbold\x1b[0m\r\n");
+            v.extend_from_slice(b"tab\there\x07bell ");
+            v.extend_from_slice(b"\x1b]0;title\x07more text");
+            v.extend_from_slice(b"\xc2\x9bquasi-csi");
+            v.extend_from_slice("日本".as_bytes());
+            v.push(0xff); // stray invalid byte
+            v.extend_from_slice(b"end");
+            v
+        }),
     ];
 
     // Printable runs ending exactly on a control / UTF-8 / SWAR-word boundary.
@@ -157,8 +169,8 @@ fn battery() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 fn corpus_inputs() -> Vec<(String, Vec<u8>)> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/terminal-conformance");
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/terminal-conformance");
     let mut out = Vec::new();
     for sub in ["transcripts", "minimized"] {
         let dir = root.join(sub);
@@ -187,10 +199,7 @@ fn corpus_inputs() -> Vec<(String, Vec<u8>)> {
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    let clean: Vec<u8> = text
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
+    let clean: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     if !clean.len().is_multiple_of(2) {
         return None;
     }

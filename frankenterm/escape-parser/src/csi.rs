@@ -3208,7 +3208,11 @@ mod test {
         }
         // Empty params == reset.
         let generic: Vec<CSI> = CSI::parse(&[], false, 'm').collect();
-        assert_eq!(generic, dispatch_fast(&[], false, 'm'), "SGR empty diverged");
+        assert_eq!(
+            generic,
+            dispatch_fast(&[], false, 'm'),
+            "SGR empty diverged"
+        );
     }
 
     #[test]
@@ -3221,17 +3225,35 @@ mod test {
             // canonical multi (fast)
             vec![int(0)],
             vec![int(1), semi.clone(), int(31)],
-            vec![int(0), semi.clone(), int(1), semi.clone(), int(4), semi.clone(), int(7)],
+            vec![
+                int(0),
+                semi.clone(),
+                int(1),
+                semi.clone(),
+                int(4),
+                semi.clone(),
+                int(7),
+            ],
             vec![int(38), semi.clone(), int(5), semi.clone(), int(200)], // fg256 -> fallback
-            vec![int(48), semi.clone(), int(2), semi.clone(), int(1), semi.clone(), int(2), semi.clone(), int(3)],
+            vec![
+                int(48),
+                semi.clone(),
+                int(2),
+                semi.clone(),
+                int(1),
+                semi.clone(),
+                int(2),
+                semi.clone(),
+                int(3),
+            ],
             vec![int(58), semi.clone(), int(5), semi.clone(), int(9)], // underline color -> fallback
             vec![int(1), semi.clone(), int(99), semi.clone(), int(31)], // unknown code -> fallback
             // non-canonical shapes (fallback)
-            vec![semi.clone(), int(4)],            // leading ;
-            vec![int(1), semi.clone()],            // trailing ;
+            vec![semi.clone(), int(4)],                       // leading ;
+            vec![int(1), semi.clone()],                       // trailing ;
             vec![int(1), semi.clone(), semi.clone(), int(4)], // double ;
-            vec![int(4), colon.clone(), int(3)],   // colon subparam
-            vec![q.clone(), int(4)],               // ? prefix
+            vec![int(4), colon.clone(), int(3)],              // colon subparam
+            vec![q.clone(), int(4)],                          // ? prefix
         ];
         for params in cases {
             let generic: Vec<CSI> = CSI::parse(&params, false, 'm').collect();
@@ -3272,11 +3294,7 @@ mod test {
     #[test]
     fn d2_csi_fast_class_table_only_marks_sgr() {
         for b in 0u16..=255 {
-            let expected = if b == b'm' as u16 {
-                CSI_FAST_SGR
-            } else {
-                0
-            };
+            let expected = if b == b'm' as u16 { CSI_FAST_SGR } else { 0 };
             assert_eq!(CSI_FAST_CLASS[b as usize], expected, "byte {b}");
         }
     }

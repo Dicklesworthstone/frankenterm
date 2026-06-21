@@ -1621,8 +1621,7 @@ mod test {
             b"1337",
         ] {
             let fast = OperatingSystemCommandCode::from_code_fast(code);
-            let generic =
-                OperatingSystemCommandCode::from_code(&String::from_utf8_lossy(code));
+            let generic = OperatingSystemCommandCode::from_code(&String::from_utf8_lossy(code));
             assert_eq!(fast, generic, "from_code_fast diverged for {code:?}");
             assert!(fast.is_some());
         }
