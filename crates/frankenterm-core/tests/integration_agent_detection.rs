@@ -107,11 +107,15 @@ fn full_pipeline_detection_to_inventory_roundtrip() {
     // Detect Gemini via process name on pane 3
     correlator.update_from_pane_info(&pane(3, Some("bash"), Some("gemini-cli")));
 
+    // Detect Antigravity via process name on pane 4. This provider is not in
+    // the legacy AgentType enum, so inventory must retain the AgentProvider slug.
+    correlator.update_from_pane_info(&pane(4, Some("bash"), Some("agy")));
+
     // Build inventory snapshot
     let inventory = correlator.inventory();
 
     // Verify running agents
-    assert_eq!(inventory.running.len(), 3);
+    assert_eq!(inventory.running.len(), 4);
 
     let cc = inventory.running.get(&1).expect("pane 1 should have agent");
     assert_eq!(cc.slug, "claude");
@@ -129,13 +133,19 @@ fn full_pipeline_detection_to_inventory_roundtrip() {
     assert_eq!(gemini.state, "active");
     assert_eq!(gemini.source, DetectionSource::ProcessName);
 
+    let agy = inventory.running.get(&4).expect("pane 4 should have agy");
+    assert_eq!(agy.slug, "agy");
+    assert_eq!(agy.state, "active");
+    assert_eq!(agy.source, DetectionSource::ProcessName);
+
     // Serde roundtrip
     let json = serde_json::to_string(&inventory).unwrap();
     let back: AgentInventory = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.running.len(), 3);
+    assert_eq!(back.running.len(), 4);
     assert_eq!(back.running.get(&1).unwrap().slug, "claude");
     assert_eq!(back.running.get(&2).unwrap().slug, "codex");
     assert_eq!(back.running.get(&3).unwrap().slug, "gemini");
+    assert_eq!(back.running.get(&4).unwrap().slug, "agy");
 }
 
 // =========================================================================
@@ -276,6 +286,22 @@ fn process_name_detection_when_no_title_match() {
         correlator.inventory().running.get(&8).unwrap().source,
         DetectionSource::ProcessName
     );
+}
+
+#[test]
+fn antigravity_process_detection_keeps_provider_slug_without_legacy_agent_type() {
+    let mut correlator = AgentCorrelator::new();
+
+    correlator.update_from_pane_info(&pane(9, Some("bash"), Some("agy")));
+
+    let meta = correlator.get_metadata(9).unwrap();
+    assert_eq!(meta.agent_type, "agy");
+    assert_eq!(meta.state.as_deref(), Some("active"));
+
+    let inventory = correlator.inventory();
+    let running = inventory.running.get(&9).unwrap();
+    assert_eq!(running.slug, "agy");
+    assert_eq!(running.source, DetectionSource::ProcessName);
 }
 
 // =========================================================================
@@ -900,8 +926,13 @@ fn inventory_source_field_reflects_detection_method() {
     // Process-detected
     correlator.update_from_pane_info(&pane(3, Some("bash"), Some("gemini-cli")));
 
+    // Provider-first process detection, no legacy AgentType mapping
+    correlator.update_from_pane_info(&pane(4, Some("bash"), Some("agy")));
+
     let inv = correlator.inventory();
     assert_eq!(inv.running[&1].source, DetectionSource::PatternEngine);
     assert_eq!(inv.running[&2].source, DetectionSource::PaneTitle);
     assert_eq!(inv.running[&3].source, DetectionSource::ProcessName);
+    assert_eq!(inv.running[&4].source, DetectionSource::ProcessName);
+    assert_eq!(inv.running[&4].slug, "agy");
 }

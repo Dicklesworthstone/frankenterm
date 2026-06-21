@@ -153,3 +153,31 @@ fn correlator_process_detection_skips_non_pattern_provider_processes() {
     assert!(correlator.get_metadata(99).is_none());
     assert!(!correlator.inventory().running.contains_key(&99));
 }
+
+#[test]
+fn antigravity_provider_survives_correlator_without_legacy_agent_type() {
+    let provider = AgentProvider::from_slug("antigravity-cli");
+    assert_eq!(provider, AgentProvider::Antigravity);
+    assert_eq!(provider.canonical_slug(), "agy");
+    assert_eq!(provider.to_agent_type().to_string(), "unknown");
+    assert_eq!(CassAgent::from_provider(&provider), None);
+    assert_eq!(CautService::from_provider(&provider), None);
+
+    let mut correlator = AgentCorrelator::new();
+    correlator.update_from_pane_info(&pane_with_detection_hints(77, None, Some("agy")));
+
+    let metadata = correlator
+        .get_metadata(77)
+        .expect("agy process should produce provider-first metadata");
+    assert_eq!(metadata.agent_type, "agy");
+
+    let inventory = correlator.inventory();
+    let running = inventory
+        .running
+        .get(&77)
+        .expect("running inventory should include agy pane");
+    assert_eq!(running.slug, "agy");
+
+    let reparsed = AgentProvider::from_slug(&running.slug);
+    assert_eq!(reparsed, AgentProvider::Antigravity);
+}

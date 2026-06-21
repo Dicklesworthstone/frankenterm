@@ -35,6 +35,21 @@
       "slug": "aider"
     },
     {
+      "binary_path": "/usr/local/bin/agy",
+      "config_path": "/Users/demo/.gemini/antigravity-cli/AGENTS.md",
+      "detected": true,
+      "display_name": "Antigravity",
+      "evidence": [
+        "found ~/.gemini/antigravity-cli",
+        "binary: /usr/local/bin/agy"
+      ],
+      "root_paths": [
+        "/Users/demo/.gemini/antigravity-cli"
+      ],
+      "slug": "agy",
+      "version": "Gemini 3.1 Pro (High)"
+    },
+    {
       "detected": false,
       "display_name": "Gemini CLI",
       "evidence": [
@@ -52,6 +67,14 @@
       "source": "pattern_engine",
       "state": "working"
     },
+    "64": {
+      "display_name": "Antigravity",
+      "pane_id": 64,
+      "session_id": "123e4567-e89b-12d3-a456-426614174000",
+      "slug": "agy",
+      "source": "process_name",
+      "state": "working"
+    },
     "7": {
       "pane_id": 7,
       "slug": "claude",
@@ -60,9 +83,9 @@
     }
   },
   "summary": {
-    "configured_count": 2,
+    "configured_count": 3,
     "installed_but_idle_count": 1,
-    "installed_count": 3,
-    "running_count": 2
+    "installed_count": 4,
+    "running_count": 3
   }
 }

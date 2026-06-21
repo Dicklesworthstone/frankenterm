@@ -60,6 +60,19 @@ fn mock_agent_inventory() -> AgentInventoryData {
             version: None,
         },
         InstalledAgentInfo {
+            slug: "agy".to_string(),
+            display_name: Some("Antigravity".to_string()),
+            detected: true,
+            evidence: vec![
+                "found ~/.gemini/antigravity-cli".to_string(),
+                "binary: /usr/local/bin/agy".to_string(),
+            ],
+            root_paths: vec!["/Users/demo/.gemini/antigravity-cli".to_string()],
+            config_path: Some("/Users/demo/.gemini/antigravity-cli/AGENTS.md".to_string()),
+            binary_path: Some("/usr/local/bin/agy".to_string()),
+            version: Some("Gemini 3.1 Pro (High)".to_string()),
+        },
+        InstalledAgentInfo {
             slug: "gemini".to_string(),
             display_name: Some("Gemini CLI".to_string()),
             detected: false,
@@ -94,14 +107,25 @@ fn mock_agent_inventory() -> AgentInventoryData {
             pane_id: 42,
         },
     );
+    running.insert(
+        64,
+        RunningAgentInfo {
+            slug: "agy".to_string(),
+            display_name: Some("Antigravity".to_string()),
+            state: "working".to_string(),
+            session_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
+            source: "process_name".to_string(),
+            pane_id: 64,
+        },
+    );
 
     AgentInventoryData {
         installed,
         running,
         summary: AgentInventorySummary {
-            installed_count: 3,
-            running_count: 2,
-            configured_count: 2,
+            installed_count: 4,
+            running_count: 3,
+            configured_count: 3,
             installed_but_idle_count: 1,
         },
         filesystem_detection_available: true,
@@ -516,4 +540,5 @@ fn agent_inventory_running_map_uses_stringified_pane_keys() {
         .expect("running inventory should serialize as an object");
     assert!(running.contains_key("7"));
     assert!(running.contains_key("42"));
+    assert!(running.contains_key("64"));
 }

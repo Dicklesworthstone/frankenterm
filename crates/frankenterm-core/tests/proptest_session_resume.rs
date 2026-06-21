@@ -73,10 +73,39 @@ fn arb_list_entry() -> impl Strategy<Value = CasrListEntry> {
         })
 }
 
+fn arb_antigravity_uuid() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+        .expect("valid Antigravity UUID regex")
+}
+
 fn path_has_component(path: &str, component: &str) -> bool {
     Path::new(path)
         .components()
         .any(|part| part.as_os_str().to_str() == Some(component))
+}
+
+fn log_agy_contract_scenario(
+    scenario_id: &str,
+    surface: &str,
+    entry: &CasrListEntry,
+    command_argv: Option<Vec<String>>,
+    fallback_reason: Option<&str>,
+) {
+    eprintln!(
+        "{}",
+        json!({
+            "bead_id": "ft-agy-provider-q8o4y-685af.2",
+            "scenario_id": scenario_id,
+            "surface": surface,
+            "provider": entry.provider.as_deref().unwrap_or("<none>"),
+            "session_id": entry.session_id,
+            "source_path": entry.path.as_deref(),
+            "command_argv": command_argv,
+            "exit_code": null,
+            "error_code": null,
+            "fallback_reason": fallback_reason,
+        })
+    );
 }
 
 #[test]
@@ -94,6 +123,8 @@ fn antigravity_discovery_lists_only_conversation_db_files() {
     .expect("write agy db fixture");
     fs::write(conversations.join("not-a-conversation.sqlite"), b"sqlite")
         .expect("write non-db fixture");
+    fs::write(conversations.join("not-a-uuid.db"), b"sqlite")
+        .expect("write invalid db-name fixture");
     fs::create_dir_all(conversations.join("directory.db")).expect("create db-named directory");
 
     let entries = discover_antigravity_conversations_from_home(home);
@@ -102,10 +133,31 @@ fn antigravity_discovery_lists_only_conversation_db_files() {
     let entry = &entries[0];
     assert_eq!(entry.session_id, conversation_id);
     assert_eq!(entry.provider.as_deref(), Some("agy"));
+    assert_eq!(
+        entry.title.as_deref(),
+        Some("Antigravity conversation (metadata schema not read)")
+    );
     assert_eq!(provider_from_list_entry(entry), AgentProvider::Antigravity);
+    assert_eq!(
+        entry.extra.get("discovery_source"),
+        Some(&json!(ANTIGRAVITY_DISCOVERY_SOURCE))
+    );
     assert_eq!(
         entry.extra.get("model_name"),
         Some(&json!(ANTIGRAVITY_MODEL))
+    );
+    assert_eq!(
+        entry.extra.get("native_resume_binary"),
+        Some(&json!(ANTIGRAVITY_BINARY))
+    );
+    assert_eq!(entry.extra.get("provider_slug"), Some(&json!("agy")));
+    assert_eq!(
+        entry.extra.get("conversation_id"),
+        Some(&json!(conversation_id))
+    );
+    assert_eq!(
+        entry.extra.get("metadata_fallback_reason"),
+        Some(&json!(ANTIGRAVITY_METADATA_FALLBACK_REASON))
     );
     assert_eq!(
         entry.extra.get("native_resume_command"),
@@ -116,6 +168,13 @@ fn antigravity_discovery_lists_only_conversation_db_files() {
             "--model",
             ANTIGRAVITY_MODEL
         ]))
+    );
+    log_agy_contract_scenario(
+        "agy-only",
+        "session_resume.discovery",
+        entry,
+        AgentProvider::Antigravity.native_resume_command(conversation_id),
+        Some(ANTIGRAVITY_METADATA_FALLBACK_REASON),
     );
 }
 
@@ -223,12 +282,15 @@ fn antigravity_e2e_fixture_merges_casr_and_native_sessions_without_cross_listing
     for entry in &entries {
         let provider = provider_from_list_entry(entry);
         let resume_command = provider.native_resume_command(&entry.session_id);
-        eprintln!(
-            "agy-e2e discovered provider={} uuid={} path={} resume_command={:?}",
-            provider.slug(),
-            entry.session_id,
-            entry.path.as_deref().unwrap_or("<none>"),
-            resume_command
+        log_agy_contract_scenario(
+            "mixed-agy-gmi",
+            "session_resume.discovery",
+            entry,
+            resume_command,
+            entry
+                .extra
+                .get("metadata_fallback_reason")
+                .and_then(|value| value.as_str()),
         );
     }
 
@@ -263,8 +325,19 @@ fn antigravity_e2e_fixture_merges_casr_and_native_sessions_without_cross_listing
         .native_resume_command(conversation_id)
         .expect("agy resume command");
     eprintln!(
-        "agy-e2e assembled_resume_command={}",
-        assembled_resume_command.join(" ")
+        "{}",
+        json!({
+            "bead_id": "ft-agy-provider-q8o4y-685af.2",
+            "scenario_id": "mixed-agy-gmi",
+            "surface": "session_resume.resume_plan",
+            "provider": "agy",
+            "session_id": conversation_id,
+            "source_path": agy_path,
+            "command_argv": assembled_resume_command.clone(),
+            "exit_code": null,
+            "error_code": null,
+            "fallback_reason": null,
+        })
     );
     assert_eq!(
         assembled_resume_command,
@@ -628,7 +701,7 @@ proptest! {
 
     // 31. Antigravity native resume command is model pinned
     #[test]
-    fn antigravity_native_resume_command_is_model_pinned(session_id in "[a-z0-9-]{1,64}") {
+    fn antigravity_native_resume_command_is_model_pinned(session_id in arb_antigravity_uuid()) {
         let command = AgentProvider::Antigravity
             .native_resume_command(&session_id)
             .expect("antigravity must have a native resume command");
@@ -644,7 +717,27 @@ proptest! {
         );
     }
 
-    // 32. Non-Antigravity providers do not get Antigravity's pinned command
+    // 32. Antigravity checked resume plan never permits non-pinned models
+    #[test]
+    fn antigravity_checked_resume_rejects_non_pinned_model(
+        session_id in arb_antigravity_uuid(),
+        model in "[A-Za-z0-9 .()_-]{1,40}",
+    ) {
+        prop_assume!(model != ANTIGRAVITY_MODEL);
+        let err = antigravity_native_resume_plan_with_model(&session_id, &model)
+            .expect_err("Antigravity must reject any non-pinned model");
+        let is_non_pinned_antigravity_model_error = matches!(
+            &err,
+            SessionResumeError::NonPinnedNativeModel {
+                provider_slug,
+                required_model,
+                ..
+            } if provider_slug.as_str() == "agy" && required_model.as_str() == ANTIGRAVITY_MODEL
+        );
+        prop_assert!(is_non_pinned_antigravity_model_error);
+    }
+
+    // 33. Non-Antigravity providers do not get Antigravity's pinned command
     #[test]
     fn only_antigravity_has_native_resume_command(provider in prop_oneof![
         Just(AgentProvider::ClaudeCode),
