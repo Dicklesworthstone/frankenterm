@@ -218,12 +218,9 @@ pub struct TieredScrollback {
     /// M4 (round-4 gauntlet): shared content-addressed chunk store for
     /// content-defined-chunking dedup of warm pages before zstd. Identical
     /// chunks across pages (repeated prompts/redraws) are stored once,
-    /// refcounted, and freed on eviction. `None` unless the
-    /// `scrollback.cdc_dedup` gate (env `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP`, or
-    /// [`Self::new_with_options`]) is enabled. The env gate also accepts
-    /// `adaptive`/`auto` to probe early pages and enable CDC only when
-    /// redundancy clears the cheap threshold. Default **off**; the off path is
-    /// byte-for-byte the legacy standalone-zstd page.
+    /// refcounted, and freed on eviction. `None` until the mode is always-on or
+    /// the promoted adaptive probe engages; falsey env overrides keep this
+    /// absent and preserve the byte-for-byte legacy standalone-zstd page.
     cdc: Option<CdcStore>,
     /// CDC policy for future warm-page flushes. Kept separate from `cdc` so
     /// adaptive mode can start without allocating the chunk store and create it
@@ -819,8 +816,10 @@ impl TieredScrollback {
     ///
     /// The promoted Q1 prefix-index fast path defaults **on** and remains
     /// controllable with `FT_MOONSHOT_SCROLLBACK_PREFIX_INDEX=0` for A/B
-    /// fallback. M4 CDC-dedup and EV3 blocked-page fast paths still default
-    /// **off** and require their `FT_MOONSHOT_SCROLLBACK_*` env gate (see
+    /// fallback. M4 CDC-dedup defaults to the adaptive probe: low-redundancy
+    /// pages stay on the standalone-zstd representation, while redundant pages
+    /// promote themselves to CDC. EV3 blocked-page indexing still defaults
+    /// **off** and requires its `FT_MOONSHOT_SCROLLBACK_*` env gate (see
     /// [`Self::new_with_all_options`] for deterministic, env-free selection).
     #[must_use]
     pub fn new(config: ScrollbackConfig) -> Self {
@@ -840,8 +839,10 @@ impl TieredScrollback {
     ///   [`Self::tier_for_offset`]. Observable behavior is identical either way
     ///   (proven byte-equivalent); the flag only changes the resolution cost.
     ///
-    /// CDC dedup is taken from the `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` env gate;
-    /// use [`Self::new_with_options`] to choose both gates explicitly.
+    /// CDC dedup is taken from the `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` env gate:
+    /// unset means the promoted adaptive probe, `0`/`false`/`off` disables CDC,
+    /// and truthy values force always-on CDC. Use [`Self::new_with_options`] to
+    /// choose both gates explicitly.
     #[must_use]
     pub fn new_with_prefix_index(config: ScrollbackConfig, prefix_index: bool) -> Self {
         Self::new_with_cdc_mode(
@@ -1653,9 +1654,11 @@ fn prefix_index_enabled_from_env() -> bool {
 
 /// M4 `scrollback.cdc_dedup` mode selected via the environment.
 ///
-/// Default **off**. Existing truthy values (`1`/`true`/`yes`/`on`) preserve the
-/// round-5 always-on CDC behavior, while `adaptive`/`auto`/`probe` enable the
-/// round-6 cheap redundancy probe before allocating the CDC store.
+/// Default **adaptive** after the round-7 RSS promotion. Existing truthy values
+/// (`1`/`true`/`yes`/`on`) preserve the round-5 always-on CDC behavior;
+/// `adaptive`/`auto`/`probe` explicitly select the promoted cheap redundancy
+/// probe; falsey values (`0`/`false`/`off`) retain the legacy standalone-zstd
+/// A/B escape hatch.
 fn cdc_dedup_mode_from_env() -> CdcDedupMode {
     if ft_moonshot_all_enabled() {
         return CdcDedupMode::Always;
@@ -1675,7 +1678,7 @@ fn cdc_dedup_mode_from_env() -> CdcDedupMode {
                 CdcDedupMode::Off
             }
         })
-        .unwrap_or(CdcDedupMode::Off)
+        .unwrap_or(CdcDedupMode::Adaptive)
 }
 
 /// Whether the EV3 blocked-page index gate is enabled via the environment.
@@ -3509,13 +3512,16 @@ mod tests {
     }
 
     #[test]
-    fn cdc_gate_defaults_off() {
+    fn cdc_gate_defaults_to_adaptive_probe() {
         if std::env::var_os("FT_MOONSHOT_SCROLLBACK_CDC_DEDUP").is_none() {
             let sb = TieredScrollback::new(small_config());
-            assert!(sb.cdc_stats().is_none(), "cdc dedup must default off");
             assert!(
-                sb.cdc_adaptive_snapshot().is_none(),
-                "adaptive CDC must also default off"
+                sb.cdc_stats().is_none(),
+                "adaptive CDC must not allocate a chunk store before the probe engages"
+            );
+            assert!(
+                sb.cdc_adaptive_snapshot().is_some(),
+                "adaptive CDC must default on through the promoted probe"
             );
         }
     }

@@ -26,9 +26,27 @@ fail-closed**. Keep entry template: [`round4-keep-ledger.md`](round4-keep-ledger
 | .13 clustered-ASCII | 4.43× dense-ASCII render | env `FT_MOONSHOT_TERM_ASCII_CLUSTER_RUN_APPEND`, `screen.rs` | mixed-content non-regression + byte-equiv (green) | promoted by `ft-97g96` |
 | D1 printable-run batch | 1.47× | escape-parser/`performer.rs` | mixed-content non-regression + byte-equiv | promoted by `ft-97g96` |
 | EV1 bulk-ASCII row writer | 1.16× | env `FT_MOONSHOT_TERM_BULK_ASCII_ROW_WRITE`, `performer.rs` | mixed-content non-regression + byte-equiv | promoted by `ft-97g96` |
-| adaptive-M4 CDC (RSS) | 19× dedup ratio on redundant content | env `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP=adaptive`, `scrollback_tiers.rs:423` | deterministic fleet-resident-bytes RSS win + cheap probe | _pending_ |
+| adaptive-M4 CDC (RSS) | 19× dedup ratio on redundant content | env `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP`, `scrollback_tiers.rs` | deterministic fleet-resident-bytes RSS win + cheap probe | **CERTIFIED** (`ft-ykde4`) |
 
 ---
+
+### 2026-06-21 | ft-ykde4 / cod_1 | adaptive-M4 CDC RSS promotion — CERTIFIED
+
+**Status:** kept and promoted — adaptive CDC is default-on via the cheap redundancy probe.
+
+**Gate:** `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` remains the safety valve. Unset defaults to the promoted adaptive probe; `adaptive`/`auto`/`probe` select it explicitly; `0`/`false`/`off` disables CDC and preserves the legacy standalone-zstd representation; `1`/`true`/`yes`/`on` forces always-on CDC for diagnostics.
+
+**Profile attribution:** warm-tier resident bytes for redundant terminal redraws. The adaptive probe samples early pages, allocates the CDC store only when the redundancy ratio clears `CDC_ADAPTIVE_RATIO_THRESHOLD_X100=150`, and otherwise stays on standalone zstd.
+
+**Measurement (deterministic RSS harness):** RCH-remote `vmi1227854`, `cargo test -p frankenterm-core --test round7_rss_harness -- --nocapture`. Redundant redraw fleet: off `27,869,200 B`, adaptive `5,533,600 B`, delta `-80.14%` (`WIN`), saving `22,335,600 B`; adaptive engaged `200/200` panes and deduped to `13` chunks. Low-redundancy fleet: off `65,616,200 B`, adaptive `65,616,200 B`, delta `+0.00%` (`TIE`), adaptive engaged `0/200` panes. Always-on CDC showed the expected low-redundancy regression: `72,869,600 B`, `+11.05%`.
+
+**Behavior-preservation:** RCH-remote `vmi1227854`, `cargo test -p frankenterm-core --test proptest_scrollback_cdc_dedup`, `4 passed`. The reconstruction proof covers byte-identical warm-page decode, repeated-content savings, eviction/refcount accounting, and default construction remaining storage-lazy before the adaptive probe engages.
+
+**A/B verdict:** promote; adaptive captures the large redundant-redraw RSS win while matching baseline exactly where always-on CDC regresses.
+
+**Pattern applied:** eager per-page standalone compression -> adaptive redundancy probe + content-addressed chunk interning only for redundant warm tiers.
+
+**Rollback:** set `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP=0`/`false`/`off`, or `git revert <ft-ykde4 commit>`.
 
 ### 2026-06-21 | ft-97g96 / cod_2 | Dense-ASCII term-render recommended-set promotion
 
