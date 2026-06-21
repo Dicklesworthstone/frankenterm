@@ -35,6 +35,7 @@ pub enum AgentProvider {
     /// Google Gemini CLI
     Gemini,
     /// Google Antigravity CLI
+    #[serde(rename = "agy", alias = "antigravity", alias = "antigravity-cli")]
     Antigravity,
     /// GitHub Copilot (CLI and editor integration)
     GithubCopilot,
@@ -231,7 +232,8 @@ impl AgentProvider {
     ///
     /// Returns `Unknown(slug)` when the slug is not in the known set.
     pub fn from_slug(slug: &str) -> Self {
-        let lower = slug.to_ascii_lowercase();
+        let trimmed = slug.trim();
+        let lower = trimmed.to_ascii_lowercase();
         match lower.as_str() {
             "claude" | "claude-code" | "claude_code" => Self::Claude,
             "cline" => Self::Cline,
@@ -246,7 +248,7 @@ impl AgentProvider {
             "opencode" | "open-code" => Self::Opencode,
             "aider" => Self::Aider,
             "windsurf" => Self::Windsurf,
-            _ => Self::Unknown(slug.to_string()),
+            _ => Self::Unknown(trimmed.to_string()),
         }
     }
 
@@ -427,6 +429,18 @@ mod tests {
     }
 
     #[test]
+    fn test_from_process_name_antigravity() {
+        assert_eq!(
+            AgentProvider::from_process_name("agy"),
+            Some(AgentProvider::Antigravity)
+        );
+        assert_eq!(
+            AgentProvider::from_process_name("antigravity-cli"),
+            Some(AgentProvider::Antigravity)
+        );
+    }
+
+    #[test]
     fn test_from_process_name_cursor() {
         assert_eq!(
             AgentProvider::from_process_name("cursor"),
@@ -561,6 +575,22 @@ mod tests {
     }
 
     #[test]
+    fn test_from_binary_name_antigravity_aliases() {
+        assert_eq!(
+            AgentProvider::from_binary_name("agy"),
+            Some(AgentProvider::Antigravity)
+        );
+        assert_eq!(
+            AgentProvider::from_binary_name("antigravity"),
+            Some(AgentProvider::Antigravity)
+        );
+        assert_eq!(
+            AgentProvider::from_binary_name("antigravity-cli"),
+            Some(AgentProvider::Antigravity)
+        );
+    }
+
+    #[test]
     fn test_from_binary_name_case_insensitive() {
         assert_eq!(
             AgentProvider::from_binary_name("Claude"),
@@ -610,6 +640,7 @@ mod tests {
         assert_eq!(AgentProvider::Claude.display_name(), "Claude Code");
         assert_eq!(AgentProvider::Codex.display_name(), "Codex");
         assert_eq!(AgentProvider::Gemini.display_name(), "Gemini");
+        assert_eq!(AgentProvider::Antigravity.display_name(), "Antigravity");
         assert_eq!(AgentProvider::Cursor.display_name(), "Cursor");
         assert_eq!(AgentProvider::Windsurf.display_name(), "Windsurf");
         assert_eq!(
@@ -639,6 +670,7 @@ mod tests {
         assert_eq!(AgentProvider::Claude.canonical_slug(), "claude");
         assert_eq!(AgentProvider::Codex.canonical_slug(), "codex");
         assert_eq!(AgentProvider::Gemini.canonical_slug(), "gemini");
+        assert_eq!(AgentProvider::Antigravity.canonical_slug(), "agy");
         assert_eq!(AgentProvider::Cursor.canonical_slug(), "cursor");
         assert_eq!(AgentProvider::Windsurf.canonical_slug(), "windsurf");
         assert_eq!(
@@ -677,6 +709,7 @@ mod tests {
         assert_eq!(AgentProvider::from_slug("claude"), AgentProvider::Claude);
         assert_eq!(AgentProvider::from_slug("codex"), AgentProvider::Codex);
         assert_eq!(AgentProvider::from_slug("gemini"), AgentProvider::Gemini);
+        assert_eq!(AgentProvider::from_slug("agy"), AgentProvider::Antigravity);
     }
 
     #[test]
@@ -693,6 +726,14 @@ mod tests {
         assert_eq!(
             AgentProvider::from_slug("gemini-cli"),
             AgentProvider::Gemini
+        );
+        assert_eq!(
+            AgentProvider::from_slug("antigravity"),
+            AgentProvider::Antigravity
+        );
+        assert_eq!(
+            AgentProvider::from_slug("antigravity-cli"),
+            AgentProvider::Antigravity
         );
         assert_eq!(
             AgentProvider::from_slug("copilot"),
@@ -720,6 +761,10 @@ mod tests {
         assert_eq!(
             AgentProvider::from_slug("Gemini-CLI"),
             AgentProvider::Gemini
+        );
+        assert_eq!(
+            AgentProvider::from_slug(" Antigravity-CLI "),
+            AgentProvider::Antigravity
         );
     }
 
@@ -781,6 +826,10 @@ mod tests {
             crate::patterns::AgentType::Gemini
         );
         assert_eq!(
+            AgentProvider::Antigravity.to_agent_type(),
+            crate::patterns::AgentType::Unknown
+        );
+        assert_eq!(
             AgentProvider::Cursor.to_agent_type(),
             crate::patterns::AgentType::Unknown
         );
@@ -828,6 +877,21 @@ mod tests {
         assert_eq!(json, "\"claude\"");
     }
 
+    #[test]
+    fn test_serde_antigravity_uses_canonical_agy_slug_with_legacy_aliases() {
+        let json = serde_json::to_string(&AgentProvider::Antigravity).expect("serialize");
+        assert_eq!(json, "\"agy\"");
+        assert_eq!(
+            serde_json::from_str::<AgentProvider>("\"antigravity\"").expect("deserialize alias"),
+            AgentProvider::Antigravity
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentProvider>("\"antigravity-cli\"")
+                .expect("deserialize alias"),
+            AgentProvider::Antigravity
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Display
     // -------------------------------------------------------------------------
@@ -851,7 +915,7 @@ mod tests {
 
     #[test]
     fn test_all_known_contains_expected_count() {
-        assert_eq!(AgentProvider::all_known().len(), 12);
+        assert_eq!(AgentProvider::all_known().len(), 13);
     }
 
     #[test]

@@ -322,12 +322,13 @@ impl AgentCorrelator {
         }
 
         // Try title-based detection
-        if let Some(agent_type) = detect_agent_from_title(pane.title.as_deref().unwrap_or("")) {
+        if let Some(provider) = detect_provider_from_title(pane.title.as_deref().unwrap_or("")) {
+            let agent_type = provider.to_agent_type();
             self.pane_agents.insert(
                 pane.pane_id,
                 PaneAgentState {
                     agent_type,
-                    provider: AgentProvider::from_agent_type(&agent_type),
+                    provider: provider.clone(),
                     source: DetectionSource::PaneTitle,
                     session_id: None,
                     cwd: pane.cwd.clone(),
@@ -338,7 +339,7 @@ impl AgentCorrelator {
             );
             debug!(
                 pane_id = pane.pane_id,
-                agent = %agent_type,
+                agent = %provider,
                 "Agent detected from pane title"
             );
             return;
@@ -350,12 +351,13 @@ impl AgentCorrelator {
             .get("foreground_process_name")
             .and_then(|v| v.as_str())
         {
-            if let Some(agent_type) = detect_agent_from_process(process) {
+            if let Some(provider) = detect_provider_from_process(process) {
+                let agent_type = provider.to_agent_type();
                 self.pane_agents.insert(
                     pane.pane_id,
                     PaneAgentState {
                         agent_type,
-                        provider: AgentProvider::from_agent_type(&agent_type),
+                        provider: provider.clone(),
                         source: DetectionSource::ProcessName,
                         session_id: None,
                         cwd: pane.cwd.clone(),
@@ -366,7 +368,7 @@ impl AgentCorrelator {
                 );
                 debug!(
                     pane_id = pane.pane_id,
-                    agent = %agent_type,
+                    agent = %provider,
                     process = %process,
                     "Agent detected from process name"
                 );
@@ -590,21 +592,24 @@ impl Default for AgentCorrelator {
 // Detection helpers
 // =============================================================================
 
-/// Detect agent type from pane title keywords.
-fn detect_agent_from_title(title: &str) -> Option<AgentType> {
+/// Detect provider from pane title keywords.
+fn detect_provider_from_title(title: &str) -> Option<AgentProvider> {
     let normalized = title.to_ascii_lowercase();
     let mut candidates = Vec::new();
     if normalized.contains("claude")
         || normalized.contains("claude-code")
         || normalized.contains("claude code")
     {
-        candidates.push(AgentType::ClaudeCode);
+        candidates.push(AgentProvider::Claude);
     }
     if normalized.contains("codex") || normalized.contains("openai") {
-        candidates.push(AgentType::Codex);
+        candidates.push(AgentProvider::Codex);
+    }
+    if contains_ascii_token(&normalized, "agy") || normalized.contains("antigravity") {
+        candidates.push(AgentProvider::Antigravity);
     }
     if normalized.contains("gemini") {
-        candidates.push(AgentType::Gemini);
+        candidates.push(AgentProvider::Gemini);
     }
 
     if candidates.is_empty() {
@@ -627,11 +632,19 @@ fn detect_agent_from_title(title: &str) -> Option<AgentType> {
         );
     }
 
-    candidates.into_iter().next()
+    candidates.into_iter().find(provider_is_inventory_trackable)
 }
 
-/// Detect agent type from foreground process name.
-fn detect_agent_from_process(process: &str) -> Option<AgentType> {
+/// Detect legacy agent type from pane title keywords.
+#[cfg(test)]
+fn detect_agent_from_title(title: &str) -> Option<AgentType> {
+    detect_provider_from_title(title)
+        .map(|provider| provider.to_agent_type())
+        .filter(|agent_type| *agent_type != AgentType::Unknown)
+}
+
+/// Detect provider from foreground process name.
+fn detect_provider_from_process(process: &str) -> Option<AgentProvider> {
     let diagnostics = AgentProvider::diagnostics_from_process_name(process);
     if diagnostics.ambiguous {
         debug!(
@@ -652,18 +665,34 @@ fn detect_agent_from_process(process: &str) -> Option<AgentType> {
         );
         return None;
     }
-    let provider = diagnostics.selected?;
-    let agent_type = provider.to_agent_type();
-    if agent_type == AgentType::Unknown {
-        trace!(
-            source = "process_name",
-            input = %process,
-            provider = %provider,
-            "Resolved provider has no legacy AgentType mapping for correlator"
-        );
-        return None;
-    }
-    Some(agent_type)
+    diagnostics.selected.filter(provider_is_inventory_trackable)
+}
+
+fn provider_is_inventory_trackable(provider: &AgentProvider) -> bool {
+    provider.to_agent_type() != AgentType::Unknown || matches!(provider, AgentProvider::Antigravity)
+}
+
+/// Detect legacy agent type from foreground process name.
+#[cfg(test)]
+fn detect_agent_from_process(process: &str) -> Option<AgentType> {
+    detect_provider_from_process(process)
+        .map(|provider| provider.to_agent_type())
+        .filter(|agent_type| *agent_type != AgentType::Unknown)
+}
+
+fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_is_boundary = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let after_is_boundary = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        before_is_boundary && after_is_boundary
+    })
 }
 
 fn metadata_agent_type_for_provider(provider: &AgentProvider) -> String {
@@ -773,6 +802,9 @@ fn preferred_root_suffixes(provider: &AgentProvider) -> &'static [&'static [&'st
         AgentProvider::Cursor => &[&[".cursor"], &[".config", "Cursor"]],
         AgentProvider::Factory => &[&[".factory-droid"], &[".config", "factory-droid"]],
         AgentProvider::Gemini => &[&[".gemini"], &[".config", "gemini"]],
+        AgentProvider::Antigravity => {
+            &[&[".gemini", "antigravity-cli"], &[".config", "antigravity"]]
+        }
         AgentProvider::GithubCopilot => &[&[".github-copilot"], &[".config", "github-copilot"]],
         AgentProvider::Opencode => &[&[".opencode"], &[".config", "opencode"]],
         AgentProvider::Windsurf => &[&[".windsurf"], &[".config", "windsurf"]],
@@ -1065,6 +1097,54 @@ mod tests {
     }
 
     #[test]
+    fn update_from_pane_info_detects_antigravity_from_title() {
+        let mut correlator = AgentCorrelator::new();
+        correlator.update_from_pane_info(&test_pane(
+            51,
+            "agy --conversation 123e4567-e89b-12d3-a456-426614174000",
+            Some("file:///repo"),
+        ));
+
+        let meta = correlator.get_metadata(51).unwrap();
+        assert_eq!(meta.agent_type, "agy");
+        assert_eq!(meta.state.as_deref(), Some("active"));
+
+        let inventory = correlator.inventory();
+        let running = inventory.running.get(&51).expect("agy pane tracked");
+        assert_eq!(running.slug, "agy");
+        assert_eq!(running.source, DetectionSource::PaneTitle);
+
+        let scent = correlator.swarm_scent_report(1_700_000_000_000, DEFAULT_SWARM_SCENT_TTL_MS);
+        let agy = scent.agents.first().expect("agy scent agent");
+        assert_eq!(agy.slug, "agy");
+        assert_eq!(agy.agent_type, "agy");
+        assert_eq!(agy.cwd.as_deref(), Some("file:///repo"));
+    }
+
+    #[test]
+    fn update_from_pane_info_detects_antigravity_from_process() {
+        let mut correlator = AgentCorrelator::new();
+        let mut pane = test_pane(52, "bash", None);
+        pane.extra.insert(
+            "foreground_process_name".to_string(),
+            serde_json::Value::String("agy".to_string()),
+        );
+
+        correlator.update_from_pane_info(&pane);
+
+        let meta = correlator.get_metadata(52).unwrap();
+        assert_eq!(meta.agent_type, "agy");
+        let running = correlator
+            .inventory()
+            .running
+            .get(&52)
+            .expect("agy process pane tracked")
+            .clone();
+        assert_eq!(running.slug, "agy");
+        assert_eq!(running.source, DetectionSource::ProcessName);
+    }
+
+    #[test]
     fn update_from_pane_info_does_not_overwrite_pattern_detection() {
         let mut correlator = AgentCorrelator::new();
 
@@ -1279,6 +1359,19 @@ mod tests {
             detect_agent_from_title("gemini-cli"),
             Some(AgentType::Gemini)
         );
+        assert_eq!(detect_agent_from_title("agy"), None);
+        assert_eq!(
+            detect_provider_from_title("agy"),
+            Some(AgentProvider::Antigravity)
+        );
+        assert_eq!(
+            detect_provider_from_title("antigravity-cli"),
+            Some(AgentProvider::Antigravity)
+        );
+        assert_eq!(
+            detect_provider_from_title("agy --model Gemini 3.1 Pro (High)"),
+            Some(AgentProvider::Antigravity)
+        );
         assert_eq!(detect_agent_from_title("bash"), None);
         assert_eq!(detect_agent_from_title("vim"), None);
     }
@@ -1303,6 +1396,11 @@ mod tests {
         assert_eq!(
             detect_agent_from_process("gemini-cli"),
             Some(AgentType::Gemini)
+        );
+        assert_eq!(detect_agent_from_process("agy"), None);
+        assert_eq!(
+            detect_provider_from_process("agy"),
+            Some(AgentProvider::Antigravity)
         );
         assert_eq!(detect_agent_from_process("bash"), None);
         assert_eq!(detect_agent_from_process("node"), None);
@@ -1436,6 +1534,18 @@ mod tests {
     }
 
     #[test]
+    fn detect_title_antigravity_does_not_rename_bare_gemini() {
+        assert_eq!(
+            detect_provider_from_title("Gemini 3.1 Pro (High)"),
+            Some(AgentProvider::Gemini)
+        );
+        assert_eq!(
+            detect_provider_from_title("Antigravity Gemini 3.1 Pro (High)"),
+            Some(AgentProvider::Antigravity)
+        );
+    }
+
+    #[test]
     fn detect_title_claude_substring() {
         // "claude" keyword is contained in longer string
         assert_eq!(
@@ -1449,6 +1559,7 @@ mod tests {
         assert_eq!(detect_agent_from_title("cloudy weather app"), None);
         assert_eq!(detect_agent_from_title("codec"), None);
         assert_eq!(detect_agent_from_title("gem"), None);
+        assert_eq!(detect_provider_from_title("strategy document"), None);
     }
 
     #[test]
@@ -1992,6 +2103,37 @@ mod tests {
         assert_eq!(
             converted.config_path.as_deref(),
             Some(preferred_config.to_string_lossy().as_ref())
+        );
+    }
+
+    #[cfg(feature = "agent-detection")]
+    #[test]
+    fn convert_detection_entry_prefers_antigravity_root_over_legacy_gemini_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let legacy_gemini_root = temp.path().join(".gemini");
+        let antigravity_root = legacy_gemini_root.join("antigravity-cli");
+        std::fs::create_dir_all(&legacy_gemini_root).unwrap();
+        std::fs::create_dir_all(&antigravity_root).unwrap();
+
+        let legacy_config = legacy_gemini_root.join("AGENTS.md");
+        let antigravity_config = antigravity_root.join("AGENTS.md");
+        std::fs::write(&legacy_config, "# legacy Gemini config\n").unwrap();
+        std::fs::write(&antigravity_config, "# Antigravity config\n").unwrap();
+
+        let converted =
+            convert_detection_entry(crate::agent_detection::InstalledAgentDetectionEntry {
+                slug: "agy".to_string(),
+                detected: true,
+                evidence: vec!["multiple .gemini roots exist".to_string()],
+                root_paths: vec![
+                    legacy_gemini_root.display().to_string(),
+                    antigravity_root.display().to_string(),
+                ],
+            });
+
+        assert_eq!(
+            converted.config_path.as_deref(),
+            Some(antigravity_config.to_string_lossy().as_ref())
         );
     }
 }

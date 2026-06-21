@@ -484,6 +484,14 @@ mod tests {
     }
 
     #[test]
+    fn kind_antigravity_is_agents_md() {
+        assert_eq!(
+            config_kind_for_provider(&AgentProvider::Antigravity),
+            AgentConfigKind::AgentsMd
+        );
+    }
+
+    #[test]
     fn kind_cline_is_agents_md() {
         assert_eq!(
             config_kind_for_provider(&AgentProvider::Cline),

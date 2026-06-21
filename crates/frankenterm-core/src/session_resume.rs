@@ -30,6 +30,7 @@ pub enum AgentProvider {
     ClaudeCode,
     Codex,
     Gemini,
+    #[serde(rename = "agy", alias = "antigravity", alias = "antigravity-cli")]
     Antigravity,
     Grok,
     /// Provider not in the known set.
@@ -39,9 +40,47 @@ pub enum AgentProvider {
 /// Required Antigravity model pin for native resume commands.
 pub const ANTIGRAVITY_MODEL: &str = "Gemini 3.1 Pro (High)";
 
+/// Antigravity CLI binary name used for native resume.
+pub const ANTIGRAVITY_BINARY: &str = "agy";
+
+/// Discovery-source tag for native Antigravity conversation DB scans.
+pub const ANTIGRAVITY_DISCOVERY_SOURCE: &str = "antigravity_conversations_db";
+
+/// Metadata fallback reason for native Antigravity DB entries.
+pub const ANTIGRAVITY_METADATA_FALLBACK_REASON: &str =
+    "antigravity_sqlite_schema_unstable_title_not_read";
+
 /// Native Antigravity conversation database location relative to a home dir.
 pub const ANTIGRAVITY_CONVERSATIONS_RELATIVE_DIR: [&str; 3] =
     [".gemini", "antigravity-cli", "conversations"];
+
+/// Native provider resume plan with the exact argv surfaced for operator and robot contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeResumePlan {
+    pub provider_slug: String,
+    pub session_id: String,
+    pub binary: String,
+    pub argv: Vec<String>,
+    pub model_name: Option<String>,
+}
+
+impl NativeResumePlan {
+    /// Fail closed if the native provider binary is not present on PATH.
+    pub fn require_binary_available_in_path(
+        &self,
+        path_env: Option<&str>,
+    ) -> Result<(), SessionResumeError> {
+        if binary_exists_on_path(&self.binary, path_env) {
+            return Ok(());
+        }
+
+        Err(SessionResumeError::NativeProviderNotFound {
+            provider_slug: self.provider_slug.clone(),
+            binary: self.binary.clone(),
+            message: format!("{} binary was not found on PATH", self.binary),
+        })
+    }
+}
 
 impl AgentProvider {
     /// The casr CLI slug for this provider.
@@ -58,27 +97,34 @@ impl AgentProvider {
 
     /// Parse a slug string into an [`AgentProvider`].
     pub fn from_slug(slug: &str) -> Self {
-        match slug {
+        let trimmed = slug.trim();
+        let normalized = trimmed.to_ascii_lowercase();
+        match normalized.as_str() {
             "claude-code" | "cc" => Self::ClaudeCode,
             "codex" | "cod" => Self::Codex,
             "gemini" | "gmi" => Self::Gemini,
             "agy" | "antigravity" | "antigravity-cli" => Self::Antigravity,
             "grok" => Self::Grok,
-            other => Self::Other(other.to_string()),
+            _ => Self::Other(trimmed.to_string()),
         }
     }
 
     /// Native provider resume command for providers that do not go through casr.
     pub fn native_resume_command(&self, session_id: &str) -> Option<Vec<String>> {
+        self.checked_native_resume_plan(session_id)
+            .ok()
+            .flatten()
+            .map(|plan| plan.argv)
+    }
+
+    /// Checked native provider resume plan for providers that do not go through casr.
+    pub fn checked_native_resume_plan(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<NativeResumePlan>, SessionResumeError> {
         match self {
-            Self::Antigravity => Some(vec![
-                "agy".to_string(),
-                "--conversation".to_string(),
-                session_id.to_string(),
-                "--model".to_string(),
-                ANTIGRAVITY_MODEL.to_string(),
-            ]),
-            _ => None,
+            Self::Antigravity => Ok(Some(antigravity_native_resume_plan(session_id)?)),
+            _ => Ok(None),
         }
     }
 }
@@ -119,6 +165,91 @@ fn default_timeout_secs() -> u64 {
 }
 
 const CASR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Build the checked native Antigravity resume plan with the mandatory model pin.
+pub fn antigravity_native_resume_plan(
+    session_id: &str,
+) -> Result<NativeResumePlan, SessionResumeError> {
+    antigravity_native_resume_plan_with_model(session_id, ANTIGRAVITY_MODEL)
+}
+
+/// Build the native Antigravity resume plan, rejecting all non-pinned model overrides.
+pub fn antigravity_native_resume_plan_with_model(
+    session_id: &str,
+    model_name: &str,
+) -> Result<NativeResumePlan, SessionResumeError> {
+    let trimmed_id = session_id.trim();
+    if !is_valid_antigravity_conversation_id(trimmed_id) {
+        return Err(SessionResumeError::InvalidNativeSessionId {
+            provider_slug: AgentProvider::Antigravity.slug().to_string(),
+            session_id: session_id.to_string(),
+            reason: "expected canonical UUID filename stem with no path separators".to_string(),
+        });
+    }
+
+    if model_name != ANTIGRAVITY_MODEL {
+        return Err(SessionResumeError::NonPinnedNativeModel {
+            provider_slug: AgentProvider::Antigravity.slug().to_string(),
+            requested_model: model_name.to_string(),
+            required_model: ANTIGRAVITY_MODEL.to_string(),
+        });
+    }
+
+    Ok(NativeResumePlan {
+        provider_slug: AgentProvider::Antigravity.slug().to_string(),
+        session_id: trimmed_id.to_string(),
+        binary: ANTIGRAVITY_BINARY.to_string(),
+        argv: vec![
+            ANTIGRAVITY_BINARY.to_string(),
+            "--conversation".to_string(),
+            trimmed_id.to_string(),
+            "--model".to_string(),
+            ANTIGRAVITY_MODEL.to_string(),
+        ],
+        model_name: Some(ANTIGRAVITY_MODEL.to_string()),
+    })
+}
+
+/// Return true for canonical UUID filename stems used by Antigravity conversations.
+pub fn is_valid_antigravity_conversation_id(session_id: &str) -> bool {
+    let bytes = session_id.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    for (idx, byte) in bytes.iter().enumerate() {
+        match idx {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !byte.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+fn binary_exists_on_path(binary: &str, path_env: Option<&str>) -> bool {
+    let binary_path = Path::new(binary);
+    if binary_path.components().count() > 1 {
+        return binary_path.is_file();
+    }
+
+    let Some(paths) = path_env
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+    else {
+        return false;
+    };
+
+    std::env::split_paths(&paths).any(|dir| dir.join(binary).is_file())
+}
 
 impl Default for SessionResumeConfig {
     fn default() -> Self {
@@ -174,6 +305,24 @@ pub enum SessionResumeError {
     SessionNotFound(String),
     /// Provider is not installed.
     ProviderNotInstalled(String),
+    /// Native provider binary was not found.
+    NativeProviderNotFound {
+        provider_slug: String,
+        binary: String,
+        message: String,
+    },
+    /// Native provider session id is malformed or unsafe.
+    InvalidNativeSessionId {
+        provider_slug: String,
+        session_id: String,
+        reason: String,
+    },
+    /// Native provider model override violated the provider contract.
+    NonPinnedNativeModel {
+        provider_slug: String,
+        requested_model: String,
+        required_model: String,
+    },
     /// Operation was cancelled or timed out.
     Timeout,
 }
@@ -190,6 +339,33 @@ impl std::fmt::Display for SessionResumeError {
             Self::ProviderNotInstalled(slug) => {
                 write!(f, "provider not installed: {}", slug)
             }
+            Self::NativeProviderNotFound {
+                provider_slug,
+                binary,
+                message,
+            } => write!(
+                f,
+                "native provider {} binary not found ({}): {}",
+                provider_slug, binary, message
+            ),
+            Self::InvalidNativeSessionId {
+                provider_slug,
+                session_id,
+                reason,
+            } => write!(
+                f,
+                "invalid native provider {} session id {:?}: {}",
+                provider_slug, session_id, reason
+            ),
+            Self::NonPinnedNativeModel {
+                provider_slug,
+                requested_model,
+                required_model,
+            } => write!(
+                f,
+                "native provider {} requires model {:?}, got {:?}",
+                provider_slug, required_model, requested_model
+            ),
             Self::Timeout => write!(f, "casr operation timed out"),
         }
     }
@@ -698,32 +874,70 @@ pub fn discover_antigravity_conversations_in_dir(conversations_dir: &Path) -> Ve
             continue;
         };
 
+        if !is_valid_antigravity_conversation_id(&session_id) {
+            warn!(
+                session_resume = true,
+                provider = "agy",
+                conversation_id = %session_id,
+                path = %path.display(),
+                "ignored Antigravity conversation database with invalid UUID filename stem"
+            );
+            continue;
+        }
+
         let started_at = dir_entry
             .metadata()
             .ok()
             .and_then(|metadata| metadata.modified().ok())
             .and_then(system_time_to_epoch_millis);
-        let resume_command = AgentProvider::Antigravity
-            .native_resume_command(&session_id)
-            .unwrap_or_default();
+        let resume_plan = match antigravity_native_resume_plan(&session_id) {
+            Ok(plan) => plan,
+            Err(err) => {
+                warn!(
+                    session_resume = true,
+                    provider = "agy",
+                    conversation_id = %session_id,
+                    path = %path.display(),
+                    error = %err,
+                    "failed to build Antigravity native resume plan"
+                );
+                continue;
+            }
+        };
         let mut extra = std::collections::HashMap::new();
         extra.insert(
             "discovery_source".to_string(),
-            serde_json::json!("antigravity_conversations_db"),
+            serde_json::json!(ANTIGRAVITY_DISCOVERY_SOURCE),
         );
         extra.insert(
             "native_resume_command".to_string(),
-            serde_json::json!(resume_command),
+            serde_json::json!(resume_plan.argv.clone()),
+        );
+        extra.insert(
+            "native_resume_binary".to_string(),
+            serde_json::json!(resume_plan.binary.clone()),
+        );
+        extra.insert(
+            "provider_slug".to_string(),
+            serde_json::json!(resume_plan.provider_slug.clone()),
+        );
+        extra.insert(
+            "conversation_id".to_string(),
+            serde_json::json!(resume_plan.session_id.clone()),
         );
         extra.insert(
             "model_name".to_string(),
             serde_json::json!(ANTIGRAVITY_MODEL),
         );
+        extra.insert(
+            "metadata_fallback_reason".to_string(),
+            serde_json::json!(ANTIGRAVITY_METADATA_FALLBACK_REASON),
+        );
 
         entries.push(CasrListEntry {
             session_id,
             provider: Some(AgentProvider::Antigravity.slug().to_string()),
-            title: Some("Antigravity conversation".to_string()),
+            title: Some("Antigravity conversation (metadata schema not read)".to_string()),
             messages: 0,
             workspace: None,
             started_at,
@@ -842,15 +1056,107 @@ mod tests {
         assert_eq!(AgentProvider::from_slug("cc"), AgentProvider::ClaudeCode);
         assert_eq!(AgentProvider::from_slug("cod"), AgentProvider::Codex);
         assert_eq!(AgentProvider::from_slug("gmi"), AgentProvider::Gemini);
+        assert_eq!(AgentProvider::from_slug(" Gemini "), AgentProvider::Gemini);
         assert_eq!(AgentProvider::from_slug("agy"), AgentProvider::Antigravity);
         assert_eq!(
             AgentProvider::from_slug("antigravity"),
             AgentProvider::Antigravity
         );
         assert_eq!(
-            AgentProvider::from_slug("antigravity-cli"),
+            AgentProvider::from_slug(" Antigravity-CLI "),
             AgentProvider::Antigravity
         );
+    }
+
+    #[test]
+    fn antigravity_native_resume_plan_is_model_pinned_and_serializable() {
+        let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+        let plan = antigravity_native_resume_plan(conversation_id).unwrap();
+
+        assert_eq!(plan.provider_slug, "agy");
+        assert_eq!(plan.session_id, conversation_id);
+        assert_eq!(plan.binary, ANTIGRAVITY_BINARY);
+        assert_eq!(plan.model_name.as_deref(), Some(ANTIGRAVITY_MODEL));
+        assert_eq!(
+            plan.argv,
+            vec![
+                "agy".to_string(),
+                "--conversation".to_string(),
+                conversation_id.to_string(),
+                "--model".to_string(),
+                ANTIGRAVITY_MODEL.to_string(),
+            ]
+        );
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["provider_slug"], "agy");
+        assert_eq!(json["model_name"], ANTIGRAVITY_MODEL);
+        assert_eq!(json["argv"][0], "agy");
+    }
+
+    #[test]
+    fn antigravity_native_resume_plan_rejects_bad_ids_and_model_overrides() {
+        let bad_id = "../123e4567-e89b-12d3-a456-426614174000";
+        let err = antigravity_native_resume_plan(bad_id).unwrap_err();
+        assert!(matches!(
+            &err,
+            SessionResumeError::InvalidNativeSessionId {
+                provider_slug,
+                ..
+            } if provider_slug.as_str() == "agy"
+        ));
+        assert!(err.to_string().contains("agy"));
+
+        let err = antigravity_native_resume_plan_with_model(
+            "123e4567-e89b-12d3-a456-426614174000",
+            "Gemini 3.1 Pro",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &err,
+            SessionResumeError::NonPinnedNativeModel {
+                provider_slug,
+                required_model,
+                ..
+            } if provider_slug.as_str() == "agy" && required_model.as_str() == ANTIGRAVITY_MODEL
+        ));
+        assert!(err.to_string().contains(ANTIGRAVITY_MODEL));
+    }
+
+    #[test]
+    fn antigravity_native_resume_plan_reports_missing_binary_provider_specifically() {
+        let plan = antigravity_native_resume_plan("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let empty_path = tempfile::tempdir().expect("temp empty path");
+        let err = plan
+            .require_binary_available_in_path(Some(empty_path.path().to_str().unwrap()))
+            .unwrap_err();
+
+        assert!(matches!(
+            &err,
+            SessionResumeError::NativeProviderNotFound {
+                provider_slug,
+                binary,
+                ..
+            } if provider_slug.as_str() == "agy" && binary.as_str() == "agy"
+        ));
+        assert!(err.to_string().contains("native provider agy"));
+    }
+
+    #[test]
+    fn antigravity_conversation_id_validation_is_uuid_only() {
+        assert!(is_valid_antigravity_conversation_id(
+            "123e4567-e89b-12d3-a456-426614174000"
+        ));
+        assert!(is_valid_antigravity_conversation_id(
+            "123E4567-E89B-12D3-A456-426614174000"
+        ));
+        assert!(!is_valid_antigravity_conversation_id("session-legacy"));
+        assert!(!is_valid_antigravity_conversation_id(
+            "123e4567-e89b-12d3-a456-426614174000/extra"
+        ));
+        assert!(!is_valid_antigravity_conversation_id(
+            "123e4567-e89b-12d3-a456-42661417400z"
+        ));
     }
 
     #[test]
@@ -872,6 +1178,20 @@ mod tests {
         let json_str = serde_json::to_string(&p).unwrap();
         let rt: AgentProvider = serde_json::from_str(&json_str).unwrap();
         assert_eq!(p, rt);
+    }
+
+    #[test]
+    fn agent_provider_antigravity_serde_uses_agy_slug() {
+        let json_str = serde_json::to_string(&AgentProvider::Antigravity).unwrap();
+        assert_eq!(json_str, "\"agy\"");
+        assert_eq!(
+            serde_json::from_str::<AgentProvider>("\"antigravity\"").unwrap(),
+            AgentProvider::Antigravity
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentProvider>("\"antigravity-cli\"").unwrap(),
+            AgentProvider::Antigravity
+        );
     }
 
     #[test]
@@ -1066,6 +1386,27 @@ mod tests {
 
         let e = SessionResumeError::ProviderNotInstalled("codex".into());
         assert!(e.to_string().contains("codex"));
+
+        let e = SessionResumeError::NativeProviderNotFound {
+            provider_slug: "agy".into(),
+            binary: "agy".into(),
+            message: "missing".into(),
+        };
+        assert!(e.to_string().contains("native provider agy"));
+
+        let e = SessionResumeError::InvalidNativeSessionId {
+            provider_slug: "agy".into(),
+            session_id: "../bad".into(),
+            reason: "bad id".into(),
+        };
+        assert!(e.to_string().contains("invalid native provider agy"));
+
+        let e = SessionResumeError::NonPinnedNativeModel {
+            provider_slug: "agy".into(),
+            requested_model: "Gemini 3.1 Pro".into(),
+            required_model: ANTIGRAVITY_MODEL.into(),
+        };
+        assert!(e.to_string().contains(ANTIGRAVITY_MODEL));
 
         let e = SessionResumeError::Timeout;
         assert!(e.to_string().contains("timed out"));
