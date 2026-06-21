@@ -11,9 +11,9 @@
 | Flag | Pane / bead | Gate-structure | OFF-path preserved | Byte-equiv proof | Verdict |
 |---|---|---|---|---|---|
 | EV4 set-based FTS | cod_3 / ft-uvjfr | ✅ own fn `fts_insert_select_batch_enabled_from_env` default-on; shared helper untouched | ✅ `=0`/`false`/`off` → off, == baseline | ✅ `round7_fts_promote.rs` | **ENDORSE** |
-| .13 clustered-ASCII | cod_2 / ft-97g96 | ✅ `moonshot_recommended_enabled() && !moonshot_env_falsey(ENV)` | ✅ `=0` → off, == baseline | ✅ `..ascii_cluster_run_append_matches_per_cell_materialization` (cluster_hits>0) | **ENDORSE (pending green)** |
-| EV1 bulk-ASCII | cod_2 / ft-97g96 | ✅ same pattern, BULK_ASCII_ROW_WRITE_ENV | ✅ `=0` → off | ✅ `..bulk_ascii_row_write_matches_scalar..` (bulk_hits>0) | **ENDORSE (pending green)** |
-| D1 print-batching | cod_2 / ft-97g96 | ✅ `default_print_batching()` default-on, dual falsey hatch | ✅ `=0` → off, == old default-off | ✅ chunked all-splits + escape-parser `parser_print_batching_equivalence.rs` | **ENDORSE (pending green)** |
+| .13 clustered-ASCII | cod_2 / ft-97g96 | ✅ `moonshot_recommended_enabled() && !moonshot_env_falsey(ENV)` | ✅ `=0` → off, == baseline | ✅ `..ascii_cluster_run_append_matches_per_cell_materialization` (cluster_hits>0) | **ENDORSE (landed 5c2d995eb, RCH green)** |
+| EV1 bulk-ASCII | cod_2 / ft-97g96 | ✅ same pattern, BULK_ASCII_ROW_WRITE_ENV | ✅ `=0` → off | ✅ `..bulk_ascii_row_write_matches_scalar..` (bulk_hits>0) | **ENDORSE (landed 5c2d995eb, RCH green)** |
+| D1 print-batching | cod_2 / ft-97g96 | ✅ `default_print_batching()` default-on, dual falsey hatch | ✅ `=0` → off, == old default-off | ✅ chunked all-splits + escape-parser `parser_print_batching_equivalence.rs` | **ENDORSE (landed 5c2d995eb, RCH green)** |
 | adaptive-M4 CDC (RSS) | cod_1 / ft-ykde4 | ⏳ not landed (scrollback_tiers.rs unmodified; CDC default still `Off`) | — | — | **AWAITING** |
 
 No promotion is missing a byte-equivalence proof. No gate restructure changes OFF behavior.
@@ -63,6 +63,32 @@ No promotion is missing a byte-equivalence proof. No gate restructure changes OF
 3. `moonshot_env_truthy` fully removed from screen.rs (no orphan → no `-D warnings` break).
 4. csi.rs / osc.rs working-tree diffs are pure `mod test` rustfmt; no production behavior change. The
    `CSI::parse_fast` call reflow in parser/mod.rs is cosmetic and gated behind default-off D2.
+5. **D1 dropped `cfg!(feature = "parser-print-batching")`** from `default_print_batching()`. The
+   feature is now inert: ZERO source `cfg!` references, not in any default set, not enabled by any
+   dependent. The only behavior delta (feature compiled-in via explicit `--features` AND env set
+   falsey: old=force-on, new=env-off) is unreachable in any realistic build, and the new behavior
+   (explicit env disable wins) is more correct. **Cleanup for cc_1:** the feature's Cargo.toml doc
+   comment ("Default-OFF") is now stale; the feature decl could be removed. (The stray `n = []`
+   feature in escape-parser/Cargo.toml is pre-existing, unrelated to round-7.)
+
+## Landed-commit verification — 5c2d995eb (term-render promotion)
+Confirmed against the committed blobs (not just working tree):
+- All three production gates are per-flag default-true, NO shared-helper default flip:
+  `ascii_cluster_run_append_enabled` (screen.rs:178), `default_print_batching` (parser/mod.rs:40),
+  `bulk_ascii_row_write_enabled` (performer.rs:219). The `term_*_enabled` mirrors in the diff are
+  bench-local (`term_parser_ab.rs`), not production. D2 table-dispatch stays opt-in (not promoted).
+- **`parser_print_batching_equivalence` (6 passed):** `normalize()` coalesces Print/PrintString runs
+  so the only permitted ON-vs-OFF difference is the intended coalescing; any swallowed control /
+  dropped-or-mis-decoded codepoint / reordered action / desynced state machine diverges. Covers
+  whole-buffer + corpus (guarded `>=6`), **all-split chunk-boundary fuzzing**, a non-vacuity toggle
+  test (OFF never emits PrintString, ON does), and the adversarial C1-via-UTF-8 (`0xC2 0x9B`) case.
+- **`csi_osc_dispatch_equivalence`:** raw `assert_eq!(off, on)` on `Vec<Action>` (no normalize — D2
+  must be byte-identical) over battery + corpus + all chunk boundaries + a gate-off-by-default
+  sanity test. Regression hygiene for the opt-in D2 path; intact, proves ON==OFF byte-for-byte.
+- Render-level: 4 inline term tests (`parser_print_batching_*` in performer.rs) green (RCH
+  vmi1152480) prove EV1/.13/D1 render byte-equivalence.
+- **No gate changes behavior when its flag is OFF:** `=0`/`false`/`off`/`no` (or `FT_MOONSHOT_RECOMMENDED`
+  falsey) maps each flag to the same path as the pre-promotion baseline; only the unset default flipped.
 
 ## Watch list
 - cod_1 adaptive-M4 CDC: when it lands, require decode byte-equivalence proof (adaptive-CDC decode ==
