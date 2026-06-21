@@ -1,7 +1,10 @@
-# v0.10.0 — Round-7 Alien Optimization Gauntlet Campaign Record
+# v0.10.0 — Round-7 Alien Optimization Gauntlet Campaign Record — FINAL
 
-> NTM 8-pane swarm, autonomous orchestrator. Resumes the radical-innovation perf campaign from v0.9.0
+> **v0.10.0 SHIPPED** — 3 platforms + checksums:
+> https://github.com/Dicklesworthstone/frankenterm/releases/tag/v0.10.0 (tag `5baf072f9`).
+> NTM 8-pane swarm, autonomous orchestrator. Resumed the radical-innovation perf campaign from v0.9.0
 > (`055bca9b0`). Epic `ft-yjihu`. Ledgers: `docs/perf-ledger/round7-{keep-ledger,negative-results,profile-targets}.md`.
+> **This is the final round-7 scorecard.**
 
 ## Charter (operator-locked)
 
@@ -25,11 +28,11 @@
 |---|---|---|---|---|
 | ft-uvjfr | cod_3 | EV4 set-based FTS → default-on | promotion | **CERTIFIED** (`8318c5514`) |
 | ft-97g96 | cod_2 | .13/D1/EV1 term-render → default-on | promotion | **CERTIFIED** (`5c2d995eb`) |
-| ft-ykde4 | cod_1 | EV3 liveness + adaptive-M4 RSS | memory axis | EV3 **refuted-on-liveness** (`cc03d97f8`); adaptive-M4 RSS pending |
+| ft-ykde4 | cod_1 | EV3 liveness + adaptive-M4 RSS | memory axis | EV3 **refuted-on-liveness** (`cc03d97f8`); adaptive-M4 **CERTIFIED** (`557982cb7`, ships next release) |
 | ft-6aban | cc_2 | deterministic fleet-resident-bytes RSS harness | infra | **landed** (`21a1d0b6f`) |
-| ft-mcz7t | cod_4 | startup-WAL / EventBus / BOCPD profile sweep | new-axis | in_progress |
-| ft-8cpho | cod_5 | scan_pipeline removal + ft-ui1xn A/B | hygiene | ft-ui1xn A/B **blocked** RCH-E410 (`df794dca3`) |
-| ft-rof2k | orch | cut v0.10.0 | release | pending |
+| ft-mcz7t | cod_4 | startup-WAL / EventBus / BOCPD profile sweep | new-axis | WAL-recovery **deferred to round-8** (`ft-yjihu.1`) |
+| ft-8cpho | cod_5 | scan_pipeline removal + ft-ui1xn A/B | hygiene | scan_pipeline deletion **deferred (operator)**; ft-ui1xn A/B Form-8 (dep landed) |
+| ft-rof2k | orch | cut v0.10.0 | release | **SHIPPED** (`v0.10.0` / `5baf072f9`, 3 platforms + checksums) |
 
 cc_1 = ledger steward; cc_3 = byte-equivalence / correctness reviewer.
 
@@ -37,7 +40,8 @@ cc_1 = ledger steward; cc_3 = byte-equivalence / correctness reviewer.
 
 _Adjudicated by cc_1 (ledger steward) against the 10 keep-gate rules + 8 retry forms (round4-negative-results.md)._
 _Tend #1 — 4 commits: `5c2d995eb` term-render, `cc03d97f8` EV3, `df794dca3` scan-pipeline, `21a1d0b6f` RSS harness._
-_Tend #2 — EV4 committed (`8318c5514`): HELD→CERTIFIED. **Both cash-in promotions now certified.**_
+_Tend #2 — EV4 committed (`8318c5514`): HELD→CERTIFIED._
+_Tend #3 (FINAL) — adaptive-M4 committed (`557982cb7`): CERTIFIED. **3 promotions certified** (term-render, EV4, adaptive-M4). v0.10.0 SHIPPED._
 
 ### Certified promotions → default-on
 
@@ -45,6 +49,12 @@ _Tend #2 — EV4 committed (`8318c5514`): HELD→CERTIFIED. **Both cash-in promo
 |---|---|---|---|---|---|---|
 | Dense-ASCII term stack: .13 cluster-run + D1 printable-run + EV1 bulk-row | ft-97g96 / `5c2d995eb` | .13 **4.43×**, D1 **1.47×**, EV1 **1.16×** | `terminal/csi_osc_heavy` +1.15% (cand CV 1.38%, base CV 2.88%, p=3e-4) — inside −3% primary / −10% per-category ratchet | RCH-green `vmi1152480`: `parser_print_batching_` lib (4 passed) + `parser_print_batching_equivalence` (6 passed) | `ascii_cluster_run_append_enabled` · `default_print_batching` · `bulk_ascii_row_write_enabled` — each its own default-true fn + own per-flag falsey env; set-wide `FT_MOONSHOT_RECOMMENDED` off-switch; shared `storage_env_flag_enabled` untouched | **CERTIFIED ✅** |
 | EV4 set-based FTS INSERT…SELECT batcher | ft-uvjfr / `8318c5514` | p95 **6.0×** / mean **9.12×** / p50 14.12× (`deferred_fts_sync`, cand CV 66% — large-effect, ≥6× every percentile) | N/A (background catch-up sync, same op batched) | round-6 RCH-green `insert_select_batch` (hz1) **+** committed oracle `round7_fts_promote.rs` (byte-equiv across all/pane/zone/time projections, sync-shape parity) | dedicated `fts_insert_select_batch_enabled_from_env` w/ own `.unwrap_or(true)`; `=0/false/off` disables (`env_value_is_truthy`); shared `storage_env_flag_enabled` untouched (`.unwrap_or(false)`) | **CERTIFIED ✅** |
+| adaptive-M4 CDC scrollback dedup (RSS) ⚠ **ships next release** | ft-ykde4 / `557982cb7` | **−80.14% fleet RSS** on redundant scrollback (27.87 MB → 5.53 MB @200 panes; probe engaged 200/200, deduped to 13 chunks) — deterministic RSS harness `vmi1227854` | low-redundancy **+0.00% TIE** (probe declined 200/200); always-on CDC would regress **+11.05%** — the adaptive probe is exactly what avoids that | RCH-green `vmi1227854`: `proptest_scrollback_cdc_dedup` (4 passed) — byte-identical warm-page decode + refcount/eviction accounting | dedicated `cdc_dedup_mode_from_env` w/ own `.unwrap_or(CdcDedupMode::Adaptive)`; `=0/false/off`→`Off`; not a shared helper | **CERTIFIED ✅** |
+
+> **adaptive-M4 release timing:** committed `557982cb7` @ 03:01:42, **~12 min after** the v0.10.0 tag
+> `5baf072f9` @ 02:49:23 (`git tag --contains 557982cb7` does not list v0.10.0). It therefore **ships in the
+> next release**, not v0.10.0. **v0.10.0 keeps CDC dedup default-off** — accurate, since the default-on flip
+> is not in the tagged tree. Term-render + EV4 promotions DID make the v0.10.0 cut.
 
 ### Refuted / blocked (negative evidence = a win)
 
@@ -57,20 +67,25 @@ _Tend #2 — EV4 committed (`8318c5514`): HELD→CERTIFIED. **Both cash-in promo
 
 | Item | Bead / commit | Note |
 |---|---|---|
-| Deterministic fleet-resident-bytes RSS harness | ft-6aban / `21a1d0b6f` | `crates/frankenterm-core/tests/round7_rss_harness.rs` (496 lines) — substrate for the adaptive-M4 CDC RSS adjudication (verdict still _pending_ on cod_1) |
+| Deterministic fleet-resident-bytes RSS harness | ft-6aban / `21a1d0b6f` | `crates/frankenterm-core/tests/round7_rss_harness.rs` (496 lines) — **delivered** the adaptive-M4 CDC RSS cert (off/adaptive/always-on three-arm verdict on `vmi1227854`) |
 
-### CRITICAL gate-guard audit — PASS (both promotions, code-verified at HEAD)
+### CRITICAL gate-guard audit — PASS (all 3 promotions, code-verified at HEAD)
 - **Term-render (`5c2d995eb`):** every promoted flag reads its OWN default-true gate fn
   (`ascii_cluster_run_append_enabled` / `bulk_ascii_row_write_enabled` via own `LazyLock`; `default_print_batching`
   via own fn) with its OWN per-flag falsey env. `FT_MOONSHOT_RECOMMENDED` is a NEW set-wide *disable* hatch
   scoped to the 3 flags — not a default-flipped shared *enable* helper.
 - **EV4 (`8318c5514`):** gate is the dedicated `fts_insert_select_batch_enabled_from_env` with its OWN
   `.unwrap_or(true)`; `=0/false/off` disables (`env_value_is_truthy` matches only `1|true|yes|on`).
+- **adaptive-M4 (`557982cb7`):** gate is the dedicated `cdc_dedup_mode_from_env` with its OWN
+  `.unwrap_or(CdcDedupMode::Adaptive)`; `=0/false/off`→`Off`, `adaptive/auto/probe`→`Adaptive`, truthy→`Always`.
 - **Shared `storage_env_flag_enabled` confirmed UNTOUCHED** at HEAD (`.unwrap_or(false)`, serving only the 3
-  group-commit flags) — no over-promotion. PASS.
+  group-commit flags) — no over-promotion. PASS for all three.
 
-### Open
-- **adaptive-M4 CDC (RSS)** — RSS harness landed (ft-6aban); awaiting cod_1 deterministic resident-bytes win + cheap redundancy probe.
-- **ft-ui1xn quick_reject A/B** — Form-8 dep (`round7_fts_promote.rs`) now committed; cod_5 re-run unblocked.
-- **new-axis (cod_4, ft-mcz7t)** — startup-WAL profile pending the ≥0.5% attribution + verified-prod-caller gate.
-- **v0.10.0 cut (ft-rof2k)** — both cash-in promotions certified; pending adaptive-M4 verdict + new-axis sweep before convergence.
+### Final disposition
+- **Release:** v0.10.0 SHIPPED (`5baf072f9`, 3 platforms + checksums). Carries term-render + EV4 promotions default-on; CDC dedup default-off (adaptive-M4 landed post-tag).
+- **3 promotions CERTIFIED:** dense-ASCII term-render stack (.13/D1/EV1), EV4 set-based FTS, adaptive-M4 CDC RSS (next release).
+- **1 idea refuted:** EV3 single-line scrollback decode — refuted-on-liveness (Form 1).
+- **Deferred:**
+  - WAL-recovery new-axis → **round-8, `ft-yjihu.1`**.
+  - `scan_pipeline` deletion → **deferred (operator decision)**; the dead-code A/B `ft-ui1xn` stays Form-8 (dep `round7_fts_promote.rs` now committed → re-runnable, not blocking).
+- **Infra retained:** deterministic fleet-RSS harness (`round7_rss_harness.rs`) for future memory-axis adjudication.
