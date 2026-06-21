@@ -12,7 +12,11 @@
 //!
 //! ft-3681t.5.10 quality support slice.
 
-use frankenterm_core::connector_host_runtime::{ConnectorCapability, ConnectorHostConfig};
+use std::collections::BTreeSet;
+
+use frankenterm_core::connector_host_runtime::{
+    ConnectorCapability, ConnectorHostConfig, ConnectorLifecyclePhase,
+};
 use frankenterm_core::connector_registry::TrustLevel;
 use frankenterm_core::connector_sdk::{
     CertificationPhase, CertificationPipeline, CertificationReport, CertificationTelemetry,
@@ -531,14 +535,14 @@ proptest! {
         }
     }
 
-    /// Connector count matches number of successfully registered connectors.
+    /// Connector count matches number of distinct successfully registered connector ids.
     #[test]
     fn simulator_count_tracks_registrations(
         ids in proptest::collection::vec(arb_package_id(), 1..5),
     ) {
         let policy = TrustPolicyBuilder::new().build();
         let mut sim = ConnectorSimulator::new(policy);
-        let mut registered = 0;
+        let mut registered = BTreeSet::new();
         for id in &ids {
             let manifest = ManifestBuilder::new(id)
                 .version("1.0.0")
@@ -548,12 +552,47 @@ proptest! {
             let config = ConnectorHostConfig::default();
             if let Ok(report) = sim.register(&manifest, b"payload", config) {
                 if report.passed() {
-                    registered += 1;
+                    registered.insert(id.clone());
                 }
             }
         }
-        prop_assert_eq!(sim.connector_count(), registered);
+        prop_assert_eq!(sim.connector_count(), registered.len());
     }
+}
+
+#[test]
+fn simulator_duplicate_registration_replaces_without_increasing_count() {
+    let policy = TrustPolicyBuilder::new().build();
+    let mut sim = ConnectorSimulator::new(policy);
+    let payload = b"payload";
+    let manifest = ManifestBuilder::new("duplicate")
+        .version("1.0.0")
+        .publisher_signature("sig")
+        .build_with_digest(payload)
+        .unwrap();
+
+    assert!(
+        sim.register(&manifest, payload, ConnectorHostConfig::default())
+            .unwrap()
+            .passed()
+    );
+    sim.start("duplicate").unwrap();
+    assert_eq!(
+        sim.phase("duplicate").unwrap(),
+        ConnectorLifecyclePhase::Running
+    );
+
+    assert!(
+        sim.register(&manifest, payload, ConnectorHostConfig::default())
+            .unwrap()
+            .passed()
+    );
+
+    assert_eq!(sim.connector_count(), 1);
+    assert_eq!(
+        sim.phase("duplicate").unwrap(),
+        ConnectorLifecyclePhase::Stopped
+    );
 }
 
 // ---------------------------------------------------------------------------

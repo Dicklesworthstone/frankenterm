@@ -103,7 +103,11 @@ fn womif_receipt_id_is_deterministic_and_well_formed_golden() {
     let suffix = id1
         .strip_prefix("evidence:lifecycle:")
         .expect("receipt_id must carry the documented prefix");
-    assert_eq!(suffix.len(), 32, "digest suffix must be 32 hex chars: {id1}");
+    assert_eq!(
+        suffix.len(),
+        32,
+        "digest suffix must be 32 hex chars: {id1}"
+    );
     assert!(
         suffix
             .bytes()
@@ -131,14 +135,19 @@ fn scrollback_compaction_preserves_retained_content_and_shrinks_file() {
         MmapScrollbackStore::new(MmapStoreConfig::new(dir.path().to_path_buf())).expect("store");
 
     for idx in 0..8 {
-        store.append_line(1, &format!("line-{idx}")).expect("append");
+        store
+            .append_line(1, &format!("line-{idx}"))
+            .expect("append");
     }
     // Drop the stale prefix (keep seq 6,7) — leaves dead bytes at the file head.
     store.prune_before(1, 6).expect("prune");
 
     let tail_before = store.tail_lines(1, 10).expect("tail before");
     let bytes_before = store.file_bytes(1);
-    assert_eq!(tail_before, vec!["line-6".to_string(), "line-7".to_string()]);
+    assert_eq!(
+        tail_before,
+        vec!["line-6".to_string(), "line-7".to_string()]
+    );
 
     assert!(
         store.compact_pane_if_stale(1, 1).expect("compact"),
@@ -205,8 +214,10 @@ use frankenterm_core::recorder_query::{
 
 #[test]
 fn recorder_query_gate_denies_underprivileged_actor_and_audits_every_attempt() {
-    let executor =
-        RecorderQueryExecutor::new(InMemoryEventStore::new(), AuditLog::new(AuditLogConfig::default()));
+    let executor = RecorderQueryExecutor::new(
+        InMemoryEventStore::new(),
+        AuditLog::new(AuditLogConfig::default()),
+    );
 
     // A free-text search requires A2 (full query). A Robot actor defaults to A1
     // (redacted query) — strictly below A2.
@@ -238,8 +249,10 @@ fn recorder_query_gate_denies_underprivileged_actor_and_audits_every_attempt() {
 
 #[test]
 fn recorder_query_metadata_only_is_authorized_for_low_tier_actor() {
-    let executor =
-        RecorderQueryExecutor::new(InMemoryEventStore::new(), AuditLog::new(AuditLogConfig::default()));
+    let executor = RecorderQueryExecutor::new(
+        InMemoryEventStore::new(),
+        AuditLog::new(AuditLogConfig::default()),
+    );
 
     // Metadata-only (no text) requires A0 — even a Robot (A1) clears it.
     // Metamorphic counterpart to the deny case: dropping the privilege demand
@@ -253,7 +266,7 @@ fn recorder_query_metadata_only_is_authorized_for_low_tier_actor() {
         "ft-ja9i1: a metadata-only (A0) query must be authorized for an A1 actor, got {result:?}"
     );
     assert!(
-        executor.audit_log().len() >= 1,
+        !executor.audit_log().is_empty(),
         "the authorized query must still be audited"
     );
 }
