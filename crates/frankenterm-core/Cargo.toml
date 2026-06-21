@@ -848,6 +848,11 @@ required-features = ["distributed"]
 name = "integration_native_events"
 path = "tests/integration_native_events.rs"
 
+[[test]]
+name = "round7_fts_promote"
+path = "tests/round7_fts_promote.rs"
+required-features = ["asupersync-runtime"]
+
 [features]
 # Everything is on by default — ft is a standalone terminal platform with no feature gates.
 # Use `--no-default-features` to compile a minimal build.

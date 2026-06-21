@@ -18865,12 +18865,31 @@ fn insert_fts_entry_backend(backend: &dyn StorageBackend, segment: &Segment) -> 
     Ok(())
 }
 
+fn fts_insert_select_batch_enabled_from_env() -> bool {
+    if std::env::var("FT_MOONSHOT_ALL")
+        .ok()
+        .map(|value| env_value_is_truthy(&value))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::var(FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV)
+        .ok()
+        .map(|value| env_value_is_truthy(&value))
+        .unwrap_or(true)
+}
+
 fn fts_insert_select_batch_enabled() -> bool {
     match FTS_INSERT_SELECT_BATCH_OVERRIDE_FOR_BENCH.load(AtomicOrdering::Relaxed) {
         FTS_INSERT_SELECT_BATCH_OVERRIDE_DISABLED => false,
         FTS_INSERT_SELECT_BATCH_OVERRIDE_ENABLED => true,
-        _ => storage_env_flag_enabled(FT_MOONSHOT_FTS_INSERT_SELECT_BATCH_ENV),
+        _ => fts_insert_select_batch_enabled_from_env(),
     }
+}
+
+#[doc(hidden)]
+pub fn fts_insert_select_batch_enabled_for_test() -> bool {
+    fts_insert_select_batch_enabled()
 }
 
 #[doc(hidden)]
