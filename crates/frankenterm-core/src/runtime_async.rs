@@ -1623,12 +1623,17 @@ pub mod process {
         PlatformProcessControl::send_signal_to_process_group(process_group_id, signal)
     }
 
-    #[cfg(unix)]
+    /// Send a process-termination signal by pid. Cross-platform: on Unix it
+    /// shells out to `kill -s <signal>`, on Windows `TERM`/`KILL` map to
+    /// `taskkill` (see the `PlatformProcessControl` impls). The historical
+    /// `unix` name is retained for caller stability; it is a direct delegate to
+    /// the platform-neutral [`send_signal_to_pid`], not a compat shim.
     pub fn send_unix_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
         send_signal_to_pid(pid, signal)
     }
 
-    #[cfg(unix)]
+    /// Send a process-group termination signal. Cross-platform delegate to
+    /// [`send_signal_to_process_group`]; see [`send_unix_signal_to_pid`].
     pub fn send_unix_signal_to_process_group(
         process_group_id: u32,
         signal: &str,

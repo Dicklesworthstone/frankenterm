@@ -53,6 +53,15 @@ impl From<IoError> for HandleCloneError {
     }
 }
 
+impl From<filedescriptor::Error> for HandleCloneError {
+    fn from(error: filedescriptor::Error) -> Self {
+        // `OwnedHandle::try_clone` returns `filedescriptor::Error`; fold it into
+        // an `io::Error` (it implements `std::error::Error`) so `clone_handle`
+        // can map it without bespoke per-variant handling.
+        Self::from(IoError::other(error))
+    }
+}
+
 impl From<HandleCloneError> for IoError {
     fn from(error: HandleCloneError) -> Self {
         error.into_io_error()
