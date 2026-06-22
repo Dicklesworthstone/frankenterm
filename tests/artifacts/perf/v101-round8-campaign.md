@@ -31,8 +31,8 @@ AND production-liveness (startup WAL recovery). Everything else is pre-rejected 
 | README `scan_pipeline` cross-chunk reality-gap (`ft-z91oa`) | hygiene/docs | **FIXED** (`f1bc1c975`) |
 | `ft-ui1xn` quick_reject vs ac_direct A/B (Form-8 dep now satisfied) | hygiene/measure | **measured — carried to round-9** (promising, profile-gated) |
 | `scan_pipeline` deletion | hygiene | **deferred to round-9** (operator) |
-| Windows (x86_64-pc-windows-msvc) asset | release platform | **BLOCKED / deferred** (toolchain wall) |
-| Cut v0.10.1 | release | **SHIPPED** (`v0.10.1` / `7fb968b17`, 3 platforms + checksums) |
+| Windows (x86_64-pc-windows-msvc) asset | release platform | **SHIPPED** — `ft.exe` from `8bdf23979`; "hard wall" was a stale host nightly (rustup update) + 8 cfg-gating fixes |
+| Cut v0.10.1 | release | **SHIPPED** (`v0.10.1` / `7fb968b17` unix + `8bdf23979` windows, 4 platforms + checksums) |
 
 ## Scorecard
 
@@ -51,16 +51,19 @@ AND production-liveness (startup WAL recovery). Everything else is pre-rejected 
 |---|---|---|
 | ft-ui1xn quick_reject vs ac_direct | **carryover** — ac_direct faster at 1–16KB (synthetic no-match), tied at 64KB; profile-gate (`detect_with_context` ≥0.5%) UNMET; not refuted, not promoted; quick_reject stays default-on | Form 8 + 1 (gated on `ft-zhj63` + realistic-workload A/B at cv≤5%) |
 | scan_pipeline deletion | **deferred to round-9** (operator); README reality-gap fixed so docs no longer mislead | Form 2 |
-| Windows build | **blocked** — `libsqlite3-sys`/`cfg_select` toolchain wall + portable-pty Windows bug + frankenterm-core Unix couplings | Form 8 + 2 (own Windows-port epic) |
+| Windows build | **RESOLVED / SHIPPED** (operator follow-up) — `ft.exe` builds for x86_64-pc-windows-msvc; the `cfg_select` "wall" was a stale host nightly (`rustup update nightly`), plus portable-pty / openssl-vendored / signal-alias / cfg-gating fixes (`91f8483d7`+`8bdf23979`); green Linux check confirmed no unix regression | n/a (resolved) |
 
 ### Release evidence
 - **Tag/commit:** `v0.10.1` / `7fb968b17` (clean tree; `SOURCE_DATE_EPOCH=0` clean stamp — `ft --version` →
   `ft 0.10.1 (7fb968b17)`, `built: 1970-01-01`, no `+dirty`).
 - **Build:** darwin-arm64 local (full default-members for the `.app`); linux amd64 native + arm64 cross
   (`gcc-aarch64-linux-gnu` **and** `g++-aarch64-linux-gnu` + `CXX_aarch64_unknown_linux_gnu` — the C++
-  cross compiler is required for the esaxx-rs dep, a round-8 learning) on Contabo `vmi1227854`.
+  cross compiler is required for the esaxx-rs dep, a round-8 learning) on Contabo `vmi1227854`; windows
+  amd64 (`ft.exe`, `--no-default-features` minus jemalloc, vendored OpenSSL via Strawberry Perl) on the
+  Tailscale host `surfacebookje`/`wlap` from `8bdf23979`.
 - **Assets (names match `install.sh`):** `ft-{darwin-arm64,linux-amd64,linux-arm64}.tar.xz` +
-  `FrankenTerm-darwin-arm64.app.tar.xz` + per-asset `.sha256` + `SHA256SUMS`. All checksums verified.
+  `FrankenTerm-darwin-arm64.app.tar.xz` + `ft-windows-amd64.zip` + per-asset `.sha256` + `SHA256SUMS`.
+  All 5 checksums verified.
 - **Version bump:** only workspace-root `Cargo.toml` (`0.10.0`→`0.10.1`) + a `Cargo.lock` member-version
   sync; portable-pty stays at its independent `0.9.0`. Pushed `main` + `main:master`. Auto-triggered
   `release.yml` cancelled (the established dsr-manual convention, as for v0.9.0/v0.10.0).

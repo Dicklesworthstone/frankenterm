@@ -87,24 +87,34 @@ deletion permission, (b) rewires the round6/round7 profile-harness denominators 
 
 **Rollback:** n/a (nothing deleted).
 
-### 2026-06-22 | round-8 release | Windows (x86_64-pc-windows-msvc) build — BLOCKED / DEFERRED
+### 2026-06-22 | round-8 release | Windows (x86_64-pc-windows-msvc) build — RESOLVED / SHIPPED
 
-**Status:** blocked at this commit (`7fb968b17`). Operator requested a Windows asset; a full build attempt
-on the Tailscale Windows host (`surfacebookje`) got past openssl-vendored (Strawberry Perl) and a
-`portable-pty` Windows source bug, then hit a **hard toolchain wall**: `libsqlite3-sys 0.38.1`'s build.rs
-uses the unstable `cfg_select` feature, which requires a newer nightly than the repo's pinned
-`nightly-2026-02-13`. The repo's own `release.yml` keeps the Windows matrix entry commented out as "a
-substantial engineering effort that belongs in its own release," and enumerates unported `frankenterm-core`
-Unix couplings (ipc, fd_budget, mux_pool, `send_unix_signal_to_pid`, asupersync UnixListener/UnixStream,
-`Cx::register_io`, `FileDescriptor::into_raw_socket`). v0.10.1 ships macOS arm64 + Linux amd64/arm64.
+**Status:** RESOLVED — `ft.exe` for `x86_64-pc-windows-msvc` is **shipped in v0.10.1** (built from commit
+`8bdf23979`). The earlier "hard wall" was misdiagnosed: the reported `libsqlite3-sys 0.38.1` /
+`cfg_select` error was NOT a repo problem — `rust-toolchain.toml` pins `channel = "nightly"` (unversioned)
+and the Windows host merely had a STALE `nightly-2026-02-13`; Linux/macOS already built on the June
+`1.98.0-nightly` (which has `cfg_select`). `rustup update nightly` on the host dissolved it entirely.
 
-**Retry-condition predicate (Form 8 + Form 2):** blocked until a Windows-port effort (its own epic):
-realign the toolchain pin with `libsqlite3-sys 0.38.1` (or pin `libsqlite3-sys` to a pre-`cfg_select`
-version), fix the `frankenterm/pty` Windows `HandleCloneError: From<filedescriptor::Error>` impl, wire
-openssl-vendored correctly in Cargo.toml, then clear the `frankenterm-core` Unix-coupling backlog
-(tracked by the `ft-51fde` Windows-coupling lint).
+**Fixes landed (all platform-isolated; the green Linux check `[RCH] hz2 1142.1s` confirmed Linux/macOS
+unaffected):**
+1. `frankenterm/pty/src/win/mod.rs`: `From<filedescriptor::Error> for HandleCloneError` (via
+   `io::Error::other`) — cfg(windows)-only file (`91f8483d7`).
+2. `crates/frankenterm/Cargo.toml`: `[target.'cfg(windows)'.dependencies] openssl-sys = {features=["vendored"]}`
+   — vendors OpenSSL via Strawberry Perl on Windows; inactive on Linux/macOS (`91f8483d7`).
+3. `runtime_async::process`: un-gate `send_unix_signal_to_pid` / `_process_group` from `cfg(unix)` — they
+   already delegate to the cross-platform `send_signal_to_pid` whose `PlatformProcessControl` impl has a
+   Windows `taskkill` backend (`91f8483d7`).
+4. `lib.rs`: `fd_budget` + `ipc` modules `cfg(unix)`→`cfg(any(unix,windows))` (both carry Windows impls);
+   `runtime_async`: gate `pub mod unix` to `cfg(unix)`; `config.rs`: Windows-gated `dirs::data_dir()` shim;
+   `vendored.rs`: `not(unix)` `PaneDelta` + `mux_pool::MuxPoolStats` shims; `main.rs`: 2 type annotations
+   the Windows-excluded `cfg(unix)` branches leave un-inferable (`8bdf23979`).
 
-**Rollback:** n/a (no Windows asset shipped).
+**Caveats (freshly ported):** the GUI app stays macOS-only; some Unix-socket IPC paths are no-ops on
+Windows; full Windows `cargo test` parity + the `ft-51fde` Unix-coupling backlog remain future work, but
+the `ft` CLI builds and smoke-tests (`--version`/`--help`/`doctor`).
+
+**Rollback:** the Windows asset is additive; the fixes are cfg-gated so reverting them does not affect
+Linux/macOS.
 
 ---
 
