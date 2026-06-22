@@ -286,6 +286,119 @@ pub use self::types::{
 /// and by the WAL-checkpoint health check in [`storage::health`].
 pub(crate) const WAL_RECOVERY_THRESHOLD: i64 = 10_000;
 
+/// [ft-yjihu.1 / round-8] Env opt-in to skip the startup PASSIVE WAL checkpoint
+/// when the WAL is small and healthy. Default OFF.
+///
+/// SQLite WAL durability does not require checkpoint-on-open: open/read replays
+/// WAL frames as needed, while checkpointing is maintenance/compaction. When this
+/// gate is on and the WAL is small + the integrity check passes + no rollback
+/// journal exists, skipping the startup `wal_checkpoint(PASSIVE)` removes the
+/// dominant startup-recovery cost (round-7 B0': 3.528% self-time on a 4.7 MB
+/// dirty WAL). Any ambiguity falls back to the existing checkpoint behavior.
+const FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT_ENV: &str =
+    "FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT";
+
+/// Default-OFF gate for [`check_and_recover_wal`]'s startup-checkpoint skip.
+///
+/// Dedicated fn with its OWN `.unwrap_or(false)` so a future promotion to
+/// default-on is a one-line change — and so the shared [`storage_env_flag_enabled`]
+/// default stays untouched. Honors the `FT_MOONSHOT_ALL` master switch like the
+/// other storage moonshot gates.
+fn skip_startup_wal_checkpoint_enabled() -> bool {
+    if std::env::var("FT_MOONSHOT_ALL")
+        .ok()
+        .map(|value| env_value_is_truthy(&value))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::var(FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT_ENV)
+        .ok()
+        .map(|value| env_value_is_truthy(&value))
+        .unwrap_or(false)
+}
+
+/// Test-only accessor for the WAL-checkpoint-skip gate, so a child test process
+/// can verify the real env → gate → decision wiring (env mutation is `unsafe`
+/// and forbidden in-process under `#![forbid(unsafe_code)]`).
+#[doc(hidden)]
+pub fn skip_startup_wal_checkpoint_enabled_for_test() -> bool {
+    skip_startup_wal_checkpoint_enabled()
+}
+
+/// SQLite WAL header magic numbers (big-endian u32 at byte offset 0); the two
+/// legal values differ only in the checksum-endianness bit.
+const WAL_HEADER_MAGIC_0: u32 = 0x377f_0682;
+const WAL_HEADER_MAGIC_1: u32 = 0x377f_0683;
+
+/// Conservative startup WAL frame-count estimate, derived from the WAL file
+/// header + on-disk size — used only to decide whether the startup checkpoint
+/// can be safely skipped (see [`skip_startup_wal_checkpoint_enabled`]).
+///
+/// The estimate intentionally **over-counts**: it divides the whole file by the
+/// frame stride and counts trailing/aborted frames the checkpoint would ignore.
+/// Over-counting is the safe direction for a skip decision — an over-estimate can
+/// only push the count past [`WAL_RECOVERY_THRESHOLD`] and force the (correct)
+/// fallback checkpoint; it can never cause an unsafe under-skip. We therefore do
+/// NOT parse salts/checksums to find the true commit boundary.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalFrameEstimate {
+    /// Header was valid and a frame count was computed (may over-count).
+    Frames(i64),
+    /// File missing/too short, bad magic, or an invalid page size — caller must
+    /// fall back to the checkpoint path.
+    Unreadable,
+}
+
+/// Estimate WAL frame count from `<db>-wal`. See [`WalFrameEstimate`].
+#[doc(hidden)]
+pub fn estimate_wal_frames(wal_path: &str) -> WalFrameEstimate {
+    use std::io::Read;
+
+    // 32-byte WAL header is mandatory; anything shorter has no valid frames.
+    let file_size = match std::fs::metadata(wal_path) {
+        Ok(meta) => meta.len(),
+        Err(_) => return WalFrameEstimate::Unreadable,
+    };
+    if file_size < 32 {
+        return WalFrameEstimate::Unreadable;
+    }
+
+    // Read ONLY the 32-byte header — never the whole multi-MB WAL (the entire
+    // point of this lever is to avoid paying startup I/O on a large WAL).
+    let mut header = [0u8; 32];
+    if std::fs::File::open(wal_path)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .is_err()
+    {
+        return WalFrameEstimate::Unreadable;
+    }
+
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != WAL_HEADER_MAGIC_0 && magic != WAL_HEADER_MAGIC_1 {
+        return WalFrameEstimate::Unreadable;
+    }
+
+    // page_size is a big-endian u32 at offset 8. SQLite encodes 65536 as the
+    // literal 1 in this field; normalize before the power-of-two sanity check.
+    let raw_page_size = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+    let page_size = if raw_page_size == 1 {
+        65_536u32
+    } else {
+        raw_page_size
+    };
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return WalFrameEstimate::Unreadable;
+    }
+
+    // frame stride = 24-byte frame header + one page; file_size >= 32 is
+    // guaranteed above so the subtraction never underflows and stride >= 536.
+    let frame_stride = u64::from(page_size) + 24;
+    let frames = (file_size - 32) / frame_stride;
+    WalFrameEstimate::Frames(i64::try_from(frames).unwrap_or(i64::MAX))
+}
+
 /// Check for and recover from unclean shutdown.
 ///
 /// Handles WAL/journal files left over from crashes by:
@@ -299,6 +412,35 @@ pub(crate) const WAL_RECOVERY_THRESHOLD: i64 = 10_000;
 /// - Database corruption is detected
 /// - WAL checkpoint fails
 pub fn check_and_recover_wal(backend: &dyn StorageBackend, db_path: &str) -> Result<()> {
+    check_and_recover_wal_inner(backend, db_path, skip_startup_wal_checkpoint_enabled())
+        .map(|_action| ())
+}
+
+/// The branch [`check_and_recover_wal_inner`] took, for deterministic test
+/// assertions. Filesystem inference is unreliable here: SQLite resets/removes the
+/// WAL on last-connection close and a PASSIVE checkpoint does not resize the file,
+/// so the branch outcome — not a file side-effect — is the honest observable.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalRecoveryAction {
+    /// Startup checkpoint was skipped (small healthy WAL + gate on).
+    SkippedCheckpoint,
+    /// PASSIVE checkpoint ran (WAL small/absent, or skip not eligible).
+    Checkpointed,
+    /// PASSIVE then TRUNCATE ran (WAL exceeded `WAL_RECOVERY_THRESHOLD`).
+    Truncated,
+}
+
+/// Inner WAL recovery with an explicit `skip_enabled` decision, so tests can
+/// exercise the skip/fallback branches without mutating process env (which is
+/// `unsafe` and therefore forbidden under `#![forbid(unsafe_code)]`). Returns the
+/// branch taken; the public [`check_and_recover_wal`] discards it.
+#[doc(hidden)]
+pub fn check_and_recover_wal_inner(
+    backend: &dyn StorageBackend,
+    db_path: &str,
+    skip_enabled: bool,
+) -> Result<WalRecoveryAction> {
     let wal_path = format!("{db_path}-wal");
     let journal_path = format!("{db_path}-journal");
 
@@ -327,6 +469,30 @@ pub fn check_and_recover_wal(backend: &dyn StorageBackend, db_path: &str) -> Res
         .into());
     }
 
+    // [ft-yjihu.1] Skip the startup PASSIVE checkpoint when the WAL is small and
+    // healthy. quick_check has already passed (corruption fail-closed above is
+    // unchanged). SQLite replays the WAL on open/read; the checkpoint here is
+    // compaction/maintenance, not a durability requirement. Fail-safe: ANY
+    // ambiguity (gate off, rollback journal present, WAL header unreadable /
+    // bad magic / bad page size, or estimate over threshold) falls through to
+    // the existing checkpoint path below.
+    if skip_enabled
+        && !journal_exists
+        && wal_exists
+        && matches!(
+            estimate_wal_frames(&wal_path),
+            WalFrameEstimate::Frames(frames) if frames <= WAL_RECOVERY_THRESHOLD
+        )
+    {
+        tracing::info!(
+            wal_path = %wal_path,
+            threshold = WAL_RECOVERY_THRESHOLD,
+            "Skipping startup WAL checkpoint (small healthy WAL; \
+             FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT)"
+        );
+        return Ok(WalRecoveryAction::SkippedCheckpoint);
+    }
+
     // Checkpoint WAL using PASSIVE mode (doesn't block readers)
     let checkpoint_row = backend
         .query_row_typed("PRAGMA wal_checkpoint(PASSIVE)", &[])
@@ -348,7 +514,9 @@ pub fn check_and_recover_wal(backend: &dyn StorageBackend, db_path: &str) -> Res
     }
 
     // If WAL is huge, do a full checkpoint to truncate it
+    let mut truncated = false;
     if wal_frames > WAL_RECOVERY_THRESHOLD {
+        truncated = true;
         tracing::warn!(
             frames = wal_frames,
             threshold = WAL_RECOVERY_THRESHOLD,
@@ -384,7 +552,11 @@ pub fn check_and_recover_wal(backend: &dyn StorageBackend, db_path: &str) -> Res
         tracing::info!("Database recovery complete");
     }
 
-    Ok(())
+    Ok(if truncated {
+        WalRecoveryAction::Truncated
+    } else {
+        WalRecoveryAction::Checkpointed
+    })
 }
 
 // =============================================================================
