@@ -267,7 +267,7 @@ pub mod explainability_console;
 pub mod explanations;
 pub mod export;
 pub mod extensions;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
@@ -326,7 +326,7 @@ pub mod input_reserve;
 pub mod instanced_cell;
 pub mod interval_tree;
 pub mod intervention_console;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod ipc;
 pub mod iterm2_osc1337;
 pub mod iterm2_osc_1337;

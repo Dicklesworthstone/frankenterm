@@ -1339,6 +1339,7 @@ macro_rules! select {
 pub use crate::select;
 
 /// Unix socket aliases/helpers for the active runtime.
+#[cfg(unix)]
 pub mod unix {
     use std::io;
     use std::path::Path;

@@ -5584,6 +5584,16 @@ mod dirs {
     pub fn home_dir() -> Option<std::path::PathBuf> {
         std::env::var("HOME").ok().map(std::path::PathBuf::from)
     }
+
+    /// Windows-only data-directory resolver for this `mod dirs` fallback (which
+    /// shadows the `dirs` crate within config.rs). Mirrors the dirs crate's
+    /// `%APPDATA%` (roaming) resolution. Only `default_data_dir`'s
+    /// `cfg(target_os = "windows")` arm calls it, so it is gated to Windows to
+    /// avoid dead code on Unix.
+    #[cfg(target_os = "windows")]
+    pub fn data_dir() -> Option<std::path::PathBuf> {
+        std::env::var("APPDATA").ok().map(std::path::PathBuf::from)
+    }
 }
 
 // =============================================================================

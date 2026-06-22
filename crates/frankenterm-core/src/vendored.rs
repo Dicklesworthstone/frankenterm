@@ -61,6 +61,55 @@ impl DirectMuxClient {
     }
 }
 
+// Windows / non-unix shim for PaneDelta. The real enum lives in the unix-only
+// mux_client submodule and is produced exclusively by the Unix-socket
+// subscription path, which is unavailable on Windows. The shim mirrors the
+// variant shape so crate::vendored-consuming code (e.g. tailer.rs) type-checks;
+// no value of this type is ever constructed on Windows.
+#[cfg(all(feature = "vendored", not(unix)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneDelta {
+    Output {
+        pane_id: u64,
+        seqno: u64,
+        delta_text: String,
+        title: String,
+        dirty_range_count: usize,
+        dirty_row_count: usize,
+    },
+    Gap {
+        pane_id: u64,
+        reason: String,
+    },
+    Ended {
+        pane_id: u64,
+        reason: String,
+    },
+}
+
+// Windows / non-unix shim for the mux_pool module. The real module (and its
+// MuxPool/MuxPoolError/etc.) is unix-only because it pools DirectMuxClient
+// connections over Unix domain sockets. Only MuxPoolStats is referenced by
+// platform-agnostic code (unified_telemetry::MuxPoolPayload), so the shim
+// re-creates just that type with identical fields/derives. PoolStats is the
+// real cross-platform type from crate::pool, keeping serialization identical.
+#[cfg(all(feature = "vendored", not(unix)))]
+pub mod mux_pool {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct MuxPoolStats {
+        pub pool: crate::pool::PoolStats,
+        pub connections_created: u64,
+        pub connections_failed: u64,
+        pub health_checks: u64,
+        pub health_check_failures: u64,
+        pub recovery_attempts: u64,
+        pub recovery_successes: u64,
+        pub permanent_failures: u64,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeztermVersion {
     pub raw: String,

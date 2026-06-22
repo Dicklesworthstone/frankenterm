@@ -30370,7 +30370,10 @@ async fn run_watcher(
     let _ = dangerous_bind_any;
 
     let config_path_buf = config_path.map(Path::to_path_buf);
-    let ipc_handle = if config.ipc.enabled {
+    let ipc_handle: Option<(
+        frankenterm_core::runtime_async::mpsc::Sender<()>,
+        frankenterm_core::runtime_async::task::JoinHandle<()>,
+    )> = if config.ipc.enabled {
         #[cfg(unix)]
         {
             let ipc_cx = frankenterm_core::cx::Cx::current()
@@ -42541,7 +42544,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             bookmark,
             bookmark_tag,
         }) => {
-            let watcher_status = {
+            let watcher_status: Result<Option<serde_json::Value>, String> = {
                 #[cfg(unix)]
                 {
                     let client = frankenterm_core::ipc::IpcClient::new(&layout.ipc_socket_path);
