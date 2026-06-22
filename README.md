@@ -1690,7 +1690,7 @@ See [`docs/audit-checklist.md`](docs/audit-checklist.md) for the per-substrate a
 
 ## Deep Dive: How the Scan Pipeline Works
 
-Every byte of pane output passes through a three-stage scan pipeline before reaching storage. The stages run in sequence on the same thread, avoiding cross-thread coordination overhead:
+This section documents the `scan_pipeline` component (`scan_pipeline.rs`). Note that the **live** capture-to-detection path does not run `ScanPipeline::process` per segment: production pattern matching is `PatternEngine::detect_with_context` (`patterns.rs`), driven per pane segment from `runtime.rs`, and cross-segment continuity is handled by a bounded tail re-scan (see [Cross-chunk subtlety](#cross-chunk-subtlety)), not the whole-buffer `trigger_data_buffer` re-scan described below. The pipeline runs three stages in sequence on the same thread, avoiding cross-thread coordination overhead:
 
 ```
 raw bytes ──► ScanPipeline::process()
@@ -1702,7 +1702,7 @@ raw bytes ──► ScanPipeline::process()
 
 **Stage 1 (Metrics)** counts newlines and ANSI escape byte density using a linear scan. The ANSI density metric is useful for detecting panes running TUI applications (high escape-sequence volume) vs plain text output.
 
-**Stage 2 (Pattern Trigger)** runs an Aho-Corasick automaton that matches all registered trigger patterns in a single pass over the buffer. An important subtlety: Aho-Corasick's LeftmostFirst non-overlapping mode is not composable across chunk boundaries, because earlier bytes consume match positions and prevent later patterns from matching. The chunked pipeline accumulates all data in a `trigger_data_buffer` and re-scans the full buffer at flush time for exact parity with batch mode.
+**Stage 2 (Pattern Trigger)** runs an Aho-Corasick automaton that matches all registered trigger patterns in a single pass over the buffer. An important subtlety: Aho-Corasick's LeftmostFirst non-overlapping mode is not composable across chunk boundaries, because earlier bytes consume match positions and prevent later patterns from matching. This `scan_pipeline` component handles it by accumulating all data in a `trigger_data_buffer` and re-scanning the full buffer at flush time. The live production engine handles the same problem differently and more cheaply — see [Cross-chunk subtlety](#cross-chunk-subtlety).
 
 **Stage 3 (Compression)** applies zstd to the raw bytes. For typical terminal output, compression ratios of 5:1 to 10:1 are common. Compression is skipped for buffers below a configurable threshold (default: 256 bytes) where the overhead exceeds the savings.
 
@@ -1827,7 +1827,7 @@ text chunk
 
 ### Cross-chunk subtlety
 
-Aho-Corasick's LeftmostFirst non-overlapping mode is **not composable across chunk boundaries**. Earlier bytes consume match positions, preventing later patterns from matching. The chunked pipeline solves this with a `trigger_data_buffer` that accumulates raw bytes and runs a definitive batch re-scan at flush time. This gives exact parity with batch mode at the cost of one extra in-memory copy of the unflushed window.
+Aho-Corasick's LeftmostFirst non-overlapping mode is **not composable across chunk boundaries**. Earlier bytes consume match positions, preventing later patterns from matching. The **live production engine** — `PatternEngine::detect_with_context` (`patterns.rs`), driven per pane segment from `runtime.rs` — solves this with a *bounded* tail re-scan: each new segment is prepended with `DetectionContext::tail_buffer` (capped at `PatternsTuning::DEFAULT_MAX_TAIL_SIZE_BYTES`, 2 KiB) and only that overlap is re-scanned, with the common no-match case rejected up front by the Bloom `quick_reject` before Aho-Corasick runs at all (segments are themselves capped at `IngestTuning::DEFAULT_MAX_PERSIST_SEGMENT_BYTES`, 64 KiB). The `scan_pipeline` component's whole-buffer `trigger_data_buffer` re-scan (described above) is a separate batch-mode path and is **not** on the live per-segment capture path; do not read it as the production cross-chunk engine.
 
 ### Rule pack composition
 
