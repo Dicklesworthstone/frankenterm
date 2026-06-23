@@ -35,7 +35,7 @@ jobs:
           - target: redactor_no_leak
             corpus: fuzz/redactor_no_leak/corpus
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: |
@@ -71,7 +71,7 @@ jobs:
           - target: redactor_no_leak
             corpus: fuzz/redactor_no_leak/corpus
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: |

@@ -25,7 +25,7 @@ jobs:
   stateright:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6.0.3
+      - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@nightly
       - name: Run Stateright model tests
         run: cargo test --manifest-path tests/robot_work_atomicity_model/Cargo.toml
