@@ -1474,7 +1474,9 @@ proptest! {
         let json = serde_json::to_string(&cfg).unwrap();
         let back: PatternsConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.packs.len(), cfg.packs.len());
-        prop_assert!(back.quick_reject_enabled);
+        // ft-ui1xn (round-9): production default is OFF (net-negative prefilter,
+        // byte-equivalent to disable); the serde roundtrip must preserve it.
+        prop_assert!(!back.quick_reject_enabled);
         prop_assert!(back.user_packs_enabled);
         prop_assert!(back.user_packs_dir.is_none());
     }

@@ -2189,7 +2189,17 @@ impl Default for PatternsConfig {
                 "builtin:wezterm".to_string(),
             ],
             pack_overrides: HashMap::new(),
-            quick_reject_enabled: true,
+            // ft-ui1xn (round-9): the Bloom `quick_reject` prefilter is net-negative on
+            // realistic no-match-dominant capture deltas — it does ~15 SipHash window-hashes/byte
+            // + 32 memchr sweeps to avoid one exact Aho-Corasick pass that is already built and
+            // does zero hashing. Round-9 B0-correction (ft-zhj63) attributes 22.76% of fleet
+            // detection self-time to it; the realistic `detect_with_context` A/B (cv≤5%, incl. the
+            // match-present case) measured ac_direct +35.67% faster, byte-equivalent (a Bloom
+            // filter has no false negatives, so disabling it never changes detection output). The
+            // production engine is built via `from_config_with_root`, so this is the production
+            // default. It remains a per-config opt-in lever for any future pack with thousands of
+            // anchors where the prefilter could pay for itself.
+            quick_reject_enabled: false,
             user_packs_enabled: true,
             user_packs_dir: None,
         }
@@ -9311,7 +9321,9 @@ mode = "periodic"
         let pc = PatternsConfig::default();
         assert_eq!(pc.packs.len(), 5);
         assert!(pc.packs.contains(&"builtin:core".to_string()));
-        assert!(pc.quick_reject_enabled);
+        // ft-ui1xn (round-9): production default flipped OFF — the Bloom prefilter
+        // is net-negative on realistic capture deltas (byte-equivalent to disable).
+        assert!(!pc.quick_reject_enabled);
         assert!(pc.user_packs_enabled);
         assert!(pc.user_packs_dir.is_none());
     }

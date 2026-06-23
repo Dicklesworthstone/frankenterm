@@ -4201,6 +4201,11 @@ impl PatternEngine {
         Self {
             library,
             index: OnceLock::new(),
+            // `new()` has zero production callers (production builds via
+            // `from_config_with_root`, whose default is OFF per ft-ui1xn round-9 —
+            // the prefilter is net-negative on realistic capture deltas). It is kept
+            // ON here only so the in-crate prefilter-algorithm tests that call
+            // `quick_reject(..)` directly continue to exercise the Bloom path.
             quick_reject_enabled: true,
             telemetry: PatternTelemetry::new(),
             agent_sharded_index: agent_sharded_index_enabled_from_env(),
