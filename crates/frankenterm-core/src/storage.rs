@@ -298,12 +298,15 @@ pub(crate) const WAL_RECOVERY_THRESHOLD: i64 = 10_000;
 const FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT_ENV: &str =
     "FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT";
 
-/// Default-OFF gate for [`check_and_recover_wal`]'s startup-checkpoint skip.
+/// Default-ON gate for [`check_and_recover_wal`]'s startup-checkpoint skip.
 ///
-/// Dedicated fn with its OWN `.unwrap_or(false)` so a future promotion to
-/// default-on is a one-line change — and so the shared [`storage_env_flag_enabled`]
-/// default stays untouched. Honors the `FT_MOONSHOT_ALL` master switch like the
-/// other storage moonshot gates.
+/// PROMOTED to default-on in round-9 (ft-yjihu.1): a deterministic startup-time
+/// A/B (`round9_wal_startup_time`) measured the skip path **+74% faster**
+/// (724 µs vs 2 789 µs, ~2.07 ms saved) on a small dirty WAL, with branch-identical
+/// (no-regression) behavior on the clean-start and over-threshold paths and
+/// durability proven by the `round8_wal_recovery` oracle. The env var is now an
+/// **opt-OUT**: set `FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT=0` to restore the
+/// legacy always-checkpoint behavior. Honors the `FT_MOONSHOT_ALL` master switch.
 fn skip_startup_wal_checkpoint_enabled() -> bool {
     if std::env::var("FT_MOONSHOT_ALL")
         .ok()
@@ -315,7 +318,7 @@ fn skip_startup_wal_checkpoint_enabled() -> bool {
     std::env::var(FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT_ENV)
         .ok()
         .map(|value| env_value_is_truthy(&value))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Test-only accessor for the WAL-checkpoint-skip gate, so a child test process

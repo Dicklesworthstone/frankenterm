@@ -1,5 +1,9 @@
 //! Round-8 keep-gate proof for `ft-yjihu.1` — skip the startup PASSIVE WAL
-//! checkpoint when the WAL is small and healthy (default-off env gate).
+//! checkpoint when the WAL is small and healthy. PROMOTED to default-ON in
+//! round-9 (the env gate is now an opt-OUT; see `round9_wal_startup_time` for the
+//! +74% startup-time A/B). The branch-equivalence cases below are unchanged; only
+//! the default-state child case (`t5_child_public_path_default_on_and_opt_out`)
+//! reflects the flipped default.
 //!
 //! Round-7 B0' profiling found `storage.wal_recovery_dirty` (storage.rs:1647,
 //! the `check_and_recover_wal` writer-open path) at 3.528% startup self-time on
@@ -364,21 +368,22 @@ fn run_child(gate_env: Option<&str>) -> (bool, String) {
 }
 
 #[test]
-fn t5_child_public_path_default_off_and_gate_on() {
-    // Default (no gate env): the public path must NOT skip.
+fn t5_child_public_path_default_on_and_opt_out() {
+    // ft-yjihu.1 round-9 promotion: the gate is now default-ON (opt-out). Default
+    // (no gate env): the public path must SKIP a small healthy WAL.
     let (gate_default, action_default) = run_child(None);
-    assert!(!gate_default, "unset {SKIP_GATE_ENV} must default the gate OFF");
-    assert_eq!(action_default, "checkpointed", "default-off must take the checkpoint path");
+    assert!(gate_default, "unset {SKIP_GATE_ENV} must default the gate ON (round-9 promotion)");
+    assert_eq!(action_default, "skipped", "default-on must skip a small healthy WAL");
 
-    // Gate on (=1): the real env -> gate -> decision wiring must skip a small WAL.
+    // Gate explicitly on (=1): the real env -> gate -> decision wiring must skip.
     let (gate_on, action_on) = run_child(Some("1"));
     assert!(gate_on, "{SKIP_GATE_ENV}=1 must enable the gate");
     assert_eq!(action_on, "skipped", "gate on must skip a small healthy WAL end-to-end");
 
-    // Falsey value disables.
+    // Falsey value is the opt-OUT: restores the legacy always-checkpoint path.
     let (gate_off, action_off) = run_child(Some("0"));
-    assert!(!gate_off, "{SKIP_GATE_ENV}=0 must keep the gate OFF");
-    assert_eq!(action_off, "checkpointed", "falsey gate value must take the checkpoint path");
+    assert!(!gate_off, "{SKIP_GATE_ENV}=0 must opt OUT (gate OFF)");
+    assert_eq!(action_off, "checkpointed", "opt-out value must take the checkpoint path");
 }
 
 // ---------------------------------------------------------------------------
