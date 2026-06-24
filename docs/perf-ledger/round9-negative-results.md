@@ -80,7 +80,8 @@ real per-delta frame is `patterns::detect_with_context`). **Deleted 4260 lines**
 `TriggerScanner` was **kept** (separate module; now test-only-referenced but harmless) to bound the blast
 radius. `cargo check -p frankenterm-core --all-targets` GREEN locally; round-6/7/9 harnesses +
 `proptest_patterns_metamorphic` + `fuzz_corpus_replay` all pass; RCH-remote cascade compile proof
-(`cargo check -p frankenterm-core --all-targets`) launched on `6f8089935` fail-closed.
+(`cargo check -p frankenterm-core --all-targets`) on `6f8089935`: **GREEN, `[RCH] hz2 (1325.1s)`
+fail-closed** — the deletion compiles cleanly across lib + all tests + all benches on a clean worker.
 
 **Retry-condition predicate:** not applicable — the gain is structural (dead-code removal), not numerical.
 
