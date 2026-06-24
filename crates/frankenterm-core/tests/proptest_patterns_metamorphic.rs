@@ -34,7 +34,6 @@ use frankenterm_core::pattern_trigger::TriggerScanner;
 use frankenterm_core::patterns::{
     AgentType, Detection, PatternEngine, PatternPack, RuleDef, Severity,
 };
-use frankenterm_core::scan_pipeline::{ChunkedPipelineState, ScanPipeline, ScanPipelineConfig};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -282,18 +281,10 @@ fn append_monotonicity_on_known_usage_limit_anchor() {
 // The MRs above target the high-level `PatternEngine::detect` surface.
 // The block below covers the layers beneath:
 //
-//   * `TriggerScanner` (used by `scan_pipeline` for byte-level Aho-Corasick
-//     matching): adds the byte-level append-monotonicity MR that the
-//     existing string-level `arb_safe_suffix` does not exercise.
-//
-//   * `ScanPipeline::process` vs `process_chunk + flush`: the chunked API
-//     is what the live capture pipeline actually runs in production; the
-//     batch API is what most tests exercise. A drift between them is the
-//     classic source of "it works in unit tests but breaks in prod" bugs
-//     and has bitten this module before (memory: Aho-Corasick LeftmostFirst
-//     non-overlapping matching is context-dependent across chunk boundaries
-//     — flush() does a batch rescan to close that gap, so the MR pins
-//     that rescan as load-bearing).
+//   * `TriggerScanner` byte-level Aho-Corasick matching: adds the byte-level
+//     append-monotonicity MR that the existing string-level `arb_safe_suffix`
+//     does not exercise. (round-9: the `scan_pipeline` module that used this
+//     scanner was deleted; the byte-level MR is retained as the coverage.)
 //
 //   * `PatternEngine::detect` under rule permutation: reordering rules
 //     whose anchors don't overlap must be a no-op, because Aho-Corasick
@@ -329,51 +320,6 @@ fn split_points(len: usize) -> BoxedStrategy<Vec<usize>> {
             v
         })
         .boxed()
-}
-
-fn slice_at_splits<'a>(bytes: &'a [u8], splits: &[usize]) -> Vec<&'a [u8]> {
-    let mut chunks = Vec::with_capacity(splits.len() + 1);
-    let mut prev = 0usize;
-    for &cut in splits {
-        chunks.push(&bytes[prev..cut]);
-        prev = cut;
-    }
-    chunks.push(&bytes[prev..]);
-    chunks
-}
-
-fn chunked_trigger_counts(
-    pipeline: &ScanPipeline,
-    bytes: &[u8],
-    chunks: &[&[u8]],
-) -> frankenterm_core::pattern_trigger::TriggerCategoryCounts {
-    // ft-cke6c: ScanPipeline now exposes TriggerCategoryCounts (a packed
-    // `[u64; N]` per-category struct) instead of HashMap<TriggerCategory, u64>.
-    // The helper signature follows suit; call sites compare TriggerCategoryCounts
-    // directly (PartialEq + Eq derived) and iterate via `.iter()` /
-    // `.iter_nonzero()` instead of `&hashmap`.
-
-    // Sanity on helper input. The test body only constructs chunk slices
-    // via `slice_at_splits`, but this debug-only check catches future
-    // refactors that might break the concat invariant.
-    debug_assert_eq!(
-        chunks
-            .iter()
-            .flat_map(|c| c.iter().copied())
-            .collect::<Vec<u8>>(),
-        bytes,
-    );
-
-    // max_buffer_bytes set to usize::MAX so `should_flush()` never fires
-    // mid-stream — the MR tests the "within one buffer" equivalence.
-    // Cross-flush behavior (where state.reset() drops the trigger
-    // overlap) is a separate property worth covering later.
-    let mut state = ChunkedPipelineState::new(usize::MAX);
-    for chunk in chunks {
-        let _ = pipeline.process_chunk(chunk, &mut state);
-    }
-    let flushed = pipeline.flush(&mut state);
-    flushed.triggers.map(|t| t.counts).unwrap_or_default()
 }
 
 /// Pairwise-disjoint anchors: no anchor is a substring of another and
@@ -497,105 +443,9 @@ proptest! {
     }
 }
 
-// ── ScanPipeline MR: chunked vs batch trigger equivalence ─────────────
-
-proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 256,
-        ..ProptestConfig::default()
-    })]
-
-    /// Chunked `process_chunk` + `flush` must yield the same per-category
-    /// trigger counts as a single `process(bytes)` on the concatenation,
-    /// for both compression modes. The chunked path runs an approximate
-    /// incremental scan during chunks and a DEFINITIVE batch rescan at
-    /// flush() — this MR pins that rescan as the correctness anchor.
-    /// If the flush rescan regresses (e.g. someone replaces the
-    /// accumulated-buffer scan with a per-chunk-sum), this MR fails
-    /// on any input where Aho-Corasick's LeftmostFirst behaviour
-    /// differs between chunked and batch scanning.
-    #[test]
-    fn mr_chunked_equals_batch_compression_on(
-        bytes in any_text_bytes(4096),
-        splits in prop::collection::vec(0usize..4096, 0..8),
-    ) {
-        // Defensively keep only in-range splits and normalize.
-        let mut splits: Vec<usize> =
-            splits.into_iter().filter(|s| *s > 0 && *s < bytes.len()).collect();
-        splits.sort_unstable();
-        splits.dedup();
-
-        let pipeline = ScanPipeline::new(ScanPipelineConfig {
-            enable_triggers: true,
-            enable_compression: true,
-            ..ScanPipelineConfig::default()
-        });
-
-        let batch_counts = pipeline
-            .process(&bytes)
-            .triggers
-            .map(|t| t.counts)
-            .unwrap_or_default();
-
-        let chunks = slice_at_splits(&bytes, &splits);
-        let chunked_counts = chunked_trigger_counts(&pipeline, &bytes, &chunks);
-
-        prop_assert_eq!(
-            &batch_counts,
-            &chunked_counts,
-            "MR chunk-vs-batch (compression=on) violated: \
-             batch {:?} != chunked {:?}, \
-             bytes_len={}, n_chunks={}",
-            batch_counts,
-            chunked_counts,
-            bytes.len(),
-            chunks.len(),
-        );
-    }
-
-    /// Same MR for the `enable_compression = false` code path, which
-    /// uses `trigger_data_buffer` (as opposed to `uncompressed_buffer`)
-    /// to accumulate bytes for the flush-time rescan. These are two
-    /// structurally separate accumulators and both must agree with
-    /// the batch result.
-    #[test]
-    fn mr_chunked_equals_batch_compression_off(
-        bytes in any_text_bytes(4096),
-        splits in prop::collection::vec(0usize..4096, 0..8),
-    ) {
-        let mut splits: Vec<usize> =
-            splits.into_iter().filter(|s| *s > 0 && *s < bytes.len()).collect();
-        splits.sort_unstable();
-        splits.dedup();
-
-        let pipeline = ScanPipeline::new(ScanPipelineConfig {
-            enable_triggers: true,
-            enable_compression: false,
-            ..ScanPipelineConfig::default()
-        });
-
-        let batch_counts = pipeline
-            .process(&bytes)
-            .triggers
-            .map(|t| t.counts)
-            .unwrap_or_default();
-
-        let chunks = slice_at_splits(&bytes, &splits);
-        let chunked_counts = chunked_trigger_counts(&pipeline, &bytes, &chunks);
-
-        prop_assert_eq!(
-            &batch_counts,
-            &chunked_counts,
-            "MR chunk-vs-batch (compression=off) violated: \
-             batch {:?} != chunked {:?}, \
-             bytes_len={}, n_chunks={}",
-            batch_counts,
-            chunked_counts,
-            bytes.len(),
-            chunks.len(),
-        );
-    }
-}
+// ── ScanPipeline MR removed in round-9 (scan_pipeline module deleted; the
+//    TriggerScanner append-benign MR above still covers the byte-level
+//    Aho-Corasick path the deleted pipeline used).
 
 // ── PatternEngine MR: rule reordering invariance (disjoint anchors) ──
 

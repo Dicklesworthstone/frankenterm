@@ -562,7 +562,6 @@ pub mod runtime_proof;
 pub mod runtime_slo_gates;
 pub mod runtime_telemetry;
 pub mod safe_channel;
-pub mod scan_pipeline;
 pub mod scope_tree;
 pub mod scope_watchdog;
 pub mod screen_state;

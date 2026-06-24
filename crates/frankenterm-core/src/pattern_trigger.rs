@@ -508,8 +508,7 @@ fn build_trigger_automaton(patterns: &[String], case_insensitive: bool) -> Optio
 
 /// br-ft-djjnj: default cap on the maximum byte length of a single
 /// custom trigger pattern. Patterns longer than this are rejected by
-/// [`TriggerScanner::try_new`] / [`ScanPipeline::try_with_custom_triggers`]
-/// because the chunked pipeline retains a per-stream overlap window
+/// [`TriggerScanner::try_new`] because a chunked scan retains a per-stream overlap window
 /// of `max_pattern_len - 1` bytes per chunk to recover cross-boundary
 /// matches. A 64KiB cap keeps the worst-case retained overlap below
 /// 64 KiB even for hostile operator/plugin trigger sets, which is

@@ -22,8 +22,11 @@ use std::time::{Duration, Instant};
 use frankenterm_core::bocpd::{BocpdConfig, BocpdManager};
 use frankenterm_core::events::{Event, EventBus};
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
+// round-9: the dead `scan_pipeline` module was deleted; the `scan_pipeline.process`
+// denominator frame is rewired to the LIVE `patterns::detect_with_context`
+// (runtime.rs:3748). Corrected B0: round9_profile_realistic_workloads.rs.
+use frankenterm_core::patterns::{DetectionContext, PatternEngine};
 use frankenterm_core::redactor::Redactor;
-use frankenterm_core::scan_pipeline::{ScanPipeline, ScanPipelineConfig};
 use frankenterm_core::storage::check_and_recover_wal;
 use frankenterm_core::storage_backend_trait::RusqliteBackend;
 use rusqlite::{params, Connection};
@@ -201,11 +204,13 @@ fn measure_wal_cases(mut make_case: impl FnMut(usize) -> WalCase) -> (u64, u128,
 }
 
 fn run_profile() -> (Vec<Frame>, u64) {
-    let pipeline = ScanPipeline::new(ScanPipelineConfig::default());
-    let mixed = mixed_terminal_frame();
+    let engine = PatternEngine::new();
+    let _ = engine.detect("warmup");
+    let mixed = String::from_utf8_lossy(&mixed_terminal_frame()).into_owned();
+    let mut sctx = DetectionContext::new();
     let (scan_calls, scan_ns) = measure(
         || {
-            black_box(pipeline.process(black_box(&mixed)));
+            black_box(engine.detect_with_context(black_box(&mixed), &mut sctx));
         },
         WARMUP,
         ITERS,
@@ -265,14 +270,14 @@ fn run_profile() -> (Vec<Frame>, u64) {
 
     let frames = vec![
         Frame {
-            name: "scan_pipeline.process",
-            location: "scan_pipeline.rs:528",
-            workload: "round6 denominator: capture scan",
+            name: "patterns.detect_with_context",
+            location: "patterns.rs:4436 (runtime.rs:3748)",
+            workload: "per-capture-delta detection (real per-delta frame)",
             candidate: false,
             calls_measured: scan_calls,
             total_nanos: scan_ns,
             calls_per_min: capture_per_min,
-            notes: "denominator",
+            notes: "denominator (rewired from deleted scan_pipeline.process)",
         },
         Frame {
             name: "redactor.redact",

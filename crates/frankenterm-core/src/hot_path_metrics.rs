@@ -2,7 +2,7 @@
 //!
 //! The performance pillar's MT8 keep-gate requires that any kept perf win name a
 //! specific profile frame with >=0.1% self-time. The hot loops — `extract_delta`,
-//! `ScanPipeline::process`, `Redactor::redact` — previously had only coarse
+//! `Redactor::redact` — previously had only coarse
 //! cumulative call-counts (`PatternTelemetry`, `IngestTelemetry`), never per-frame
 //! self-time, so MT8 attribution was impossible and no `.bench-history` baseline
 //! could be captured meaningfully.

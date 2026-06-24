@@ -215,11 +215,10 @@ fn bench_throughput(c: &mut Criterion) {
 /// FINDING (the load-bearing reason B1 does not proceed to implementation):
 /// the flagship target named in the round-6 marching orders —
 /// `scan_pipeline::ChunkedPipelineState::flush` re-scanning the accumulated
-/// `trigger_data_buffer` (README §"Cross-chunk subtlety", lines 1828-1830) —
-/// is **dead code**. `ScanPipeline` / `ChunkedPipelineState` /
-/// `TriggerScanner` have ZERO production callers repo-wide (only tests +
-/// benches reference them), so that whole-window re-scan has 0% self-time on
-/// any realistic workload and cannot clear the >=0.5% profile-first gate.
+/// `trigger_data_buffer` (README §"Cross-chunk subtlety") — was **dead code**
+/// (ZERO production callers repo-wide), and the whole `scan_pipeline` module was
+/// DELETED in round-9. That whole-window re-scan never had non-test self-time
+/// and could not clear the >=0.5% profile-first gate.
 ///
 /// The *real* production cross-chunk detection path is
 /// [`PatternEngine::detect_with_context`] (driven per pane segment from

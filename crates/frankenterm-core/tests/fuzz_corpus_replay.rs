@@ -42,28 +42,6 @@ fn read_seeds(target: &str) -> Vec<(String, Vec<u8>)> {
     seeds
 }
 
-// ── scan_pipeline_quick ──────────────────────────────────────────────────
-
-#[test]
-fn replay_scan_pipeline_quick() {
-    use frankenterm_core::scan_pipeline::quick_scan;
-
-    let seeds = read_seeds("scan_pipeline_quick");
-    assert!(!seeds.is_empty(), "no corpus seeds found");
-
-    for (name, data) in &seeds {
-        if data.len() > 128_000 {
-            continue;
-        }
-        let output = quick_scan(data);
-        assert_eq!(
-            output.input_bytes,
-            data.len() as u64,
-            "seed {name}: input_bytes mismatch"
-        );
-    }
-}
-
 // ── config_toml_parser ───────────────────────────────────────────────────
 
 #[test]

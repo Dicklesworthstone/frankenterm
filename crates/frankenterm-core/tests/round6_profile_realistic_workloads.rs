@@ -15,9 +15,9 @@
 //! | Workload            | Frame(s) exercised                                  |
 //! |---------------------|-----------------------------------------------------|
 //! | high-pane capture   | `ingest::extract_delta`                             |
-//! | ANSI-dense render   | `ScanPipeline::process` (ANSI-saturated stress)     |
+//! | per-delta detection | `patterns::detect_with_context` (ANSI/trigger stress) |
 //! | deep-scroll         | `TieredScrollback::locate_offset` + `::warm_line`   |
-//! | search-heavy        | `ScanPipeline::process` + `Redactor::redact`        |
+//! | search-heavy        | `patterns::detect_with_context` + `Redactor::redact` |
 //!
 //! ## Method (honest self-time, not a flamegraph artifact)
 //!
@@ -60,9 +60,14 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+// round-9: the dead `scan_pipeline` module was deleted; its `scan_pipeline.process`
+// per-delta frame is rewired here to the LIVE per-capture-delta production frame
+// `patterns::detect_with_context` (runtime.rs:3748). The corrected B0 is
+// `round9_profile_realistic_workloads.rs`; this historical harness keeps measuring
+// the real frame so it still compiles and ranks a live target.
 use frankenterm_core::ingest::extract_delta;
+use frankenterm_core::patterns::{DetectionContext, PatternEngine};
 use frankenterm_core::redactor::Redactor;
-use frankenterm_core::scan_pipeline::{ScanPipeline, ScanPipelineConfig};
 use frankenterm_core::scrollback_tiers::{
     ScrollbackConfig, ScrollbackLocationHint, TieredScrollback,
 };
@@ -254,22 +259,30 @@ fn run_profile() -> (Vec<Frame>, f64, f64) {
         ITERS,
     );
 
-    // scan — representative mixed terminal output (the realistic per-delta mix)
-    let pipeline = ScanPipeline::new(ScanPipelineConfig::default());
-    let mixed = mixed_terminal_frame();
+    // per-delta detection — the REAL per-capture-delta production frame
+    // (round-9: rewired from the deleted ScanPipeline::process to
+    // detect_with_context, runtime.rs:3748).
+    let engine = PatternEngine::new();
+    let _ = engine.detect("warmup");
+    let mixed = String::from_utf8_lossy(&mixed_terminal_frame()).into_owned();
+    let mut sctx = DetectionContext::new();
     let (s_calls, s_ns) = measure(
         || {
-            black_box(pipeline.process(black_box(&mixed)));
+            black_box(engine.detect_with_context(black_box(&mixed), &mut sctx));
         },
         WARMUP,
         ITERS,
     );
 
-    // scan stress — ANSI-saturated and trigger-saturated (informational only)
-    let ansi = ansi_saturated_frame();
-    let (_, ansi_ns) = measure(|| { black_box(pipeline.process(black_box(&ansi))); }, WARMUP, ITERS);
-    let triggers = trigger_saturated_frame();
-    let (_, trig_ns) = measure(|| { black_box(pipeline.process(black_box(&triggers))); }, WARMUP, ITERS);
+    // detection stress — ANSI-saturated and trigger-saturated (informational only)
+    let ansi = String::from_utf8_lossy(&ansi_saturated_frame()).into_owned();
+    let mut actx = DetectionContext::new();
+    let (_, ansi_ns) =
+        measure(|| { black_box(engine.detect_with_context(black_box(&ansi), &mut actx)); }, WARMUP, ITERS);
+    let triggers = String::from_utf8_lossy(&trigger_saturated_frame()).into_owned();
+    let mut tctx = DetectionContext::new();
+    let (_, trig_ns) =
+        measure(|| { black_box(engine.detect_with_context(black_box(&triggers), &mut tctx)); }, WARMUP, ITERS);
     let ansi_mean = ansi_ns as f64 / ITERS as f64;
     let trig_mean = trig_ns as f64 / ITERS as f64;
 
@@ -325,12 +338,12 @@ fn run_profile() -> (Vec<Frame>, f64, f64) {
             calls_per_min: cap_per_min,
         },
         Frame {
-            name: "scan_pipeline.process",
-            location: "scan_pipeline.rs:528",
-            workload: "ANSI-dense render + search-heavy",
+            name: "patterns.detect_with_context",
+            location: "patterns.rs:4436 (runtime.rs:3748)",
+            workload: "per-capture-delta detection (the real per-delta frame)",
             calls_measured: s_calls,
             total_nanos: s_ns,
-            calls_per_min: cap_per_min, // every captured delta is scanned
+            calls_per_min: cap_per_min, // every captured delta runs detection
         },
         Frame {
             name: "redactor.redact",
