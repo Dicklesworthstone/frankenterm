@@ -30,6 +30,7 @@ members = [
     "crates/ft-perf-gate",
     "crates/ft-test-log",
     "lints/cx_propagation",
+    "lints/cache_gpu_handle",
     "crates/frankenterm-core-test-macros",
     "fuzz",
     # FrankenTerm crates (ex-WezTerm, owned in-tree)

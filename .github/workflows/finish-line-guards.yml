@@ -140,6 +140,19 @@ jobs:
         run: |
           cargo run -q --release -p cx_propagation_lint -- crates/frankenterm-core/src
 
+      # cache-gpu-handle lint: forbid any PROCESS-GLOBAL cache from
+      # transitively owning a GPU-resource handle (Sprite / CachedGlyph /
+      # Texture2d / WebGpuTexture / wgpu::Texture/TextureView). Makes the
+      # glyph-run-interner atlas-pinning leak class (691 MB IOSurface
+      # observed; fixed by caching ShapedInfoTemplate with no Rc<CachedGlyph>)
+      # UNREPRESENTABLE: the syn-AST type-graph BFS fails the lane the moment
+      # any thread_local!/static/lazy_static/LazyLock/OnceLock root can reach
+      # a forbidden GPU leaf. Exit 0 = clean (currently 0 findings).
+      - name: Run cache-gpu-handle lint
+        run: |
+          cargo run -q --release -p cache_gpu_handle_lint -- \
+            crates/frankenterm-gui/src frankenterm/window/src
+
       - name: Upload ft-e87u6.4 hedge alignment artifact bundle
         if: always()
         uses: actions/upload-artifact@v7.0.1

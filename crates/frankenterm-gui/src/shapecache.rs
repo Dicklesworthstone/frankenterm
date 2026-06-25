@@ -97,6 +97,17 @@ impl ShapedRunInterner {
         run: &[ShapedInfo],
     ) {
         if self.entries >= SHAPED_RUN_INTERNER_MAX_ENTRIES {
+            // Bounded reclamation — the "no silent unbounded growth" discipline.
+            // The interner hard-caps at MAX_ENTRIES and bulk-reclaims; this rare
+            // (cap-only, never per-frame) counter makes that reclamation
+            // observable in `ft`'s stats. A spike means the shaping cache is
+            // thrashing and the cap may want tuning. NB: post the atlas-pinning
+            // fix, an entry is tiny template data (positions/keys) and NEVER a GPU
+            // texture, so a clear is cheap and frees no GPU memory — which is why a
+            // heavyweight runtime surface/texture pool here would be pure overhead
+            // (the leak-freedom guarantee is provided statically by the
+            // `cache_gpu_handle` lint + the reclamation behavior-proof test).
+            metrics::counter!("gui.shaped_run_interner.clear_evictions").increment(1);
             self.runs.clear();
             self.entries = 0;
         }
@@ -605,6 +616,50 @@ mod test {
                 "lookup must re-attach the CURRENT glyph at index {idx}, not a stale one"
             );
         }
+    }
+
+    /// Behavior proof (the extreme-software-optimization "prove the behavior"
+    /// discipline): drive many shape+intern cycles across SIMULATED atlas
+    /// recreations and prove the interner reclaims EVERY prior generation's
+    /// glyphs. Each generation uses fresh `Rc<CachedGlyph>` (exactly what a real
+    /// atlas recreation produces) and then drops them; if the interner pinned any
+    /// of them (the leak), that generation's ~49 MB atlas texture could never be
+    /// reclaimed. With the lifetime-decoupled interner, zero past-generation
+    /// glyphs survive — so atlas residency stays flat instead of the observed
+    /// ~691 MB / ~14-generation growth.
+    #[test]
+    fn churn_across_atlas_recreations_reclaims_every_old_generation() {
+        use std::rc::Weak;
+
+        let mut interner = ShapedRunInterner::default();
+        let mut weaks: Vec<Weak<CachedGlyph>> = Vec::new();
+        const GENERATIONS: u32 = 64;
+
+        for generation in 0..GENERATIONS {
+            let (infos, glyphs, run) = fake_shaped_run(generation + 1);
+            for glyph in &glyphs {
+                weaks.push(Rc::downgrade(glyph));
+            }
+            let key = shaped_run_key(&infos, &glyphs);
+            interner.insert(key, &infos, &glyphs, &run);
+            // End of generation: the atlas is "recreated", so this generation's
+            // glyphs are dropped by their owner (the GlyphCache). The interner
+            // must NOT keep any of them alive.
+            drop(run);
+            drop(glyphs);
+        }
+
+        let still_pinned = weaks.iter().filter(|w| w.strong_count() > 0).count();
+        assert_eq!(
+            still_pinned, 0,
+            "{still_pinned} glyphs from past atlas generations are still alive — the \
+             interner is pinning old atlas textures (the GPU-memory leak). Must be 0: \
+             the shaping cache must never own a GPU resource."
+        );
+        assert!(
+            interner.entries <= SHAPED_RUN_INTERNER_MAX_ENTRIES,
+            "interner entry count must stay bounded across churn"
+        );
     }
 
     #[test]
