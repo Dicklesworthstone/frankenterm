@@ -384,11 +384,52 @@ fn path_last_is(path: &syn::Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True only when an item is compiled *exclusively* under `#[cfg(test)]`.
+/// The previous `tokens.to_string().contains("test")` was a correctness bug:
+/// it also matched `#[cfg(not(test))]` (production-only code), `#[cfg(any(test,
+/// feature="x"))]` (built in prod under feature x) and `#[cfg(feature=
+/// "test-helpers")]`. We parse the predicate and decide test-only precisely.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
-        a.path().is_ident("cfg")
-            && matches!(&a.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test"))
+        if !a.path().is_ident("cfg") {
+            return false;
+        }
+        match &a.meta {
+            syn::Meta::List(list) => syn::parse2::<syn::Meta>(list.tokens.clone())
+                .map(|pred| cfg_is_test_only(&pred))
+                .unwrap_or(false),
+            _ => false,
+        }
     })
+}
+
+/// Does this cfg predicate compile the item *only* when `test` is set?
+/// bare `test` → yes; `all(..)` → yes if any conjunct forces test; `any(..)` →
+/// yes only if every branch forces test; `not(..)` / `feature = ".."` → no.
+fn cfg_is_test_only(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(p) => p.is_ident("test"),
+        syn::Meta::List(list) => {
+            let ident = list
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let inner: Vec<syn::Meta> = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .map(|p| p.into_iter().collect())
+                .unwrap_or_default();
+            match ident.as_str() {
+                "all" => inner.iter().any(cfg_is_test_only),
+                "any" => !inner.is_empty() && inner.iter().all(cfg_is_test_only),
+                _ => false,
+            }
+        }
+        syn::Meta::NameValue(_) => false,
+    }
 }
 
 #[allow(dead_code)]

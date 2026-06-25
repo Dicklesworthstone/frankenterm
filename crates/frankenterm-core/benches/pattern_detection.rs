@@ -328,7 +328,7 @@ fn bench_b1_cross_chunk_rescan(c: &mut Criterion) {
 /// negatives, so `quick_reject` never rejects a text the AC matcher would match;
 /// disabling it only runs the exact matcher on more inputs → identical output.
 /// Arms (one run, compare IDs):
-///   - `quick_reject_on` — current default (Bloom prefilter then AC)
+///   - `quick_reject_on` — Bloom prefilter then AC (the pre-9137b11ab default)
 ///   - `ac_direct`       — `quick_reject` disabled (AC matcher only)
 fn bench_quick_reject_vs_ac_direct(c: &mut Criterion) {
     let on = PatternEngine::new();

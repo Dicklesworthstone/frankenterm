@@ -379,7 +379,7 @@ impl AbResult {
 }
 
 fn run_ab(corpus: &[(String, bool)]) -> AbResult {
-    let on = PatternEngine::new(); // production default: quick_reject ON
+    let on = PatternEngine::new(); // test-only ctor keeps quick_reject ON (prod default is now OFF)
     let _ = on.detect("warmup");
     let mut off = PatternEngine::new();
     off.set_quick_reject_enabled(false);
@@ -460,7 +460,7 @@ fn run_profile(detect_mean_ns: f64) -> (Vec<Frame>, u64) {
     let frames = vec![
         Frame {
             name: "patterns.detect_with_context",
-            location: "patterns.rs:4436 (runtime.rs:3748)",
+            location: "patterns.rs:4441 (runtime.rs:3748)",
             workload: "per-capture-delta detection (realistic corpus, quick_reject ON)",
             candidate: true,
             calls_measured: ITERS as u64,

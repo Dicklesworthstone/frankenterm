@@ -385,12 +385,14 @@ impl<'a, 'ast> Visit<'ast> for FileVisitor<'a> {
     }
 
     fn visit_item(&mut self, node: &'ast Item) {
-        // Skip `#[cfg(test)] mod tests { ... }` — the lint only enforces
-        // production code paths (mirrors cx_propagation).
-        if let Item::Mod(m) = node {
-            if has_cfg_test(&m.attrs) {
-                return;
-            }
+        // Skip test-only code — the lint only enforces production code paths.
+        // Covers both `#[cfg(test)] mod tests { ... }` and a top-level
+        // `#[cfg(test)]`/`#[test]` fn whose body declares a `thread_local!`/
+        // `static` (which would otherwise be flagged as a false positive).
+        match node {
+            Item::Mod(m) if has_cfg_test(&m.attrs) => return,
+            Item::Fn(f) if has_cfg_test(&f.attrs) || has_test_attr(&f.attrs) => return,
+            _ => {}
         }
         syn::visit::visit_item(self, node);
     }
@@ -578,32 +580,7 @@ fn collect_field_idents(fields: &Fields, out: &mut BTreeSet<String>) {
 /// idents as graph edges.
 fn collect_type_idents(ty: &Type, out: &mut BTreeSet<String>) {
     match ty {
-        Type::Path(p) => {
-            for seg in &p.path.segments {
-                out.insert(seg.ident.to_string());
-                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                    for arg in &args.args {
-                        match arg {
-                            syn::GenericArgument::Type(inner) => {
-                                collect_type_idents(inner, out);
-                            }
-                            syn::GenericArgument::AssocType(assoc) => {
-                                collect_type_idents(&assoc.ty, out);
-                            }
-                            _ => {}
-                        }
-                    }
-                } else if let syn::PathArguments::Parenthesized(p) = &seg.arguments {
-                    // Fn(Args) -> Ret
-                    for input in &p.inputs {
-                        collect_type_idents(input, out);
-                    }
-                    if let syn::ReturnType::Type(_, rty) = &p.output {
-                        collect_type_idents(rty, out);
-                    }
-                }
-            }
-        }
+        Type::Path(p) => collect_path_idents(&p.path, out),
         Type::Reference(r) => collect_type_idents(&r.elem, out),
         Type::Ptr(p) => collect_type_idents(&p.elem, out),
         Type::Slice(s) => collect_type_idents(&s.elem, out),
@@ -616,31 +593,21 @@ fn collect_type_idents(ty: &Type, out: &mut BTreeSet<String>) {
         Type::Group(g) => collect_type_idents(&g.elem, out),
         Type::Paren(p) => collect_type_idents(&p.elem, out),
         Type::TraitObject(to) => {
-            // `dyn Texture2d` — the trait name is the leaf ident.
+            // `dyn Texture2d` — the trait name is a leaf ident, and a forbidden
+            // leaf can also hide in the trait's generic / associated-type args
+            // (`dyn Iterator<Item = Sprite>`), so descend through the whole path.
             for bound in &to.bounds {
                 if let syn::TypeParamBound::Trait(tb) = bound {
-                    if let Some(seg) = tb.path.segments.last() {
-                        out.insert(seg.ident.to_string());
-                    }
-                    // also descend into trait generic args
-                    for seg in &tb.path.segments {
-                        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-                            for arg in &args.args {
-                                if let syn::GenericArgument::Type(inner) = arg {
-                                    collect_type_idents(inner, out);
-                                }
-                            }
-                        }
-                    }
+                    collect_path_idents(&tb.path, out);
                 }
             }
         }
         Type::ImplTrait(it) => {
+            // `impl Iterator<Item = Sprite>` — identical treatment to `dyn Trait`;
+            // the previous code dropped the generic args entirely (false negative).
             for bound in &it.bounds {
                 if let syn::TypeParamBound::Trait(tb) = bound {
-                    if let Some(seg) = tb.path.segments.last() {
-                        out.insert(seg.ident.to_string());
-                    }
+                    collect_path_idents(&tb.path, out);
                 }
             }
         }
@@ -653,6 +620,40 @@ fn collect_type_idents(ty: &Type, out: &mut BTreeSet<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Collect every type-name ident reachable from a `syn::Path`: the segment
+/// idents plus everything inside angle-bracketed generic args — both
+/// `GenericArgument::Type` and associated-type bindings (`Iterator<Item = T>`) —
+/// and parenthesized `Fn(Args) -> Ret` args. Shared by the `Type::Path`,
+/// `dyn Trait`, and `impl Trait` arms so a forbidden leaf cannot hide behind any
+/// of them (the `dyn`/`impl` arms previously dropped assoc-type / generic args).
+fn collect_path_idents(path: &syn::Path, out: &mut BTreeSet<String>) {
+    for seg in &path.segments {
+        out.insert(seg.ident.to_string());
+        match &seg.arguments {
+            syn::PathArguments::AngleBracketed(args) => {
+                for arg in &args.args {
+                    match arg {
+                        syn::GenericArgument::Type(inner) => collect_type_idents(inner, out),
+                        syn::GenericArgument::AssocType(assoc) => {
+                            collect_type_idents(&assoc.ty, out)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            syn::PathArguments::Parenthesized(p) => {
+                for input in &p.inputs {
+                    collect_type_idents(input, out);
+                }
+                if let syn::ReturnType::Type(_, rty) = &p.output {
+                    collect_type_idents(rty, out);
+                }
+            }
+            syn::PathArguments::None => {}
+        }
     }
 }
 
@@ -670,10 +671,67 @@ fn render_type(ty: &Type) -> String {
     s
 }
 
+/// True only when an item is compiled *exclusively* under `#[cfg(test)]` and so
+/// can be skipped. The previous `tokens.to_string().contains("test")` was a
+/// correctness bug: it also matched `#[cfg(not(test))]` (production-only code —
+/// the exact thing the lint must scan), `#[cfg(any(feature="x", test))]` (built
+/// in prod under feature x), and `#[cfg(feature="test-helpers")]`. We parse the
+/// predicate and decide test-only precisely.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
-        a.path().is_ident("cfg")
-            && matches!(&a.meta, syn::Meta::List(list) if list.tokens.to_string().contains("test"))
+        if !a.path().is_ident("cfg") {
+            return false;
+        }
+        match &a.meta {
+            syn::Meta::List(list) => syn::parse2::<syn::Meta>(list.tokens.clone())
+                .map(|pred| cfg_is_test_only(&pred))
+                .unwrap_or(false),
+            _ => false,
+        }
+    })
+}
+
+/// Does this cfg predicate compile the item *only* when `test` is set?
+/// - bare `test`                      → yes
+/// - `all(..)`                        → yes if ANY conjunct forces test (all() needs every cond)
+/// - `any(..)`                        → yes only if EVERY branch forces test (else it builds in prod)
+/// - `not(..)`                        → no (e.g. `not(test)` is production code)
+/// - `feature = ".."`, `unix`, etc.   → no
+fn cfg_is_test_only(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(p) => p.is_ident("test"),
+        syn::Meta::List(list) => {
+            let ident = list
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let inner: Vec<syn::Meta> = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .map(|p| p.into_iter().collect())
+                .unwrap_or_default();
+            match ident.as_str() {
+                "all" => inner.iter().any(cfg_is_test_only),
+                "any" => !inner.is_empty() && inner.iter().all(cfg_is_test_only),
+                _ => false, // not(..) and any unknown wrapper: not test-only
+            }
+        }
+        syn::Meta::NameValue(_) => false,
+    }
+}
+
+/// True for `#[test]`, `#[tokio::test]`, `#[async_std::test]`, etc. — used to
+/// skip test functions whose bodies declare `thread_local!`/`static` globals
+/// (those are not production caches and must not be flagged).
+fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path()
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "test")
     })
 }
 
@@ -887,5 +945,135 @@ mod tests {
     fn render_type_collapses_whitespace() {
         let ty: Type = syn::parse_str("RefCell<ShapedRunInterner>").unwrap();
         assert_eq!(render_type(&ty), "RefCell<ShapedRunInterner>");
+    }
+
+    // --- Regression tests for the fresh-eyes review fixes ---------------------
+
+    #[test]
+    fn cfg_not_test_is_production_and_must_be_scanned() {
+        // REGRESSION (false negative): `#[cfg(not(test))]` is PRODUCTION code.
+        // The old `tokens.contains("test")` skipped it, silently hiding a real
+        // GPU-handle-owning global — the worst possible failure for this lint.
+        let src = r#"
+            #[cfg(not(test))]
+            mod prod {
+                thread_local! {
+                    static C: RefCell<Sprite> = panic!();
+                }
+            }
+        "#;
+        let (_g, globals) = build_graph_and_globals(src);
+        assert_eq!(globals.len(), 1, "#[cfg(not(test))] is production — must scan");
+        let f = first_finding(src).expect("production global reaching Sprite must flag");
+        assert_eq!(f.forbidden_leaf, "Sprite");
+    }
+
+    #[test]
+    fn cfg_any_with_test_and_feature_is_production_under_feature() {
+        // `#[cfg(any(test, feature = "x"))]` still compiles in prod under feature
+        // x, so it must be scanned (not test-only).
+        let src = r#"
+            #[cfg(any(test, feature = "debug"))]
+            mod maybe_prod {
+                thread_local! {
+                    static C: RefCell<Sprite> = panic!();
+                }
+            }
+        "#;
+        assert!(
+            first_finding(src).is_some(),
+            "any(test, feature) builds in prod under the feature — must scan"
+        );
+    }
+
+    #[test]
+    fn cfg_all_test_unix_is_test_only_and_skipped() {
+        // `#[cfg(all(test, unix))]` only ever compiles under test → skip.
+        let src = r#"
+            #[cfg(all(test, unix))]
+            mod tests {
+                thread_local! {
+                    static C: RefCell<Sprite> = panic!();
+                }
+            }
+        "#;
+        let (_g, globals) = build_graph_and_globals(src);
+        assert!(globals.is_empty(), "all(test, ..) is test-only — must skip");
+    }
+
+    #[test]
+    fn cfg_feature_test_helpers_is_not_the_test_gate() {
+        // `#[cfg(feature = "test-helpers")]` is a real production feature whose
+        // NAME merely contains "test"; it must be scanned.
+        let src = r#"
+            #[cfg(feature = "test-helpers")]
+            mod helpers {
+                thread_local! {
+                    static C: RefCell<Sprite> = panic!();
+                }
+            }
+        "#;
+        assert!(
+            first_finding(src).is_some(),
+            "feature = \"test-helpers\" is production — must scan"
+        );
+    }
+
+    #[test]
+    fn forbidden_leaf_in_trait_object_assoc_type_is_flagged() {
+        // REGRESSION (false negative): a forbidden leaf hidden in a `dyn Trait`
+        // associated-type binding was dropped by the old TraitObject arm.
+        let src = r#"
+            static CACHE: Holder = Holder;
+            struct Holder { it: Box<dyn Iterator<Item = Sprite>> }
+        "#;
+        let f = first_finding(src).expect("Sprite in dyn assoc-type must flag");
+        assert_eq!(f.forbidden_leaf, "Sprite");
+    }
+
+    #[test]
+    fn forbidden_leaf_via_fn_ptr_return_dyn_assoc_is_flagged() {
+        // REGRESSION (false negative): a forbidden leaf reached only through a
+        // fn-pointer return type whose `dyn Trait` carries it in an associated
+        // type — exercises both the BareFn return descent and the TraitObject
+        // assoc-type fix that the old code dropped.
+        let src = r#"
+            static CACHE: Holder = Holder;
+            struct Holder { it: MakeIter }
+            type MakeIter = fn() -> Box<dyn Iterator<Item = WebGpuTexture>>;
+        "#;
+        let f = first_finding(src).expect("WebGpuTexture in iterator item must flag");
+        assert_eq!(f.forbidden_leaf, "WebGpuTexture");
+    }
+
+    #[test]
+    fn cfg_test_fn_local_global_is_not_flagged() {
+        // REGRESSION (false positive): a `static`/`thread_local!` inside a
+        // `#[cfg(test)]` fn (not a `mod`) was visited and flagged.
+        let src = r#"
+            #[cfg(test)]
+            fn helper() {
+                thread_local! {
+                    static C: RefCell<Sprite> = panic!();
+                }
+            }
+        "#;
+        let (_g, globals) = build_graph_and_globals(src);
+        assert!(globals.is_empty(), "#[cfg(test)] fn-local global must be skipped");
+    }
+
+    #[test]
+    fn test_attr_fn_local_global_is_not_flagged() {
+        // REGRESSION (false positive): same, for a `#[test]`/`#[tokio::test]` fn.
+        let src = r#"
+            #[tokio::test]
+            async fn t() {
+                thread_local! {
+                    static C: RefCell<Sprite> = panic!();
+                }
+            }
+        "#;
+        let (_g, globals) = build_graph_and_globals(src);
+        assert!(globals.is_empty(), "#[test] fn-local global must be skipped");
     }
 }
