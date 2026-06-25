@@ -81,7 +81,11 @@ impl ShapedRunInterner {
         self.runs.get(&key).and_then(|runs| {
             runs.iter()
                 .find(|run| shaped_run_matches(infos, glyphs, run))
-                .map(|run| run.shaped.clone())
+                // Re-attach the CURRENT glyphs (current atlas generation), not
+                // the ones captured at intern time — see `rebuild`. This is what
+                // makes the interner leak-free: it never holds a `Rc<CachedGlyph>`
+                // and so can never keep an old atlas texture alive.
+                .map(|run| run.rebuild(glyphs))
         })
     }
 
@@ -108,18 +112,56 @@ impl ShapedRunInterner {
     }
 }
 
+/// The atlas-generation-INVARIANT slice of a `ShapedInfo`: glyph position and
+/// block key. Deliberately excludes `glyph: Rc<CachedGlyph>` (the only
+/// atlas-dependent, GPU-resource-owning field) so the interner cannot pin a
+/// glyph — and therefore cannot pin the ~tens-of-MB atlas texture that glyph's
+/// `Sprite` references. The `GlyphPosition`/`BlockKey` are pure shaping output
+/// (from the shaper's `GlyphInfo` + invariant font metrics) and are identical
+/// across atlas recreations, so caching them is sound and survives recreation.
+#[derive(Clone, Debug)]
+struct ShapedInfoTemplate {
+    pos: GlyphPosition,
+    block_key: Option<BlockKey>,
+}
+
 #[derive(Clone, Debug)]
 struct InternedShapedRun {
     signature: Vec<ShapedRunGlyph>,
-    shaped: Vec<ShapedInfo>,
+    /// Invariant per-glyph templates. NO `Rc<CachedGlyph>` is stored here — that
+    /// is the whole point (ft glyph-run-interner atlas-pinning leak fix): the
+    /// shaping cache caches the CPU shaping result, never the GPU residency.
+    templates: Vec<ShapedInfoTemplate>,
 }
 
 impl InternedShapedRun {
     fn new(infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>], shaped: &[ShapedInfo]) -> Self {
         Self {
             signature: shaped_run_signature(infos, glyphs),
-            shaped: shaped.to_vec(),
+            templates: shaped
+                .iter()
+                .map(|s| ShapedInfoTemplate {
+                    pos: s.pos.clone(),
+                    block_key: s.block_key,
+                })
+                .collect(),
         }
+    }
+
+    /// Materialize a `Vec<ShapedInfo>` for THIS call by zipping the cached
+    /// invariant templates with the caller's CURRENT glyphs (current atlas).
+    /// The matching `signature`/`len` guarantee `glyphs` lines up 1:1 with the
+    /// templates, so each template gets the live glyph at its index.
+    fn rebuild(&self, glyphs: &[Rc<CachedGlyph>]) -> Vec<ShapedInfo> {
+        self.templates
+            .iter()
+            .zip(glyphs.iter())
+            .map(|(template, glyph)| ShapedInfo {
+                pos: template.pos.clone(),
+                glyph: Rc::clone(glyph),
+                block_key: template.block_key,
+            })
+            .collect()
     }
 
     fn matches(&self, infos: &[GlyphInfo], glyphs: &[Rc<CachedGlyph>]) -> bool {
@@ -518,6 +560,51 @@ mod test {
                 .is_none(),
             "stale cluster/byte mapping must not hit an interned run for another text"
         );
+    }
+
+    /// Regression guard for the glyph-run-interner atlas-generation GPU leak.
+    ///
+    /// The interner must cache only the atlas-INVARIANT shaping result
+    /// (`GlyphPosition` + `BlockKey`) and hold ZERO strong refs to
+    /// `Rc<CachedGlyph>`. A `CachedGlyph` transitively owns a GPU atlas texture
+    /// (`CachedGlyph.texture -> Sprite -> Rc<dyn Texture2d>`, ~tens of MB each).
+    /// If the interner ever pins a glyph, every atlas recreation leaks the old
+    /// atlas generation — the ~691 MB IOSurface footprint observed in the field.
+    /// This test fails the moment anyone reintroduces a strong glyph ref.
+    #[test]
+    fn interner_does_not_pin_glyphs_atlas_generation_leak_guard() {
+        let (infos, glyphs, run) = fake_shaped_run(7);
+        let key = shaped_run_key(&infos, &glyphs);
+
+        let mut interner = ShapedRunInterner::default();
+        interner.insert(key, &infos, &glyphs, &run);
+        drop(run); // drop the freshly-built run's own glyph clones
+
+        // After interning, the ONLY strong refs to each glyph must be the local
+        // `glyphs` Vec (count == 1). count > 1 ⇒ the interner pinned the glyph ⇒
+        // its atlas generation can never be reclaimed ⇒ the leak is back.
+        for (idx, glyph) in glyphs.iter().enumerate() {
+            assert_eq!(
+                Rc::strong_count(glyph),
+                1,
+                "interner retained a strong ref to glyph {idx}: this reintroduces the \
+                 atlas-generation GPU-texture leak (the shaping cache must not own GPU \
+                 resources — cache the invariant shaping, re-attach the live glyph on hit)"
+            );
+        }
+
+        // The cache must still resolve, rebuilding against the CURRENT glyphs —
+        // this is exactly what lets it survive atlas recreation WITHOUT leaking.
+        let hit = interner
+            .lookup(key, &infos, &glyphs)
+            .expect("interned run must still resolve by signature");
+        assert_eq!(hit.len(), glyphs.len(), "rebuilt run length must match");
+        for (idx, (hit_info, glyph)) in hit.iter().zip(glyphs.iter()).enumerate() {
+            assert!(
+                Rc::ptr_eq(&hit_info.glyph, glyph),
+                "lookup must re-attach the CURRENT glyph at index {idx}, not a stale one"
+            );
+        }
     }
 
     #[test]
