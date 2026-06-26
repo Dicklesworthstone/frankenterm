@@ -146,6 +146,16 @@ impl super::TermWindow {
                 // old cache stays consistent with the old metrics.
                 self.shape_generation =
                     next_shape_generation_for_scale_change(self.shape_generation);
+                // A scale change alters per-glyph PIXEL advances, so the cached
+                // shaping is genuinely stale — not merely its atlas sprites.
+                // Clear the shape cache so the next paint re-SHAPES at the new
+                // scale. This is also load-bearing for the shape-cache/atlas
+                // decoupling (render/mod.rs `recreate_texture_atlas`): every
+                // shaping-input change (font/config/scale) must clear, so the
+                // only entries that survive a `shape_generation` bump are those
+                // that saw an *atlas* rebuild — for which re-resolving sprites
+                // (without re-shaping) is correct.
+                self.shape_cache.borrow_mut().clear();
                 // ft-uroqc: warm-rasterize the common ASCII/Latin glyph set at
                 // the NEW CellMetricKey so the first paint after a scale change
                 // finds them already in the atlas instead of synchronously

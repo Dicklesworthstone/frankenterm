@@ -1046,7 +1046,7 @@ pub struct TermWindow {
     /// here to call `begin_gesture` once per gesture rather than
     /// per `resize` event.
     quad_buffer_in_resize_gesture: bool,
-    shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
+    shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<CachedShape>>>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
     line_state_cache: RefCell<LfuCacheU64<Arc<CachedLineState>>>,

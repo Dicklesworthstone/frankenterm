@@ -4,7 +4,7 @@ use ahash::{AHashMap, AHasher};
 use config::TextStyle;
 use frankenterm_font::shaper::GlyphInfo;
 use frankenterm_font::units::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
@@ -57,6 +57,35 @@ impl ShapedInfo {
         SHAPED_RUN_INTERNER.with(|interner| interner.borrow_mut().insert(key, infos, glyphs, &run));
         run
     }
+}
+
+/// A cached shaping result that survives glyph-atlas rebuilds.
+///
+/// HarfBuzz shaping (`infos`) is **atlas-invariant**: it depends only on the
+/// font + text, not on which atlas generation the glyph sprites currently live
+/// in. The resolved [`ShapedInfo`] sprites (`glyphs`) ARE atlas-dependent. By
+/// caching the invariant `infos` alongside the sprites plus a `generation` tag,
+/// an atlas rebuild can re-resolve the (cheap) sprites from `infos` instead of
+/// throwing the entry away and re-running (expensive) HarfBuzz shaping. This is
+/// the shape-cache analogue of the [`ShapedRunInterner`] decoupling, and it
+/// removes the per-rebuild full-screen re-shape that drove the progressive GUI
+/// slowdown (the render loop's HarfBuzz time climbing over a session).
+///
+/// **Soundness of "re-resolve, don't re-shape":** the font-fallback and config
+/// invalidation paths always `clear()` the shape cache. Therefore any entry
+/// that *survives* a `shape_generation` bump only ever experienced an *atlas*
+/// rebuild — for which the cached `infos` remain valid and only the sprites
+/// need re-resolving. (A genuine shaping-input change clears the entry, forcing
+/// a real re-shape on the next miss.)
+#[derive(Debug)]
+pub struct CachedShape {
+    /// Atlas-invariant HarfBuzz output (glyph indices, clusters, advances).
+    pub infos: Vec<GlyphInfo>,
+    /// Atlas-dependent resolved sprites; re-resolved in place when `generation`
+    /// falls behind the window's `shape_generation`.
+    pub glyphs: RefCell<Rc<Vec<ShapedInfo>>>,
+    /// The `shape_generation` at which `glyphs` was last resolved.
+    pub generation: Cell<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
