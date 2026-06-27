@@ -694,24 +694,30 @@ struct PaneWriter {
 
 impl std::io::Write for PaneWriter {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
-        // This is a sync `Write` impl invoked on the GUI main thread when the
-        // user types into a remote pane. It must drive a mux RPC to completion.
-        // Use `block_on_io` (spawn-on-runtime + join), NOT `block_on`: the RPC
-        // is serviced by the reader task on the runtime, so its I/O readiness is
-        // actually driven and the main-thread `block_on` deadlock guard does not
-        // trip. Plain `block_on` here panicked ("called while running a task on
-        // the main-thread spawn queue") / could not drive the reply.
+        // Invoked on the GUI main thread when the user types into a remote pane
+        // (macOS `Key::Composed`/IME, kitty-keyboard, win32-input-mode, SendString,
+        // charselect). It MUST NOT block: the previous `block_on_io(write_to_pane)`
+        // parked the main thread on the RPC reply, and because `send_pdu` has no
+        // timeout, typing into a pane on a slow or dead/reconnecting domain froze
+        // the ENTIRE GUI — every pane stopped rendering and no other domain was
+        // serviced (a head-of-line block; visible in profiles as the main thread in
+        // `__psynch_cvwait`/`semaphore_wait`). Mirror the non-blocking sibling input
+        // methods (`key_down`, `send_paste`, `resize`): fire-and-forget on the
+        // runtime and report the bytes as accepted. Ordering is preserved — spawned
+        // tasks run FIFO on the main-thread spawn queue and each enqueues its PDU
+        // into the ordered channel before its first await, exactly as `key_down`
+        // already relies on.
         let client = Arc::clone(&self.client);
         let pane_id = self.remote_pane_id;
         let data = data.to_vec();
         let len = data.len();
-        promise::spawn::block_on_io(async move {
+        promise::spawn::spawn(async move {
             client
                 .client
                 .write_to_pane(WriteToPane { pane_id, data })
                 .await
         })
-        .map_err(|e| std::io::Error::other(format!("{}", e)))?;
+        .detach();
         Ok(len)
     }
 
