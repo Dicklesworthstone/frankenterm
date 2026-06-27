@@ -36,11 +36,6 @@ fn initial_last_poll(now: Instant) -> Instant {
     now.checked_sub(base_poll_interval()).unwrap_or(now)
 }
 
-/// RTT (ms) at or above which predictive echo is worth showing. The configured
-/// `local_echo_threshold_ms` is capped at this, so prediction is active on
-/// moderate-latency links (~25ms) where it still helps -- the stock 100ms
-/// default left it dormant there. [3c]
-const PREDICT_RTT_FLOOR_MS: u64 = 20;
 /// Prediction confidence score bounds + thresholds. The score rises when a
 /// prediction is confirmed correct and falls (harder) when wrong. [3b/3c/3d]
 const PREDICT_SCORE_MAX: i32 = 12;
@@ -51,6 +46,23 @@ const PREDICT_CONFIDENT_SCORE: i32 = 6;
 /// At/below this score, stop predicting: the app is suppressing echo (raw-mode
 /// readline, password prompt, etc.) so our guesses keep missing. [3c]
 const PREDICT_SUPPRESS_SCORE: i32 = -4;
+/// Once suppressed, stay suppressed at least this long after the most recent
+/// misprediction before re-arming to re-test -- otherwise prediction would
+/// re-fire on the very next keystroke and keep painting secret characters in an
+/// echo-off prompt. [3c, review F1]
+const PREDICT_SUPPRESS_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Best-effort heuristic: does this line look like a secret prompt (password /
+/// passphrase) where we must not predict/echo the typed-or-pasted secret? Not a
+/// security boundary -- the confidence model also suppresses prediction after
+/// repeated misses -- but it avoids painting the obvious cases. [review F8]
+fn looks_like_secret_prompt(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("sword")        // password / passwd / [sudo] password
+        || t.contains("passphrase")
+        || t.contains("passcode")
+        || t.contains("pin:") // "Enter PIN:" -- colon keeps false matches down
+}
 
 fn should_apply_unilateral_delta(current_seqno: SequenceNo, delta_seqno: SequenceNo) -> bool {
     delta_seqno >= current_seqno
@@ -74,7 +86,13 @@ fn render_line_cache_capacity_for_values(
     scrollback_hot_lines: usize,
     viewport_rows: usize,
 ) -> NonZeroUsize {
-    let responsive_floor = viewport_rows.max(128);
+    // Size the floor for the prefetch working set: the visible viewport plus ~one
+    // viewport of read-ahead above and below (get_lines prefetches +/- span where
+    // span == the viewport). Without this, a small-scrollback + tall-viewport
+    // config could thrash, evicting just-rendered on-screen rows in favor of
+    // speculative off-screen ones. Default (large scrollback) configs are
+    // unaffected -- scrollback dominates the budget. [review 3f]
+    let responsive_floor = viewport_rows.saturating_mul(3).max(128);
     let scrollback_budget = scrollback_lines.max(responsive_floor);
     let capacity = if tiered_enabled {
         scrollback_hot_lines
@@ -182,6 +200,10 @@ pub struct RenderableInner {
     /// High => show predictions without the underline cue (glitchless, 3d);
     /// very low => stop predicting (the app suppresses echo, 3c). [3b/3c/3d]
     prediction_score: i32,
+    /// When the most recent misprediction happened, used to hold suppression for
+    /// a cooldown so a password prompt stays suppressed instead of re-firing on
+    /// the next keystroke. [3c, review F1]
+    last_prediction_miss: Instant,
 }
 
 pub struct RenderableState {
@@ -225,6 +247,7 @@ impl RenderableInner {
             predictions: Vec::new(),
             alt_screen_active: false,
             prediction_score: 0,
+            last_prediction_miss: now,
         }
     }
 
@@ -259,11 +282,12 @@ impl RenderableInner {
             return false;
         }
         // Predict when the link is laggy enough for echo to matter. The configured
-        // threshold is the activation point, capped at a low perceptibility floor
-        // so prediction is active on moderate-latency links (~25ms). `None`
-        // disables predictive echo entirely. [3c]
+        // local_echo_threshold_ms is the activation point, honored as-is (the
+        // default is now 20ms -- low enough to activate on ~25ms remote links;
+        // explicit per-domain values are respected). `None` disables predictive
+        // echo entirely. [3c, review F7]
         match self.client.local_echo_threshold_ms {
-            Some(thresh) => self.last_input_rtt >= thresh.min(PREDICT_RTT_FLOOR_MS),
+            Some(thresh) => self.last_input_rtt >= thresh,
             None => false,
         }
     }
@@ -305,33 +329,54 @@ impl RenderableInner {
                 .into_iter()
                 .partition(|p| p.input_serial <= serial);
         self.predictions = pending;
+        let now = Instant::now();
         for p in confirmed {
             // Validate against the authoritative content the server sent inline with
             // this delta: the cursor row (where typed echo lands) always rides in
             // bonus_lines, which has NOT yet been written to the cache at this point.
-            // Rows not present in bonus_lines can't be judged -> they count as neither.
-            let verdict = bonus_lines
-                .iter()
-                .find(|(r, _)| *r == p.row)
-                .and_then(|(_, l)| l.get_cell(p.col).map(|c| c.str() == p.predicted.str()));
+            // Rows not present in bonus_lines can't be judged -> verdict None. A
+            // missing cell counts as a blank, so a predicted blank (backspace/delete)
+            // at a compressed trailing position reads as correct, not no-event, and a
+            // predicted glyph the server didn't echo reads as a miss. [review F9]
+            let verdict = bonus_lines.iter().find(|(r, _)| *r == p.row).map(|(_, l)| {
+                match l.get_cell(p.col) {
+                    Some(c) => c.str() == p.predicted.str(),
+                    None => p.predicted.str() == " ",
+                }
+            });
             match verdict {
                 Some(true) => {
                     self.prediction_score = (self.prediction_score + 1).min(PREDICT_SCORE_MAX);
                 }
                 Some(false) => {
-                    self.prediction_score = (self.prediction_score - 2).max(PREDICT_SCORE_MIN);
+                    // A miss drops the score AND forces it below the confident
+                    // threshold, so secret characters in an echo-off prompt never
+                    // render plain even if the pane was confident a moment ago. [F2]
+                    self.prediction_score = (self.prediction_score - 2)
+                        .min(PREDICT_CONFIDENT_SCORE - 1)
+                        .max(PREDICT_SCORE_MIN);
+                    self.last_prediction_miss = now;
                 }
                 None => {}
             }
+        }
+        // Recover from suppression -- but only after a quiet cooldown since the last
+        // miss, so an echo-off prompt stays suppressed instead of re-firing (and
+        // re-painting a secret char) on the very next keystroke. Once suppressed the
+        // pane stops predicting, so nothing validates it back up; this re-arms it to
+        // re-test after the bad patch has passed. [review F1]
+        if self.prediction_score <= PREDICT_SUPPRESS_SCORE
+            && self.last_prediction_miss.elapsed() > PREDICT_SUPPRESS_COOLDOWN
+        {
+            self.prediction_score = PREDICT_SUPPRESS_SCORE + 1;
         }
     }
 
     fn apply_prediction(&mut self, c: KeyCode, line: &Line) {
         let text = line.as_str();
-        if text.contains("sword") {
-            // This line might be a password prompt.  Don't force
-            // on local echo here, as we don't want to reveal content
-            // from their password
+        if looks_like_secret_prompt(&text) {
+            // This line might be a password/passphrase prompt. Don't predict, as we
+            // don't want to reveal the secret the user is typing. [review F8]
             return;
         }
 
@@ -442,6 +487,16 @@ impl RenderableInner {
 
     pub fn predict_from_paste(&mut self, text: &str) {
         if !self.should_predict() {
+            return;
+        }
+        // Don't predict a paste into a password/passphrase prompt. [review F8]
+        let cursor_row = self.cursor_position.y;
+        let secret = matches!(
+            self.lines.peek(&cursor_row),
+            Some(LineEntry::Line(l) | LineEntry::Stale(l) | LineEntry::LineAndFetching(l, _))
+                if looks_like_secret_prompt(&l.as_str())
+        );
+        if secret {
             return;
         }
 
@@ -1072,9 +1127,14 @@ impl RenderableState {
         // from cached server content (recorded, not mutated in), which is what
         // later lets 3b validate/rewind them and 3d resolve the underline cue from
         // prediction state at render time. [3a]
-        inner
-            .predictions
-            .retain(|p| p.born.elapsed() < Duration::from_secs(1));
+        // Expire never-confirmed predictions, scaled by the measured RTT: a fixed 1s
+        // would drop them before the echo arrives on a >1s link (the high-latency
+        // case the feature is for), while on fast links a short TTL keeps the
+        // stale-overpaint window (a unilateral redraw under a stale prediction)
+        // small. [review F3/F4]
+        let predict_ttl = Duration::from_millis(250)
+            .max(Duration::from_millis(inner.last_input_rtt.saturating_mul(4)));
+        inner.predictions.retain(|p| p.born.elapsed() < predict_ttl);
         if !inner.predictions.is_empty() {
             let (start, end) = (lines.start, lines.end);
             // Glitchless flagging: once predictions are reliably confirmed correct
@@ -1266,9 +1326,11 @@ mod tests {
             render_line_cache_capacity_for_values(100_000, false, 2_000, 48).get(),
             100_000
         );
+        // Small scrollback + tall viewport: floor sizes to the prefetch working
+        // set (3 * viewport), not just the viewport. [review 3f]
         assert_eq!(
             render_line_cache_capacity_for_values(64, true, 8, 240).get(),
-            240
+            720
         );
     }
 

@@ -2326,7 +2326,13 @@ pub fn default_write_timeout() -> Duration {
 }
 
 pub fn default_local_echo_threshold_ms() -> Option<u64> {
-    Some(100)
+    // 20ms: low enough that predictive echo activates on moderate-latency remote
+    // links (~25ms), where it meaningfully hides round-trip latency, but above
+    // typical LAN/local-mux RTT so it stays off where echo is already instant.
+    // (Was 100ms, inherited from upstream -- too conservative for a remote-
+    // multiplexing terminal; the predictor's confidence model + glitchless cue
+    // keep it unobtrusive.) An explicit per-domain value is honored as-is.
+    Some(20)
 }
 
 fn default_bypass_mouse_reporting_modifiers() -> Modifiers {
@@ -3109,8 +3115,8 @@ mod tests {
     }
 
     #[test]
-    fn default_local_echo_threshold_ms_is_some_100() {
-        assert_eq!(default_local_echo_threshold_ms(), Some(100));
+    fn default_local_echo_threshold_ms_is_some_20() {
+        assert_eq!(default_local_echo_threshold_ms(), Some(20));
     }
 
     #[test]
