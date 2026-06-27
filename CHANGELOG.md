@@ -9,6 +9,27 @@ Organized by landed capabilities, not raw diff order. Each section describes wha
 
 ---
 
+## [0.11.0] -- 2026-06-27
+
+Mux latency-hiding + mosh-grade predictive echo for remote (SSH-mux) panes.
+
+- **Non-blocking remote-pane writer** — typing into a slow or dead/reconnecting
+  SSH-mux pane no longer freezes the whole GUI (the writer previously drove a
+  blocking, un-timed RPC on the GUI main thread).
+- **Zero-poll liveness** — the per-pane liveness poll collapses to a slow backstop
+  (disconnect is detected by the transport reader + `PaneRemoved` push, both
+  poll-independent), cutting redundant round-trips on active panes.
+- **Viewport prefetch** — speculative ±one-viewport read-ahead so scrolling a
+  high-latency remote pane doesn't stall a round-trip per page.
+- **Predictive local echo (mosh-grade)** — typing into a moderate-latency remote
+  pane (~25 ms+) echoes instantly; predictions are validated against the server
+  with a per-pane confidence model, rendered glitchlessly once confident, and
+  suppressed in echo-off prompts (password/passphrase) and full-screen TUIs
+  (alt-screen). Default `local_echo_threshold_ms` lowered 100 → 20 ms.
+
+(The earlier 0.10.x optimization rounds are recorded in the git history rather
+than here.)
+
 ## [0.1.0] -- 2026-04-11
 
 First feature-complete changelog baseline. Establishes what works, what is feature-gated, and what is in progress.
