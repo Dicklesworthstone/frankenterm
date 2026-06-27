@@ -122,9 +122,12 @@ pub(crate) fn parse_toml_config_with_overrides(
     content: &str,
     overrides: &Value,
 ) -> anyhow::Result<Config> {
-    let toml_value: toml::Value = content
-        .parse()
-        .context("Error parsing TOML config content")?;
+    // NB: use `toml::from_str` (document parser), NOT `str::parse::<toml::Value>()`.
+    // Under toml 1.x, `FromStr for Value` parses a single *bare* value, not a whole
+    // document, so any multi-key `frankenterm.toml` fails with "unexpected content,
+    // expected nothing" and the config silently falls back to defaults (see #65).
+    let toml_value: toml::Value =
+        toml::from_str(content).context("Error parsing TOML config content")?;
 
     let mut dynamic = toml_to_dynamic(&toml_value);
     merge_dynamic_overrides(&mut dynamic, overrides);
@@ -379,7 +382,7 @@ mod tests {
     #[test]
     fn empty_toml_produces_default_config() {
         let toml_str = "";
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -403,7 +406,7 @@ scrollback_warm_max_mb = 48
 font_size = 14.0
 color_scheme = "Catppuccin Mocha"
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -434,7 +437,7 @@ agent_show_backpressure = true
 agent_border_width = 3
 agent_auto_layout = "by_activity"
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -584,7 +587,7 @@ family = "JetBrains Mono"
 harfbuzz_features = ["calt=0", "clig=0", "liga=0"]
 
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -623,7 +626,7 @@ harfbuzz_features = ["calt=0", "clig=0", "liga=0"]
     fn type_mismatch_produces_error() {
         // scrollback_lines should be integer, not string
         let toml_str = r#"scrollback_lines = "not a number""#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let result = Config::from_dynamic(
             &dynamic,
@@ -638,7 +641,7 @@ harfbuzz_features = ["calt=0", "clig=0", "liga=0"]
     #[test]
     fn default_values_for_unpopulated_keys() {
         let toml_str = "color_scheme = \"Test\"\n";
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -666,7 +669,7 @@ right = 8
 top = 12
 bottom = 12
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -686,7 +689,7 @@ bottom = 12
         let toml_str = r#"
 scrollback_lines = 5000
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let mut dynamic = toml_to_dynamic(&toml_value);
 
         // Override scrollback_lines to 9999
@@ -723,7 +726,7 @@ resize_wrap_readability_max_line_badness_delta = 1000
 resize_wrap_readability_max_total_badness_delta = 5000
 resize_wrap_readability_max_fallback_ratio_percent = 40
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -748,7 +751,7 @@ resize_wrap_kp_forced_break_penalty = 10000
 resize_wrap_kp_lookahead_limit = 128
 resize_wrap_kp_max_dp_states = 16384
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -769,7 +772,7 @@ resize_wrap_kp_max_dp_states = 16384
         let toml_str = r#"
 scrollback_lines = 5000
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -799,7 +802,7 @@ scrollback_lines = 5000
         let toml_str = r#"
 resize_wrap_readability_max_fallback_ratio_percent = 50
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -818,7 +821,7 @@ resize_wrap_readability_max_fallback_ratio_percent = 50
 resize_wrap_scorecard_enabled = false
 resize_wrap_readability_gate_enabled = false
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -845,7 +848,7 @@ connect_automatically = true
 name = "staging"
 remote_address = "staging.example.com"
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -875,7 +878,7 @@ remote_address = "staging.example.com"
         let toml_str = r#"
 scrollback_lines = 5000
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -899,7 +902,7 @@ remote_address = "myhost.local"
 multiplexing = "None"
 no_agent_auth = true
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -924,7 +927,7 @@ name = "custom"
 remote_address = "myhost.local"
 ssh_config_file = "/tmp/ft-ssh-config"
 "#;
-        let toml_value: toml::Value = toml_str.parse().unwrap();
+        let toml_value: toml::Value = toml::from_str(toml_str).unwrap();
         let dynamic = toml_to_dynamic(&toml_value);
         let cfg = Config::from_dynamic(
             &dynamic,
@@ -938,6 +941,32 @@ ssh_config_file = "/tmp/ft-ssh-config"
         assert_eq!(
             domains[0].ssh_config_file.as_deref(),
             Some("/tmp/ft-ssh-config")
+        );
+    }
+
+    // Regression for #65: a real `frankenterm.toml` (leading comment + multiple
+    // top-level keys) must load through the GUI loader. Under toml 1.x,
+    // `str::parse::<toml::Value>()` only parses a single bare value, so this exact
+    // shape failed with "unexpected content, expected nothing" and the config
+    // silently fell back to defaults — which also resurrected the update banner
+    // because `check_for_updates = false` was never applied.
+    #[test]
+    fn realistic_commented_document_loads_via_gui_loader() {
+        let toml_str = "\
+# FrankenTerm configuration
+scrollback_lines = 4242
+color_scheme = \"Catppuccin Mocha\"
+check_for_updates = false
+";
+        let cfg = parse_toml_config_with_overrides(toml_str, &Value::default())
+            .expect("a commented multi-key frankenterm.toml must parse (see #65)")
+            .compute_extra_defaults(None);
+
+        assert_eq!(cfg.scrollback_lines, 4242);
+        assert_eq!(cfg.color_scheme.as_deref(), Some("Catppuccin Mocha"));
+        assert!(
+            !cfg.check_for_updates,
+            "check_for_updates from the file must be honored, not reset to its default"
         );
     }
 
