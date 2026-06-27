@@ -795,7 +795,13 @@ fn ensure_rustls_provider_installed() {
     static INSTALL: Once = Once::new();
 
     INSTALL.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Install ring (not aws-lc-rs) as the process-default crypto provider
+        // (#67). aws-lc-rs's jitter-entropy thread trips Rust std's
+        // thread-lifecycle assertion during Windows FLS teardown at process
+        // exit; ring has no such thread. aws-lc-rs is also compiled out of the
+        // tree (see workspace `rustls` dependency), so this is the only
+        // provider available.
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 

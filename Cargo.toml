@@ -559,7 +559,15 @@ glob = "0.3.3"
 console = "0.16.3"
 getrandom = "0.4.2"
 trybuild = { version = "1.0.116", default-features = false }
-rustls = "0.23.40"
+# Crypto provider: ring, NOT the rustls default of aws-lc-rs (#67). aws-lc-rs
+# spawns a jitter-entropy background thread whose Windows FLS teardown during
+# RtlExitUserProcess trips Rust std's thread-lifecycle assertion, panicking
+# ft.exe at process exit. `default-features = false` drops the `aws_lc_rs`
+# feature (and thus the aws-lc-rs/aws-lc-sys crates) from the dependency graph
+# entirely; `ring` is the pure-Rust/asm backend already pulled in via
+# asupersync's `tls` feature (`rustls/ring`). We re-add the other rustls
+# defaults (logging, std, tls12) so behavior is otherwise unchanged.
+rustls = { version = "0.23.40", default-features = false, features = ["logging", "std", "tls12", "ring"] }
 rustls-pemfile = "2.2.0"
 fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "09de04d147927b048aa054116c90f7647427416a", package = "fastmcp-rust" }
 fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "39ff887fca40763a62233d2e7b83b5b62725b286", package = "fastapi-rust" }
