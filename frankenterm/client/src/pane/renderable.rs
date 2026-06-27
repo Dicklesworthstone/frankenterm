@@ -954,6 +954,53 @@ impl RenderableState {
             inner.lines.put(idx, entry);
         }
 
+        // Speculative read-ahead: prefetch ~one viewport above and below the visible
+        // range so a page scroll finds those rows already cached instead of stalling
+        // ~1 RTT per viewport-fill on a high-latency link. Reuses the same LineEntry
+        // state machine (rows already fresh or in flight are skipped: dedupe) and the
+        // seqno staleness guard, so a widened fetch stays one range-batched GetLines
+        // RPC. A cheap peek decides whether any read-ahead row is actually missing
+        // before spending a fetch-limiter token, so a stationary viewport (everything
+        // cached) costs nothing and never steals fetch budget from on-screen updates.
+        // Off-screen rows join `to_fetch` but never `result` (they are not displayed).
+        // [prefetch]
+        let span = (lines.end - lines.start).max(1);
+        let lo = lines.start.saturating_sub(span);
+        let hi = lines.end.saturating_add(span);
+        let needs_prefetch = (lo..lines.start).chain(lines.end..hi).any(|idx| {
+            match inner.lines.peek(&idx) {
+                None | Some(LineEntry::Stale(_)) => true,
+                Some(LineEntry::Line(line)) => line.changed_since(inner.seqno),
+                Some(LineEntry::Fetching(_)) | Some(LineEntry::LineAndFetching(..)) => false,
+            }
+        });
+        if needs_prefetch && inner.fetch_limiter.non_blocking_admittance_check(1) {
+            for idx in (lo..lines.start).chain(lines.end..hi) {
+                match inner.lines.pop(&idx) {
+                    Some(LineEntry::Line(line)) => {
+                        if line.changed_since(inner.seqno) {
+                            to_fetch.add(idx);
+                            inner.lines.put(idx, LineEntry::LineAndFetching(line, now));
+                        } else {
+                            inner.lines.put(idx, LineEntry::Line(line));
+                        }
+                    }
+                    Some(LineEntry::Stale(line)) => {
+                        to_fetch.add(idx);
+                        inner.lines.put(idx, LineEntry::LineAndFetching(line, now));
+                    }
+                    // Already in flight (Fetching / LineAndFetching): dedupe -> leave.
+                    Some(other) => {
+                        inner.lines.put(idx, other);
+                    }
+                    None => {
+                        to_fetch.add(idx);
+                        inner.lines.put(idx, LineEntry::Fetching(now));
+                    }
+                }
+            }
+        }
+
         log::trace!(
             "get_lines: {:?}, num result lines={}, will fetch {:?}",
             lines,
