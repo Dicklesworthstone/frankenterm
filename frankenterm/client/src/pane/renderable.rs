@@ -369,7 +369,17 @@ impl RenderableInner {
             self.remote_pane_id
         );
         let now = Instant::now();
-        self.poll_interval = base_poll_interval();
+        // Intentionally do NOT reset poll_interval to base here. This delta arrived
+        // via the server's unilateral PUSH, which already delivered the update; the
+        // liveness poll's GetPaneRenderChanges would return only liveness (no data,
+        // since the push already advanced the seqno). Re-pinning the poll to base on
+        // every push fires a redundant uplink RPC per push — roughly 2x the
+        // round-trip/PDU traffic of an active pane on a wait-bound link, tightest
+        // exactly when the pane is busiest. Let the poll back off toward max (30s)
+        // while output streams: updates still arrive via push, `last_recv_time` below
+        // keeps liveness fresh, death detection stays bounded at the same 30s the idle
+        // path already uses, and `update_last_send()` still snaps the poll tight on
+        // user input for echo/tardy responsiveness. [mux round-trip optimization]
         self.last_recv_time = now;
 
         if !should_apply_unilateral_delta(self.seqno, delta.seqno) {
