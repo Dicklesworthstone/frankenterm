@@ -36,6 +36,22 @@ fn initial_last_poll(now: Instant) -> Instant {
     now.checked_sub(base_poll_interval()).unwrap_or(now)
 }
 
+/// RTT (ms) at or above which predictive echo is worth showing. The configured
+/// `local_echo_threshold_ms` is capped at this, so prediction is active on
+/// moderate-latency links (~25ms) where it still helps -- the stock 100ms
+/// default left it dormant there. [3c]
+const PREDICT_RTT_FLOOR_MS: u64 = 20;
+/// Prediction confidence score bounds + thresholds. The score rises when a
+/// prediction is confirmed correct and falls (harder) when wrong. [3b/3c/3d]
+const PREDICT_SCORE_MAX: i32 = 12;
+const PREDICT_SCORE_MIN: i32 = -6;
+/// At/above this score, predictions are confident: shown without the underline
+/// uncertainty cue (glitchless). [3d]
+const PREDICT_CONFIDENT_SCORE: i32 = 6;
+/// At/below this score, stop predicting: the app is suppressing echo (raw-mode
+/// readline, password prompt, etc.) so our guesses keep missing. [3c]
+const PREDICT_SUPPRESS_SCORE: i32 = -4;
+
 fn should_apply_unilateral_delta(current_seqno: SequenceNo, delta_seqno: SequenceNo) -> bool {
     delta_seqno >= current_seqno
 }
@@ -108,40 +124,23 @@ fn rebuild_cache_as_stale(lines: &mut LruCache<StableRowIndex, LineEntry>, capac
     *lines = stale_lines;
 }
 
-/// State of a single speculative cell prediction (mosh-grade local echo).
-/// 3a only ever produces `Tentative`; 3b adds the validated `Confirmed`/
-/// `Incorrect` transitions used for instant clean rewind + confidence.
-#[allow(dead_code)] // Confirmed/Incorrect are consumed by 3b (validation/confidence)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PredictionState {
-    Tentative,
-    Confirmed,
-    Incorrect,
-}
-
-/// A single predicted cell mutation, kept as an overlay record instead of being
-/// baked into the cached server `Line`. Storing predictions separately is what
-/// lets us validate them against the authoritative server cell, rewind a wrong
-/// prediction instantly from `original` (no corrective round-trip), and resolve
-/// the display attribute (underline cue) from `state` at render time. The cursor
-/// is still predicted in place (cursor_position) and reconciled by the existing
-/// input_serial gate.
-#[allow(dead_code)] // epoch/original/state are consumed by 3b (rewind) + 3d (flagging)
+/// A single predicted cell, kept as an overlay record instead of being baked into
+/// the cached server `Line`. Storing predictions separately is what lets us
+/// validate each against the authoritative server cell (to drive prediction
+/// confidence), rewind a wrong one for free (the overlay simply stops painting,
+/// revealing the authoritative cached content), and resolve the underline cue
+/// from the pane's confidence at render time. The cursor is still predicted in
+/// place (cursor_position) and reconciled by the existing input_serial gate.
 #[derive(Debug, Clone)]
 struct Prediction {
-    /// Prediction epoch; predictions from a stale epoch are discarded en masse
-    /// when an unpredictable event invalidates the speculative line state.
-    epoch: u64,
     row: StableRowIndex,
     col: usize,
-    /// What we drew speculatively.
+    /// The plain predicted glyph (no underline); the underline cue is applied at
+    /// render time only while prediction confidence is low.
     predicted: Cell,
-    /// The authoritative cell content before this prediction, for clean rewind.
-    original: Cell,
     /// Serial of the keystroke that produced this prediction; the server echoes
     /// it back, letting us tell which predictions a delta confirms.
     input_serial: InputSerial,
-    state: PredictionState,
     born: Instant,
 }
 
@@ -175,9 +174,14 @@ pub struct RenderableInner {
     /// Active speculative cell predictions (mosh-grade local echo), kept as an
     /// overlay applied at render time rather than mutated into the cached lines.
     predictions: Vec<Prediction>,
-    /// Monotonic prediction epoch; bumped to invalidate the whole speculative
-    /// line state when an unpredictable event occurs.
-    prediction_epoch: u64,
+    /// Whether the pane is currently showing the alternate screen (vim/TUI). We
+    /// never predict there: those keystrokes are commands, not echoed text. [3e]
+    alt_screen_active: bool,
+    /// Confidence score for predictive echo on this pane: bumped up when a
+    /// prediction is confirmed correct by the server, down (harder) when wrong.
+    /// High => show predictions without the underline cue (glitchless, 3d);
+    /// very low => stop predicting (the app suppresses echo, 3c). [3b/3c/3d]
+    prediction_score: i32,
 }
 
 pub struct RenderableState {
@@ -219,7 +223,8 @@ impl RenderableInner {
             input_serial: InputSerial::empty(),
             seqno: SEQ_ZERO,
             predictions: Vec::new(),
-            prediction_epoch: 0,
+            alt_screen_active: false,
+            prediction_score: 0,
         }
     }
 
@@ -243,10 +248,24 @@ impl RenderableInner {
     /// Predictive echo can be noisy when the link is working well,
     /// so we only employ it when it looks like the latency is high.
     fn should_predict(&self) -> bool {
-        self.client
-            .local_echo_threshold_ms
-            .map(|thresh| self.last_input_rtt >= thresh)
-            .unwrap_or(false)
+        // Never predict into a full-screen / alt-screen app (vim, less, TUIs):
+        // those keystrokes are editor commands, not echoed text. [3e]
+        if self.alt_screen_active {
+            return false;
+        }
+        // Stop predicting if recent predictions were consistently wrong -- the app
+        // is suppressing echo (raw-mode readline, password prompt). [3c]
+        if self.prediction_score <= PREDICT_SUPPRESS_SCORE {
+            return false;
+        }
+        // Predict when the link is laggy enough for echo to matter. The configured
+        // threshold is the activation point, capped at a low perceptibility floor
+        // so prediction is active on moderate-latency links (~25ms). `None`
+        // disables predictive echo entirely. [3c]
+        match self.client.local_echo_threshold_ms {
+            Some(thresh) => self.last_input_rtt >= thresh.min(PREDICT_RTT_FLOOR_MS),
+            None => false,
+        }
     }
 
     /// Compute a "prediction" and apply it to the line data that we
@@ -261,23 +280,50 @@ impl RenderableInner {
     ///
     /// There are bound to be a number of other edge cases that we should
     /// handle.
-    /// Record an overlay prediction for `predicted` at (row, col), capturing the
-    /// authoritative cell currently there as `original` for clean rewind (3b).
-    fn record_prediction(&mut self, row: StableRowIndex, col: usize, predicted: Cell, line: &Line) {
-        let original = line
-            .get_cell(col)
-            .map(|c| c.as_cell())
-            .unwrap_or_else(|| Cell::new(' ', CellAttributes::default()));
+    /// Record an overlay prediction for the plain glyph `predicted` at (row, col).
+    fn record_prediction(&mut self, row: StableRowIndex, col: usize, predicted: Cell) {
         self.predictions.push(Prediction {
-            epoch: self.prediction_epoch,
             row,
             col,
             predicted,
-            original,
             input_serial: self.input_serial,
-            state: PredictionState::Tentative,
             born: Instant::now(),
         });
+    }
+
+    /// Retire the predictions the server has now confirmed (input_serial <= serial),
+    /// validating each against the authoritative cached cell to drive the pane's
+    /// prediction confidence score. Rewind is automatic: a wrong prediction simply
+    /// stops being painted, revealing the authoritative content beneath it. [3b]
+    fn validate_and_retire_predictions(
+        &mut self,
+        serial: InputSerial,
+        bonus_lines: &[(StableRowIndex, Line)],
+    ) {
+        let (confirmed, pending): (Vec<Prediction>, Vec<Prediction>) =
+            std::mem::take(&mut self.predictions)
+                .into_iter()
+                .partition(|p| p.input_serial <= serial);
+        self.predictions = pending;
+        for p in confirmed {
+            // Validate against the authoritative content the server sent inline with
+            // this delta: the cursor row (where typed echo lands) always rides in
+            // bonus_lines, which has NOT yet been written to the cache at this point.
+            // Rows not present in bonus_lines can't be judged -> they count as neither.
+            let verdict = bonus_lines
+                .iter()
+                .find(|(r, _)| *r == p.row)
+                .and_then(|(_, l)| l.get_cell(p.col).map(|c| c.str() == p.predicted.str()));
+            match verdict {
+                Some(true) => {
+                    self.prediction_score = (self.prediction_score + 1).min(PREDICT_SCORE_MAX);
+                }
+                Some(false) => {
+                    self.prediction_score = (self.prediction_score - 2).max(PREDICT_SCORE_MIN);
+                }
+                None => {}
+            }
+        }
     }
 
     fn apply_prediction(&mut self, c: KeyCode, line: &Line) {
@@ -309,25 +355,22 @@ impl RenderableInner {
             KeyCode::Delete => {
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x;
-                self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()), line);
+                self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()));
             }
             KeyCode::Backspace if self.cursor_position.x > 0 => {
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x - 1;
-                self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()), line);
+                self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()));
                 self.cursor_position.x -= 1;
             }
             KeyCode::Char(c) => {
-                let cell = Cell::new(
-                    c,
-                    CellAttributes::default()
-                        .set_underline(Underline::Double)
-                        .clone(),
-                );
+                // Store the plain glyph; the underline uncertainty cue is applied at
+                // render time only while confidence is low (glitchless, 3d).
+                let cell = Cell::new(c, CellAttributes::default());
                 let width = cell.width();
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x;
-                self.record_prediction(row, col, cell, line);
+                self.record_prediction(row, col, cell);
                 // Adjust the cursor to reflect the width of this new cell
                 self.cursor_position.x += width;
             }
@@ -373,11 +416,9 @@ impl RenderableInner {
         }
     }
 
-    fn apply_paste_prediction(&mut self, paste_idx: usize, text: &str, line: &Line) {
-        let attrs = CellAttributes::default()
-            .set_underline(Underline::Double)
-            .clone();
-
+    fn apply_paste_prediction(&mut self, paste_idx: usize, text: &str) {
+        // Plain glyphs; the underline cue is applied at render time (3d).
+        let attrs = CellAttributes::default();
         let text_line = Line::from_text(text, &attrs, SEQ_ZERO, None);
         let target_row = self.cursor_position.y + paste_idx as StableRowIndex;
 
@@ -385,14 +426,14 @@ impl RenderableInner {
             // First pasted line is appended at the cursor.
             for cell in text_line.visible_cells() {
                 let col = self.cursor_position.x;
-                self.record_prediction(target_row, col, cell.as_cell(), line);
+                self.record_prediction(target_row, col, cell.as_cell());
                 self.cursor_position.x += cell.width();
             }
         } else {
             // Subsequent pasted lines replace the row content from column 0.
             let mut col = 0;
             for cell in text_line.visible_cells() {
-                self.record_prediction(target_row, col, cell.as_cell(), line);
+                self.record_prediction(target_row, col, cell.as_cell());
                 col += cell.width();
             }
             self.cursor_position.x = col;
@@ -409,17 +450,13 @@ impl RenderableInner {
 
         for (idx, paste_line) in lines.iter().enumerate() {
             let row = self.cursor_position.y + idx as StableRowIndex;
-
-            // Peek+clone the authoritative line; predictions are recorded as an
-            // overlay rather than mutated into the cached line.
-            let line = self.lines.peek(&row).and_then(|e| match e {
-                LineEntry::Line(l) | LineEntry::Stale(l) | LineEntry::LineAndFetching(l, _) => {
-                    Some(l.clone())
-                }
-                LineEntry::Fetching(_) => None,
-            });
-            if let Some(line) = line {
-                self.apply_paste_prediction(idx, paste_line, &line);
+            // Only predict for rows we already have cached; recorded as an overlay.
+            let cached = matches!(
+                self.lines.peek(&row),
+                Some(LineEntry::Line(_) | LineEntry::Stale(_) | LineEntry::LineAndFetching(..))
+            );
+            if cached {
+                self.apply_paste_prediction(idx, paste_line);
             }
         }
         self.cursor_position.y += lines.len().saturating_sub(1) as StableRowIndex;
@@ -482,13 +519,15 @@ impl RenderableInner {
 
         // Keep track of the approximate round trip time by recording how
         // long it took for this response to come back
+        // Track alt-screen state so we never predict into a full-screen TUI. [3e]
+        self.alt_screen_active = delta.alt_screen_active;
         if let Some(serial) = delta.input_serial {
             self.last_input_rtt = serial.elapsed_millis();
-            // The server has processed every keystroke up to `serial`, so any
-            // predictions for those keystrokes are now reflected in the authoritative
-            // content arriving in this delta -> retire them. [3a] (3b validates the
-            // predicted cell against the server cell before retiring.)
-            self.predictions.retain(|p| p.input_serial > serial);
+            // The server has processed every keystroke up to `serial`; validate the
+            // predictions it confirms against the authoritative content and retire
+            // them. Rewinding a wrong prediction is automatic -- removing it from the
+            // overlay reveals the authoritative cell underneath. [3b]
+            self.validate_and_retire_predictions(serial, &bonus_lines);
         }
 
         // When it comes to updating the cursor position, if the update was tagged
@@ -1038,10 +1077,18 @@ impl RenderableState {
             .retain(|p| p.born.elapsed() < Duration::from_secs(1));
         if !inner.predictions.is_empty() {
             let (start, end) = (lines.start, lines.end);
+            // Glitchless flagging: once predictions are reliably confirmed correct
+            // (high confidence) paint them plain so correct echo is seamless; while
+            // confidence is still building, flag each with the underline cue. [3d]
+            let confident = inner.prediction_score >= PREDICT_CONFIDENT_SCORE;
             for p in &inner.predictions {
                 if p.row >= start && p.row < end {
                     if let Some(line) = result.get_mut((p.row - start) as usize) {
-                        line.set_cell(p.col, p.predicted.clone(), SEQ_ZERO);
+                        let mut cell = p.predicted.clone();
+                        if !confident {
+                            cell.attrs_mut().set_underline(Underline::Double);
+                        }
+                        line.set_cell(p.col, cell, SEQ_ZERO);
                     }
                 }
             }
