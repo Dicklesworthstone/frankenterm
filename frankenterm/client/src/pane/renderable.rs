@@ -183,7 +183,11 @@ impl RenderableInner {
     /// showing.
     pub fn is_tardy(&self) -> bool {
         let elapsed = self.last_recv_time.elapsed();
-        if elapsed > self.poll_interval.max(Duration::from_secs(3)) {
+        // Fixed threshold, decoupled from poll_interval: the liveness poll now sits
+        // at the long backstop interval, but the "laggy connection" cue should still
+        // appear ~3s after we sent something without hearing back (the value the old
+        // `.max(3s)` floor produced right after input). [zero-poll]
+        if elapsed > Duration::from_secs(3) {
             self.last_send_time > self.last_recv_time
         } else {
             false
@@ -355,7 +359,11 @@ impl RenderableInner {
 
     pub fn update_last_send(&mut self) {
         self.last_send_time = Instant::now();
-        self.poll_interval = base_poll_interval();
+        // Deliberately does NOT re-pin poll_interval to base. The poll is now a slow
+        // liveness backstop (see poll()); input echo and updates arrive via the
+        // server push, and is_tardy() uses a fixed threshold — so re-pinning here
+        // would only re-trigger the poll ramp on every keystroke/mouse event,
+        // exactly the round-trip churn this work removes. [zero-poll]
     }
 
     pub fn apply_changes_to_surface(
@@ -670,9 +678,14 @@ impl RenderableInner {
             return Ok(());
         }
 
-        let interval = self.poll_interval;
-        let interval = (interval + interval).min(max_poll_interval());
-        self.poll_interval = interval;
+        // Liveness backstop only: jump straight to the max interval after the
+        // bootstrap poll instead of ramping 20ms -> ... -> max. Real updates arrive
+        // via the server's unilateral push, and a dead connection is detected at
+        // ~RTT by the transport reader thread + the PaneRemoved push, so the poll is
+        // just a slow backstop. The first poll still fires immediately (the pane is
+        // constructed with last_poll = initial_last_poll(now)) to register the
+        // server-side push tracking that all subsequent pushes depend on. [zero-poll]
+        self.poll_interval = max_poll_interval();
 
         self.last_poll = Instant::now();
         self.poll_in_progress.store(true, Ordering::SeqCst);
