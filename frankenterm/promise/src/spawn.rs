@@ -29,6 +29,16 @@ static SCHEDULER_CONFIGURED: AtomicBool = AtomicBool::new(false);
 static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
     std::sync::LazyLock::new(|| {
         asupersync::runtime::RuntimeBuilder::current_thread()
+            // Install the wall-clock timer driver. WITHOUT this, the builder
+            // leaves `timer_driver: None`, so asupersync's `time::sleep` (which
+            // backs `promise::spawn::sleep`) takes its documented fallback of
+            // spawning a fresh OS thread *per timer* (asupersync time/sleep.rs).
+            // Under the mux client's timer-heavy workload that churned ~37
+            // threads/sec (751 spawns / 20s in a profile) and dominated idle
+            // CPU. With the driver installed, sleeps register with the runtime's
+            // timer wheel and the worker fires expired timers in its park loop —
+            // no thread-per-sleep.
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_wall_clock())
             .build()
             .expect("failed to build asupersync runtime")
     });
