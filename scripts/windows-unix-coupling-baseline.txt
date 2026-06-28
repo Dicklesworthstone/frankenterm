@@ -2,10 +2,10 @@
 # Regenerate with: BLESS=1 scripts/check_windows_unix_coupling.sh
 # Each line: <path>\t<trimmed source line>. Removing entries is always safe;
 # adding entries means you accepted a NEW ungated coupling — justify it in the commit.
-Cargo.toml	DEP nix = "0.29"
+Cargo.toml	DEP nix = "0.31.3"
 Cargo.toml	DEP passfd = "0.1.6"
-Cargo.toml	DEP signal-hook = "0.3"
-Cargo.toml	DEP termios = "0.3"
+Cargo.toml	DEP signal-hook = "0.4.4"
+Cargo.toml	DEP termios = "0.3.3"
 crates/frankenterm-core/Cargo.toml	DEP nix = { workspace = true, optional = true, features = ["fs"] }
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link).unwrap();
 crates/frankenterm-core/src/patterns.rs	std::os::unix::fs::symlink(&target, &link_path).unwrap();
