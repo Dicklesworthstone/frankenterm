@@ -9,6 +9,28 @@ Organized by landed capabilities, not raw diff order. Each section describes wha
 
 ---
 
+## [0.12.0] -- 2026-06-29
+
+Runtime churn fix (asupersync 0.3.5) + window-state persistence.
+
+- **Thread-per-sleep churn eliminated** — bumped the asupersync runtime to 0.3.5,
+  which replaces the OS-thread-per-timer fallback (a `pthread_create`/`exit` per
+  `time::sleep`) with a single shared process-global fallback timer. On a settled
+  mux session this cut Sleep-poll thread spawns from ~1591/20s to **0** and dropped
+  idle CPU's upper range from ~65% to ~39%. (The residual idle CPU is a separate
+  `sched_yield` busy-spin lever, tracked upstream in asupersync.)
+- **Window maximize/fullscreen persistence** — windows reopen maximized or
+  fullscreen if they were when you quit, remembered per workspace
+  (`DATA_DIR/window-state.json`). A missing/corrupt file falls back to today's
+  default geometry; nothing changes for un-maximized windows.
+- **Own-lib refresh** — asupersync, asupersync-macros, rich_rust, fastmcp_rust,
+  fastapi_rust, frankensearch bumped to their latest main; the ecosystem now
+  unifies on a single asupersync 0.3.5 (fastapi_rust's exact `=0.3.4` pin relaxed
+  upstream). Ported the optional `distributed` feature to asupersync 0.3.5's
+  `http::h1` client API.
+
+---
+
 ## [0.11.0] -- 2026-06-27
 
 Mux latency-hiding + mosh-grade predictive echo for remote (SSH-mux) panes.
