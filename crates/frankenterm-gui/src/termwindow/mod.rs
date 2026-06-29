@@ -2521,6 +2521,24 @@ impl TermWindow {
             myself.emit_status_event();
         }
 
+        // Restore the persisted maximize/fullscreen state for this window's
+        // workspace, if any. A missing/empty entry calls neither method, so a
+        // window with no saved state keeps today's exact default geometry. The
+        // existing position-restore path above is untouched.
+        if let Some(workspace) = mux
+            .get_window(mux_window_id)
+            .map(|w| w.get_workspace().to_string())
+        {
+            if let Some(saved) = crate::window_state_persist::load_for_workspace(&workspace) {
+                if saved.maximized {
+                    window.maximize();
+                }
+                if saved.fullscreen {
+                    window.toggle_fullscreen();
+                }
+            }
+        }
+
         crate::update::start_update_checker();
         if let Some(front_end) = try_front_end() {
             front_end.record_known_window(window, mux_window_id);

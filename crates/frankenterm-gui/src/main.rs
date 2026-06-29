@@ -87,6 +87,7 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
+mod window_state_persist;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
