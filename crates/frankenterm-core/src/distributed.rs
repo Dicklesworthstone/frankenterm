@@ -1012,7 +1012,7 @@ impl DistributedHttpClient {
         if cx.is_cancel_requested() {
             return Err(asupersync::http::h1::http_client::ClientError::Cancelled);
         }
-        race_with_cx_cancel(cx, self.inner.get(cx, url)).await
+        race_with_cx_cancel(cx, self.inner.get(url).send(cx)).await
     }
 
     /// Send a POST request with a body.
@@ -1031,7 +1031,7 @@ impl DistributedHttpClient {
         if cx.is_cancel_requested() {
             return Err(asupersync::http::h1::http_client::ClientError::Cancelled);
         }
-        race_with_cx_cancel(cx, self.inner.post(cx, url, body)).await
+        race_with_cx_cancel(cx, self.inner.post(url).body(body).send(cx)).await
     }
 }
 
