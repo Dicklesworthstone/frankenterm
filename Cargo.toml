@@ -550,8 +550,8 @@ wasmtime-wasi = { version = "45.0.1", default-features = false, features = ["p1"
 criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
-asupersync-macros = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
+asupersync = { version = "0.3.5" }
+asupersync-macros = { version = "0.3.5" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae" }
 log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -613,37 +613,20 @@ strip = "none"
 [profile.release.package.frankenterm-fuzz]
 debug = 1
 
-# Override the crates.io versions of rich_rust / asupersync that the upstream repos
-# (fastmcp_rust, fastapi_rust) depend on, pinning them to upstream GitHub revs so the
-# graph is single-sourced and resolvable on any machine (CI runners, cargo install,
-# external contributors). Absolute /dp/... path patches broke every build outside the
-# fleet (and CI's --locked jobs), since /dp only exists on development machines.
+# [patch.crates-io] redirects crates.io-sourced deps to pinned upstream GitHub revs
+# so the graph single-sources and resolves on any machine (CI runners, cargo install,
+# external contributors). Do NOT use absolute /dp/... path patches: they break every
+# build outside the dev fleet (and CI's --locked jobs), since /dp only exists there.
 #
-# PIN MAINTENANCE: these revs are refreshed to the deps' origin/main HEADs as of the
-# pin date, i.e. exactly the content local checkouts built against at that time. If
-# you need frankenterm to pick up unpushed local work in one of these deps, add a
-# TEMPORARY local patch override (e.g. `asupersync = { path = "/dp/asupersync" }`)
-# while iterating, then land the dep, bump the rev here, and REVERT the temporary
-# patch before committing — committing a /dp path breaks CI and external builds.
-# asupersync/rich_rust: frankenterm's own crates depend on these as DIRECT git deps
-# (see [workspace.dependencies]). This [patch.crates-io] asupersync rev redirects the
-# crates.io-sourced asupersync that the fastmcp/fastapi/frankensearch deps pull, so the
-# whole graph unifies on one asupersync. Current rev 78f21b06 = 0.3.5, which brings the
-# shared process-global fallback timer (kills the thread-per-sleep churn). The rich_rust
-# [patch.crates-io] entry was removed: nothing pulls rich_rust from crates.io, so it was
-# unused. Keep this rev FRESH when asupersync moves — see PIN MAINTENANCE above.
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
+# asupersync no longer needs a patch here: 0.3.5 is published on crates.io, so
+# frankenterm's own crates depend on it by version (see [workspace.dependencies]) and
+# the fastmcp/fastapi/frankensearch deps resolve that same registry 0.3.5 — the whole
+# graph unifies on a single source without any git-rev redirect.
+[patch.crates-io]
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
 k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b48b5e05cf1f8fffc7c" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae" }
-
-[patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
-
-[patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
