@@ -550,9 +550,9 @@ wasmtime-wasi = { version = "45.0.1", default-features = false, features = ["p1"
 criterion = "0.8.2"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.3.4" }
-asupersync-macros = { version = "0.3.4" }
-rich_rust = { version = "0.2.0" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
+asupersync-macros = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae" }
 log = "0.4.32"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 glob = "0.3.3"
@@ -561,12 +561,12 @@ getrandom = "0.4.2"
 trybuild = { version = "1.0.116", default-features = false }
 rustls = "0.23.40"
 rustls-pemfile = "2.2.0"
-fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "09de04d147927b048aa054116c90f7647427416a", package = "fastmcp-rust" }
-fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "39ff887fca40763a62233d2e7b83b5b62725b286", package = "fastapi-rust" }
+fastmcp = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "1038dd4e64cc7df8ea8122dbfb8806b0b04a7130", package = "fastmcp-rust" }
+fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "dd49823fcb81f5c6d2bce6090b8080f33b0ac9e2", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
-frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", package = "frankensearch", default-features = false, features = ["hybrid"] }
+frankensearch = { git = "https://github.com/Dicklesworthstone/frankensearch", rev = "4a75fd706917df915e644b00248540786df438f2", package = "frankensearch", default-features = false, features = ["hybrid"] }
 # Agent detection (optional integration, enabled via frankenterm-core feature flag)
 franken-agent-detection = "0.1.8"
 
@@ -618,7 +618,7 @@ debug = 1
 # while iterating, then land the dep, bump the rev here, and REVERT the temporary
 # patch before committing — committing a /dp path breaks CI and external builds.
 [patch.crates-io]
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae" }
 # asupersync is pinned to the v0.3.4 release tag (rev 1e87cc68, 2026-06-07). 0.3.4
 # supersedes the yanked 0.3.3, which shipped a tls compile regression in
 # src/atp/policy/scope.rs (E0277 only under tls features) plus packaging breakage.
@@ -626,18 +626,18 @@ rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "138
 # previously stale pin, 3b9d1199, shipped the older waker path and broke handshakes
 # with "Timed out while parsing the response from the server").
 # Keep this pin FRESH when asupersync moves — see PIN MAINTENANCE above.
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
 # k9 0.12.0 on crates.io still pulls terminal_size 0.2 -> rustix 0.37, whose
 # feature probe enables removed rustc_* layout attributes on current nightly.
 # The pinned upstream revision keeps the same k9 version but updates terminal_size to 0.4.
 k9 = { git = "https://github.com/aaronabramov/k9", rev = "db63bcd7f6766051f3767b48b5e05cf1f8fffc7c" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "1386fec4bafb385cea801dd1f7974ceabcfa09dc" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "1e87cc68fac906b5a5e98a555f6fa7659831eaa6" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "78f21b0677ca3a7cb3bfbb8364dd011bbf2540f4" }
