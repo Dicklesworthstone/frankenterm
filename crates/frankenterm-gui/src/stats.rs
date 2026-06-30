@@ -4,6 +4,7 @@ use config::lua::mlua::Lua;
 use hdrhistogram::Histogram;
 use metrics::{Counter, Gauge, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -300,6 +301,35 @@ impl Stats {
     }
 }
 
+/// Safety valve for the per-thread handle caches below. The recorder is fed only the small, fixed
+/// set of static metric names declared across the GUI (a couple dozen), so in practice each cache
+/// holds a handful of entries and this cap is never reached. It exists purely to bound memory if a
+/// future caller ever introduces dynamically-keyed metrics (labels / formatted names): once a
+/// thread has cached this many distinct handles, further keys fall back to the global-lock path
+/// instead of growing the cache without bound (graceful degradation to the pre-cache behavior).
+const MAX_PER_THREAD_HANDLE_CACHE: usize = 1024;
+
+thread_local! {
+    /// Per-thread metric-handle cache.
+    ///
+    /// The `metrics` macros re-resolve a metric's handle on *every* emission — the crate caches
+    /// only the static `Key`, never the resolved `Counter`/`Histogram` handle (see metrics 0.24
+    /// `__register_metric!`). So without this cache, every `histogram!`/`counter!` on a hot path
+    /// (per-glyph, per-line, per-frame, per-PDU, per-RPC) would lock the single global `INNER`
+    /// mutex, serializing all emitting threads and surfacing as `parking_lot RawMutex::lock_slow`
+    /// contention under load.
+    ///
+    /// Resolving each metric once per (thread, key) and caching the handle thread-locally makes
+    /// every subsequent emission lock-free; the global `INNER` mutex is taken only on the cold
+    /// miss (a handful of times per thread over the whole process). The cached handles are `Arc`
+    /// clones of the exact same metric objects stored in `INNER`, so records made through a cached
+    /// handle land in the same histogram/counter, and the stats-printer thread and the Lua
+    /// `get_counters` view are unaffected. Entries are never invalidated because `INNER` never
+    /// replaces a key's handle (insert-once, reuse-forever), so a cached handle is always valid.
+    static COUNTER_CACHE: RefCell<HashMap<Key, Counter>> = RefCell::new(HashMap::new());
+    static HISTOGRAM_CACHE: RefCell<HashMap<Key, metrics::Histogram>> = RefCell::new(HashMap::new());
+}
+
 impl Recorder for Stats {
     fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
@@ -308,17 +338,29 @@ impl Recorder for Stats {
     fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata) -> Counter {
-        let mut inner = self.inner.lock();
-        match inner.counters.get(key) {
-            Some(existing) => Counter::from_arc(existing.clone()),
-            None => {
-                let counter = Arc::new(MyCounter {
-                    value: AtomicUsize::new(0),
-                });
-                inner.counters.insert(key.clone(), counter.clone());
-                metrics::Counter::from_arc(counter)
-            }
+        if let Some(existing) = COUNTER_CACHE.with(|c| c.borrow().get(key).cloned()) {
+            return existing;
         }
+        let counter = {
+            let mut inner = self.inner.lock();
+            match inner.counters.get(key) {
+                Some(existing) => Counter::from_arc(existing.clone()),
+                None => {
+                    let counter = Arc::new(MyCounter {
+                        value: AtomicUsize::new(0),
+                    });
+                    inner.counters.insert(key.clone(), counter.clone());
+                    metrics::Counter::from_arc(counter)
+                }
+            }
+        };
+        COUNTER_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if cache.len() < MAX_PER_THREAD_HANDLE_CACHE {
+                cache.insert(key.clone(), counter.clone());
+            }
+        });
+        counter
     }
 
     fn register_gauge(&self, _key: &Key, _metadata: &Metadata) -> Gauge {
@@ -326,35 +368,47 @@ impl Recorder for Stats {
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata) -> metrics::Histogram {
-        let mut inner = self.inner.lock();
-        if key.name().ends_with(".rate") {
-            match inner.throughput.get(key) {
-                Some(existing) => metrics::Histogram::from_arc(existing.clone()),
-                None => {
-                    let tput = Arc::new(Throughput::new());
-                    inner.throughput.insert(key.clone(), tput.clone());
-
-                    metrics::Histogram::from_arc(tput)
-                }
-            }
-        } else {
-            match inner.histograms.get(key) {
-                Some(existing) => metrics::Histogram::from_arc(existing.clone()),
-                None => {
-                    let scale = if key.name().ends_with(".size") {
-                        1.0
-                    } else {
-                        // Assume seconds; convert to nanoseconds
-                        1_000_000_000.0
-                    };
-
-                    let histogram = ScaledHistogram::new(scale);
-                    inner.histograms.insert(key.clone(), histogram.clone());
-
-                    metrics::Histogram::from_arc(histogram)
-                }
-            }
+        if let Some(existing) = HISTOGRAM_CACHE.with(|c| c.borrow().get(key).cloned()) {
+            return existing;
         }
+        let histogram = {
+            let mut inner = self.inner.lock();
+            if key.name().ends_with(".rate") {
+                match inner.throughput.get(key) {
+                    Some(existing) => metrics::Histogram::from_arc(existing.clone()),
+                    None => {
+                        let tput = Arc::new(Throughput::new());
+                        inner.throughput.insert(key.clone(), tput.clone());
+
+                        metrics::Histogram::from_arc(tput)
+                    }
+                }
+            } else {
+                match inner.histograms.get(key) {
+                    Some(existing) => metrics::Histogram::from_arc(existing.clone()),
+                    None => {
+                        let scale = if key.name().ends_with(".size") {
+                            1.0
+                        } else {
+                            // Assume seconds; convert to nanoseconds
+                            1_000_000_000.0
+                        };
+
+                        let histogram = ScaledHistogram::new(scale);
+                        inner.histograms.insert(key.clone(), histogram.clone());
+
+                        metrics::Histogram::from_arc(histogram)
+                    }
+                }
+            }
+        };
+        HISTOGRAM_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if cache.len() < MAX_PER_THREAD_HANDLE_CACHE {
+                cache.insert(key.clone(), histogram.clone());
+            }
+        });
+        histogram
     }
 }
 
@@ -440,4 +494,53 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         })?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics::Level;
+
+    // The per-thread handle cache must be transparent: a handle returned from the cache
+    // (thread-local hit) must point at the SAME metric object stored in the global `INNER` map
+    // that the stats-printer thread and the Lua `get_counters`/`get_latency` views read — so
+    // records made through cached handles are observable exactly as before the cache existed.
+
+    #[test]
+    fn cached_counter_handles_share_the_inner_counter() {
+        let stats = Stats::new();
+        let md = Metadata::new("test", Level::INFO, None);
+        let key = Key::from_static_name("test.recorder_cache.counter.alpha");
+        // Cold miss: registers into INNER + populates the thread-local cache.
+        let c1 = stats.register_counter(&key, &md);
+        c1.increment(3);
+        // Thread-local hit: a handle for the same underlying counter.
+        let c2 = stats.register_counter(&key, &md);
+        c2.increment(4);
+        // Both increments land in the single counter held by INNER.
+        let inner = stats.inner.lock();
+        let stored = inner
+            .counters
+            .get(&key)
+            .expect("counter registered exactly once in INNER");
+        assert_eq!(stored.value.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn cached_histogram_handles_share_the_inner_histogram() {
+        let stats = Stats::new();
+        let md = Metadata::new("test", Level::INFO, None);
+        let key = Key::from_static_name("test.recorder_cache.histogram.alpha");
+        let h1 = stats.register_histogram(&key, &md);
+        let h2 = stats.register_histogram(&key, &md);
+        h1.record(0.000_001);
+        h2.record(0.000_002);
+        // Exactly one ScaledHistogram in INNER for this key; both cached handles recorded into it.
+        let inner = stats.inner.lock();
+        let stored = inner
+            .histograms
+            .get(&key)
+            .expect("histogram registered exactly once in INNER");
+        assert_eq!(stored.hist.lock().len(), 2);
+    }
 }
