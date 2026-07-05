@@ -623,8 +623,10 @@ impl CostBudget {
 
 /// Adaptive backoff state for a single connector.
 ///
-/// Tracks consecutive failures and computes exponential backoff with jitter
-/// to prevent thundering-herd retries across connectors.
+/// Tracks consecutive failures and computes a deterministic exponential
+/// backoff delay (`base * multiplier^(n-1)`, capped at the max). No jitter is
+/// applied; the delay is advisory to callers — the outbound bridge treats a
+/// `Throttle` verdict as pacing guidance rather than a denial (ft-7h5da.5.15).
 #[derive(Debug)]
 pub struct AdaptiveBackoff {
     /// Base delay in milliseconds.
