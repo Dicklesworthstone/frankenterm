@@ -2502,6 +2502,55 @@ mod tests {
     }
 
     #[test]
+    fn execute_with_store_fails_closed_on_crash_orphaned_pending() -> Result<(), String> {
+        let (executor, dispatched_steps) = RecordingExecutor::new();
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let contract = make_test_contract(2);
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("crashed-exec", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        // Crash window: step-0 was reserved with the write-ahead Pending marker and
+        // the process died before the terminal-outcome upgrade. A bare re-execute
+        // against the same store must refuse to re-dispatch (fail closed) rather
+        // than double-apply the side effect.
+        store
+            .record_execution(
+                "crashed-exec",
+                IdempotencyKey::new(&contract.plan.plan_id.0, "step-0", "commit"),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "agent-step-0",
+                5_000,
+            )
+            .map_err(|err| err.to_string())?;
+
+        let mut replay_contract = make_test_contract(2);
+        let err = engine
+            .execute_with_store(&mut replay_contract, &mut store, 6_000)
+            .err()
+            .ok_or_else(|| "bare re-execute over an in-flight step must fail closed".to_string())?;
+
+        match &err {
+            TxExecutionError::DedupConflict { step_id, outcome } => {
+                if step_id != "step-0" {
+                    return Err(format!("conflict on unexpected step: {step_id}"));
+                }
+                if !outcome.contains("Pending") {
+                    return Err(format!("conflict outcome should be Pending: {outcome}"));
+                }
+            }
+            other => return Err(format!("expected DedupConflict, got: {other}")),
+        }
+        assert!(
+            dispatched_steps.borrow().is_empty(),
+            "no side effects may dispatch when an in-flight marker conflicts"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn execute_with_failure_injection_triggers_compensation() {
         let mut contract = make_test_contract(3);
         let config = TxExecutionConfig {

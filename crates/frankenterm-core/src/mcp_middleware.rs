@@ -872,7 +872,6 @@ mod tests {
     /// the inner tool AND return Err. Pre-fix the wrapper would invoke
     /// inner.call regardless and silently violate the caller's budget.
     #[test]
-    #[ignore = "ft-ymn10: test relies on fastmcp::Cx cancellation which requires matching asupersync versions (0.2.9 vs 0.3.1)"]
     fn audited_tool_handler_bails_pre_flight_on_expired_cx_ft_ymn10() {
         let called = Arc::new(AtomicBool::new(false));
         let inner = InnerCallObserver {
@@ -893,9 +892,9 @@ mod tests {
         ));
         let wrapper = AuditedToolHandler::new(inner, "ft_ymn10_observer", Arc::new(tmp));
 
-        // Construct a Cx with a Time::ZERO deadline so checkpoint() fails
-        // immediately. The asupersync-side test helper exposes this.
-        let cx = fastmcp::Cx::for_testing_with_budget(fastmcp::Budget::with_deadline_ns(1));
+        // Construct a Cx with a near-Time::ZERO absolute deadline so checkpoint()
+        // fails immediately. The asupersync-side test helper exposes this.
+        let cx = fastmcp::Cx::for_testing_with_budget(fastmcp::Budget::with_deadline_at_ns(1));
         std::thread::sleep(std::time::Duration::from_millis(50));
         let ctx = McpContext::new(cx, 1);
 
