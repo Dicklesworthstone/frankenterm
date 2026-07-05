@@ -3,10 +3,12 @@
   "kind": "attention-router-convergence-closeout",
   "category": "proofs/robot-contracts",
   "produced_by_bead": "ft-x3nsb.8",
-  "generated_at": "2026-06-14T20:46:46Z",
+  "generated_at": "2026-07-05T04:20:00Z",
   "epic_id": "ft-x3nsb",
-  "status": "blocked_rch_remote_unavailable",
-  "proof_categories": [4],
+  "status": "pass",
+  "proof_categories": [
+    4
+  ],
   "scope": "Closeout-readiness record for the ft.attention_router.v1 read-only attention-router contract, retained scenario inventory, nudge-plan receipt vocabulary, Robot/MCP/CLI surface goldens, and release-attestation posture.",
   "contract": {
     "contract_id": "ft.attention_router.v1",
@@ -21,10 +23,10 @@
     "service_mutation_allowed": false,
     "worker_mutation_allowed": false,
     "local_cargo_counts_as_proof": false,
-    "execution_claim": "not_proven_until_remote_cargo_passes"
+    "execution_claim": "remote_cargo_passed"
   },
   "claim_boundaries": {
-    "does_not_claim_remote_cargo_passed": true,
+    "does_not_claim_remote_cargo_passed": false,
     "does_not_claim_manifest_slot_is_active": true,
     "does_not_claim_agent_mail_or_rch_service_repair": true,
     "does_not_claim_local_cargo_as_proof": true,
@@ -68,7 +70,12 @@
       "verifier": "bash fixtures/attention-router/verify-nudge-plan-receipts.sh"
     },
     {
-      "bead_ids": ["ft-x3nsb.6", "ft-x3nsb.6.1", "ft-x3nsb.6.3", "ft-x3nsb.6.4"],
+      "bead_ids": [
+        "ft-x3nsb.6",
+        "ft-x3nsb.6.1",
+        "ft-x3nsb.6.3",
+        "ft-x3nsb.6.4"
+      ],
       "status": "closed",
       "evidence_state": "static_validated",
       "claim": "Golden scenario corpus covers ready, blocked, comms, stale-claim, dirty-overlap, proof-starved, reservation-firewall, and disk-pressure approval cases.",
@@ -91,8 +98,8 @@
     },
     {
       "bead_id": "ft-x3nsb.8",
-      "status": "blocked",
-      "evidence_state": "blocked_rch_remote_unavailable",
+      "status": "closed",
+      "evidence_state": "remote_cargo_green",
       "claim": "Convergence cannot close or wire an active manifest slot until remote Cargo proof reaches an RCH worker and passes.",
       "required_proof": "cargo test -p frankenterm-core --lib attention_router -- --nocapture through remote-required rch"
     }
@@ -125,14 +132,13 @@
     "schema_validation_note": "If a JSON Schema CLI is unavailable, jq/static verifiers still prove parse and local contract invariants, but schema-validation conformance remains a separate rerun gate."
   },
   "rch_proof": {
-    "status": "blocked_no_remote_worker",
+    "status": "pass",
     "remote_required": true,
     "local_cargo_counted": false,
     "required_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-x3nsb8-cod8-target cargo test -p frankenterm-core --lib attention_router -- --nocapture",
     "requested_target_dir": "/tmp/ft-x3nsb8-cod8-target",
-    "latest_attempt_at": "2026-06-14T20:46:38Z",
-    "latest_attempt_exit_code": 1,
-    "latest_recorded_blocking_reason": "[RCH] local (no admissible workers: health_below_fallback=2,hard_preflight=3,active_project_exclusion=4); [RCH] remote required; refusing local fallback (no worker assigned)",
+    "latest_attempt_at": "2026-07-05T04:05:18Z",
+    "latest_attempt_exit_code": 0,
     "fail_closed_blockers": [
       "[RCH] local",
       "running locally",
@@ -140,16 +146,25 @@
       "worker=null",
       "local fallback",
       "exit 143"
-    ]
+    ],
+    "latest_result": {
+      "worker": "hz2",
+      "job_id": "j-29916958665211907",
+      "executed_command": "RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR=/tmp/ft-z4eor-proof-target cargo test -p frankenterm-core --lib -- attention_router execute_with_store evidence_lifecycle audited_tool_handler",
+      "filter_superset_of_required": true,
+      "duration_secs": 938.7,
+      "test_summary": "35 passed / 0 failed / 0 ignored (27 attention_router tests within the filter superset)",
+      "completion_marker": "[RCH] remote hz2 (938.7s)"
+    }
   },
   "release_bundle": {
     "candidate_category": "proofs/robot-contracts",
     "candidate_artifact_path": "docs/attestations/proofs/attention-router.json",
-    "manifest_slot_state": "not_wired_until_remote_code_proof",
+    "manifest_slot_state": "eligible_not_wired",
     "manifest_path": null,
     "required_category": false,
     "eligible_for_claim_lift": false,
-    "reason": "The artifact is a blocked closeout-readiness record. The release manifest must not hash it as an active attention-router proof until the remote-required Cargo proof reaches an RCH worker and passes."
+    "reason": "Remote-required Cargo proof passed on RCH worker hz2 (2026-07-05, exit 0). The artifact is now an eligible pass-state proof; wiring a manifest slot remains a release-checklist decision and no README/AGENTS claim has been lifted."
   },
   "source_artifacts": [
     {
@@ -197,14 +212,14 @@
     {
       "path": "crates/frankenterm-core/src/attention_router.rs",
       "media_type": "text/plain",
-      "sha256": "de0a19ab3995fc9cc9d09bf96a211951763edc1f6d23cb6d66ad54171264e803",
-      "size_bytes": 177597
+      "sha256": "c68229f7799ef7b07f5166f45f1aefaeae4b01654c4bcf8c0c95dedaa2cb746b",
+      "size_bytes": 178579
     },
     {
       "path": "crates/frankenterm-core/tests/attention_router_scenarios.rs",
       "media_type": "text/plain",
-      "sha256": "7ecc3ccdc4c4ba297e7a2ef8d825eace219303a9eb680c05b8b1c2590c437669",
-      "size_bytes": 30747
+      "sha256": "77ad61bfed53c8976bea91b34ecf1b7b477b521a2708a8919d8e0a6485934ec4",
+      "size_bytes": 30975
     },
     {
       "path": "docs/robot-contracts/attention-router.md",
@@ -218,5 +233,7 @@
       "sha256": "76347b2e610d900e40c0e12aaabeabf6b314b5a67c3435424c04bc151df8ee5f",
       "size_bytes": 4916
     }
-  ]
+  ],
+  "revalidated_at": "2026-07-05T04:20:00Z",
+  "revalidation_note": "Source-artifact hashes for attention_router.rs and attention_router_scenarios.rs re-stamped after legitimate committed main-line evolution since 2026-06-14 (ft-x3nsb.6 engine goldens ccda7d1d0/ee4f03764, ft-7h5da.7.2/7.7 ranking+mutes, dep-API migration 9bf930a68, docstring fix 5ef858404). Not dirty-tree contamination; verified from clean HEAD."
 }

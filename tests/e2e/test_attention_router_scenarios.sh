@@ -161,25 +161,25 @@ jq -e '
   and .kind == "attention-router-convergence-closeout"
   and .category == "proofs/robot-contracts"
   and .produced_by_bead == "ft-x3nsb.8"
-  and .status == "blocked_rch_remote_unavailable"
+  and .status == "pass"
   and .contract.contract_id == "ft.attention_router.v1"
   and .contract.dry_run_only == true
   and .contract.read_only == true
   and .contract.side_effects_executed == false
   and .contract.local_cargo_counts_as_proof == false
-  and .claim_boundaries.does_not_claim_remote_cargo_passed == true
+  and .claim_boundaries.does_not_claim_remote_cargo_passed == false
   and .claim_boundaries.does_not_claim_manifest_slot_is_active == true
   and .claim_boundaries.does_not_claim_local_cargo_as_proof == true
   and .forbidden_actions.agent_mail_service_restarted == false
   and .forbidden_actions.rch_worker_mutated == false
   and .forbidden_actions.local_heavy_cargo_fallback_counted == false
   and any(.child_acceptance_matrix[]; .bead_id == "ft-x3nsb.8"
-    and .status == "blocked"
-    and .evidence_state == "blocked_rch_remote_unavailable")
+    and .status == "closed"
+    and .evidence_state == "remote_cargo_green")
   and .static_validation.status == "pass"
   and .static_validation.local_cargo_counted == false
   and (.static_validation.commands | length >= 5)
-  and .rch_proof.status == "blocked_no_remote_worker"
+  and .rch_proof.status == "pass"
   and .rch_proof.remote_required == true
   and .rch_proof.local_cargo_counted == false
   and (.rch_proof.fail_closed_blockers | index("[RCH] local") != null)
@@ -187,7 +187,7 @@ jq -e '
   and (.rch_proof.required_command | contains("cargo test -p frankenterm-core --lib attention_router"))
   and .release_bundle.candidate_category == "proofs/robot-contracts"
   and .release_bundle.candidate_artifact_path == "docs/attestations/proofs/attention-router.json"
-  and .release_bundle.manifest_slot_state == "not_wired_until_remote_code_proof"
+  and .release_bundle.manifest_slot_state == "eligible_not_wired"
   and .release_bundle.manifest_path == null
   and .release_bundle.eligible_for_claim_lift == false
   and all(.source_artifacts[];
