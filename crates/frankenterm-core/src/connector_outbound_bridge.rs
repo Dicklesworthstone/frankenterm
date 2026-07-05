@@ -2982,7 +2982,10 @@ mod tests {
                 .policy_engine_mut()
                 .reliability_registry_mut()
                 .get_or_create("slack");
-            for i in 0..3 {
+            let failure_threshold = u64::from(
+                crate::connector_reliability::ConnectorCircuitConfig::default().failure_threshold,
+            );
+            for i in 0..failure_threshold {
                 controller.record_failure(
                     &failed_action,
                     "connector timed out",
@@ -3509,33 +3512,40 @@ mod tests {
             1100,
         );
 
+        // The failure feedback must have activated governor adaptive backoff:
+        // at t=1200 the second failure's backoff window (1100 + 2000ms) is live.
+        let decision = bridge
+            .policy_engine_mut()
+            .connector_governor_mut()
+            .evaluate(&failed_action, 1200);
+        assert_eq!(decision.verdict, GovernorVerdict::Throttle);
+        assert_eq!(
+            decision.reason,
+            crate::connector_governor::GovernorReason::AdaptiveBackoff
+        );
+        assert!(decision.delay_ms > 0);
+
+        // ft-7h5da.5.15 contract: a Throttle verdict is advisory pacing, not a
+        // denial — the action still dispatches and is counted in
+        // actions_throttled rather than actions_blocked_governor.
         let event = make_event("test", OutboundEventSource::Custom).with_timestamp_ms(1200);
         let result = bridge.process_event(&event).unwrap();
 
-        assert!(result.actions_dispatched.is_empty());
-        assert_eq!(result.actions_blocked.len(), 1);
-        assert!(
-            result.actions_blocked[0]
-                .reason
-                .contains("governor(throttle: adaptive_backoff")
-        );
-        let denial = result.actions_blocked[0]
-            .denial
-            .as_ref()
-            .expect("adaptive-backoff governor block should emit typed denial");
-        assert_eq!(denial.error_code, "connector.governor_denied");
-        assert_eq!(denial.reason_code, "adaptive_backoff");
-        assert_eq!(bridge.pending_action_count(), 0);
+        assert_eq!(result.actions_dispatched.len(), 1);
+        assert!(result.actions_blocked.is_empty());
+        assert_eq!(bridge.pending_action_count(), 1);
 
         let tel = bridge.telemetry();
-        assert_eq!(tel.actions_dispatched, 0);
-        assert_eq!(tel.actions_blocked_governor, 1);
+        assert_eq!(tel.actions_dispatched, 1);
+        assert_eq!(tel.actions_throttled, 1);
+        assert_eq!(tel.actions_blocked_governor, 0);
         assert_eq!(tel.actions_blocked_reliability, 0);
     }
 
     #[test]
     fn connector_outbound_bridge_outcome_failure_feeds_reliability_ft_x3211() {
         let mut bridge = ConnectorOutboundBridge::new(ConnectorOutboundBridgeConfig::default());
+        bridge.set_connector_admission_enforced("slack", true);
         bridge.register_sandbox_zone("slack", permissive_zone());
         bridge.add_rule(make_rule(
             "r1",
@@ -3552,7 +3562,10 @@ mod tests {
             params: serde_json::json!({"source": "regression"}),
             created_at_ms: 900,
         };
-        for completed_at_ms in 1000..1003 {
+        let failure_threshold = u64::from(
+            crate::connector_reliability::ConnectorCircuitConfig::default().failure_threshold,
+        );
+        for completed_at_ms in 1000..1000 + failure_threshold {
             bridge.record_action_failure(
                 &failed_action,
                 "connector timed out",
