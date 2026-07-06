@@ -1,3 +1,9 @@
 [toolchain]
 channel = "nightly"
 components = ["rustfmt", "clippy"]
+# Windows cross-check stdlib (ft-iubh9): rustup auto-installs this target on
+# every host that builds the repo — local Macs, CI, and RCH workers alike — so
+# remote `cargo check --target x86_64-pc-windows-gnu` proof lanes stop dying
+# with E0463 (missing target stdlib) and survive toolchain bumps without
+# per-worker provisioning.
+targets = ["x86_64-pc-windows-gnu"]
