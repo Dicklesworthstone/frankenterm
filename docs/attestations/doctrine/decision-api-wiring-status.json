@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "kind": "decision-api-wiring-status",
+  "produced_by_bead": "ft-7h5da.5.5",
+  "generated_at": "2026-07-07T02:00:00Z",
+  "engine": "frankenterm-topo::analyze_decision_api_wiring (DEADWIRE_WIRING_STATUS_SCHEMA_VERSION 1)",
+  "validated_by": "crates/frankenterm-topo/tests/deadwire_gate_workspace.rs — runs in CI via cargo test --workspace; statuses below are re-computed from the live tree on every run and this artifact fails the gate when stale",
+  "dormant_manifest": "crates/frankenterm-topo/deadwire-dormant.json",
+  "limitations": "line-based scan: mentions inside comments count as production callers (a 'wired' verdict is weaker than a 'deadwire' one); #[cfg(test)] regions and tests/ paths are excluded by the gate driver before analysis",
+  "records": [
+    {
+      "symbol": "run_connector_lifecycle_intent",
+      "defining_path": "crates/frankenterm-core/src/policy.rs",
+      "status": "dormant",
+      "dormant_bead": "ft-pohny",
+      "dormant_expires_on": "2026-10-01",
+      "note": "gated production boundary landed + unit-proven (ft-7h5da.5.11); operator surface pending"
+    },
+    {
+      "symbol": "route_connector_operation_through_mesh",
+      "defining_path": "crates/frankenterm-core/src/policy.rs",
+      "status": "wired",
+      "note": "production-called from runtime outbound dispatch (runtime.rs)"
+    },
+    {
+      "symbol": "process_connector_outbound_runtime_event",
+      "defining_path": "crates/frankenterm-core/src/runtime.rs",
+      "status": "wired",
+      "note": "called from the runtime event loop"
+    },
+    {
+      "symbol": "check_dedup",
+      "defining_path": "crates/frankenterm-core/src/tx_idempotency.rs",
+      "status": "wired",
+      "note": "consulted pre-dispatch by tx_execution commit/compensation paths (ft-b0pw6)"
+    },
+    {
+      "symbol": "execute_with_store",
+      "defining_path": "crates/frankenterm-core/src/tx_execution.rs",
+      "status": "wired",
+      "note": "production entry for ft tx run / robot tx run / steer run"
+    },
+    {
+      "symbol": "allow_operation",
+      "defining_path": "crates/frankenterm-core/src/connector_reliability.rs",
+      "status": "wired",
+      "note": "reliability admission gate in connector_outbound_bridge dispatch (ft-x3211)"
+    },
+    {
+      "symbol": "record_action_failure",
+      "defining_path": "crates/frankenterm-core/src/connector_outbound_bridge.rs",
+      "status": "wired",
+      "note": "runtime dispatch feeds failure outcomes to governor backoff + reliability DLQ"
+    },
+    {
+      "symbol": "evaluate_from_trackers",
+      "defining_path": "crates/frankenterm-core/src/quota_gate.rs",
+      "status": "dormant",
+      "dormant_bead": "ft-nmlbn",
+      "dormant_expires_on": "2026-10-01",
+      "note": "QuotaGate launch-admission verdict never consulted in production (ft-nmlbn)"
+    }
+  ]
+}

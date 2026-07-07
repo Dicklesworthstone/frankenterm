@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "note": "Dormant exemptions for the workspace deadwire gate (ft-7h5da.5.5). Every entry MUST carry the bead tracking the wiring work and an expiry date; the gate fails CI when an exemption expires so entries cannot rot into blanket passes. Remove an entry once its symbol gains a production caller.",
+  "exemptions": [
+    {
+      "symbol": "run_connector_lifecycle_intent",
+      "bead_id": "ft-pohny",
+      "expires_on": "2026-10-01"
+    },
+    {
+      "symbol": "evaluate_from_trackers",
+      "bead_id": "ft-nmlbn",
+      "expires_on": "2026-10-01"
+    }
+  ]
+}
