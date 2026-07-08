@@ -805,11 +805,109 @@ pub const CONFIG_KEY_WIRING_INVENTORY: &[ConfigKeyWiringRecord] = &[
         tracking_bead: "ft-vyg9y",
         validation: "SearchConfig::validate_key_wiring rejects reranker_enabled=true as parsed but no-effect",
     },
+    ConfigKeyWiringRecord {
+        key: "workflows.audit_steps",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "no workflow engine/runner path reads it; workflow execution state persists to workflow_executions unconditionally and there is no step-level audit toggle",
+        tracking_bead: "ft-7h5da.5.7",
+        validation: "Config::validate rejects non-default values as parsed but no-effect",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.redaction",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "custom patterns/placeholder/enabled/redact_audit/redact_segments are dropped — the runtime Redactor uses a fixed built-in catalog",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects any non-default [safety.redaction] block fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.capabilities",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "allow_control_chars/allow_non_agent_panes/allow_arbitrary_text/confirm_dangerous_patterns are ignored — input gating uses runtime PaneCapabilities",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects any non-default [safety.capabilities] block fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.reservations",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "default_ttl_secs/max_ttl_secs/conflict_behavior/auto_release_on_complete are ignored — TTL clamping uses the storage PaneReservationConfig",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects any non-default [safety.reservations] block fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.semantic_shock",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "no runtime SemanticShockResponder is wired — anomalies are never surfaced or paused",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects any non-default [safety.semantic_shock] block fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "safety.approval.require_reapproval_on_failure",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "read nowhere — no effect on the approval path",
+        tracking_bead: "ft-1t4o4",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "ingest.backpressure_threshold",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "overflow backpressure uses the fixed consecutive-event threshold in tailer.rs, not this queue-depth value",
+        tracking_bead: "ft-ta5as",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "ingest.gap_detection",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "capture-gap recording is unconditional; disabling it is intentionally not honored to avoid silent replay-fidelity holes",
+        tracking_bead: "ft-ta5as",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "ingest.gap_detection_threshold_percent",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "no overlap/percentage heuristic consumes it",
+        tracking_bead: "ft-ta5as",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
+    ConfigKeyWiringRecord {
+        key: "ingest.max_segment_bytes",
+        status: ConfigKeyWiringStatus::ParsedButUnconsumed,
+        consumer: "none",
+        evidence: "the persistence segment ceiling comes from tuning.ingest.max_persist_segment_bytes, not this field",
+        tracking_bead: "ft-ta5as",
+        validation: "Config::validate rejects non-default values fail-closed",
+    },
 ];
 
 #[must_use]
 pub const fn config_key_wiring_inventory() -> &'static [ConfigKeyWiringRecord] {
     CONFIG_KEY_WIRING_INVENTORY
+}
+
+/// Operator-facing report for `ft config validate`: one line per parsed config
+/// key that currently has no production effect (ft-7h5da.5.7). These keys fail
+/// closed at validate time when customized; at their defaults they are inert,
+/// and this report keeps them visible instead of silently parsed.
+#[must_use]
+pub fn config_key_wiring_validate_report() -> Vec<String> {
+    CONFIG_KEY_WIRING_INVENTORY
+        .iter()
+        .filter(|record| record.status == ConfigKeyWiringStatus::ParsedButUnconsumed)
+        .map(|record| {
+            format!(
+                "{} is parsed but currently has no effect (fail-closed if customized; tracking {})",
+                record.key, record.tracking_bead
+            )
+        })
+        .collect()
 }
 
 fn parsed_but_unconsumed_config_key_message(key: &str, detail: &str) -> String {
@@ -5250,6 +5348,25 @@ impl Config {
                  wired to their runtime consumers.",
                 unhonored_ingest.join("; ")
             ))
+            .into());
+        }
+
+        // ft-7h5da.5.7 [dead-wire][workflows]: workflows.audit_steps is parsed,
+        // defaulted (true), and documented as "Enable step-level audit logging"
+        // but has ZERO production consumers — no workflow engine/runner path
+        // reads it (execution state persists to workflow_executions
+        // unconditionally; there is no step-level audit toggle). Fail closed on
+        // a customized value so an operator disabling — or relying on — step
+        // audit gets a clear error instead of a silent no-op. The default is
+        // honored (no rejection).
+        if self.workflows.audit_steps != WorkflowsConfig::default().audit_steps {
+            return Err(crate::error::ConfigError::ValidationError(
+                parsed_but_unconsumed_config_key_message(
+                    "workflows.audit_steps",
+                    "no workflow engine/runner path reads it — step execution recording is \
+                     unconditional and there is no step-level audit toggle",
+                ),
+            )
             .into());
         }
 

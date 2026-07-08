@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "kind": "config-key-wiring-status",
+  "produced_by_bead": "ft-7h5da.5.7",
+  "generated_at": "2026-07-07T21:00:00Z",
+  "validated_by": "crates/frankenterm-core/tests/config_key_wiring_inventory_artifact.rs — pins these records to the in-code CONFIG_KEY_WIRING_INVENTORY on every cargo test --workspace run; ft config validate surfaces the parsed_but_unconsumed keys and Config::validate rejects customized values for them fail-closed",
+  "note": "Inventory of parsed config keys audited for dead-wire honesty (W4.6). 'consumed' keys have a named production consumer; 'parsed_but_unconsumed' keys are inert at their defaults and REJECTED by validate when customized, so no parsed-but-ignored key ships silently.",
+  "records": [
+    {
+      "key": "search.models_dir",
+      "status": "consumed",
+      "consumer": "crate::search::daemon::worker::EmbedWorker::with_search_config",
+      "evidence": "search_config_models_dir_reaches_fastembed_loader_config_ft_jl09u covers FastEmbed cache_dir propagation",
+      "tracking_bead": "ft-7h5da.5.7",
+      "validation": "accepted by Config::validate, including non-default operator paths"
+    },
+    {
+      "key": "search.mode",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "source audit found no production reads of config.search.mode; dispatch reads concrete search tuning fields directly",
+      "tracking_bead": "ft-7h5da.5.7",
+      "validation": "Config::validate rejects non-default values as parsed but no-effect"
+    },
+    {
+      "key": "search.daemon.enabled",
+      "status": "consumed",
+      "consumer": "crate::ipc::build_search_status_payload",
+      "evidence": "ipc.rs reads search.daemon.enabled to flip background_job_status between idle and paused",
+      "tracking_bead": "ft-v46vj",
+      "validation": "accepted for both true and false"
+    },
+    {
+      "key": "search.daemon.socket_path",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "no production code binds or connects this UDS path; EmbedServer/EmbedClient are foundation types exercised only by tests",
+      "tracking_bead": "ft-v46vj",
+      "validation": "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect"
+    },
+    {
+      "key": "search.daemon.auto_spawn",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "no client-connect path spawns a search daemon, so the toggle has no production effect",
+      "tracking_bead": "ft-v46vj",
+      "validation": "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect"
+    },
+    {
+      "key": "search.daemon.worker_scan_interval_secs",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "no daemon worker loop scans for embedding work; the frankensearch coalescer uses its own batch-wait config",
+      "tracking_bead": "ft-v46vj",
+      "validation": "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect"
+    },
+    {
+      "key": "search.daemon.worker_batch_size",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "no daemon worker batches embedding jobs; frankensearch batching uses its own independently-defaulted max/min_batch_size",
+      "tracking_bead": "ft-v46vj",
+      "validation": "SearchDaemonConfig::validate rejects non-default values as parsed but no-effect"
+    },
+    {
+      "key": "search.reranker_enabled",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "only advertised_embedder_tiers reads it (appends a 'cross-encoder' status-tier string); no production search dispatch reranks — the storage hybrid path has no rerank step, and rerank_fused_results/CrossEncoderReranker are a test-only orchestrator scaffold with an unimplemented ONNX stub",
+      "tracking_bead": "ft-vyg9y",
+      "validation": "SearchConfig::validate_key_wiring rejects reranker_enabled=true as parsed but no-effect"
+    },
+    {
+      "key": "workflows.audit_steps",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "no workflow engine/runner path reads it; workflow execution state persists to workflow_executions unconditionally and there is no step-level audit toggle",
+      "tracking_bead": "ft-7h5da.5.7",
+      "validation": "Config::validate rejects non-default values as parsed but no-effect"
+    },
+    {
+      "key": "safety.redaction",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "custom patterns/placeholder/enabled/redact_audit/redact_segments are dropped — the runtime Redactor uses a fixed built-in catalog",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects any non-default [safety.redaction] block fail-closed"
+    },
+    {
+      "key": "safety.capabilities",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "allow_control_chars/allow_non_agent_panes/allow_arbitrary_text/confirm_dangerous_patterns are ignored — input gating uses runtime PaneCapabilities",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects any non-default [safety.capabilities] block fail-closed"
+    },
+    {
+      "key": "safety.reservations",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "default_ttl_secs/max_ttl_secs/conflict_behavior/auto_release_on_complete are ignored — TTL clamping uses the storage PaneReservationConfig",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects any non-default [safety.reservations] block fail-closed"
+    },
+    {
+      "key": "safety.semantic_shock",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "no runtime SemanticShockResponder is wired — anomalies are never surfaced or paused",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects any non-default [safety.semantic_shock] block fail-closed"
+    },
+    {
+      "key": "safety.approval.require_reapproval_on_failure",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "read nowhere — no effect on the approval path",
+      "tracking_bead": "ft-1t4o4",
+      "validation": "Config::validate rejects non-default values fail-closed"
+    },
+    {
+      "key": "ingest.backpressure_threshold",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "overflow backpressure uses the fixed consecutive-event threshold in tailer.rs, not this queue-depth value",
+      "tracking_bead": "ft-ta5as",
+      "validation": "Config::validate rejects non-default values fail-closed"
+    },
+    {
+      "key": "ingest.gap_detection",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "capture-gap recording is unconditional; disabling it is intentionally not honored to avoid silent replay-fidelity holes",
+      "tracking_bead": "ft-ta5as",
+      "validation": "Config::validate rejects non-default values fail-closed"
+    },
+    {
+      "key": "ingest.gap_detection_threshold_percent",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "no overlap/percentage heuristic consumes it",
+      "tracking_bead": "ft-ta5as",
+      "validation": "Config::validate rejects non-default values fail-closed"
+    },
+    {
+      "key": "ingest.max_segment_bytes",
+      "status": "parsed_but_unconsumed",
+      "consumer": "none",
+      "evidence": "the persistence segment ceiling comes from tuning.ingest.max_persist_segment_bytes, not this field",
+      "tracking_bead": "ft-ta5as",
+      "validation": "Config::validate rejects non-default values fail-closed"
+    }
+  ]
+}

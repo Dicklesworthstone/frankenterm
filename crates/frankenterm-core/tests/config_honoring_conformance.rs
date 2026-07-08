@@ -128,6 +128,19 @@ fn ingest_fields_are_not_silently_ignored() {
 }
 
 #[test]
+fn workflows_audit_steps_is_not_silently_ignored() {
+    // ft-7h5da.5.7: workflows.audit_steps is documented as "Enable step-level
+    // audit logging" but no workflow engine/runner path reads it — workflow
+    // execution recording is unconditional and there is no step-level audit
+    // toggle. A customized value must fail closed instead of silently taking
+    // no effect (an operator "disabling" audit logging must not believe it
+    // was ever on in that form).
+    assert_rejects("workflows", "workflows.audit_steps", |c| {
+        c.workflows.audit_steps = !c.workflows.audit_steps;
+    });
+}
+
+#[test]
 fn search_daemon_unconsumed_fields_are_not_silently_ignored() {
     // ft-v46vj: only search.daemon.enabled is consumed (ipc flips
     // background_job_status). The four sibling fields have no running daemon to
@@ -138,10 +151,14 @@ fn search_daemon_unconsumed_fields_are_not_silently_ignored() {
     assert_rejects("search.daemon", "search.daemon.auto_spawn", |c| {
         c.search.daemon.auto_spawn = !c.search.daemon.auto_spawn;
     });
-    assert_rejects("search.daemon", "search.daemon.worker_scan_interval_secs", |c| {
-        c.search.daemon.worker_scan_interval_secs =
-            c.search.daemon.worker_scan_interval_secs.wrapping_add(1);
-    });
+    assert_rejects(
+        "search.daemon",
+        "search.daemon.worker_scan_interval_secs",
+        |c| {
+            c.search.daemon.worker_scan_interval_secs =
+                c.search.daemon.worker_scan_interval_secs.wrapping_add(1);
+        },
+    );
     assert_rejects("search.daemon", "search.daemon.worker_batch_size", |c| {
         c.search.daemon.worker_batch_size = c.search.daemon.worker_batch_size.wrapping_add(1);
     });
@@ -205,19 +222,39 @@ where
 /// different runtime behavior, the inverse of a silent ignore.
 #[test]
 fn retention_max_mb_value_drives_eviction() {
-    use frankenterm_core::storage::{StorageConfig, StorageHandle};
+    use frankenterm_core::storage::{PaneRecord, StorageConfig, StorageHandle};
 
     run_async(async {
-        let db_path = std::env::temp_dir().join(format!(
-            "ft_m5hvl_retention_{}.db",
-            std::process::id()
-        ));
+        let db_path =
+            std::env::temp_dir().join(format!("ft_m5hvl_retention_{}.db", std::process::id()));
         let db_str = db_path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&db_path);
 
         let storage = StorageHandle::with_config(&db_str, StorageConfig::default())
             .await
             .expect("open storage");
+
+        // Segments carry a foreign key to their pane row, so register the pane
+        // before appending (matches the live capture path: discovery upserts
+        // the pane, then captures append segments).
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 7,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("pane-7".to_string()),
+                cwd: Some("/tmp/pane-7".to_string()),
+                tty_name: None,
+                first_seen_at: 1_710_000_000_000,
+                last_seen_at: 1_710_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: Some(1_710_000_000_000),
+            })
+            .await
+            .expect("upsert pane 7");
 
         // ~4 MiB of low-cardinality content keeps the FTS index tiny so segment
         // content dominates the live size; comfortably over a 1 MiB cap.
@@ -294,7 +331,11 @@ fn session_retention_max_closed_sessions_drives_cleanup() {
     for i in 0..5 {
         insert_closed_session(&conn, &format!("sess-{i}"), 1_000 + i64::from(i));
     }
-    assert_eq!(count_sessions(&conn), 5, "fixture: 5 closed sessions inserted");
+    assert_eq!(
+        count_sessions(&conn),
+        5,
+        "fixture: 5 closed sessions inserted"
+    );
 
     // Only exercise the count policy: disable age + size so this assertion is
     // attributable solely to max_closed_sessions.
@@ -309,7 +350,11 @@ fn session_retention_max_closed_sessions_drives_cleanup() {
         r0.deleted_by_count, 0,
         "max_closed_sessions=0 (unlimited) must delete nothing by count"
     );
-    assert_eq!(count_sessions(&conn), 5, "unlimited cleanup retains all sessions");
+    assert_eq!(
+        count_sessions(&conn),
+        5,
+        "unlimited cleanup retains all sessions"
+    );
 
     let capped = SessionRetentionConfig {
         max_age_days: 0,

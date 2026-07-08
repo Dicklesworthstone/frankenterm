@@ -53958,6 +53958,23 @@ async fn handle_config_command(
                     anyhow::bail!("{} warning(s) found in strict mode", warnings.len());
                 }
             }
+
+            // ft-7h5da.5.7: surface every parsed-but-unconsumed key so operators
+            // learn which settings have no effect BEFORE customizing one (a
+            // customized value fails validate loudly above). Informational —
+            // these keys are inert at their defaults, so they do not trip
+            // --strict.
+            let unconsumed = frankenterm_core::config::config_key_wiring_validate_report();
+            if !unconsumed.is_empty() {
+                println!();
+                println!(
+                    "Parsed-but-unconsumed keys ({} — inventory: docs/attestations/doctrine/config-key-wiring-status.json):",
+                    unconsumed.len()
+                );
+                for line in &unconsumed {
+                    println!("  ○ {line}");
+                }
+            }
         }
 
         ConfigCommands::Show {
