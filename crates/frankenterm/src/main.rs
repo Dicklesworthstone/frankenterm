@@ -68954,6 +68954,115 @@ recorder_backend = "frankensqlite"
         });
     }
 
+    /// ft-6k5gh: a forged GapNotice must NOT advance the per-(sender,pane)
+    /// delta-acceptance frontier. Before the fix, the Gap branch jammed
+    /// `pane_seq_by_sender` to `seq_after - 1`, so a peer sending
+    /// `Gap{ seq_before: 0, seq_after: u64::MAX }` permanently silenced its own
+    /// pane — every later legitimate PaneDelta then failed `delta.seq < expected`
+    /// and was dropped as out-of-order. This drives the exact attack through the
+    /// production `distributed_persist_payload` and proves (a) the frontier is
+    /// untouched by the gap and (b) a subsequent seq-0 delta is still accepted
+    /// and persisted.
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_forged_gap_does_not_suppress_future_deltas_ft_6k5gh() {
+        run_async_test(async {
+            let (storage_handle, db_path) = setup_storage("distributed_forged_gap_frontier").await;
+            let storage =
+                std::sync::Arc::new(frankenterm_core::runtime_async::Mutex::new(storage_handle));
+            let event_bus = std::sync::Arc::new(frankenterm_core::events::EventBus::new(64));
+            let pane_seq_by_sender =
+                frankenterm_core::runtime_async::Mutex::new(std::collections::HashMap::<
+                    (String, u64),
+                    u64,
+                >::new());
+
+            let sender = "agent-gapper";
+            let source_pane_id = 71_u64;
+            let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
+            let seq_key = (sender.to_string(), source_pane_id);
+
+            // Attack: a forged gap claiming everything up to u64::MAX was skipped.
+            distributed_persist_payload(
+                sender,
+                None,
+                frankenterm_core::wire_protocol::WirePayload::Gap(
+                    frankenterm_core::wire_protocol::GapNotice {
+                        pane_id: source_pane_id,
+                        seq_before: 0,
+                        seq_after: u64::MAX,
+                        reason: "forged".to_string(),
+                        detected_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            // The gap must NOT have advanced (or created) the delta frontier.
+            {
+                let guard = pane_seq_by_sender.lock().await;
+                assert!(
+                    guard.get(&seq_key).is_none(),
+                    "ft-6k5gh: a GapNotice must not seed/advance the delta frontier, got {:?}",
+                    guard.get(&seq_key)
+                );
+            }
+
+            // A subsequent legitimate seq-0 delta must still be accepted.
+            let marker = "DIST_GAP_FRONTIER_MARKER";
+            let content = format!("{marker} post-gap delta");
+            distributed_persist_payload(
+                sender,
+                None,
+                frankenterm_core::wire_protocol::WirePayload::PaneDelta(
+                    frankenterm_core::wire_protocol::PaneDelta {
+                        pane_id: source_pane_id,
+                        seq: 0,
+                        content: content.clone(),
+                        content_len: content.len(),
+                        captured_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await
+            .unwrap();
+
+            // Frontier now reflects the accepted delta, and the content is stored.
+            {
+                let guard = pane_seq_by_sender.lock().await;
+                assert_eq!(
+                    guard.get(&seq_key).copied(),
+                    Some(0),
+                    "ft-6k5gh: the seq-0 delta must be accepted and advance the frontier to 0"
+                );
+            }
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                let hits = storage_handle.search(marker).await.unwrap();
+                assert!(
+                    hits.iter().any(|seg| seg.pane_id == remote_pane_id),
+                    "ft-6k5gh: the post-gap delta must be persisted, not dropped as out-of-order"
+                );
+            }
+
+            {
+                let storage_handle = storage.lock().await.clone(); // ubs:ignore
+                storage_handle.shutdown().await.unwrap();
+            }
+            drop(storage);
+            let _ = std::fs::remove_file(&db_path);
+            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+            let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        });
+    }
+
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_persist_payload_normalizes_sender_case_for_remote_pane_mapping() {

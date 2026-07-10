@@ -73,16 +73,21 @@ fn replay_from_checkpoint_is_idempotent() {
     assert_eq!(first, second, "replay_from_checkpoint must be idempotent");
 }
 
-/// CHARACTERIZATION of the ft-3e8mv bug — passes TODAY.
+/// REGRESSION for ft-3e8mv (fixed in 2f13122d1): `compact_before` reclaims
+/// entry memory WITHOUT evicting compacted correlation_ids from the dedup
+/// index. The index is the journal's historical idempotency oracle, so
+/// membership must survive compaction — otherwise a redelivered control command
+/// whose entry was compacted passes the dedup check and is applied twice.
 ///
-/// `MissionJournal::compact_before` removes compacted entries' correlation_ids
-/// from the dedup index, so a redelivered control command with an already-seen
-/// (but compacted) correlation_id is WRONGLY re-accepted. This test locks the
-/// bug's exact shape; DELETE or flip it once ft-3e8mv is fixed (see the
-/// `#[ignore]`d desired-behavior test below, which becomes the regression proof).
+/// (This test was authored as a characterization of the pre-fix bug, but the
+/// fix had already landed ~1.5h earlier, so it was RED-on-HEAD from the start;
+/// flipped to lock the correct post-fix behavior.)
+///
+/// This locks the index-membership half; `compaction_preserves_correlation_dedup`
+/// below locks the append-rejection half (the observable double-apply guard).
 #[test]
-fn compaction_currently_drops_correlation_dedup_ft_3e8mv() {
-    let mut journal = MissionJournal::new(MissionId("m-compact-bug".into()));
+fn compaction_preserves_correlation_index_membership_ft_3e8mv() {
+    let mut journal = MissionJournal::new(MissionId("m-compact-fixed".into()));
     let seq_a = journal
         .append(marker(), "cid-A", "op", "test", None, 1_000)
         .unwrap();
@@ -91,26 +96,29 @@ fn compaction_currently_drops_correlation_dedup_ft_3e8mv() {
         .unwrap();
     assert!(journal.has_correlation("cid-A"));
 
-    // Compact away cid-A's entry (seq < seq_a + 1).
+    // Compact away cid-A's entry (seq < seq_a + 1): the entry is reclaimed…
     journal.compact_before(seq_a + 1);
+    assert_eq!(
+        journal.len(),
+        1,
+        "cid-A's entry is compacted away, cid-B remains"
+    );
 
+    // …but its correlation_id must remain in the historical dedup index.
     assert!(
-        !journal.has_correlation("cid-A"),
-        "ft-3e8mv: compaction drops cid-A from the correlation index"
+        journal.has_correlation("cid-A"),
+        "ft-3e8mv: compaction must NOT drop cid-A from the correlation index"
     );
     let re = journal.append(marker(), "cid-A", "op", "test", None, 3_000);
     assert!(
-        re.is_ok(),
-        "ft-3e8mv BUG (characterized): a compacted correlation_id is re-accepted \
-         instead of rejected; got {re:?}"
+        matches!(re, Err(MissionJournalError::DuplicateCorrelation(ref c)) if c.as_str() == "cid-A"),
+        "ft-3e8mv: a compacted correlation_id must still be rejected, not re-accepted; got {re:?}"
     );
 }
 
-/// DESIRED behavior, pinned to ft-3e8mv. Un-ignore when the fix lands — this is
-/// the regression proof that compaction must NOT reopen the dedup window.
+/// DESIRED behavior, pinned to ft-3e8mv (fixed in 2f13122d1) — the regression
+/// proof that compaction must NOT reopen the dedup window.
 #[test]
-#[ignore = "ft-3e8mv: MissionJournal::compact_before drops correlation_index entries; \
-            un-ignore when fixed — correlation dedup MUST survive compaction"]
 fn compaction_preserves_correlation_dedup() {
     let mut journal = MissionJournal::new(MissionId("m-compact-fixed".into()));
     let seq_x = journal
@@ -129,9 +137,11 @@ fn compaction_preserves_correlation_dedup() {
         matches!(re, Err(MissionJournalError::DuplicateCorrelation(_))),
         "compaction must preserve correlation dedup (ft-3e8mv): got {re:?}"
     );
+    // cid-X's entry was compacted and the redelivery was rejected, so only
+    // cid-Y remains.
     assert_eq!(
         journal.len(),
-        2,
-        "no duplicate re-appended after compaction (cid-Y + the rejected cid-X)"
+        1,
+        "only cid-Y remains: cid-X compacted, its redelivery rejected"
     );
 }
