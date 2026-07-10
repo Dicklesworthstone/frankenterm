@@ -48,7 +48,10 @@ pub fn native_output_truncation_gap_reason(dropped_bytes: u64) -> String {
 
 #[cfg(any(unix, windows))]
 mod socket_transport {
-    #[cfg(all(test, unix))]
+    // Only the `native-events-inline-tests` test modules consume these; an
+    // unconditional `all(test, unix)` gate leaves the re-export unused (and
+    // warning) in default `cargo test` builds where that feature is off.
+    #[cfg(all(test, unix, feature = "native-events-inline-tests"))]
     pub use crate::runtime_async::unix::{AsyncWriteExt, connect};
     #[cfg(unix)]
     pub use crate::runtime_async::unix::{
