@@ -17,7 +17,7 @@
 //! Ungated so the default `cargo test` exercises it; the runtime harness mirrors
 //! `tests/web.rs`.
 
-use frankenterm_core::storage::{SearchOptions, StorageConfig, StorageHandle};
+use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageConfig, StorageHandle};
 
 const QUERY_EMBEDDER_ID: &str = "fnv1a-hash-128";
 
@@ -46,6 +46,30 @@ async fn open_storage(db_path: &str) -> StorageHandle {
     StorageHandle::with_config(db_path, StorageConfig::default())
         .await
         .expect("open storage")
+}
+
+/// Segments carry a foreign key to their pane row, so register the pane before
+/// appending (matches the live capture path: discovery upserts the pane, then
+/// captures append segments).
+async fn register_pane_7(storage: &StorageHandle) {
+    storage
+        .upsert_pane(PaneRecord {
+            pane_id: 7,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: None,
+            tab_id: None,
+            title: Some("pane-7".to_string()),
+            cwd: Some("/tmp/pane-7".to_string()),
+            tty_name: None,
+            first_seen_at: 1_710_000_000_000,
+            last_seen_at: 1_710_000_000_000,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: Some(1_710_000_000_000),
+        })
+        .await
+        .expect("upsert pane 7");
 }
 
 async fn cleanup(storage: StorageHandle, db_path: &str) {
@@ -82,6 +106,7 @@ fn write_embed_search_pipeline_e2e() {
     run_async(async {
         let db = temp_db_path("pipeline");
         let storage = open_storage(&db).await;
+        register_pane_7(&storage).await;
 
         let texts = [
             "error: compilation failed in module auth",
@@ -168,6 +193,7 @@ fn retention_size_eviction_honors_config_and_cascades_embeddings_e2e() {
     run_async(async {
         let db = temp_db_path("retention");
         let storage = open_storage(&db).await;
+        register_pane_7(&storage).await;
 
         // ~4 MiB of low-cardinality content (so the FTS index stays tiny and the
         // segment content dominates the live size), comfortably over a 1 MiB cap.

@@ -37584,7 +37584,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     let mission_path =
                                         resolve_mission_file_path(&layout, mission_file);
-                                    let mission = match load_mission_from_path(&mission_path) {
+                                    let mission = match enforce_robot_mission_path_containment(
+                                        &layout,
+                                        &mission_path,
+                                    )
+                                    .and_then(|()| load_mission_from_path(&mission_path))
+                                    {
                                         Ok(mission) => mission,
                                         Err(err) => {
                                             let response =
@@ -37643,7 +37648,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     let mission_path =
                                         resolve_mission_file_path(&layout, mission_file);
-                                    let mission = match load_mission_from_path(&mission_path) {
+                                    let mission = match enforce_robot_mission_path_containment(
+                                        &layout,
+                                        &mission_path,
+                                    )
+                                    .and_then(|()| load_mission_from_path(&mission_path))
+                                    {
                                         Ok(mission) => mission,
                                         Err(err) => {
                                             let response = RobotResponse::<
@@ -37689,21 +37699,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 RobotTxCommands::Plan { contract_file } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract =
-                                        match load_mission_tx_contract_from_path(&contract_path) {
-                                            Ok(contract) => contract,
-                                            Err(err) => {
-                                                let response =
+                                    let contract = match enforce_robot_mission_path_containment(
+                                        &layout,
+                                        &contract_path,
+                                    )
+                                    .and_then(|()| {
+                                        load_mission_tx_contract_from_path(&contract_path)
+                                    }) {
+                                        Ok(contract) => contract,
+                                        Err(err) => {
+                                            let response =
                                                 RobotResponse::<RobotTxPlanData>::error_with_code(
                                                     robot_tx_error_code(err.error_code),
                                                     err.message,
                                                     err.hint,
                                                     elapsed_ms(start),
                                                 );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     let data = RobotTxPlanData {
                                         contract_file: contract_path.display().to_string(),
@@ -37727,21 +37742,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract =
-                                        match load_mission_tx_contract_from_path(&contract_path) {
-                                            Ok(contract) => contract,
-                                            Err(err) => {
-                                                let response =
+                                    let contract = match enforce_robot_mission_path_containment(
+                                        &layout,
+                                        &contract_path,
+                                    )
+                                    .and_then(|()| {
+                                        load_mission_tx_contract_from_path(&contract_path)
+                                    }) {
+                                        Ok(contract) => contract,
+                                        Err(err) => {
+                                            let response =
                                                 RobotResponse::<RobotTxShowData>::error_with_code(
                                                     robot_tx_error_code(err.error_code),
                                                     err.message,
                                                     err.hint,
                                                     elapsed_ms(start),
                                                 );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     let data = RobotTxShowData {
                                         contract_file: contract_path.display().to_string(),
@@ -37771,21 +37791,26 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let mut contract =
-                                        match load_mission_tx_contract_from_path(&contract_path) {
-                                            Ok(contract) => contract,
-                                            Err(err) => {
-                                                let response =
+                                    let mut contract = match enforce_robot_mission_path_containment(
+                                        &layout,
+                                        &contract_path,
+                                    )
+                                    .and_then(|()| {
+                                        load_mission_tx_contract_from_path(&contract_path)
+                                    }) {
+                                        Ok(contract) => contract,
+                                        Err(err) => {
+                                            let response =
                                                 RobotResponse::<RobotTxRunData>::error_with_code(
                                                     robot_tx_error_code(err.error_code),
                                                     err.message,
                                                     err.hint,
                                                     elapsed_ms(start),
                                                 );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     if let Some(fail_step_id) = fail_step.as_deref()
                                         && !contract
@@ -37935,11 +37960,16 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract =
-                                        match load_mission_tx_contract_from_path(&contract_path) {
-                                            Ok(contract) => contract,
-                                            Err(err) => {
-                                                let response = RobotResponse::<
+                                    let contract = match enforce_robot_mission_path_containment(
+                                        &layout,
+                                        &contract_path,
+                                    )
+                                    .and_then(|()| {
+                                        load_mission_tx_contract_from_path(&contract_path)
+                                    }) {
+                                        Ok(contract) => contract,
+                                        Err(err) => {
+                                            let response = RobotResponse::<
                                                     RobotTxRollbackData,
                                                 >::error_with_code(
                                                     robot_tx_error_code(err.error_code),
@@ -37947,10 +37977,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     err.hint,
                                                     elapsed_ms(start),
                                                 );
-                                                print_robot_response(&response, format, stats)?;
-                                                return Ok(());
-                                            }
-                                        };
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+                                    };
 
                                     let now_ms = mission_now_ms();
                                     let commit_report = match build_robot_tx_rollback_commit_report(
@@ -43901,29 +43931,32 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
                 let contract_path = resolve_mission_tx_file_path(&layout, contract_file);
-                let mut contract = match load_mission_tx_contract_from_path(&contract_path) {
-                    Ok(contract) => contract,
-                    Err(err) => {
-                        if as_json {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "ok": false,
-                                    "error_code": err.error_code,
-                                    "error": err.message,
-                                    "hint": err.hint,
-                                    "version": frankenterm_core::VERSION,
-                                })
-                            );
-                        } else {
-                            eprintln!("Error: {}", err.message);
-                            if let Some(hint) = err.hint {
-                                eprintln!("Hint: {hint}");
+                let mut contract =
+                    match enforce_robot_mission_path_containment(&layout, &contract_path)
+                        .and_then(|()| load_mission_tx_contract_from_path(&contract_path))
+                    {
+                        Ok(contract) => contract,
+                        Err(err) => {
+                            if as_json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "error_code": err.error_code,
+                                        "error": err.message,
+                                        "hint": err.hint,
+                                        "version": frankenterm_core::VERSION,
+                                    })
+                                );
+                            } else {
+                                eprintln!("Error: {}", err.message);
+                                if let Some(hint) = err.hint {
+                                    eprintln!("Hint: {hint}");
+                                }
                             }
+                            std::process::exit(err.exit_code);
                         }
-                        std::process::exit(err.exit_code);
-                    }
-                };
+                    };
                 if let Some(fail_step_id) = fail_step.as_deref()
                     && !contract
                         .plan
@@ -43953,7 +43986,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
                 let live_mission = match &mission_file {
                     Some(path) => {
-                        let parsed = std::fs::read_to_string(path).ok().and_then(|s| {
+                        // ft-99ybo: steer is a machine-driven surface — the
+                        // caller-supplied mission path gets the same
+                        // containment guard + capped read as the contract.
+                        if let Err(err) = enforce_robot_mission_path_containment(&layout, path) {
+                            eprintln!("Error: {}", err.message);
+                            if let Some(hint) = err.hint {
+                                eprintln!("Hint: {hint}");
+                            }
+                            std::process::exit(err.exit_code);
+                        }
+                        let parsed = read_mission_file_capped(path).ok().and_then(|s| {
                             serde_json::from_str::<frankenterm_core::plan::Mission>(&s).ok()
                         });
                         match parsed {
@@ -55688,6 +55731,160 @@ mod read_mission_file_capped_tests {
     }
 }
 
+/// ft-99ybo containment guard for ROBOT-surface mission/tx file paths.
+///
+/// Mirrors the MCP-side `resolve_workspace_scoped_path` contract
+/// (`mcp_missions.rs`): reject any parent-directory (`..`) component, then
+/// canonicalize the closest existing ancestor and require it to stay inside
+/// the workspace root (so symlinks cannot smuggle the read outside either).
+/// Applied only at robot/steer call sites — the human `ft mission` / `ft tx`
+/// operator commands intentionally keep unconstrained paths.
+fn enforce_robot_mission_path_containment(
+    layout: &frankenterm_core::config::WorkspaceLayout,
+    path: &Path,
+) -> Result<(), MissionCommandError> {
+    use std::path::Component;
+
+    let escape = |detail: String| MissionCommandError {
+        exit_code: MISSION_EXIT_INVALID_INPUT,
+        error_code: "mission.path_escapes_workspace",
+        message: detail,
+        hint: Some(
+            "Robot mission/tx paths must resolve inside the workspace and must not \
+             contain parent-dir (..) components."
+                .to_string(),
+        ),
+    };
+
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(escape(format!(
+                "path contains parent-directory component: {}",
+                path.display()
+            )));
+        }
+    }
+
+    let root_canon = layout
+        .root
+        .canonicalize()
+        .map_err(|err| escape(format!("failed to canonicalize workspace root: {err}")))?;
+    // Canonicalize the closest existing ancestor: the target file (and even its
+    // mission/ directory) may not exist yet on a fresh workspace, but its
+    // containment is still decidable from the first ancestor that does exist.
+    let mut ancestor = path;
+    let ancestor_canon = loop {
+        match ancestor.canonicalize() {
+            Ok(resolved) => break resolved,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => match ancestor.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => ancestor = parent,
+                _ => {
+                    return Err(escape(format!(
+                        "path has no accessible ancestor: {}",
+                        path.display()
+                    )));
+                }
+            },
+            Err(err) => {
+                return Err(escape(format!(
+                    "path not accessible while resolving containment: {err}"
+                )));
+            }
+        }
+    };
+    if !ancestor_canon.starts_with(&root_canon) {
+        return Err(escape(format!(
+            "path escapes workspace root: {} is not under {}",
+            path.display(),
+            layout.root.display()
+        )));
+    }
+    Ok(())
+}
+
+/// ft-99ybo containment-half regression coverage: the robot/steer surfaces
+/// must reject caller paths that escape the workspace (parent-dir components,
+/// absolute out-of-root paths, symlink escapes) while the default `.ft`
+/// mission/tx paths — including not-yet-created ones — keep passing.
+#[cfg(test)]
+mod robot_mission_path_containment_tests {
+    use super::*;
+
+    fn layout_for_root(root: &Path) -> frankenterm_core::config::WorkspaceLayout {
+        let ft_dir = root.join(".ft");
+        frankenterm_core::config::WorkspaceLayout {
+            root: root.to_path_buf(),
+            db_path: ft_dir.join("ft.db"),
+            lock_path: ft_dir.join("watch.lock"),
+            ipc_socket_path: ft_dir.join("ft.sock"),
+            logs_dir: ft_dir.join("logs"),
+            log_path: ft_dir.join("logs").join("ft-watch.log"),
+            crash_dir: ft_dir.join("crash"),
+            diag_dir: ft_dir.join("diag"),
+            ft_dir,
+        }
+    }
+
+    #[test]
+    fn rejects_parent_dir_components() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_root(dir.path());
+        let sneaky = dir.path().join("..").join("outside.json");
+        let err = enforce_robot_mission_path_containment(&layout, &sneaky)
+            .expect_err("parent-dir component must be rejected");
+        assert_eq!(err.error_code, "mission.path_escapes_workspace");
+        assert_eq!(err.exit_code, MISSION_EXIT_INVALID_INPUT);
+    }
+
+    #[test]
+    fn rejects_absolute_path_outside_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let elsewhere = tempfile::tempdir().expect("outside tempdir");
+        let layout = layout_for_root(workspace.path());
+        let outside = elsewhere.path().join("contract.json");
+        std::fs::write(&outside, "{}").expect("write outside file");
+        let err = enforce_robot_mission_path_containment(&layout, &outside)
+            .expect_err("out-of-workspace absolute path must be rejected");
+        assert_eq!(err.error_code, "mission.path_escapes_workspace");
+    }
+
+    #[test]
+    fn accepts_existing_file_inside_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_root(dir.path());
+        let inside = dir.path().join("mission.json");
+        std::fs::write(&inside, "{}").expect("write inside file");
+        enforce_robot_mission_path_containment(&layout, &inside)
+            .expect("in-workspace file must pass containment");
+    }
+
+    #[test]
+    fn accepts_default_not_yet_created_ft_mission_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_root(dir.path());
+        // .ft/mission/active.json does not exist yet — containment must still
+        // resolve via the nearest existing ancestor (the workspace root).
+        let default_path = default_mission_file_path(&layout);
+        enforce_robot_mission_path_containment(&layout, &default_path)
+            .expect("default .ft mission path must pass even before creation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escaping_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let elsewhere = tempfile::tempdir().expect("outside tempdir");
+        let layout = layout_for_root(workspace.path());
+        let target = elsewhere.path().join("secret.json");
+        std::fs::write(&target, "{}").expect("write symlink target");
+        let link = workspace.path().join("innocent.json");
+        std::os::unix::fs::symlink(&target, &link).expect("create escaping symlink");
+        let err = enforce_robot_mission_path_containment(&layout, &link)
+            .expect_err("symlink escaping the workspace must be rejected");
+        assert_eq!(err.error_code, "mission.path_escapes_workspace");
+    }
+}
+
 fn mission_now_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as i64,
@@ -55714,9 +55911,7 @@ fn load_mission_from_path(
             exit_code: MISSION_EXIT_NOT_FOUND,
             error_code: "mission.file_not_found",
             message: format!("Mission file not found: {}", path.display()),
-            hint: Some(
-                "Pass --mission-file <path> or create .ft/mission/active.json.".to_string(),
-            ),
+            hint: Some("Pass --mission-file <path> or create .ft/mission/active.json.".to_string()),
         },
         MissionFileReadFailure::Io(err) => MissionCommandError {
             exit_code: MISSION_EXIT_IO,
@@ -56623,6 +56818,7 @@ fn robot_mission_error_code(mission_error_code: &str) -> &'static str {
     match mission_error_code {
         "mission.file_not_found" => "robot.mission_not_found",
         "mission.file_read_failed" => "robot.mission_read_failed",
+        "mission.path_escapes_workspace" => "robot.path_escapes_workspace",
         "mission.invalid_json" => "robot.mission_invalid_json",
         "mission.validation_failed" => "robot.mission_validation_failed",
         "mission.assignment_not_found" => "robot.assignment_not_found",
@@ -56646,6 +56842,9 @@ fn robot_tx_error_code(tx_error_code: &str) -> &'static str {
         "mission.tx.file_read_failed" => "robot.tx_read_failed",
         "mission.tx.invalid_json" => "robot.tx_invalid_json",
         "mission.tx.validation_failed" => "robot.tx_validation_failed",
+        // The containment guard is shared across the mission and tx loaders,
+        // so its code arrives in the mission.* namespace here too (ft-99ybo).
+        "mission.path_escapes_workspace" => "robot.path_escapes_workspace",
         _ => "robot.tx_error",
     }
 }
@@ -67925,6 +68124,10 @@ reason = "overly conservative pending threshold"
             ROBOT_ERR_INVALID_ARGS
         );
         assert_eq!(
+            robot_mission_error_code("mission.path_escapes_workspace"),
+            "robot.path_escapes_workspace"
+        );
+        assert_eq!(
             robot_mission_error_code("mission.unmapped"),
             "robot.mission_error"
         );
@@ -67939,6 +68142,10 @@ reason = "overly conservative pending threshold"
         assert_eq!(
             robot_tx_error_code("mission.tx.validation_failed"),
             "robot.tx_validation_failed"
+        );
+        assert_eq!(
+            robot_tx_error_code("mission.path_escapes_workspace"),
+            "robot.path_escapes_workspace"
         );
         assert_eq!(robot_tx_error_code("mission.tx.unmapped"), "robot.tx_error");
     }
