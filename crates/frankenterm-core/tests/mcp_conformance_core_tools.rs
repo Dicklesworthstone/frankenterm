@@ -681,9 +681,14 @@ fn assert_search_success_data(envelope: &Value) {
     assert_json_number_field(data, "pane_filter", 1.0);
     assert_json_number_field(data, "since_filter", 0.0);
     assert_json_number_field(data, "until_filter", 4_102_444_800_000.0);
+    // Effective mode is now "hybrid", not a lexical fallback: ft-xx5cl wired
+    // embed-on-append, so seed_search_db's appended segments carry fnv1a-hash-128
+    // embeddings and the hybrid search finds real semantic candidates instead of
+    // degrading to lexical. `data.mode` == `metrics.effective_mode` (both report
+    // the mode that actually ran); `requested_mode` stays "hybrid".
     assert_eq!(
         data.get("mode"),
-        Some(&Value::String("lexical".to_string()))
+        Some(&Value::String("hybrid".to_string()))
     );
     let metrics = data
         .get("metrics")
@@ -695,7 +700,7 @@ fn assert_search_success_data(envelope: &Value) {
     );
     assert_eq!(
         metrics.get("effective_mode"),
-        Some(&Value::String("lexical".to_string()))
+        Some(&Value::String("hybrid".to_string()))
     );
     assert!(metrics.get("fallback_reason").is_some());
     assert!(metrics.get("semantic_latency_ms").is_some());

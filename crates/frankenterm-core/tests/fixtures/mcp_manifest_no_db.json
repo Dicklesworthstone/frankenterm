@@ -10,7 +10,7 @@
         "operator"
       ],
       "uri_template": "wa://attention-router/items/{item_id}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Compile an objective into the same dry-run surface as wa.mission_objective_plan",
@@ -22,7 +22,7 @@
         "robot"
       ],
       "uri_template": "wa://mission/objective-plan/{objective}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only operating-envelope run artifact shape",
@@ -34,7 +34,7 @@
         "operating-envelope"
       ],
       "uri_template": "wa://operating-envelope/runs/{run_id}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Filter proof history by bead, category, status, or release-blocking",
@@ -46,7 +46,7 @@
         "proof-history"
       ],
       "uri_template": "wa://proof-history/{filter}/{value}/{limit}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only score or explain receipt using the default demo manifest",
@@ -58,7 +58,7 @@
         "operator"
       ],
       "uri_template": "wa://rehearsal-score/{surface}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Filter rule catalog by agent type",
@@ -69,7 +69,7 @@
         "rules"
       ],
       "uri_template": "wa://rules/{agent_type}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only swarm-capacity run artifact shape",
@@ -81,7 +81,7 @@
         "operator"
       ],
       "uri_template": "wa://swarm-capacity/runs/{run_id}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     }
   ],
   "resources": [
@@ -96,7 +96,7 @@
         "coordination"
       ],
       "uri": "wa://agent-mail/outbox",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only attention-router status surface with degraded source health",
@@ -108,7 +108,7 @@
         "operator"
       ],
       "uri": "wa://attention-router/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Active signed attestation retractions",
@@ -120,7 +120,7 @@
         "retractions"
       ],
       "uri": "wa://attestation/retractions",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only herd-wave contract and dry-run planner surface",
@@ -132,7 +132,7 @@
         "operator"
       ],
       "uri": "wa://herd-wave",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only fail-closed swarm operating-envelope status",
@@ -144,7 +144,7 @@
         "operating-envelope"
       ],
       "uri": "wa://operating-envelope/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Pane snapshot (same data surface as wa.state)",
@@ -155,7 +155,7 @@
         "panes"
       ],
       "uri": "wa://panes",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only input-to-photon renderer SLO status and evidence pointers",
@@ -168,7 +168,7 @@
         "input-to-photon"
       ],
       "uri": "wa://perf/renderer-slo/input_to_photon",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only SSIM parity renderer SLO status and evidence pointers",
@@ -181,7 +181,7 @@
         "ssim-parity"
       ],
       "uri": "wa://perf/renderer-slo/ssim_parity",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only proof-history rows with release-blocking summary",
@@ -193,7 +193,7 @@
         "proof-history"
       ],
       "uri": "wa://proof-history",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only proof-history rows blocking release",
@@ -206,7 +206,7 @@
         "release-blocking"
       ],
       "uri": "wa://proof-history/release-blocking",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only rehearsal score receipt from the default demo manifest",
@@ -218,7 +218,7 @@
         "operator"
       ],
       "uri": "wa://rehearsal-score/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Rule catalog (same data surface as wa.rules_list with verbose output)",
@@ -229,7 +229,7 @@
         "rules"
       ],
       "uri": "wa://rules",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only swarm-capacity status, doctor, and MCP resource shape",
@@ -241,7 +241,20 @@
         "operator"
       ],
       "uri": "wa://swarm-capacity/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
+    },
+    {
+      "description": "Read-only sibling-agent scent with live CWDs, reservations, and TTL freshness",
+      "mime_type": "application/json",
+      "name": "ft swarm scent",
+      "tags": [
+        "wa",
+        "swarm",
+        "scent",
+        "attention"
+      ],
+      "uri": "wa://swarm/scent",
+      "version": "0.12.0"
     },
     {
       "description": "Builtin workflow catalog and metadata",
@@ -252,7 +265,7 @@
         "workflows"
       ],
       "uri": "wa://workflows",
-      "version": "0.5.0"
+      "version": "0.12.0"
     }
   ],
   "tools": [
@@ -306,7 +319,7 @@
         "robot",
         "attention"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -384,7 +397,7 @@
         "robot",
         "cass"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -418,7 +431,7 @@
         "robot",
         "cass"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -471,7 +484,7 @@
         "robot",
         "cass"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -517,7 +530,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -552,7 +565,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -691,7 +704,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -751,7 +764,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -818,13 +831,13 @@
         "swarm",
         "operating-envelope"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": {
-        "destructive": false,
-        "idempotent": true,
-        "readOnly": true
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "readOnlyHint": true
       },
       "description": "Score or explain a demo rehearsal manifest without mutating panes, services, Beads, or storage (robot parity)",
       "input_schema": {
@@ -875,7 +888,7 @@
         "rehearsal",
         "demo"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -912,7 +925,7 @@
         "robot",
         "rules"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -952,7 +965,7 @@
         "robot",
         "rules"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -989,7 +1002,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1043,7 +1056,7 @@
         "robot",
         "steer"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1074,7 +1087,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1110,7 +1123,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1169,7 +1182,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     }
   ]
 }

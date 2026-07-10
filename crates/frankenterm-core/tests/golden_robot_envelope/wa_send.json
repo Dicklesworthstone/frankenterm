@@ -16,6 +16,11 @@
         "maxLength": 16,
         "type": "string"
       },
+      "idempotency_key": {
+        "description": "Caller replay key; repeated non-dry-run sends with the same pane/text/key return the stored submitted or queued receipt without re-sending",
+        "maxLength": 256,
+        "type": "string"
+      },
       "pane_id": {
         "description": "Pane ID to send to",
         "minimum": 0,
@@ -209,7 +214,7 @@
     "mcp_version": "v1",
     "now": 0,
     "ok": true,
-    "version": "0.5.0"
+    "version": "0.12.0"
   },
   "tool": "wa.send"
 }

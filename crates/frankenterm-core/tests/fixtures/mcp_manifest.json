@@ -9,7 +9,7 @@
         "accounts"
       ],
       "uri_template": "wa://accounts/{service}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only explanation for a scored attention-router item",
@@ -21,7 +21,7 @@
         "operator"
       ],
       "uri_template": "wa://attention-router/items/{item_id}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read only unhandled events with configurable limit",
@@ -33,7 +33,7 @@
         "unhandled"
       ],
       "uri_template": "wa://events/unhandled/{limit}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Override page size for events resource",
@@ -44,7 +44,7 @@
         "events"
       ],
       "uri_template": "wa://events/{limit}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Compile an objective into the same dry-run surface as wa.mission_objective_plan",
@@ -56,7 +56,7 @@
         "robot"
       ],
       "uri_template": "wa://mission/objective-plan/{objective}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only operating-envelope run artifact shape",
@@ -68,7 +68,7 @@
         "operating-envelope"
       ],
       "uri_template": "wa://operating-envelope/runs/{run_id}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Filter proof history by bead, category, status, or release-blocking",
@@ -80,7 +80,7 @@
         "proof-history"
       ],
       "uri_template": "wa://proof-history/{filter}/{value}/{limit}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only score or explain receipt using the default demo manifest",
@@ -92,7 +92,7 @@
         "operator"
       ],
       "uri_template": "wa://rehearsal-score/{surface}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Filter reservations by pane id",
@@ -103,7 +103,7 @@
         "reservations"
       ],
       "uri_template": "wa://reservations/{pane_id}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Filter rule catalog by agent type",
@@ -114,7 +114,7 @@
         "rules"
       ],
       "uri_template": "wa://rules/{agent_type}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only swarm-capacity run artifact shape",
@@ -126,7 +126,7 @@
         "operator"
       ],
       "uri_template": "wa://swarm-capacity/runs/{run_id}",
-      "version": "0.5.0"
+      "version": "0.12.0"
     }
   ],
   "resources": [
@@ -139,7 +139,7 @@
         "accounts"
       ],
       "uri": "wa://accounts",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only Agent Mail fallback outbox entries and replay state",
@@ -152,7 +152,7 @@
         "coordination"
       ],
       "uri": "wa://agent-mail/outbox",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only attention-router status surface with degraded source health",
@@ -164,7 +164,7 @@
         "operator"
       ],
       "uri": "wa://attention-router/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Active signed attestation retractions",
@@ -176,7 +176,7 @@
         "retractions"
       ],
       "uri": "wa://attestation/retractions",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only context pressure and handoff risk forecast",
@@ -188,7 +188,7 @@
         "horizon"
       ],
       "uri": "wa://context/horizon",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Recent detection events (default limit 50)",
@@ -199,7 +199,7 @@
         "events"
       ],
       "uri": "wa://events",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only herd-wave contract and dry-run planner surface",
@@ -211,7 +211,7 @@
         "operator"
       ],
       "uri": "wa://herd-wave",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only fail-closed swarm operating-envelope status",
@@ -223,7 +223,7 @@
         "operating-envelope"
       ],
       "uri": "wa://operating-envelope/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Pane snapshot (same data surface as wa.state)",
@@ -234,7 +234,7 @@
         "panes"
       ],
       "uri": "wa://panes",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only input-to-photon renderer SLO status and evidence pointers",
@@ -247,7 +247,7 @@
         "input-to-photon"
       ],
       "uri": "wa://perf/renderer-slo/input_to_photon",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only SSIM parity renderer SLO status and evidence pointers",
@@ -260,7 +260,7 @@
         "ssim-parity"
       ],
       "uri": "wa://perf/renderer-slo/ssim_parity",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only proof-history rows with release-blocking summary",
@@ -272,7 +272,7 @@
         "proof-history"
       ],
       "uri": "wa://proof-history",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only proof-history rows blocking release",
@@ -285,7 +285,7 @@
         "release-blocking"
       ],
       "uri": "wa://proof-history/release-blocking",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only rehearsal score receipt from the default demo manifest",
@@ -297,7 +297,7 @@
         "operator"
       ],
       "uri": "wa://rehearsal-score/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Active pane reservations (same data surface as wa.reservations)",
@@ -308,7 +308,7 @@
         "reservations"
       ],
       "uri": "wa://reservations",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Rule catalog (same data surface as wa.rules_list with verbose output)",
@@ -319,7 +319,7 @@
         "rules"
       ],
       "uri": "wa://rules",
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "description": "Read-only swarm-capacity status, doctor, and MCP resource shape",
@@ -331,7 +331,20 @@
         "operator"
       ],
       "uri": "wa://swarm-capacity/current",
-      "version": "0.5.0"
+      "version": "0.12.0"
+    },
+    {
+      "description": "Read-only sibling-agent scent with live CWDs, reservations, and TTL freshness",
+      "mime_type": "application/json",
+      "name": "ft swarm scent",
+      "tags": [
+        "wa",
+        "swarm",
+        "scent",
+        "attention"
+      ],
+      "uri": "wa://swarm/scent",
+      "version": "0.12.0"
     },
     {
       "description": "Builtin workflow catalog and metadata",
@@ -342,7 +355,7 @@
         "workflows"
       ],
       "uri": "wa://workflows",
-      "version": "0.5.0"
+      "version": "0.12.0"
     }
   ],
   "tools": [
@@ -379,7 +392,7 @@
         "robot",
         "accounts"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -411,7 +424,7 @@
         "robot",
         "accounts"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -463,285 +476,7 @@
         "robot",
         "attention"
       ],
-      "version": "0.5.0"
-    },
-    {
-      "annotations": null,
-      "description": "Search coding agent session history via cass",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "agent": {
-            "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt",
-            "maxLength": 64,
-            "type": "string"
-          },
-          "days": {
-            "description": "Only sessions within the last N days",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "fields": {
-            "description": "Field selection (cass-defined; e.g. minimal)",
-            "type": "string"
-          },
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "maxLength": 16,
-            "type": "string"
-          },
-          "limit": {
-            "default": 10,
-            "description": "Maximum results (0 = cass default)",
-            "maximum": 1000,
-            "minimum": 0,
-            "type": "integer"
-          },
-          "max_tokens": {
-            "description": "Max tokens per hit content (cass-defined)",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "offset": {
-            "default": 0,
-            "description": "Offset into results",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "query": {
-            "description": "Search query string",
-            "maxLength": 65536,
-            "type": "string"
-          },
-          "timeout_secs": {
-            "default": 15,
-            "description": "cass timeout override (seconds)",
-            "maximum": 600,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "workspace": {
-            "description": "Workspace filter (cass-defined)",
-            "type": "string"
-          }
-        },
-        "required": [
-          "query"
-        ],
-        "type": "object"
-      },
-      "name": "wa.cass_search",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "cass"
-      ],
-      "version": "0.5.0"
-    },
-    {
-      "annotations": null,
-      "description": "Check cass index status",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "maxLength": 16,
-            "type": "string"
-          },
-          "timeout_secs": {
-            "default": 15,
-            "description": "cass timeout override (seconds)",
-            "maximum": 600,
-            "minimum": 1,
-            "type": "integer"
-          }
-        },
-        "type": "object"
-      },
-      "name": "wa.cass_status",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "cass"
-      ],
-      "version": "0.5.0"
-    },
-    {
-      "annotations": null,
-      "description": "View context for a cass search hit",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "context_lines": {
-            "default": 10,
-            "description": "Context lines before/after match",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "maxLength": 16,
-            "type": "string"
-          },
-          "line_number": {
-            "description": "Line number returned by cass search",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "source_path": {
-            "description": "Source path returned by cass search",
-            "type": "string"
-          },
-          "timeout_secs": {
-            "default": 15,
-            "description": "cass timeout override (seconds)",
-            "maximum": 600,
-            "minimum": 1,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "source_path",
-          "line_number"
-        ],
-        "type": "object"
-      },
-      "name": "wa.cass_view",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "cass"
-      ],
-      "version": "0.5.0"
-    },
-    {
-      "annotations": null,
-      "description": "Semantic pane API: flat OSC 133 zones for a pane (robot parity). Returns a flat list, NOT a DOM tree.",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "command_index": {
-            "description": "Command index for output_of/exit_code; -1 (default) selects the most recent",
-            "type": "integer"
-          },
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "maxLength": 16,
-            "type": "string"
-          },
-          "pane_id": {
-            "description": "The pane ID to query",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "query": {
-            "description": "Semantic-pane verb: zones (flat list), last_command, output_of, or exit_code",
-            "enum": [
-              "zones",
-              "last_command",
-              "output_of",
-              "exit_code"
-            ],
-            "type": "string"
-          }
-        },
-        "required": [
-          "pane_id",
-          "query"
-        ],
-        "type": "object"
-      },
-      "name": "wa.dom",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot"
-      ],
-      "version": "0.5.0"
-    },
-    {
-      "annotations": null,
-      "description": "Get pattern detection events (robot parity)",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "event_type": {
-            "description": "Filter by event type",
-            "type": "string"
-          },
-          "format": {
-            "description": "Optional output format override for this call",
-            "enum": [
-              "json",
-              "toon"
-            ],
-            "maxLength": 16,
-            "type": "string"
-          },
-          "label": {
-            "description": "Filter by label (exact match)",
-            "type": "string"
-          },
-          "limit": {
-            "default": 20,
-            "description": "Maximum results",
-            "maximum": 1000,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "pane": {
-            "description": "Filter by pane ID",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "rule_id": {
-            "description": "Filter by rule ID (exact match)",
-            "type": "string"
-          },
-          "since": {
-            "description": "Filter by time (epoch ms)",
-            "type": "integer"
-          },
-          "triage_state": {
-            "description": "Filter by triage state (exact match)",
-            "type": "string"
-          },
-          "unhandled": {
-            "default": false,
-            "description": "Only return unhandled events",
-            "type": "boolean"
-          }
-        },
-        "type": "object"
-      },
-      "name": "wa.events",
-      "output_schema": null,
-      "tags": [
-        "wa",
-        "robot",
-        "events"
-      ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -824,7 +559,285 @@
         "robot",
         "events"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
+    },
+    {
+      "annotations": null,
+      "description": "Search coding agent session history via cass",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "description": "Agent filter: codex|claude_code|gemini|cursor|aider|chatgpt",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "days": {
+            "description": "Only sessions within the last N days",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fields": {
+            "description": "Field selection (cass-defined; e.g. minimal)",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Maximum results (0 = cass default)",
+            "maximum": 1000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens": {
+            "description": "Max tokens per hit content (cass-defined)",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Offset into results",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "description": "Search query string",
+            "maxLength": 65536,
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": 15,
+            "description": "cass timeout override (seconds)",
+            "maximum": 600,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "workspace": {
+            "description": "Workspace filter (cass-defined)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "wa.cass_search",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "cass"
+      ],
+      "version": "0.12.0"
+    },
+    {
+      "annotations": null,
+      "description": "Check cass index status",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": 15,
+            "description": "cass timeout override (seconds)",
+            "maximum": 600,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.cass_status",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "cass"
+      ],
+      "version": "0.12.0"
+    },
+    {
+      "annotations": null,
+      "description": "View context for a cass search hit",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "context_lines": {
+            "default": 10,
+            "description": "Context lines before/after match",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "line_number": {
+            "description": "Line number returned by cass search",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_path": {
+            "description": "Source path returned by cass search",
+            "type": "string"
+          },
+          "timeout_secs": {
+            "default": 15,
+            "description": "cass timeout override (seconds)",
+            "maximum": 600,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_path",
+          "line_number"
+        ],
+        "type": "object"
+      },
+      "name": "wa.cass_view",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "cass"
+      ],
+      "version": "0.12.0"
+    },
+    {
+      "annotations": null,
+      "description": "Semantic pane API: flat OSC 133 zones for a pane (robot parity). Returns a flat list, NOT a DOM tree.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "command_index": {
+            "description": "Command index for output_of/exit_code; -1 (default) selects the most recent",
+            "type": "integer"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "pane_id": {
+            "description": "The pane ID to query",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "query": {
+            "description": "Semantic-pane verb: zones (flat list), last_command, output_of, or exit_code",
+            "enum": [
+              "zones",
+              "last_command",
+              "output_of",
+              "exit_code"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "pane_id",
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "wa.dom",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot"
+      ],
+      "version": "0.12.0"
+    },
+    {
+      "annotations": null,
+      "description": "Get pattern detection events (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "event_type": {
+            "description": "Filter by event type",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "maxLength": 16,
+            "type": "string"
+          },
+          "label": {
+            "description": "Filter by label (exact match)",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "Maximum results",
+            "maximum": 1000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "pane": {
+            "description": "Filter by pane ID",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rule_id": {
+            "description": "Filter by rule ID (exact match)",
+            "type": "string"
+          },
+          "since": {
+            "description": "Filter by time (epoch ms)",
+            "type": "integer"
+          },
+          "triage_state": {
+            "description": "Filter by triage state (exact match)",
+            "type": "string"
+          },
+          "unhandled": {
+            "default": false,
+            "description": "Only return unhandled events",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.events",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "events"
+      ],
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -872,7 +885,7 @@
         "robot",
         "events"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -924,7 +937,7 @@
         "robot",
         "events"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -972,7 +985,7 @@
         "robot",
         "events"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1018,7 +1031,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1064,7 +1077,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1099,7 +1112,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1238,7 +1251,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1280,7 +1293,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1315,7 +1328,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1375,7 +1388,7 @@
         "robot",
         "mission"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1442,13 +1455,13 @@
         "swarm",
         "operating-envelope"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": {
-        "destructive": false,
-        "idempotent": true,
-        "readOnly": true
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "readOnlyHint": true
       },
       "description": "Score or explain a demo rehearsal manifest without mutating panes, services, Beads, or storage (robot parity)",
       "input_schema": {
@@ -1499,7 +1512,7 @@
         "rehearsal",
         "demo"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1533,7 +1546,7 @@
         "robot",
         "reservations"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1565,7 +1578,7 @@
         "robot",
         "reservations"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1620,7 +1633,7 @@
         "robot",
         "reservations"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1657,7 +1670,7 @@
         "robot",
         "rules"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1697,7 +1710,7 @@
         "robot",
         "rules"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1767,7 +1780,7 @@
         "robot",
         "search"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1787,6 +1800,11 @@
               "toon"
             ],
             "maxLength": 16,
+            "type": "string"
+          },
+          "idempotency_key": {
+            "description": "Caller replay key; repeated non-dry-run sends with the same pane/text/key return the stored submitted or queued receipt without re-sending",
+            "maxLength": 256,
             "type": "string"
           },
           "pane_id": {
@@ -1843,7 +1861,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1880,7 +1898,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1934,7 +1952,7 @@
         "robot",
         "steer"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -1965,7 +1983,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -2000,7 +2018,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -2044,7 +2062,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -2080,7 +2098,7 @@
         "robot",
         "tx"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -2139,7 +2157,7 @@
         "wa",
         "robot"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -2184,7 +2202,7 @@
         "robot",
         "workflow"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     },
     {
       "annotations": null,
@@ -2259,7 +2277,7 @@
         "robot",
         "workflow"
       ],
-      "version": "0.5.0"
+      "version": "0.12.0"
     }
   ]
 }
