@@ -12976,16 +12976,38 @@ fn append_segment_backend(
     zone_type: Option<&str>,
 ) -> Result<Segment> {
     let next_seq = next_output_segment_seq_backend(backend, pane_id)?;
-    insert_output_segment_with_seq_backend(
+    let now = now_ms();
+    let segment = insert_output_segment_with_seq_backend(
         backend,
         pane_id,
         next_seq,
         content,
         content_hash,
         zone_type,
-        now_ms(),
+        now,
         crate::redact_backfill::current_catalog_version(),
-    )
+    )?;
+    // ft-xx5cl parity: the batched group-commit path embeds every persisted
+    // segment, but the writer routes a lone queued append (group.len() == 1)
+    // through this single-append path — without this call those segments
+    // silently skipped semantic indexing, making `wa.search` semantic/hybrid
+    // coverage batch-size-dependent. The dispatch arm redacts before calling
+    // us, so `content` here is the persisted (redacted) form, matching the
+    // group path's embed-over-redacted contract.
+    let semantic_embedder = crate::search::HashEmbedder::default();
+    let semantic_embedder_id = {
+        use crate::search::Embedder;
+        semantic_embedder.info().name
+    };
+    index_segment_embedding_backend(
+        backend,
+        &semantic_embedder,
+        &semantic_embedder_id,
+        segment.id,
+        content,
+        now,
+    );
+    Ok(segment)
 }
 
 struct CommittedAppendSegment {
@@ -21553,6 +21575,48 @@ fn append_segment_assigns_gapless_monotonic_independent_seqs() {
         0,
         "no duplicate (pane_id, seq) pairs may exist"
     );
+}
+
+/// ft-xx5cl parity guard: the SINGLE-append path must write the same
+/// `fnv1a-hash-128` semantic embedding the batched group-commit path writes.
+/// The writer routes a lone queued append (`group.len() == 1`) through
+/// `append_segment_backend`, so before this guard those segments silently
+/// skipped semantic indexing and `wa.search` semantic/hybrid coverage became
+/// batch-size-dependent.
+#[test]
+fn append_segment_backend_writes_semantic_embedding_like_group_path() {
+    let backend = memory_backend();
+    seed_pane_backend(&backend, 1, 1_000);
+
+    let seg = append_segment_backend(&backend, 1, "compilation failed in auth", None, None)
+        .unwrap();
+
+    let row = backend
+        .query_row_typed(
+            "SELECT embedder_id, dimension FROM segment_embeddings WHERE segment_id = ?1",
+            &[ToSqlValue::Integer(seg.id)],
+        )
+        .unwrap()
+        .expect("single-append segment must have a semantic embedding row");
+    let reader = RowReader::new(&row);
+    assert_eq!(
+        reader.string(0).unwrap(),
+        "fnv1a-hash-128",
+        "embedder_id must match the query path"
+    );
+    assert_eq!(reader.i64(1).unwrap(), 128, "dimension must match HashEmbedder::default()");
+
+    // Empty content is skipped by contract (nothing to embed) — and must not
+    // error out the append itself.
+    let empty = append_segment_backend(&backend, 1, "", None, None).unwrap();
+    let empty_row = backend
+        .query_row_typed(
+            "SELECT COUNT(*) FROM segment_embeddings WHERE segment_id = ?1",
+            &[ToSqlValue::Integer(empty.id)],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(RowReader::new(&empty_row).i64(0).unwrap(), 0);
 }
 
 fn seed_pane_with_last_seen_backend(
