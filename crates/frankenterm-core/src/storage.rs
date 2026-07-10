@@ -16005,6 +16005,13 @@ const SIZE_EVICTION_MAX_DELETE_PER_PASS: usize = 200_000;
 /// Oldest-segment delete batch per inner iteration of size eviction.
 const SIZE_EVICTION_BATCH: usize = 4_096;
 
+/// Hard cap on size-eviction loop iterations per invocation. Proportional
+/// batch estimation (see [`enforce_size_limit_backend`]) can shrink batches to
+/// a handful of segments near the cap; this bounds the per-invocation PRAGMA
+/// remeasure cost for pathological overhead-dominated databases. An
+/// over-limit exit is retried by the next maintenance tick.
+const SIZE_EVICTION_MAX_PASSES: usize = 4_096;
+
 /// Estimated live (non-free) database size in bytes:
 /// `(page_count - freelist_count) * page_size`. This is the quantity a
 /// size-cap eviction must drive down — unlike the raw file size
@@ -16070,9 +16077,29 @@ fn enforce_size_limit_backend(
 
     let mut deleted_total = 0usize;
     let mut used_now = used_before;
-    while used_now > cap_bytes && deleted_total < SIZE_EVICTION_MAX_DELETE_PER_PASS {
+    let mut passes = 0usize;
+    while used_now > cap_bytes
+        && deleted_total < SIZE_EVICTION_MAX_DELETE_PER_PASS
+        && passes < SIZE_EVICTION_MAX_PASSES
+    {
+        passes += 1;
         let budget = SIZE_EVICTION_MAX_DELETE_PER_PASS - deleted_total;
-        let batch = SIZE_EVICTION_BATCH.min(budget);
+        // Proportional batch sizing: estimate how many oldest segments must go
+        // to reach the cap (attributing the whole live size to the current
+        // segment population) instead of always deleting a full
+        // SIZE_EVICTION_BATCH. A fixed 4096-batch wiped EVERY segment in any
+        // over-cap database holding fewer than 4096 of them — a small DB one
+        // megabyte over its cap lost all scrollback instead of its oldest
+        // slice. The estimate over-attributes fixed overhead to segments, so
+        // it under-deletes and the loop converges from above in a few passes.
+        let seg_count = count_segments_before_backend(backend, i64::MAX)?;
+        if seg_count == 0 {
+            break;
+        }
+        let avg_bytes = (used_now / seg_count as u64).max(1);
+        let over_bytes = used_now - cap_bytes;
+        let needed = usize::try_from(over_bytes.div_ceil(avg_bytes)).unwrap_or(usize::MAX);
+        let batch = SIZE_EVICTION_BATCH.min(budget).min(needed.max(1));
         let deleted = delete_oldest_segments_backend(backend, batch)?;
         deleted_total += deleted;
         if deleted == 0 {
@@ -22790,6 +22817,27 @@ fn enforce_size_limit_evicts_oldest_segments_under_cap() {
             StorageHandle::with_config_with_cx(&cx, &db_path_str, StorageConfig::default())
                 .await
                 .unwrap();
+
+        // Segments carry a foreign key to their pane row; register the pane
+        // before appending (matches the live capture path).
+        storage
+            .upsert_pane(PaneRecord {
+                pane_id: 7,
+                pane_uuid: None,
+                domain: "local".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("size-cap".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: 1_700_000_000_000,
+                last_seen_at: 1_700_000_000_000,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: None,
+            })
+            .await
+            .unwrap();
 
         // Low-cardinality content (a single repeated char) keeps the FTS index
         // tiny so the output_segments content dominates the live size, making
