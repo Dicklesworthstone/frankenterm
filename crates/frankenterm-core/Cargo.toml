@@ -857,9 +857,12 @@ required-features = ["asupersync-runtime"]
 [features]
 # Everything is on by default — ft is a standalone terminal platform with no feature gates.
 # Use `--no-default-features` to compile a minimal build.
+# `agent-mail` is deliberately NOT default (ft-ok02z): the AgentMailBridge live
+# messaging/reservation transport has zero production callers, so shipping it
+# on-by-default overadvertised unwired capability. Opt in with
+# `--features agent-mail`; re-promotion is gated on ft-7c21y (real wiring).
 default = [
     "agent-detection",
-    "agent-mail",
     "asupersync-runtime",
     "browser",
     "cass-export",

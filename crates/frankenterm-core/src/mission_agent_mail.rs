@@ -21,7 +21,10 @@
 //! that lifecycle is driven in production — it does not describe behavior the
 //! running product exercises today. Do not read the present-tense API docs as
 //! an active multi-agent-coordination guarantee. Wiring is gated on the mission
-//! coordination lifecycle itself becoming live; tracked by ft-ok02z.
+//! coordination lifecycle itself becoming live; tracked by ft-7c21y (the
+//! `agent-mail`-gated [`MissionMailTransport`] impl for `AgentMailBridge` is
+//! also opt-in now that `agent-mail` was demoted out of the default feature
+//! set under ft-ok02z).
 
 use std::collections::{BTreeSet, HashMap};
 
