@@ -68982,7 +68982,10 @@ recorder_backend = "frankensqlite"
             let remote_pane_id = distributed_remote_pane_id(sender, source_pane_id);
             let seq_key = (sender.to_string(), source_pane_id);
 
-            // Attack: a forged gap claiming everything up to u64::MAX was skipped.
+            // Attack A: a forged gap claiming a huge (but i64-representable) span
+            // was skipped. This records the gap for forensics but must NOT move
+            // the delta frontier — that is the exact ft-6k5gh jam vector.
+            let huge_seq_after = i64::MAX as u64;
             distributed_persist_payload(
                 sender,
                 None,
@@ -68990,8 +68993,8 @@ recorder_backend = "frankensqlite"
                     frankenterm_core::wire_protocol::GapNotice {
                         pane_id: source_pane_id,
                         seq_before: 0,
-                        seq_after: u64::MAX,
-                        reason: "forged".to_string(),
+                        seq_after: huge_seq_after,
+                        reason: "forged-huge".to_string(),
                         detected_at_ms: now_ms(),
                     },
                 ),
@@ -69000,7 +69003,7 @@ recorder_backend = "frankensqlite"
                 &pane_seq_by_sender,
             )
             .await
-            .unwrap();
+            .expect("a representable forged gap is recorded without error");
 
             // The gap must NOT have advanced (or created) the delta frontier.
             {
@@ -69008,6 +69011,41 @@ recorder_backend = "frankensqlite"
                 assert!(
                     guard.get(&seq_key).is_none(),
                     "ft-6k5gh: a GapNotice must not seed/advance the delta frontier, got {:?}",
+                    guard.get(&seq_key)
+                );
+            }
+
+            // Attack B: an over-i64-range seq_after cannot be persisted, so the
+            // Gap branch returns an Err — but the caller (the listener loop)
+            // handles that with `if let Err(err) = …` and continues. Crucially,
+            // the frontier is STILL untouched, so the pane is not silenced even
+            // when the forged gap is rejected at the storage layer.
+            let over_range_result = distributed_persist_payload(
+                sender,
+                None,
+                frankenterm_core::wire_protocol::WirePayload::Gap(
+                    frankenterm_core::wire_protocol::GapNotice {
+                        pane_id: source_pane_id,
+                        seq_before: 0,
+                        seq_after: u64::MAX,
+                        reason: "forged-overflow".to_string(),
+                        detected_at_ms: now_ms(),
+                    },
+                ),
+                &storage,
+                &event_bus,
+                &pane_seq_by_sender,
+            )
+            .await;
+            assert!(
+                over_range_result.is_err(),
+                "ft-6k5gh: an over-i64 seq_after gap is rejected at persist, not silently applied"
+            );
+            {
+                let guard = pane_seq_by_sender.lock().await;
+                assert!(
+                    guard.get(&seq_key).is_none(),
+                    "ft-6k5gh: even a rejected over-range gap must not touch the frontier, got {:?}",
                     guard.get(&seq_key)
                 );
             }
