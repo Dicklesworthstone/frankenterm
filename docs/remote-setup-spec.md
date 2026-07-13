@@ -127,6 +127,14 @@ Type=simple
 ExecStart=/usr/bin/frankenterm-mux-server --daemonize=false
 Restart=on-failure
 RestartSec=2
+# The mux owns every pane's PTY, so an oomd kill takes down every process
+# hosted in those panes -- on a fleet box, the whole agent swarm at once.
+# It is a small-RSS process and is only ever picked because it is a cheap
+# candidate in a pressured slice, so remove it from oomd's candidate set.
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto
+ManagedOOMPreference=omit
+MemoryHigh=400G
 
 [Install]
 WantedBy=default.target

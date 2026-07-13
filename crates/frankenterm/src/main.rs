@@ -29584,6 +29584,12 @@ async fn run_distributed_agent(
 
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
         .with_tuning(config.tuning.clone())
+        .with_connector_inbound_bridge_config(
+            frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
+                classifier: config.safety.data_classifier.clone(),
+                ..Default::default()
+            },
+        )
         .with_event_bus(Arc::clone(&event_bus))
         .with_wezterm_handle(wezterm_handle);
     let handle = Arc::new(runtime.start().await?);
@@ -30274,6 +30280,12 @@ async fn run_watcher(
     // Create and start the observation runtime (with event bus for workflow integration)
     let mut runtime = ObservationRuntime::new(runtime_config, storage, pattern_engine)
         .with_tuning(config.tuning.clone())
+        .with_connector_inbound_bridge_config(
+            frankenterm_core::connector_inbound_bridge::ConnectorInboundBridgeConfig {
+                classifier: config.safety.data_classifier.clone(),
+                ..Default::default()
+            },
+        )
         .with_event_bus(Arc::clone(&event_bus))
         .with_wezterm_handle(wezterm_handle.clone());
     let handle = Arc::new(runtime.start().await?);
@@ -61741,6 +61753,16 @@ async fn run_guided_setup(apply: bool, dry_run: bool, verbose: u8) -> anyhow::Re
 }
 
 /// Generate a systemd unit for the FrankenTerm mux server using the resolved binary path.
+///
+/// The unit opts out of systemd-oomd. The mux owns every pane's PTY, so killing
+/// it takes down every process hosted in those panes at once. On a fleet box
+/// that is the entire agent swarm: on 2026-07-12 oomd killed this service
+/// ("memory pressure for user@1000.service being 61.38% > 50.00% for > 20s")
+/// and destroyed 14 panes, 11 claude/codex agents, and the tmux sessions under
+/// them. The mux is a tiny RSS process (~200MB), so it is never the right thing
+/// to reclaim -- it is only ever picked because it is a cheap candidate sitting
+/// in a pressured slice. `ManagedOOMPreference=omit` removes it from oomd's
+/// candidate set entirely; `MemoryHigh` still bounds it if it genuinely leaks.
 fn remote_mux_service_unit(mux_path: &str) -> String {
     format!(
         r"[Unit]
@@ -61752,6 +61774,12 @@ Type=simple
 ExecStart={mux_path} --daemonize=false
 Restart=on-failure
 RestartSec=2
+# Never let systemd-oomd reclaim the mux: it holds every pane's PTY, so an
+# oomd kill destroys every agent session on the host. See fn doc above.
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto
+ManagedOOMPreference=omit
+MemoryHigh=400G
 
 [Install]
 WantedBy=default.target
