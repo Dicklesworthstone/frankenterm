@@ -145,3 +145,67 @@ fn compaction_preserves_correlation_dedup() {
         "only cid-Y remains: cid-X compacted, its redelivery rejected"
     );
 }
+
+#[test]
+fn correlation_index_cap_refuses_new_ids_fail_closed_ft_anpt8() {
+    // ft-anpt8: the dedup index only grows (compaction must not reopen
+    // correlation IDs — ft-3e8mv), so a long-running mission used to grow
+    // one owned String per distinct control command forever. The fix bounds
+    // the index: at the cap, NEW correlation IDs are refused with a typed
+    // fail-closed error, while duplicates of already-accepted IDs keep
+    // deduplicating exactly (the double-apply window never reopens).
+    let mut journal =
+        MissionJournal::new(MissionId("m-cap".into())).with_correlation_index_cap(3);
+
+    for i in 0..3_i64 {
+        journal
+            .append(marker(), format!("cid-{i}"), "op", "test", None, 1_000 + i)
+            .expect("appends under the cap succeed");
+    }
+
+    // A NEW id at the cap is refused fail-closed…
+    let overflow = journal.append(marker(), "cid-new", "op", "test", None, 2_000);
+    assert!(
+        matches!(overflow, Err(MissionJournalError::CorrelationIndexFull(3))),
+        "new correlation id at cap must be refused with CorrelationIndexFull, got {overflow:?}"
+    );
+    assert_eq!(journal.len(), 3, "refused append must not add an entry");
+    assert!(
+        !journal.has_correlation("cid-new"),
+        "refused id must not be recorded as seen"
+    );
+
+    // …but duplicates of accepted ids still dedup exactly (the invariant the
+    // cap must never weaken).
+    let dup = journal.append(marker(), "cid-1", "op", "test", None, 3_000);
+    assert!(
+        matches!(dup, Err(MissionJournalError::DuplicateCorrelation(ref c)) if c.as_str() == "cid-1"),
+        "duplicates must still be detected at cap, got {dup:?}"
+    );
+    assert!(journal.has_correlation("cid-1"));
+
+    // Compaction reclaims entries but neither forgets accepted ids nor frees
+    // cap headroom (the index is historical by design).
+    journal.compact_before(u64::MAX);
+    assert_eq!(journal.len(), 0);
+    assert!(journal.has_correlation("cid-0"));
+    let still_full = journal.append(marker(), "cid-after-compact", "op", "test", None, 4_000);
+    assert!(
+        matches!(still_full, Err(MissionJournalError::CorrelationIndexFull(3))),
+        "compaction must not reopen index headroom, got {still_full:?}"
+    );
+}
+
+#[test]
+fn correlation_index_cap_zero_is_clamped_to_one_ft_anpt8() {
+    let mut journal =
+        MissionJournal::new(MissionId("m-cap-zero".into())).with_correlation_index_cap(0);
+    journal
+        .append(marker(), "cid-only", "op", "test", None, 1_000)
+        .expect("cap 0 clamps to 1, so one id is accepted");
+    let second = journal.append(marker(), "cid-two", "op", "test", None, 2_000);
+    assert!(
+        matches!(second, Err(MissionJournalError::CorrelationIndexFull(1))),
+        "second distinct id must hit the clamped cap, got {second:?}"
+    );
+}

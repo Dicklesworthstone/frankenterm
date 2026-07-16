@@ -5663,8 +5663,35 @@ impl MissionJournalReplayReport {
 pub enum MissionJournalError {
     #[error("duplicate correlation ID: {0}")]
     DuplicateCorrelation(String),
+    #[error(
+        "correlation index full ({0} correlation IDs): the journal refuses NEW correlation IDs \
+         so long-mission dedup memory stays bounded (ft-anpt8); duplicates of already-accepted \
+         IDs are still rejected as duplicates. Raise the bound with \
+         MissionJournal::with_correlation_index_cap or rotate the mission"
+    )]
+    CorrelationIndexFull(usize),
     #[error("journal error: {0}")]
     Internal(String),
+}
+
+/// Default bound on distinct correlation IDs a journal tracks (ft-anpt8).
+///
+/// 100k digests ≈ 5 MB of dedup state — far beyond any practical mission's
+/// distinct control-command count, but a hard ceiling instead of an OOM.
+const DEFAULT_CORRELATION_INDEX_CAP: usize = 100_000;
+
+/// Stable 128-bit digest of a correlation ID for the dedup index (ft-anpt8).
+///
+/// Storing digests instead of owned `String`s cuts per-ID memory ~5x while
+/// keeping the index exact for all practical purposes: a collision requires
+/// ~2^64 distinct IDs, and its only effect is a FALSE REJECT
+/// (`DuplicateCorrelation` for a genuinely new ID) — the fail-safe direction.
+/// A false accept (double-apply) cannot be produced by a collision.
+fn correlation_id_digest(cid: &str) -> u128 {
+    let digest = Sha256::digest(cid.as_bytes());
+    let mut first_half = [0u8; 16];
+    first_half.copy_from_slice(&digest[..16]);
+    u128::from_le_bytes(first_half)
 }
 
 /// Crash-consistent, append-only mission journal.
@@ -5672,8 +5699,13 @@ pub struct MissionJournal {
     mission_id: MissionId,
     entries: Vec<MissionJournalEntry>,
     next_seq: u64,
-    // Historical idempotency set. Entry compaction must not reopen correlation IDs.
-    correlation_index: std::collections::HashSet<String>,
+    // Historical idempotency set (digests — see `correlation_id_digest`).
+    // Entry compaction must not reopen correlation IDs, so this set only
+    // grows; `correlation_index_cap` bounds that growth fail-closed
+    // (ft-anpt8) instead of letting a long-running mission grow one owned
+    // String per control command forever (the ft-3e8mv follow-up footgun).
+    correlation_index: std::collections::HashSet<u128>,
+    correlation_index_cap: usize,
     last_checkpoint_seq: Option<u64>,
     max_entries: Option<usize>,
 }
@@ -5687,6 +5719,7 @@ impl MissionJournal {
             entries: Vec::new(),
             next_seq: 1,
             correlation_index: std::collections::HashSet::new(),
+            correlation_index_cap: DEFAULT_CORRELATION_INDEX_CAP,
             last_checkpoint_seq: None,
             max_entries: None,
         }
@@ -5696,6 +5729,19 @@ impl MissionJournal {
     #[must_use]
     pub fn with_max_entries(mut self, limit: usize) -> Self {
         self.max_entries = Some(limit);
+        self
+    }
+
+    /// Override the bound on distinct correlation IDs (ft-anpt8).
+    ///
+    /// When the index reaches the cap, [`Self::append`] refuses NEW
+    /// correlation IDs with [`MissionJournalError::CorrelationIndexFull`]
+    /// (fail-closed, observable) rather than growing without bound;
+    /// already-accepted IDs keep deduplicating exactly. A cap of 0 is
+    /// clamped to 1 so a journal can never be constructed append-dead.
+    #[must_use]
+    pub fn with_correlation_index_cap(mut self, cap: usize) -> Self {
+        self.correlation_index_cap = cap.max(1);
         self
     }
 
@@ -5722,15 +5768,21 @@ impl MissionJournal {
         timestamp_ms: i64,
     ) -> Result<u64, MissionJournalError> {
         let cid = correlation_id.into();
-        if self.correlation_index.contains(&cid) {
+        let digest = correlation_id_digest(&cid);
+        if self.correlation_index.contains(&digest) {
             return Err(MissionJournalError::DuplicateCorrelation(cid));
+        }
+        if self.correlation_index.len() >= self.correlation_index_cap {
+            return Err(MissionJournalError::CorrelationIndexFull(
+                self.correlation_index.len(),
+            ));
         }
 
         let seq = self.next_seq;
         self.next_seq += 1;
 
         let entry_hash = format!("h:{seq}:{}", self.mission_id.0);
-        self.correlation_index.insert(cid.clone());
+        self.correlation_index.insert(digest);
         self.entries.push(MissionJournalEntry {
             seq,
             timestamp_ms,
@@ -5810,7 +5862,7 @@ impl MissionJournal {
     /// Whether a correlation ID has ever been accepted by the journal.
     #[must_use]
     pub fn has_correlation(&self, cid: &str) -> bool {
-        self.correlation_index.contains(cid)
+        self.correlation_index.contains(&correlation_id_digest(cid))
     }
 
     /// Whether the journal exceeds its max entry limit.
