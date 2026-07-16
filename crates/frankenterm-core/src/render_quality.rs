@@ -463,8 +463,17 @@ pub const RENDERER_SSIM_PARITY_MCP_RESOURCE_URI: &str = "wa://perf/renderer-slo/
 /// Current non-claiming status for the input-to-photon SLO substrate.
 pub const RENDERER_INPUT_TO_PHOTON_STATUS: &str = "stage_telemetry_substrate_wired_pending_lab_run";
 /// Retained-evidence ledger status for the input-to-photon SLOs.
+///
+/// ft-tf6g3.3.8 (2026-07-16): a retained macOS target run now exists
+/// (native Apple-Silicon Metal, exit 0) but measured OVER the 16ms p95
+/// target through the headless GPU-readback proxy on a loaded fleet host —
+/// so the status advances from `substrate_only_…` to `retained_run_over_
+/// target_…` while remaining non-claiming (`pending_lab_run`, never
+/// `validated`) until a quiet-host run proves the bound. See
+/// docs/perf/resize-quality-slo.json RQ-S2 `target_run_attempt` for the
+/// artifact hashes and confounder analysis.
 pub const RENDERER_INPUT_TO_PHOTON_RETAINED_EVIDENCE_STATUS: &str =
-    "substrate_only_pending_lab_run";
+    "retained_run_over_target_pending_lab_run";
 /// Gap-evidence artifact for input-to-photon until a retained lab run lands.
 pub const RENDERER_INPUT_TO_PHOTON_GAP_EVIDENCE: &str =
     "docs/attestations/perf/lindley-bounds.json";
