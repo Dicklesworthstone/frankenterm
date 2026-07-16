@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use frankenterm_escape_parser::parser::Parser;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_escape_parser::Action;
+use frankenterm_escape_parser::parser::Parser;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use serde_json::json;
@@ -272,12 +272,14 @@ fn now_ms() -> u64 {
 }
 
 fn bench_term_parser_ab(c: &mut Criterion) {
+    type ParserDriver = fn(&[u8]) -> usize;
+    type ParserLane = (&'static str, ParserDriver);
+
     let workloads: &[(&str, &[u8])] = &[
         ("dense_ascii_rows", dense_ascii_rows_payload()),
         ("csi_osc_heavy", csi_osc_heavy_payload()),
     ];
-    let lanes: &[(&str, fn(&[u8]) -> usize)] =
-        &[("parser", drive_parser), ("terminal", drive_terminal)];
+    let lanes: &[ParserLane] = &[("parser", drive_parser), ("terminal", drive_terminal)];
 
     let mut group = c.benchmark_group("term_parser_ab");
     for (workload, payload) in workloads {
