@@ -2826,6 +2826,19 @@ impl MissionTxState {
     pub fn is_settled(self) -> bool {
         self.is_terminal() || matches!(self, Self::Failed)
     }
+
+    const fn expected_outcome(self) -> TxOutcome {
+        match self {
+            Self::Committed => TxOutcome::Committed,
+            Self::Failed => TxOutcome::Failed,
+            Self::Compensated | Self::RolledBack => TxOutcome::Compensated,
+            Self::Draft
+            | Self::Planned
+            | Self::Prepared
+            | Self::Committing
+            | Self::Compensating => TxOutcome::Pending,
+        }
+    }
 }
 
 impl fmt::Display for MissionTxState {
@@ -3425,6 +3438,12 @@ impl MissionTxContract {
 
     /// Validate contract consistency.
     pub fn validate(&self) -> Result<(), String> {
+        if self.tx_version != MISSION_TX_SCHEMA_VERSION {
+            return Err(format!(
+                "Transaction tx_version {} is unsupported; expected {}",
+                self.tx_version, MISSION_TX_SCHEMA_VERSION
+            ));
+        }
         validate_tx_identifier("intent tx_id", &self.intent.tx_id.0)?;
         validate_tx_identifier("plan tx_id", &self.plan.tx_id.0)?;
         validate_tx_identifier("plan_id", &self.plan.plan_id.0)?;
@@ -3434,6 +3453,14 @@ impl MissionTxContract {
             return Err(format!(
                 "Transaction intent tx_id {} does not match plan tx_id {}",
                 self.intent.tx_id.0, self.plan.tx_id.0
+            ));
+        }
+
+        let expected_outcome = self.lifecycle_state.expected_outcome();
+        if self.outcome != expected_outcome {
+            return Err(format!(
+                "Transaction state {} requires outcome {:?}, got {:?}",
+                self.lifecycle_state, expected_outcome, self.outcome
             ));
         }
 
@@ -3504,6 +3531,8 @@ impl MissionTxContract {
             }
         }
 
+        let _ = validate_persisted_tx_receipts(self)?;
+
         Ok(())
     }
 }
@@ -3526,6 +3555,14 @@ pub struct TxPrepareGateInput {
     pub step_id: TxStepId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<u64>,
+    /// Whether every plan-level precondition was proven from the prepare snapshot.
+    ///
+    /// This defaults to `false` on deserialization so legacy or incomplete gate
+    /// evidence cannot silently bypass newly added preconditions.
+    #[serde(default)]
+    pub preconditions_satisfied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precondition_reason_code: Option<String>,
     pub policy_passed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_reason_code: Option<String>,
@@ -3696,6 +3733,9 @@ pub struct TxPrepareTargetSnapshot {
 pub struct TxPrepareEvaluationContext {
     pub workspace_id: String,
     pub surface: PolicySurface,
+    /// Authenticated caller identity for policy evaluation. This must come
+    /// from the entry surface, never from the caller-authored tx contract.
+    pub actor: ActorKind,
     pub workflow_id: Option<String>,
     pub agent_type: Option<String>,
     pub stale_after_ms: i64,
@@ -3709,6 +3749,7 @@ impl TxPrepareEvaluationContext {
         Self {
             workspace_id: workspace_id.into(),
             surface: PolicySurface::Workflow,
+            actor: ActorKind::Workflow,
             workflow_id: None,
             agent_type: None,
             stale_after_ms: Self::DEFAULT_STALE_AFTER_MS,
@@ -3718,6 +3759,12 @@ impl TxPrepareEvaluationContext {
     #[must_use]
     pub fn with_surface(mut self, surface: PolicySurface) -> Self {
         self.surface = surface;
+        self
+    }
+
+    #[must_use]
+    pub fn with_actor(mut self, actor: ActorKind) -> Self {
+        self.actor = actor;
         self
     }
 
@@ -3881,13 +3928,6 @@ impl TxPrepareTargetLookup for StorageBackedPrepareTargetLookup<'_> {
     }
 }
 
-fn tx_prepare_actor_kind(role: MissionActorRole) -> ActorKind {
-    match role {
-        MissionActorRole::Operator => ActorKind::Human,
-        MissionActorRole::Planner | MissionActorRole::Dispatcher => ActorKind::Workflow,
-    }
-}
-
 fn tx_prepare_action_kind(action: &StepAction) -> ActionKind {
     match action {
         StepAction::SendText { .. } => ActionKind::SendText,
@@ -4029,7 +4069,6 @@ fn tx_prepare_reservation(
 }
 
 fn tx_prepare_policy_input(
-    contract: &MissionTxContract,
     step: &TxStep,
     pane_id: Option<u64>,
     snapshot: Option<&TxPrepareTargetSnapshot>,
@@ -4045,13 +4084,10 @@ fn tx_prepare_policy_input(
         capabilities.reserved_by = Some(reserved_by);
     }
 
-    let mut input = PolicyInput::new(
-        tx_prepare_action_kind(&step.action),
-        tx_prepare_actor_kind(contract.intent.requested_by),
-    )
-    .with_surface(context.surface)
-    .with_capabilities(capabilities)
-    .with_text_summary(tx_prepare_text_summary(step));
+    let mut input = PolicyInput::new(tx_prepare_action_kind(&step.action), context.actor)
+        .with_surface(context.surface)
+        .with_capabilities(capabilities)
+        .with_text_summary(tx_prepare_text_summary(step));
 
     if let Some(pane_id) = pane_id {
         input = input.with_pane(pane_id);
@@ -4078,9 +4114,90 @@ fn tx_prepare_policy_input(
     input
 }
 
+fn tx_prepare_plan_preconditions<T>(
+    plan: &TxPlan,
+    targets: &T,
+    target_cache: &mut HashMap<u64, std::result::Result<Option<TxPrepareTargetSnapshot>, String>>,
+    context: &TxPrepareEvaluationContext,
+    now_ms: i64,
+) -> (bool, Option<String>)
+where
+    T: TxPrepareTargetLookup,
+{
+    if plan
+        .preconditions
+        .iter()
+        .any(|precondition| matches!(precondition, TxPrecondition::Custom { .. }))
+    {
+        return (
+            false,
+            Some("tx.prepare.precondition.custom_unsupported".to_string()),
+        );
+    }
+
+    for precondition in &plan.preconditions {
+        let TxPrecondition::PromptActive { pane_id } = precondition else {
+            continue;
+        };
+        let snapshot_result = target_cache
+            .entry(*pane_id)
+            .or_insert_with(|| targets.lookup_target(*pane_id))
+            .clone();
+        let (target_live, liveness_reason_code) =
+            tx_prepare_liveness(Some(*pane_id), Some(&snapshot_result), context, now_ms);
+        if !target_live {
+            let reason_code = liveness_reason_code.map_or_else(
+                || format!("tx.prepare.precondition.prompt_active.target_unknown:{pane_id}"),
+                |reason_code| {
+                    reason_code.replacen("tx.prepare.", "tx.prepare.precondition.prompt_active.", 1)
+                },
+            );
+            return (false, Some(reason_code));
+        }
+
+        let snapshot = match snapshot_result {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) | Err(_) => {
+                return (
+                    false,
+                    Some(format!(
+                        "tx.prepare.precondition.prompt_active.target_unknown:{pane_id}"
+                    )),
+                );
+            }
+        };
+        if snapshot.pane_id != *pane_id {
+            return (
+                false,
+                Some(format!(
+                    "tx.prepare.precondition.prompt_active.target_mismatch:{pane_id}"
+                )),
+            );
+        }
+        if !snapshot.capabilities.prompt_active {
+            return (
+                false,
+                Some(format!(
+                    "tx.prepare.precondition.prompt_active.inactive:{pane_id}"
+                )),
+            );
+        }
+    }
+
+    (true, None)
+}
+
 /// Build explicit allow-all prepare-gate inputs used by synthetic tx surfaces.
+///
+/// Prompt-state checks are treated as supplied synthetic evidence. Custom
+/// expressions remain unsupported and therefore fail closed even here.
 #[must_use]
 pub fn tx_prepare_gate_inputs_allow_all(contract: &MissionTxContract) -> Vec<TxPrepareGateInput> {
+    let custom_precondition_unsupported = contract
+        .plan
+        .preconditions
+        .iter()
+        .any(|precondition| matches!(precondition, TxPrecondition::Custom { .. }));
     contract
         .plan
         .steps
@@ -4088,6 +4205,9 @@ pub fn tx_prepare_gate_inputs_allow_all(contract: &MissionTxContract) -> Vec<TxP
         .map(|step| TxPrepareGateInput {
             step_id: step.step_id.clone(),
             pane_id: tx_prepare_pane_id(&step.action),
+            preconditions_satisfied: !custom_precondition_unsupported,
+            precondition_reason_code: custom_precondition_unsupported
+                .then(|| "tx.prepare.precondition.custom_unsupported".to_string()),
             policy_passed: true,
             policy_reason_code: None,
             reservation_available: true,
@@ -4101,7 +4221,8 @@ pub fn tx_prepare_gate_inputs_allow_all(contract: &MissionTxContract) -> Vec<TxP
         .collect()
 }
 
-/// Build prepare-gate inputs by evaluating policy, approval, reservation, and liveness.
+/// Build prepare-gate inputs by evaluating plan preconditions, policy, approval,
+/// reservation, and liveness against one cached target snapshot per pane.
 #[must_use]
 pub fn mission_tx_prepare_gate_inputs<P, A, T>(
     contract: &MissionTxContract,
@@ -4120,6 +4241,8 @@ where
         u64,
         std::result::Result<Option<TxPrepareTargetSnapshot>, String>,
     > = HashMap::new();
+    let (preconditions_satisfied, precondition_reason_code) =
+        tx_prepare_plan_preconditions(&contract.plan, targets, &mut target_cache, context, now_ms);
 
     contract
         .plan
@@ -4141,7 +4264,7 @@ where
             let (reservation_available, reservation_reason_code) =
                 tx_prepare_reservation(pane_id, snapshot_result.as_ref(), context);
 
-            let policy_input = tx_prepare_policy_input(contract, step, pane_id, snapshot, context);
+            let policy_input = tx_prepare_policy_input(step, pane_id, snapshot, context);
             let policy_decision = policy.authorize_prepare(&policy_input);
 
             let (
@@ -4197,6 +4320,8 @@ where
             TxPrepareGateInput {
                 step_id: step.step_id.clone(),
                 pane_id,
+                preconditions_satisfied,
+                precondition_reason_code: precondition_reason_code.clone(),
                 policy_passed,
                 policy_reason_code,
                 reservation_available,
@@ -4305,62 +4430,217 @@ pub fn mission_tx_synthetic_commit_report(
     }
 }
 
+fn looks_like_persisted_tx_receipt(value: &serde_json::Value) -> bool {
+    value.get("phase").is_some()
+        || (value.get("seq").is_some()
+            && value.get("tx_id").is_some()
+            && value.get("plan_id").is_some())
+}
+
+fn validate_persisted_tx_receipts(
+    contract: &MissionTxContract,
+) -> Result<Vec<(usize, TxReceipt)>, String> {
+    let plan_step_ids = contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.step_id.0.as_str())
+        .collect::<HashSet<_>>();
+    let compensation_step_ids = contract
+        .plan
+        .compensations
+        .iter()
+        .map(|compensation| compensation.for_step_id.0.as_str())
+        .collect::<HashSet<_>>();
+    let mut validated = Vec::new();
+    let mut previous_seq = 0u64;
+
+    for (persisted_index, receipt_value) in contract.receipts.iter().enumerate() {
+        if !looks_like_persisted_tx_receipt(receipt_value) {
+            continue;
+        }
+
+        let receipt =
+            serde_json::from_value::<TxReceipt>(receipt_value.clone()).map_err(|err| {
+                format!("invalid transaction receipt at persisted index {persisted_index}: {err}")
+            })?;
+
+        if receipt.emitted_at_ms < 0 {
+            return Err(format!(
+                "transaction receipt seq {} has negative emitted_at_ms {}",
+                receipt.seq, receipt.emitted_at_ms
+            ));
+        }
+
+        if receipt.tx_id != contract.intent.tx_id.0 || receipt.plan_id != contract.plan.plan_id.0 {
+            return Err(format!(
+                "{} receipt does not belong to tx {} / plan {}",
+                if receipt.phase == "compensate" {
+                    "compensation"
+                } else {
+                    receipt.phase.as_str()
+                },
+                contract.intent.tx_id.0,
+                contract.plan.plan_id.0
+            ));
+        }
+
+        match receipt.phase.as_str() {
+            "commit" => {
+                if receipt.state != MissionTxState::Committing {
+                    return Err(format!(
+                        "commit receipt for seq {} has incoherent tx state {}",
+                        receipt.seq, receipt.state
+                    ));
+                }
+                let step_id = receipt
+                    .step_id
+                    .as_deref()
+                    .ok_or_else(|| "commit receipt missing step_id".to_string())?;
+                if !plan_step_ids.contains(step_id) {
+                    return Err(format!("commit receipt references unknown step {step_id}"));
+                }
+                if !matches!(receipt.outcome.as_str(), "committed" | "failed" | "skipped") {
+                    return Err(format!(
+                        "unknown commit receipt outcome '{}' for step {step_id}",
+                        receipt.outcome
+                    ));
+                }
+            }
+            "compensate" => {
+                if receipt.state != MissionTxState::Compensating {
+                    return Err(format!(
+                        "compensation receipt for seq {} has incoherent tx state {}",
+                        receipt.seq, receipt.state
+                    ));
+                }
+                let step_id = receipt
+                    .step_id
+                    .as_deref()
+                    .ok_or_else(|| "compensation receipt missing step_id".to_string())?;
+                if !plan_step_ids.contains(step_id) {
+                    return Err(format!(
+                        "compensation receipt references unknown step {step_id}"
+                    ));
+                }
+                if !compensation_step_ids.contains(step_id) {
+                    return Err(format!(
+                        "compensation receipt references step {step_id} without a declared compensation action"
+                    ));
+                }
+                if !matches!(
+                    receipt.outcome.as_str(),
+                    "compensated" | "failed" | "skipped"
+                ) {
+                    return Err(format!(
+                        "unknown compensation receipt outcome '{}' for step {step_id}",
+                        receipt.outcome
+                    ));
+                }
+            }
+            "lifecycle" => {
+                if receipt.step_id.is_some() || receipt.outcome != "state_checkpoint" {
+                    return Err(format!(
+                        "lifecycle receipt for seq {} must have no step_id and outcome state_checkpoint",
+                        receipt.seq
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown transaction receipt phase '{other}' at persisted index {persisted_index}"
+                ));
+            }
+        }
+
+        if receipt.seq <= previous_seq {
+            return Err(format!(
+                "transaction receipt seq {} at persisted index {} is not strictly greater than previous seq {}",
+                receipt.seq, persisted_index, previous_seq
+            ));
+        }
+        previous_seq = receipt.seq;
+        validated.push((persisted_index, receipt));
+    }
+
+    Ok(validated)
+}
+
 /// Build the commit report a rollback surface should compensate against.
 ///
 /// Rollback must compensate only the steps that are proven to have committed.
-/// When a contract carries commit receipts, those receipts are the source of
-/// truth. A synthetic all-committed fallback is only allowed for already
-/// committed tx contracts that have no commit receipts recorded yet.
+/// Commit receipts are the sole source of truth. Successful commit and
+/// compensation receipts are sticky effect-state facts: later failed/skipped
+/// retries are diagnostic and cannot erase an already-applied or already-undone
+/// effect. The returned report retains one result per plan step.
 pub fn mission_tx_rollback_commit_report(
     contract: &MissionTxContract,
     completed_at_ms: i64,
 ) -> Result<TxCommitReport, String> {
+    if matches!(
+        contract.lifecycle_state,
+        MissionTxState::RolledBack | MissionTxState::Compensated
+    ) {
+        return Err(format!(
+            "rollback is not allowed for terminal tx state {}",
+            contract.lifecycle_state
+        ));
+    }
+    contract.validate()?;
+
     let mut latest_commit_receipts = HashMap::<String, TxReceipt>::new();
+    let mut latest_successful_commit_receipts = HashMap::<String, TxReceipt>::new();
+    let mut latest_successful_compensation_receipts = HashMap::<String, TxReceipt>::new();
+    let mut steps_with_compensation_attempts = HashSet::<String>::new();
     let mut commit_receipts = Vec::new();
 
-    for receipt_value in &contract.receipts {
-        let phase = receipt_value
-            .get("phase")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if phase != "commit" {
-            continue;
-        }
-
-        let receipt = serde_json::from_value::<TxReceipt>(receipt_value.clone())
-            .map_err(|err| format!("invalid commit receipt schema: {err}"))?;
-        if receipt.tx_id != contract.intent.tx_id.0 || receipt.plan_id != contract.plan.plan_id.0 {
-            return Err(format!(
-                "commit receipt does not belong to tx {} / plan {}",
-                contract.intent.tx_id.0, contract.plan.plan_id.0
-            ));
-        }
-        let step_id = receipt
-            .step_id
-            .clone()
-            .ok_or_else(|| "commit receipt missing step_id".to_string())?;
-
-        match latest_commit_receipts.get(&step_id) {
-            Some(existing) if existing.seq >= receipt.seq => {}
-            _ => {
-                latest_commit_receipts.insert(step_id, receipt.clone());
+    for (persisted_index, receipt) in validate_persisted_tx_receipts(contract)? {
+        match receipt.phase.as_str() {
+            "commit" => {
+                let step_id = receipt
+                    .step_id
+                    .clone()
+                    .ok_or_else(|| "commit receipt missing step_id".to_string())?;
+                if receipt.outcome == "committed" {
+                    if steps_with_compensation_attempts.contains(&step_id) {
+                        return Err(format!(
+                            "committed receipt for step {step_id} follows a compensation attempt; a new effect generation is required before recommit"
+                        ));
+                    }
+                    latest_successful_commit_receipts.insert(step_id.clone(), receipt.clone());
+                }
+                latest_commit_receipts.insert(step_id, receipt);
+                commit_receipts.push(contract.receipts[persisted_index].clone());
             }
+            "compensate" => {
+                let step_id = receipt
+                    .step_id
+                    .clone()
+                    .ok_or_else(|| "compensation receipt missing step_id".to_string())?;
+                let commit_receipt = latest_successful_commit_receipts.get(&step_id).ok_or_else(|| {
+                    format!(
+                        "compensation receipt for step {step_id} has no preceding committed receipt"
+                    )
+                })?;
+                if receipt.seq <= commit_receipt.seq {
+                    return Err(format!(
+                        "compensation receipt for step {step_id} does not follow its committed receipt"
+                    ));
+                }
+                steps_with_compensation_attempts.insert(step_id.clone());
+                if receipt.outcome == "compensated" {
+                    latest_successful_compensation_receipts.insert(step_id, receipt);
+                }
+            }
+            _ => {}
         }
-        commit_receipts.push(receipt_value.clone());
     }
 
     if latest_commit_receipts.is_empty() {
-        return if contract.lifecycle_state == MissionTxState::Committed {
-            Ok(mission_tx_synthetic_commit_report(
-                contract,
-                completed_at_ms,
-            ))
-        } else {
-            Err(format!(
-                "rollback requires commit receipts or a committed tx state, got {}",
-                contract.lifecycle_state
-            ))
-        };
+        return Err(format!(
+            "rollback requires commit receipts, got none for tx state {}",
+            contract.lifecycle_state
+        ));
     }
 
     commit_receipts.sort_by_key(|receipt| {
@@ -4379,52 +4659,89 @@ pub fn mission_tx_rollback_commit_report(
     let mut report_completed_at_ms = completed_at_ms;
 
     for step in &contract.plan.steps {
-        let receipt = latest_commit_receipts.get(&step.step_id.0).ok_or_else(|| {
+        let latest_receipt = latest_commit_receipts.get(&step.step_id.0).ok_or_else(|| {
             format!(
                 "rollback requires a commit receipt for step {}",
                 step.step_id.0
             )
         })?;
+        // A committed effect is a sticky safety fact. Later failed/skipped
+        // commit attempts are diagnostic only and cannot make the already
+        // applied external effect disappear from rollback reconstruction.
+        let receipt = latest_successful_commit_receipts
+            .get(&step.step_id.0)
+            .unwrap_or(latest_receipt);
 
         report_completed_at_ms = report_completed_at_ms.max(receipt.emitted_at_ms);
 
-        let outcome = match receipt.outcome.as_str() {
-            "committed" => {
-                committed_count += 1;
-                TxCommitStepOutcome::Committed {
-                    reason_code: receipt.reason_code.clone(),
+        // A proven successful compensation is a sticky safety fact. A later
+        // failed/skipped retry receipt must not erase it and authorize the same
+        // external compensation a second time.
+        let already_compensated = latest_successful_compensation_receipts
+            .get(&step.step_id.0)
+            .filter(|compensation_receipt| compensation_receipt.seq > receipt.seq);
+        let (outcome, decision_path, step_completed_at_ms) =
+            match (receipt.outcome.as_str(), already_compensated) {
+                ("committed", Some(compensation_receipt)) => {
+                    skipped_count += 1;
+                    report_completed_at_ms =
+                        report_completed_at_ms.max(compensation_receipt.emitted_at_ms);
+                    (
+                        TxCommitStepOutcome::Skipped {
+                            reason_code: "already_compensated".to_string(),
+                        },
+                        "rollback_compensation_receipts->already_compensated".to_string(),
+                        compensation_receipt.emitted_at_ms,
+                    )
                 }
-            }
-            "failed" => {
-                failed_count += 1;
-                failure_boundary.get_or_insert_with(|| step.step_id.0.clone());
-                if report_error_code.is_none() {
-                    report_error_code.clone_from(&receipt.error_code);
+                ("committed", None) => {
+                    committed_count += 1;
+                    (
+                        TxCommitStepOutcome::Committed {
+                            reason_code: receipt.reason_code.clone(),
+                        },
+                        receipt.decision_path.clone(),
+                        receipt.emitted_at_ms,
+                    )
                 }
-                TxCommitStepOutcome::Failed {
-                    reason_code: receipt.reason_code.clone(),
+                ("failed", None) => {
+                    failed_count += 1;
+                    failure_boundary.get_or_insert_with(|| step.step_id.0.clone());
+                    if report_error_code.is_none() {
+                        report_error_code.clone_from(&receipt.error_code);
+                    }
+                    (
+                        TxCommitStepOutcome::Failed {
+                            reason_code: receipt.reason_code.clone(),
+                        },
+                        receipt.decision_path.clone(),
+                        receipt.emitted_at_ms,
+                    )
                 }
-            }
-            "skipped" => {
-                skipped_count += 1;
-                TxCommitStepOutcome::Skipped {
-                    reason_code: receipt.reason_code.clone(),
+                ("skipped", None) => {
+                    skipped_count += 1;
+                    (
+                        TxCommitStepOutcome::Skipped {
+                            reason_code: receipt.reason_code.clone(),
+                        },
+                        receipt.decision_path.clone(),
+                        receipt.emitted_at_ms,
+                    )
                 }
-            }
-            other => {
-                return Err(format!(
-                    "unknown commit receipt outcome '{other}' for step {}",
-                    step.step_id.0
-                ));
-            }
-        };
+                (other, _) => {
+                    return Err(format!(
+                        "unknown commit receipt outcome '{other}' for step {}",
+                        step.step_id.0
+                    ));
+                }
+            };
 
         step_results.push(TxCommitStepResult {
             step_id: step.step_id.clone(),
             ordinal: step.ordinal,
             outcome,
-            decision_path: receipt.decision_path.clone(),
-            completed_at_ms: receipt.emitted_at_ms,
+            decision_path,
+            completed_at_ms: step_completed_at_ms,
         });
     }
 
@@ -4456,9 +4773,16 @@ pub fn mission_tx_rollback_commit_report(
 fn tx_last_receipt_seq(receipts: &[serde_json::Value]) -> u64 {
     receipts
         .iter()
-        .filter_map(|receipt| receipt.get("seq").and_then(serde_json::Value::as_u64))
-        .max()
+        .rev()
+        .filter(|receipt| looks_like_persisted_tx_receipt(receipt))
+        .find_map(|receipt| receipt.get("seq").and_then(serde_json::Value::as_u64))
         .unwrap_or(0)
+}
+
+fn tx_increment_receipt_seq(previous_seq: u64) -> Result<u64, String> {
+    previous_seq
+        .checked_add(1)
+        .ok_or_else(|| format!("transaction receipt sequence overflow after seq {previous_seq}"))
 }
 
 // Tx receipts keep sequencing, policy, and proof metadata explicit.
@@ -4498,13 +4822,13 @@ fn tx_blocked_commit_report(
     error_code: Option<&str>,
     decision_path: &str,
     completed_at_ms: i64,
-) -> TxCommitReport {
+) -> Result<TxCommitReport, String> {
     let mut next_seq = tx_last_receipt_seq(&contract.receipts);
     let mut step_results = Vec::with_capacity(contract.plan.steps.len());
     let mut receipts = Vec::with_capacity(contract.plan.steps.len());
 
     for step in &contract.plan.steps {
-        next_seq += 1;
+        next_seq = tx_increment_receipt_seq(next_seq)?;
         step_results.push(TxCommitStepResult {
             step_id: step.step_id.clone(),
             ordinal: step.ordinal,
@@ -4519,7 +4843,7 @@ fn tx_blocked_commit_report(
             "commit",
             &contract.intent.tx_id,
             &contract.plan.plan_id,
-            contract.lifecycle_state,
+            MissionTxState::Committing,
             Some(&step.step_id),
             "skipped",
             reason_code,
@@ -4529,7 +4853,7 @@ fn tx_blocked_commit_report(
         ));
     }
 
-    TxCommitReport {
+    Ok(TxCommitReport {
         tx_id: contract.intent.tx_id.clone(),
         plan_id: contract.plan.plan_id.clone(),
         outcome,
@@ -4543,7 +4867,7 @@ fn tx_blocked_commit_report(
         error_code: error_code.map(str::to_string),
         completed_at_ms,
         receipts,
-    }
+    })
 }
 
 fn duplicate_commit_input_step_id(commit_inputs: &[TxCommitStepInput]) -> Option<&str> {
@@ -4713,9 +5037,21 @@ pub fn evaluate_prepare_phase(
         });
     }
 
+    if plan
+        .preconditions
+        .iter()
+        .any(|precondition| matches!(precondition, TxPrecondition::Custom { .. }))
+    {
+        return Ok(TxPrepareReport {
+            outcome: TxPrepareOutcome::Denied,
+            gate_inputs: gate_inputs.to_vec(),
+        });
+    }
+
     let mut all_ready = true;
     let mut approval_required = false;
     let mut denied = false;
+    let plan_has_preconditions = !plan.preconditions.is_empty();
     for step in &plan.steps {
         let mut matched_any = false;
         let mut step_ready = true;
@@ -4727,13 +5063,18 @@ pub fn evaluate_prepare_phase(
             .filter(|gate| gate.step_id == step.step_id)
         {
             matched_any = true;
-            step_denied |=
-                !gate.policy_passed || !gate.reservation_available || !gate.target_liveness;
-            step_requires_approval |= gate.policy_passed
+            let preconditions_satisfied = !plan_has_preconditions || gate.preconditions_satisfied;
+            step_denied |= !preconditions_satisfied
+                || !gate.policy_passed
+                || !gate.reservation_available
+                || !gate.target_liveness;
+            step_requires_approval |= preconditions_satisfied
+                && gate.policy_passed
                 && gate.reservation_available
                 && gate.target_liveness
                 && !gate.approval_satisfied;
-            step_ready &= gate.policy_passed
+            step_ready &= preconditions_satisfied
+                && gate.policy_passed
                 && gate.reservation_available
                 && gate.approval_satisfied
                 && gate.target_liveness;
@@ -4795,25 +5136,25 @@ pub fn execute_commit_phase(
             MissionKillSwitchLevel::HardStop => Some("tx.kill_switch.hard_stop"),
             MissionKillSwitchLevel::Off => None,
         };
-        return Ok(tx_blocked_commit_report(
+        return tx_blocked_commit_report(
             contract,
             TxCommitOutcome::KillSwitchBlocked,
             "kill_switch_blocked",
             error_code,
             "commit_phase->kill_switch_blocked",
             now_ms,
-        ));
+        );
     }
 
     if paused {
-        return Ok(tx_blocked_commit_report(
+        return tx_blocked_commit_report(
             contract,
             TxCommitOutcome::PauseSuspended,
             "pause_suspended",
             None,
             "commit_phase->pause_suspended",
             now_ms,
-        ));
+        );
     }
 
     if let Some(step_id) = duplicate_commit_input_step_id(commit_inputs) {
@@ -4890,13 +5231,13 @@ pub fn execute_commit_phase(
             )
         };
 
-        next_seq += 1;
+        next_seq = tx_increment_receipt_seq(next_seq)?;
         receipts.push(tx_build_receipt(
             next_seq,
             "commit",
             &contract.intent.tx_id,
             &contract.plan.plan_id,
-            contract.lifecycle_state,
+            MissionTxState::Committing,
             Some(&step.step_id),
             match &outcome {
                 TxCommitStepOutcome::Committed { .. } => "committed",
@@ -5074,7 +5415,7 @@ pub fn execute_compensation_phase(
             completed_at_ms,
         });
 
-        next_seq += 1;
+        next_seq = tx_increment_receipt_seq(next_seq)?;
         receipts.push(tx_build_receipt(
             next_seq,
             "compensate",
@@ -8682,7 +9023,7 @@ mod tests {
                 ],
             },
             lifecycle_state: state,
-            outcome: TxOutcome::Pending,
+            outcome: state.expected_outcome(),
             receipts: Vec::new(),
         }
     }
@@ -8739,6 +9080,44 @@ mod tests {
                 "{field} should fail as an invalid identifier: {err}"
             );
         }
+    }
+
+    #[test]
+    fn tx_contract_validate_rejects_unsupported_schema_version() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.tx_version = MISSION_TX_SCHEMA_VERSION + 1;
+
+        let err = contract
+            .validate()
+            .expect_err("newer tx schema must fail closed");
+        assert_eq!(
+            err,
+            format!(
+                "Transaction tx_version {} is unsupported; expected {}",
+                MISSION_TX_SCHEMA_VERSION + 1,
+                MISSION_TX_SCHEMA_VERSION
+            )
+        );
+
+        contract.tx_version = 0;
+        assert_eq!(
+            contract.validate().unwrap_err(),
+            format!(
+                "Transaction tx_version 0 is unsupported; expected {}",
+                MISSION_TX_SCHEMA_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn tx_contract_validate_rejects_lifecycle_outcome_mismatch() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.outcome = TxOutcome::Failed;
+
+        let err = contract.validate().unwrap_err();
+
+        assert!(err.contains("requires outcome Pending"));
+        assert!(err.contains("got Failed"));
     }
 
     #[test]
@@ -9102,12 +9481,21 @@ mod tests {
     struct MockTargetLookup {
         snapshots: HashMap<u64, TxPrepareTargetSnapshot>,
         failures: HashMap<u64, String>,
+        lookup_counts: RefCell<HashMap<u64, usize>>,
     }
 
     impl MockTargetLookup {
         fn with_snapshot(mut self, snapshot: TxPrepareTargetSnapshot) -> Self {
             self.snapshots.insert(snapshot.pane_id, snapshot);
             self
+        }
+
+        fn lookup_count(&self, pane_id: u64) -> usize {
+            self.lookup_counts
+                .borrow()
+                .get(&pane_id)
+                .copied()
+                .unwrap_or_default()
         }
     }
 
@@ -9116,6 +9504,7 @@ mod tests {
             &self,
             pane_id: u64,
         ) -> std::result::Result<Option<TxPrepareTargetSnapshot>, String> {
+            *self.lookup_counts.borrow_mut().entry(pane_id).or_default() += 1;
             if let Some(reason) = self.failures.get(&pane_id) {
                 return Err(reason.clone());
             }
@@ -9166,9 +9555,146 @@ mod tests {
         assert_eq!(inputs.len(), 3);
         assert_eq!(inputs[0].step_id.0, "tx-step:1");
         assert!(inputs.iter().all(|input| input.policy_passed
+            && input.preconditions_satisfied
             && input.reservation_available
             && input.approval_satisfied
             && input.target_liveness));
+        assert_eq!(targets.lookup_count(1), 1);
+        assert_eq!(targets.lookup_count(2), 1);
+        assert_eq!(targets.lookup_count(3), 1);
+    }
+
+    #[test]
+    fn tx_prepare_policy_identity_comes_from_authenticated_context() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.intent.requested_by = MissionActorRole::Operator;
+        let context = TxPrepareEvaluationContext::new("workspace:test")
+            .with_surface(PolicySurface::Mcp)
+            .with_actor(ActorKind::Mcp);
+
+        let input = tx_prepare_policy_input(&contract.plan.steps[0], Some(1), None, &context);
+
+        assert_eq!(input.actor, ActorKind::Mcp);
+        assert_eq!(input.surface, PolicySurface::Mcp);
+    }
+
+    #[test]
+    fn tx_prepare_prompt_active_precondition_fails_when_prompt_is_inactive() {
+        let contract = sample_tx_contract(MissionTxState::Planned);
+        let mut inactive = live_target_snapshot(1, 1_700_000_000_000);
+        inactive.capabilities = PaneCapabilities::running();
+        let targets = MockTargetLookup::default()
+            .with_snapshot(inactive)
+            .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+            .with_snapshot(live_target_snapshot(3, 1_700_000_000_000));
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &MockPolicyAuthorizer::allow_all(),
+            &MockApprovalChecker::default(),
+            &targets,
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(inputs.iter().all(|input| !input.preconditions_satisfied));
+        assert!(inputs.iter().all(|input| {
+            input.precondition_reason_code.as_deref()
+                == Some("tx.prepare.precondition.prompt_active.inactive:1")
+        }));
+        let report = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect("prepare report");
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+    }
+
+    #[test]
+    fn tx_prepare_prompt_active_precondition_fails_when_target_is_missing() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.plan.preconditions = vec![TxPrecondition::PromptActive { pane_id: 99 }];
+        let inputs = mission_tx_prepare_gate_inputs(
+            &contract,
+            &MockPolicyAuthorizer::allow_all(),
+            &MockApprovalChecker::default(),
+            &MockTargetLookup::default()
+                .with_snapshot(live_target_snapshot(1, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(2, 1_700_000_000_000))
+                .with_snapshot(live_target_snapshot(3, 1_700_000_000_000)),
+            &sample_prepare_context(),
+            1_700_000_000_000,
+        );
+
+        assert!(inputs.iter().all(|input| !input.preconditions_satisfied));
+        assert!(inputs.iter().all(|input| {
+            input.precondition_reason_code.as_deref()
+                == Some("tx.prepare.precondition.prompt_active.target_missing:99")
+        }));
+    }
+
+    #[test]
+    fn tx_prepare_custom_precondition_is_explicitly_unsupported() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.plan.preconditions = vec![TxPrecondition::Custom {
+            check: "operator_attested".to_string(),
+        }];
+        let mut inputs = tx_prepare_gate_inputs_allow_all(&contract);
+
+        assert!(inputs.iter().all(|input| !input.preconditions_satisfied));
+        assert!(inputs.iter().all(|input| {
+            input.precondition_reason_code.as_deref()
+                == Some("tx.prepare.precondition.custom_unsupported")
+        }));
+
+        // Even a caller-supplied passing bit cannot make an unsupported custom
+        // expression executable: the reducer validates the plan itself.
+        for input in &mut inputs {
+            input.preconditions_satisfied = true;
+            input.precondition_reason_code = None;
+        }
+        let report = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect("prepare report");
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
+    }
+
+    #[test]
+    fn tx_prepare_missing_precondition_evidence_deserializes_fail_closed() {
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        contract.plan.steps.truncate(1);
+        let mut serialized = serde_json::to_value(
+            tx_prepare_gate_inputs_allow_all(&contract)
+                .into_iter()
+                .next()
+                .expect("prepare input"),
+        )
+        .expect("serialize prepare input");
+        let removed_evidence = serialized
+            .as_object_mut()
+            .expect("prepare input object")
+            .remove("preconditions_satisfied");
+        assert!(removed_evidence.is_some());
+        let input: TxPrepareGateInput =
+            serde_json::from_value(serialized).expect("deserialize legacy prepare input");
+
+        assert!(!input.preconditions_satisfied);
+        let report = evaluate_prepare_phase(
+            &contract.intent.tx_id,
+            &contract.plan,
+            &[input],
+            MissionKillSwitchLevel::Off,
+            1_700_000_000_000,
+        )
+        .expect("prepare report");
+        assert_eq!(report.outcome, TxPrepareOutcome::Denied);
     }
 
     #[test]
@@ -9610,9 +10136,142 @@ mod tests {
         assert_eq!(receipt.phase, "commit");
         assert_eq!(receipt.tx_id, "tx:test");
         assert_eq!(receipt.plan_id, "plan:test");
+        assert_eq!(receipt.state, MissionTxState::Committing);
         assert_eq!(receipt.step_id.as_deref(), Some("tx-step:1"));
         assert_eq!(receipt.outcome, "committed");
         assert_eq!(receipt.reason_code, "commit_succeeded");
+    }
+
+    #[test]
+    fn tx_contract_validate_rejects_foreign_receipt_plan_ownership() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let report = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        let mut persisted = contract;
+        persisted.receipts = report.receipts;
+        persisted.receipts[0]["plan_id"] = serde_json::json!("plan:foreign");
+
+        let err = persisted
+            .validate()
+            .expect_err("foreign receipt plan must fail closed");
+        assert!(
+            err.contains("commit receipt does not belong to tx tx:test / plan plan:test"),
+            "unexpected ownership error: {err}"
+        );
+    }
+
+    #[test]
+    fn tx_contract_validate_rejects_incoherent_receipt_phase_state_and_outcome() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let report = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        let mut persisted = contract;
+        persisted.receipts = report.receipts;
+
+        let mut wrong_state = persisted.clone();
+        wrong_state.receipts[0]["state"] = serde_json::json!("compensating");
+        let state_err = wrong_state
+            .validate()
+            .expect_err("commit receipt in compensating state must fail closed");
+        assert!(state_err.contains("commit receipt for seq 1 has incoherent tx state"));
+
+        let mut wrong_outcome = persisted.clone();
+        wrong_outcome.receipts[0]["outcome"] = serde_json::json!("compensated");
+        let outcome_err = wrong_outcome
+            .validate()
+            .expect_err("commit receipt with compensation outcome must fail closed");
+        assert!(outcome_err.contains("unknown commit receipt outcome 'compensated'"));
+
+        persisted.receipts[0]["phase"] = serde_json::json!("unknown");
+        let phase_err = persisted
+            .validate()
+            .expect_err("unknown receipt phase must fail closed");
+        assert!(phase_err.contains("unknown transaction receipt phase 'unknown'"));
+    }
+
+    #[test]
+    fn tx_contract_validate_rejects_non_increasing_seq_across_receipt_phases() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let compensation_report = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &sample_committed_comp_inputs(None),
+            20_500,
+        )
+        .expect("compensation report");
+
+        let mut persisted = sample_tx_contract(MissionTxState::Failed);
+        persisted.receipts = commit_report.receipts.clone();
+        let compensation_start = persisted.receipts.len();
+        persisted.receipts.extend(compensation_report.receipts);
+        persisted
+            .validate()
+            .expect("generated cross-phase receipt order should validate");
+
+        let last_commit_seq =
+            receipt_seq(commit_report.receipts.last().expect("last commit receipt"));
+        persisted.receipts[compensation_start]["seq"] = serde_json::json!(last_commit_seq);
+        let err = persisted
+            .validate()
+            .expect_err("duplicate seq at phase boundary must fail closed");
+        assert!(
+            err.contains("is not strictly greater than previous seq"),
+            "unexpected receipt order error: {err}"
+        );
+    }
+
+    #[test]
+    fn tx_commit_receipt_sequence_overflow_fails_closed() {
+        let contract = sample_tx_contract(MissionTxState::Prepared);
+        let prior_report = execute_commit_phase(
+            &contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("prior commit report");
+        let mut at_sequence_limit = contract;
+        at_sequence_limit.receipts = vec![prior_report.receipts[0].clone()];
+        at_sequence_limit.receipts[0]["seq"] = serde_json::json!(u64::MAX);
+
+        let err = execute_commit_phase(
+            &at_sequence_limit,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            11_000,
+        )
+        .expect_err("receipt sequence overflow must fail closed");
+        assert_eq!(
+            err,
+            format!(
+                "transaction receipt sequence overflow after seq {}",
+                u64::MAX
+            )
+        );
     }
 
     #[test]
@@ -9650,7 +10309,7 @@ mod tests {
     fn tx_rollback_commit_report_rejects_non_committed_tx_without_commit_receipts() {
         let contract = sample_tx_contract(MissionTxState::Prepared);
         let err = mission_tx_rollback_commit_report(&contract, 55).expect_err("rollback error");
-        assert!(err.contains("rollback requires commit receipts or a committed tx state"));
+        assert!(err.contains("rollback requires commit receipts"));
     }
 
     #[test]
@@ -9667,6 +10326,7 @@ mod tests {
 
         let mut rollback_contract = sample_tx_contract(MissionTxState::Failed);
         rollback_contract.intent.tx_id = TxId("tx:other".to_string());
+        rollback_contract.plan.tx_id = rollback_contract.intent.tx_id.clone();
         rollback_contract.receipts = commit_report.receipts;
 
         let err =
@@ -9675,19 +10335,361 @@ mod tests {
     }
 
     #[test]
-    fn tx_rollback_commit_report_falls_back_to_synthetic_for_committed_tx_without_receipts() {
+    fn tx_rollback_commit_report_rejects_receiptless_committed_tx() {
         let contract = sample_tx_contract(MissionTxState::Committed);
-        let report =
-            mission_tx_rollback_commit_report(&contract, 5_151).expect("synthetic fallback");
+        let err = mission_tx_rollback_commit_report(&contract, 5_151)
+            .expect_err("receiptless committed tx must fail closed");
 
-        assert_eq!(report.outcome, TxCommitOutcome::FullyCommitted);
-        assert_eq!(report.committed_count, 3);
-        assert!(
-            report
-                .step_results
-                .iter()
-                .all(|result| result.outcome.is_committed())
+        assert_eq!(
+            err,
+            "rollback requires commit receipts, got none for tx state committed"
         );
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_rejects_already_terminal_rollback_states() {
+        for state in [MissionTxState::RolledBack, MissionTxState::Compensated] {
+            let contract = sample_tx_contract(state);
+            let err = mission_tx_rollback_commit_report(&contract, 5_151)
+                .expect_err("already-rolled-back tx must fail closed");
+
+            assert_eq!(
+                err,
+                format!("rollback is not allowed for terminal tx state {state}")
+            );
+        }
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_retries_only_failed_or_uncompensated_steps() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let compensation_report = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &sample_committed_comp_inputs(Some("tx-step:1")),
+            20_500,
+        )
+        .expect("partial compensation report");
+        assert_eq!(
+            compensation_report.outcome,
+            TxCompensationOutcome::CompensationFailed
+        );
+
+        let mut retry_contract = sample_tx_contract(MissionTxState::Failed);
+        retry_contract.receipts = commit_report.receipts.clone();
+        retry_contract
+            .receipts
+            .extend(compensation_report.receipts.clone());
+
+        let retry_report = mission_tx_rollback_commit_report(&retry_contract, 21_000)
+            .expect("retry commit reconstruction");
+        assert_eq!(
+            retry_report.step_results.len(),
+            retry_contract.plan.steps.len()
+        );
+        assert_eq!(retry_report.committed_count, 1);
+        assert_eq!(retry_report.failed_count, 1);
+        assert_eq!(retry_report.skipped_count, 1);
+        assert!(retry_report.step_results[0].outcome.is_committed());
+        assert!(matches!(
+            &retry_report.step_results[1].outcome,
+            TxCommitStepOutcome::Skipped { reason_code }
+                if reason_code == "already_compensated"
+        ));
+        assert!(matches!(
+            retry_report.step_results[2].outcome,
+            TxCommitStepOutcome::Failed { .. }
+        ));
+
+        let retry_inputs = mission_tx_compensation_inputs(&retry_report, None, 21_500);
+        assert_eq!(retry_inputs.len(), 1);
+        assert_eq!(retry_inputs[0].for_step_id.0, "tx-step:1");
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_keeps_successful_compensation_sticky() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let compensation_report = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &sample_committed_comp_inputs(Some("tx-step:1")),
+            20_500,
+        )
+        .expect("partial compensation report");
+
+        let mut retry_contract = sample_tx_contract(MissionTxState::Failed);
+        retry_contract.receipts = commit_report.receipts;
+        retry_contract.receipts.extend(compensation_report.receipts);
+        let next_seq = tx_increment_receipt_seq(tx_last_receipt_seq(&retry_contract.receipts))
+            .expect("receipt sequence headroom");
+        let step_id = TxStepId("tx-step:2".to_string());
+        retry_contract.receipts.push(tx_build_receipt(
+            next_seq,
+            "compensate",
+            &retry_contract.intent.tx_id,
+            &retry_contract.plan.plan_id,
+            MissionTxState::Compensating,
+            Some(&step_id),
+            "failed",
+            "later_retry_failed",
+            Some("FTX4999"),
+            "test->later_retry_failed",
+            21_000,
+        ));
+
+        let retry_report = mission_tx_rollback_commit_report(&retry_contract, 21_500)
+            .expect("sticky compensation reconstruction");
+
+        assert!(matches!(
+            &retry_report.step_results[1].outcome,
+            TxCommitStepOutcome::Skipped { reason_code }
+                if reason_code == "already_compensated"
+        ));
+        let retry_inputs = mission_tx_compensation_inputs(&retry_report, None, 22_000);
+        assert_eq!(retry_inputs.len(), 1);
+        assert_eq!(retry_inputs[0].for_step_id.0, "tx-step:1");
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_keeps_successful_commit_sticky() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+
+        let mut retry_contract = sample_tx_contract(MissionTxState::Failed);
+        retry_contract.receipts = commit_report.receipts;
+        let step_id = TxStepId("tx-step:2".to_string());
+        for (outcome, reason_code) in [
+            ("failed", "later_retry_failed"),
+            ("skipped", "later_retry_skipped"),
+        ] {
+            let next_seq = tx_increment_receipt_seq(tx_last_receipt_seq(&retry_contract.receipts))
+                .expect("receipt sequence headroom");
+            retry_contract.receipts.push(tx_build_receipt(
+                next_seq,
+                "commit",
+                &retry_contract.intent.tx_id,
+                &retry_contract.plan.plan_id,
+                MissionTxState::Committing,
+                Some(&step_id),
+                outcome,
+                reason_code,
+                (outcome == "failed").then_some("FTX4998"),
+                "test->later_commit_retry",
+                20_000 + i64::try_from(next_seq).expect("small test sequence"),
+            ));
+        }
+
+        let retry_report = mission_tx_rollback_commit_report(&retry_contract, 21_000)
+            .expect("sticky commit reconstruction");
+        assert_eq!(retry_report.committed_count, 3);
+        assert_eq!(retry_report.failed_count, 0);
+        assert_eq!(retry_report.skipped_count, 0);
+        assert!(retry_report.step_results[1].outcome.is_committed());
+        let retry_inputs = mission_tx_compensation_inputs(&retry_report, None, 22_000);
+        assert_eq!(retry_inputs.len(), 3);
+        assert!(
+            retry_inputs
+                .iter()
+                .any(|input| input.for_step_id == step_id)
+        );
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_rejects_compensation_without_committed_fact() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:2")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("partial commit report");
+        let mut retry_contract = sample_tx_contract(MissionTxState::Failed);
+        retry_contract.receipts = commit_report.receipts;
+        let next_seq = tx_increment_receipt_seq(tx_last_receipt_seq(&retry_contract.receipts))
+            .expect("receipt sequence headroom");
+        let step_id = TxStepId("tx-step:2".to_string());
+        retry_contract.receipts.push(tx_build_receipt(
+            next_seq,
+            "compensate",
+            &retry_contract.intent.tx_id,
+            &retry_contract.plan.plan_id,
+            MissionTxState::Compensating,
+            Some(&step_id),
+            "compensated",
+            "invalid_compensation",
+            None,
+            "test->invalid_compensation",
+            20_000,
+        ));
+
+        let err = mission_tx_rollback_commit_report(&retry_contract, 21_000)
+            .expect_err("a failed commit cannot authorize compensation");
+        assert!(
+            err.contains("step tx-step:2 has no preceding committed receipt"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_rejects_compensation_without_declared_action() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(None),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        let mut retry_contract = sample_tx_contract(MissionTxState::Failed);
+        retry_contract
+            .plan
+            .compensations
+            .retain(|compensation| compensation.for_step_id.0 != "tx-step:2");
+        retry_contract.receipts = commit_report.receipts;
+        let next_seq = tx_increment_receipt_seq(tx_last_receipt_seq(&retry_contract.receipts))
+            .expect("receipt sequence headroom");
+        let step_id = TxStepId("tx-step:2".to_string());
+        retry_contract.receipts.push(tx_build_receipt(
+            next_seq,
+            "compensate",
+            &retry_contract.intent.tx_id,
+            &retry_contract.plan.plan_id,
+            MissionTxState::Compensating,
+            Some(&step_id),
+            "compensated",
+            "forged_compensation",
+            None,
+            "test->forged_compensation",
+            20_000,
+        ));
+
+        let err = mission_tx_rollback_commit_report(&retry_contract, 21_000)
+            .expect_err("receipt cannot invent an undeclared compensation action");
+        assert!(
+            err.contains("step tx-step:2 without a declared compensation action"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_rejects_recommit_after_compensation_attempt() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let compensation_report = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &sample_committed_comp_inputs(Some("tx-step:1")),
+            20_500,
+        )
+        .expect("partial compensation report");
+
+        let mut retry_contract = sample_tx_contract(MissionTxState::Failed);
+        retry_contract.receipts = commit_report.receipts;
+        retry_contract.receipts.extend(compensation_report.receipts);
+        let next_seq = tx_increment_receipt_seq(tx_last_receipt_seq(&retry_contract.receipts))
+            .expect("receipt sequence headroom");
+        let step_id = TxStepId("tx-step:2".to_string());
+        retry_contract.receipts.push(tx_build_receipt(
+            next_seq,
+            "commit",
+            &retry_contract.intent.tx_id,
+            &retry_contract.plan.plan_id,
+            MissionTxState::Committing,
+            Some(&step_id),
+            "committed",
+            "unsafe_recommit",
+            None,
+            "test->unsafe_recommit",
+            21_000,
+        ));
+
+        let err = mission_tx_rollback_commit_report(&retry_contract, 21_500)
+            .expect_err("post-compensation recommit needs an explicit generation");
+        assert!(
+            err.contains("new effect generation is required before recommit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tx_rollback_commit_report_rejects_foreign_or_unknown_compensation_receipts() {
+        let commit_contract = sample_tx_contract(MissionTxState::Prepared);
+        let commit_report = execute_commit_phase(
+            &commit_contract,
+            &sample_commit_inputs(Some("tx-step:3")),
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("commit report");
+        let mut compensating_contract = sample_tx_contract(MissionTxState::Compensating);
+        compensating_contract.receipts = commit_report.receipts.clone();
+        let compensation_report = execute_compensation_phase(
+            &compensating_contract,
+            &commit_report,
+            &sample_committed_comp_inputs(Some("tx-step:1")),
+            20_500,
+        )
+        .expect("partial compensation report");
+
+        let mut contract = sample_tx_contract(MissionTxState::Failed);
+        contract.receipts = commit_report.receipts;
+        contract.receipts.extend(compensation_report.receipts);
+
+        let mut foreign_receipt_contract = contract.clone();
+        foreign_receipt_contract
+            .receipts
+            .last_mut()
+            .expect("compensation receipt")["tx_id"] = serde_json::json!("tx:other");
+        let foreign_err = mission_tx_rollback_commit_report(&foreign_receipt_contract, 21_000)
+            .expect_err("foreign compensation receipt must fail closed");
+        assert!(foreign_err.contains("compensation receipt does not belong"));
+
+        contract.receipts.last_mut().expect("compensation receipt")["outcome"] =
+            serde_json::json!("unknown");
+        let outcome_err = mission_tx_rollback_commit_report(&contract, 21_000)
+            .expect_err("unknown compensation outcome must fail closed");
+        assert!(outcome_err.contains("unknown compensation receipt outcome 'unknown'"));
     }
 
     #[test]
@@ -9697,6 +10699,8 @@ mod tests {
             TxPrepareGateInput {
                 step_id: TxStepId("tx-step:1".to_string()),
                 pane_id: Some(1),
+                preconditions_satisfied: true,
+                precondition_reason_code: None,
                 policy_passed: true,
                 policy_reason_code: None,
                 reservation_available: true,
@@ -9710,6 +10714,8 @@ mod tests {
             TxPrepareGateInput {
                 step_id: TxStepId("tx-step:1".to_string()),
                 pane_id: Some(1),
+                preconditions_satisfied: true,
+                precondition_reason_code: None,
                 policy_passed: true,
                 policy_reason_code: None,
                 reservation_available: true,
@@ -9723,6 +10729,8 @@ mod tests {
             TxPrepareGateInput {
                 step_id: TxStepId("tx-step:2".to_string()),
                 pane_id: Some(2),
+                preconditions_satisfied: true,
+                precondition_reason_code: None,
                 policy_passed: true,
                 policy_reason_code: None,
                 reservation_available: true,
@@ -9754,6 +10762,8 @@ mod tests {
         gate_inputs.push(TxPrepareGateInput {
             step_id: TxStepId("tx-step:unrelated".to_string()),
             pane_id: Some(99),
+            preconditions_satisfied: true,
+            precondition_reason_code: None,
             policy_passed: false,
             policy_reason_code: Some("policy_denied".to_string()),
             reservation_available: false,
@@ -9906,6 +10916,8 @@ mod tests {
         gate_inputs.push(TxPrepareGateInput {
             step_id: TxStepId("tx-step/escape".to_string()),
             pane_id: Some(99),
+            preconditions_satisfied: true,
+            precondition_reason_code: None,
             policy_passed: true,
             policy_reason_code: None,
             reservation_available: true,
