@@ -1017,6 +1017,19 @@ enum WriteCommand {
         name: String,
         respond: oneshot::Sender<Result<bool>>,
     },
+    /// ft-pohny: read a JSON value from the generic `config` KV table
+    /// (baseline schema, previously dormant). Returns `None` when the
+    /// key is absent.
+    GetConfigValue {
+        key: String,
+        respond: oneshot::Sender<Result<Option<String>>>,
+    },
+    /// ft-pohny: upsert a JSON value into the generic `config` KV table.
+    SetConfigValue {
+        key: String,
+        value: String,
+        respond: oneshot::Sender<Result<()>>,
+    },
     /// Insert a new mux session record
     InsertMuxSession {
         session_id: String,
@@ -1121,6 +1134,8 @@ impl std::fmt::Debug for WriteCommand {
             Self::GetAgentProfile { .. } => "GetAgentProfile",
             Self::ListAgentProfiles { .. } => "ListAgentProfiles",
             Self::DeleteAgentProfile { .. } => "DeleteAgentProfile",
+            Self::GetConfigValue { .. } => "GetConfigValue",
+            Self::SetConfigValue { .. } => "SetConfigValue",
             Self::InsertMuxSession { .. } => "InsertMuxSession",
             Self::InsertSessionCheckpoint { .. } => "InsertSessionCheckpoint",
             Self::PruneSessionCheckpoints { .. } => "PruneSessionCheckpoints",
@@ -3466,6 +3481,65 @@ impl StorageHandle {
                 cx,
                 WriteCommand::DeleteAgentProfile {
                     name: name.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// ft-pohny: read a JSON value from the generic `config` KV table.
+    /// Returns `None` when the key has never been written.
+    pub async fn get_config_value(&self, key: &str) -> Result<Option<String>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_config_value_with_cx(&cx, key).await
+    }
+
+    /// ft-pohny: Cx-first sibling of [`Self::get_config_value`].
+    pub async fn get_config_value_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        key: &str,
+    ) -> Result<Option<String>> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_config_value cancelled: {err}")))?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::GetConfigValue {
+                    key: key.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// ft-pohny: upsert a JSON value into the generic `config` KV table.
+    pub async fn set_config_value(&self, key: &str, value: &str) -> Result<()> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.set_config_value_with_cx(&cx, key, value).await
+    }
+
+    /// ft-pohny: Cx-first sibling of [`Self::set_config_value`].
+    pub async fn set_config_value_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("set_config_value cancelled: {err}")))?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::SetConfigValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
                     respond: tx,
                 },
             )
@@ -9419,6 +9493,12 @@ fn fail_undispatched_write_command(cmd: WriteCommand, message: String) -> bool {
         WriteCommand::ListAgentProfiles { respond, .. } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
         }
+        WriteCommand::GetConfigValue { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
+        WriteCommand::SetConfigValue { respond, .. } => {
+            respond_oneshot_best_effort(respond, writer_panic_error(&message));
+        }
         #[cfg(test)]
         WriteCommand::PanicForTest { respond } => {
             respond_oneshot_best_effort(respond, writer_panic_error(&message));
@@ -12179,6 +12259,20 @@ fn dispatch_write_command_raw(
         WriteCommand::DeleteAgentProfile { name, respond } => {
             let respond = WriterResultResponder::new(respond);
             let result = delete_agent_profile_backend(backend, &name);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::GetConfigValue { key, respond } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = get_config_value_backend(backend, &key);
+            respond_oneshot_best_effort(respond, result);
+        }
+        WriteCommand::SetConfigValue {
+            key,
+            value,
+            respond,
+        } => {
+            let respond = WriterResultResponder::new(respond);
+            let result = set_config_value_backend(backend, &key, &value);
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertMuxSession {
@@ -15535,6 +15629,20 @@ fn delete_agent_profile_backend(backend: &dyn StorageBackend, name: &str) -> Res
         )
         .map_err(|err| storage_backend_error("agent_profiles delete", err))?;
     Ok(deleted.is_some())
+}
+
+/// ft-pohny: read one JSON value from the generic `config` KV table.
+/// SQL lives in [`crate::storage_backend_helpers::get_config_kv`].
+fn get_config_value_backend(backend: &dyn StorageBackend, key: &str) -> Result<Option<String>> {
+    crate::storage_backend_helpers::get_config_kv(backend, key)
+        .map_err(|err| storage_backend_error("config get", err).into())
+}
+
+/// ft-pohny: upsert one JSON value into the generic `config` KV table.
+/// SQL lives in [`crate::storage_backend_helpers::set_config_kv`].
+fn set_config_value_backend(backend: &dyn StorageBackend, key: &str, value: &str) -> Result<()> {
+    crate::storage_backend_helpers::set_config_kv(backend, key, value, now_epoch_ms())
+        .map_err(|err| storage_backend_error("config set", err).into())
 }
 
 fn agent_profile_from_backend_cells(

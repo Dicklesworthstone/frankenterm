@@ -216,6 +216,47 @@ pub fn execute_typed(
     Ok(())
 }
 
+/// ft-pohny: read one JSON value from the generic `config` KV table
+/// (baseline schema: key TEXT PRIMARY KEY / value TEXT / updated_at
+/// INTEGER). Returns `None` when the key has never been written.
+///
+/// Single source of the `config`-KV SQL: the `StorageHandle`
+/// writer-loop backend fns and the one-shot robot CLI dispatch both
+/// route through here so the two paths cannot drift.
+pub fn get_config_kv(
+    backend: &dyn StorageBackend,
+    key: &str,
+) -> Result<Option<String>, BackendError> {
+    let row = backend.query_row_cells(
+        "SELECT value FROM config WHERE key = ?1",
+        &[ToSqlValue::Text(key)],
+    )?;
+    row.as_deref()
+        .map(|cells| crate::storage_backend_row_helpers::CellRowReader::new(cells).string(0))
+        .transpose()
+}
+
+/// ft-pohny: upsert one JSON value into the generic `config` KV table.
+pub fn set_config_kv(
+    backend: &dyn StorageBackend,
+    key: &str,
+    value: &str,
+    updated_at_ms: i64,
+) -> Result<(), BackendError> {
+    execute_typed(
+        backend,
+        "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET
+             value = excluded.value,
+             updated_at = excluded.updated_at",
+        &[
+            ToSqlValue::Text(key),
+            ToSqlValue::Text(value),
+            ToSqlValue::Integer(updated_at_ms),
+        ],
+    )
+}
+
 /// SQLite identifier safety: ASCII alphanumeric + underscore.
 /// Stricter than SQLite's actual lexer but bullet-proof
 /// against injection. Same rule as
@@ -502,5 +543,34 @@ mod tests {
         )
         .unwrap();
         assert!(exists);
+    }
+
+    #[test]
+    fn config_kv_get_set_round_trip_ft_pohny() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL, \
+                 updated_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+
+        // Absent key reads as None.
+        assert_eq!(get_config_kv(&backend, "k").unwrap(), None);
+
+        // Set then get round-trips.
+        set_config_kv(&backend, "k", "{\"a\":1}", 1000).unwrap();
+        assert_eq!(
+            get_config_kv(&backend, "k").unwrap().as_deref(),
+            Some("{\"a\":1}")
+        );
+
+        // Upsert replaces the value in place (single row per key).
+        set_config_kv(&backend, "k", "{\"a\":2}", 2000).unwrap();
+        assert_eq!(
+            get_config_kv(&backend, "k").unwrap().as_deref(),
+            Some("{\"a\":2}")
+        );
+        assert_eq!(count_table(&backend, "config").unwrap(), 1);
     }
 }

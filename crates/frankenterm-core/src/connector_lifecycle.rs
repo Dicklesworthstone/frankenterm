@@ -405,6 +405,29 @@ impl ConnectorLifecycleManager {
             .collect()
     }
 
+    /// Snapshot of every managed connector, ordered by connector id
+    /// (ft-pohny persistence surface).
+    #[must_use]
+    pub fn managed_connectors(&self) -> Vec<ManagedConnector> {
+        self.connectors.values().cloned().collect()
+    }
+
+    /// Rehydrate managed-connector state from a persisted snapshot
+    /// (ft-pohny).
+    ///
+    /// Persistence rehydration ONLY: entries were already admitted through
+    /// the install/update trust gate when first executed, so this does NOT
+    /// re-run trust gating and does NOT advance `op_counter`. Replaces any
+    /// existing entry with the same connector id. Intended for one-shot
+    /// operator surfaces (`ft robot connector …`) that load state from the
+    /// workspace DB before executing an intent.
+    pub fn restore_connectors(&mut self, connectors: Vec<ManagedConnector>) {
+        for connector in connectors {
+            self.connectors
+                .insert(connector.connector_id.clone(), connector);
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Execute intents
     // -------------------------------------------------------------------------
