@@ -36250,17 +36250,53 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // Run the workflow (ft-xbnl0.2.3 tick 226:
                                         // cross-crate cx-first migration matching the
                                         // pattern from ticks 224/225).
+                                        //
+                                        // ft-cli44: manual runs go through the
+                                        // lock + execution-record protocol so
+                                        // progress persists and the run is
+                                        // visible to status/abort surfaces.
                                         let cx = frankenterm_core::cx::Cx::current()
                                             .unwrap_or_else(frankenterm_core::cx::for_request);
-                                        let result = runner
-                                            .run_workflow_with_cx(
+                                        let outcome = runner
+                                            .run_workflow_manual_with_cx(
                                                 &cx,
                                                 pane_id,
                                                 wf,
                                                 &execution_id,
-                                                0,
+                                                Some(serde_json::json!({
+                                                    "trigger": "robot",
+                                                    "command": "workflows run",
+                                                })),
                                             )
                                             .await;
+                                        let result = match outcome {
+                                            frankenterm_core::workflows::ManualWorkflowRunOutcome::Ran(result) => result,
+                                            frankenterm_core::workflows::ManualWorkflowRunOutcome::PaneLocked {
+                                                held_by_workflow,
+                                                held_by_execution,
+                                                ..
+                                            } => WorkflowExecutionResult::Error {
+                                                execution_id: None,
+                                                error: format!(
+                                                    "Pane {pane_id} is locked by workflow '{held_by_workflow}' (execution {held_by_execution})"
+                                                ),
+                                            },
+                                            frankenterm_core::workflows::ManualWorkflowRunOutcome::ConcurrencyLimitReached {
+                                                active,
+                                                limit,
+                                            } => WorkflowExecutionResult::Error {
+                                                execution_id: None,
+                                                error: format!(
+                                                    "Workflow concurrency limit reached ({active} active / limit {limit})"
+                                                ),
+                                            },
+                                            frankenterm_core::workflows::ManualWorkflowRunOutcome::StartError {
+                                                error,
+                                            } => WorkflowExecutionResult::Error {
+                                                execution_id: None,
+                                                error: format!("Failed to start workflow: {error}"),
+                                            },
+                                        };
 
                                         let (
                                             status,
@@ -42375,13 +42411,77 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             let execution_id = format!("human-{name}-{now_ms}");
 
                             // Run the workflow (ft-xbnl0.2.3 tick 226: cx-first)
+                            //
+                            // ft-cli44: manual runs go through the lock +
+                            // execution-record protocol so progress persists
+                            // and `ft workflow status <execution_id>` works.
                             let run_start = std::time::Instant::now();
                             let cx = frankenterm_core::cx::Cx::current()
                                 .unwrap_or_else(frankenterm_core::cx::for_request);
-                            let result = runner
-                                .run_workflow_with_cx(&cx, pane, wf, &execution_id, 0)
+                            let outcome = runner
+                                .run_workflow_manual_with_cx(
+                                    &cx,
+                                    pane,
+                                    wf,
+                                    &execution_id,
+                                    Some(serde_json::json!({
+                                        "trigger": "human",
+                                        "command": "workflow run",
+                                    })),
+                                )
                                 .await;
                             let elapsed = run_start.elapsed();
+                            let result = match outcome {
+                                frankenterm_core::workflows::ManualWorkflowRunOutcome::Ran(
+                                    result,
+                                ) => result,
+                                frankenterm_core::workflows::ManualWorkflowRunOutcome::PaneLocked {
+                                    held_by_workflow,
+                                    held_by_execution,
+                                    ..
+                                } => {
+                                    eprintln!(
+                                        "Result: not started — pane {pane} is locked by workflow '{held_by_workflow}' (execution {held_by_execution})"
+                                    );
+                                    eprintln!(
+                                        "\nHint: Wait for the running workflow to finish, or abort it with 'ft robot workflows abort {held_by_execution}'."
+                                    );
+                                    if let Err(e) = storage.shutdown().await {
+                                        tracing::warn!(
+                                            "Failed to shutdown storage cleanly: {e}"
+                                        );
+                                    }
+                                    std::process::exit(1);
+                                }
+                                frankenterm_core::workflows::ManualWorkflowRunOutcome::ConcurrencyLimitReached {
+                                    active,
+                                    limit,
+                                } => {
+                                    eprintln!(
+                                        "Result: not started — workflow concurrency limit reached ({active} active / limit {limit})"
+                                    );
+                                    eprintln!(
+                                        "\nHint: Retry after a running workflow completes."
+                                    );
+                                    if let Err(e) = storage.shutdown().await {
+                                        tracing::warn!(
+                                            "Failed to shutdown storage cleanly: {e}"
+                                        );
+                                    }
+                                    std::process::exit(1);
+                                }
+                                frankenterm_core::workflows::ManualWorkflowRunOutcome::StartError {
+                                    error,
+                                } => {
+                                    eprintln!("Result: not started — {error}");
+                                    if let Err(e) = storage.shutdown().await {
+                                        tracing::warn!(
+                                            "Failed to shutdown storage cleanly: {e}"
+                                        );
+                                    }
+                                    std::process::exit(1);
+                                }
+                            };
 
                             match result {
                                 WorkflowExecutionResult::Completed { steps_executed, .. } => {

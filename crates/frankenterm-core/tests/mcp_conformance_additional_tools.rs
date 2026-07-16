@@ -140,6 +140,24 @@ case "$cmd" in
 {"query":"agent context","count":1,"hits":[{"source_path":"/tmp/session.md","line_number":42,"agent":"codex","content":"needle hit"}]}
 EOF
     ;;
+  context)
+    # [ft-0uzlr / ft-cli44] wa.cass_view probes `cass context --json -- <path>`
+    # for index membership before reading. Indexed <=> top-level `source`
+    # object present and no top-level `error` (see
+    # cass_context_output_indicates_indexed). Answer "indexed" only for the
+    # fixture session path; everything else gets cass's not-found shape so
+    # the containment gate stays observable in conformance runs.
+    path="${!#}"
+    if [[ "$path" == "/tmp/session.md" ]]; then
+      cat <<'EOF'
+{"source":{"path":"/tmp/session.md","agent":"codex"},"line":42}
+EOF
+    else
+      cat <<'EOF'
+{"error":{"kind":"not-found"}}
+EOF
+    fi
+    ;;
   view)
     cat <<'EOF'
 {"source_path":"/tmp/session.md","line_number":42,"match_line":{"line_number":42,"content":"needle hit","role":"assistant"},"context_before":[{"line_number":41,"content":"before","role":"user"}],"context_after":[{"line_number":43,"content":"after","role":"assistant"}]}

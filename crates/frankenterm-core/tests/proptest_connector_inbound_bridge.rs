@@ -100,6 +100,7 @@ fn arb_config() -> impl Strategy<Value = ConnectorInboundBridgeConfig> {
             dedup_ttl_secs: dedup_ttl,
             reject_unknown_kinds: reject,
             rule_id_overrides: HashMap::new(),
+            ..Default::default()
         }
     })
 }

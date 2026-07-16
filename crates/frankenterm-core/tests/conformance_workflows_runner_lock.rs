@@ -19,9 +19,10 @@ use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
 use frankenterm_core::storage::{ExportQuery, PaneRecord, StorageHandle, now_ms};
 use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
 use frankenterm_core::workflows::{
-    BoxFuture, CxPolicyInjector, PaneWorkflowLockManager, StepResult, WaitCondition, Workflow,
-    WorkflowContext, WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
-    WorkflowStartResult, WorkflowStep, WorkflowTriggerPolicy,
+    BoxFuture, CxPolicyInjector, ManualWorkflowRunOutcome, PaneWorkflowLockManager, StepResult,
+    WaitCondition, Workflow, WorkflowContext, WorkflowEngine, WorkflowExecutionResult,
+    WorkflowRunner, WorkflowRunnerConfig, WorkflowStartResult, WorkflowStep,
+    WorkflowTriggerPolicy,
 };
 
 const PANE_ID: u64 = 7204;
@@ -728,5 +729,104 @@ fn workflow_runner_prestart_cancel_releases_claimed_lock_conformance() {
         );
         assert_pane_unlocked(&lock_manager, "prestart_cancel");
         assert_eq!(lock_manager.active_count(), 0);
+    });
+}
+
+#[test]
+fn workflow_runner_manual_run_persists_record_and_releases_lock_ft_cli44() {
+    let fixture = RuntimeFixture::current_thread();
+    fixture.block_on(async {
+        // 1. A manual run (the MCP / robot / human-CLI entry points) must
+        //    use the same lock + execution-record protocol as the detection
+        //    path. Before ft-cli44 these callers invoked `run_workflow`
+        //    directly with a fabricated execution id: no record existed, so
+        //    every record-requiring persistence helper failed with
+        //    "Workflow not found: <execution_id>" and the run was invisible
+        //    to status/abort surfaces.
+        let (runner, storage, lock_manager) =
+            build_runner("manual_run", WorkflowRunnerConfig::default(), true).await;
+        let workflow = Arc::new(ScriptedWorkflow::new(
+            "manual_run_wf",
+            vec![StepResult::done_empty()],
+        ));
+        runner.register_workflow(Arc::clone(&workflow) as Arc<dyn Workflow>);
+        let cx = frankenterm_core::cx::for_testing();
+        let outcome = runner
+            .run_workflow_manual_with_cx(
+                &cx,
+                PANE_ID,
+                workflow,
+                "mcp-manual_run_wf-1",
+                Some(serde_json::json!({ "trigger": "mcp" })),
+            )
+            .await;
+        let ManualWorkflowRunOutcome::Ran(result) = outcome else {
+            panic!("manual run should acquire lock + start: {outcome:?}");
+        };
+        assert!(
+            matches!(result, WorkflowExecutionResult::Completed { .. }),
+            "manual run should complete: {result:?}"
+        );
+        let record = storage
+            .get_workflow("mcp-manual_run_wf-1")
+            .await
+            .expect("get_workflow query")
+            .expect("manual run must persist an execution record (ft-cli44)");
+        assert_eq!(record.workflow_name, "manual_run_wf");
+        assert_eq!(record.pane_id, PANE_ID);
+        assert_eq!(record.status, "completed");
+        assert_eq!(
+            record
+                .context
+                .as_ref()
+                .and_then(|c| c.get("trigger"))
+                .and_then(|v| v.as_str()),
+            Some("mcp"),
+            "manual trigger context must be persisted for forensics"
+        );
+        assert_pane_unlocked(&lock_manager, "manual_run");
+        assert_eq!(lock_manager.active_count(), 0);
+
+        // 2. A manual run against a pane whose lock is held by another
+        //    execution must refuse with PaneLocked, create no record, and
+        //    leave the holder's lock untouched.
+        let (runner, storage, lock_manager) =
+            build_runner("manual_run_locked", WorkflowRunnerConfig::default(), true).await;
+        let holder = Arc::new(ScriptedWorkflow::new(
+            "manual_lock_holder",
+            vec![StepResult::done_empty()],
+        ));
+        let (holder_execution_id, _start) = start_workflow(&runner, holder).await;
+        assert!(
+            lock_manager.is_locked(PANE_ID).is_some(),
+            "lock holder must be claimed before manual contention check"
+        );
+        let contender = Arc::new(ScriptedWorkflow::new(
+            "manual_lock_contender",
+            vec![StepResult::done_empty()],
+        ));
+        let outcome = runner
+            .run_workflow_manual_with_cx(&cx, PANE_ID, contender, "mcp-contender-1", None)
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                ManualWorkflowRunOutcome::PaneLocked { ref held_by_execution, .. }
+                    if *held_by_execution == holder_execution_id
+            ),
+            "manual run against a held lock must refuse with the holder's id: {outcome:?}"
+        );
+        assert!(
+            storage
+                .get_workflow("mcp-contender-1")
+                .await
+                .expect("get_workflow query")
+                .is_none(),
+            "refused manual run must not create an execution record"
+        );
+        assert!(
+            lock_manager.is_locked(PANE_ID).is_some(),
+            "holder's lock must survive a refused manual contender"
+        );
     });
 }

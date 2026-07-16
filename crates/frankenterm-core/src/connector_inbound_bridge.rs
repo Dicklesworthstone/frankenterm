@@ -49,6 +49,18 @@ pub struct ConnectorInboundBridgeConfig {
     /// Key: "connector_name.signal_kind", Value: rule_id prefix.
     #[serde(default)]
     pub rule_id_overrides: HashMap<String, String>,
+    /// Classifier configuration (markers, salts, audit depth, and — crucially —
+    /// operator classification policies) applied to connector ingress.
+    ///
+    /// Before ft-pzxsr the bridge always built its classifier from
+    /// `ClassifierConfig::default()`, so operator `[safety.data_classifier]`
+    /// settings and policies were silently inert on the inbound path. The
+    /// built-in [`ClassificationPolicy::default()`] wildcard is still
+    /// registered as the final fallback, so connectors unmatched by any
+    /// operator policy keep pre-ft-pzxsr routing behavior; an operator
+    /// wildcard policy takes precedence over that fallback.
+    #[serde(default)]
+    pub classifier: crate::connector_data_classification::ClassifierConfig,
 }
 
 fn default_dedup_capacity() -> usize {
@@ -66,6 +78,7 @@ impl Default for ConnectorInboundBridgeConfig {
             dedup_ttl_secs: default_dedup_ttl_secs(),
             reject_unknown_kinds: false,
             rule_id_overrides: HashMap::new(),
+            classifier: crate::connector_data_classification::ClassifierConfig::default(),
         }
     }
 }
@@ -467,10 +480,16 @@ pub struct ConnectorInboundBridge {
 
 impl ConnectorInboundBridge {
     /// Create a new inbound bridge.
+    ///
+    /// The ingress classifier is built from `config.classifier`, so operator
+    /// classification/redaction policies configured there are enforced on
+    /// `route_signal` (ft-pzxsr). The built-in default wildcard policy is
+    /// registered last as a fallback for connectors no operator policy
+    /// matches, preserving the pre-ft-pzxsr routing behavior for them.
     #[must_use]
     pub fn new(event_bus: Arc<EventBus>, config: ConnectorInboundBridgeConfig) -> Self {
         let dedup_ttl = Duration::from_secs(config.dedup_ttl_secs);
-        let mut classifier = ConnectorDataClassifier::new(Default::default());
+        let mut classifier = ConnectorDataClassifier::new(config.classifier.clone());
         classifier.register_policy(ClassificationPolicy::default());
         Self {
             event_bus,
@@ -1418,6 +1437,70 @@ mod tests {
         let audit = bridge.classification_audit_log().back().unwrap();
         assert_eq!(audit.policy_id, "github-emergency");
         assert_eq!(audit.decision, IngestionDecision::AcceptRedacted);
+    }
+
+    #[test]
+    fn bridge_config_operator_policy_enforced_on_ingress_ft_pzxsr() {
+        use crate::connector_data_classification::{
+            ClassificationRule, ClassifierConfig, DataSensitivity,
+        };
+
+        // Operator declares (via `[safety.data_classifier]`) that the `ssn`
+        // field is Prohibited for the "slack" connector. Before ft-pzxsr the
+        // bridge built its classifier from `Default`, so this policy was
+        // inert: the built-in default policy classifies `ssn` as merely
+        // Restricted and would have routed the signal (redacted).
+        let config = ConnectorInboundBridgeConfig {
+            classifier: ClassifierConfig {
+                policies: vec![ClassificationPolicy {
+                    policy_id: "slack-pii".to_string(),
+                    connector_pattern: "slack".to_string(),
+                    rules: vec![ClassificationRule::new(
+                        "ssn-prohibited",
+                        DataSensitivity::Prohibited,
+                        vec!["ssn".to_string()],
+                    )],
+                    scan_for_secrets: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bus = make_bus();
+        let mut sub = bus.subscribe_detections();
+        let mut bridge = ConnectorInboundBridge::new(bus, config);
+        // Operator policy + built-in default wildcard fallback.
+        assert_eq!(bridge.classification_policy_count(), 2);
+
+        let sig = ConnectorSignal::new(
+            "slack",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({"ssn": "123-45-6789", "note": "hi"}),
+        )
+        .with_timestamp_ms(1000);
+        let err = bridge.route_signal(&sig).unwrap_err();
+        assert!(matches!(err, ConnectorBridgeError::PrivacyRejected { .. }));
+        assert!(sub.try_recv().is_none());
+        let audit = bridge.classification_audit_log().back().unwrap();
+        assert_eq!(audit.policy_id, "slack-pii");
+        assert!(matches!(audit.decision, IngestionDecision::Reject { .. }));
+
+        // Connectors unmatched by any operator policy still route through
+        // the built-in default fallback (pre-ft-pzxsr behavior preserved:
+        // `ssn` is Restricted there, so the signal routes redacted).
+        let fallback_sig = ConnectorSignal::new(
+            "github",
+            ConnectorSignalKind::Webhook,
+            serde_json::json!({"ssn": "123-45-6789", "note": "hi"}),
+        )
+        .with_timestamp_ms(1000);
+        let routed = bridge
+            .route_signal(&fallback_sig)
+            .expect("default fallback policy must keep unmatched connectors routable");
+        assert_eq!(routed.delivered_count, 1);
+        let audit = bridge.classification_audit_log().back().unwrap();
+        assert_eq!(audit.policy_id, "default");
     }
 
     #[test]

@@ -1415,6 +1415,12 @@ pub struct ObservationRuntime {
     event_bus: Option<Arc<EventBus>>,
     /// Runtime-owned inbound connector bridge feeding the live event bus.
     connector_inbound_bridge: Option<Arc<StdMutex<ConnectorInboundBridge>>>,
+    /// Configuration used when constructing the inbound connector bridge.
+    ///
+    /// Carries the operator ingress classifier settings/policies (ft-pzxsr);
+    /// set via [`Self::with_connector_inbound_bridge_config`] before or after
+    /// [`Self::with_event_bus`].
+    connector_inbound_bridge_config: ConnectorInboundBridgeConfig,
     /// Runtime-owned outbound connector bridge draining live EventBus traffic.
     connector_outbound_bridge: Option<Arc<StdMutex<ConnectorOutboundBridge>>>,
     /// Optional recording manager for capturing session recordings
@@ -1486,6 +1492,7 @@ impl ObservationRuntime {
             config_rx,
             event_bus: None,
             connector_inbound_bridge: None,
+            connector_inbound_bridge_config: ConnectorInboundBridgeConfig::default(),
             connector_outbound_bridge: None,
             recording: None,
             replay_capture: None,
@@ -1529,7 +1536,7 @@ impl ObservationRuntime {
     pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
         self.connector_inbound_bridge = Some(Arc::new(StdMutex::new(ConnectorInboundBridge::new(
             Arc::clone(&event_bus),
-            ConnectorInboundBridgeConfig::default(),
+            self.connector_inbound_bridge_config.clone(),
         ))));
         self.connector_outbound_bridge.get_or_insert_with(|| {
             Arc::new(StdMutex::new(ConnectorOutboundBridge::new(
@@ -1537,6 +1544,32 @@ impl ObservationRuntime {
             )))
         });
         self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// Configure the runtime-owned inbound connector bridge.
+    ///
+    /// This is how operator `[safety.data_classifier]` settings and
+    /// classification policies reach the connector ingress path (ft-pzxsr):
+    /// pass a config whose `classifier` field was built from the operator
+    /// `SafetyConfig`. Call before [`Self::start`]; order relative to
+    /// [`Self::with_event_bus`] does not matter — if the bridge already
+    /// exists it is rebuilt with the new config.
+    #[must_use]
+    pub fn with_connector_inbound_bridge_config(
+        mut self,
+        config: ConnectorInboundBridgeConfig,
+    ) -> Self {
+        self.connector_inbound_bridge_config = config;
+        if self.connector_inbound_bridge.is_some()
+            && let Some(event_bus) = self.event_bus.as_ref()
+        {
+            self.connector_inbound_bridge =
+                Some(Arc::new(StdMutex::new(ConnectorInboundBridge::new(
+                    Arc::clone(event_bus),
+                    self.connector_inbound_bridge_config.clone(),
+                ))));
+        }
         self
     }
 
@@ -6333,6 +6366,80 @@ mod tests {
                     Some("github")
                 );
             }
+        });
+    }
+
+    #[test]
+    fn runtime_inbound_bridge_enforces_operator_classifier_config_ft_pzxsr() {
+        use crate::connector_data_classification::{
+            ClassificationPolicy, ClassificationRule, ClassifierConfig, DataSensitivity,
+        };
+
+        run_async_test(async {
+            // Operator policy: `ssn` is Prohibited for "slack". The built-in
+            // default policy classifies `ssn` as Restricted and would route
+            // the signal (redacted), so a rejection proves the operator
+            // config reached the bridge — the exact wiring ft-pzxsr fixed.
+            let bridge_config = ConnectorInboundBridgeConfig {
+                classifier: ClassifierConfig {
+                    policies: vec![ClassificationPolicy {
+                        policy_id: "slack-pii".to_string(),
+                        connector_pattern: "slack".to_string(),
+                        rules: vec![ClassificationRule::new(
+                            "ssn-prohibited",
+                            DataSensitivity::Prohibited,
+                            vec!["ssn".to_string()],
+                        )],
+                        scan_for_secrets: false,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let signal = ConnectorSignal::new(
+                "slack",
+                crate::connector_inbound_bridge::ConnectorSignalKind::Webhook,
+                serde_json::json!({ "ssn": "123-45-6789", "note": "hi" }),
+            );
+
+            // Order used by the production watcher paths in main.rs:
+            // bridge config first, then the event bus.
+            let (_dir_a, db_path_a) = temp_db_path();
+            let storage_a = StorageHandle::new(&db_path_a).await.unwrap();
+            let runtime_a = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage_a,
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_connector_inbound_bridge_config(bridge_config.clone())
+            .with_event_bus(Arc::new(EventBus::new(16)));
+            let err = runtime_a
+                .route_connector_signal(&signal)
+                .expect_err("operator prohibited-field policy must reject ingress");
+            assert!(matches!(
+                err,
+                crate::connector_inbound_bridge::ConnectorBridgeError::PrivacyRejected { .. }
+            ));
+
+            // Reverse order must behave identically (the setter rebuilds an
+            // already-constructed bridge).
+            let (_dir_b, db_path_b) = temp_db_path();
+            let storage_b = StorageHandle::new(&db_path_b).await.unwrap();
+            let runtime_b = ObservationRuntime::new(
+                RuntimeConfig::default(),
+                storage_b,
+                Arc::new(RwLock::new(PatternEngine::new())),
+            )
+            .with_event_bus(Arc::new(EventBus::new(16)))
+            .with_connector_inbound_bridge_config(bridge_config);
+            let err = runtime_b
+                .route_connector_signal(&signal)
+                .expect_err("config applied after with_event_bus must also reject ingress");
+            assert!(matches!(
+                err,
+                crate::connector_inbound_bridge::ConnectorBridgeError::PrivacyRejected { .. }
+            ));
         });
     }
 

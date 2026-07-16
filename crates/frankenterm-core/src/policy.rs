@@ -16827,6 +16827,7 @@ mod tests {
                 redaction_marker: "[REDACTED]".to_string(),
                 hash_salt: "custom-salt".to_string(),
                 detailed_audit: true,
+                ..Default::default()
             },
             ..Default::default()
         };

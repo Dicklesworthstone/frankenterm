@@ -707,6 +707,7 @@ proptest! {
             redaction_marker: marker,
             hash_salt: salt,
             detailed_audit: detailed,
+            policies: Vec::new(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: ClassifierConfig = serde_json::from_str(&json).unwrap();

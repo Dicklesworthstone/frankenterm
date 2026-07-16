@@ -74,10 +74,11 @@ use super::{
     HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
     MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
     MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-    MCP_ERR_WORKFLOW, McpToolError, Osc133State, PaneCapabilities, PaneFilterConfig, PaneInfo,
-    PaneReservation, PaneWaiter, PatternEngine, PolicyDecision, PolicyEngine, PolicyGatedInjector,
-    PolicyInput, SearchQueryDefaults, SearchQueryInput, SharedRateLimiter, StorageHandle,
-    UnifiedSearchMode, WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow,
+    MCP_ERR_WORKFLOW, ManualWorkflowRunOutcome, McpToolError, Osc133State, PaneCapabilities,
+    PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter, PatternEngine, PolicyDecision,
+    PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults, SearchQueryInput,
+    SharedRateLimiter, StorageHandle, UnifiedSearchMode, WaitOptions, WaitResult, WeztermError,
+    WeztermHandleSource, Workflow,
     WorkflowExecutionResult, approval_command, build_mcp_shared_rate_limiter,
     build_mcp_workflow_assembly, build_policy_engine_with_shared_rate_limiter,
     default_wezterm_handle, effective_search_fusion_backend, effective_search_fusion_weights,
@@ -5291,9 +5292,61 @@ impl ToolHandler for WaWorkflowRunTool {
                 })?;
 
                 let execution_id = format!("mcp-{}-{}", params.name, now_ms());
-                let result = runner
-                    .run_workflow(params.pane_id, workflow, &execution_id, 0)
+                // ft-cli44: manual runs must use the same lock +
+                // execution-record protocol as the detection path. Calling
+                // `run_workflow` directly left no execution record, so every
+                // record-requiring persistence helper failed with
+                // "Workflow not found: <execution_id>" and the run was
+                // invisible to status/abort surfaces.
+                let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                let outcome = runner
+                    .run_workflow_manual_with_cx(
+                        &cx,
+                        params.pane_id,
+                        workflow,
+                        &execution_id,
+                        Some(serde_json::json!({
+                            "trigger": "mcp",
+                            "tool": "wa.workflow_run",
+                        })),
+                    )
                     .await;
+                let result = match outcome {
+                    ManualWorkflowRunOutcome::Ran(result) => result,
+                    ManualWorkflowRunOutcome::PaneLocked {
+                        held_by_workflow,
+                        held_by_execution,
+                        ..
+                    } => {
+                        return Err(McpToolError::new(
+                            MCP_ERR_WORKFLOW,
+                            format!(
+                                "Pane {} is locked by workflow '{held_by_workflow}' (execution {held_by_execution})",
+                                params.pane_id
+                            ),
+                            Some(
+                                "Wait for the running workflow to finish, or check wa.workflow_status."
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+                    ManualWorkflowRunOutcome::ConcurrencyLimitReached { active, limit } => {
+                        return Err(McpToolError::new(
+                            MCP_ERR_WORKFLOW,
+                            format!(
+                                "Workflow concurrency limit reached ({active} active / limit {limit})"
+                            ),
+                            Some("Retry after a running workflow completes.".to_string()),
+                        ));
+                    }
+                    ManualWorkflowRunOutcome::StartError { error } => {
+                        return Err(McpToolError::new(
+                            MCP_ERR_WORKFLOW,
+                            format!("Failed to start workflow: {error}"),
+                            None,
+                        ));
+                    }
+                };
 
                 let (status, message, result_value, steps_executed, step_index) = match result {
                     WorkflowExecutionResult::Completed {

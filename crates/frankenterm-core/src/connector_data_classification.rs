@@ -603,6 +603,15 @@ pub struct ClassifierConfig {
     pub hash_salt: String,
     /// Whether to emit detailed per-field audit entries.
     pub detailed_audit: bool,
+    /// Operator-declared classification policies, registered at classifier
+    /// construction in declaration order. Exact connector patterns still take
+    /// precedence over wildcards regardless of order (see
+    /// [`ConnectorDataClassifier::register_policy`]). Before ft-pzxsr the
+    /// `[safety.data_classifier]` TOML section could tune markers/salts but
+    /// carried no policies, so every classification policy had to be
+    /// registered programmatically.
+    #[serde(default)]
+    pub policies: Vec<ClassificationPolicy>,
 }
 
 impl Default for ClassifierConfig {
@@ -612,6 +621,7 @@ impl Default for ClassifierConfig {
             redaction_marker: "[CLASSIFIED]".to_string(),
             hash_salt: "ft-dc-salt".to_string(),
             detailed_audit: false,
+            policies: Vec::new(),
         }
     }
 }
@@ -670,16 +680,25 @@ pub struct ConnectorDataClassifier {
 
 impl ConnectorDataClassifier {
     /// Create a new classifier with the given configuration.
+    ///
+    /// Any policies declared in [`ClassifierConfig::policies`] are registered
+    /// immediately, so a classifier built from operator TOML enforces the
+    /// operator's policies without a separate programmatic registration pass
+    /// (ft-pzxsr).
     #[must_use]
     pub fn new(config: ClassifierConfig) -> Self {
-        Self {
+        let mut classifier = Self {
             config,
             policies: Vec::new(),
             redactor: Redactor::new(),
             audit_log: VecDeque::new(),
             telemetry: ClassificationTelemetry::default(),
             next_token_id: 1,
+        };
+        for policy in classifier.config.policies.clone() {
+            classifier.register_policy(policy);
         }
+        classifier
     }
 
     /// Register a classification policy for a connector pattern.
@@ -2207,6 +2226,74 @@ mod tests {
         assert_eq!(classifier.policy_count(), 0);
         classifier.register_policy(ClassificationPolicy::default());
         assert_eq!(classifier.policy_count(), 1);
+    }
+
+    #[test]
+    fn config_policies_registered_at_construction_ft_pzxsr() {
+        let config = ClassifierConfig {
+            policies: vec![
+                ClassificationPolicy {
+                    policy_id: "wildcard-fallback".to_string(),
+                    connector_pattern: "*".to_string(),
+                    ..Default::default()
+                },
+                ClassificationPolicy {
+                    policy_id: "github-exact".to_string(),
+                    connector_pattern: "github".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let classifier = ConnectorDataClassifier::new(config);
+        assert_eq!(classifier.policy_count(), 2);
+        // Exact patterns win over wildcards even when declared after them.
+        assert_eq!(
+            classifier.find_policy("github").unwrap().policy_id,
+            "github-exact"
+        );
+        assert_eq!(
+            classifier.find_policy("gitlab").unwrap().policy_id,
+            "wildcard-fallback"
+        );
+    }
+
+    #[test]
+    fn config_policies_serde_default_keeps_legacy_toml_working_ft_pzxsr() {
+        // Pre-ft-pzxsr [safety.data_classifier] TOML has no `policies` key;
+        // deserialization must still succeed with an empty policy list.
+        let legacy: ClassifierConfig = toml::from_str(
+            r#"
+            max_audit_entries = 100
+            redaction_marker = "[X]"
+            hash_salt = "salt"
+            detailed_audit = true
+            "#,
+        )
+        .expect("legacy classifier TOML without policies must deserialize");
+        assert!(legacy.policies.is_empty());
+        assert_eq!(legacy.max_audit_entries, 100);
+
+        let with_policies: ClassifierConfig = toml::from_str(
+            r#"
+            max_audit_entries = 100
+            redaction_marker = "[X]"
+            hash_salt = "salt"
+            detailed_audit = false
+
+            [[policies]]
+            policy_id = "slack-pii"
+            connector_pattern = "slack"
+            rules = []
+            default_sensitivity = "internal"
+            scan_for_secrets = true
+            max_payload_bytes = 1048576
+            allow_prohibited = false
+            "#,
+        )
+        .expect("classifier TOML with declared policies must deserialize");
+        assert_eq!(with_policies.policies.len(), 1);
+        assert_eq!(with_policies.policies[0].policy_id, "slack-pii");
     }
 
     // ── JSON helpers ──

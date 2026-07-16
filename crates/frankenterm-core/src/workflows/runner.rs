@@ -313,6 +313,40 @@ pub enum WorkflowStartResult {
     },
 }
 
+/// Outcome of a manually invoked workflow run (ft-cli44).
+///
+/// The manual entry points — MCP `wa.workflow_run`, `ft robot workflows run`,
+/// and `ft workflow run` — must use the same lock + execution-record protocol
+/// as the detection path. See [`WorkflowRunner::run_workflow_manual_with_cx`].
+#[derive(Debug)]
+pub enum ManualWorkflowRunOutcome {
+    /// Lock acquired, execution record persisted, workflow ran to a terminal
+    /// result.
+    Ran(WorkflowExecutionResult),
+    /// The target pane is already locked by another workflow execution; the
+    /// workflow was not started.
+    PaneLocked {
+        /// The pane that is locked.
+        pane_id: u64,
+        /// Workflow name holding the lock.
+        held_by_workflow: String,
+        /// Execution ID holding the lock.
+        held_by_execution: String,
+    },
+    /// Runner-wide concurrency limit reached; the workflow was not started.
+    ConcurrencyLimitReached {
+        /// Current number of active workflows.
+        active: usize,
+        /// Configured maximum.
+        limit: usize,
+    },
+    /// The execution record could not be created; the workflow was not run.
+    StartError {
+        /// Error message from the engine/storage start handshake.
+        error: String,
+    },
+}
+
 impl WorkflowStartResult {
     /// Returns true if a workflow was started.
     #[must_use]
@@ -819,6 +853,96 @@ impl WorkflowRunner {
                 // lock_guard drops here → release(pane_id, &execution_id).
                 drop(lock_guard);
                 WorkflowStartResult::Error {
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+
+    /// Manually start and run a workflow to completion (ft-cli44).
+    ///
+    /// The detection path ([`Self::handle_detection_with_cx`]) acquires the
+    /// pane workflow lock and persists the execution record via
+    /// `engine.start_with_id_cx` BEFORE `run_workflow`. The manual entry
+    /// points (MCP `wa.workflow_run`, `ft robot workflows run`,
+    /// `ft workflow run`) used to skip both and call [`Self::run_workflow`]
+    /// directly with a fabricated execution id: every storage helper that
+    /// requires the execution record (`update_execution_step`,
+    /// abort/complete persistence) then failed with
+    /// `WorkflowError::NotFound(execution_id)`, so manual runs could not
+    /// persist progress, were invisible to status/abort surfaces, and
+    /// bypassed the pane lock + concurrency limit.
+    ///
+    /// This method is the supported manual entry point: same lock +
+    /// execution-record protocol as the detection path, minus the
+    /// detection-only trigger checks (source-pane trust scope and the
+    /// rate-limit decline are properties of pane-output-triggered
+    /// automation; manual runs are operator-initiated and remain
+    /// policy-gated per step).
+    pub async fn run_workflow_manual_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+        workflow: Arc<dyn Workflow>,
+        execution_id: &str,
+        trigger_context: Option<serde_json::Value>,
+    ) -> ManualWorkflowRunOutcome {
+        let workflow_name = workflow.name().to_string();
+        let lock_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
+            pane_id,
+            &workflow_name,
+            execution_id,
+            self.config.max_concurrent,
+        ) {
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(g)) => g,
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                ..
+            }) => {
+                return ManualWorkflowRunOutcome::PaneLocked {
+                    pane_id,
+                    held_by_workflow,
+                    held_by_execution,
+                };
+            }
+            Err(limit_info) => {
+                return ManualWorkflowRunOutcome::ConcurrencyLimitReached {
+                    active: limit_info.active,
+                    limit: limit_info.limit,
+                };
+            }
+        };
+
+        match self
+            .engine
+            .start_with_id_cx(
+                cx,
+                &self.storage,
+                super::engine::WorkflowStartInput {
+                    execution_id: execution_id.to_string(),
+                    workflow_name: workflow_name.clone(),
+                    pane_id,
+                    trigger_event_id: None,
+                    context: trigger_context,
+                },
+            )
+            .await
+        {
+            Ok(_execution) => {
+                // Handoff to `run_workflow_inner`, which takes its own RAII
+                // release guard at entry — defuse (consume without
+                // releasing) exactly like the detection path.
+                lock_guard.defuse();
+                ManualWorkflowRunOutcome::Ran(
+                    self.run_workflow_with_cx(cx, pane_id, workflow, execution_id, 0)
+                        .await,
+                )
+            }
+            Err(e) => {
+                // lock_guard drops here → release(pane_id, &execution_id).
+                drop(lock_guard);
+                ManualWorkflowRunOutcome::StartError {
                     error: e.to_string(),
                 }
             }
