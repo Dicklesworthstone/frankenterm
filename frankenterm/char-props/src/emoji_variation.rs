@@ -863,7 +863,7 @@ pub const VARIATION_MAP: phf::Map<&'static str, (Presentation, Presentation)> = 
 
 use crate::widechar_width::{WcLookupTable, WcWidth};
 
-pub const WCWIDTH_TABLE: WcLookupTable = WcLookupTable {
+pub static WCWIDTH_TABLE: WcLookupTable = WcLookupTable {
     table: [
         WcWidth::NonPrint,
         WcWidth::NonPrint,

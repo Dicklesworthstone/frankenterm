@@ -71,7 +71,7 @@ fn emit_classify_table() {
     let table = WcLookupTable::new();
     println!("use crate::widechar_width::{{WcLookupTable, WcWidth}};");
     println!();
-    println!("pub const WCWIDTH_TABLE: WcLookupTable = WcLookupTable {{");
+    println!("pub static WCWIDTH_TABLE: WcLookupTable = WcLookupTable {{");
     println!("  table: [");
 
     for c in &table.table {
