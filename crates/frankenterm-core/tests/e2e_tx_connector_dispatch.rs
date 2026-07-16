@@ -27,7 +27,7 @@
 //! in-process + tempdir tests — no network, no remote workers.
 
 use frankenterm_core::tx_idempotency::{
-    IdempotencyKey, IdempotencyPolicy, IdempotencyStore, StepOutcome,
+    IdempotencyKey, IdempotencyPolicy, IdempotencyStore, StepOutcome, TxPhase,
 };
 use frankenterm_core::tx_plan_compiler::{StepRisk, TxPlan, TxRiskSummary};
 
@@ -95,20 +95,43 @@ fn tx_durable_idempotency_survives_store_restart_no_double_effect() {
             .create_ledger(EXEC_ID, &minimal_plan(plan_id))
             .expect("create ledger");
         store
-            .record_execution(
+            .transition_phase(EXEC_ID, TxPhase::Preparing)
+            .expect("enter prepare phase");
+        store
+            .transition_phase(EXEC_ID, TxPhase::Committing)
+            .expect("enter commit phase");
+        let mut reservation = store
+            .acquire_durable_reservation(EXEC_ID, &key, 999)
+            .expect("acquire durable reservation");
+        assert!(reservation.observed_outcome().is_none());
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                EXEC_ID,
+                key.clone(),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "agent-e2e",
+                999,
+            )
+            .expect("persist pending step before dispatch");
+        store
+            .complete_execution_reserved(
+                reservation,
                 EXEC_ID,
                 key.clone(),
                 StepOutcome::Success {
                     result: Some("committed".to_string()),
                 },
-                StepRisk::High,
-                "agent-e2e",
                 1000,
             )
-            .expect("record committed step");
+            .expect("persist committed step");
+        store
+            .transition_phase(EXEC_ID, TxPhase::Completed)
+            .expect("complete transaction");
 
         assert!(
-            store.check_dedup(&key).is_some(),
+            store.peek_cached_outcome(&key, 1000).is_some(),
             "committed step must dedup within the same process"
         );
     } // store dropped — simulates process exit / crash after the durable commit.
@@ -125,9 +148,15 @@ fn tx_durable_idempotency_survives_store_restart_no_double_effect() {
     // reload the persisted ledger and still recognize the committed step, so a
     // re-run would skip it instead of re-dispatching the side effect.
     {
-        let restarted = IdempotencyStore::open(ft_dir, IdempotencyPolicy::default())
+        let mut restarted = IdempotencyStore::open(ft_dir, IdempotencyPolicy::default())
             .expect("reopen durable idempotency store after restart");
-        let recovered = restarted.check_dedup(&key);
+        restarted
+            .create_ledger("txe-1001", &minimal_plan(plan_id))
+            .expect("create retry ledger");
+        let reservation = restarted
+            .acquire_durable_reservation("txe-1001", &key, 1001)
+            .expect("refresh authoritative proof under key lock");
+        let recovered = reservation.observed_outcome();
         assert!(
             recovered.is_some(),
             "ft-iz1ki RESTART-SAFETY: a committed step must still dedup after the \
@@ -159,27 +188,60 @@ fn tx_durable_idempotency_is_key_scoped_not_blanket() {
             .create_ledger("txe-2000", &minimal_plan(plan_id))
             .expect("create ledger");
         store
-            .record_execution(
+            .transition_phase("txe-2000", TxPhase::Preparing)
+            .expect("enter prepare phase");
+        store
+            .transition_phase("txe-2000", TxPhase::Committing)
+            .expect("enter commit phase");
+        let mut reservation = store
+            .acquire_durable_reservation("txe-2000", &committed_key, 1999)
+            .expect("acquire durable reservation");
+        assert!(reservation.observed_outcome().is_none());
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                "txe-2000",
+                committed_key.clone(),
+                StepOutcome::Pending,
+                StepRisk::Medium,
+                "agent-e2e",
+                1999,
+            )
+            .expect("persist pending step before dispatch");
+        store
+            .complete_execution_reserved(
+                reservation,
                 "txe-2000",
                 committed_key.clone(),
                 StepOutcome::Success { result: None },
-                StepRisk::Medium,
-                "agent-e2e",
                 2000,
             )
-            .expect("record committed step");
+            .expect("persist committed step");
+        store
+            .transition_phase("txe-2000", TxPhase::Completed)
+            .expect("complete transaction");
     }
 
     // After restart: the committed key dedups, but an unrelated key must NOT —
     // restart-safety must never become a blanket suppressor of new work.
-    let restarted =
+    let mut restarted =
         IdempotencyStore::open(ft_dir, IdempotencyPolicy::default()).expect("reopen durable store");
+    restarted
+        .create_ledger("txe-2001", &minimal_plan(plan_id))
+        .expect("create retry ledger");
+    let committed = restarted
+        .acquire_durable_reservation("txe-2001", &committed_key, 2001)
+        .expect("refresh committed key under lock");
     assert!(
-        restarted.check_dedup(&committed_key).is_some(),
+        committed.observed_outcome().is_some(),
         "the previously-committed step must dedup after restart"
     );
+    drop(committed);
+    let fresh = restarted
+        .acquire_durable_reservation("txe-2001", &fresh_key, 2001)
+        .expect("refresh fresh key under lock");
     assert!(
-        restarted.check_dedup(&fresh_key).is_none(),
+        fresh.observed_outcome().is_none(),
         "an uncommitted step must NOT be deduped — dedup is key-scoped, not blanket"
     );
 }
@@ -259,7 +321,10 @@ fn connector_dispatch_deduplicates_replayed_event_no_double_effect() {
     .with_correlation_id("replay-key-1");
 
     let first = bridge.process_event(&event).expect("process first");
-    assert!(!first.deduplicated, "first delivery must not be deduplicated");
+    assert!(
+        !first.deduplicated,
+        "first delivery must not be deduplicated"
+    );
 
     let replay = bridge.process_event(&event).expect("process replay");
     assert!(
@@ -304,26 +369,54 @@ fn tx_committed_step_is_honored_across_runs_regardless_of_provenance() {
             .create_ledger("txe-synthetic-1000", &minimal_plan(plan_id))
             .expect("create ledger");
         store
-            .record_execution(
+            .transition_phase("txe-synthetic-1000", TxPhase::Preparing)
+            .expect("enter prepare phase");
+        store
+            .transition_phase("txe-synthetic-1000", TxPhase::Committing)
+            .expect("enter commit phase");
+        let mut reservation = store
+            .acquire_durable_reservation("txe-synthetic-1000", &key, 999)
+            .expect("acquire durable reservation");
+        assert!(reservation.observed_outcome().is_none());
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                "txe-synthetic-1000",
+                key.clone(),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "synthetic-fallback",
+                999,
+            )
+            .expect("persist pending step before dispatch");
+        store
+            .complete_execution_reserved(
+                reservation,
                 "txe-synthetic-1000",
                 key.clone(),
                 StepOutcome::Success {
                     result: Some("committed-by-bypassed-run".to_string()),
                 },
-                StepRisk::High,
-                "synthetic-fallback",
                 1000,
             )
-            .expect("record committed step");
+            .expect("persist committed step");
+        store
+            .transition_phase("txe-synthetic-1000", TxPhase::Completed)
+            .expect("complete transaction");
     }
 
     // RESTART: a later legitimate run opens the same durable store under a fresh
-    // execution id. check_dedup is keyed on (plan, step, action), so the prior
-    // commit is found and the step would be skipped — with no way to tell it was
-    // produced by a bypassed run.
-    let later = IdempotencyStore::open(ft_dir, IdempotencyPolicy::default())
-        .expect("reopen durable store");
-    let recovered = later.check_dedup(&key);
+    // execution id. The key-locked live-spool refresh finds the prior commit —
+    // with no way to tell it was produced by a bypassed run.
+    let mut later =
+        IdempotencyStore::open(ft_dir, IdempotencyPolicy::default()).expect("reopen durable store");
+    later
+        .create_ledger("txe-legitimate-2000", &minimal_plan(plan_id))
+        .expect("create later execution ledger");
+    let reservation = later
+        .acquire_durable_reservation("txe-legitimate-2000", &key, 2000)
+        .expect("refresh authoritative prior proof");
+    let recovered = reservation.observed_outcome();
     assert!(
         matches!(
             recovered,

@@ -85,6 +85,8 @@ fn all_gates_pass(num_steps: usize) -> Vec<TxPrepareGateInput> {
         .map(|i| TxPrepareGateInput {
             step_id: TxStepId(format!("s{i}")),
             pane_id: None,
+            preconditions_satisfied: true,
+            precondition_reason_code: None,
             policy_passed: true,
             policy_reason_code: None,
             reservation_available: true,

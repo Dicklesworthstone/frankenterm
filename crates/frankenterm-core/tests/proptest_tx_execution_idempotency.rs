@@ -266,7 +266,9 @@ proptest! {
     ) {
         let (executor, events) = RecordingConnectorExecutor::new();
         let engine = TxExecutionEngine::new(executor, tx_config(None));
-        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let store_dir = tempfile::tempdir().map_err(engine_error)?;
+        let mut store = IdempotencyStore::open(store_dir.path(), IdempotencyPolicy::default())
+            .map_err(engine_error)?;
         let mut first_contract = contract_from_kinds("commit-replay", &kinds);
 
         let first = engine
@@ -313,7 +315,9 @@ proptest! {
         let (executor, events) = RecordingConnectorExecutor::new();
         let fail_step = format!("step-{fail_index}");
         let engine = TxExecutionEngine::new(executor, tx_config(Some(fail_step)));
-        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let store_dir = tempfile::tempdir().map_err(engine_error)?;
+        let mut store = IdempotencyStore::open(store_dir.path(), IdempotencyPolicy::default())
+            .map_err(engine_error)?;
         let mut first_contract = contract_from_kinds("compensating-replay", &kinds);
 
         let first = engine

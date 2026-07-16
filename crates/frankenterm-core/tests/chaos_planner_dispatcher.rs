@@ -611,6 +611,8 @@ fn b1_multi_gate_denial_cascade() {
         .map(|i| TxPrepareGateInput {
             step_id: TxStepId(format!("s{i}")),
             pane_id: None,
+            preconditions_satisfied: true,
+            precondition_reason_code: None,
             policy_passed: i != 1,
             policy_reason_code: if i == 1 {
                 Some("org-policy-block".into())
@@ -944,10 +946,15 @@ fn c3_ledger_sealed_after_terminal() {
         .unwrap();
 
     // Transition to terminal phase: Preparing → Committing → Completed.
-    let ledger = store.get_ledger_mut("exec-c3").unwrap();
-    ledger.transition_phase(IdemPhase::Preparing).unwrap();
-    ledger.transition_phase(IdemPhase::Committing).unwrap();
-    ledger.transition_phase(IdemPhase::Completed).unwrap();
+    store
+        .transition_phase("exec-c3", IdemPhase::Preparing)
+        .unwrap();
+    store
+        .transition_phase("exec-c3", IdemPhase::Committing)
+        .unwrap();
+    store
+        .transition_phase("exec-c3", IdemPhase::Completed)
+        .unwrap();
 
     // Now try to append — should fail.
     let key2 = IdempotencyKey::new("plan-c3", "s2", "action-2");
@@ -1034,10 +1041,12 @@ fn c5_resume_intact_chain_continue() {
         .unwrap();
 
     // Transition to Preparing (non-terminal).
-    let ledger = store.get_ledger_mut("exec-c5").unwrap();
-    ledger.transition_phase(IdemPhase::Preparing).unwrap();
+    store
+        .transition_phase("exec-c5", IdemPhase::Preparing)
+        .unwrap();
 
     // Verify chain is intact.
+    let ledger = store.get_ledger("exec-c5").unwrap();
     let verification = ledger.verify_chain();
     assert!(verification.chain_intact, "[C5] chain should be intact");
 
@@ -1078,9 +1087,12 @@ fn c6_resume_partial_commit() {
             .unwrap();
     }
 
-    let ledger = store.get_ledger_mut("exec-c6").unwrap();
-    ledger.transition_phase(IdemPhase::Preparing).unwrap();
-    ledger.transition_phase(IdemPhase::Committing).unwrap();
+    store
+        .transition_phase("exec-c6", IdemPhase::Preparing)
+        .unwrap();
+    store
+        .transition_phase("exec-c6", IdemPhase::Committing)
+        .unwrap();
 
     // Resume should recommend continuing from checkpoint.
     let resume = store.resume_context("exec-c6", &plan).unwrap();

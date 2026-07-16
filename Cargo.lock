@@ -3615,6 +3615,8 @@ dependencies = [
  "asupersync",
  "base64 0.22.1",
  "bloomfilter",
+ "cap-fs-ext",
+ "cap-std",
  "chacha20poly1305",
  "chrono",
  "codec",

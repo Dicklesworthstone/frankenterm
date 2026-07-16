@@ -15,15 +15,24 @@ use assert_cmd::Command;
 #[cfg(unix)]
 #[path = "../../frankenterm-core/tests/common/wezterm_subprocess.rs"]
 mod wezterm_subprocess;
+#[cfg(unix)]
+use frankenterm_core::approval::ApprovalScope;
 use frankenterm_core::plan::{
-    MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
-    TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId,
+    MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
+    MissionTxState, StepAction, TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId,
+    TxStep, TxStepId, execute_commit_phase, mission_tx_commit_step_inputs,
+};
+#[cfg(unix)]
+use frankenterm_core::policy::{
+    ActionKind, ActorKind, PaneCapabilities, PolicyInput, PolicySurface,
 };
 #[cfg(unix)]
 use frankenterm_core::scrollback_mmap_format::RecordKind;
 use frankenterm_core::scrollback_mmap_format::{FormatVersion, HeaderFlags, ScrollbackHeader};
 #[cfg(unix)]
 use frankenterm_core::scrollback_mmap_writer::{MmapScrollback, MmapScrollbackConfig};
+#[cfg(unix)]
+use frankenterm_core::tx_idempotency::{StepOutcome, TxExecutionLedger, TxPhase};
 use predicates::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -358,64 +367,63 @@ fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
                 TxStep {
                     step_id: TxStepId("tx-step:1".to_string()),
                     ordinal: 1,
-                    action: StepAction::SendText {
-                        pane_id: 1,
-                        text: "step-1".to_string(),
-                        paste_mode: Some(false),
+                    action: StepAction::StoreData {
+                        key: "tx-step:1".to_string(),
+                        value: serde_json::json!({"state": "committed", "step": 1}),
                     },
                     description: "step 1".to_string(),
                 },
                 TxStep {
                     step_id: TxStepId("tx-step:2".to_string()),
                     ordinal: 2,
-                    action: StepAction::SendText {
-                        pane_id: 2,
-                        text: "step-2".to_string(),
-                        paste_mode: Some(false),
+                    action: StepAction::StoreData {
+                        key: "tx-step:2".to_string(),
+                        value: serde_json::json!({"state": "committed", "step": 2}),
                     },
                     description: "step 2".to_string(),
                 },
                 TxStep {
                     step_id: TxStepId("tx-step:3".to_string()),
                     ordinal: 3,
-                    action: StepAction::SendText {
-                        pane_id: 3,
-                        text: "step-3".to_string(),
-                        paste_mode: Some(true),
+                    action: StepAction::StoreData {
+                        key: "tx-step:3".to_string(),
+                        value: serde_json::json!({"state": "committed", "step": 3}),
                     },
                     description: "step 3".to_string(),
                 },
             ],
-            preconditions: vec![TxPrecondition::PromptActive { pane_id: 1 }],
+            preconditions: Vec::new(),
             compensations: vec![
                 TxCompensation {
                     for_step_id: TxStepId("tx-step:1".to_string()),
-                    action: StepAction::SendText {
-                        pane_id: 1,
-                        text: "undo-1".to_string(),
-                        paste_mode: Some(false),
+                    action: StepAction::StoreData {
+                        key: "tx-step:1".to_string(),
+                        value: serde_json::json!({"state": "compensated", "step": 1}),
                     },
                 },
                 TxCompensation {
                     for_step_id: TxStepId("tx-step:2".to_string()),
-                    action: StepAction::SendText {
-                        pane_id: 2,
-                        text: "undo-2".to_string(),
-                        paste_mode: Some(false),
+                    action: StepAction::StoreData {
+                        key: "tx-step:2".to_string(),
+                        value: serde_json::json!({"state": "compensated", "step": 2}),
                     },
                 },
                 TxCompensation {
                     for_step_id: TxStepId("tx-step:3".to_string()),
-                    action: StepAction::SendText {
-                        pane_id: 3,
-                        text: "undo-3".to_string(),
-                        paste_mode: Some(true),
+                    action: StepAction::StoreData {
+                        key: "tx-step:3".to_string(),
+                        value: serde_json::json!({"state": "compensated", "step": 3}),
                     },
                 },
             ],
         },
         lifecycle_state: state,
-        outcome: TxOutcome::Pending,
+        outcome: match state {
+            MissionTxState::Committed => TxOutcome::Committed,
+            MissionTxState::Failed => TxOutcome::Failed,
+            MissionTxState::Compensated | MissionTxState::RolledBack => TxOutcome::Compensated,
+            _ => TxOutcome::Pending,
+        },
         receipts: Vec::new(),
     }
 }
@@ -428,13 +436,685 @@ fn write_default_tx_contract(dir: &TempDir, state: MissionTxState) -> std::path:
         .join("tx-active.json");
     std::fs::create_dir_all(path.parent().expect("tx contract parent"))
         .expect("create mission dir");
-    let contract = sample_tx_contract(state);
+    let mut contract = sample_tx_contract(state);
+    if state == MissionTxState::Committed {
+        let mut committing = contract.clone();
+        committing.lifecycle_state = MissionTxState::Committing;
+        committing.outcome = TxOutcome::Pending;
+        let inputs = mission_tx_commit_step_inputs(&committing, None, 1_700_000_000_001);
+        contract.receipts = execute_commit_phase(
+            &committing,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            1_700_000_000_001,
+        )
+        .expect("build committed tx fixture receipts")
+        .receipts;
+    }
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&contract).expect("serialize tx contract"),
     )
     .expect("write tx contract");
     path
+}
+
+#[cfg(unix)]
+fn executable_send_text_contract(
+    mut contract: MissionTxContract,
+    pane_id: u64,
+    commit_prefix: &str,
+    compensation_prefix: &str,
+) -> MissionTxContract {
+    for step in &mut contract.plan.steps {
+        step.action = StepAction::SendText {
+            pane_id,
+            text: format!("{commit_prefix}:{}", step.step_id.0),
+            paste_mode: Some(false),
+        };
+    }
+    for compensation in &mut contract.plan.compensations {
+        compensation.action = StepAction::SendText {
+            pane_id,
+            text: format!("{compensation_prefix}:{}", compensation.for_step_id.0),
+            paste_mode: Some(false),
+        };
+    }
+    contract
+}
+
+#[cfg(unix)]
+fn write_executable_send_text_tx_contract(
+    dir: &TempDir,
+    state: MissionTxState,
+) -> std::path::PathBuf {
+    let path = dir
+        .path()
+        .join(".ft")
+        .join("mission")
+        .join("tx-active.json");
+    std::fs::create_dir_all(path.parent().expect("tx contract parent"))
+        .expect("create mission dir");
+    let mut contract = executable_send_text_contract(
+        sample_tx_contract(state),
+        0,
+        "tx-test-commit",
+        "tx-test-compensate",
+    );
+    if state == MissionTxState::Committed {
+        let mut committing = contract.clone();
+        committing.lifecycle_state = MissionTxState::Committing;
+        committing.outcome = TxOutcome::Pending;
+        let inputs = mission_tx_commit_step_inputs(&committing, None, 1_700_000_000_001);
+        contract.receipts = execute_commit_phase(
+            &committing,
+            &inputs,
+            MissionKillSwitchLevel::Off,
+            false,
+            1_700_000_000_001,
+        )
+        .expect("build committed executable tx fixture receipts")
+        .receipts;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&contract).expect("serialize executable tx contract"),
+    )
+    .expect("write executable tx contract");
+    path
+}
+
+#[cfg(unix)]
+struct TxWeztermCliStub {
+    binary_path: std::path::PathBuf,
+    list_fixture_path: std::path::PathBuf,
+    effect_log_path: std::path::PathBuf,
+    home: std::path::PathBuf,
+    data_home: std::path::PathBuf,
+    config_home: std::path::PathBuf,
+    runtime_dir: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl TxWeztermCliStub {
+    fn new(dir: &TempDir) -> Self {
+        let binary_path = dir.path().join("tx-wezterm-stub.sh");
+        let effect_log_path = dir.path().join("tx-wezterm-effects.log");
+        let list_fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("frankenterm-core")
+            .join("tests")
+            .join("fixtures")
+            .join("wezterm_cli")
+            .join("local_single_pane.json");
+        assert!(
+            list_fixture_path.is_file(),
+            "missing WezTerm CLI fixture {}",
+            list_fixture_path.display()
+        );
+
+        let script = r#"#!/bin/sh
+set -eu
+
+if [ "${1:-}" != "cli" ]; then
+  echo "unsupported wezterm stub invocation: $*" >&2
+  exit 64
+fi
+shift
+if [ "${1:-}" = "--no-auto-start" ]; then
+  shift
+fi
+
+operation="${1:-}"
+if [ -z "$operation" ]; then
+  echo "missing wezterm cli operation" >&2
+  exit 64
+fi
+shift
+
+case "$operation" in
+  list)
+    cat "$FT_TEST_WEZTERM_LIST_JSON"
+    ;;
+  send-text)
+    pane_id=""
+    text=""
+    while [ "$#" -gt 0 ]; do
+      case "${1:-}" in
+        --pane-id)
+          pane_id="${2:-}"
+          shift 2
+          ;;
+        --no-paste|--no-newline)
+          shift
+          ;;
+        --)
+          shift
+          if [ "$#" -ne 1 ]; then
+            echo "send-text stub expects exactly one text argument" >&2
+            exit 64
+          fi
+          text="$1"
+          shift
+          ;;
+        *)
+          echo "unsupported send-text args: $*" >&2
+          exit 64
+          ;;
+      esac
+    done
+    if [ -z "$pane_id" ]; then
+      echo "missing --pane-id" >&2
+      exit 64
+    fi
+    printf '%s\t%s\n' "$pane_id" "$text" >> "$FT_TEST_WEZTERM_EFFECT_LOG"
+    ;;
+  *)
+    echo "unsupported wezterm cli operation: $operation" >&2
+    exit 64
+    ;;
+esac
+"#;
+        std::fs::write(&binary_path, script).expect("write transaction WezTerm CLI stub");
+        let mut permissions = std::fs::metadata(&binary_path)
+            .expect("stat transaction WezTerm CLI stub")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&binary_path, permissions)
+            .expect("make transaction WezTerm CLI stub executable");
+        std::fs::write(&effect_log_path, b"").expect("create transaction effect log");
+
+        let home = dir.path().join("tx-home");
+        let data_home = dir.path().join("tx-data-home");
+        let config_home = dir.path().join("tx-config-home");
+        let runtime_dir = dir.path().join("tx-runtime");
+        for path in [&home, &data_home, &config_home, &runtime_dir] {
+            std::fs::create_dir_all(path).expect("create isolated transaction CLI environment");
+        }
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_millis() as i64;
+        let db_path = dir.path().join(".ft").join("ft.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open transaction fixture DB");
+        conn.execute(
+            "INSERT OR REPLACE INTO panes \
+             (pane_id, domain, title, cwd, first_seen_at, last_seen_at, observed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![0i64, "local", "zsh", "/home/user", now_ms, now_ms, true],
+        )
+        .expect("seed live transaction target pane");
+
+        Self {
+            binary_path,
+            list_fixture_path,
+            effect_log_path,
+            home,
+            data_home,
+            config_home,
+            runtime_dir,
+        }
+    }
+
+    fn command(&self, workspace: &str) -> Command {
+        let mut command = Command::cargo_bin("ft").expect("ft binary should be built");
+        command
+            .timeout(REAL_MUX_ROBOT_WAIT_TIMEOUT)
+            .env("FT_WORKSPACE", workspace)
+            .env("FT_WEZTERM_CLI", &self.binary_path)
+            .env("FT_TEST_WEZTERM_LIST_JSON", &self.list_fixture_path)
+            .env("FT_TEST_WEZTERM_EFFECT_LOG", &self.effect_log_path)
+            .env("HOME", &self.home)
+            .env("XDG_DATA_HOME", &self.data_home)
+            .env("XDG_CONFIG_HOME", &self.config_home)
+            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .env_remove("FRANKENTERM_CONFIG_FILE")
+            .env_remove("FRANKENTERM_CONFIG_DIR")
+            .env_remove("WEZTERM_CONFIG_FILE")
+            .env_remove("WEZTERM_CONFIG_DIR")
+            .env_remove("WEZTERM_FT_SOCKET")
+            .env_remove("WEZTERM_UNIX_SOCKET");
+        command
+    }
+
+    fn run_json(&self, workspace: &str, args: &[&str]) -> serde_json::Value {
+        let output = self
+            .command(workspace)
+            .args(args)
+            .output()
+            .expect("ft transaction command should execute");
+        assert!(
+            output.status.success(),
+            "command failed: ft {}\nstatus: {:?}\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ft transaction stdout should be valid JSON")
+    }
+
+    fn approve_robot_run(&self, workspace: &str, contract_path: &std::path::Path) {
+        let contract: MissionTxContract = serde_json::from_slice(
+            &std::fs::read(contract_path).expect("read robot transaction contract for approvals"),
+        )
+        .expect("deserialize robot transaction contract for approvals");
+        let db_path = std::path::Path::new(workspace).join(".ft").join("ft.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open robot approval fixture DB");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_millis() as i64;
+
+        for step in &contract.plan.steps {
+            let StepAction::SendText {
+                pane_id,
+                text,
+                paste_mode: _,
+            } = &step.action
+            else {
+                panic!(
+                    "robot transaction approval fixture requires SendText steps, got {}",
+                    step.action.action_type_name()
+                );
+            };
+            assert_eq!(*pane_id, 0, "stub fixture exposes only pane 0");
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_surface(PolicySurface::Robot)
+                .with_capabilities(PaneCapabilities::unknown())
+                .with_text_summary(step.description.clone())
+                .with_pane(*pane_id)
+                .with_domain("local")
+                .with_pane_title("zsh")
+                .with_pane_cwd("/home/user")
+                .with_command_text(text.clone());
+            let scope = ApprovalScope::from_input(workspace, &input);
+            conn.execute(
+                "INSERT INTO approval_tokens \
+                 (code_hash, created_at, expires_at, used_at, workspace_id, action_kind, \
+                  pane_id, action_fingerprint, plan_hash, plan_version, risk_summary) \
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, NULL, NULL, ?8)",
+                rusqlite::params![
+                    format!("tx-cli-stub-approval-{}", step.ordinal),
+                    now_ms,
+                    now_ms.saturating_add(600_000),
+                    scope.workspace_id(),
+                    scope.action_kind(),
+                    scope.pane_id(),
+                    scope.action_fingerprint(),
+                    "isolated CLI transaction fixture approval"
+                ],
+            )
+            .expect("seed scoped robot transaction approval");
+        }
+    }
+
+    fn effects(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.effect_log_path)
+            .expect("read transaction effect log")
+            .lines()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn assert_effects(&self, expected: &[&str]) {
+        assert_eq!(
+            self.effects(),
+            expected,
+            "real SendText effects and compensations must match the durable reports"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn ft_0rlfq_tx_contract() -> MissionTxContract {
+    let tx_id = TxId("tx:ft-0rlfq-cli-durability".to_string());
+    executable_send_text_contract(
+        MissionTxContract {
+            tx_version: MISSION_TX_SCHEMA_VERSION,
+            intent: TxIntent {
+                tx_id: tx_id.clone(),
+                requested_by: MissionActorRole::Operator,
+                summary: "cross-process CLI contract and ledger durability".to_string(),
+                correlation_id: "corr:ft-0rlfq-cli-durability".to_string(),
+                created_at_ms: 1_700_000_000_000,
+            },
+            plan: TxPlan {
+                plan_id: TxPlanId("plan:ft-0rlfq-cli-durability".to_string()),
+                tx_id,
+                steps: vec![
+                    TxStep {
+                        step_id: TxStepId("tx-step:1".to_string()),
+                        ordinal: 1,
+                        action: StepAction::StoreData {
+                            key: "ft-0rlfq-step-1".to_string(),
+                            value: serde_json::json!({"state": "committed", "step": 1}),
+                        },
+                        description: "record first contract-transition marker".to_string(),
+                    },
+                    TxStep {
+                        step_id: TxStepId("tx-step:2".to_string()),
+                        ordinal: 2,
+                        action: StepAction::StoreData {
+                            key: "ft-0rlfq-step-2".to_string(),
+                            value: serde_json::json!({"state": "committed", "step": 2}),
+                        },
+                        description: "record second contract-transition marker".to_string(),
+                    },
+                ],
+                preconditions: Vec::new(),
+                compensations: vec![
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:1".to_string()),
+                        action: StepAction::StoreData {
+                            key: "ft-0rlfq-step-1".to_string(),
+                            value: serde_json::json!({"state": "compensated", "step": 1}),
+                        },
+                    },
+                    TxCompensation {
+                        for_step_id: TxStepId("tx-step:2".to_string()),
+                        action: StepAction::StoreData {
+                            key: "ft-0rlfq-step-2".to_string(),
+                            value: serde_json::json!({"state": "compensated", "step": 2}),
+                        },
+                    },
+                ],
+            },
+            lifecycle_state: MissionTxState::Planned,
+            outcome: TxOutcome::Pending,
+            receipts: Vec::new(),
+        },
+        0,
+        "ft-0rlfq-commit",
+        "ft-0rlfq-compensate",
+    )
+}
+
+#[cfg(unix)]
+fn write_ft_0rlfq_tx_contract(dir: &TempDir) -> std::path::PathBuf {
+    let path = dir
+        .path()
+        .join(".ft")
+        .join("mission")
+        .join("tx-active.json");
+    std::fs::create_dir_all(path.parent().expect("tx contract parent"))
+        .expect("create mission dir");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&ft_0rlfq_tx_contract()).expect("serialize tx contract"),
+    )
+    .expect("write tx contract");
+    path
+}
+
+#[cfg(unix)]
+fn run_ft_0rlfq_json(
+    workspace: &str,
+    wezterm_stub: &TxWeztermCliStub,
+    args: &[&str],
+) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    let output = wezterm_stub
+        .command(workspace)
+        .args(args)
+        .output()
+        .expect("ft tx command should execute");
+
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "suite": "ft-0rlfq-cli-durability",
+            "phase": "command",
+            "command": format!("ft {}", args.join(" ")),
+            "status": output.status.code(),
+            "elapsed_ms": started.elapsed().as_millis(),
+        })
+    );
+    assert!(
+        output.status.success(),
+        "command failed: ft {}\nstatus: {:?}\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("ft tx stdout should be valid JSON")
+}
+
+#[cfg(unix)]
+fn assert_ft_0rlfq_persisted_tx(
+    show_payload: &serde_json::Value,
+    contract_path: &std::path::Path,
+    expected_lifecycle: &str,
+    expected_outcome: &str,
+    expected_receipts: &[(u64, &str, &str, &str)],
+) -> serde_json::Value {
+    assert_eq!(show_payload["ok"], true);
+    let data = &show_payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["lifecycle_state"].as_str(), Some(expected_lifecycle));
+    assert_eq!(data["outcome"].as_str(), Some(expected_outcome));
+    assert_eq!(
+        data["receipt_count"].as_u64(),
+        Some(expected_receipts.len() as u64)
+    );
+
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(contract_path).expect("read persisted tx contract"))
+            .expect("persisted tx contract should be valid JSON");
+    assert_eq!(
+        data["contract"], persisted,
+        "show --include-contract must return the exact contract persisted by the prior process"
+    );
+    assert_eq!(
+        persisted["lifecycle_state"].as_str(),
+        Some(expected_lifecycle)
+    );
+    assert_eq!(persisted["outcome"].as_str(), Some(expected_outcome));
+
+    let receipts = persisted["receipts"]
+        .as_array()
+        .expect("persisted receipts should be an array");
+    assert_eq!(receipts.len(), expected_receipts.len());
+    for (receipt, &(seq, phase, step_id, outcome)) in receipts.iter().zip(expected_receipts) {
+        assert_eq!(receipt["seq"].as_u64(), Some(seq));
+        assert_eq!(receipt["phase"].as_str(), Some(phase));
+        assert_eq!(receipt["step_id"].as_str(), Some(step_id));
+        assert_eq!(receipt["outcome"].as_str(), Some(outcome));
+    }
+
+    persisted
+}
+
+fn tx_report_receipts(report: &serde_json::Value, report_name: &str) -> Vec<serde_json::Value> {
+    report["receipts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{report_name}.receipts should be an array"))
+        .clone()
+}
+
+fn assert_tx_receipt_partition(
+    persisted: &serde_json::Value,
+    emitted_commit_receipts: &[serde_json::Value],
+    emitted_compensation_receipts: &[serde_json::Value],
+) {
+    let persisted_receipts = persisted["receipts"]
+        .as_array()
+        .expect("persisted transaction receipts should be an array");
+    assert_eq!(
+        persisted_receipts.len(),
+        emitted_commit_receipts.len() + emitted_compensation_receipts.len(),
+        "persisted receipt count must equal the exact emitted commit and compensation arrays"
+    );
+    assert_eq!(
+        &persisted_receipts[..emitted_commit_receipts.len()],
+        emitted_commit_receipts,
+        "the emitted commit receipt array must be the exact persisted prefix"
+    );
+    assert_eq!(
+        &persisted_receipts[emitted_commit_receipts.len()..],
+        emitted_compensation_receipts,
+        "the emitted compensation receipt array must be the exact appended persisted suffix"
+    );
+}
+
+fn assert_tx_show_matches_persisted_contract(
+    show_payload: &serde_json::Value,
+    contract_path: &std::path::Path,
+    expected_lifecycle: &str,
+    expected_outcome: &str,
+) -> serde_json::Value {
+    assert_eq!(show_payload["ok"], true);
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(contract_path).expect("read transaction contract after fresh-process show"),
+    )
+    .expect("persisted transaction contract should be valid JSON");
+    let data = &show_payload["data"];
+    assert_eq!(
+        data["contract_file"].as_str(),
+        Some(contract_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(data["lifecycle_state"].as_str(), Some(expected_lifecycle));
+    assert_eq!(data["outcome"].as_str(), Some(expected_outcome));
+    assert_eq!(
+        data["receipt_count"].as_u64(),
+        persisted["receipts"]
+            .as_array()
+            .map(|receipts| receipts.len() as u64)
+    );
+    assert_eq!(
+        data["contract"], persisted,
+        "fresh-process show --include-contract must exactly match the on-disk contract"
+    );
+    assert_eq!(
+        persisted["lifecycle_state"].as_str(),
+        Some(expected_lifecycle)
+    );
+    assert_eq!(persisted["outcome"].as_str(), Some(expected_outcome));
+    persisted
+}
+
+#[cfg(unix)]
+fn load_ft_0rlfq_tx_ledgers(workspace_root: &std::path::Path) -> Vec<TxExecutionLedger> {
+    let ledger_dir = workspace_root.join(".ft").join("tx_ledgers");
+    let mut ledger_paths = std::fs::read_dir(&ledger_dir)
+        .unwrap_or_else(|err| panic!("read durable ledger spool {}: {err}", ledger_dir.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "enumerate durable ledger spool {}: {err}",
+                        ledger_dir.display()
+                    )
+                })
+                .path()
+        })
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    ledger_paths.sort();
+    ledger_paths
+        .into_iter()
+        .map(|path| {
+            serde_json::from_slice(
+                &std::fs::read(&path)
+                    .unwrap_or_else(|err| panic!("read durable ledger {}: {err}", path.display())),
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "deserialize and validate durable ledger {}: {err}",
+                    path.display()
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn assert_ft_0rlfq_terminal_ledgers(
+    workspace_root: &std::path::Path,
+    expected_ledger_count: usize,
+    expected_success_steps: &[&str],
+    expected_compensated_steps: &[&str],
+) {
+    let ledgers = load_ft_0rlfq_tx_ledgers(workspace_root);
+    assert_eq!(
+        ledgers.len(),
+        expected_ledger_count,
+        "every ft-0rlfq process execution should retain one durable ledger"
+    );
+
+    let mut success_steps = Vec::new();
+    let mut compensated_steps = Vec::new();
+    for ledger in &ledgers {
+        assert_eq!(ledger.plan_id(), "plan:ft-0rlfq-cli-durability");
+        assert!(
+            ledger.phase().is_terminal(),
+            "ledger {} must be terminal, got {:?}",
+            ledger.execution_id(),
+            ledger.phase()
+        );
+        assert_eq!(
+            ledger.phase(),
+            TxPhase::Completed,
+            "successful run and rollback ledgers must complete"
+        );
+        let verification = ledger.verify_chain();
+        assert!(
+            verification.chain_intact,
+            "ledger {} hash chain must be intact: {verification:?}",
+            ledger.execution_id()
+        );
+        assert_eq!(verification.total_records, ledger.records().len());
+        assert!(
+            !ledger.records().is_empty(),
+            "ledger {} should retain durable step records",
+            ledger.execution_id()
+        );
+
+        let mut ledger_has_success = false;
+        let mut ledger_has_compensation = false;
+        for record in ledger.records() {
+            match &record.outcome {
+                StepOutcome::Success { .. } => {
+                    ledger_has_success = true;
+                    success_steps.push(record.idem_key.step_id().to_string());
+                }
+                StepOutcome::Compensated { .. } => {
+                    ledger_has_compensation = true;
+                    compensated_steps.push(record.idem_key.step_id().to_string());
+                }
+                other => panic!(
+                    "ledger {} retained unexpected outcome {other:?} for {}",
+                    ledger.execution_id(),
+                    record.idem_key.step_id()
+                ),
+            }
+        }
+        assert!(
+            !(ledger_has_success && ledger_has_compensation),
+            "run and rollback records should remain separated by execution ledger"
+        );
+    }
+
+    success_steps.sort();
+    compensated_steps.sort();
+    let mut expected_success_steps = expected_success_steps
+        .iter()
+        .map(|step| (*step).to_string())
+        .collect::<Vec<_>>();
+    let mut expected_compensated_steps = expected_compensated_steps
+        .iter()
+        .map(|step| (*step).to_string())
+        .collect::<Vec<_>>();
+    expected_success_steps.sort();
+    expected_compensated_steps.sort();
+    assert_eq!(success_steps, expected_success_steps);
+    assert_eq!(compensated_steps, expected_compensated_steps);
 }
 
 fn assert_tx_transition_contract_shape(transitions: &serde_json::Value) {
@@ -477,7 +1157,7 @@ fn assert_tx_contract_payload_shape(contract: &serde_json::Value, expected_state
         contract["plan"]["preconditions"]
             .as_array()
             .map(std::vec::Vec::len),
-        Some(1)
+        Some(0)
     );
     assert_eq!(
         contract["plan"]["compensations"]
@@ -2385,7 +3065,7 @@ fn contract_tx_plan_json_envelope() {
     assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
     assert_eq!(data["lifecycle_state"].as_str(), Some("planned"));
     assert_eq!(data["step_count"].as_u64(), Some(3));
-    assert_eq!(data["precondition_count"].as_u64(), Some(1));
+    assert_eq!(data["precondition_count"].as_u64(), Some(0));
     assert_eq!(data["compensation_count"].as_u64(), Some(3));
     assert_tx_transition_contract_shape(&data["legal_transitions"]);
 }
@@ -2410,18 +3090,23 @@ fn contract_tx_show_include_contract_json_envelope() {
     assert_eq!(data["lifecycle_state"].as_str(), Some("planned"));
     assert_eq!(data["outcome"].as_str(), Some("pending"));
     assert_eq!(data["step_count"].as_u64(), Some(3));
-    assert_eq!(data["precondition_count"].as_u64(), Some(1));
+    assert_eq!(data["precondition_count"].as_u64(), Some(0));
     assert_eq!(data["compensation_count"].as_u64(), Some(3));
     assert_eq!(data["receipt_count"].as_u64(), Some(0));
     assert_tx_transition_contract_shape(&data["legal_transitions"]);
     assert_tx_contract_payload_shape(&data["contract"], "planned");
 }
 
+#[cfg(unix)]
 #[test]
 fn contract_tx_run_partial_failure_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
-    let payload = run_wa_json(
+    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let contract_path = write_executable_send_text_tx_contract(&dir, MissionTxState::Planned);
+    let authoritative_contract_path = contract_path
+        .canonicalize()
+        .expect("canonicalize locked tx contract");
+    let payload = wezterm_stub.run_json(
         &ws,
         &["tx", "run", "--format", "json", "--fail-step", "tx-step:2"],
     );
@@ -2430,7 +3115,7 @@ fn contract_tx_run_partial_failure_json_envelope() {
     let data = &payload["data"];
     assert_eq!(
         data["contract_file"].as_str(),
-        Some(contract_path.to_string_lossy().as_ref())
+        Some(authoritative_contract_path.to_string_lossy().as_ref())
     );
     assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
     assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
@@ -2464,6 +3149,36 @@ fn contract_tx_run_partial_failure_json_envelope() {
             > 0
     );
     assert_eq!(data["final_state"].as_str(), Some("rolled_back"));
+
+    let emitted_commit_receipts = tx_report_receipts(&data["commit_report"], "commit_report");
+    let emitted_compensation_receipts =
+        tx_report_receipts(&data["compensation_report"], "compensation_report");
+    let show_payload = wezterm_stub.run_json(
+        &ws,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "show",
+            "--include-contract",
+        ],
+    );
+    let persisted = assert_tx_show_matches_persisted_contract(
+        &show_payload,
+        &contract_path,
+        "rolled_back",
+        "compensated",
+    );
+    assert_tx_receipt_partition(
+        &persisted,
+        &emitted_commit_receipts,
+        &emitted_compensation_receipts,
+    );
+    wezterm_stub.assert_effects(&[
+        "0\ttx-test-commit:tx-step:1",
+        "0\ttx-test-compensate:tx-step:1",
+    ]);
 }
 
 #[test]
@@ -2524,7 +3239,7 @@ fn contract_robot_tx_plan_json_envelope() {
     assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
     assert_eq!(data["lifecycle_state"].as_str(), Some("planned"));
     assert_eq!(data["step_count"].as_u64(), Some(3));
-    assert_eq!(data["precondition_count"].as_u64(), Some(1));
+    assert_eq!(data["precondition_count"].as_u64(), Some(0));
     assert_eq!(data["compensation_count"].as_u64(), Some(3));
     assert_tx_transition_contract_shape(&data["legal_transitions"]);
 }
@@ -2673,11 +3388,17 @@ fn contract_robot_tx_show_include_contract_json_envelope() {
     assert_tx_contract_payload_shape(&data["contract"], "planned");
 }
 
+#[cfg(unix)]
 #[test]
 fn contract_robot_tx_run_partial_failure_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
-    let payload = run_wa_json(
+    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let contract_path = write_executable_send_text_tx_contract(&dir, MissionTxState::Planned);
+    wezterm_stub.approve_robot_run(&ws, &contract_path);
+    let authoritative_contract_path = contract_path
+        .canonicalize()
+        .expect("canonicalize locked tx contract");
+    let payload = wezterm_stub.run_json(
         &ws,
         &[
             "robot",
@@ -2698,7 +3419,7 @@ fn contract_robot_tx_run_partial_failure_json_envelope() {
     let data = &payload["data"];
     assert_eq!(
         data["contract_file"].as_str(),
-        Some(contract_path.to_string_lossy().as_ref())
+        Some(authoritative_contract_path.to_string_lossy().as_ref())
     );
     assert_eq!(data["tx_id"].as_str(), Some("tx:test"));
     assert_eq!(data["plan_id"].as_str(), Some("plan:test"));
@@ -2746,6 +3467,29 @@ fn contract_robot_tx_run_partial_failure_json_envelope() {
         Some(1)
     );
     assert_eq!(data["final_state"].as_str(), Some("rolled_back"));
+
+    let emitted_commit_receipts = tx_report_receipts(&data["commit_report"], "commit_report");
+    let emitted_compensation_receipts =
+        tx_report_receipts(&data["compensation_report"], "compensation_report");
+    let show_payload = wezterm_stub.run_json(
+        &ws,
+        &["tx", "show", "--include-contract", "--format", "json"],
+    );
+    let persisted = assert_tx_show_matches_persisted_contract(
+        &show_payload,
+        &contract_path,
+        "rolled_back",
+        "compensated",
+    );
+    assert_tx_receipt_partition(
+        &persisted,
+        &emitted_commit_receipts,
+        &emitted_compensation_receipts,
+    );
+    wezterm_stub.assert_effects(&[
+        "0\ttx-test-commit:tx-step:1",
+        "0\ttx-test-compensate:tx-step:1",
+    ]);
 }
 
 #[test]
@@ -2825,19 +3569,16 @@ fn contract_robot_tx_run_safe_mode_json_envelope() {
     assert_eq!(data["final_state"].as_str(), Some("failed"));
 }
 
+#[cfg(unix)]
 #[test]
 fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
     let (dir, ws) = setup_workspace();
-    // ft-sjmhw: a `Planned` tx has no applied steps, so the rollback guard in
-    // plan.rs (`rollback requires commit receipts or a committed tx state`)
-    // correctly rejects it -- you cannot compensate steps that never ran. This
-    // test exercises rollback FAILURE + RECOVERY over the 3 committed steps, so
-    // the contract must start `Committed` (the guard then synthesizes commit
-    // receipts for each step). The guard is a real safety invariant and is left
-    // intact; the test's setup state was the bug.
-    write_default_tx_contract(&dir, MissionTxState::Committed);
+    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    // A `Planned` tx has no applied steps. Seed a Committed contract with real
+    // commit receipts so rollback is constrained to proven external effects.
+    write_executable_send_text_tx_contract(&dir, MissionTxState::Committed);
 
-    let fail_payload = run_wa_json(
+    let fail_payload = wezterm_stub.run_json(
         &ws,
         &[
             "robot",
@@ -2881,8 +3622,13 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
         Some(3)
     );
     assert_eq!(fail_data["final_state"].as_str(), Some("failed"));
+    wezterm_stub.assert_effects(&[
+        "0\ttx-test-compensate:tx-step:3",
+        "0\ttx-test-compensate:tx-step:2",
+    ]);
 
-    let recovery_payload = run_wa_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
+    let recovery_payload =
+        wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
 
     assert_eq!(recovery_payload["ok"], true);
     assert!(recovery_payload["elapsed_ms"].as_u64().is_some());
@@ -2898,7 +3644,7 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
     );
     assert_eq!(
         recovery_data["compensation_report"]["compensated_count"].as_u64(),
-        Some(3)
+        Some(1)
     );
     assert_eq!(
         recovery_data["compensation_report"]["failed_count"].as_u64(),
@@ -2912,9 +3658,14 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
         recovery_data["compensation_report"]["receipts"]
             .as_array()
             .map(std::vec::Vec::len),
-        Some(3)
+        Some(1)
     );
     assert_eq!(recovery_data["final_state"].as_str(), Some("rolled_back"));
+    wezterm_stub.assert_effects(&[
+        "0\ttx-test-compensate:tx-step:3",
+        "0\ttx-test-compensate:tx-step:2",
+        "0\ttx-test-compensate:tx-step:1",
+    ]);
 }
 
 #[test]
@@ -2949,6 +3700,310 @@ fn contract_robot_tx_run_invalid_fail_step_json_error_envelope() {
     assert!(payload["elapsed_ms"].as_u64().is_some());
     assert!(payload["now"].as_u64().is_some());
     assert!(payload["version"].as_str().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_ft_0rlfq_terminal_backend_unavailable_leaves_no_transaction_evidence() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let config_home = dir.path().join("config-home");
+    let runtime_dir = dir.path().join("runtime");
+    for path in [&data_home, &config_home, &runtime_dir] {
+        std::fs::create_dir_all(path).expect("create isolated terminal-backend environment");
+    }
+
+    let contract_path = write_ft_0rlfq_tx_contract(&dir);
+    let mut contract = ft_0rlfq_tx_contract();
+    contract.plan.steps[0].action = StepAction::SendText {
+        pane_id: 91_337,
+        text: "terminal backend must be available".to_string(),
+        paste_mode: Some(false),
+    };
+    std::fs::write(
+        &contract_path,
+        serde_json::to_vec_pretty(&contract).expect("serialize terminal-backed tx contract"),
+    )
+    .expect("write terminal-backed tx contract");
+    let contract_before = std::fs::read(&contract_path).expect("snapshot tx contract before run");
+
+    let output = wa_cmd_for(&ws)
+        .timeout(REAL_MUX_ROBOT_WAIT_TIMEOUT)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HOME", dir.path())
+        .env("FT_WEZTERM_CLI", dir.path().join("missing-wezterm"))
+        .env_remove("FRANKENTERM_CONFIG_FILE")
+        .env_remove("FRANKENTERM_CONFIG_DIR")
+        .env_remove("WEZTERM_CONFIG_FILE")
+        .env_remove("WEZTERM_CONFIG_DIR")
+        .env_remove("WEZTERM_UNIX_SOCKET")
+        .args(["tx", "run", "--format", "json"])
+        .output()
+        .expect("ft tx run should report the unavailable terminal backend");
+
+    assert_eq!(output.status.code(), Some(7));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure stdout should be valid JSON");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(
+        payload["error_code"].as_str(),
+        Some("mission.tx.execution_failed")
+    );
+    let error = payload["error"]
+        .as_str()
+        .expect("failure envelope should contain an error message");
+    assert!(error.contains("real tx runtime unavailable"));
+    assert!(error.contains("terminal backend unavailable for real tx execution"));
+
+    let contract_after = std::fs::read(&contract_path).expect("read tx contract after failed run");
+    assert_eq!(
+        contract_after, contract_before,
+        "backend preflight failure must not mutate the authoritative transaction contract"
+    );
+    let persisted: serde_json::Value = serde_json::from_slice(&contract_after)
+        .expect("unchanged contract should remain valid JSON");
+    assert_eq!(persisted["lifecycle_state"], "planned");
+    assert_eq!(persisted["outcome"], "pending");
+    assert_eq!(persisted["receipts"], serde_json::json!([]));
+
+    let ledger_dir = dir.path().join(".ft").join("tx_ledgers");
+    let ledger_count = if ledger_dir.exists() {
+        std::fs::read_dir(&ledger_dir)
+            .unwrap_or_else(|err| panic!("read ledger directory {}: {err}", ledger_dir.display()))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|err| {
+                        panic!("enumerate ledger directory {}: {err}", ledger_dir.display())
+                    })
+                    .path()
+            })
+            .filter(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("json")
+            })
+            .count()
+    } else {
+        0
+    };
+    assert_eq!(
+        ledger_count, 0,
+        "backend preflight failure must not create a durable transaction ledger"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_ft_0rlfq_human_run_robot_show_human_rollback_persists_contract_and_ledger() {
+    // This fixture proves the cross-process contract/receipt/ledger boundary
+    // against real SendText effects recorded by the isolated CLI stub.
+    let (dir, ws) = setup_workspace();
+    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let contract_path = write_ft_0rlfq_tx_contract(&dir);
+
+    let run_payload = run_ft_0rlfq_json(&ws, &wezterm_stub, &["tx", "run", "--format", "json"]);
+    assert_eq!(run_payload["ok"], true);
+    assert_eq!(run_payload["data"]["final_state"], "committed");
+    assert_eq!(
+        run_payload["data"]["commit_report"]["outcome"],
+        "fully_committed"
+    );
+    assert_eq!(run_payload["data"]["commit_report"]["committed_count"], 2);
+    let emitted_commit_receipts =
+        tx_report_receipts(&run_payload["data"]["commit_report"], "commit_report");
+
+    let show_after_run = run_ft_0rlfq_json(
+        &ws,
+        &wezterm_stub,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "show",
+            "--include-contract",
+        ],
+    );
+    let persisted_after_run = assert_ft_0rlfq_persisted_tx(
+        &show_after_run,
+        &contract_path,
+        "committed",
+        "committed",
+        &[
+            (1, "commit", "tx-step:1", "committed"),
+            (2, "commit", "tx-step:2", "committed"),
+        ],
+    );
+    assert_eq!(persisted_after_run["intent"]["requested_by"], "operator");
+    assert_tx_receipt_partition(&persisted_after_run, &emitted_commit_receipts, &[]);
+    assert_ft_0rlfq_terminal_ledgers(dir.path(), 1, &["tx-step:1", "tx-step:2"], &[]);
+    wezterm_stub.assert_effects(&[
+        "0\tft-0rlfq-commit:tx-step:1",
+        "0\tft-0rlfq-commit:tx-step:2",
+    ]);
+
+    let rollback_payload =
+        run_ft_0rlfq_json(&ws, &wezterm_stub, &["tx", "rollback", "--format", "json"]);
+    assert_eq!(rollback_payload["ok"], true);
+    assert_eq!(rollback_payload["data"]["final_state"], "rolled_back");
+    assert_eq!(
+        rollback_payload["data"]["compensation_report"]["outcome"],
+        "fully_rolled_back"
+    );
+    assert_eq!(
+        rollback_payload["data"]["compensation_report"]["compensated_count"],
+        2
+    );
+    let emitted_compensation_receipts = tx_report_receipts(
+        &rollback_payload["data"]["compensation_report"],
+        "compensation_report",
+    );
+
+    let show_after_rollback = run_ft_0rlfq_json(
+        &ws,
+        &wezterm_stub,
+        &[
+            "robot",
+            "--format",
+            "json",
+            "tx",
+            "show",
+            "--include-contract",
+        ],
+    );
+    let persisted_after_rollback = assert_ft_0rlfq_persisted_tx(
+        &show_after_rollback,
+        &contract_path,
+        "rolled_back",
+        "compensated",
+        &[
+            (1, "commit", "tx-step:1", "committed"),
+            (2, "commit", "tx-step:2", "committed"),
+            (3, "compensate", "tx-step:2", "compensated"),
+            (4, "compensate", "tx-step:1", "compensated"),
+        ],
+    );
+    assert_tx_receipt_partition(
+        &persisted_after_rollback,
+        &emitted_commit_receipts,
+        &emitted_compensation_receipts,
+    );
+    assert_ft_0rlfq_terminal_ledgers(
+        dir.path(),
+        2,
+        &["tx-step:1", "tx-step:2"],
+        &["tx-step:1", "tx-step:2"],
+    );
+    wezterm_stub.assert_effects(&[
+        "0\tft-0rlfq-commit:tx-step:1",
+        "0\tft-0rlfq-commit:tx-step:2",
+        "0\tft-0rlfq-compensate:tx-step:2",
+        "0\tft-0rlfq-compensate:tx-step:1",
+    ]);
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_ledger() {
+    // This fixture proves the cross-process contract/receipt/ledger boundary
+    // against real SendText effects recorded by the isolated CLI stub.
+    let (dir, ws) = setup_workspace();
+    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let contract_path = write_ft_0rlfq_tx_contract(&dir);
+    wezterm_stub.approve_robot_run(&ws, &contract_path);
+
+    let run_payload = run_ft_0rlfq_json(
+        &ws,
+        &wezterm_stub,
+        &["robot", "--format", "json", "tx", "run"],
+    );
+    assert_eq!(run_payload["ok"], true);
+    assert_eq!(run_payload["data"]["final_state"], "committed");
+    assert_eq!(
+        run_payload["data"]["commit_report"]["outcome"],
+        "fully_committed"
+    );
+    assert_eq!(run_payload["data"]["commit_report"]["committed_count"], 2);
+    let emitted_commit_receipts =
+        tx_report_receipts(&run_payload["data"]["commit_report"], "commit_report");
+
+    let show_after_run = run_ft_0rlfq_json(
+        &ws,
+        &wezterm_stub,
+        &["tx", "show", "--include-contract", "--format", "json"],
+    );
+    let persisted_after_run = assert_ft_0rlfq_persisted_tx(
+        &show_after_run,
+        &contract_path,
+        "committed",
+        "committed",
+        &[
+            (1, "commit", "tx-step:1", "committed"),
+            (2, "commit", "tx-step:2", "committed"),
+        ],
+    );
+    assert_eq!(persisted_after_run["intent"]["requested_by"], "operator");
+    assert_tx_receipt_partition(&persisted_after_run, &emitted_commit_receipts, &[]);
+    assert_ft_0rlfq_terminal_ledgers(dir.path(), 1, &["tx-step:1", "tx-step:2"], &[]);
+    wezterm_stub.assert_effects(&[
+        "0\tft-0rlfq-commit:tx-step:1",
+        "0\tft-0rlfq-commit:tx-step:2",
+    ]);
+
+    let rollback_payload = run_ft_0rlfq_json(
+        &ws,
+        &wezterm_stub,
+        &["robot", "--format", "json", "tx", "rollback"],
+    );
+    assert_eq!(rollback_payload["ok"], true);
+    assert_eq!(rollback_payload["data"]["final_state"], "rolled_back");
+    assert_eq!(
+        rollback_payload["data"]["compensation_report"]["outcome"],
+        "fully_rolled_back"
+    );
+    assert_eq!(
+        rollback_payload["data"]["compensation_report"]["compensated_count"],
+        2
+    );
+    let emitted_compensation_receipts = tx_report_receipts(
+        &rollback_payload["data"]["compensation_report"],
+        "compensation_report",
+    );
+
+    let show_after_rollback = run_ft_0rlfq_json(
+        &ws,
+        &wezterm_stub,
+        &["tx", "show", "--include-contract", "--format", "json"],
+    );
+    let persisted_after_rollback = assert_ft_0rlfq_persisted_tx(
+        &show_after_rollback,
+        &contract_path,
+        "rolled_back",
+        "compensated",
+        &[
+            (1, "commit", "tx-step:1", "committed"),
+            (2, "commit", "tx-step:2", "committed"),
+            (3, "compensate", "tx-step:2", "compensated"),
+            (4, "compensate", "tx-step:1", "compensated"),
+        ],
+    );
+    assert_tx_receipt_partition(
+        &persisted_after_rollback,
+        &emitted_commit_receipts,
+        &emitted_compensation_receipts,
+    );
+    assert_ft_0rlfq_terminal_ledgers(
+        dir.path(),
+        2,
+        &["tx-step:1", "tx-step:2"],
+        &["tx-step:1", "tx-step:2"],
+    );
+    wezterm_stub.assert_effects(&[
+        "0\tft-0rlfq-commit:tx-step:1",
+        "0\tft-0rlfq-commit:tx-step:2",
+        "0\tft-0rlfq-compensate:tx-step:2",
+        "0\tft-0rlfq-compensate:tx-step:1",
+    ]);
 }
 
 // =============================================================================

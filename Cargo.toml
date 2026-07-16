@@ -360,6 +360,8 @@ base64 = { version = "0.22.1", default-features = false }
 bitflags = { version = "2.13.0", features = ["serde"] }
 bstr = "1.12.1"
 camino = "1.2.2"
+cap-fs-ext = "3.4.5"
+cap-std = "3.4.5"
 cassowary = "0.3"
 colorgrad = { version = "0.8.0", features = ["named-colors", "preset"] }
 crossbeam = "0.8.4"

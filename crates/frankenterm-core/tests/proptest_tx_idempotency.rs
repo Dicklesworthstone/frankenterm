@@ -115,11 +115,31 @@ proptest! {
         action in arb_action_fingerprint(),
     ) {
         let k = IdempotencyKey::new(&plan_id, &step_id, &action);
-        prop_assert!(k.as_str().starts_with("txk:"), "Key must start with txk: prefix");
-        prop_assert!(k.as_str().len() > 4, "Key must have content after prefix");
+        let digest = k
+            .as_str()
+            .strip_prefix("txk:v2:")
+            .ok_or_else(|| TestCaseError::fail("Key must start with txk:v2: prefix"))?;
+        prop_assert_eq!(digest.len(), 64, "Key digest must be exactly 256 bits");
+        prop_assert!(
+            digest
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch)),
+            "Key digest must use canonical lowercase hexadecimal"
+        );
         prop_assert_eq!(k.plan_id(), &plan_id);
         prop_assert_eq!(k.step_id(), &step_id);
     }
+}
+
+#[test]
+fn ti_03b_length_delimited_key_material_has_no_tuple_aliases() {
+    let first = IdempotencyKey::new("a|b", "c", "d");
+    let second = IdempotencyKey::new("a", "b", "c|d");
+
+    assert_ne!(
+        first, second,
+        "distinct input tuples must not alias through delimiter placement"
+    );
 }
 
 // ── TI-04: Compensation keys differ from normal keys ─────────────────────────
@@ -150,6 +170,26 @@ proptest! {
         let json = serde_json::to_string(&k).unwrap();
         let back: IdempotencyKey = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&k, &back, "Serde roundtrip must preserve key");
+
+        let persisted: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let hash_input = persisted["hash_input"]
+            .as_str()
+            .ok_or_else(|| TestCaseError::fail("serialized key must contain hash_input digest"))?;
+        let digest = hash_input
+            .strip_prefix("sha256:")
+            .ok_or_else(|| TestCaseError::fail("hash_input must use sha256 digest format"))?;
+        prop_assert_eq!(digest.len(), 64);
+        prop_assert_ne!(hash_input, action.as_str(), "raw action fingerprint must not persist");
+        let fields = persisted
+            .as_object()
+            .ok_or_else(|| TestCaseError::fail("serialized key must be an object"))?;
+        prop_assert!(
+            fields
+                .values()
+                .all(|value| value.as_str() != Some(action.as_str())),
+            "serialized key must not persist the raw action fingerprint as a field value"
+        );
+        prop_assert!(!fields.contains_key("action_fingerprint"));
     }
 }
 
@@ -365,7 +405,16 @@ proptest! {
         let mut guard = DeduplicationGuard::new(1000);
         for i in 0..n {
             let key = IdempotencyKey::new("p1", &format!("s{i}"), "act");
-            guard.record(&key, "exec-1", StepOutcome::Success { result: None }, i as u64 * 1000);
+            guard.record(
+                &key,
+                "exec-1",
+                StepOutcome::Failed {
+                    error_code: "retryable".to_string(),
+                    error_message: "eligible for ttl eviction".to_string(),
+                    compensated: false,
+                },
+                i as u64 * 1000,
+            );
         }
         let cutoff_ms = (cutoff_idx.min(n) as u64) * 1000;
         guard.evict_before(cutoff_ms);
@@ -498,6 +547,21 @@ proptest! {
             IdempotencyError::LedgerNotFound { execution_id: "e1".to_string() },
             IdempotencyError::LedgerIndexCorrupt { reason: "duplicate key".to_string() },
             IdempotencyError::ChainIntegrityViolation { ordinal: 42 },
+            IdempotencyError::ExecutionMutationInProgress {
+                execution_id: "e1".to_string(),
+            },
+            IdempotencyError::ReservationExecutionMismatch {
+                reserved: "e1".to_string(),
+                attempted: "e2".to_string(),
+            },
+            IdempotencyError::ReservationAlreadyUsed {
+                key: "k1".to_string(),
+                execution_id: "e1".to_string(),
+            },
+            IdempotencyError::ReservationNotPending {
+                key: "k1".to_string(),
+                execution_id: "e1".to_string(),
+            },
         ];
         for err in &errors {
             let json = serde_json::to_string(err).unwrap();
@@ -516,7 +580,7 @@ proptest! {
         let plan = make_plan(n);
 
         store.create_ledger("exec-1", &plan).unwrap();
-        store.get_ledger_mut("exec-1").unwrap().transition_phase(TxPhase::Preparing).unwrap();
+        store.transition_phase("exec-1", TxPhase::Preparing).unwrap();
 
         // Record in first execution.
         for (i, step) in plan.steps.iter().enumerate() {
@@ -535,7 +599,7 @@ proptest! {
         store.create_ledger("exec-2", &plan).unwrap();
         for step in &plan.steps {
             let key = IdempotencyKey::new("test-plan", &step.id, "act");
-            let dedup = store.check_dedup(&key);
+            let dedup = store.peek_cached_outcome(&key, u64::MAX);
             prop_assert!(dedup.is_some(), "Cross-instance dedup must find step {}", step.id);
         }
     }
@@ -568,9 +632,8 @@ proptest! {
         store.create_ledger("exec-1", &plan).unwrap();
 
         // Phase transitions.
-        let ledger = store.get_ledger_mut("exec-1").unwrap();
-        ledger.transition_phase(TxPhase::Preparing).unwrap();
-        ledger.transition_phase(TxPhase::Committing).unwrap();
+        store.transition_phase("exec-1", TxPhase::Preparing).unwrap();
+        store.transition_phase("exec-1", TxPhase::Committing).unwrap();
 
         // Execute all steps.
         for (i, step) in plan.steps.iter().enumerate() {
@@ -586,7 +649,7 @@ proptest! {
         }
 
         // Complete.
-        store.get_ledger_mut("exec-1").unwrap().transition_phase(TxPhase::Completed).unwrap();
+        store.transition_phase("exec-1", TxPhase::Completed).unwrap();
 
         // Verify.
         let ledger = store.get_ledger("exec-1").unwrap();
@@ -597,6 +660,124 @@ proptest! {
         let ctx = store.resume_context("exec-1", &plan).unwrap();
         prop_assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
     }
+}
+
+// ── TI-26: Durable reservation serializes whole-ledger writers ──────────────
+
+#[test]
+fn ti_26_durable_reservation_prevents_cross_store_lost_updates_and_token_reuse() {
+    let ft_dir = tempfile::tempdir().expect("create durable store directory");
+    let plan = make_plan(2);
+    let execution_id = "exec-cross-store";
+    let first_key = IdempotencyKey::new(&plan.plan_id, &plan.steps[0].id, "first-action");
+    let second_key = IdempotencyKey::new(&plan.plan_id, &plan.steps[1].id, "second-action");
+    let first_outcome = StepOutcome::Success {
+        result: Some("first-committed".to_string()),
+    };
+    let second_outcome = StepOutcome::Success {
+        result: Some("second-committed".to_string()),
+    };
+
+    let mut first = IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default())
+        .expect("open first durable store");
+    first
+        .create_ledger(execution_id, &plan)
+        .expect("create durable ledger");
+    first
+        .transition_phase(execution_id, TxPhase::Preparing)
+        .expect("transition durable ledger");
+    let mut stale_second = IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default())
+        .expect("open stale second durable store");
+
+    let mut first_reservation = first
+        .acquire_durable_reservation(execution_id, &first_key, 1_000)
+        .expect("reserve first key");
+    assert!(first_reservation.observed_outcome().is_none());
+
+    let blocked = stale_second
+        .acquire_durable_reservation(execution_id, &second_key, 1_000)
+        .expect_err("different-key writer must not publish a stale ledger snapshot");
+    assert!(matches!(
+        blocked,
+        IdempotencyError::ExecutionMutationInProgress { .. }
+    ));
+
+    first
+        .record_execution_reserved(
+            &mut first_reservation,
+            execution_id,
+            first_key.clone(),
+            StepOutcome::Pending,
+            StepRisk::Low,
+            "agent-first",
+            1_000,
+        )
+        .expect("persist first pending reservation");
+    let reused = first
+        .record_execution_reserved(
+            &mut first_reservation,
+            execution_id,
+            first_key.clone(),
+            StepOutcome::Pending,
+            StepRisk::Low,
+            "agent-first",
+            1_001,
+        )
+        .expect_err("one reservation token cannot append Pending twice");
+    assert!(matches!(
+        reused,
+        IdempotencyError::ReservationAlreadyUsed { .. }
+    ));
+    first
+        .complete_execution_reserved(
+            first_reservation,
+            execution_id,
+            first_key.clone(),
+            first_outcome.clone(),
+            1_001,
+        )
+        .expect("complete first reservation");
+
+    let mut second_reservation = stale_second
+        .acquire_durable_reservation(execution_id, &second_key, 2_000)
+        .expect("retry second key after first writer releases ledger lock");
+    assert!(second_reservation.observed_outcome().is_none());
+    stale_second
+        .record_execution_reserved(
+            &mut second_reservation,
+            execution_id,
+            second_key.clone(),
+            StepOutcome::Pending,
+            StepRisk::Medium,
+            "agent-second",
+            2_000,
+        )
+        .expect("persist second pending reservation");
+    stale_second
+        .complete_execution_reserved(
+            second_reservation,
+            execution_id,
+            second_key.clone(),
+            second_outcome.clone(),
+            2_001,
+        )
+        .expect("complete second reservation");
+
+    let reopened = IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default())
+        .expect("reopen durable store");
+    assert_eq!(
+        reopened.peek_cached_outcome(&first_key, 2_001),
+        Some(&first_outcome)
+    );
+    assert_eq!(
+        reopened.peek_cached_outcome(&second_key, 2_001),
+        Some(&second_outcome)
+    );
+    let ledger = reopened
+        .get_ledger(execution_id)
+        .expect("nonterminal ledger remains resumable");
+    assert_eq!(ledger.records().len(), 2);
+    assert!(ledger.verify_chain().chain_intact);
 }
 
 // ── TI-22..TI-25: br-ft-e9r75 ledger chain tip + field authentication ────────
@@ -610,11 +791,9 @@ proptest! {
 // record (outcome, timestamp, key, etc.) was invisible because no
 // subsequent record's prev_hash needed to match the tip.
 //
-// Post-fix: hash now canonicalizes risk + agent_id, and verify_chain
-// flags a tip mismatch on the last record's ordinal. These tests pin
-// the contract — each constructs a tampered ledger via serde-roundtrip
-// JSON-edit and asserts verify_chain reports !chain_intact at the
-// expected ordinal.
+// Post-fix: hash now canonicalizes risk + agent_id, and the deserialize trust
+// boundary rejects a detached tip while verify_chain detects broken interior
+// links. These tests pin both detection paths.
 
 fn build_n_record_ledger_for_tamper(n: usize) -> TxExecutionLedger {
     let mut ledger = TxExecutionLedger::new("exec-tamper", "plan-tamper", 0);
@@ -660,19 +839,24 @@ proptest! {
         records[target_idx]["risk"] = serde_json::Value::String("critical".to_string());
         let tampered_json = serde_json::to_string(&value).expect("re-serializes");
 
-        let mut tampered: TxExecutionLedger =
-            serde_json::from_str(&tampered_json).expect("tampered deserializes");
-        tampered.rebuild_index();
-
-        let v = tampered.verify_chain();
-        prop_assert!(
-            !v.chain_intact,
-            "ft-e9r75: risk-field tamper at idx {target_idx} must break the chain (n={n})"
-        );
-        prop_assert!(
-            v.first_break_at.is_some(),
-            "ft-e9r75: first_break_at must be set on risk tamper"
-        );
+        match serde_json::from_str::<TxExecutionLedger>(&tampered_json) {
+            Ok(mut tampered) => {
+                tampered.rebuild_index();
+                let v = tampered.verify_chain();
+                prop_assert!(
+                    !v.chain_intact,
+                    "ft-e9r75: risk-field tamper at idx {target_idx} must be rejected on load or break the chain (n={n})"
+                );
+                prop_assert!(
+                    v.first_break_at.is_some(),
+                    "ft-e9r75: first_break_at must be set when risk tamper reaches verification"
+                );
+            }
+            Err(error) => prop_assert!(
+                error.to_string().contains("last_hash"),
+                "ft-e9r75: risk tamper may fail load only as a detached final hash: {error}"
+            ),
+        }
     }
 }
 
@@ -700,15 +884,20 @@ proptest! {
             serde_json::Value::String("agent-impersonator".to_string());
         let tampered_json = serde_json::to_string(&value).expect("re-serializes");
 
-        let mut tampered: TxExecutionLedger =
-            serde_json::from_str(&tampered_json).expect("tampered deserializes");
-        tampered.rebuild_index();
-
-        let v = tampered.verify_chain();
-        prop_assert!(
-            !v.chain_intact,
-            "ft-e9r75: agent_id tamper at idx {target_idx} must break the chain (n={n})"
-        );
+        match serde_json::from_str::<TxExecutionLedger>(&tampered_json) {
+            Ok(mut tampered) => {
+                tampered.rebuild_index();
+                let v = tampered.verify_chain();
+                prop_assert!(
+                    !v.chain_intact,
+                    "ft-e9r75: agent_id tamper at idx {target_idx} must be rejected on load or break the chain (n={n})"
+                );
+            }
+            Err(error) => prop_assert!(
+                error.to_string().contains("last_hash"),
+                "ft-e9r75: agent tamper may fail load only as a detached final hash: {error}"
+            ),
+        }
     }
 }
 
@@ -735,22 +924,11 @@ proptest! {
         records[last_idx]["outcome"] = serde_json::json!("pending");
         let tampered_json = serde_json::to_string(&value).expect("re-serializes");
 
-        let mut tampered: TxExecutionLedger =
-            serde_json::from_str(&tampered_json).expect("tampered deserializes");
-        tampered.rebuild_index();
-
-        let v = tampered.verify_chain();
+        let error = serde_json::from_str::<TxExecutionLedger>(&tampered_json)
+            .expect_err("final-record tamper must fail at the deserialize trust boundary");
         prop_assert!(
-            !v.chain_intact,
-            "ft-e9r75: tampering the final record's outcome must break the chain (n={n})"
-        );
-        // The break is at the LAST record's ordinal — that's where the
-        // tip mismatch was detected post-loop.
-        let last_ordinal = (n - 1) as u64;
-        prop_assert_eq!(
-            v.first_break_at,
-            Some(last_ordinal),
-            "ft-e9r75: tip-mismatch break must point to the last record's ordinal"
+            error.to_string().contains("last_hash"),
+            "ft-e9r75: final-record tamper must fail as a detached chain anchor (n={n}): {error}"
         );
     }
 }

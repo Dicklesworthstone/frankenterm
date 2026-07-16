@@ -4066,6 +4066,14 @@ enum RobotCommands {
         command: RobotProfileCommands,
     },
 
+    /// Connector lifecycle administration (status/install/update/enable/
+    /// disable/restart/uninstall/rollback) — ft-pohny; contract at
+    /// docs/robot-contracts/connector.md
+    Connector {
+        #[command(subcommand)]
+        command: RobotConnectorCommands,
+    },
+
     /// Explain proof-lane command intent without executing it
     ProofDoctor {
         /// Bead whose proof lane is being inspected
@@ -5455,6 +5463,94 @@ enum RobotProfileCommands {
     Validate {
         /// Profile name to validate
         name: String,
+    },
+}
+
+/// Connector lifecycle administration verbs (ft-pohny).
+///
+/// Contract: docs/robot-contracts/connector.md. All mutations route through
+/// the policy engine's gated production boundary (emergency kill switch
+/// fails closed). Non-dry-run uninstall/rollback are approval-blocked in
+/// this slice.
+#[derive(Subcommand)]
+enum RobotConnectorCommands {
+    /// Show managed connectors (all, or one by id)
+    Status {
+        /// Connector id to show (omit for all)
+        connector_id: Option<String>,
+    },
+    /// Install a connector from a manifest file (JSON ConnectorManifest)
+    Install {
+        /// Path to the manifest JSON file
+        #[arg(long)]
+        manifest_file: String,
+
+        /// Preview only (side-effect-free plan receipt)
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Upgrade an installed connector to a new manifest
+    Update {
+        /// Connector id to upgrade
+        connector_id: String,
+
+        /// Path to the new manifest JSON file
+        #[arg(long)]
+        manifest_file: String,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Administratively enable a connector
+    Enable {
+        /// Connector id
+        connector_id: String,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Administratively disable a connector
+    Disable {
+        /// Connector id
+        connector_id: String,
+
+        /// Reason recorded in the lifecycle audit log
+        #[arg(long)]
+        reason: String,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restart a connector (restart-limit windows apply)
+    Restart {
+        /// Connector id
+        connector_id: String,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Uninstall a connector (destructive — approval-blocked; use --dry-run)
+    Uninstall {
+        /// Connector id
+        connector_id: String,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Roll back a connector to its previous manifest (destructive —
+    /// approval-blocked; use --dry-run)
+    Rollback {
+        /// Connector id
+        connector_id: String,
+
+        /// Preview only
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -6919,7 +7015,9 @@ fn robot_gui_unify_windows_response(
             return RobotResponse::<RobotGuiUnifyWindowsData>::error_with_code(
                 ROBOT_ERR_GUI_UNIFY,
                 err.to_string(),
-                Some("Use --all-domains or pass a domain name/id known to the live mux.".to_string()),
+                Some(
+                    "Use --all-domains or pass a domain name/id known to the live mux.".to_string(),
+                ),
                 elapsed_ms,
             );
         }
@@ -6979,7 +7077,10 @@ fn robot_gui_unify_selected_domains(
 ) -> anyhow::Result<BTreeMap<mux::domain::DomainId, String>> {
     let mut selected = BTreeMap::new();
     if all_domains {
-        for window in windows.iter().filter(|window| window.workspace == workspace) {
+        for window in windows
+            .iter()
+            .filter(|window| window.workspace == workspace)
+        {
             for tab in &window.tabs {
                 if let Some(identity) = &tab.identity {
                     selected
@@ -18646,8 +18747,8 @@ fn robot_work_define_data(
     }
 
     if let Some(labels) = labels {
-        let labels_json =
-            serde_json::to_string(labels).map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
+        let labels_json = serde_json::to_string(labels)
+            .map_err(|err| robot_work_backend_error(err, elapsed_ms))?;
         tx.execute(
             "UPDATE work_claims SET labels_json = ?2, updated_at_ms = ?3 WHERE claim_id = ?1",
             rusqlite::params![item_id, labels_json, now_ms],
@@ -19206,14 +19307,7 @@ fn robot_context_status_for_pane(
         .optional()?;
 
     let (active_context_id, token_budget, tokens_consumed, active_depth) = active.map_or_else(
-        || {
-            (
-                String::new(),
-                ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET,
-                0,
-                depth,
-            )
-        },
+        || (String::new(), ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET, 0, depth),
         |row| {
             (
                 row.context_id,
@@ -19544,8 +19638,7 @@ fn robot_context_report_data(
     } else {
         let pane_s = pane_id.to_string();
         let now_string = now_ms.to_string();
-        let context_id =
-            robot_context_make_id("ctx", &[&pane_s, &now_string, "0", "", "report"]);
+        let context_id = robot_context_make_id("ctx", &[&pane_s, &now_string, "0", "", "report"]);
         tx.execute(
             "INSERT INTO pane_contexts
              (context_id, pane_id, state, depth, created_at_ms, token_budget, tokens_consumed,
@@ -19857,7 +19950,10 @@ mod robot_context_backend_tests {
         let lower = expect_context_ok(robot_context_report_data(&db_path, 7, budget / 2, 5));
         assert_eq!(lower["pressure_tier"].as_str(), Some("green")); // 50% -> green
         let status2 = expect_context_ok(robot_context_status_data(&db_path, Some(7), 5));
-        assert_eq!(status2["panes"][0]["tokens_consumed"].as_u64(), Some(budget / 2));
+        assert_eq!(
+            status2["panes"][0]["tokens_consumed"].as_u64(),
+            Some(budget / 2)
+        );
         assert_eq!(status2["panes"][0]["pressure_tier"].as_str(), Some("green"));
         // depth unchanged: report does not rotate.
         assert_eq!(status2["panes"][0]["depth"].as_u64(), Some(0));
@@ -19869,7 +19965,12 @@ mod robot_context_backend_tests {
         // status read with the derived tier.
         let (_dir, db_path) = setup_robot_context_test_db();
         expect_context_ok(robot_context_rotate_data(
-            &db_path, 3, "agent_default", None, None, 5,
+            &db_path,
+            3,
+            "agent_default",
+            None,
+            None,
+            5,
         ));
         let budget = ROBOT_CONTEXT_DEFAULT_TOKEN_BUDGET as u64;
         expect_context_ok(robot_context_report_data(&db_path, 3, budget, 5)); // 100% -> black
@@ -37839,13 +37940,47 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let mut contract = match enforce_robot_mission_path_containment(
+                                    if let Err(err) = enforce_robot_mission_path_containment(
                                         &layout,
                                         &contract_path,
-                                    )
-                                    .and_then(|()| {
-                                        load_mission_tx_contract_from_path(&contract_path)
-                                    }) {
+                                    ) {
+                                        let response =
+                                            RobotResponse::<RobotTxRunData>::error_with_code(
+                                                robot_tx_error_code(err.error_code),
+                                                err.message,
+                                                err.hint,
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                    let contract_lock = if dry_run {
+                                        None
+                                    } else {
+                                        match lock_mission_tx_contract(&layout.root, &contract_path)
+                                        {
+                                            Ok(lock) => Some(lock),
+                                            Err(err) => {
+                                                let response = RobotResponse::<
+                                                    RobotTxRunData,
+                                                >::error_with_code(
+                                                    robot_tx_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        }
+                                    };
+                                    let contract_result = match contract_lock.as_ref() {
+                                        Some(contract_lock) => {
+                                            load_mission_tx_contract_from_guard(contract_lock)
+                                        }
+                                        None => load_mission_tx_contract_from_path(&contract_path),
+                                    };
+                                    let mut contract = match contract_result {
                                         Ok(contract) => contract,
                                         Err(err) => {
                                             let response =
@@ -37859,6 +37994,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
                                     };
+                                    let execution_contract_path = contract_lock
+                                        .as_ref()
+                                        .map_or(contract_path.as_path(), |contract_lock| {
+                                            contract_lock.authoritative_path()
+                                        });
 
                                     if let Some(fail_step_id) = fail_step.as_deref()
                                         && !contract
@@ -37879,8 +38019,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                                     let now_ms = mission_now_ms();
                                     let kill_switch = kill_switch.into();
-                                    let (real_runtime, fallback_reason) =
-                                        resolve_real_tx_runtime(&config, &layout).await;
+                                    let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
+                                        &config,
+                                        &layout,
+                                        tx_run_requires_terminal_backend(&contract),
+                                    )
+                                    .await;
                                     let executor_label = if real_runtime.is_some() {
                                         "pane_executor"
                                     } else {
@@ -37890,7 +38034,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         command = "robot.tx.run",
                                         tx_id = %contract.intent.tx_id.0,
                                         plan_id = %contract.plan.plan_id.0,
-                                        contract_file = %contract_path.display(),
+                                        contract_file = %execution_contract_path.display(),
                                         executor_type = executor_label,
                                         dry_run,
                                         paused,
@@ -37922,6 +38066,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         let prepare_context =
                                             frankenterm_core::plan::TxPrepareEvaluationContext::new(
                                                 layout.root.to_string_lossy().to_string(),
+                                            )
+                                            .with_surface(
+                                                frankenterm_core::policy::PolicySurface::Robot,
+                                            )
+                                            .with_actor(
+                                                frankenterm_core::policy::ActorKind::Robot,
                                             );
                                         let executor =
                                             frankenterm_core::tx_execution::PaneStepExecutor::new(
@@ -37933,7 +38083,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             );
                                         execute_tx_run_with_executor(
                                             executor,
-                                            &contract_path,
+                                            execution_contract_path,
+                                            contract_lock.as_ref(),
                                             &mut contract,
                                             kill_switch,
                                             paused,
@@ -37948,13 +38099,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         // executor — doing so would bypass policy + approval
                                         // gates and poison the durable idempotency ledger.
                                         // Surfaced via the existing Err handler below.
-                                        Err(format!(
+                                        Err(TxCommandExecutionError::execution(format!(
                                             "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
                                             fallback_reason
                                                 .as_deref()
                                                 .map(|reason| format!(" ({reason})"))
                                                 .unwrap_or_default()
-                                        ))
+                                        )))
                                     } else {
                                         if let Some(reason) = fallback_reason.as_deref() {
                                             tracing::warn!(
@@ -37964,7 +38115,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                         execute_tx_run_with_executor(
                                             frankenterm_core::tx_execution::SyntheticStepExecutor,
-                                            &contract_path,
+                                            execution_contract_path,
+                                            contract_lock.as_ref(),
                                             &mut contract,
                                             kill_switch,
                                             paused,
@@ -37976,11 +38128,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let data = match data {
                                         Ok(data) => data,
                                         Err(err) => {
+                                            let error_code = robot_tx_command_error_code(&err);
+                                            let hint = tx_command_error_hint(&err);
                                             let response =
                                                 RobotResponse::<RobotTxRunData>::error_with_code(
-                                                    "robot.tx_execution_failed",
-                                                    err,
-                                                    None,
+                                                    error_code,
+                                                    err.to_string(),
+                                                    hint,
                                                     elapsed_ms(start),
                                                 );
                                             print_robot_response(&response, format, stats)?;
@@ -38008,14 +38162,25 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 } => {
                                     let contract_path =
                                         resolve_mission_tx_file_path(&layout, contract_file);
-                                    let contract = match enforce_robot_mission_path_containment(
+                                    if let Err(err) = enforce_robot_mission_path_containment(
                                         &layout,
                                         &contract_path,
-                                    )
-                                    .and_then(|()| {
-                                        load_mission_tx_contract_from_path(&contract_path)
-                                    }) {
-                                        Ok(contract) => contract,
+                                    ) {
+                                        let response =
+                                            RobotResponse::<RobotTxRollbackData>::error_with_code(
+                                                robot_tx_error_code(err.error_code),
+                                                err.message,
+                                                err.hint,
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                    let contract_lock = match lock_mission_tx_contract(
+                                        &layout.root,
+                                        &contract_path,
+                                    ) {
+                                        Ok(lock) => lock,
                                         Err(err) => {
                                             let response = RobotResponse::<
                                                     RobotTxRollbackData,
@@ -38029,6 +38194,24 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             return Ok(());
                                         }
                                     };
+                                    let mut contract =
+                                        match load_mission_tx_contract_from_guard(&contract_lock) {
+                                            Ok(contract) => contract,
+                                            Err(err) => {
+                                                let response = RobotResponse::<
+                                                    RobotTxRollbackData,
+                                                >::error_with_code(
+                                                    robot_tx_error_code(err.error_code),
+                                                    err.message,
+                                                    err.hint,
+                                                    elapsed_ms(start),
+                                                );
+                                                print_robot_response(&response, format, stats)?;
+                                                return Ok(());
+                                            }
+                                        };
+                                    let execution_contract_path =
+                                        contract_lock.authoritative_path();
 
                                     let now_ms = mission_now_ms();
                                     let commit_report = match build_robot_tx_rollback_commit_report(
@@ -38072,8 +38255,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         print_robot_response(&response, format, stats)?;
                                         return Ok(());
                                     }
-                                    let (real_runtime, fallback_reason) =
-                                        resolve_real_tx_runtime(&config, &layout).await;
+                                    let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
+                                        &config,
+                                        &layout,
+                                        tx_rollback_requires_terminal_backend(
+                                            &contract,
+                                            &commit_report,
+                                        ),
+                                    )
+                                    .await;
                                     let executor_label = if real_runtime.is_some() {
                                         "pane_executor"
                                     } else {
@@ -38083,7 +38273,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         command = "robot.tx.rollback",
                                         tx_id = %contract.intent.tx_id.0,
                                         plan_id = %contract.plan.plan_id.0,
-                                        contract_file = %contract_path.display(),
+                                        contract_file = %execution_contract_path.display(),
                                         executor_type = executor_label,
                                         fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
                                         "robot tx rollback starting"
@@ -38113,6 +38303,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         let prepare_context =
                                             frankenterm_core::plan::TxPrepareEvaluationContext::new(
                                                 layout.root.to_string_lossy().to_string(),
+                                            )
+                                            .with_surface(
+                                                frankenterm_core::policy::PolicySurface::Robot,
+                                            )
+                                            .with_actor(
+                                                frankenterm_core::policy::ActorKind::Robot,
                                             );
                                         let executor =
                                             frankenterm_core::tx_execution::PaneStepExecutor::new(
@@ -38124,9 +38320,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             );
                                         execute_tx_rollback_with_executor(
                                             executor,
-                                            &contract_path,
-                                            &contract,
-                                            &commit_report,
+                                            execution_contract_path,
+                                            &contract_lock,
+                                            &mut contract,
                                             fail_compensation_for_step.as_deref(),
                                             now_ms,
                                         )
@@ -38169,11 +38365,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let data = match data {
                                         Ok(data) => data,
                                         Err(err) => {
+                                            let error_code = robot_tx_command_error_code(&err);
+                                            let hint = tx_command_error_hint(&err);
                                             let response =
                                                 RobotResponse::<RobotTxRollbackData>::error_with_code(
-                                                    "robot.tx_execution_failed",
-                                                    err,
-                                                    None,
+                                                    error_code,
+                                                    err.to_string(),
+                                                    hint,
                                                     elapsed_ms(start),
                                                 );
                                             print_robot_response(&response, format, stats)?;
@@ -39674,6 +39872,265 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 elapsed_ms(start),
                             )
                             .await;
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::Connector { command } => {
+                            // ft-pohny: connector lifecycle administration.
+                            // Contract: docs/robot-contracts/connector.md.
+                            // Load the persisted managed-connector snapshot
+                            // (fail-closed on a corrupt blob), rehydrate the
+                            // policy engine's lifecycle manager, route the
+                            // intent through the gated production boundary
+                            // (emergency kill switch fails closed,
+                            // op_counter telemetry advances), and persist
+                            // the snapshot back after a successful
+                            // non-dry-run mutation.
+                            use frankenterm_core::robot_connector_handler::{
+                                CONNECTOR_LIFECYCLE_STATE_KEY, ConnectorAction,
+                                ConnectorActionOutcome, RobotConnectorError,
+                                decode_connector_state, encode_connector_state,
+                                handle_connector_action,
+                            };
+                            use frankenterm_core::storage_backend_helpers::{
+                                get_config_kv, set_config_kv,
+                            };
+
+                            let read_manifest_file = |path: &str| -> Result<
+                                Box<frankenterm_core::connector_registry::ConnectorManifest>,
+                                String,
+                            > {
+                                let raw = std::fs::read_to_string(path).map_err(|e| {
+                                    format!("failed to read manifest file '{path}': {e}")
+                                })?;
+                                serde_json::from_str(&raw).map(Box::new).map_err(|e| {
+                                    format!("failed to parse manifest JSON '{path}': {e}")
+                                })
+                            };
+
+                            let action: Result<ConnectorAction, String> = match &command {
+                                RobotConnectorCommands::Status { connector_id } => {
+                                    Ok(ConnectorAction::Status {
+                                        connector_id: connector_id.clone(),
+                                    })
+                                }
+                                RobotConnectorCommands::Install {
+                                    manifest_file,
+                                    dry_run,
+                                } => read_manifest_file(manifest_file).map(|manifest| {
+                                    ConnectorAction::Install {
+                                        manifest,
+                                        dry_run: *dry_run,
+                                    }
+                                }),
+                                RobotConnectorCommands::Update {
+                                    connector_id,
+                                    manifest_file,
+                                    dry_run,
+                                } => read_manifest_file(manifest_file).map(|manifest| {
+                                    ConnectorAction::Update {
+                                        connector_id: connector_id.clone(),
+                                        manifest,
+                                        dry_run: *dry_run,
+                                    }
+                                }),
+                                RobotConnectorCommands::Enable {
+                                    connector_id,
+                                    dry_run,
+                                } => Ok(ConnectorAction::Enable {
+                                    connector_id: connector_id.clone(),
+                                    dry_run: *dry_run,
+                                }),
+                                RobotConnectorCommands::Disable {
+                                    connector_id,
+                                    reason,
+                                    dry_run,
+                                } => Ok(ConnectorAction::Disable {
+                                    connector_id: connector_id.clone(),
+                                    reason: reason.clone(),
+                                    dry_run: *dry_run,
+                                }),
+                                RobotConnectorCommands::Restart {
+                                    connector_id,
+                                    dry_run,
+                                } => Ok(ConnectorAction::Restart {
+                                    connector_id: connector_id.clone(),
+                                    dry_run: *dry_run,
+                                }),
+                                RobotConnectorCommands::Uninstall {
+                                    connector_id,
+                                    dry_run,
+                                } => Ok(ConnectorAction::Uninstall {
+                                    connector_id: connector_id.clone(),
+                                    dry_run: *dry_run,
+                                }),
+                                RobotConnectorCommands::Rollback {
+                                    connector_id,
+                                    dry_run,
+                                } => Ok(ConnectorAction::Rollback {
+                                    connector_id: connector_id.clone(),
+                                    dry_run: *dry_run,
+                                }),
+                            };
+                            let action = match action {
+                                Ok(action) => action,
+                                Err(msg) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            "robot.connector.manifest_invalid",
+                                            msg,
+                                            Some(
+                                                "Provide a JSON ConnectorManifest file via \
+                                                 --manifest-file."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to resolve workspace layout: {e}"),
+                                            Some("Check --workspace or FT_WORKSPACE.".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let backend = match frankenterm_core::storage_backend_trait::RusqliteBackend::open_path(
+                                &layout.db_path,
+                                &frankenterm_core::storage_backend_trait::OpenConfig {
+                                    wal_mode: false,
+                                    ..frankenterm_core::storage_backend_trait::OpenConfig::default()
+                                },
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!(
+                                                "Failed to open workspace DB at {}: {e}",
+                                                layout.db_path.display()
+                                            ),
+                                            Some(
+                                                "Is the database initialized? Run 'ft watch' first."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            // Load + decode the persisted snapshot. A corrupt
+                            // blob fails closed (see contract).
+                            let loaded =
+                                match get_config_kv(&backend, CONNECTOR_LIFECYCLE_STATE_KEY) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let response =
+                                            RobotResponse::<serde_json::Value>::error_with_code(
+                                                ROBOT_ERR_STORAGE,
+                                                format!(
+                                                    "Failed to read connector lifecycle state: {e}"
+                                                ),
+                                                None,
+                                                elapsed_ms(start),
+                                            );
+                                        print_robot_response(&response, format, stats)?;
+                                        return Ok(());
+                                    }
+                                };
+                            let state_present = loaded.is_some();
+                            let restored = match loaded.as_deref().map(decode_connector_state) {
+                                None => Vec::new(),
+                                Some(Ok(connectors)) => connectors,
+                                Some(Err(err)) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            err.code(),
+                                            err.message(),
+                                            err.hint().map(str::to_string),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+
+                            let mut engine =
+                                frankenterm_core::policy::PolicyEngine::from_safety_config(
+                                    &config.safety,
+                                );
+                            engine.lifecycle_manager_mut().restore_connectors(restored);
+
+                            let now = u64::try_from(now_epoch_ms()).unwrap_or_default();
+                            let response = match handle_connector_action(&mut engine, action, now) {
+                                Ok(ConnectorActionOutcome::Status(mut data)) => {
+                                    data.state_persisted = state_present;
+                                    RobotResponse::<serde_json::Value>::success(
+                                        serde_json::to_value(&data)
+                                            .unwrap_or(serde_json::Value::Null),
+                                        elapsed_ms(start),
+                                    )
+                                }
+                                Ok(ConnectorActionOutcome::DryRun(data)) => RobotResponse::<
+                                    serde_json::Value,
+                                >::success(
+                                    serde_json::to_value(&data).unwrap_or(serde_json::Value::Null),
+                                    elapsed_ms(start),
+                                ),
+                                Ok(ConnectorActionOutcome::Mutated(mut data)) => {
+                                    let snapshot = engine.lifecycle_manager().managed_connectors();
+                                    let persist =
+                                        encode_connector_state(&snapshot).and_then(|json| {
+                                            set_config_kv(
+                                                &backend,
+                                                CONNECTOR_LIFECYCLE_STATE_KEY,
+                                                &json,
+                                                now_epoch_ms(),
+                                            )
+                                            .map_err(
+                                                |e| RobotConnectorError::StateSaveFailed {
+                                                    detail: e.to_string(),
+                                                },
+                                            )
+                                        });
+                                    match persist {
+                                        Ok(()) => {
+                                            data.persisted = true;
+                                            RobotResponse::<serde_json::Value>::success(
+                                                serde_json::to_value(&data)
+                                                    .unwrap_or(serde_json::Value::Null),
+                                                elapsed_ms(start),
+                                            )
+                                        }
+                                        Err(err) => {
+                                            RobotResponse::<serde_json::Value>::error_with_code(
+                                                err.code(),
+                                                err.message(),
+                                                err.hint().map(str::to_string),
+                                                elapsed_ms(start),
+                                            )
+                                        }
+                                    }
+                                }
+                                Err(err) => RobotResponse::<serde_json::Value>::error_with_code(
+                                    err.code(),
+                                    err.message(),
+                                    err.hint().map(str::to_string),
+                                    elapsed_ms(start),
+                                ),
+                            };
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Profile { command } => {
@@ -44043,32 +44500,49 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     }
                 };
                 let contract_path = resolve_mission_tx_file_path(&layout, contract_file);
-                let mut contract =
-                    match enforce_robot_mission_path_containment(&layout, &contract_path)
-                        .and_then(|()| load_mission_tx_contract_from_path(&contract_path))
-                    {
-                        Ok(contract) => contract,
-                        Err(err) => {
-                            if as_json {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "ok": false,
-                                        "error_code": err.error_code,
-                                        "error": err.message,
-                                        "hint": err.hint,
-                                        "version": frankenterm_core::VERSION,
-                                    })
-                                );
-                            } else {
-                                eprintln!("Error: {}", err.message);
-                                if let Some(hint) = err.hint {
-                                    eprintln!("Hint: {hint}");
-                                }
-                            }
-                            std::process::exit(err.exit_code);
-                        }
+                let (contract_lock, mut contract) = match enforce_robot_mission_path_containment(
+                    &layout,
+                    &contract_path,
+                )
+                .and_then(|()| {
+                    let contract_lock = if dry_run {
+                        None
+                    } else {
+                        Some(lock_mission_tx_contract(&layout.root, &contract_path)?)
                     };
+                    let contract = match contract_lock.as_ref() {
+                        Some(contract_lock) => load_mission_tx_contract_from_guard(contract_lock)?,
+                        None => load_mission_tx_contract_from_path(&contract_path)?,
+                    };
+                    Ok((contract_lock, contract))
+                }) {
+                    Ok(contract) => contract,
+                    Err(err) => {
+                        if as_json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error_code": err.error_code,
+                                    "error": err.message,
+                                    "hint": err.hint,
+                                    "version": frankenterm_core::VERSION,
+                                })
+                            );
+                        } else {
+                            eprintln!("Error: {}", err.message);
+                            if let Some(hint) = err.hint {
+                                eprintln!("Hint: {hint}");
+                            }
+                        }
+                        std::process::exit(err.exit_code);
+                    }
+                };
+                let execution_contract_path = contract_lock
+                    .as_ref()
+                    .map_or(contract_path.as_path(), |contract_lock| {
+                        contract_lock.authoritative_path()
+                    });
                 if let Some(fail_step_id) = fail_step.as_deref()
                     && !contract
                         .plan
@@ -44180,7 +44654,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 "valid": false,
                                 "error_code": error_code,
                                 "executed": false,
-                                "contract_file": contract_path.display().to_string(),
+                                "contract_file": execution_contract_path.display().to_string(),
                                 "live_tx_hash": live_tx_hash,
                                 "version": frankenterm_core::VERSION,
                             })
@@ -44200,8 +44674,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     .push(steering_receipt_tx_attachment(&stored, &live_tx_hash, now));
 
                 let kill_switch = kill_switch.into();
-                let (real_runtime, fallback_reason) =
-                    resolve_real_tx_runtime(&config, &layout).await;
+                let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
+                    &config,
+                    &layout,
+                    tx_run_requires_terminal_backend(&contract),
+                )
+                .await;
                 let executor_label = if real_runtime.is_some() {
                     "pane_executor"
                 } else {
@@ -44228,7 +44706,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     );
                     let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
                         layout.root.to_string_lossy().to_string(),
-                    );
+                    )
+                    .with_surface(frankenterm_core::policy::PolicySurface::Robot)
+                    .with_actor(frankenterm_core::policy::ActorKind::Robot);
                     let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
                         wezterm,
                         policy_engine,
@@ -44241,8 +44721,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             executor,
                             stored.clone(),
                             live_mission.clone(),
+                            live_tx_hash.clone(),
                         ),
-                        &contract_path,
+                        execution_contract_path,
+                        contract_lock.as_ref(),
                         &mut contract,
                         kill_switch,
                         paused,
@@ -44254,13 +44736,13 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     // ft-pmbe1 FAIL-CLOSED: real tx runtime unavailable -> refuse to
                     // commit through the synthetic allow-all executor (policy + approval
                     // bypass + durable ledger poisoning). Surfaced via the Err handler.
-                    Err(format!(
+                    Err(TxCommandExecutionError::execution(format!(
                         "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
                         fallback_reason
                             .as_deref()
                             .map(|reason| format!(" ({reason})"))
                             .unwrap_or_default()
-                    ))
+                    )))
                 } else {
                     if let Some(reason) = fallback_reason.as_deref() {
                         tracing::warn!(%reason, "synthetic dry-run preview (real tx runtime unavailable)");
@@ -44270,8 +44752,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             frankenterm_core::tx_execution::SyntheticStepExecutor,
                             stored.clone(),
                             live_mission.clone(),
+                            live_tx_hash.clone(),
                         ),
-                        &contract_path,
+                        execution_contract_path,
+                        contract_lock.as_ref(),
                         &mut contract,
                         kill_switch,
                         paused,
@@ -44280,23 +44764,98 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         now,
                     )
                 };
+                let (terminal_result, terminal_verification) = match data.as_ref() {
+                    Ok(data) => {
+                        let succeeded = if dry_run {
+                            data.prepare_report.outcome
+                                == frankenterm_core::plan::TxPrepareOutcome::AllReady
+                        } else {
+                            data.commit_report.as_ref().is_some_and(|report| {
+                                report.outcome
+                                    == frankenterm_core::plan::TxCommitOutcome::FullyCommitted
+                            })
+                        };
+                        (
+                            if succeeded { "success" } else { "failed" },
+                            format!(
+                                "dry_run={dry_run} final_state={} prepare_outcome={} commit_outcome={}",
+                                data.final_state,
+                                tx_prepare_outcome_label(&data.prepare_report.outcome),
+                                data.commit_report
+                                    .as_ref()
+                                    .map(|report| tx_commit_outcome_label(&report.outcome))
+                                    .unwrap_or("not_started")
+                            ),
+                        )
+                    }
+                    Err(err) => ("failed", format!("dry_run={dry_run} execution_error={err}")),
+                };
+                let terminal_audit_cx = frankenterm_core::cx::Cx::current()
+                    .unwrap_or_else(frankenterm_core::cx::for_request);
+                match frankenterm_core::storage::StorageHandle::new_with_cx(
+                    &terminal_audit_cx,
+                    &db_path,
+                )
+                .await
+                {
+                    Ok(storage) => {
+                        let audit = frankenterm_core::storage::AuditActionRecord {
+                            id: 0,
+                            ts: mission_now_ms(),
+                            actor_kind: "robot".to_string(),
+                            actor_id: Some("ft.steer.run".to_string()),
+                            correlation_id: Some(stored.receipt_id.clone()),
+                            pane_id: None,
+                            domain: None,
+                            action_kind: "steer.run.complete".to_string(),
+                            policy_decision: "allow".to_string(),
+                            decision_reason: Some(
+                                "steering receipt revalidated before tx dispatch".to_string(),
+                            ),
+                            rule_id: None,
+                            input_summary: Some(format!(
+                                "receipt={} contract={}",
+                                stored.receipt_id,
+                                contract_path.display()
+                            )),
+                            verification_summary: Some(terminal_verification),
+                            decision_context: None,
+                            result: terminal_result.to_string(),
+                        };
+                        if let Err(err) = storage.record_audit_action(audit).await {
+                            eprintln!("Warning: terminal steer audit row not written: {err}");
+                        }
+                        let _ = storage.shutdown().await;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "Warning: terminal steer audit row not written \
+                             (storage unavailable: {err})"
+                        );
+                    }
+                }
                 let mut data = match data {
                     Ok(data) => data,
                     Err(err) => {
+                        let err = mission_tx_command_error(err);
                         if as_json {
                             println!(
                                 "{}",
                                 serde_json::json!({
                                     "ok": false,
-                                    "error_code": "mission.tx.execution_failed",
-                                    "error": err,
+                                    "error_code": err.error_code,
+                                    "error": err.message,
+                                    "hint": err.hint,
                                     "version": frankenterm_core::VERSION,
                                 })
                             );
                         } else {
-                            eprintln!("Error: {err}");
+                            eprintln!("Error: {}", err.message);
+                            if let Some(hint) = err.hint {
+                                eprintln!("Hint: {hint}");
+                            }
                         }
-                        std::process::exit(MISSION_EXIT_VALIDATION);
+                        std::process::exit(err.exit_code);
                     }
                 };
                 data.steering_receipt_id = Some(stored.receipt_id.clone());
@@ -44311,7 +44870,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             "valid": true,
                             "error_code": serde_json::Value::Null,
                             "executed": !dry_run && data.commit_report.is_some(),
-                            "contract_file": contract_path.display().to_string(),
+                            "contract_file": execution_contract_path.display().to_string(),
                             "live_tx_hash": live_tx_hash,
                             "tx": data,
                             "version": frankenterm_core::VERSION,
@@ -55619,6 +56178,72 @@ struct MissionCommandError {
     hint: Option<String>,
 }
 
+#[derive(Debug)]
+enum TxCommandExecutionError {
+    Execution(String),
+    ContractLock {
+        context: String,
+        source: frankenterm_core::tx_execution::TxContractStoreError,
+    },
+    ContractStore {
+        context: String,
+        source: frankenterm_core::tx_execution::TxContractStoreError,
+    },
+}
+
+impl TxCommandExecutionError {
+    fn execution(message: impl Into<String>) -> Self {
+        Self::Execution(message.into())
+    }
+
+    fn contract_lock(
+        context: impl Into<String>,
+        source: frankenterm_core::tx_execution::TxContractStoreError,
+    ) -> Self {
+        Self::ContractLock {
+            context: context.into(),
+            source,
+        }
+    }
+
+    fn contract_store(
+        context: impl Into<String>,
+        source: frankenterm_core::tx_execution::TxContractStoreError,
+    ) -> Self {
+        Self::ContractStore {
+            context: context.into(),
+            source,
+        }
+    }
+
+    fn contract_store_error(
+        &self,
+    ) -> Option<&frankenterm_core::tx_execution::TxContractStoreError> {
+        match self {
+            Self::Execution(_) => None,
+            Self::ContractLock { source, .. } | Self::ContractStore { source, .. } => Some(source),
+        }
+    }
+}
+
+impl std::fmt::Display for TxCommandExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Execution(message) => f.write_str(message),
+            Self::ContractLock { context, source } | Self::ContractStore { context, source } => {
+                write!(f, "{context}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TxCommandExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.contract_store_error()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MissionTransitionRecord {
     from: frankenterm_core::plan::MissionLifecycleState,
@@ -55981,6 +56606,16 @@ mod robot_mission_path_containment_tests {
             .expect("default .ft mission path must pass even before creation");
     }
 
+    #[test]
+    fn resolves_relative_tx_contract_path_from_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = layout_for_root(dir.path());
+
+        let resolved = resolve_mission_tx_file_path(&layout, Some(PathBuf::from("plans/tx.json")));
+
+        assert_eq!(resolved, dir.path().join("plans/tx.json"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_escaping_workspace() {
@@ -56073,21 +56708,18 @@ fn resolve_mission_tx_file_path(
     layout: &frankenterm_core::config::WorkspaceLayout,
     contract_file: Option<PathBuf>,
 ) -> PathBuf {
-    contract_file.unwrap_or_else(|| default_mission_tx_file_path(layout))
+    match contract_file {
+        Some(path) if path.is_relative() => layout.root.join(path),
+        Some(path) => path,
+        None => default_mission_tx_file_path(layout),
+    }
 }
 
 fn load_mission_tx_contract_from_path(
     path: &Path,
 ) -> Result<frankenterm_core::plan::MissionTxContract, MissionCommandError> {
     let raw = read_mission_file_capped(path).map_err(|reason| match reason {
-        MissionFileReadFailure::NotFound => MissionCommandError {
-            exit_code: MISSION_EXIT_NOT_FOUND,
-            error_code: "mission.tx.file_not_found",
-            message: format!("Tx contract file not found: {}", path.display()),
-            hint: Some(
-                "Pass --contract-file <path> or create .ft/mission/tx-active.json.".to_string(),
-            ),
-        },
+        MissionFileReadFailure::NotFound => mission_tx_file_not_found_error(path),
         MissionFileReadFailure::Io(err) => MissionCommandError {
             exit_code: MISSION_EXIT_IO,
             error_code: "mission.tx.file_read_failed",
@@ -56105,8 +56737,53 @@ fn load_mission_tx_contract_from_path(
         },
     })?;
 
+    parse_mission_tx_contract(&raw, path)
+}
+
+fn load_mission_tx_contract_from_guard(
+    guard: &frankenterm_core::tx_execution::TxContractLockGuard,
+) -> Result<frankenterm_core::plan::MissionTxContract, MissionCommandError> {
+    use frankenterm_core::tx_execution::TxContractStoreErrorKind;
+
+    let path = guard.authoritative_path();
+    let raw = guard
+        .read_authoritative_contract_bytes()
+        .map_err(|err| match err.kind() {
+            TxContractStoreErrorKind::TooLarge => MissionCommandError {
+                exit_code: MISSION_EXIT_INVALID_INPUT,
+                error_code: "mission.tx.file_too_large",
+                message: err.to_string(),
+                hint: Some("16 MiB is the ft-99ybo mission/tx hostile-file DoS cap.".to_string()),
+            },
+            TxContractStoreErrorKind::InProgress
+            | TxContractStoreErrorKind::Lock
+            | TxContractStoreErrorKind::Validation
+            | TxContractStoreErrorKind::Serialization
+            | TxContractStoreErrorKind::Write
+            | TxContractStoreErrorKind::Sync
+            | TxContractStoreErrorKind::Rename => MissionCommandError {
+                exit_code: MISSION_EXIT_IO,
+                error_code: "mission.tx.file_read_failed",
+                message: format!("Failed to read tx contract file {}: {err}", path.display()),
+                hint: None,
+            },
+        })?;
+    let raw = std::str::from_utf8(&raw).map_err(|err| MissionCommandError {
+        exit_code: MISSION_EXIT_IO,
+        error_code: "mission.tx.file_read_failed",
+        message: format!("Failed to read tx contract file {}: {err}", path.display()),
+        hint: None,
+    })?;
+
+    parse_mission_tx_contract(raw, path)
+}
+
+fn parse_mission_tx_contract(
+    raw: &str,
+    path: &Path,
+) -> Result<frankenterm_core::plan::MissionTxContract, MissionCommandError> {
     let contract: frankenterm_core::plan::MissionTxContract =
-        serde_json::from_str(&raw).map_err(|err| MissionCommandError {
+        serde_json::from_str(raw).map_err(|err| MissionCommandError {
             exit_code: MISSION_EXIT_INVALID_INPUT,
             error_code: "mission.tx.invalid_json",
             message: format!("Invalid tx contract JSON in {}: {err}", path.display()),
@@ -56124,6 +56801,49 @@ fn load_mission_tx_contract_from_path(
     })?;
 
     Ok(contract)
+}
+
+fn mission_tx_file_not_found_error(path: &Path) -> MissionCommandError {
+    MissionCommandError {
+        exit_code: MISSION_EXIT_NOT_FOUND,
+        error_code: "mission.tx.file_not_found",
+        message: format!("Tx contract file not found: {}", path.display()),
+        hint: Some("Pass --contract-file <path> or create .ft/mission/tx-active.json.".to_string()),
+    }
+}
+
+fn lock_mission_tx_contract(
+    workspace_root: &Path,
+    path: &Path,
+) -> Result<frankenterm_core::tx_execution::TxContractLockGuard, MissionCommandError> {
+    if let Err(err) = fs::symlink_metadata(path)
+        && err.kind() == std::io::ErrorKind::NotFound
+    {
+        return Err(mission_tx_file_not_found_error(path));
+    }
+
+    frankenterm_core::tx_execution::acquire_tx_contract_lock(workspace_root, path).map_err(|err| {
+        let in_progress =
+            err.kind() == frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress;
+        MissionCommandError {
+            exit_code: if in_progress {
+                MISSION_EXIT_VALIDATION
+            } else {
+                MISSION_EXIT_IO
+            },
+            error_code: if in_progress {
+                "mission.tx.in_progress"
+            } else {
+                "mission.tx.lock_failed"
+            },
+            message: err.to_string(),
+            hint: Some(if in_progress {
+                "Wait for the in-flight transaction mutation to finish, then retry.".to_string()
+            } else {
+                "Fix access to the transaction contract lock file, then retry.".to_string()
+            }),
+        }
+    })
 }
 
 fn robot_tx_transition_info(
@@ -56199,6 +56919,7 @@ fn tx_prepare_target_state(
 async fn resolve_real_tx_runtime(
     config: &frankenterm_core::config::Config,
     layout: &frankenterm_core::config::WorkspaceLayout,
+    require_terminal_backend: bool,
 ) -> (
     Option<(
         frankenterm_core::storage::StorageHandle,
@@ -56226,6 +56947,10 @@ async fn resolve_real_tx_runtime(
     };
 
     let wezterm = frankenterm_core::wezterm::wezterm_handle_from_config(config);
+    if !require_terminal_backend {
+        return (Some((storage, wezterm)), None);
+    }
+
     // ft-xbnl0.2.3 tick 234: cx-first.
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
     match wezterm.list_panes_with_cx(&cx).await {
@@ -56237,6 +56962,71 @@ async fn resolve_real_tx_runtime(
             )),
         ),
     }
+}
+
+fn tx_action_requires_terminal_backend(action: &frankenterm_core::plan::StepAction) -> bool {
+    match action {
+        frankenterm_core::plan::StepAction::SendText { .. } => true,
+        frankenterm_core::plan::StepAction::WaitFor {
+            pane_id, condition, ..
+        } => {
+            pane_id.is_some()
+                || matches!(
+                    condition,
+                    frankenterm_core::plan::WaitCondition::Pattern {
+                        pane_id: Some(_),
+                        ..
+                    } | frankenterm_core::plan::WaitCondition::PaneIdle {
+                        pane_id: Some(_),
+                        ..
+                    } | frankenterm_core::plan::WaitCondition::StableTail {
+                        pane_id: Some(_),
+                        ..
+                    }
+                )
+        }
+        frankenterm_core::plan::StepAction::AcquireLock { .. }
+        | frankenterm_core::plan::StepAction::ReleaseLock { .. }
+        | frankenterm_core::plan::StepAction::StoreData { .. }
+        | frankenterm_core::plan::StepAction::RunWorkflow { .. }
+        | frankenterm_core::plan::StepAction::MarkEventHandled { .. }
+        | frankenterm_core::plan::StepAction::ValidateApproval { .. }
+        | frankenterm_core::plan::StepAction::NestedPlan { .. }
+        | frankenterm_core::plan::StepAction::Custom { .. } => false,
+    }
+}
+
+fn tx_run_requires_terminal_backend(contract: &frankenterm_core::plan::MissionTxContract) -> bool {
+    contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| &step.action)
+        .chain(
+            contract
+                .plan
+                .compensations
+                .iter()
+                .map(|compensation| &compensation.action),
+        )
+        .any(tx_action_requires_terminal_backend)
+}
+
+fn tx_rollback_requires_terminal_backend(
+    contract: &frankenterm_core::plan::MissionTxContract,
+    commit_report: &frankenterm_core::plan::TxCommitReport,
+) -> bool {
+    let committed_steps = commit_report
+        .step_results
+        .iter()
+        .filter(|result| result.outcome.is_committed())
+        .map(|result| result.step_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    contract.plan.compensations.iter().any(|compensation| {
+        committed_steps.contains(&compensation.for_step_id)
+            && tx_action_requires_terminal_backend(&compensation.action)
+    })
 }
 
 fn steering_tx_contract_hash(contract: &frankenterm_core::plan::MissionTxContract) -> String {
@@ -56267,6 +57057,9 @@ struct SteeringReceiptRevalidatingExecutor<E> {
     inner: E,
     receipt: frankenterm_core::steering::SteeringReceipt,
     live_mission: Option<frankenterm_core::plan::Mission>,
+    // Durable execution presents one-step contract views to `execute_steps`.
+    // Revalidation must remain bound to the admitted full transaction identity.
+    full_tx_contract_hash: String,
 }
 
 impl<E> SteeringReceiptRevalidatingExecutor<E> {
@@ -56274,11 +57067,13 @@ impl<E> SteeringReceiptRevalidatingExecutor<E> {
         inner: E,
         receipt: frankenterm_core::steering::SteeringReceipt,
         live_mission: Option<frankenterm_core::plan::Mission>,
+        full_tx_contract_hash: String,
     ) -> Self {
         Self {
             inner,
             receipt,
             live_mission,
+            full_tx_contract_hash,
         }
     }
 }
@@ -56300,11 +57095,10 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
         fail_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
-        let live_tx_hash = steering_tx_contract_hash(contract);
         let verdict = frankenterm_core::steer_run::steer_run_gate(
             &self.receipt,
             self.live_mission.as_ref(),
-            Some(&live_tx_hash),
+            Some(&self.full_tx_contract_hash),
             now_ms,
         );
         if let Some(error_code) = verdict.error_code() {
@@ -56342,13 +57136,14 @@ impl<E: frankenterm_core::tx_execution::StepExecutor> frankenterm_core::tx_execu
 fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>(
     executor: E,
     contract_path: &Path,
+    contract_lock: Option<&frankenterm_core::tx_execution::TxContractLockGuard>,
     contract: &mut frankenterm_core::plan::MissionTxContract,
     kill_switch: frankenterm_core::plan::MissionKillSwitchLevel,
     paused: bool,
     fail_step: Option<String>,
     dry_run: bool,
     now_ms: i64,
-) -> Result<RobotTxRunData, String> {
+) -> Result<RobotTxRunData, TxCommandExecutionError> {
     let tx_id = contract.intent.tx_id.0.clone();
     let plan_id = contract.plan.plan_id.0.clone();
 
@@ -56361,7 +57156,9 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
             kill_switch,
             now_ms,
         )
-        .map_err(|err| format!("prepare phase failed: {err}"))?;
+        .map_err(|err| {
+            TxCommandExecutionError::execution(format!("prepare phase failed: {err}"))
+        })?;
 
         return Ok(RobotTxRunData {
             contract_file: contract_path.display().to_string(),
@@ -56376,6 +57173,20 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
         });
     }
 
+    let contract_lock = contract_lock.ok_or_else(|| {
+        TxCommandExecutionError::execution(
+            "transaction execution requires the caller to hold the contract lock",
+        )
+    })?;
+    let authoritative_contract_path = contract_lock.authoritative_path();
+    if contract_path != authoritative_contract_path {
+        contract_lock.authorizes(contract_path).map_err(|source| {
+            TxCommandExecutionError::contract_lock(
+                "transaction contract lock does not authorize execution",
+                source,
+            )
+        })?;
+    }
     let engine = frankenterm_core::tx_execution::TxExecutionEngine::new(
         executor,
         frankenterm_core::tx_execution::TxExecutionConfig {
@@ -56388,26 +57199,61 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
     // ft-iz1ki: open the durable idempotency store and execute THROUGH it, so
     // a crash-restart of this tx run reloads the committed-step ledger and
     // dedups instead of re-dispatching already-committed pane side effects.
-    // The spool is rooted beside the contract file (`<contract_dir>/tx_ledgers/`)
-    // so re-running the same contract in place is restart-safe; open() appends
-    // the `tx_ledgers` subdir. Fail-closed: if the durable spool can't be opened
-    // we refuse the run rather than silently fall back to non-durable.
-    // (Rooting at the workspace `.ft` instead would require threading ft_dir
-    // through this fn's 6 production + 5 test call sites — deferred.)
-    let ledger_root = contract_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let mut idem_store = frankenterm_core::tx_idempotency::IdempotencyStore::open(
-        ledger_root,
-        frankenterm_core::tx_idempotency::IdempotencyPolicy::default(),
-    )
-    .map_err(|err| format!("tx idempotency store open failed: {err}"))?;
-    let result = engine
-        .execute_with_store(contract, &mut idem_store, now_ms)
-        .map_err(|err| format!("tx execution failed: {err}"))?;
+    // The workspace-global spool is opened through the guard's pinned `.ft`
+    // capability. Fail closed if the workspace/control namespace changed.
+    contract_lock
+        .authorizes(authoritative_contract_path)
+        .map_err(|source| {
+            TxCommandExecutionError::contract_lock(
+                "transaction contract lock does not authorize execution",
+                source,
+            )
+        })?;
+    let mut idem_store = contract_lock
+        .open_idempotency_store(frankenterm_core::tx_idempotency::IdempotencyPolicy::default())
+        .map_err(|err| {
+            TxCommandExecutionError::execution(format!("tx idempotency store open failed: {err}"))
+        })?;
+    // Re-check immediately before the executor can dispatch external effects.
+    contract_lock
+        .authorizes(authoritative_contract_path)
+        .map_err(|source| {
+            TxCommandExecutionError::contract_lock(
+                "transaction contract lock does not authorize execution",
+                source,
+            )
+        })?;
+    let execution_result = engine.execute_with_store(contract, &mut idem_store, now_ms);
+    let save_result = frankenterm_core::tx_execution::save_tx_contract_atomic(
+        contract_lock,
+        authoritative_contract_path,
+        contract,
+    );
+    let result = match (execution_result, save_result) {
+        (Ok(result), Ok(())) => result,
+        (Ok(_), Err(save_err)) => {
+            return Err(TxCommandExecutionError::contract_store(
+                "transaction execution completed, but its authoritative contract could not be persisted",
+                save_err,
+            ));
+        }
+        (Err(execution_err), Ok(())) => {
+            return Err(TxCommandExecutionError::execution(format!(
+                "tx execution failed after persisting available transaction evidence: {execution_err}; inspect tx show before retrying because external effects may have occurred"
+            )));
+        }
+        (Err(execution_err), Err(save_err)) => {
+            return Err(TxCommandExecutionError::contract_store(
+                format!(
+                    "tx execution failed ({execution_err}) and its available transaction evidence could not be persisted"
+                ),
+                save_err,
+            ));
+        }
+    };
 
     Ok(RobotTxRunData {
-        contract_file: contract_path.display().to_string(),
+        contract_file: authoritative_contract_path.display().to_string(),
         tx_id,
         plan_id,
         steering_receipt_id: None,
@@ -56422,33 +57268,85 @@ fn execute_tx_run_with_executor<E: frankenterm_core::tx_execution::StepExecutor>
 fn execute_tx_rollback_with_executor<E: frankenterm_core::tx_execution::StepExecutor>(
     executor: E,
     contract_path: &Path,
-    contract: &frankenterm_core::plan::MissionTxContract,
-    commit_report: &frankenterm_core::plan::TxCommitReport,
+    contract_lock: &frankenterm_core::tx_execution::TxContractLockGuard,
+    contract: &mut frankenterm_core::plan::MissionTxContract,
     fail_compensation_for_step: Option<&str>,
     now_ms: i64,
-) -> Result<RobotTxRollbackData, String> {
-    let compensation_inputs =
-        executor.execute_compensations(contract, commit_report, fail_compensation_for_step, now_ms);
-
-    let mut compensating_contract = contract.clone();
-    compensating_contract.lifecycle_state = frankenterm_core::plan::MissionTxState::Compensating;
-    compensating_contract
-        .receipts
-        .clone_from(&contract.receipts);
-
-    let compensation_report = frankenterm_core::plan::execute_compensation_phase(
-        &compensating_contract,
-        commit_report,
-        &compensation_inputs,
-        now_ms,
-    )
-    .map_err(|err| format!("rollback compensation failed: {err}"))?;
+) -> Result<RobotTxRollbackData, TxCommandExecutionError> {
+    let tx_id = contract.intent.tx_id.0.clone();
+    let plan_id = contract.plan.plan_id.0.clone();
+    let authoritative_contract_path = contract_lock.authoritative_path();
+    if contract_path != authoritative_contract_path {
+        contract_lock.authorizes(contract_path).map_err(|source| {
+            TxCommandExecutionError::contract_lock(
+                "transaction contract lock does not authorize rollback",
+                source,
+            )
+        })?;
+    }
+    let engine = frankenterm_core::tx_execution::TxExecutionEngine::new(
+        executor,
+        frankenterm_core::tx_execution::TxExecutionConfig {
+            fail_compensation_for_step: fail_compensation_for_step.map(str::to_string),
+            ..Default::default()
+        },
+    );
+    contract_lock
+        .authorizes(authoritative_contract_path)
+        .map_err(|source| {
+            TxCommandExecutionError::contract_lock(
+                "transaction contract lock does not authorize rollback",
+                source,
+            )
+        })?;
+    let mut idem_store = contract_lock
+        .open_idempotency_store(frankenterm_core::tx_idempotency::IdempotencyPolicy::default())
+        .map_err(|err| {
+            TxCommandExecutionError::execution(format!("tx idempotency store open failed: {err}"))
+        })?;
+    // Re-check immediately before the executor can dispatch compensation effects.
+    contract_lock
+        .authorizes(authoritative_contract_path)
+        .map_err(|source| {
+            TxCommandExecutionError::contract_lock(
+                "transaction contract lock does not authorize rollback",
+                source,
+            )
+        })?;
+    let rollback_result = engine.rollback_with_store(contract, &mut idem_store, now_ms);
+    let save_result = frankenterm_core::tx_execution::save_tx_contract_atomic(
+        contract_lock,
+        authoritative_contract_path,
+        contract,
+    );
+    let compensation_report = match (rollback_result, save_result) {
+        (Ok(result), Ok(())) => result.compensation_report,
+        (Ok(_), Err(save_err)) => {
+            return Err(TxCommandExecutionError::contract_store(
+                "rollback completed, but its authoritative contract could not be persisted",
+                save_err,
+            ));
+        }
+        (Err(rollback_err), Ok(())) => {
+            return Err(TxCommandExecutionError::execution(format!(
+                "rollback failed after persisting available transaction evidence: {rollback_err}; inspect tx show before retrying because compensation effects may have occurred"
+            )));
+        }
+        (Err(rollback_err), Err(save_err)) => {
+            return Err(TxCommandExecutionError::contract_store(
+                format!(
+                    "rollback failed ({rollback_err}) and its available transaction evidence could not be persisted"
+                ),
+                save_err,
+            ));
+        }
+    };
 
     Ok(RobotTxRollbackData {
-        contract_file: contract_path.display().to_string(),
-        tx_id: contract.intent.tx_id.0.clone(),
-        plan_id: contract.plan.plan_id.0.clone(),
-        final_state: compensation_report.outcome.target_tx_state(),
+        contract_file: authoritative_contract_path.display().to_string(),
+        tx_id,
+        plan_id,
+        final_state: contract.lifecycle_state,
         compensation_report,
     })
 }
@@ -56953,11 +57851,130 @@ fn robot_tx_error_code(tx_error_code: &str) -> &'static str {
         "mission.tx.file_not_found" => "robot.tx_not_found",
         "mission.tx.file_read_failed" => "robot.tx_read_failed",
         "mission.tx.invalid_json" => "robot.tx_invalid_json",
+        "mission.tx.in_progress" => "robot.tx_in_progress",
+        "mission.tx.lock_failed" => "robot.tx_lock_failed",
+        "mission.tx.serialize_failed" => "robot.tx_serialize_failed",
+        "mission.tx.file_too_large" | "mission.tx.oversize" => "robot.tx_oversize",
+        "mission.tx.write_failed" => "robot.tx_write_failed",
         "mission.tx.validation_failed" => "robot.tx_validation_failed",
         // The containment guard is shared across the mission and tx loaders,
         // so its code arrives in the mission.* namespace here too (ft-99ybo).
         "mission.path_escapes_workspace" => "robot.path_escapes_workspace",
         _ => "robot.tx_error",
+    }
+}
+
+fn tx_contract_store_mission_error_code(
+    kind: frankenterm_core::tx_execution::TxContractStoreErrorKind,
+) -> &'static str {
+    use frankenterm_core::tx_execution::TxContractStoreErrorKind;
+
+    match kind {
+        TxContractStoreErrorKind::Validation => "mission.tx.validation_failed",
+        TxContractStoreErrorKind::Serialization => "mission.tx.serialize_failed",
+        TxContractStoreErrorKind::TooLarge => "mission.tx.oversize",
+        TxContractStoreErrorKind::InProgress
+        | TxContractStoreErrorKind::Lock
+        | TxContractStoreErrorKind::Write
+        | TxContractStoreErrorKind::Sync
+        | TxContractStoreErrorKind::Rename => "mission.tx.write_failed",
+    }
+}
+
+fn tx_contract_lock_mission_error_code(
+    kind: frankenterm_core::tx_execution::TxContractStoreErrorKind,
+) -> &'static str {
+    if kind == frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress {
+        "mission.tx.in_progress"
+    } else {
+        "mission.tx.lock_failed"
+    }
+}
+
+fn tx_contract_store_exit_code(
+    kind: frankenterm_core::tx_execution::TxContractStoreErrorKind,
+) -> i32 {
+    use frankenterm_core::tx_execution::TxContractStoreErrorKind;
+
+    match kind {
+        TxContractStoreErrorKind::Validation => MISSION_EXIT_VALIDATION,
+        TxContractStoreErrorKind::TooLarge => MISSION_EXIT_INVALID_INPUT,
+        TxContractStoreErrorKind::InProgress
+        | TxContractStoreErrorKind::Lock
+        | TxContractStoreErrorKind::Serialization
+        | TxContractStoreErrorKind::Write
+        | TxContractStoreErrorKind::Sync
+        | TxContractStoreErrorKind::Rename => MISSION_EXIT_IO,
+    }
+}
+
+fn tx_command_error_hint(error: &TxCommandExecutionError) -> Option<String> {
+    if let Some(recovery_path) = error
+        .contract_store_error()
+        .and_then(|source| source.recovery_path())
+    {
+        return Some(format!(
+            "Do not retry this transaction mutation until inspecting the workspace-global durable tx idempotency ledger and reconciling any external effects. A transaction recovery artifact was retained through the pinned contract parent; {} is only its last-known display path and may no longer resolve after a namespace change. Validate the ledger evidence and the artifact's completeness and contents before recovery.",
+            recovery_path.display()
+        ));
+    }
+
+    match error {
+        TxCommandExecutionError::ContractLock { source, .. }
+            if source.kind()
+                == frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress =>
+        {
+            Some("Wait for the in-flight transaction mutation to finish, then retry.".to_string())
+        }
+        TxCommandExecutionError::ContractLock { .. } => {
+            Some("Acquire the lock for this exact transaction contract, then retry.".to_string())
+        }
+        TxCommandExecutionError::ContractStore { .. } => Some(
+            "Do not retry this transaction mutation until inspecting the workspace-global durable tx idempotency ledger and reconciling any external effects. The contract path is only a last-known display path after a namespace change and may now resolve to stale or foreign data."
+                .to_string(),
+        ),
+        TxCommandExecutionError::Execution(_) => None,
+    }
+}
+
+fn robot_tx_command_error_code(error: &TxCommandExecutionError) -> &'static str {
+    match error {
+        TxCommandExecutionError::Execution(_) => "robot.tx_execution_failed",
+        TxCommandExecutionError::ContractLock { source, .. } => {
+            robot_tx_error_code(tx_contract_lock_mission_error_code(source.kind()))
+        }
+        TxCommandExecutionError::ContractStore { source, .. } => {
+            robot_tx_error_code(tx_contract_store_mission_error_code(source.kind()))
+        }
+    }
+}
+
+fn mission_tx_command_error(error: TxCommandExecutionError) -> MissionCommandError {
+    let (exit_code, error_code) = match &error {
+        TxCommandExecutionError::Execution(_) => {
+            (MISSION_EXIT_VALIDATION, "mission.tx.execution_failed")
+        }
+        TxCommandExecutionError::ContractLock { source, .. } => (
+            if source.kind() == frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress
+            {
+                MISSION_EXIT_VALIDATION
+            } else {
+                MISSION_EXIT_IO
+            },
+            tx_contract_lock_mission_error_code(source.kind()),
+        ),
+        TxCommandExecutionError::ContractStore { source, .. } => (
+            tx_contract_store_exit_code(source.kind()),
+            tx_contract_store_mission_error_code(source.kind()),
+        ),
+    };
+    let hint = tx_command_error_hint(&error);
+
+    MissionCommandError {
+        exit_code,
+        error_code,
+        message: error.to_string(),
+        hint,
     }
 }
 
@@ -57723,10 +58740,27 @@ async fn handle_tx_command(
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let contract_path = resolve_mission_tx_file_path(layout, contract_file);
-            let mut contract = match load_mission_tx_contract_from_path(&contract_path) {
+            let contract_lock = if dry_run {
+                None
+            } else {
+                Some(
+                    lock_mission_tx_contract(&layout.root, &contract_path)
+                        .unwrap_or_else(|err| emit_mission_error(output_format, err)),
+                )
+            };
+            let contract_result = match contract_lock.as_ref() {
+                Some(contract_lock) => load_mission_tx_contract_from_guard(contract_lock),
+                None => load_mission_tx_contract_from_path(&contract_path),
+            };
+            let mut contract = match contract_result {
                 Ok(contract) => contract,
                 Err(err) => emit_mission_error(output_format, err),
             };
+            let execution_contract_path = contract_lock
+                .as_ref()
+                .map_or(contract_path.as_path(), |contract_lock| {
+                    contract_lock.authoritative_path()
+                });
 
             if let Some(fail_step_id) = fail_step.as_deref()
                 && !contract
@@ -57752,7 +58786,12 @@ async fn handle_tx_command(
             let started = Instant::now();
             let now_ms = mission_now_ms();
             let kill_switch = kill_switch.into();
-            let (real_runtime, fallback_reason) = resolve_real_tx_runtime(config, layout).await;
+            let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
+                config,
+                layout,
+                tx_run_requires_terminal_backend(&contract),
+            )
+            .await;
             let executor_label = if real_runtime.is_some() {
                 "pane_executor"
             } else {
@@ -57762,7 +58801,7 @@ async fn handle_tx_command(
                 command = "tx.run",
                 tx_id = %contract.intent.tx_id.0,
                 plan_id = %contract.plan.plan_id.0,
-                contract_file = %contract_path.display(),
+                contract_file = %execution_contract_path.display(),
                 executor_type = executor_label,
                 dry_run,
                 paused,
@@ -57789,7 +58828,8 @@ async fn handle_tx_command(
                 );
                 let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
                     layout.root.to_string_lossy().to_string(),
-                );
+                )
+                .with_actor(frankenterm_core::policy::ActorKind::Human);
                 let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
                     wezterm,
                     policy_engine,
@@ -57799,7 +58839,8 @@ async fn handle_tx_command(
                 );
                 execute_tx_run_with_executor(
                     executor,
-                    &contract_path,
+                    execution_contract_path,
+                    contract_lock.as_ref(),
                     &mut contract,
                     kill_switch,
                     paused,
@@ -57811,20 +58852,21 @@ async fn handle_tx_command(
                 // ft-pmbe1 FAIL-CLOSED: real tx runtime unavailable -> refuse to commit
                 // through the synthetic allow-all executor (policy + approval bypass +
                 // durable ledger poisoning). Surfaced via the .map_err handler below.
-                Err(format!(
+                Err(TxCommandExecutionError::execution(format!(
                     "real tx runtime unavailable{}; refusing to commit a transaction through the synthetic allow-all executor (policy and approval gates would be bypassed). Re-run with --dry-run for a preview, or restore the storage/terminal backend.",
                     fallback_reason
                         .as_deref()
                         .map(|reason| format!(" ({reason})"))
                         .unwrap_or_default()
-                ))
+                )))
             } else {
                 if let Some(reason) = fallback_reason.as_deref() {
                     tracing::warn!(%reason, "synthetic dry-run preview (real tx runtime unavailable)");
                 }
                 execute_tx_run_with_executor(
                     frankenterm_core::tx_execution::SyntheticStepExecutor,
-                    &contract_path,
+                    execution_contract_path,
+                    contract_lock.as_ref(),
                     &mut contract,
                     kill_switch,
                     paused,
@@ -57833,12 +58875,7 @@ async fn handle_tx_command(
                     now_ms,
                 )
             }
-            .map_err(|message| MissionCommandError {
-                exit_code: MISSION_EXIT_VALIDATION,
-                error_code: "mission.tx.execution_failed",
-                message,
-                hint: None,
-            })
+            .map_err(mission_tx_command_error)
             .unwrap_or_else(|err| emit_mission_error(output_format, err));
 
             tracing::info!(
@@ -57906,10 +58943,13 @@ async fn handle_tx_command(
         } => {
             let output_format = MissionCommandOutputFormat::from_flag(&format);
             let contract_path = resolve_mission_tx_file_path(layout, contract_file);
-            let contract = match load_mission_tx_contract_from_path(&contract_path) {
+            let contract_lock = lock_mission_tx_contract(&layout.root, &contract_path)
+                .unwrap_or_else(|err| emit_mission_error(output_format, err));
+            let mut contract = match load_mission_tx_contract_from_guard(&contract_lock) {
                 Ok(contract) => contract,
                 Err(err) => emit_mission_error(output_format, err),
             };
+            let execution_contract_path = contract_lock.authoritative_path();
 
             let now_ms = mission_now_ms();
             let commit_report = match build_robot_tx_rollback_commit_report(&contract, now_ms) {
@@ -57947,7 +58987,12 @@ async fn handle_tx_command(
                 );
             }
             let started = Instant::now();
-            let (real_runtime, fallback_reason) = resolve_real_tx_runtime(config, layout).await;
+            let (real_runtime, fallback_reason) = resolve_real_tx_runtime(
+                config,
+                layout,
+                tx_rollback_requires_terminal_backend(&contract, &commit_report),
+            )
+            .await;
             let executor_label = if real_runtime.is_some() {
                 "pane_executor"
             } else {
@@ -57957,7 +59002,7 @@ async fn handle_tx_command(
                 command = "tx.rollback",
                 tx_id = %contract.intent.tx_id.0,
                 plan_id = %contract.plan.plan_id.0,
-                contract_file = %contract_path.display(),
+                contract_file = %execution_contract_path.display(),
                 executor_type = executor_label,
                 fail_compensation_for_step = fail_compensation_for_step.as_deref().unwrap_or(""),
                 "tx rollback starting"
@@ -57982,7 +59027,8 @@ async fn handle_tx_command(
                 );
                 let prepare_context = frankenterm_core::plan::TxPrepareEvaluationContext::new(
                     layout.root.to_string_lossy().to_string(),
-                );
+                )
+                .with_actor(frankenterm_core::policy::ActorKind::Human);
                 let executor = frankenterm_core::tx_execution::PaneStepExecutor::new(
                     wezterm,
                     policy_engine,
@@ -57992,9 +59038,9 @@ async fn handle_tx_command(
                 );
                 execute_tx_rollback_with_executor(
                     executor,
-                    &contract_path,
-                    &contract,
-                    &commit_report,
+                    execution_contract_path,
+                    &contract_lock,
+                    &mut contract,
                     fail_compensation_for_step.as_deref(),
                     now_ms,
                 )
@@ -58031,12 +59077,7 @@ async fn handle_tx_command(
                     },
                 )
             }
-            .map_err(|message| MissionCommandError {
-                exit_code: MISSION_EXIT_VALIDATION,
-                error_code: "mission.tx.execution_failed",
-                message,
-                hint: None,
-            })
+            .map_err(mission_tx_command_error)
             .unwrap_or_else(|err| emit_mission_error(output_format, err));
 
             tracing::info!(
@@ -65922,6 +66963,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tx_terminal_dependency_tracks_only_actions_that_use_the_mux() {
+        use frankenterm_core::plan::{StepAction, WaitCondition};
+
+        assert!(tx_action_requires_terminal_backend(&StepAction::SendText {
+            pane_id: 7,
+            text: "status".to_string(),
+            paste_mode: Some(false),
+        }));
+        assert!(tx_action_requires_terminal_backend(&StepAction::WaitFor {
+            pane_id: None,
+            condition: WaitCondition::PaneIdle {
+                pane_id: Some(7),
+                idle_threshold_ms: 10,
+            },
+            timeout_ms: 100,
+        }));
+        assert!(!tx_action_requires_terminal_backend(&StepAction::WaitFor {
+            pane_id: None,
+            condition: WaitCondition::External {
+                key: "release".to_string(),
+            },
+            timeout_ms: 100,
+        }));
+        assert!(!tx_action_requires_terminal_backend(
+            &StepAction::StoreData {
+                key: "transaction-marker".to_string(),
+                value: serde_json::json!({"state": "prepared"}),
+            }
+        ));
+    }
+
+    #[test]
+    fn tx_run_terminal_dependency_includes_automatic_compensations() {
+        use frankenterm_core::plan::StepAction;
+
+        let mut contract = sample_robot_tx_contract();
+        for step in &mut contract.plan.steps {
+            step.action = StepAction::StoreData {
+                key: step.step_id.0.clone(),
+                value: serde_json::json!({"phase": "commit"}),
+            };
+        }
+        assert!(
+            tx_run_requires_terminal_backend(&contract),
+            "pane-backed compensation can run automatically after a partial commit"
+        );
+
+        for compensation in &mut contract.plan.compensations {
+            compensation.action = StepAction::StoreData {
+                key: compensation.for_step_id.0.clone(),
+                value: serde_json::json!({"phase": "compensate"}),
+            };
+        }
+        assert!(!tx_run_requires_terminal_backend(&contract));
+    }
+
+    fn persisted_robot_tx_contract(
+        contract: &frankenterm_core::plan::MissionTxContract,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create tx contract tempdir");
+        std::fs::create_dir(dir.path().join(".ft")).expect("create pinned tx control directory");
+        let path = dir.path().join("tx.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(contract).expect("serialize tx contract fixture"),
+        )
+        .expect("write tx contract fixture");
+        (dir, path)
+    }
+
+    fn lock_robot_tx_contract_fixture(
+        path: &Path,
+    ) -> frankenterm_core::tx_execution::TxContractLockGuard {
+        let workspace_root = path.parent().expect("tx fixture has workspace root");
+        lock_mission_tx_contract(workspace_root, path).expect("lock tx contract fixture")
+    }
+
     fn sample_resource_what_if_package()
     -> frankenterm_core_replay::replay_counterfactual::ResourceControlOverridePackage {
         use frankenterm_core_replay::replay_counterfactual::ResourceControlOverrideLoader;
@@ -67773,11 +68892,19 @@ reason = "overly conservative pending threshold"
     #[derive(Clone, Default)]
     struct RecordingStepExecutor {
         calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        execute_contract_hashes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl RecordingStepExecutor {
         fn recorded_calls(&self) -> Vec<&'static str> {
             self.calls.lock().expect("recorded calls lock").clone()
+        }
+
+        fn recorded_execute_contract_hashes(&self) -> Vec<String> {
+            self.execute_contract_hashes
+                .lock()
+                .expect("recorded execute contract hashes lock")
+                .clone()
         }
     }
 
@@ -67805,6 +68932,10 @@ reason = "overly conservative pending threshold"
                 .lock()
                 .expect("recorded calls lock")
                 .push("execute_steps");
+            self.execute_contract_hashes
+                .lock()
+                .expect("recorded execute contract hashes lock")
+                .push(steering_tx_contract_hash(contract));
             build_robot_tx_commit_step_inputs(contract, fail_step, now_ms)
         }
 
@@ -67823,6 +68954,93 @@ reason = "overly conservative pending threshold"
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NamespaceSubstitutionPhase {
+        Commit,
+        Compensate,
+    }
+
+    #[derive(Clone)]
+    struct NamespaceSubstitutingExecutor {
+        inner: RecordingStepExecutor,
+        phase: NamespaceSubstitutionPhase,
+        contract_path: PathBuf,
+        detached_path: PathBuf,
+        foreign_sentinel: Vec<u8>,
+        substituted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl NamespaceSubstitutingExecutor {
+        fn new(
+            phase: NamespaceSubstitutionPhase,
+            contract_path: PathBuf,
+            detached_path: PathBuf,
+            foreign_sentinel: Vec<u8>,
+        ) -> Self {
+            Self {
+                inner: RecordingStepExecutor::default(),
+                phase,
+                contract_path,
+                detached_path,
+                foreign_sentinel,
+                substituted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        fn substitute_once(&self) {
+            if self
+                .substituted
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            std::fs::rename(&self.contract_path, &self.detached_path)
+                .expect("detach authorized transaction basename during dispatch");
+            std::fs::write(&self.contract_path, &self.foreign_sentinel)
+                .expect("install foreign transaction basename during dispatch");
+        }
+
+        fn recorded_calls(&self) -> Vec<&'static str> {
+            self.inner.recorded_calls()
+        }
+    }
+
+    impl frankenterm_core::tx_execution::StepExecutor for NamespaceSubstitutingExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxPrepareGateInput> {
+            self.inner.evaluate_gates(contract, now_ms)
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCommitStepInput> {
+            if self.phase == NamespaceSubstitutionPhase::Commit {
+                self.substitute_once();
+            }
+            self.inner.execute_steps(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            contract: &frankenterm_core::plan::MissionTxContract,
+            commit_report: &frankenterm_core::plan::TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<frankenterm_core::plan::TxCompensationStepInput> {
+            if self.phase == NamespaceSubstitutionPhase::Compensate {
+                self.substitute_once();
+            }
+            self.inner
+                .execute_compensations(contract, commit_report, fail_for_step, now_ms)
+        }
+    }
+
     #[test]
     fn tx_run_helper_dry_run_stops_after_prepare_phase() {
         let mut contract = sample_robot_tx_contract();
@@ -67831,6 +69049,7 @@ reason = "overly conservative pending threshold"
         let data = execute_tx_run_with_executor(
             executor.clone(),
             Path::new("/tmp/tx.json"),
+            None,
             &mut contract,
             frankenterm_core::plan::MissionKillSwitchLevel::Off,
             false,
@@ -67863,11 +69082,14 @@ reason = "overly conservative pending threshold"
     #[test]
     fn tx_run_helper_execute_maps_engine_result_into_robot_data() {
         let mut contract = sample_robot_tx_contract();
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
         let executor = RecordingStepExecutor::default();
 
         let data = execute_tx_run_with_executor(
             executor.clone(),
-            Path::new("/tmp/tx.json"),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
             &mut contract,
             frankenterm_core::plan::MissionKillSwitchLevel::Off,
             false,
@@ -67879,9 +69101,12 @@ reason = "overly conservative pending threshold"
 
         assert_eq!(
             executor.recorded_calls(),
-            vec!["evaluate_gates", "execute_steps"]
+            vec!["evaluate_gates", "execute_steps", "execute_steps"]
         );
-        assert_eq!(data.contract_file, "/tmp/tx.json");
+        assert_eq!(
+            data.contract_file,
+            contract_lock.authoritative_path().display().to_string()
+        );
         assert_eq!(data.tx_id, "tx:robot-interface-test");
         assert_eq!(data.plan_id, "tx-plan:robot-interface-test");
         assert_eq!(
@@ -67903,6 +69128,179 @@ reason = "overly conservative pending threshold"
             contract.lifecycle_state,
             frankenterm_core::plan::MissionTxState::Committed
         );
+    }
+
+    #[test]
+    fn tx_run_helper_preserves_store_kind_and_recovery_path() {
+        let mut contract = sample_robot_tx_contract();
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        contract.receipts.push(serde_json::json!({
+            "oversize_test_attachment": "x".repeat(
+                frankenterm_core::tx_execution::TX_CONTRACT_MAX_BYTES
+            ),
+        }));
+
+        let err = execute_tx_run_with_executor(
+            RecordingStepExecutor::default(),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_252,
+        )
+        .expect_err("oversize post-execution contract should fail persistence");
+
+        let store_err = err
+            .contract_store_error()
+            .expect("typed contract-store error should be retained");
+        assert_eq!(
+            store_err.kind(),
+            frankenterm_core::tx_execution::TxContractStoreErrorKind::TooLarge
+        );
+        let recovery_path = store_err
+            .recovery_path()
+            .expect("oversize save should retain a recovery artifact")
+            .to_path_buf();
+        assert!(recovery_path.exists());
+        assert_eq!(robot_tx_command_error_code(&err), "robot.tx_oversize");
+        assert!(
+            tx_command_error_hint(&err)
+                .expect("recovery hint should be present")
+                .contains(&recovery_path.display().to_string())
+        );
+        assert!(
+            tx_command_error_hint(&err)
+                .expect("recovery hint should be present")
+                .contains("Do not retry this transaction mutation")
+        );
+
+        let mission_err = mission_tx_command_error(err);
+        assert_eq!(mission_err.error_code, "mission.tx.oversize");
+        assert_eq!(mission_err.exit_code, MISSION_EXIT_INVALID_INPUT);
+        assert!(
+            mission_err
+                .hint
+                .expect("human error should retain recovery hint")
+                .contains(&recovery_path.display().to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_run_shared_front_substitution_preserves_foreign_file_and_recovery_evidence() {
+        let mut contract = sample_robot_tx_contract();
+        let (workspace, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let detached_path = workspace.path().join("tx-run-authorized-detached.json");
+        let baseline = std::fs::read(&contract_path).expect("read planned contract baseline");
+        let foreign_sentinel = b"foreign run contract sentinel".to_vec();
+        let executor = NamespaceSubstitutingExecutor::new(
+            NamespaceSubstitutionPhase::Commit,
+            contract_path.clone(),
+            detached_path.clone(),
+            foreign_sentinel.clone(),
+        );
+
+        let err = execute_tx_run_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            5_202,
+        )
+        .expect_err("post-authorization basename substitution must fail pinned save");
+
+        assert_eq!(
+            executor.recorded_calls(),
+            vec!["evaluate_gates", "execute_steps", "execute_steps"]
+        );
+        assert_eq!(
+            std::fs::read(&contract_path).expect("read foreign run sentinel"),
+            foreign_sentinel
+        );
+        assert_eq!(
+            std::fs::read(&detached_path).expect("read detached authorized contract"),
+            baseline
+        );
+        let store_err = err
+            .contract_store_error()
+            .expect("post-effect save must preserve typed store error");
+        let recovery_path = store_err
+            .recovery_path()
+            .expect("substitution must retain the completed contract snapshot");
+        let recovered: frankenterm_core::plan::MissionTxContract = serde_json::from_slice(
+            &std::fs::read(recovery_path).expect("read retained run recovery snapshot"),
+        )
+        .expect("parse retained run recovery snapshot");
+        assert_eq!(
+            recovered.lifecycle_state,
+            frankenterm_core::plan::MissionTxState::Committed
+        );
+        assert_eq!(
+            recovered.outcome,
+            frankenterm_core::plan::TxOutcome::Committed
+        );
+        let hint = tx_command_error_hint(&err).expect("unsafe retry hint must be present");
+        assert!(hint.contains("Do not retry this transaction mutation"));
+        assert!(workspace.path().join(".ft").join("tx_ledgers").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_command_store_error_without_recovery_warns_against_retry() {
+        let contract = sample_robot_tx_contract();
+        let workspace = tempfile::tempdir().expect("create tx workspace");
+        std::fs::create_dir(workspace.path().join(".ft"))
+            .expect("create pinned tx control directory");
+        let parent = workspace.path().join("mission");
+        std::fs::create_dir(&parent).expect("create contract parent");
+        let contract_path = parent.join("tx.json");
+        std::fs::write(
+            &contract_path,
+            serde_json::to_vec_pretty(&contract).expect("serialize tx contract fixture"),
+        )
+        .expect("write tx contract fixture");
+        let contract_lock = lock_mission_tx_contract(workspace.path(), &contract_path)
+            .expect("lock nested tx contract fixture");
+
+        let detached_parent = workspace.path().join("mission-detached");
+        std::fs::rename(&parent, &detached_parent).expect("detach authorized contract parent");
+        std::fs::create_dir(&parent).expect("install foreign contract parent");
+        std::fs::write(&contract_path, b"foreign-contract-sentinel")
+            .expect("install foreign contract sentinel");
+
+        let store_error = frankenterm_core::tx_execution::save_tx_contract_atomic(
+            &contract_lock,
+            contract_lock.authoritative_path(),
+            &contract,
+        )
+        .expect_err("detached namespace must be reported after pinned save");
+        assert!(
+            store_error.recovery_path().is_none(),
+            "post-publication namespace detach has no retained temp name"
+        );
+        assert_eq!(
+            std::fs::read(&contract_path).expect("read foreign sentinel"),
+            b"foreign-contract-sentinel",
+            "pinned save must not overwrite the foreign replacement"
+        );
+
+        let error = TxCommandExecutionError::contract_store(
+            "transaction effect may already have completed",
+            store_error,
+        );
+        let hint = tx_command_error_hint(&error).expect("unsafe retry hint must be present");
+        assert!(hint.contains("Do not retry this transaction mutation"));
+        assert!(hint.contains("workspace-global durable tx idempotency ledger"));
+        assert!(hint.contains("last-known display path"));
     }
 
     #[test]
@@ -67956,11 +69354,19 @@ reason = "overly conservative pending threshold"
         contract
             .receipts
             .push(steering_receipt_tx_attachment(&receipt, &live_hash, 5_151));
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
         let executor = RecordingStepExecutor::default();
 
         let data = execute_tx_run_with_executor(
-            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None),
-            Path::new("/tmp/tx.json"),
+            SteeringReceiptRevalidatingExecutor::new(
+                executor.clone(),
+                receipt,
+                None,
+                live_hash.clone(),
+            ),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
             &mut contract,
             frankenterm_core::plan::MissionKillSwitchLevel::Off,
             false,
@@ -67972,7 +69378,15 @@ reason = "overly conservative pending threshold"
 
         assert_eq!(
             executor.recorded_calls(),
-            vec!["evaluate_gates", "execute_steps"]
+            vec!["evaluate_gates", "execute_steps", "execute_steps"]
+        );
+        let execute_contract_hashes = executor.recorded_execute_contract_hashes();
+        assert_eq!(execute_contract_hashes.len(), contract.plan.steps.len());
+        assert!(
+            execute_contract_hashes
+                .iter()
+                .all(|dispatch_hash| dispatch_hash != &live_hash),
+            "the durable engine must dispatch one-step contract views; steering revalidation must retain the admitted full-contract hash"
         );
         assert_eq!(
             data.final_state,
@@ -67994,11 +69408,20 @@ reason = "overly conservative pending threshold"
             1_704_200_000_000,
             Some(60_000),
         );
+        let live_hash = steering_tx_contract_hash(&contract);
+        assert_ne!(
+            receipt.tx_contract_hash.as_deref(),
+            Some(live_hash.as_str()),
+            "fixture must bind a stale tx identity"
+        );
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
         let executor = RecordingStepExecutor::default();
 
         let data = execute_tx_run_with_executor(
-            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None),
-            Path::new("/tmp/tx.json"),
+            SteeringReceiptRevalidatingExecutor::new(executor.clone(), receipt, None, live_hash),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
             &mut contract,
             frankenterm_core::plan::MissionKillSwitchLevel::Off,
             false,
@@ -68025,11 +69448,14 @@ reason = "overly conservative pending threshold"
     #[test]
     fn tx_run_helper_fail_step_surfaces_compensation_and_failed_final_state() {
         let mut contract = sample_robot_tx_contract();
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
         let executor = RecordingStepExecutor::default();
 
         let data = execute_tx_run_with_executor(
             executor.clone(),
-            Path::new("/tmp/tx.json"),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
             &mut contract,
             frankenterm_core::plan::MissionKillSwitchLevel::Off,
             false,
@@ -68041,7 +69467,13 @@ reason = "overly conservative pending threshold"
 
         assert_eq!(
             executor.recorded_calls(),
-            vec!["evaluate_gates", "execute_steps", "execute_compensations"]
+            vec![
+                "evaluate_gates",
+                "execute_steps",
+                "execute_steps",
+                "evaluate_gates",
+                "execute_compensations",
+            ]
         );
         let commit_report = data
             .commit_report
@@ -68061,22 +69493,46 @@ reason = "overly conservative pending threshold"
 
     #[test]
     fn tx_rollback_helper_maps_compensation_report_into_robot_data() {
-        let contract = sample_robot_tx_contract();
-        let commit_report = build_robot_tx_synthetic_commit_report(&contract, 7_171);
+        let mut contract = sample_robot_tx_contract();
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        execute_tx_run_with_executor(
+            RecordingStepExecutor::default(),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            7_171,
+        )
+        .expect("setup execution should persist committed receipts");
         let executor = RecordingStepExecutor::default();
 
         let data = execute_tx_rollback_with_executor(
             executor.clone(),
-            Path::new("/tmp/tx.json"),
-            &contract,
-            &commit_report,
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut contract,
             Some("tx-step:1"),
             8_181,
         )
         .expect("rollback should succeed");
 
-        assert_eq!(executor.recorded_calls(), vec!["execute_compensations"]);
-        assert_eq!(data.contract_file, "/tmp/tx.json");
+        assert_eq!(
+            executor.recorded_calls(),
+            vec![
+                "evaluate_gates",
+                "execute_compensations",
+                "evaluate_gates",
+                "execute_compensations",
+            ]
+        );
+        assert_eq!(
+            data.contract_file,
+            contract_lock.authoritative_path().display().to_string()
+        );
         assert_eq!(data.tx_id, "tx:robot-interface-test");
         assert_eq!(data.plan_id, "tx-plan:robot-interface-test");
         assert_eq!(data.compensation_report.failed_count, 1);
@@ -68087,6 +69543,212 @@ reason = "overly conservative pending threshold"
     }
 
     #[test]
+    fn tx_rollback_helper_rejects_wrong_lock_before_compensation() {
+        let mut contract = sample_robot_tx_contract();
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        execute_tx_run_with_executor(
+            RecordingStepExecutor::default(),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            8_282,
+        )
+        .expect("setup execution should persist committed receipts");
+
+        let other_contract = sample_robot_tx_contract();
+        let (_other_dir, other_path) = persisted_robot_tx_contract(&other_contract);
+        let wrong_lock = lock_robot_tx_contract_fixture(&other_path);
+        let executor = RecordingStepExecutor::default();
+        let err = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &wrong_lock,
+            &mut contract,
+            None,
+            9_292,
+        )
+        .expect_err("wrong lock must fail rollback authorization");
+
+        assert!(
+            executor.recorded_calls().is_empty(),
+            "lock authorization must fail before compensation side effects"
+        );
+        assert_eq!(
+            err.contract_store_error()
+                .expect("typed contract-store error should be retained")
+                .kind(),
+            frankenterm_core::tx_execution::TxContractStoreErrorKind::Lock
+        );
+        assert_eq!(robot_tx_command_error_code(&err), "robot.tx_lock_failed");
+        let mission_err = mission_tx_command_error(err);
+        assert_eq!(mission_err.error_code, "mission.tx.lock_failed");
+        assert_eq!(mission_err.exit_code, MISSION_EXIT_IO);
+    }
+
+    #[test]
+    fn tx_rollback_helper_preserves_store_kind_and_recovery_path() {
+        let mut contract = sample_robot_tx_contract();
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        execute_tx_run_with_executor(
+            RecordingStepExecutor::default(),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            9_393,
+        )
+        .expect("setup execution should persist committed receipts");
+        contract.receipts.push(serde_json::json!({
+            "oversize_test_attachment": "x".repeat(
+                frankenterm_core::tx_execution::TX_CONTRACT_MAX_BYTES
+            ),
+        }));
+        let executor = RecordingStepExecutor::default();
+
+        let err = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut contract,
+            None,
+            10_303,
+        )
+        .expect_err("oversize post-rollback contract should fail persistence");
+
+        assert_eq!(
+            executor.recorded_calls(),
+            vec![
+                "evaluate_gates",
+                "execute_compensations",
+                "evaluate_gates",
+                "execute_compensations",
+            ]
+        );
+        let store_err = err
+            .contract_store_error()
+            .expect("typed contract-store error should be retained");
+        assert_eq!(
+            store_err.kind(),
+            frankenterm_core::tx_execution::TxContractStoreErrorKind::TooLarge
+        );
+        let recovery_path = store_err
+            .recovery_path()
+            .expect("oversize rollback save should retain a recovery artifact")
+            .to_path_buf();
+        assert!(recovery_path.exists());
+        assert_eq!(robot_tx_command_error_code(&err), "robot.tx_oversize");
+        assert!(
+            tx_command_error_hint(&err)
+                .expect("recovery hint should be present")
+                .contains(&recovery_path.display().to_string())
+        );
+        assert!(
+            tx_command_error_hint(&err)
+                .expect("recovery hint should be present")
+                .contains("Do not retry this transaction mutation")
+        );
+
+        let mission_err = mission_tx_command_error(err);
+        assert_eq!(mission_err.error_code, "mission.tx.oversize");
+        assert_eq!(mission_err.exit_code, MISSION_EXIT_INVALID_INPUT);
+        assert!(
+            mission_err
+                .hint
+                .expect("human error should retain recovery hint")
+                .contains(&recovery_path.display().to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_rollback_shared_front_substitution_preserves_foreign_file_and_recovery_evidence() {
+        let mut contract = sample_robot_tx_contract();
+        let (workspace, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        execute_tx_run_with_executor(
+            RecordingStepExecutor::default(),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            9_202,
+        )
+        .expect("setup execution should persist committed transaction proof");
+        let baseline = std::fs::read(&contract_path).expect("read committed contract baseline");
+        let detached_path = workspace
+            .path()
+            .join("tx-rollback-authorized-detached.json");
+        let foreign_sentinel = b"foreign rollback contract sentinel".to_vec();
+        let executor = NamespaceSubstitutingExecutor::new(
+            NamespaceSubstitutionPhase::Compensate,
+            contract_path.clone(),
+            detached_path.clone(),
+            foreign_sentinel.clone(),
+        );
+
+        let err = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut contract,
+            None,
+            10_202,
+        )
+        .expect_err("post-authorization rollback substitution must fail pinned save");
+
+        assert_eq!(
+            executor.recorded_calls(),
+            vec![
+                "evaluate_gates",
+                "execute_compensations",
+                "evaluate_gates",
+                "execute_compensations"
+            ]
+        );
+        assert_eq!(
+            std::fs::read(&contract_path).expect("read foreign rollback sentinel"),
+            foreign_sentinel
+        );
+        assert_eq!(
+            std::fs::read(&detached_path).expect("read detached committed contract"),
+            baseline
+        );
+        let store_err = err
+            .contract_store_error()
+            .expect("post-compensation save must preserve typed store error");
+        let recovery_path = store_err
+            .recovery_path()
+            .expect("substitution must retain the rolled-back contract snapshot");
+        let recovered: frankenterm_core::plan::MissionTxContract = serde_json::from_slice(
+            &std::fs::read(recovery_path).expect("read retained rollback recovery snapshot"),
+        )
+        .expect("parse retained rollback recovery snapshot");
+        assert_eq!(
+            recovered.lifecycle_state,
+            frankenterm_core::plan::MissionTxState::RolledBack
+        );
+        assert_eq!(
+            recovered.outcome,
+            frankenterm_core::plan::TxOutcome::Compensated
+        );
+        let hint = tx_command_error_hint(&err).expect("unsafe retry hint must be present");
+        assert!(hint.contains("Do not retry this transaction mutation"));
+        assert!(workspace.path().join(".ft").join("tx_ledgers").is_dir());
+    }
+
+    #[test]
     fn mission_robot_tx_contract_loader_maps_io_parse_and_validation_errors() {
         let temp_root = std::env::temp_dir().join(format!(
             "ft-robot-tx-loader-{}-{}",
@@ -68094,6 +69756,7 @@ reason = "overly conservative pending threshold"
             now_ms()
         ));
         std::fs::create_dir_all(&temp_root).expect("create temp root");
+        std::fs::create_dir_all(temp_root.join(".ft")).expect("create pinned tx control directory");
 
         let missing_path = temp_root.join("missing.json");
         let missing_err = load_mission_tx_contract_from_path(&missing_path)
@@ -68129,6 +69792,32 @@ reason = "overly conservative pending threshold"
             .expect("valid contract should load");
         assert_eq!(loaded.intent.tx_id.0, "tx:robot-interface-test");
         assert_eq!(loaded.plan.steps.len(), 2);
+
+        let contract_lock = lock_mission_tx_contract(&temp_root, &valid_contract_path)
+            .expect("lock valid contract for pinned load");
+        let pinned = load_mission_tx_contract_from_guard(&contract_lock)
+            .expect("valid contract should load through pinned guard");
+        assert_eq!(pinned.intent.tx_id.0, loaded.intent.tx_id.0);
+        assert_eq!(pinned.plan.steps.len(), loaded.plan.steps.len());
+    }
+
+    #[test]
+    fn mission_tx_lock_missing_contract_preserves_not_found_without_sidecar() {
+        let dir = tempfile::tempdir().expect("create missing tx tempdir");
+        let missing_path = dir.path().join("missing.json");
+        let lock_path = missing_path.with_extension("json.lock");
+
+        let err = match lock_mission_tx_contract(dir.path(), &missing_path) {
+            Ok(_) => panic!("missing contract must not be locked"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.error_code, "mission.tx.file_not_found");
+        assert_eq!(err.exit_code, MISSION_EXIT_NOT_FOUND);
+        assert!(
+            !lock_path.exists(),
+            "missing contract preflight must happen before sidecar creation"
+        );
     }
 
     #[test]
@@ -68272,10 +69961,46 @@ reason = "overly conservative pending threshold"
             "robot.tx_validation_failed"
         );
         assert_eq!(
+            robot_tx_error_code("mission.tx.in_progress"),
+            "robot.tx_in_progress"
+        );
+        assert_eq!(
+            robot_tx_error_code("mission.tx.lock_failed"),
+            "robot.tx_lock_failed"
+        );
+        assert_eq!(
+            robot_tx_error_code("mission.tx.serialize_failed"),
+            "robot.tx_serialize_failed"
+        );
+        assert_eq!(
+            robot_tx_error_code("mission.tx.oversize"),
+            "robot.tx_oversize"
+        );
+        assert_eq!(
+            robot_tx_error_code("mission.tx.file_too_large"),
+            "robot.tx_oversize"
+        );
+        assert_eq!(
+            robot_tx_error_code("mission.tx.write_failed"),
+            "robot.tx_write_failed"
+        );
+        assert_eq!(
             robot_tx_error_code("mission.path_escapes_workspace"),
             "robot.path_escapes_workspace"
         );
         assert_eq!(robot_tx_error_code("mission.tx.unmapped"), "robot.tx_error");
+        assert_eq!(
+            tx_contract_store_mission_error_code(
+                frankenterm_core::tx_execution::TxContractStoreErrorKind::Lock
+            ),
+            "mission.tx.write_failed"
+        );
+        assert_eq!(
+            tx_contract_store_mission_error_code(
+                frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress
+            ),
+            "mission.tx.write_failed"
+        );
     }
 
     #[test]
@@ -77446,7 +79171,9 @@ log_level = "debug"
         assert_eq!(defined_a["unblocks_count"], 1, "A unblocks B");
 
         // Ready set: B is blocked while A is open.
-        let ready = robot_work_ready_data(&db_path, None, 50, 0).ok().expect("ready");
+        let ready = robot_work_ready_data(&db_path, None, 50, 0)
+            .ok()
+            .expect("ready");
         assert_eq!(ready["total_blocked"], 1, "B blocked while A open");
 
         // The --label filter now finds B (was always 0 items before ft-tnew9).
@@ -77471,7 +79198,9 @@ log_level = "debug"
         );
 
         // Ready set: nothing blocked now that A is complete.
-        let ready2 = robot_work_ready_data(&db_path, None, 50, 0).ok().expect("ready2");
+        let ready2 = robot_work_ready_data(&db_path, None, 50, 0)
+            .ok()
+            .expect("ready2");
         assert_eq!(ready2["total_blocked"], 0, "B ready after A completes");
 
         let _ = std::fs::remove_file(&db);
@@ -83263,8 +84992,11 @@ A  docs/new-proof.md\n";
             .path()
             .join(".gemini/antigravity-cli/conversations");
         fs::create_dir_all(&conversations).expect("create conversations dir");
-        fs::write(conversations.join(format!("{conversation_id}.db")), b"SQLite fixture")
-            .expect("write db fixture");
+        fs::write(
+            conversations.join(format!("{conversation_id}.db")),
+            b"SQLite fixture",
+        )
+        .expect("write db fixture");
 
         let data = build_robot_session_resume_list_data(
             Some("agy".to_string()),
@@ -83274,7 +85006,10 @@ A  docs/new-proof.md\n";
         )
         .expect("agy listing should not require casr");
 
-        assert_eq!(data.schema_version, ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION);
+        assert_eq!(
+            data.schema_version,
+            ROBOT_SESSION_RESUME_LIST_SCHEMA_VERSION
+        );
         assert_eq!(data.provider_filter.as_deref(), Some("agy"));
         assert_eq!(data.count, 1);
         assert!(data.warnings.is_empty());

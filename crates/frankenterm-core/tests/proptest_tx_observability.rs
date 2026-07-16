@@ -34,14 +34,18 @@ fn make_test_plan(n_steps: usize) -> TxPlan {
 fn make_test_ledger(plan: &TxPlan) -> TxExecutionLedger {
     let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
     store.create_ledger("exec-001", plan).unwrap();
-    let ledger = store.get_ledger_mut("exec-001").unwrap();
-    ledger.transition_phase(TxPhase::Preparing).unwrap();
-    ledger.transition_phase(TxPhase::Committing).unwrap();
+    store
+        .transition_phase("exec-001", TxPhase::Preparing)
+        .unwrap();
+    store
+        .transition_phase("exec-001", TxPhase::Committing)
+        .unwrap();
     // Record one step
     if let Some(step) = plan.steps.first() {
         let key = IdempotencyKey::new(&plan.plan_id, &step.id, "exec");
-        ledger
-            .append(
+        store
+            .record_execution(
+                "exec-001",
                 key,
                 StepOutcome::Success {
                     result: Some("ok".into()),
@@ -52,22 +56,28 @@ fn make_test_ledger(plan: &TxPlan) -> TxExecutionLedger {
             )
             .unwrap();
     }
-    ledger.transition_phase(TxPhase::Aborted).unwrap();
+    store
+        .transition_phase("exec-001", TxPhase::Aborted)
+        .unwrap();
     store.archive_ledger("exec-001").unwrap()
 }
 
 fn make_populated_ledger(plan: &TxPlan, n_records: usize) -> TxExecutionLedger {
     let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
     store.create_ledger("exec-pop", plan).unwrap();
-    let ledger = store.get_ledger_mut("exec-pop").unwrap();
-    ledger.transition_phase(TxPhase::Preparing).unwrap();
-    ledger.transition_phase(TxPhase::Committing).unwrap();
+    store
+        .transition_phase("exec-pop", TxPhase::Preparing)
+        .unwrap();
+    store
+        .transition_phase("exec-pop", TxPhase::Committing)
+        .unwrap();
     let count = n_records.min(plan.steps.len());
     for (i, step) in plan.steps.iter().take(count).enumerate() {
         let key = IdempotencyKey::new(&plan.plan_id, &step.id, "exec");
         let ts = (i as u64 + 1) * 100;
-        ledger
-            .append(
+        store
+            .record_execution(
+                "exec-pop",
                 key,
                 StepOutcome::Success {
                     result: Some(format!("result-{}", i)),
@@ -78,7 +88,9 @@ fn make_populated_ledger(plan: &TxPlan, n_records: usize) -> TxExecutionLedger {
             )
             .unwrap();
     }
-    ledger.transition_phase(TxPhase::Aborted).unwrap();
+    store
+        .transition_phase("exec-pop", TxPhase::Aborted)
+        .unwrap();
     store.archive_ledger("exec-pop").unwrap()
 }
 

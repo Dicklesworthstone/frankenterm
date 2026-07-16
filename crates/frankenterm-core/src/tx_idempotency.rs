@@ -2,7 +2,7 @@
 //!
 //! Guarantees restart-safe idempotency and resume semantics across prepare/commit/compensation
 //! paths. Integrates with the tx plan compiler's [`TxPlan`] / [`TxStep`] types and uses
-//! content-addressed keys (FNV-1a) consistent with the plan hash scheme.
+//! collision-resistant, domain-separated content-addressed keys.
 //!
 //! # Key Components
 //!
@@ -14,11 +14,22 @@
 //! - [`ResumeContext`]: Reconstructs tx state from a persisted ledger for restart recovery.
 //! - [`IdempotencyPolicy`]: Configuration for key generation, dedup windows, and resume behavior.
 
+use cap_fs_ext::{
+    DirExt, FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt,
+};
+#[cfg(any(unix, windows))]
+use cap_std::fs::OpenOptionsExt as CapOpenOptionsExt;
+use cap_std::fs::{Dir, File as CapFile, OpenOptions as CapOpenOptions};
+use fs2::FileExt;
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::tx_plan_compiler::{StepRisk, TxPlan};
 
@@ -26,9 +37,11 @@ use crate::tx_plan_compiler::{StepRisk, TxPlan};
 
 /// Content-addressed idempotency key for a tx step execution.
 ///
-/// Generated deterministically from (plan_id, step_id, action_fingerprint) so that
-/// replaying the same plan produces the same keys. The FNV-1a scheme matches
-/// `tx_plan_compiler::compute_plan_hash` for consistency.
+/// Generated deterministically from (kind, plan_id, step_id, fingerprint) so
+/// replaying the same operation produces the same key. The persisted v2 format
+/// uses a domain-separated SHA-256 digest over length-delimited tuple
+/// components; delimiter placement and action/compensation namespaces therefore
+/// cannot alias distinct effects.
 ///
 /// # Persisted-key integrity (br-ft-f4vta)
 ///
@@ -36,60 +49,109 @@ use crate::tx_plan_compiler::{StepRisk, TxPlan};
 /// the serde boundary even though `key` is documented as derived
 /// from the other two plus an action fingerprint. The custom
 /// `Deserialize` impl below validates the wire-format of `key`
-/// (must be `txk:` + exactly 16 lowercase-hex characters), rejects
+/// (must be `txk:v2:` + exactly 64 lowercase-hex characters), rejects
 /// empty `plan_id` or `step_id`, AND re-derives the canonical hash
-/// from the persisted `(plan_id, step_id, hash_input)` tuple to
+/// from the persisted `(key_kind, plan_id, step_id, hash_input)` tuple to
 /// confirm it matches the persisted `key`. This catches the cross-
 /// step alias attack flagged by the bead body: a malformed ledger
 /// carrying a `txk:HASH` from step A while claiming `step_id = B`
 /// is rejected at deserialize time, before the forged form can
 /// reach dedup decisions or resume accounting.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IdempotencyKeyKind {
+    Action,
+    Compensation,
+}
+
+impl IdempotencyKeyKind {
+    const fn domain_tag(self) -> &'static [u8] {
+        match self {
+            Self::Action => b"action",
+            Self::Compensation => b"compensation",
+        }
+    }
+
+    const fn fingerprint_domain(self) -> &'static [u8] {
+        match self {
+            Self::Action => b"frankenterm.tx.action-fingerprint.v1",
+            Self::Compensation => b"frankenterm.tx.compensation-fingerprint.v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct IdempotencyKey {
-    /// The raw key string, format: `txk:{hash_hex}`.
+    /// The raw key string, format: `txk:v2:{sha256_hex}`.
     key: String,
     /// Plan ID this key belongs to.
     plan_id: String,
     /// Step ID within the plan.
     step_id: String,
-    /// br-ft-f4vta: the post-`plan_id|step_id|` segment of the
-    /// original FNV-1a hash input — i.e., the action fingerprint
-    /// for [`Self::new`] or `comp:{compensation_kind}` for
-    /// [`Self::for_compensation`]. Persisted so the custom
-    /// `Deserialize` impl can re-derive the canonical key and
-    /// verify the persisted form has not been tampered or aliased
-    /// from a different step.
+    /// Semantic namespace for the external effect. Action and compensation
+    /// keys must remain distinct even when caller-controlled fingerprints have
+    /// identical text.
+    key_kind: IdempotencyKeyKind,
+    /// SHA-256 digest of the caller-provided action fingerprint. Persisting the
+    /// digest instead of the raw preimage avoids retaining commands, action
+    /// arguments, or secrets in every durable ledger while still allowing the
+    /// custom `Deserialize` implementation to re-derive the canonical key.
     hash_input: String,
 }
 
 impl IdempotencyKey {
-    /// br-ft-f4vta: compute the canonical key string for
-    /// `(plan_id, step_id, hash_input)`. Single source of truth
-    /// used by both constructors and the deserialize validator.
-    fn compute_key(plan_id: &str, step_id: &str, hash_input: &str) -> String {
-        let hash = fnv1a_hash(&format!("{plan_id}|{step_id}|{hash_input}"));
-        format!("txk:{hash:016x}")
+    /// Compute the canonical v2 key from the complete persisted tuple.
+    fn compute_key(
+        key_kind: IdempotencyKeyKind,
+        plan_id: &str,
+        step_id: &str,
+        hash_input_digest: &str,
+    ) -> String {
+        format!(
+            "txk:v2:{}",
+            sha256_domain_digest(
+                b"frankenterm.tx.idempotency-key.v2",
+                &[
+                    key_kind.domain_tag(),
+                    plan_id.as_bytes(),
+                    step_id.as_bytes(),
+                    hash_input_digest.as_bytes(),
+                ],
+            )
+        )
+    }
+
+    fn compute_hash_input_digest(key_kind: IdempotencyKeyKind, hash_input: &str) -> String {
+        format!(
+            "sha256:{}",
+            sha256_domain_digest(key_kind.fingerprint_domain(), &[hash_input.as_bytes()])
+        )
     }
 
     /// Create a new idempotency key from plan + step + action content.
     #[must_use]
     pub fn new(plan_id: &str, step_id: &str, action_fingerprint: &str) -> Self {
+        let key_kind = IdempotencyKeyKind::Action;
+        let hash_input = Self::compute_hash_input_digest(key_kind, action_fingerprint);
         Self {
-            key: Self::compute_key(plan_id, step_id, action_fingerprint),
+            key: Self::compute_key(key_kind, plan_id, step_id, &hash_input),
             plan_id: plan_id.to_string(),
             step_id: step_id.to_string(),
-            hash_input: action_fingerprint.to_string(),
+            key_kind,
+            hash_input,
         }
     }
 
     /// Create a key for a compensation execution.
     #[must_use]
     pub fn for_compensation(plan_id: &str, step_id: &str, compensation_kind: &str) -> Self {
-        let hash_input = format!("comp:{compensation_kind}");
+        let key_kind = IdempotencyKeyKind::Compensation;
+        let hash_input = Self::compute_hash_input_digest(key_kind, compensation_kind);
         Self {
-            key: Self::compute_key(plan_id, step_id, &hash_input),
+            key: Self::compute_key(key_kind, plan_id, step_id, &hash_input),
             plan_id: plan_id.to_string(),
             step_id: step_id.to_string(),
+            key_kind,
             hash_input,
         }
     }
@@ -120,17 +182,25 @@ impl std::fmt::Display for IdempotencyKey {
 }
 
 /// br-ft-f4vta: validate that `raw` is a well-formed idempotency
-/// key string. Returns `true` iff `raw` starts with `"txk:"`
-/// followed by exactly 16 lowercase-hex characters — the format
-/// produced by `format!("txk:{:016x}", hash)` in `IdempotencyKey::new`
+/// key string. Returns `true` iff `raw` starts with `"txk:v2:"`
+/// followed by exactly 64 lowercase-hex characters — the format
+/// produced by [`IdempotencyKey::compute_key`]
 /// and `for_compensation`. Rejects any other shape (wrong prefix,
 /// uppercase hex, padding chars, length drift, embedded
 /// whitespace).
 fn is_well_formed_idempotency_key(raw: &str) -> bool {
-    let Some(hex) = raw.strip_prefix("txk:") else {
+    let Some(hex) = raw.strip_prefix("txk:v2:") else {
         return false;
     };
-    hex.len() == 16
+    is_lower_hex_digest(hex)
+}
+
+fn is_well_formed_hash_input_digest(raw: &str) -> bool {
+    raw.strip_prefix("sha256:").is_some_and(is_lower_hex_digest)
+}
+
+fn is_lower_hex_digest(hex: &str) -> bool {
+    hex.len() == 64
         && hex
             .chars()
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
@@ -146,6 +216,7 @@ struct IdempotencyKeyShape {
     key: String,
     plan_id: String,
     step_id: String,
+    key_kind: IdempotencyKeyKind,
     hash_input: String,
 }
 
@@ -157,7 +228,7 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
         let shape = IdempotencyKeyShape::deserialize(deserializer)?;
         if !is_well_formed_idempotency_key(&shape.key) {
             return Err(serde::de::Error::custom(format!(
-                "br-ft-f4vta: malformed IdempotencyKey raw key `{}`; expected format `txk:` + 16 lowercase hex chars",
+                "br-ft-f4vta: malformed IdempotencyKey raw key `{}`; expected format `txk:v2:` + 64 lowercase hex chars",
                 shape.key
             )));
         }
@@ -171,19 +242,28 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
                 "br-ft-f4vta: IdempotencyKey.step_id must not be empty",
             ));
         }
+        if !is_well_formed_hash_input_digest(&shape.hash_input) {
+            return Err(serde::de::Error::custom(
+                "br-ft-f4vta: IdempotencyKey.hash_input must be `sha256:` plus 64 lowercase hex chars",
+            ));
+        }
         // br-ft-f4vta cross-step alias check: re-derive the canonical
-        // key from the persisted (plan_id, step_id, hash_input) tuple
+        // key from the persisted (key_kind, plan_id, step_id, hash_input) tuple
         // and confirm it matches the persisted `key`. Pre-fix the
         // attacker could swap any of (key, plan_id, step_id) without
         // detection — the format check alone catches malformed wire-
         // format strings but not a valid `txk:HASH` aliased to the
         // wrong step's metadata.
-        let expected =
-            IdempotencyKey::compute_key(&shape.plan_id, &shape.step_id, &shape.hash_input);
+        let expected = IdempotencyKey::compute_key(
+            shape.key_kind,
+            &shape.plan_id,
+            &shape.step_id,
+            &shape.hash_input,
+        );
         if expected != shape.key {
             return Err(serde::de::Error::custom(format!(
                 "br-ft-f4vta: IdempotencyKey.key `{}` does not match \
-                 hash(plan_id|step_id|hash_input) — persisted form is \
+                 hash(length-delimited key_kind, plan_id, step_id, hash_input) — persisted form is \
                  forged or aliased from a different step (expected `{}`)",
                 shape.key, expected
             )));
@@ -192,6 +272,7 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
             key: shape.key,
             plan_id: shape.plan_id,
             step_id: shape.step_id,
+            key_kind: shape.key_kind,
             hash_input: shape.hash_input,
         })
     }
@@ -247,6 +328,29 @@ impl StepOutcome {
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
     }
+
+    /// Whether this outcome is durable replay proof that must not age out by
+    /// wall-clock TTL alone.
+    ///
+    /// `Pending` is an ambiguity marker: expiration could turn an uncertain
+    /// external dispatch into permission to dispatch again. Successful and
+    /// compensated effects likewise remain authoritative until bounded
+    /// capacity or an explicit reconciliation policy retires them. Failures
+    /// may expire to permit a deliberate retry with the same key.
+    #[must_use]
+    fn is_sticky_replay_proof(&self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Success { .. } | Self::Compensated { .. }
+        )
+    }
+
+    /// Whether the outcome is insufficient to prove whether an external
+    /// effect should be considered complete.
+    #[must_use]
+    fn is_ambiguous_replay_outcome(&self) -> bool {
+        matches!(self, Self::Pending | Self::Skipped { .. })
+    }
 }
 
 // ── Step Execution Record ────────────────────────────────────────────────────
@@ -272,14 +376,14 @@ pub struct StepExecutionRecord {
     pub outcome: StepOutcome,
     /// Risk level of the step (from the plan).
     pub risk: StepRisk,
-    /// FNV-1a hash of the previous record's canonical form (empty string for first).
+    /// SHA-256 hash of the previous record's canonical form (empty string for first).
     pub prev_hash: String,
     /// Agent that executed this step.
     pub agent_id: String,
 }
 
 impl StepExecutionRecord {
-    /// Compute the FNV-1a hash of this record's canonical form.
+    /// Compute a domain-separated SHA-256 hash of this record's canonical form.
     ///
     /// **Chain-integrity contract**: the hash is load-bearing for
     /// the idempotency-resume protocol's chain-of-records dedup.
@@ -314,28 +418,13 @@ impl StepExecutionRecord {
     /// hashes will diverge from the embedded `prev_hash` chain.
     #[must_use]
     pub fn hash(&self) -> String {
-        let outcome_json = serde_json::to_string(&self.outcome).expect(
-            "StepOutcome::serialize is infallible — the enum derives Serialize from \
-             primitive String/bool/Box fields; if this fires, a fallible-Serialize \
-             field was added (br-ft-jyywz follow-up)",
+        let canonical = serde_json::to_vec(self).expect(
+            "StepExecutionRecord serialization is infallible for its typed primitive fields",
         );
-        let risk_json = serde_json::to_string(&self.risk).expect(
-            "StepRisk::serialize is infallible — the enum derives Serialize from a \
-             unit-variant set with #[serde(rename_all = \"snake_case\")]; if this \
-             fires, a fallible-Serialize variant was added (br-ft-e9r75)",
-        );
-        let canonical = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
-            self.ordinal,
-            self.idem_key.as_str(),
-            self.execution_id,
-            self.timestamp_ms,
-            outcome_json,
-            risk_json,
-            self.agent_id,
-            self.prev_hash,
-        );
-        format!("{:016x}", fnv1a_hash(&canonical))
+        sha256_domain_digest(
+            b"frankenterm.tx.execution-record.v2",
+            &[canonical.as_slice()],
+        )
     }
 }
 
@@ -408,7 +497,7 @@ pub struct TxExecutionLedger {
     next_ordinal: u64,
     /// Index: idem_key → record ordinal for O(1) dedup lookup.
     #[serde(skip)]
-    key_index: HashMap<String, u64>,
+    key_index: HashMap<IdempotencyKey, u64>,
 }
 
 #[derive(Deserialize)]
@@ -422,11 +511,13 @@ struct TxExecutionLedgerSerde {
     next_ordinal: u64,
 }
 
-fn build_ledger_key_index(records: &[StepExecutionRecord]) -> Result<HashMap<String, u64>, String> {
+fn build_ledger_key_index(
+    records: &[StepExecutionRecord],
+) -> Result<HashMap<IdempotencyKey, u64>, String> {
     let mut key_index = HashMap::with_capacity(records.len());
 
     for record in records {
-        let key = record.idem_key.as_str().to_string();
+        let key = record.idem_key.clone();
         match key_index.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(record.ordinal);
@@ -451,6 +542,56 @@ impl<'de> Deserialize<'de> for TxExecutionLedger {
         D: Deserializer<'de>,
     {
         let serialized = TxExecutionLedgerSerde::deserialize(deserializer)?;
+        if !is_valid_execution_id(&serialized.execution_id) {
+            return Err(de::Error::custom(format!(
+                "TxExecutionLedger execution_id is unsafe or malformed: {:?}",
+                serialized.execution_id
+            )));
+        }
+        if serialized.plan_id.is_empty() {
+            return Err(de::Error::custom(
+                "TxExecutionLedger plan_id must not be empty",
+            ));
+        }
+        let mut timestamp_high_water = None;
+        for record in &serialized.records {
+            if record.execution_id != serialized.execution_id {
+                return Err(de::Error::custom(format!(
+                    "TxExecutionLedger record {} execution_id {:?} does not match ledger execution_id {:?}",
+                    record.ordinal, record.execution_id, serialized.execution_id
+                )));
+            }
+            if record.idem_key.plan_id() != serialized.plan_id {
+                return Err(de::Error::custom(format!(
+                    "TxExecutionLedger record {} idempotency plan_id {:?} does not match ledger plan_id {:?}",
+                    record.ordinal,
+                    record.idem_key.plan_id(),
+                    serialized.plan_id
+                )));
+            }
+            if let Some(previous) = timestamp_high_water
+                && record.timestamp_ms < previous
+            {
+                return Err(de::Error::custom(format!(
+                    "TxExecutionLedger record {} timestamp {} is below prior high-water {}",
+                    record.ordinal, record.timestamp_ms, previous
+                )));
+            }
+            timestamp_high_water = Some(record.timestamp_ms);
+        }
+        if serialized.phase.is_terminal() {
+            let ambiguous_ordinals: Vec<u64> = serialized
+                .records
+                .iter()
+                .filter(|record| record.outcome.is_ambiguous_replay_outcome())
+                .map(|record| record.ordinal)
+                .collect();
+            if !ambiguous_ordinals.is_empty() {
+                return Err(de::Error::custom(format!(
+                    "terminal TxExecutionLedger contains ambiguous Pending/Skipped records at ordinals {ambiguous_ordinals:?}"
+                )));
+            }
+        }
         let key_index = build_ledger_key_index(&serialized.records).map_err(de::Error::custom)?;
 
         // br-ft-ddm8k: validate trust-boundary invariants before
@@ -594,6 +735,20 @@ impl TxExecutionLedger {
                 to: next,
             });
         }
+        if next.is_terminal() {
+            let ambiguous_ordinals: Vec<u64> = self
+                .records
+                .iter()
+                .filter(|record| record.outcome.is_ambiguous_replay_outcome())
+                .map(|record| record.ordinal)
+                .collect();
+            if !ambiguous_ordinals.is_empty() {
+                return Err(IdempotencyError::AmbiguousTerminalTransition {
+                    execution_id: self.execution_id.clone(),
+                    ambiguous_ordinals,
+                });
+            }
+        }
         let prev = self.phase;
         self.phase = next;
         Ok(prev)
@@ -602,14 +757,14 @@ impl TxExecutionLedger {
     /// Check if a step has already been executed (dedup check).
     #[must_use]
     pub fn is_executed(&self, idem_key: &IdempotencyKey) -> bool {
-        self.key_index.contains_key(idem_key.as_str())
+        self.key_index.contains_key(idem_key)
     }
 
     /// Get the record for a previously executed step, if any.
     #[must_use]
     pub fn get_record(&self, idem_key: &IdempotencyKey) -> Option<&StepExecutionRecord> {
         self.key_index
-            .get(idem_key.as_str())
+            .get(idem_key)
             .and_then(|&ordinal| self.records.iter().find(|r| r.ordinal == ordinal))
     }
 
@@ -642,13 +797,30 @@ impl TxExecutionLedger {
         if self.phase.is_terminal() {
             return Err(IdempotencyError::LedgerSealed { phase: self.phase });
         }
+        if idem_key.plan_id() != self.plan_id {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "idempotency key plan_id {:?} does not match ledger plan_id {:?}",
+                    idem_key.plan_id(),
+                    self.plan_id
+                ),
+            });
+        }
+        if let Some(previous) = self.records.last()
+            && timestamp_ms < previous.timestamp_ms
+        {
+            return Err(IdempotencyError::RetrogradeTimestamp {
+                observed_ms: timestamp_ms,
+                high_water_ms: previous.timestamp_ms,
+            });
+        }
 
         if self.key_index.is_empty() && !self.records.is_empty() {
             self.rebuild_index_checked()
                 .map_err(|reason| IdempotencyError::LedgerIndexCorrupt { reason })?;
         }
 
-        if self.key_index.contains_key(idem_key.as_str()) {
+        if self.key_index.contains_key(&idem_key) {
             return Err(IdempotencyError::DuplicateExecution {
                 key: idem_key.as_str().to_string(),
             });
@@ -670,8 +842,7 @@ impl TxExecutionLedger {
 
         let record_hash = record.hash();
         self.last_hash.clone_from(&record_hash);
-        self.key_index
-            .insert(idem_key.as_str().to_string(), ordinal);
+        self.key_index.insert(idem_key, ordinal);
         self.records.push(record);
 
         Ok(record_hash)
@@ -699,14 +870,16 @@ impl TxExecutionLedger {
                 .map_err(|reason| IdempotencyError::LedgerIndexCorrupt { reason })?;
         }
 
-        let ordinal = *self.key_index.get(idem_key.as_str()).ok_or_else(|| {
-            IdempotencyError::LedgerIndexCorrupt {
-                reason: format!(
-                    "cannot complete unreserved idempotency key {}",
-                    idem_key.as_str()
-                ),
-            }
-        })?;
+        let ordinal =
+            *self
+                .key_index
+                .get(idem_key)
+                .ok_or_else(|| IdempotencyError::LedgerIndexCorrupt {
+                    reason: format!(
+                        "cannot complete unreserved idempotency key {}",
+                        idem_key.as_str()
+                    ),
+                })?;
         let index = self
             .records
             .iter()
@@ -722,6 +895,31 @@ impl TxExecutionLedger {
         if !self.records[index].outcome.is_pending() {
             return Err(IdempotencyError::DuplicateExecution {
                 key: idem_key.as_str().to_string(),
+            });
+        }
+        if outcome.is_ambiguous_replay_outcome() {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "a Pending reservation must complete with an unambiguous outcome"
+                    .to_string(),
+            });
+        }
+        let previous_timestamp = index
+            .checked_sub(1)
+            .and_then(|previous| self.records.get(previous))
+            .map(|record| record.timestamp_ms)
+            .unwrap_or(0);
+        let minimum_timestamp = previous_timestamp.max(self.records[index].timestamp_ms);
+        let next_timestamp = self
+            .records
+            .get(index + 1)
+            .map(|record| record.timestamp_ms);
+        if timestamp_ms < minimum_timestamp
+            || next_timestamp.is_some_and(|next| timestamp_ms > next)
+        {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "completion timestamp {timestamp_ms} would violate ledger timestamp order around ordinal {ordinal}"
+                ),
             });
         }
 
@@ -868,9 +1066,9 @@ pub struct DeduplicationGuard {
     /// Maximum number of entries to retain.
     capacity: usize,
     /// Map: idempotency key → (execution_id, outcome, timestamp_ms).
-    entries: BTreeMap<String, DeduplicationEntry>,
+    entries: BTreeMap<IdempotencyKey, DeduplicationEntry>,
     /// Oldest-to-newest record/update order for eviction.
-    order: VecDeque<String>,
+    order: VecDeque<IdempotencyKey>,
 }
 
 /// A single dedup entry.
@@ -895,7 +1093,7 @@ impl DeduplicationGuard {
     /// Check if a key has already been executed. Returns the cached outcome if so.
     #[must_use]
     pub fn check(&self, idem_key: &IdempotencyKey) -> Option<&DeduplicationEntry> {
-        self.entries.get(idem_key.as_str())
+        self.entries.get(idem_key)
     }
 
     fn latest_timestamp_ms(&self) -> Option<u64> {
@@ -910,15 +1108,15 @@ impl DeduplicationGuard {
         outcome: StepOutcome,
         timestamp_ms: u64,
     ) {
-        let key_str = idem_key.as_str().to_string();
+        let key = idem_key.clone();
 
         // If already present, update in place and refresh eviction order.
-        if let Some(entry) = self.entries.get_mut(&key_str) {
+        if let Some(entry) = self.entries.get_mut(&key) {
             entry.execution_id = execution_id.to_string();
             entry.outcome = outcome;
             entry.timestamp_ms = timestamp_ms;
-            self.order.retain(|existing| existing != &key_str);
-            self.order.push_back(key_str);
+            self.order.retain(|existing| existing != &key);
+            self.order.push_back(key);
             return;
         }
 
@@ -930,14 +1128,14 @@ impl DeduplicationGuard {
         }
 
         self.entries.insert(
-            key_str.clone(),
+            key.clone(),
             DeduplicationEntry {
                 execution_id: execution_id.to_string(),
                 outcome,
                 timestamp_ms,
             },
         );
-        self.order.push_back(key_str);
+        self.order.push_back(key);
     }
 
     /// Number of entries currently tracked.
@@ -960,15 +1158,15 @@ impl DeduplicationGuard {
 
     /// Evict entries older than the given timestamp.
     pub fn evict_before(&mut self, cutoff_ms: u64) {
-        let expired: Vec<String> = self
+        let expired: HashSet<IdempotencyKey> = self
             .entries
             .iter()
-            .filter(|(_, e)| e.timestamp_ms < cutoff_ms)
+            .filter(|(_, entry)| {
+                entry.timestamp_ms < cutoff_ms && !entry.outcome.is_sticky_replay_proof()
+            })
             .map(|(k, _)| k.clone())
             .collect();
-        for key in &expired {
-            self.entries.remove(key);
-        }
+        self.entries.retain(|key, _| !expired.contains(key));
         self.order.retain(|k| !expired.contains(k));
     }
 }
@@ -1048,6 +1246,10 @@ impl ResumeContext {
             .filter(|r| matches!(r.outcome, StepOutcome::Compensated { .. }))
             .map(|r| r.idem_key.step_id().to_string())
             .collect();
+        let has_ambiguous_outcome = ledger
+            .records()
+            .iter()
+            .any(|record| record.outcome.is_ambiguous_replay_outcome());
         let remaining = if failed.is_empty() {
             plan.steps
                 .iter()
@@ -1063,6 +1265,8 @@ impl ResumeContext {
 
         let recommendation = if policy.require_chain_integrity && !verification.chain_intact {
             ResumeRecommendation::RestartFresh
+        } else if has_ambiguous_outcome {
+            ResumeRecommendation::CompensateAndAbort
         } else if ledger.phase().is_terminal() {
             ResumeRecommendation::AlreadyComplete
         } else if !failed.is_empty() {
@@ -1097,6 +1301,143 @@ impl ResumeContext {
 
 // ── Idempotency Store ────────────────────────────────────────────────────────
 
+/// Exclusive cross-process lease for one idempotency key.
+///
+/// The backing file lock is released when this value is dropped. Durable tx
+/// engines must keep the reservation alive from the post-lock dedup decision,
+/// through the durable `Pending` write and external dispatch, until the
+/// terminal outcome has been durably completed.
+#[derive(Debug)]
+pub struct IdempotencyReservation {
+    idem_key: String,
+    execution_id: String,
+    observed_outcome: Option<StepOutcome>,
+    pending_recorded: bool,
+    key_lock_dir: Arc<Dir>,
+    key_lock_name: PathBuf,
+    // Fields drop in declaration order. Release the execution lock first while
+    // the key lease is still held, preserving the key-then-execution lifecycle
+    // through the final instant of reservation ownership.
+    execution_lock: ExecutionLedgerLock,
+    _lock_file: File,
+}
+
+impl IdempotencyReservation {
+    /// Durable outcome observed while holding the key's exclusive lock.
+    ///
+    /// `None` permits a new Pending append only when the target execution does
+    /// not already contain this key (normally a freshly-created retry
+    /// execution). Per-ledger key uniqueness still rejects an expired retry in
+    /// the original execution. `Some(Pending)` is an ambiguous predecessor and
+    /// must fail closed; other outcomes must be interpreted by the tx engine's
+    /// semantic replay rules before it decides whether to dispatch.
+    #[must_use]
+    pub fn observed_outcome(&self) -> Option<&StepOutcome> {
+        self.observed_outcome.as_ref()
+    }
+
+    /// Whether this lease authorizes mutation for `idem_key`.
+    #[must_use]
+    pub fn authorizes(&self, idem_key: &IdempotencyKey) -> bool {
+        self.idem_key == idem_key.as_str()
+    }
+}
+
+/// Exclusive cross-process lock for one execution ledger.
+///
+/// Durable lock order is always idempotency-key lock first, execution lock
+/// second. Operations that do not hold a key lock (create, phase transition,
+/// archive, abort) take only the execution lock. This prevents different-key
+/// writers from publishing stale whole-ledger snapshots over each other.
+#[derive(Debug)]
+struct ExecutionLedgerLock {
+    execution_id: String,
+    spool_dir: Arc<Dir>,
+    spool_display: PathBuf,
+    lock_dir: Arc<Dir>,
+    lock_name: PathBuf,
+    _lock_file: File,
+}
+
+/// A verified durable ledger together with the exact filesystem object that
+/// supplied its bytes. Keeping the handle alive until publication prevents
+/// inode reuse from making a different leaf look like the ledger that the
+/// mutation actually authorized.
+struct LockedDurableLedger {
+    ledger: TxExecutionLedger,
+    pinned_file: CapFile,
+}
+
+#[derive(Debug, Clone)]
+struct DurableOutcomeObservation {
+    timestamp_ms: u64,
+    execution_id: String,
+    ordinal: u64,
+    outcome: StepOutcome,
+}
+
+fn select_authoritative_durable_outcome(
+    idem_key: &IdempotencyKey,
+    mut observations: Vec<DurableOutcomeObservation>,
+) -> Result<Option<DurableOutcomeObservation>, IdempotencyError> {
+    observations.sort_unstable_by(|left, right| {
+        left.timestamp_ms
+            .cmp(&right.timestamp_ms)
+            .then_with(|| left.execution_id.cmp(&right.execution_id))
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+
+    let mut sticky: Option<DurableOutcomeObservation> = None;
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.outcome.is_sticky_replay_proof())
+    {
+        if let Some(existing) = &sticky
+            && existing.outcome != observation.outcome
+        {
+            return Err(IdempotencyError::LedgerIndexCorrupt {
+                reason: format!(
+                    "conflicting sticky durable outcomes for key {idem_key}: {:?} in execution {} and {:?} in execution {}",
+                    existing.outcome,
+                    existing.execution_id,
+                    observation.outcome,
+                    observation.execution_id
+                ),
+            });
+        }
+        sticky = Some(observation.clone());
+    }
+
+    // Pending, Success, and Compensated are durable safety facts. A later
+    // retry failure must never downgrade them into permission to dispatch.
+    // When no sticky fact exists, the newest failure/skipped observation is
+    // the authoritative retry state.
+    Ok(sticky.or_else(|| observations.pop()))
+}
+
+/// Capability bundle rooted at the caller-declared stable control-plane
+/// anchor. The caller must identity-gate that parent (normally the pinned
+/// workspace `.ft` directory) before construction. Replacing the anchor's own
+/// namespace is outside this store's same-UID threat boundary; every
+/// descendant operation here is relative to the pinned capabilities. A ledger
+/// replacement revalidates the open destination identity immediately before
+/// rename, but POSIX exposes no capability-relative compare-and-swap rename;
+/// a same-UID actor swapping that exact leaf in the final check-to-rename
+/// interval is therefore also outside the noninterference guarantee.
+#[derive(Debug)]
+struct DurableSpool {
+    parent_dir: Arc<Dir>,
+    dir: Arc<Dir>,
+    execution_lock_dir: Arc<Dir>,
+    key_lock_dir: Arc<Dir>,
+    /// Preflighted directory handle used to make ledger namespace mutations
+    /// durable on supported Unix-like platforms. Windows store acquisition
+    /// fails closed until capability-relative write-through rename exists;
+    /// directory `FlushFileBuffers` is not a documented durability primitive.
+    sync_file: File,
+    display_path: PathBuf,
+}
+
 /// Cross-instance idempotency store that tracks execution across multiple tx runs.
 ///
 /// Provides the core dedup + resume API surface.
@@ -1108,12 +1449,795 @@ pub struct IdempotencyStore {
     dedup: DeduplicationGuard,
     /// Policy configuration.
     policy: IdempotencyPolicy,
-    /// On-disk durability sink (ft-iz1ki). When `Some`, every ledger
-    /// mutation (create/record) is flushed to `<dir>/<execution_id>.json`
-    /// before the operation returns, so a crash-restart can reload the
-    /// committed ledgers and dedup already-dispatched steps. `None` keeps
-    /// the legacy in-memory, single-process behavior.
-    persist_dir: Option<PathBuf>,
+    /// On-disk durability sink (ft-iz1ki). The open directory capabilities
+    /// pin the filesystem objects selected at construction time; the display
+    /// path is diagnostics-only and is never re-resolved for I/O.
+    durable_spool: Option<DurableSpool>,
+    #[cfg(test)]
+    fail_persist_writes: bool,
+}
+
+const TX_LEDGER_DIR_NAME: &str = "tx_ledgers";
+const EXECUTION_LOCK_DIR_NAME: &str = "execution_locks";
+const KEY_LOCK_DIR_NAME: &str = "key_locks";
+/// Maximum serialized size accepted for one durable execution ledger. Reads
+/// use a `MAX + 1` limited reader so a hostile valid-named spool entry cannot
+/// drive unbounded allocation before validation fails closed.
+const MAX_DURABLE_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
+
+#[cfg(unix)]
+fn metadata_identity(metadata: &impl CapMetadataExt) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+fn open_or_create_dir_nofollow(
+    parent: &Dir,
+    name: &str,
+    display_path: &Path,
+) -> Result<Dir, IdempotencyError> {
+    match parent.create_dir(name) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!("create durable directory {}: {err}", display_path.display()),
+            });
+        }
+    }
+    parent
+        .open_dir_nofollow(name)
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "open durable directory {} without following symlinks: {err}",
+                display_path.display()
+            ),
+        })
+}
+
+fn validate_pinned_dir_entry(
+    parent: &Dir,
+    name: &str,
+    pinned: &Dir,
+    display_path: &Path,
+) -> Result<(), IdempotencyError> {
+    let current =
+        parent
+            .open_dir_nofollow(name)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "validate pinned durable directory {} without following symlinks: {err}",
+                    display_path.display()
+                ),
+            })?;
+    let current_metadata =
+        current
+            .dir_metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect current durable directory {}: {err}",
+                    display_path.display()
+                ),
+            })?;
+    let pinned_metadata = pinned
+        .dir_metadata()
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "inspect pinned durable directory {}: {err}",
+                display_path.display()
+            ),
+        })?;
+    #[cfg(windows)]
+    let _ = (&current_metadata, &pinned_metadata);
+    #[cfg(unix)]
+    if metadata_identity(&current_metadata) != metadata_identity(&pinned_metadata) {
+        return Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "durable directory namespace entry {} no longer names the pinned filesystem object",
+                display_path.display()
+            ),
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(IdempotencyError::LedgerPersist {
+        reason: format!(
+            "durable directory identity validation is unsupported for {} on this platform",
+            display_path.display()
+        ),
+    });
+    // On Windows cap-std directory handles are deliberately opened without
+    // FILE_SHARE_DELETE. While `pinned` is alive the directory entry cannot be
+    // renamed or replaced, avoiding the truncated 64-bit ReFS file-id issue in
+    // metadata-based comparisons.
+    Ok(())
+}
+
+impl DurableSpool {
+    fn display(&self, relative: &Path) -> PathBuf {
+        self.display_path.join(relative)
+    }
+
+    fn validate_namespace(&self) -> Result<(), IdempotencyError> {
+        validate_pinned_dir_entry(
+            &self.parent_dir,
+            TX_LEDGER_DIR_NAME,
+            &self.dir,
+            &self.display_path,
+        )?;
+        validate_pinned_dir_entry(
+            &self.dir,
+            EXECUTION_LOCK_DIR_NAME,
+            &self.execution_lock_dir,
+            &self.display_path.join(EXECUTION_LOCK_DIR_NAME),
+        )?;
+        validate_pinned_dir_entry(
+            &self.dir,
+            KEY_LOCK_DIR_NAME,
+            &self.key_lock_dir,
+            &self.display_path.join(KEY_LOCK_DIR_NAME),
+        )
+    }
+}
+
+fn nofollow_open_options(read: bool, write: bool) -> CapOpenOptions {
+    let mut options = CapOpenOptions::new();
+    options.read(read).write(write);
+    options.follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.nonblock(true);
+    options
+}
+
+fn lock_open_options() -> CapOpenOptions {
+    let mut options = nofollow_open_options(true, true);
+    options.create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    #[cfg(windows)]
+    options.share_mode(0x0000_0001 | 0x0000_0002);
+    options
+}
+
+fn validate_regular_file(
+    is_file: bool,
+    link_count: u64,
+    display_path: &Path,
+) -> Result<(), IdempotencyError> {
+    if !is_file {
+        return Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "durable leaf {} is not a regular file",
+                display_path.display()
+            ),
+        });
+    }
+    if link_count != 1 {
+        return Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "durable leaf {} has {} hard links; exactly one is required",
+                display_path.display(),
+                link_count
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_open_regular_file(
+    metadata: &cap_std::fs::Metadata,
+    display_path: &Path,
+) -> Result<(), IdempotencyError> {
+    validate_regular_file(metadata.is_file(), metadata.nlink(), display_path)
+}
+
+fn validate_std_open_regular_file(
+    metadata: &std::fs::Metadata,
+    display_path: &Path,
+) -> Result<(), IdempotencyError> {
+    validate_regular_file(metadata.is_file(), metadata.nlink(), display_path)
+}
+
+fn open_regular_nofollow(
+    dir: &Dir,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<CapFile, IdempotencyError> {
+    let options = nofollow_open_options(true, false);
+    let file =
+        dir.open_with(relative, &options)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "open durable leaf {} without following symlinks: {err}",
+                    display_path.display()
+                ),
+            })?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!("inspect durable leaf {}: {err}", display_path.display()),
+        })?;
+    validate_open_regular_file(&metadata, display_path)?;
+    Ok(file)
+}
+
+fn read_regular_nofollow(
+    dir: &Dir,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Vec<u8>, IdempotencyError> {
+    let mut file = open_regular_nofollow(dir, relative, display_path)?;
+    read_bounded_ledger(&mut file, display_path)
+}
+
+fn read_bounded_ledger(
+    reader: &mut impl Read,
+    display_path: &Path,
+) -> Result<Vec<u8>, IdempotencyError> {
+    let mut contents = Vec::new();
+    reader
+        .take(MAX_DURABLE_LEDGER_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!("read durable leaf {}: {err}", display_path.display()),
+        })?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > MAX_DURABLE_LEDGER_BYTES {
+        return Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "durable ledger {} exceeds the {} byte safety limit",
+                display_path.display(),
+                MAX_DURABLE_LEDGER_BYTES
+            ),
+        });
+    }
+    Ok(contents)
+}
+
+fn validate_pinned_file_entry(
+    dir: &Dir,
+    relative: &Path,
+    held_file: &File,
+    display_path: &Path,
+) -> Result<(), IdempotencyError> {
+    let current = open_regular_nofollow(dir, relative, display_path)?;
+    let current_metadata = current
+        .metadata()
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "inspect current durable leaf {}: {err}",
+                display_path.display()
+            ),
+        })?;
+    let held_metadata = held_file
+        .metadata()
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "inspect pinned durable leaf {}: {err}",
+                display_path.display()
+            ),
+        })?;
+    validate_std_open_regular_file(&held_metadata, display_path)?;
+    #[cfg(windows)]
+    let _ = &current_metadata;
+    #[cfg(unix)]
+    if metadata_identity(&current_metadata) != metadata_identity(&held_metadata) {
+        return Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "durable leaf namespace entry {} no longer names the pinned filesystem object",
+                display_path.display()
+            ),
+        });
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(IdempotencyError::LedgerPersist {
+        reason: format!(
+            "durable leaf identity validation is unsupported for {} on this platform",
+            display_path.display()
+        ),
+    });
+    // Windows lock handles are opened without FILE_SHARE_DELETE by
+    // `lock_open_options`, so a held lock leaf cannot be renamed or replaced.
+    Ok(())
+}
+
+fn retain_failed_ledger_temp(
+    temp_file: CapFile,
+    spool: &DurableSpool,
+    temp_name: &Path,
+    action: &str,
+    error: &dyn std::fmt::Display,
+) -> IdempotencyError {
+    let file_sync_error = temp_file.sync_all().err();
+    drop(temp_file);
+    let directory_sync_error = sync_ledger_parent(spool).err();
+    let retention = if file_sync_error.is_none() && directory_sync_error.is_none() {
+        format!(
+            "recovery artifact name durably retained in the pinned spool as {} (last-known path {}); contents may be partial",
+            temp_name.display(),
+            spool.display(temp_name).display()
+        )
+    } else {
+        let file_detail = file_sync_error.map_or_else(String::new, |sync_error| {
+            format!("; file sync failed: {sync_error}")
+        });
+        let directory_detail = directory_sync_error.map_or_else(String::new, |sync_error| {
+            format!("; directory sync failed: {sync_error}")
+        });
+        format!(
+            "best-effort recovery artifact may remain in the pinned spool as {} (last-known path {}), but durability was not confirmed{file_detail}{directory_detail}",
+            temp_name.display(),
+            spool.display(temp_name).display()
+        )
+    };
+    IdempotencyError::LedgerPersist {
+        reason: format!("{action}: {error}; {retention}"),
+    }
+}
+
+fn open_directory_sync_file(dir: &Dir, display_path: &Path) -> Result<File, IdempotencyError> {
+    #[cfg(not(windows))]
+    let file =
+        dir.try_clone()
+            .map(Dir::into_std_file)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "clone pinned directory {} for synchronization: {err}",
+                    display_path.display()
+                ),
+            })?;
+
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        return Err(windows_durable_rename_unsupported(display_path));
+    }
+
+    #[cfg(not(windows))]
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_durable_rename_unsupported(display_path: &Path) -> IdempotencyError {
+    IdempotencyError::LedgerPersist {
+        reason: format!(
+            "durable idempotency rename is unsupported on Windows for {} until a capability-relative MOVEFILE_WRITE_THROUGH publication primitive is available",
+            display_path.display()
+        ),
+    }
+}
+
+fn ensure_durable_rename_supported(display_path: &Path) -> Result<(), IdempotencyError> {
+    #[cfg(windows)]
+    {
+        Err(windows_durable_rename_unsupported(display_path))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = display_path;
+        Ok(())
+    }
+}
+
+fn sync_ledger_parent(spool: &DurableSpool) -> std::io::Result<()> {
+    spool.sync_file.sync_all()
+}
+
+fn sync_pinned_directory(
+    dir: &Dir,
+    display_path: &Path,
+    action: &str,
+) -> Result<(), IdempotencyError> {
+    open_directory_sync_file(dir, display_path)?
+        .sync_all()
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "{action} by synchronizing pinned directory {}: {err}",
+                display_path.display()
+            ),
+        })
+}
+
+fn create_ledger_temp(spool: &DurableSpool) -> Result<(PathBuf, CapFile), IdempotencyError> {
+    for _ in 0..128 {
+        let temp_name = PathBuf::from(format!(
+            ".tx-ledger-{:032x}.recovery.tmp",
+            rand::random::<u128>()
+        ));
+        let mut options = nofollow_open_options(true, true);
+        options.create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match spool.dir.open_with(&temp_name, &options) {
+            Ok(file) => {
+                let metadata = file
+                    .metadata()
+                    .map_err(|err| IdempotencyError::LedgerPersist {
+                        reason: format!(
+                            "inspect ledger recovery file {}: {err}",
+                            spool.display(&temp_name).display()
+                        ),
+                    })?;
+                validate_open_regular_file(&metadata, &spool.display(&temp_name))?;
+                return Ok((temp_name, file));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "create ledger recovery file in pinned spool {}: {err}",
+                        spool.display_path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Err(IdempotencyError::LedgerPersist {
+        reason: format!(
+            "could not allocate a unique ledger recovery file in pinned spool {} after 128 attempts",
+            spool.display_path.display()
+        ),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum LedgerPersistMode<'a> {
+    Create,
+    Replace { expected_file: &'a CapFile },
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Deterministic seam for exercising the otherwise tiny interval between
+    /// the live locked read and the immediate pre-rename identity check.
+    static LEDGER_PRE_REPLACE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct LedgerPreReplaceTestHookGuard;
+
+#[cfg(test)]
+impl Drop for LedgerPreReplaceTestHookGuard {
+    fn drop(&mut self) {
+        LEDGER_PRE_REPLACE_TEST_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn set_ledger_pre_replace_test_hook(
+    hook: impl FnOnce() + 'static,
+) -> LedgerPreReplaceTestHookGuard {
+    LEDGER_PRE_REPLACE_TEST_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+    LedgerPreReplaceTestHookGuard
+}
+
+#[cfg(test)]
+fn run_ledger_pre_replace_test_hook() {
+    let hook = LEDGER_PRE_REPLACE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+fn validate_ledger_replacement_target(
+    spool: &DurableSpool,
+    final_name: &Path,
+    expected_file: &CapFile,
+    final_display: &Path,
+) -> Result<CapFile, IdempotencyError> {
+    // Revalidate the complete pinned namespace immediately before resolving
+    // the destination leaf. A failure here must precede the rename so the
+    // synchronized recovery artifact can be retained without touching an
+    // untrusted destination.
+    spool.validate_namespace()?;
+    let current_file = open_regular_nofollow(&spool.dir, final_name, final_display)?;
+    let current_metadata =
+        current_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect current ledger replacement target {}: {err}",
+                    final_display.display()
+                ),
+            })?;
+    let expected_metadata =
+        expected_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect pinned ledger replacement source {}: {err}",
+                    final_display.display()
+                ),
+            })?;
+    validate_open_regular_file(&expected_metadata, final_display)?;
+
+    #[cfg(unix)]
+    {
+        if metadata_identity(&current_metadata) != metadata_identity(&expected_metadata) {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "ledger replacement target {} no longer names the exact filesystem object read under the execution lock",
+                    final_display.display()
+                ),
+            });
+        }
+        Ok(current_file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (&current_metadata, &expected_metadata);
+        Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "exact ledger replacement identity validation is unsupported for {} on this platform",
+                final_display.display()
+            ),
+        })
+    }
+}
+
+fn persist_ledger_bytes(
+    spool: &DurableSpool,
+    final_name: &Path,
+    bytes: &[u8],
+    mode: LedgerPersistMode<'_>,
+) -> Result<(), IdempotencyError> {
+    spool.validate_namespace()?;
+    let final_display = spool.display(final_name);
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_DURABLE_LEDGER_BYTES {
+        return Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "refusing to persist ledger {} above the {} byte safety limit",
+                final_display.display(),
+                MAX_DURABLE_LEDGER_BYTES
+            ),
+        });
+    }
+    let existing_permissions = match mode {
+        LedgerPersistMode::Create => match spool.dir.symlink_metadata(final_name) {
+            Ok(metadata) if metadata.file_type().is_symlink() => None,
+            Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => {
+                Some(metadata.permissions())
+            }
+            Ok(metadata) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "inspect existing ledger permissions on {}: expected a single-link regular file, got type {:?} with {} links",
+                        final_display.display(),
+                        metadata.file_type(),
+                        metadata.nlink()
+                    ),
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "inspect existing ledger permissions on {}: {err}",
+                        final_display.display()
+                    ),
+                });
+            }
+        },
+        LedgerPersistMode::Replace { expected_file } => {
+            let metadata =
+                expected_file
+                    .metadata()
+                    .map_err(|err| IdempotencyError::LedgerPersist {
+                        reason: format!(
+                            "inspect pinned ledger permissions on {}: {err}",
+                            final_display.display()
+                        ),
+                    })?;
+            validate_open_regular_file(&metadata, &final_display)?;
+            Some(metadata.permissions())
+        }
+    };
+
+    let (temp_name, mut temp_file) = create_ledger_temp(spool)?;
+    let temp_display = spool.display(&temp_name);
+    if let Some(permissions) = existing_permissions {
+        if let Err(err) = temp_file.set_permissions(permissions) {
+            return Err(retain_failed_ledger_temp(
+                temp_file,
+                spool,
+                &temp_name,
+                &format!("preserve ledger permissions on {}", temp_display.display()),
+                &err,
+            ));
+        }
+    }
+    if let Err(err) = temp_file.write_all(bytes) {
+        return Err(retain_failed_ledger_temp(
+            temp_file,
+            spool,
+            &temp_name,
+            &format!("write ledger recovery file {}", temp_display.display()),
+            &err,
+        ));
+    }
+    if let Err(err) = temp_file.sync_all() {
+        return Err(retain_failed_ledger_temp(
+            temp_file,
+            spool,
+            &temp_name,
+            &format!("sync ledger recovery file {}", temp_display.display()),
+            &err,
+        ));
+    }
+
+    match mode {
+        LedgerPersistMode::Create => {
+            if let Err(error) = spool.dir.hard_link(&temp_name, &spool.dir, final_name) {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    drop(temp_file);
+                    if let Err(cleanup_error) = spool.dir.remove_file(&temp_name) {
+                        let directory_sync_error = sync_ledger_parent(spool).err();
+                        return Err(IdempotencyError::LedgerPersist {
+                            reason: format!(
+                                "ledger {} already exists, but collision recovery artifact {} could not be removed: {cleanup_error}{}",
+                                final_display.display(),
+                                temp_display.display(),
+                                directory_sync_error.map_or_else(String::new, |sync_error| format!(
+                                    "; additionally failed to synchronize pinned spool: {sync_error}"
+                                ))
+                            ),
+                        });
+                    }
+                    sync_ledger_parent(spool).map_err(|sync_error| {
+                        IdempotencyError::LedgerPersist {
+                            reason: format!(
+                                "ledger {} already exists and collision recovery artifact {} was removed, but pinned spool cleanup could not be synchronized: {sync_error}",
+                                final_display.display(),
+                                temp_display.display()
+                            ),
+                        }
+                    })?;
+                    spool.validate_namespace()?;
+                    let execution_id = final_name
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map_or_else(|| final_display.display().to_string(), ToString::to_string);
+                    return Err(IdempotencyError::DuplicateExecution { key: execution_id });
+                }
+                return Err(retain_failed_ledger_temp(
+                    temp_file,
+                    spool,
+                    &temp_name,
+                    &format!(
+                        "atomically create ledger {} from {}",
+                        final_display.display(),
+                        temp_display.display()
+                    ),
+                    &error,
+                ));
+            }
+            if let Err(error) = spool.dir.remove_file(&temp_name) {
+                let sync_error = sync_ledger_parent(spool).err();
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "ledger {} was created without clobbering, but recovery link {} could not be removed: {error}{}",
+                        final_display.display(),
+                        temp_display.display(),
+                        sync_error.map_or_else(String::new, |sync_error| format!(
+                            "; additionally failed to synchronize pinned spool: {sync_error}"
+                        ))
+                    ),
+                });
+            }
+        }
+        LedgerPersistMode::Replace { expected_file } => {
+            #[cfg(test)]
+            run_ledger_pre_replace_test_hook();
+            let current_file = match validate_ledger_replacement_target(
+                spool,
+                final_name,
+                expected_file,
+                &final_display,
+            ) {
+                Ok(current_file) => current_file,
+                Err(error) => {
+                    return Err(retain_failed_ledger_temp(
+                        temp_file,
+                        spool,
+                        &temp_name,
+                        &format!(
+                            "refuse to replace ledger {} from {} after destination identity changed",
+                            final_display.display(),
+                            temp_display.display()
+                        ),
+                        &error,
+                    ));
+                }
+            };
+            if let Err(error) = spool.dir.rename(&temp_name, &spool.dir, final_name) {
+                return Err(retain_failed_ledger_temp(
+                    temp_file,
+                    spool,
+                    &temp_name,
+                    &format!(
+                        "atomically replace ledger {} from {}",
+                        final_display.display(),
+                        temp_display.display()
+                    ),
+                    &error,
+                ));
+            }
+            drop(current_file);
+        }
+    }
+
+    // The namespace mutation is already externally visible. Synchronize its
+    // containing directory before any later fallible verification so every
+    // post-publication error leaves the create/replace durability state known.
+    sync_ledger_parent(spool).map_err(|err| IdempotencyError::LedgerPersist {
+        reason: format!(
+            "ledger {} was published, but pinned spool directory {} could not be synchronized: {err}",
+            final_display.display(),
+            spool.display_path.display()
+        ),
+    })?;
+    spool.validate_namespace()?;
+
+    let persisted = open_regular_nofollow(&spool.dir, final_name, &final_display)?;
+    #[cfg(unix)]
+    let persisted_metadata =
+        persisted
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect published ledger {}: {err}",
+                    final_display.display()
+                ),
+            })?;
+    #[cfg(unix)]
+    let temp_metadata = temp_file
+        .metadata()
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "inspect source handle for published ledger {}: {err}",
+                final_display.display()
+            ),
+        })?;
+    #[cfg(unix)]
+    if metadata_identity(&persisted_metadata) != metadata_identity(&temp_metadata) {
+        return Err(IdempotencyError::LedgerPersist {
+            reason: format!(
+                "published ledger {} no longer names the synchronized temporary filesystem object",
+                final_display.display()
+            ),
+        });
+    }
+    #[cfg(windows)]
+    {
+        // Windows ReFS file identifiers are 128-bit while the metadata APIs
+        // exposed by cap-fs-ext are only 64-bit. Verify the bytes through the
+        // nofollow-opened destination instead of treating a truncated ID as
+        // authoritative.
+        let mut persisted_reader = &persisted;
+        let persisted_bytes = read_bounded_ledger(&mut persisted_reader, &final_display)?;
+        if persisted_bytes != bytes {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "published ledger {} does not contain the synchronized bytes",
+                    final_display.display()
+                ),
+            });
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(IdempotencyError::LedgerPersist {
+        reason: format!(
+            "published ledger identity validation is unsupported for {} on this platform",
+            final_display.display()
+        ),
+    });
+    drop(persisted);
+    drop(temp_file);
+    spool.validate_namespace()?;
+
+    Ok(())
 }
 
 impl IdempotencyStore {
@@ -1124,106 +2248,734 @@ impl IdempotencyStore {
             ledgers: HashMap::new(),
             dedup: DeduplicationGuard::new(policy.dedup_capacity),
             policy,
-            persist_dir: None,
+            durable_spool: None,
+            #[cfg(test)]
+            fail_persist_writes: false,
         }
     }
 
-    /// ft-iz1ki: open a *durable* idempotency store rooted at the workspace
-    /// `.ft` directory. Ledgers are persisted under `<ft_dir>/tx_ledgers/` and
-    /// the most-recent ones are reloaded so a restarted `tx run` dedups steps
-    /// that a prior (possibly crashed) run already committed — closing the
-    /// "crash re-dispatches committed side effects" gap.
+    /// Whether this store is backed by the durable ledger spool.
     ///
-    /// Reload is bounded to `max_active_ledgers - 1` files (most recent by
-    /// execution-id, which encodes the run timestamp) so a long-lived spool
-    /// can never starve `create_ledger` of its active-ledger budget. Files
-    /// that fail to parse are skipped (a single corrupt ledger must not block
-    /// startup); the durable spool is append-only audit history.
+    /// Transaction execution, rollback, and recovery paths that can cause
+    /// external effects must require `true`; an in-memory store cannot provide
+    /// restart or cross-process idempotency.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.durable_spool.is_some()
+    }
+
+    fn durable_spool(&self) -> Result<&DurableSpool, IdempotencyError> {
+        let spool = self
+            .durable_spool
+            .as_ref()
+            .ok_or(IdempotencyError::DurableReservationRequired)?;
+        spool.validate_namespace()?;
+        Ok(spool)
+    }
+
+    fn durable_spool_for_write(&self) -> Result<&DurableSpool, IdempotencyError> {
+        #[cfg(test)]
+        if self.fail_persist_writes {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: "simulated durable ledger persistence failure".to_string(),
+            });
+        }
+        self.durable_spool()
+    }
+
+    fn acquire_execution_lock(
+        &self,
+        execution_id: &str,
+    ) -> Result<ExecutionLedgerLock, IdempotencyError> {
+        if !is_valid_execution_id(execution_id) {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!("unsafe execution_id for execution lock: {execution_id:?}"),
+            });
+        }
+        let spool = self.durable_spool()?;
+        let lock_name = PathBuf::from(format!("{execution_id}.lock"));
+        let lock_relative = Path::new(EXECUTION_LOCK_DIR_NAME).join(&lock_name);
+        let lock_display = spool.display(&lock_relative);
+        let options = lock_open_options();
+        let lock_file = spool
+            .execution_lock_dir
+            .open_with(&lock_name, &options)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "open execution lock {} for {execution_id} without following symlinks: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        let metadata = lock_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!("inspect execution lock {}: {err}", lock_display.display()),
+            })?;
+        validate_open_regular_file(&metadata, &lock_display)?;
+        let lock_file = lock_file.into_std();
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(IdempotencyError::ExecutionMutationInProgress {
+                    execution_id: execution_id.to_string(),
+                });
+            }
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "acquire execution lock {} for {execution_id}: {err}",
+                        lock_display.display()
+                    ),
+                });
+            }
+        }
+        validate_pinned_file_entry(
+            &spool.execution_lock_dir,
+            &lock_name,
+            &lock_file,
+            &lock_display,
+        )?;
+        Ok(ExecutionLedgerLock {
+            execution_id: execution_id.to_string(),
+            spool_dir: Arc::clone(&spool.dir),
+            spool_display: spool.display_path.clone(),
+            lock_dir: Arc::clone(&spool.execution_lock_dir),
+            lock_name,
+            _lock_file: lock_file,
+        })
+    }
+
+    fn validate_execution_lock(
+        &self,
+        execution_lock: &ExecutionLedgerLock,
+        execution_id: &str,
+    ) -> Result<(), IdempotencyError> {
+        if execution_lock.execution_id != execution_id {
+            return Err(IdempotencyError::ReservationExecutionMismatch {
+                reserved: execution_lock.execution_id.clone(),
+                attempted: execution_id.to_string(),
+            });
+        }
+        let spool = self.durable_spool()?;
+        if !Arc::ptr_eq(&spool.dir, &execution_lock.spool_dir)
+            || !Arc::ptr_eq(&spool.execution_lock_dir, &execution_lock.lock_dir)
+        {
+            return Err(IdempotencyError::ReservationStoreMismatch {
+                reserved_spool: execution_lock.spool_display.display().to_string(),
+                attempted_spool: spool.display_path.display().to_string(),
+            });
+        }
+        let lock_relative = Path::new(EXECUTION_LOCK_DIR_NAME).join(&execution_lock.lock_name);
+        validate_pinned_file_entry(
+            &execution_lock.lock_dir,
+            &execution_lock.lock_name,
+            &execution_lock._lock_file,
+            &spool.display(&lock_relative),
+        )?;
+        Ok(())
+    }
+
+    fn read_durable_ledger_locked(
+        &self,
+        execution_lock: &ExecutionLedgerLock,
+    ) -> Result<LockedDurableLedger, IdempotencyError> {
+        self.validate_execution_lock(execution_lock, &execution_lock.execution_id)?;
+        let spool = self.durable_spool()?;
+        let ledger_name = PathBuf::from(format!("{}.json", execution_lock.execution_id));
+        let ledger_display = spool.display(&ledger_name);
+        let options = nofollow_open_options(true, false);
+        let mut ledger_file = spool.dir.open_with(&ledger_name, &options).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                IdempotencyError::LedgerNotFound {
+                    execution_id: execution_lock.execution_id.clone(),
+                }
+            } else {
+                IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "open locked ledger {} without following symlinks: {err}",
+                        ledger_display.display()
+                    ),
+                }
+            }
+        })?;
+        let metadata = ledger_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!("inspect locked ledger {}: {err}", ledger_display.display()),
+            })?;
+        validate_open_regular_file(&metadata, &ledger_display)?;
+        let contents = read_bounded_ledger(&mut ledger_file, &ledger_display)?;
+        let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
+            IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "deserialize locked ledger {}: {err}",
+                    ledger_display.display()
+                ),
+            }
+        })?;
+        if ledger.execution_id() != execution_lock.execution_id {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "locked ledger identity mismatch for {}: expected {:?}, got {:?}",
+                    ledger_display.display(),
+                    execution_lock.execution_id,
+                    ledger.execution_id()
+                ),
+            });
+        }
+        let verification = ledger.verify_chain();
+        if !verification.chain_intact {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "verify locked ledger hash chain for {}: first_break_at={:?}, missing_ordinals={:?}",
+                    ledger_display.display(),
+                    verification.first_break_at,
+                    verification.missing_ordinals
+                ),
+            });
+        }
+        Ok(LockedDurableLedger {
+            ledger,
+            pinned_file: ledger_file,
+        })
+    }
+
+    /// ft-iz1ki: open a *durable* idempotency store rooted at the workspace
+    /// `.ft` directory. Ledgers are persisted under `<ft_dir>/tx_ledgers/`.
+    /// Every verified ledger contributes its records to the bounded global
+    /// replay index, while only nonterminal ledgers remain active for resume.
+    ///
+    /// Every valid-named ledger file is read, deserialized, and hash-chain
+    /// verified before startup succeeds. Corruption fails closed: silently
+    /// omitting a committed ledger would make replay treat its side effects as
+    /// unrecorded and could dispatch them twice. Records are replayed into the
+    /// bounded dedup guard in deterministic `(timestamp, execution_id,
+    /// ordinal, key)` order, oldest first, so capacity eviction retains the
+    /// newest proofs. Terminal ledgers remain durable spool evidence but do
+    /// not consume active capacity. Every nonterminal ledger is reloaded; if
+    /// their count exceeds `max_active_ledgers`, startup fails closed rather
+    /// than silently discarding resumable state.
     ///
     /// # Errors
     /// Returns [`IdempotencyError::LedgerPersist`] if the spool directory
-    /// cannot be created or listed.
+    /// cannot be created or listed, or if any valid-named ledger cannot be
+    /// read, deserialized, identity-checked, or hash-chain verified.
     pub fn open(ft_dir: &Path, policy: IdempotencyPolicy) -> Result<Self, IdempotencyError> {
-        let dir = ft_dir.join("tx_ledgers");
-        std::fs::create_dir_all(&dir).map_err(|err| IdempotencyError::LedgerPersist {
-            reason: format!("create tx_ledgers dir {}: {err}", dir.display()),
+        ensure_durable_rename_supported(ft_dir)?;
+        let leaf_name = ft_dir
+            .file_name()
+            .ok_or_else(|| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "durable idempotency parent {} has no final path component",
+                    ft_dir.display()
+                ),
+            })?;
+        let ambient_parent_path = ft_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let ambient_parent = Dir::open_ambient_dir(
+            ambient_parent_path,
+            cap_std::ambient_authority(),
+        )
+        .map_err(|err| IdempotencyError::LedgerPersist {
+            reason: format!(
+                "bind parent directory {} before opening durable idempotency anchor {}: {err}",
+                ambient_parent_path.display(),
+                ft_dir.display()
+            ),
         })?;
+        match ambient_parent.create_dir(leaf_name) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "create durable idempotency anchor {}: {err}",
+                        ft_dir.display()
+                    ),
+                });
+            }
+        }
+        let parent = ambient_parent.open_dir_nofollow(leaf_name).map_err(|err| {
+            IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "bind durable idempotency anchor {} without following its final component: {err}",
+                    ft_dir.display()
+                ),
+            }
+        })?;
+        Self::open_in_pinned_dir(parent, ft_dir.to_path_buf(), policy)
+    }
+
+    /// Open a durable store beneath an already-pinned workspace control
+    /// directory. The supplied parent is the caller-declared stable
+    /// control-plane anchor (normally `<workspace_root>/.ft`) and must already
+    /// have passed the caller's workspace identity gates. Replacing that
+    /// anchor's own namespace is outside this store's same-UID threat boundary.
+    /// Descendant ledger leaves are identity-checked immediately before atomic
+    /// replacement, but a same-UID swap of the exact destination leaf in the
+    /// final check-to-rename interval remains outside the guarantee because the
+    /// platform does not provide a capability-relative compare-and-swap rename.
+    /// `parent_display` is used only for diagnostics; all listing, reads,
+    /// locks, publication, and directory synchronization are relative to
+    /// `parent` and the descendant capabilities opened here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyError::LedgerPersist`] when the pinned namespace
+    /// cannot be initialized or any durable ledger fails closed validation.
+    pub(crate) fn open_in_pinned_dir(
+        parent: Dir,
+        parent_display: PathBuf,
+        policy: IdempotencyPolicy,
+    ) -> Result<Self, IdempotencyError> {
+        ensure_durable_rename_supported(&parent_display)?;
+        let spool_display = parent_display.join(TX_LEDGER_DIR_NAME);
+        let spool_dir = open_or_create_dir_nofollow(&parent, TX_LEDGER_DIR_NAME, &spool_display)?;
+        sync_pinned_directory(
+            &parent,
+            &parent_display,
+            "persist tx_ledgers namespace entry",
+        )?;
+        let execution_lock_dir = open_or_create_dir_nofollow(
+            &spool_dir,
+            EXECUTION_LOCK_DIR_NAME,
+            &spool_display.join(EXECUTION_LOCK_DIR_NAME),
+        )?;
+        let key_lock_dir = open_or_create_dir_nofollow(
+            &spool_dir,
+            KEY_LOCK_DIR_NAME,
+            &spool_display.join(KEY_LOCK_DIR_NAME),
+        )?;
+        let spool_sync_file = open_directory_sync_file(&spool_dir, &spool_display)?;
+        spool_sync_file
+            .sync_all()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "persist durable lock namespace entries by synchronizing pinned directory {}: {err}",
+                    spool_display.display()
+                ),
+            })?;
 
         let mut store = Self {
             ledgers: HashMap::new(),
             dedup: DeduplicationGuard::new(policy.dedup_capacity),
-            persist_dir: Some(dir.clone()),
             policy,
+            durable_spool: Some(DurableSpool {
+                parent_dir: Arc::new(parent),
+                dir: Arc::new(spool_dir),
+                execution_lock_dir: Arc::new(execution_lock_dir),
+                key_lock_dir: Arc::new(key_lock_dir),
+                sync_file: spool_sync_file,
+                display_path: spool_display,
+            }),
+            #[cfg(test)]
+            fail_persist_writes: false,
         };
+        let spool = store.durable_spool()?;
 
-        // Collect candidate ledger files, newest-first by file stem
-        // (execution_id `txe-<ms>` sorts chronologically within an era).
-        let mut stems: Vec<String> = Vec::new();
-        let entries = std::fs::read_dir(&dir).map_err(|err| IdempotencyError::LedgerPersist {
-            reason: format!("read tx_ledgers dir {}: {err}", dir.display()),
-        })?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json")
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        // Filename order is used only to make validation/error reporting
+        // deterministic. Dedup recency is determined by authenticated record
+        // timestamps below, never by an execution-id naming convention.
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+        let entries = spool
+            .dir
+            .entries()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "list pinned tx_ledgers directory {}: {err}",
+                    spool.display_path.display()
+                ),
+            })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "read entry in pinned tx_ledgers directory {}: {err}",
+                    spool.display_path.display()
+                ),
+            })?;
+            let name = PathBuf::from(entry.file_name());
+            if name.extension().and_then(|extension| extension.to_str()) == Some("json")
+                && let Some(stem) = name.file_stem().and_then(|stem| stem.to_str())
                 && is_valid_execution_id(stem)
             {
-                stems.push(stem.to_string());
+                candidates.push((stem.to_string(), name));
             }
         }
-        stems.sort_unstable();
-        stems.reverse();
-        let budget = store.policy.max_active_ledgers.saturating_sub(1).max(1);
+        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut verified_ledgers = Vec::with_capacity(candidates.len());
 
-        for stem in stems.into_iter().take(budget) {
-            let path = dir.join(format!("{stem}.json"));
-            let Ok(contents) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(ledger) = serde_json::from_str::<TxExecutionLedger>(&contents) else {
-                continue;
-            };
-            store
-                .ledgers
-                .insert(ledger.execution_id().to_string(), ledger);
+        for (stem, name) in candidates {
+            let display_path = spool.display(&name);
+            let contents =
+                read_regular_nofollow(&spool.dir, &name, &display_path).map_err(|error| {
+                    IdempotencyError::LedgerPersist {
+                        reason: format!("read ledger {}: {error}", display_path.display()),
+                    }
+                })?;
+            let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
+                IdempotencyError::LedgerPersist {
+                    reason: format!("deserialize ledger {}: {err}", display_path.display()),
+                }
+            })?;
+            if ledger.execution_id() != stem {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "ledger identity mismatch for {}: filename execution_id {stem:?}, payload execution_id {:?}",
+                        display_path.display(),
+                        ledger.execution_id()
+                    ),
+                });
+            }
+            let verification = ledger.verify_chain();
+            if !verification.chain_intact {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "verify ledger hash chain for {}: first_break_at={:?}, missing_ordinals={:?}",
+                        display_path.display(),
+                        verification.first_break_at,
+                        verification.missing_ordinals
+                    ),
+                });
+            }
+            verified_ledgers.push((stem, ledger));
+        }
+
+        let active_count = verified_ledgers
+            .iter()
+            .filter(|(_, ledger)| !ledger.phase().is_terminal())
+            .count();
+        if active_count > store.policy.max_active_ledgers {
+            return Err(IdempotencyError::ActiveLedgerLimitExceeded {
+                max_active_ledgers: store.policy.max_active_ledgers,
+            });
+        }
+
+        // Rebuild replay proof independently of active-ledger retention. Group
+        // by the complete authenticated key so a later failure cannot erase a
+        // prior Pending/Success/Compensated fact. Contradictory sticky facts
+        // fail startup closed instead of depending on timestamp or HashMap
+        // iteration order.
+        let mut replay_records: BTreeMap<IdempotencyKey, Vec<DurableOutcomeObservation>> =
+            BTreeMap::new();
+        for (execution_id, ledger) in &verified_ledgers {
+            for record in ledger.records() {
+                replay_records
+                    .entry(record.idem_key.clone())
+                    .or_default()
+                    .push(DurableOutcomeObservation {
+                        timestamp_ms: record.timestamp_ms,
+                        execution_id: execution_id.clone(),
+                        ordinal: record.ordinal,
+                        outcome: record.outcome.clone(),
+                    });
+            }
+        }
+        let mut authoritative_records = Vec::with_capacity(replay_records.len());
+        for (idem_key, observations) in replay_records {
+            if let Some(authoritative) =
+                select_authoritative_durable_outcome(&idem_key, observations)?
+            {
+                authoritative_records.push((idem_key, authoritative));
+            }
+        }
+        authoritative_records.sort_unstable_by(|(left_key, left), (right_key, right)| {
+            left.timestamp_ms
+                .cmp(&right.timestamp_ms)
+                .then_with(|| left.execution_id.cmp(&right.execution_id))
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        for (idem_key, authoritative) in authoritative_records {
+            store.dedup.record(
+                &idem_key,
+                &authoritative.execution_id,
+                authoritative.outcome,
+                authoritative.timestamp_ms,
+            );
+        }
+
+        for (execution_id, ledger) in verified_ledgers {
+            if !ledger.phase().is_terminal() {
+                store.ledgers.insert(execution_id, ledger);
+            }
         }
 
         Ok(store)
     }
 
-    /// Flush a single ledger to the durable spool (no-op when in-memory).
-    fn persist_ledger(&self, execution_id: &str) -> Result<(), IdempotencyError> {
-        let Some(dir) = &self.persist_dir else {
-            return Ok(());
+    /// Acquire the exclusive durable lease for an idempotency key and refresh
+    /// that key's outcome from the live spool while the lease is held.
+    ///
+    /// The refresh is load-bearing. A process may have opened its store before
+    /// another process completed the same key; taking the OS lock without
+    /// rereading durable state would still allow the stale process to dispatch
+    /// after the first lock holder exits. `now_ms` is the caller's logical
+    /// dispatch time. It is checked against both the local and durable spool
+    /// high-water marks before it can expire a retryable failure or skip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyError::DurableReservationRequired`] for an
+    /// in-memory store, [`IdempotencyError::ReservationInProgress`] when
+    /// another process currently owns the key,
+    /// [`IdempotencyError::RetrogradeTimestamp`] when `now_ms` is behind the
+    /// local or durable spool high-water mark, or
+    /// [`IdempotencyError::LedgerPersist`] when the lock or live-spool refresh
+    /// cannot be completed safely.
+    pub fn acquire_durable_reservation(
+        &mut self,
+        execution_id: &str,
+        idem_key: &IdempotencyKey,
+        now_ms: u64,
+    ) -> Result<IdempotencyReservation, IdempotencyError> {
+        self.validate_monotonic_timestamp(now_ms)?;
+        let (key_lock_dir, spool_display) = {
+            let spool = self.durable_spool()?;
+            (Arc::clone(&spool.key_lock_dir), spool.display_path.clone())
         };
+        let key_hash = idem_key
+            .as_str()
+            .strip_prefix("txk:v2:")
+            .expect("IdempotencyKey constructors/deserializer enforce txk:v2 prefix");
+        let lock_name = PathBuf::from(format!("{key_hash}.lock"));
+        let lock_display = spool_display.join(KEY_LOCK_DIR_NAME).join(&lock_name);
+        let options = lock_open_options();
+        let lock_file = key_lock_dir
+            .open_with(&lock_name, &options)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "open idempotency key lock {} for {} without following symlinks: {err}",
+                    lock_display.display(),
+                    idem_key.as_str()
+                ),
+            })?;
+        let metadata = lock_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect idempotency key lock {}: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        validate_open_regular_file(&metadata, &lock_display)?;
+        let lock_file = lock_file.into_std();
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(IdempotencyError::ReservationInProgress {
+                    key: idem_key.as_str().to_string(),
+                });
+            }
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "acquire idempotency key lock {} for {}: {err}",
+                        lock_display.display(),
+                        idem_key.as_str()
+                    ),
+                });
+            }
+        }
+        validate_pinned_file_entry(&key_lock_dir, &lock_name, &lock_file, &lock_display)?;
+
+        // Lock order is key then execution. Holding both through Pending,
+        // dispatch, and terminal completion serializes whole-ledger writers and
+        // prevents an abort/archive process from sealing this execution while
+        // an external effect is in flight.
+        let execution_lock = self.acquire_execution_lock(execution_id)?;
+        let current = self.read_durable_ledger_locked(&execution_lock)?;
+        if current.ledger.phase().is_terminal() {
+            return Err(IdempotencyError::LedgerSealed {
+                phase: current.ledger.phase(),
+            });
+        }
+        self.ledgers
+            .insert(execution_id.to_string(), current.ledger);
+
+        // Keep both files alive before refreshing: any error below drops them
+        // and releases the OS locks, while success transfers ownership to the
+        // reservation returned to the caller.
+        let observed_outcome = self.refresh_durable_outcome_for_key(idem_key, now_ms)?;
+        Ok(IdempotencyReservation {
+            idem_key: idem_key.as_str().to_string(),
+            execution_id: execution_id.to_string(),
+            observed_outcome,
+            pending_recorded: false,
+            key_lock_dir,
+            key_lock_name: lock_name,
+            execution_lock,
+            _lock_file: lock_file,
+        })
+    }
+
+    fn refresh_durable_outcome_for_key(
+        &mut self,
+        idem_key: &IdempotencyKey,
+        now_ms: u64,
+    ) -> Result<Option<StepOutcome>, IdempotencyError> {
+        let spool = self.durable_spool()?;
+        let entries = spool
+            .dir
+            .entries()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "list pinned tx_ledgers directory {} during key refresh: {err}",
+                    spool.display_path.display()
+                ),
+            })?;
+        let mut matching_records = Vec::new();
+        let mut durable_high_water_ms = 0;
+        for entry in entries {
+            let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "read entry in pinned tx_ledgers directory {}: {err}",
+                    spool.display_path.display()
+                ),
+            })?;
+            let name = PathBuf::from(entry.file_name());
+            if name.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = name.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if !is_valid_execution_id(stem) {
+                continue;
+            }
+            let display_path = spool.display(&name);
+            let contents = read_regular_nofollow(&spool.dir, &name, &display_path)?;
+            let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
+                IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "deserialize ledger {} during key refresh: {err}",
+                        display_path.display()
+                    ),
+                }
+            })?;
+            if ledger.execution_id() != stem {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "ledger identity mismatch for {} during key refresh: filename execution_id {stem:?}, payload execution_id {:?}",
+                        display_path.display(),
+                        ledger.execution_id()
+                    ),
+                });
+            }
+            let verification = ledger.verify_chain();
+            if !verification.chain_intact {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "verify ledger hash chain for {} during key refresh: first_break_at={:?}, missing_ordinals={:?}",
+                        display_path.display(),
+                        verification.first_break_at,
+                        verification.missing_ordinals
+                    ),
+                });
+            }
+            durable_high_water_ms = durable_high_water_ms.max(
+                ledger
+                    .records()
+                    .iter()
+                    .map(|record| record.timestamp_ms)
+                    .max()
+                    .unwrap_or(0),
+            );
+            if let Some(record) = ledger.get_record(idem_key) {
+                matching_records.push(DurableOutcomeObservation {
+                    timestamp_ms: record.timestamp_ms,
+                    execution_id: stem.to_string(),
+                    ordinal: record.ordinal,
+                    outcome: record.outcome.clone(),
+                });
+            }
+        }
+
+        if now_ms < durable_high_water_ms {
+            return Err(IdempotencyError::RetrogradeTimestamp {
+                observed_ms: now_ms,
+                high_water_ms: durable_high_water_ms,
+            });
+        }
+
+        let Some(authoritative) = select_authoritative_durable_outcome(idem_key, matching_records)?
+        else {
+            return Ok(None);
+        };
+        if !self.is_fresh_for_dedup(&authoritative.outcome, authoritative.timestamp_ms, now_ms) {
+            return Ok(None);
+        }
+        self.dedup.record(
+            idem_key,
+            &authoritative.execution_id,
+            authoritative.outcome.clone(),
+            authoritative.timestamp_ms,
+        );
+        Ok(Some(authoritative.outcome))
+    }
+
+    /// Flush an explicit ledger snapshot to the durable spool (no-op when
+    /// in-memory). Durable replacement requires the still-open file handle from
+    /// the mutation's locked live read, so a substituted leaf cannot be
+    /// mistaken for the object that was authorized. Taking the snapshot by
+    /// reference lets compound mutations use copy-on-write: publish to disk
+    /// first, then install the same state in the in-memory map only after
+    /// persistence succeeds.
+    fn persist_ledger_snapshot(
+        &self,
+        ledger: &TxExecutionLedger,
+        expected_file: Option<&CapFile>,
+    ) -> Result<(), IdempotencyError> {
+        if self.durable_spool.is_none() {
+            return Ok(());
+        }
+        let spool = self.durable_spool_for_write()?;
+        let execution_id = ledger.execution_id();
         if !is_valid_execution_id(execution_id) {
             return Err(IdempotencyError::LedgerPersist {
                 reason: format!("unsafe execution_id for ledger filename: {execution_id:?}"),
             });
         }
-        let Some(ledger) = self.ledgers.get(execution_id) else {
-            return Ok(());
-        };
-        let json = serde_json::to_string_pretty(ledger).map_err(|err| {
-            IdempotencyError::LedgerPersist {
+        let json =
+            serde_json::to_vec_pretty(ledger).map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!("serialize ledger {execution_id}: {err}"),
-            }
-        })?;
-        let final_path = dir.join(format!("{execution_id}.json"));
-        let tmp_path = dir.join(format!("{execution_id}.json.tmp"));
-        std::fs::write(&tmp_path, json.as_bytes()).map_err(|err| {
-            IdempotencyError::LedgerPersist {
-                reason: format!("write {}: {err}", tmp_path.display()),
-            }
-        })?;
-        std::fs::rename(&tmp_path, &final_path).map_err(|err| IdempotencyError::LedgerPersist {
+            })?;
+        let final_name = PathBuf::from(format!("{execution_id}.json"));
+        let expected_file = expected_file.ok_or_else(|| IdempotencyError::LedgerPersist {
             reason: format!(
-                "rename {} -> {}: {err}",
-                tmp_path.display(),
-                final_path.display()
+                "refusing to replace durable ledger {execution_id} without the exact file handle used by its locked live read"
             ),
         })?;
-        Ok(())
+        persist_ledger_bytes(
+            spool,
+            &final_name,
+            &json,
+            LedgerPersistMode::Replace { expected_file },
+        )
+    }
+
+    fn persist_new_ledger_snapshot(
+        &self,
+        ledger: &TxExecutionLedger,
+    ) -> Result<(), IdempotencyError> {
+        let spool = self.durable_spool_for_write()?;
+        let execution_id = ledger.execution_id();
+        if !is_valid_execution_id(execution_id) {
+            return Err(IdempotencyError::LedgerPersist {
+                reason: format!("unsafe execution_id for ledger filename: {execution_id:?}"),
+            });
+        }
+        let json =
+            serde_json::to_vec_pretty(ledger).map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!("serialize new ledger {execution_id}: {err}"),
+            })?;
+        persist_ledger_bytes(
+            spool,
+            &PathBuf::from(format!("{execution_id}.json")),
+            &json,
+            LedgerPersistMode::Create,
+        )
     }
 
     /// Create a new ledger for a tx execution. Returns error if execution ID already exists.
@@ -1232,6 +2984,11 @@ impl IdempotencyStore {
         execution_id: &str,
         plan: &TxPlan,
     ) -> Result<(), IdempotencyError> {
+        let execution_lock = if self.is_durable() {
+            Some(self.acquire_execution_lock(execution_id)?)
+        } else {
+            None
+        };
         if self.ledgers.contains_key(execution_id) {
             return Err(IdempotencyError::DuplicateExecution {
                 key: execution_id.to_string(),
@@ -1243,10 +3000,16 @@ impl IdempotencyStore {
             });
         }
         let ledger = TxExecutionLedger::new(execution_id, &plan.plan_id, plan.plan_hash);
-        self.ledgers.insert(execution_id.to_string(), ledger);
         // ft-iz1ki: durably record the freshly-created ledger so a crash
         // before the first step still leaves a recoverable execution record.
-        self.persist_ledger(execution_id)?;
+        // Publish before installing the active value so a persistence failure
+        // leaves no half-created in-memory execution behind.
+        if execution_lock.is_some() {
+            self.persist_new_ledger_snapshot(&ledger)?;
+        } else {
+            self.persist_ledger_snapshot(&ledger, None)?;
+        }
+        self.ledgers.insert(execution_id.to_string(), ledger);
         Ok(())
     }
 
@@ -1256,27 +3019,88 @@ impl IdempotencyStore {
         self.ledgers.get(execution_id)
     }
 
-    /// Get a mutable reference to a ledger.
-    #[must_use]
-    pub fn get_ledger_mut(&mut self, execution_id: &str) -> Option<&mut TxExecutionLedger> {
-        self.ledgers.get_mut(execution_id)
+    /// Transition a tracked ledger and durably publish the new phase.
+    ///
+    /// The transition is copy-on-write: the candidate ledger is validated and
+    /// atomically persisted before it replaces the in-memory value. A failed
+    /// validation or write therefore leaves the previously visible phase
+    /// unchanged. In-memory stores still use the same API, with persistence as
+    /// a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyError::LedgerNotFound`] when `execution_id` is not
+    /// tracked, [`IdempotencyError::InvalidPhaseTransition`] when `next` is not
+    /// reachable from the current phase, or [`IdempotencyError::LedgerPersist`]
+    /// when the durable snapshot cannot be published.
+    pub fn transition_phase(
+        &mut self,
+        execution_id: &str,
+        next: TxPhase,
+    ) -> Result<TxPhase, IdempotencyError> {
+        let execution_lock = if self.is_durable() {
+            Some(self.acquire_execution_lock(execution_id)?)
+        } else {
+            None
+        };
+        let (mut candidate, pinned_file) = if let Some(lock) = &execution_lock {
+            let locked = self.read_durable_ledger_locked(lock)?;
+            (locked.ledger, Some(locked.pinned_file))
+        } else {
+            (
+                self.ledgers.get(execution_id).cloned().ok_or_else(|| {
+                    IdempotencyError::LedgerNotFound {
+                        execution_id: execution_id.to_string(),
+                    }
+                })?,
+                None,
+            )
+        };
+        let previous = candidate.transition_phase(next)?;
+        self.persist_ledger_snapshot(&candidate, pinned_file.as_ref())?;
+        self.ledgers.insert(execution_id.to_string(), candidate);
+        Ok(previous)
     }
 
-    /// Execute-or-skip: check dedup, and if already done, return cached outcome.
-    /// Otherwise return `None` so the caller knows to execute.
+    /// Get a mutable reference to a ledger.
+    ///
+    /// This escape hatch is intentionally unavailable for durable stores:
+    /// mutating a stale in-memory snapshot would bypass execution locking and
+    /// could overwrite another process's proof. Durable callers must use the
+    /// explicit mutation APIs.
     #[must_use]
-    pub fn check_dedup(&self, idem_key: &IdempotencyKey) -> Option<&StepOutcome> {
-        let now_ms = self.logical_clock_ms();
+    pub fn get_ledger_mut(&mut self, execution_id: &str) -> Option<&mut TxExecutionLedger> {
+        if self.is_durable() {
+            None
+        } else {
+            self.ledgers.get_mut(execution_id)
+        }
+    }
+
+    /// Peek at the bounded in-memory cache for an outcome that is fresh at
+    /// `now_ms`.
+    ///
+    /// This method is advisory only. In a durable store it neither acquires the
+    /// cross-process key lease nor refreshes the live spool, so `None` never
+    /// authorizes an external effect. Effectful callers must use
+    /// [`Self::acquire_durable_reservation`] and inspect the outcome observed
+    /// while that reservation is held.
+    #[must_use]
+    pub fn peek_cached_outcome(
+        &self,
+        idem_key: &IdempotencyKey,
+        now_ms: u64,
+    ) -> Option<&StepOutcome> {
         // Check the global dedup guard first (cross-instance).
         if let Some(entry) = self.dedup.check(idem_key) {
-            if self.is_fresh_for_dedup(entry.timestamp_ms, now_ms) {
+            if self.is_fresh_for_dedup(&entry.outcome, entry.timestamp_ms, now_ms) {
                 return Some(&entry.outcome);
             }
         }
         // Check all active ledgers.
         for ledger in self.ledgers.values() {
             if let Some(record) = ledger.get_record(idem_key) {
-                if self.is_fresh_for_dedup(record.timestamp_ms, now_ms) {
+                if self.is_fresh_for_dedup(&record.outcome, record.timestamp_ms, now_ms) {
                     return Some(&record.outcome);
                 }
             }
@@ -1284,7 +3108,12 @@ impl IdempotencyStore {
         None
     }
 
-    /// Record a step execution in a ledger and in the global dedup guard.
+    /// Record a step execution in an in-memory ledger and dedup guard.
+    ///
+    /// Durable callers must use [`Self::record_execution_reserved`] before an
+    /// external dispatch, or [`Self::record_recovered_execution`] when linking
+    /// an already-proven sticky outcome into a recovery ledger. Allowing this
+    /// unchecked API on a durable store would make the key lease optional.
     pub fn record_execution(
         &mut self,
         execution_id: &str,
@@ -1294,14 +3123,19 @@ impl IdempotencyStore {
         agent_id: &str,
         timestamp_ms: u64,
     ) -> Result<String, IdempotencyError> {
-        let ledger =
-            self.ledgers
-                .get_mut(execution_id)
-                .ok_or_else(|| IdempotencyError::LedgerNotFound {
-                    execution_id: execution_id.to_string(),
-                })?;
+        if self.is_durable() {
+            return Err(IdempotencyError::DurableMutationRequiresReservation {
+                operation: "record_execution".to_string(),
+            });
+        }
+        let mut candidate = self.ledgers.get(execution_id).cloned().ok_or_else(|| {
+            IdempotencyError::LedgerNotFound {
+                execution_id: execution_id.to_string(),
+            }
+        })?;
+        self.validate_monotonic_timestamp(timestamp_ms)?;
 
-        let hash = ledger.append(
+        let hash = candidate.append(
             idem_key.clone(),
             outcome.clone(),
             risk,
@@ -1309,25 +3143,139 @@ impl IdempotencyStore {
             timestamp_ms,
         )?;
 
-        self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
+        // Persist the candidate before publishing either the in-memory ledger
+        // or the global dedup entry. A failed write therefore cannot make this
+        // process believe a reservation/outcome exists when restart cannot
+        // prove it.
+        self.persist_ledger_snapshot(&candidate, None)?;
 
-        // Also record in the global dedup guard.
+        self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
         self.dedup
             .record(&idem_key, execution_id, outcome, timestamp_ms);
-
-        // ft-iz1ki: flush the updated ledger BEFORE returning, so the
-        // committed step is durable. execute_with_store calls this per
-        // commit/compensation step; a fail-closed persist error aborts the tx
-        // (mapped to TxExecutionError::LedgerWrite) rather than letting a
-        // non-durable commit proceed.
-        self.persist_ledger(execution_id)?;
+        self.ledgers.insert(execution_id.to_string(), candidate);
 
         Ok(hash)
     }
 
-    /// Complete a durable pending reservation created before side-effect
-    /// dispatch, then refresh the cross-instance dedup guard and persistence
-    /// spool with the terminal outcome.
+    /// Durably reserve a key while its cross-process lease is held.
+    ///
+    /// Durable tx engines should use this wrapper instead of
+    /// [`Self::record_execution`] for the pre-dispatch `Pending` record. It
+    /// binds the mutation to the exact locked key and refuses to overwrite an
+    /// outcome observed by the live-spool refresh performed during lease
+    /// acquisition.
+    pub fn record_execution_reserved(
+        &mut self,
+        reservation: &mut IdempotencyReservation,
+        execution_id: &str,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        risk: StepRisk,
+        agent_id: &str,
+        timestamp_ms: u64,
+    ) -> Result<String, IdempotencyError> {
+        self.validate_reservation_binding(reservation, &idem_key)?;
+        self.validate_execution_lock(&reservation.execution_lock, execution_id)?;
+        if reservation.execution_id != execution_id {
+            return Err(IdempotencyError::ReservationExecutionMismatch {
+                reserved: reservation.execution_id.clone(),
+                attempted: execution_id.to_string(),
+            });
+        }
+        if reservation.pending_recorded {
+            return Err(IdempotencyError::ReservationAlreadyUsed {
+                key: reservation.idem_key.clone(),
+                execution_id: reservation.execution_id.clone(),
+            });
+        }
+        if reservation.observed_outcome.is_some() {
+            return Err(IdempotencyError::DuplicateExecution {
+                key: idem_key.as_str().to_string(),
+            });
+        }
+        if !outcome.is_pending() {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "a new durable reservation must begin with Pending before dispatch"
+                    .to_string(),
+            });
+        }
+        self.validate_monotonic_timestamp(timestamp_ms)?;
+        let locked = self.read_durable_ledger_locked(&reservation.execution_lock)?;
+        let mut candidate = locked.ledger;
+        let hash = candidate.append(
+            idem_key.clone(),
+            outcome.clone(),
+            risk,
+            agent_id,
+            timestamp_ms,
+        )?;
+        self.persist_ledger_snapshot(&candidate, Some(&locked.pinned_file))?;
+        self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
+        self.dedup
+            .record(&idem_key, execution_id, outcome, timestamp_ms);
+        self.ledgers.insert(execution_id.to_string(), candidate);
+        reservation.pending_recorded = true;
+        Ok(hash)
+    }
+
+    /// Link an already-proven durable outcome into the current recovery
+    /// ledger without dispatching the external effect again.
+    ///
+    /// This method acquires the normal key-then-execution locks, refreshes the
+    /// authoritative outcome from the complete durable spool, and appends only
+    /// when that proof exactly matches `outcome`. Only Success and Compensated
+    /// facts are linkable; Pending, failure, and skipped states cannot certify
+    /// that a prior effect completed.
+    pub fn record_recovered_execution(
+        &mut self,
+        execution_id: &str,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        risk: StepRisk,
+        agent_id: &str,
+        timestamp_ms: u64,
+    ) -> Result<String, IdempotencyError> {
+        if !matches!(
+            &outcome,
+            StepOutcome::Success { .. } | StepOutcome::Compensated { .. }
+        ) {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "recovered proof link for key {idem_key} requires Success or Compensated, got {outcome:?}"
+                ),
+            });
+        }
+        let reservation =
+            self.acquire_durable_reservation(execution_id, &idem_key, timestamp_ms)?;
+        if reservation.observed_outcome.as_ref() != Some(&outcome) {
+            return Err(IdempotencyError::RecoveredProofMismatch {
+                key: idem_key.as_str().to_string(),
+                expected: format!("{outcome:?}"),
+                observed: format!("{:?}", reservation.observed_outcome),
+            });
+        }
+        self.validate_monotonic_timestamp(timestamp_ms)?;
+        let locked = self.read_durable_ledger_locked(&reservation.execution_lock)?;
+        let mut candidate = locked.ledger;
+        let hash = candidate.append(
+            idem_key.clone(),
+            outcome.clone(),
+            risk,
+            agent_id,
+            timestamp_ms,
+        )?;
+        self.persist_ledger_snapshot(&candidate, Some(&locked.pinned_file))?;
+        self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
+        self.dedup
+            .record(&idem_key, execution_id, outcome, timestamp_ms);
+        self.ledgers.insert(execution_id.to_string(), candidate);
+        Ok(hash)
+    }
+
+    /// Complete a pending reservation in an in-memory store.
+    ///
+    /// Durable callers must retain and consume the token through
+    /// [`Self::complete_execution_reserved`].
     pub fn complete_execution(
         &mut self,
         execution_id: &str,
@@ -1335,20 +3283,97 @@ impl IdempotencyStore {
         outcome: StepOutcome,
         timestamp_ms: u64,
     ) -> Result<String, IdempotencyError> {
-        let ledger =
-            self.ledgers
-                .get_mut(execution_id)
-                .ok_or_else(|| IdempotencyError::LedgerNotFound {
-                    execution_id: execution_id.to_string(),
-                })?;
-        let hash = ledger.complete_pending(&idem_key, outcome.clone(), timestamp_ms)?;
+        if self.is_durable() {
+            return Err(IdempotencyError::DurableMutationRequiresReservation {
+                operation: "complete_execution".to_string(),
+            });
+        }
+        let mut candidate = self.ledgers.get(execution_id).cloned().ok_or_else(|| {
+            IdempotencyError::LedgerNotFound {
+                execution_id: execution_id.to_string(),
+            }
+        })?;
+        self.validate_monotonic_timestamp(timestamp_ms)?;
+        let hash = candidate.complete_pending(&idem_key, outcome.clone(), timestamp_ms)?;
+
+        self.persist_ledger_snapshot(&candidate, None)?;
 
         self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
         self.dedup
             .record(&idem_key, execution_id, outcome, timestamp_ms);
-        self.persist_ledger(execution_id)?;
+        self.ledgers.insert(execution_id.to_string(), candidate);
 
         Ok(hash)
+    }
+
+    /// Complete a pending reservation while retaining the same cross-process
+    /// key lease that authorized the pre-dispatch write.
+    pub fn complete_execution_reserved(
+        &mut self,
+        reservation: IdempotencyReservation,
+        execution_id: &str,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        timestamp_ms: u64,
+    ) -> Result<String, IdempotencyError> {
+        self.validate_reservation_binding(&reservation, &idem_key)?;
+        self.validate_execution_lock(&reservation.execution_lock, execution_id)?;
+        if reservation.execution_id != execution_id {
+            return Err(IdempotencyError::ReservationExecutionMismatch {
+                reserved: reservation.execution_id,
+                attempted: execution_id.to_string(),
+            });
+        }
+        if !reservation.pending_recorded {
+            return Err(IdempotencyError::ReservationNotPending {
+                key: reservation.idem_key,
+                execution_id: execution_id.to_string(),
+            });
+        }
+        self.validate_monotonic_timestamp(timestamp_ms)?;
+        let locked = self.read_durable_ledger_locked(&reservation.execution_lock)?;
+        let mut candidate = locked.ledger;
+        let hash = candidate.complete_pending(&idem_key, outcome.clone(), timestamp_ms)?;
+        self.persist_ledger_snapshot(&candidate, Some(&locked.pinned_file))?;
+        self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
+        self.dedup
+            .record(&idem_key, execution_id, outcome, timestamp_ms);
+        self.ledgers.insert(execution_id.to_string(), candidate);
+        Ok(hash)
+    }
+
+    fn validate_reservation_binding(
+        &self,
+        reservation: &IdempotencyReservation,
+        idem_key: &IdempotencyKey,
+    ) -> Result<(), IdempotencyError> {
+        if !reservation.authorizes(idem_key) {
+            return Err(IdempotencyError::ReservationKeyMismatch {
+                reserved: reservation.idem_key.clone(),
+                attempted: idem_key.as_str().to_string(),
+            });
+        }
+        let spool = self.durable_spool()?;
+        if !Arc::ptr_eq(&spool.dir, &reservation.execution_lock.spool_dir)
+            || !Arc::ptr_eq(&spool.key_lock_dir, &reservation.key_lock_dir)
+        {
+            return Err(IdempotencyError::ReservationStoreMismatch {
+                reserved_spool: reservation
+                    .execution_lock
+                    .spool_display
+                    .display()
+                    .to_string(),
+                attempted_spool: spool.display_path.display().to_string(),
+            });
+        }
+        let lock_relative = Path::new(KEY_LOCK_DIR_NAME).join(&reservation.key_lock_name);
+        validate_pinned_file_entry(
+            &reservation.key_lock_dir,
+            &reservation.key_lock_name,
+            &reservation._lock_file,
+            &spool.display(&lock_relative),
+        )?;
+        Ok(())
     }
 
     /// Build a resume context for a given execution.
@@ -1359,18 +3384,116 @@ impl IdempotencyStore {
             .map(|ledger| ResumeContext::from_ledger_with_policy(ledger, plan, &self.policy))
     }
 
-    /// Remove a completed/aborted ledger from active tracking.
-    /// Returns the ledger for archival if it was terminal.
+    /// Abort and archive every active execution for an exact compiled plan.
+    ///
+    /// This is the safe handoff primitive for a caller that has completed its
+    /// contract/dedup recovery preflight and is about to create a superseding
+    /// execution. Matching is deliberately on both `plan_id` and `plan_hash`:
+    /// a reused human-readable plan ID must never retire an execution whose
+    /// action graph differs.
+    ///
+    /// The operation is copy-on-write with respect to memory. Candidate
+    /// ledgers are cloned, nonterminal candidates transition to `Aborted`, and
+    /// every snapshot is durably published before any active entry is removed.
+    /// If validation or persistence fails, the in-memory map is unchanged.
+    /// Multiple spool files cannot be atomically replaced as one filesystem
+    /// transaction, so a mid-batch failure may leave an already-published
+    /// candidate durably `Aborted`; that is fail-closed and will be treated as
+    /// terminal on restart.
+    ///
+    /// Returns retired execution IDs in lexical order. The retired count is
+    /// `result.len()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-transition error if a matching nonterminal ledger
+    /// cannot safely transition to `Aborted`, or a persistence error if any
+    /// terminal snapshot cannot be durably published.
+    pub fn abort_and_archive_matching_ledgers(
+        &mut self,
+        plan_id: &str,
+        plan_hash: u64,
+    ) -> Result<Vec<String>, IdempotencyError> {
+        let mut execution_ids: Vec<String> = self
+            .ledgers
+            .iter()
+            .filter(|(_, ledger)| ledger.plan_id() == plan_id && ledger.plan_hash() == plan_hash)
+            .map(|(execution_id, _)| execution_id.clone())
+            .collect();
+        execution_ids.sort_unstable();
+
+        let mut execution_locks = Vec::with_capacity(execution_ids.len());
+        if self.is_durable() {
+            for execution_id in &execution_ids {
+                execution_locks.push(self.acquire_execution_lock(execution_id)?);
+            }
+        }
+
+        let mut terminal_snapshots = Vec::with_capacity(execution_ids.len());
+        for execution_id in &execution_ids {
+            let (mut candidate, pinned_file) = if let Some(lock) = execution_locks
+                .iter()
+                .find(|lock| lock.execution_id == *execution_id)
+            {
+                let locked = self.read_durable_ledger_locked(lock)?;
+                (locked.ledger, Some(locked.pinned_file))
+            } else {
+                (
+                    self.ledgers
+                        .get(execution_id)
+                        .expect("execution ID collected from active ledger map")
+                        .clone(),
+                    None,
+                )
+            };
+            if !candidate.phase().is_terminal() {
+                candidate.transition_phase(TxPhase::Aborted)?;
+            }
+            terminal_snapshots.push((candidate, pinned_file));
+        }
+
+        for (candidate, pinned_file) in &terminal_snapshots {
+            self.persist_ledger_snapshot(candidate, pinned_file.as_ref())?;
+        }
+
+        for execution_id in &execution_ids {
+            self.ledgers
+                .remove(execution_id)
+                .expect("candidate remained active until all snapshots persisted");
+        }
+
+        Ok(execution_ids)
+    }
+
+    /// Remove a completed/aborted ledger from active tracking while retaining
+    /// its durable spool file as replay proof and audit evidence.
+    ///
+    /// Durable callers must invoke this after publishing a terminal phase;
+    /// terminal ledgers are deliberately not auto-removed by
+    /// [`Self::transition_phase`] because callers commonly still need the
+    /// returned ledger to build their final report.
     pub fn archive_ledger(
         &mut self,
         execution_id: &str,
     ) -> Result<TxExecutionLedger, IdempotencyError> {
-        let ledger =
-            self.ledgers
-                .get(execution_id)
-                .ok_or_else(|| IdempotencyError::LedgerNotFound {
-                    execution_id: execution_id.to_string(),
-                })?;
+        let execution_lock = if self.is_durable() {
+            Some(self.acquire_execution_lock(execution_id)?)
+        } else {
+            None
+        };
+        let (ledger, pinned_file) = if let Some(lock) = &execution_lock {
+            let locked = self.read_durable_ledger_locked(lock)?;
+            (locked.ledger, Some(locked.pinned_file))
+        } else {
+            (
+                self.ledgers.get(execution_id).cloned().ok_or_else(|| {
+                    IdempotencyError::LedgerNotFound {
+                        execution_id: execution_id.to_string(),
+                    }
+                })?,
+                None,
+            )
+        };
 
         if !ledger.phase().is_terminal() {
             return Err(IdempotencyError::LedgerNotTerminal {
@@ -1379,17 +3502,12 @@ impl IdempotencyStore {
             });
         }
 
-        let removed = self.ledgers.remove(execution_id).expect("checked above");
-        // ft-iz1ki: drop the durable spool file for an archived (terminal)
-        // ledger. Best-effort — a failed unlink must not fail archival, since
-        // the in-memory removal already succeeded and the stale file is inert
-        // (its execution_id won't be recreated: txe-<ms> is monotonic).
-        if let Some(dir) = &self.persist_dir
-            && is_valid_execution_id(execution_id)
-        {
-            let _ = std::fs::remove_file(dir.join(format!("{execution_id}.json")));
-        }
-        Ok(removed)
+        // Re-publish the terminal snapshot before removing active state. This
+        // also makes archival safe for callers that reached the terminal phase
+        // through the legacy mutable-ledger API.
+        self.persist_ledger_snapshot(&ledger, pinned_file.as_ref())?;
+        self.ledgers.remove(execution_id);
+        Ok(ledger)
     }
 
     /// Number of active ledgers.
@@ -1422,8 +3540,20 @@ impl IdempotencyStore {
             .unwrap_or(0)
     }
 
-    fn is_fresh_for_dedup(&self, timestamp_ms: u64, now_ms: u64) -> bool {
-        timestamp_ms.saturating_add(self.policy.dedup_ttl_ms) >= now_ms
+    fn validate_monotonic_timestamp(&self, timestamp_ms: u64) -> Result<(), IdempotencyError> {
+        let high_water_ms = self.logical_clock_ms();
+        if timestamp_ms < high_water_ms {
+            return Err(IdempotencyError::RetrogradeTimestamp {
+                observed_ms: timestamp_ms,
+                high_water_ms,
+            });
+        }
+        Ok(())
+    }
+
+    fn is_fresh_for_dedup(&self, outcome: &StepOutcome, timestamp_ms: u64, now_ms: u64) -> bool {
+        outcome.is_sticky_replay_proof()
+            || timestamp_ms.saturating_add(self.policy.dedup_ttl_ms) >= now_ms
     }
 }
 
@@ -1440,7 +3570,12 @@ pub struct IdempotencyPolicy {
     pub dedup_ttl_ms: u64,
     /// Whether to require chain integrity for resume (vs restart fresh).
     pub require_chain_integrity: bool,
-    /// Maximum number of active ledgers before oldest is archived.
+    /// Maximum number of nonterminal ledgers retained for resume.
+    ///
+    /// Terminal ledgers do not count after explicit archival or durable
+    /// reopen, but their spool files remain replay proof. Startup fails closed
+    /// if verified nonterminal ledgers exceed this limit; it never evicts
+    /// resumable state to manufacture capacity.
     pub max_active_ledgers: usize,
 }
 
@@ -1479,14 +3614,80 @@ pub enum IdempotencyError {
         phase: TxPhase,
     },
 
+    #[error(
+        "ledger {execution_id} cannot become terminal with ambiguous records at ordinals {ambiguous_ordinals:?}"
+    )]
+    AmbiguousTerminalTransition {
+        execution_id: String,
+        ambiguous_ordinals: Vec<u64>,
+    },
+
     #[error("ledger index corrupt: {reason}")]
     LedgerIndexCorrupt { reason: String },
+
+    #[error("ledger record invariant violated: {reason}")]
+    LedgerRecordInvariant { reason: String },
 
     #[error("chain integrity violation at ordinal {ordinal}")]
     ChainIntegrityViolation { ordinal: u64 },
 
     #[error("active ledger limit exceeded: max_active_ledgers={max_active_ledgers}")]
     ActiveLedgerLimitExceeded { max_active_ledgers: usize },
+
+    #[error("durable idempotency reservation requires a spool-backed store")]
+    DurableReservationRequired,
+
+    #[error("durable {operation} requires an execution-bound idempotency reservation")]
+    DurableMutationRequiresReservation { operation: String },
+
+    #[error("idempotency reservation already in progress for key {key}")]
+    ReservationInProgress { key: String },
+
+    #[error("execution ledger mutation already in progress for execution {execution_id}")]
+    ExecutionMutationInProgress { execution_id: String },
+
+    #[error(
+        "idempotency reservation key mismatch: reserved {reserved}, attempted mutation for {attempted}"
+    )]
+    ReservationKeyMismatch { reserved: String, attempted: String },
+
+    #[error(
+        "idempotency reservation execution mismatch: reserved {reserved}, attempted mutation for {attempted}"
+    )]
+    ReservationExecutionMismatch { reserved: String, attempted: String },
+
+    #[error("idempotency reservation for key {key} in execution {execution_id} was already used")]
+    ReservationAlreadyUsed { key: String, execution_id: String },
+
+    #[error(
+        "idempotency reservation for key {key} in execution {execution_id} has no durable Pending record"
+    )]
+    ReservationNotPending { key: String, execution_id: String },
+
+    #[error(
+        "recovered proof mismatch for key {key}: expected durable {expected}, observed {observed}"
+    )]
+    RecoveredProofMismatch {
+        key: String,
+        expected: String,
+        observed: String,
+    },
+
+    #[error(
+        "idempotency reservation store mismatch: reserved spool {reserved_spool}, attempted spool {attempted_spool}"
+    )]
+    ReservationStoreMismatch {
+        reserved_spool: String,
+        attempted_spool: String,
+    },
+
+    #[error(
+        "retrograde idempotency timestamp: observed {observed_ms}ms below store high-water {high_water_ms}ms"
+    )]
+    RetrogradeTimestamp {
+        observed_ms: u64,
+        high_water_ms: u64,
+    },
 
     /// ft-iz1ki: the durable ledger spool could not be opened or flushed.
     /// Surfaced fail-closed so a tx never reports commit success on a step
@@ -1496,7 +3697,7 @@ pub enum IdempotencyError {
 }
 
 /// ft-iz1ki: filename safety guard for durable ledger files. Execution IDs are
-/// `txe-<ms>` (engine-generated), but validate defensively before they reach
+/// timestamp-sortable and nonce-qualified when engine-generated, but validate defensively before they reach
 /// the filesystem so a malformed/operator-influenced id can never traverse out
 /// of the `tx_ledgers/` spool. Mirrors `steer_receipt_store::is_valid_receipt_id`.
 #[must_use]
@@ -1511,16 +3712,22 @@ pub fn is_valid_execution_id(execution_id: &str) -> bool {
         && !execution_id.contains("..")
 }
 
-// ── FNV-1a Hash ──────────────────────────────────────────────────────────────
+// ── Collision-resistant hashing ─────────────────────────────────────────────
 
-/// FNV-1a hash (consistent with `tx_plan_compiler::compute_plan_hash`).
-fn fnv1a_hash(data: &str) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in data.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+/// Hash a versioned domain plus a sequence of unambiguous, length-delimited
+/// components. Lengths are encoded as big-endian `u64` values so concatenation
+/// boundaries cannot be moved by caller-controlled bytes.
+fn sha256_domain_digest(domain: &[u8], components: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    let domain_len = u64::try_from(domain.len()).expect("hash domain length fits u64");
+    hasher.update(domain_len.to_be_bytes());
+    hasher.update(domain);
+    for component in components {
+        let component_len = u64::try_from(component.len()).expect("hash component length fits u64");
+        hasher.update(component_len.to_be_bytes());
+        hasher.update(component);
     }
-    hash
+    hex::encode(hasher.finalize())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1530,6 +3737,11 @@ mod tests {
     use super::*;
     use crate::tx_plan_compiler::{CompilerConfig, PlannerAssignment, compile_tx_plan};
     use proptest::prelude::*;
+    #[cfg(not(windows))]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(not(windows))]
+    static DURABLE_TEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
     fn make_key(plan: &str, step: &str) -> IdempotencyKey {
         IdempotencyKey::new(plan, step, "action-content")
@@ -1546,6 +3758,60 @@ mod tests {
             })
             .collect();
         compile_tx_plan("test-plan", &assignments, &CompilerConfig::default())
+    }
+
+    #[cfg(not(windows))]
+    fn durable_test_dir(label: &str) -> PathBuf {
+        let nonce = DURABLE_TEST_NONCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "tx-idempotency-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(unix)]
+    fn ledger_recovery_artifacts(spool: &Path) -> Vec<PathBuf> {
+        let mut artifacts: Vec<PathBuf> = std::fs::read_dir(spool)
+            .expect("list durable ledger spool")
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with(".tx-ledger-") && name.ends_with(".recovery.tmp"))
+                    .then(|| entry.path())
+            })
+            .collect();
+        artifacts.sort_unstable();
+        artifacts
+    }
+
+    fn record_durable_outcome(
+        store: &mut IdempotencyStore,
+        execution_id: &str,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        risk: StepRisk,
+        agent_id: &str,
+        timestamp_ms: u64,
+    ) {
+        let mut reservation = store
+            .acquire_durable_reservation(execution_id, &idem_key, timestamp_ms)
+            .expect("acquire durable reservation");
+        assert!(reservation.observed_outcome().is_none());
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                execution_id,
+                idem_key.clone(),
+                StepOutcome::Pending,
+                risk,
+                agent_id,
+                timestamp_ms.saturating_sub(1),
+            )
+            .expect("persist durable pending record");
+        store
+            .complete_execution_reserved(reservation, execution_id, idem_key, outcome, timestamp_ms)
+            .expect("persist durable terminal outcome");
     }
 
     // ── IdempotencyKey tests ──
@@ -1580,9 +3846,27 @@ mod tests {
     }
 
     #[test]
+    fn action_and_compensation_key_namespaces_cannot_alias() {
+        let action = IdempotencyKey::new("p1", "s1", "comp:rollback");
+        let compensation = IdempotencyKey::for_compensation("p1", "s1", "rollback");
+        assert_ne!(action, compensation);
+        assert_ne!(action.as_str(), compensation.as_str());
+    }
+
+    #[test]
     fn key_format_prefix() {
         let k = IdempotencyKey::new("p1", "s1", "action");
-        assert!(k.as_str().starts_with("txk:"));
+        assert!(k.as_str().starts_with("txk:v2:"));
+        assert_eq!(k.as_str().len(), "txk:v2:".len() + 64);
+    }
+
+    #[test]
+    fn key_length_delimiting_prevents_pipe_tuple_alias() {
+        let left = IdempotencyKey::new("a|b", "c", "d");
+        let right = IdempotencyKey::new("a", "b", "c|d");
+
+        assert_ne!(left, right);
+        assert_ne!(left.as_str(), right.as_str());
     }
 
     #[test]
@@ -1617,7 +3901,7 @@ mod tests {
     fn key_deserialize_rejects_missing_txk_prefix() {
         // br-ft-f4vta: format check fires before the hash-match check,
         // so hash_input value here is arbitrary.
-        let json = r#"{"key":"sha256:0123456789abcdef","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
+        let json = r#"{"key":"sha256:0123456789abcdef","plan_id":"p1","step_id":"s1","key_kind":"action","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("malformed prefix must reject");
         let msg = err.to_string();
@@ -1629,7 +3913,7 @@ mod tests {
 
     #[test]
     fn key_deserialize_rejects_short_hex() {
-        let json = r#"{"key":"txk:0123","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
+        let json = r#"{"key":"txk:v2:0123","plan_id":"p1","step_id":"s1","key_kind":"action","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("short hex must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1637,7 +3921,7 @@ mod tests {
 
     #[test]
     fn key_deserialize_rejects_long_hex() {
-        let json = r#"{"key":"txk:0123456789abcdef0","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
+        let json = r#"{"key":"txk:v2:00000000000000000000000000000000000000000000000000000000000000000","plan_id":"p1","step_id":"s1","key_kind":"action","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("long hex must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1649,8 +3933,7 @@ mod tests {
         // canonical case so a tampered ledger using uppercase
         // (which Deserialize_was_not_required to reject pre-fix)
         // is flagged.
-        let json =
-            r#"{"key":"txk:0123456789ABCDEF","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
+        let json = r#"{"key":"txk:v2:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","plan_id":"p1","step_id":"s1","key_kind":"action","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("uppercase hex must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1658,8 +3941,7 @@ mod tests {
 
     #[test]
     fn key_deserialize_rejects_non_hex_chars() {
-        let json =
-            r#"{"key":"txk:0123456789abcdeg","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
+        let json = r#"{"key":"txk:v2:000000000000000000000000000000000000000000000000000000000000000g","plan_id":"p1","step_id":"s1","key_kind":"action","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("non-hex char must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1667,18 +3949,18 @@ mod tests {
 
     #[test]
     fn key_deserialize_rejects_empty_plan_id() {
-        let json =
-            r#"{"key":"txk:0123456789abcdef","plan_id":"","step_id":"s1","hash_input":"action"}"#;
-        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let mut value = serde_json::to_value(IdempotencyKey::new("p1", "s1", "action")).unwrap();
+        value["plan_id"] = serde_json::Value::String(String::new());
+        let result: Result<IdempotencyKey, _> = serde_json::from_value(value);
         let err = result.expect_err("empty plan_id must reject");
         assert!(err.to_string().contains("plan_id"));
     }
 
     #[test]
     fn key_deserialize_rejects_empty_step_id() {
-        let json =
-            r#"{"key":"txk:0123456789abcdef","plan_id":"p1","step_id":"","hash_input":"action"}"#;
-        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let mut value = serde_json::to_value(IdempotencyKey::new("p1", "s1", "action")).unwrap();
+        value["step_id"] = serde_json::Value::String(String::new());
+        let result: Result<IdempotencyKey, _> = serde_json::from_value(value);
         let err = result.expect_err("empty step_id must reject");
         assert!(err.to_string().contains("step_id"));
     }
@@ -1695,11 +3977,9 @@ mod tests {
         // Forge: keep step-a's `key` and `hash_input`, but alias the
         // step_id to "step-b" — this is the smoking-gun cross-step
         // alias the bead body warns about.
-        let forged_json = format!(
-            r#"{{"key":"{}","plan_id":"p1","step_id":"step-b","hash_input":"action-a"}}"#,
-            real_a.as_str()
-        );
-        let result: Result<IdempotencyKey, _> = serde_json::from_str(&forged_json);
+        let mut forged = serde_json::to_value(real_a).unwrap();
+        forged["step_id"] = serde_json::Value::String("step-b".to_string());
+        let result: Result<IdempotencyKey, _> = serde_json::from_value(forged);
         let err = result.expect_err("cross-step alias must reject");
         let msg = err.to_string();
         assert!(
@@ -1716,11 +3996,9 @@ mod tests {
     #[test]
     fn key_deserialize_rejects_tampered_hash_input_ft_f4vta() {
         let real = IdempotencyKey::new("p1", "s1", "real-action");
-        let forged_json = format!(
-            r#"{{"key":"{}","plan_id":"p1","step_id":"s1","hash_input":"FORGED-action"}}"#,
-            real.as_str()
-        );
-        let result: Result<IdempotencyKey, _> = serde_json::from_str(&forged_json);
+        let mut forged = serde_json::to_value(real).unwrap();
+        forged["hash_input"] = serde_json::Value::String(format!("sha256:{}", "0".repeat(64)));
+        let result: Result<IdempotencyKey, _> = serde_json::from_value(forged);
         assert!(
             result.is_err(),
             "tampered hash_input must reject (got Ok = forge undetected)"
@@ -1729,19 +4007,15 @@ mod tests {
 
     /// br-ft-f4vta: tampering `key` while keeping plan_id/step_id/
     /// hash_input must reject. Format check passes if the tampered
-    /// key is still `txk:16hex`, but the hash-match gate fires.
+    /// key is still a valid v2 SHA-256 form, but the hash-match gate fires.
     #[test]
     fn key_deserialize_rejects_tampered_key_with_valid_format_ft_f4vta() {
         let real = IdempotencyKey::new("p1", "s1", "real-action");
         // Use a different valid txk format string (different hex)
         // that does NOT match the legitimate hash for these inputs.
-        let forged_json = format!(
-            r#"{{"key":"txk:0000000000000000","plan_id":"{}","step_id":"{}","hash_input":"{}"}}"#,
-            real.plan_id(),
-            real.step_id(),
-            "real-action",
-        );
-        let result: Result<IdempotencyKey, _> = serde_json::from_str(&forged_json);
+        let mut forged = serde_json::to_value(real).unwrap();
+        forged["key"] = serde_json::Value::String(format!("txk:v2:{}", "0".repeat(64)));
+        let result: Result<IdempotencyKey, _> = serde_json::from_value(forged);
         let err = result.expect_err("forged key must reject even with valid format");
         let msg = err.to_string();
         assert!(
@@ -1770,7 +4044,7 @@ mod tests {
         }
 
         /// br-ft-f4vta: arbitrary `key` strings that DO NOT
-        /// match the txk:16hex format are rejected by the
+        /// match the txk:v2:64hex format are rejected by the
         /// Deserialize gate. Universal quantifier over the
         /// reject path.
         #[test]
@@ -1778,16 +4052,12 @@ mod tests {
             bad_prefix in "[a-z]{1,8}:",
             tail in "[0-9a-f]{0,32}",
         ) {
-            // Skip valid `txk:16hex` outputs from this generator.
+            // Skip valid v2 outputs from this generator.
             let bad_key = format!("{bad_prefix}{tail}");
-            let is_valid = bad_key.starts_with("txk:")
-                && bad_key.len() == 20
-                && bad_key[4..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+            let is_valid = is_well_formed_idempotency_key(&bad_key);
             prop_assume!(!is_valid);
 
-            let json = format!(
-                r#"{{"key":"{bad_key}","plan_id":"p","step_id":"s","hash_input":"a"}}"#
-            );
+            let json = format!(r#"{{"key":"{bad_key}","plan_id":"p","step_id":"s","key_kind":"action","hash_input":"sha256:{}"}}"#, "0".repeat(64));
             let result: Result<IdempotencyKey, _> =
                 serde_json::from_str(&json);
             let is_err = result.is_err();
@@ -1818,15 +4088,9 @@ mod tests {
             // Forge: take A's key with B's full source tuple. The
             // re-derivation will yield key_b, mismatching the
             // persisted key_a → reject.
-            let forged_json = format!(
-                r#"{{"key":"{}","plan_id":"{}","step_id":"{}","hash_input":"{}"}}"#,
-                key_a.as_str(),
-                plan_b,
-                step_b,
-                action_b
-            );
-            let result: Result<IdempotencyKey, _> =
-                serde_json::from_str(&forged_json);
+            let mut forged = serde_json::to_value(&key_b).expect("serialize key B");
+            forged["key"] = serde_json::Value::String(key_a.as_str().to_string());
+            let result: Result<IdempotencyKey, _> = serde_json::from_value(forged);
             prop_assert!(
                 result.is_err(),
                 "cross-tuple alias must reject: A.key={} with B.tuple=({}, {}, {})",
@@ -2033,6 +4297,90 @@ mod tests {
             .append(key, StepOutcome::Pending, StepRisk::Low, "a", 1000)
             .unwrap_err();
         assert!(matches!(err, IdempotencyError::LedgerSealed { .. }));
+    }
+
+    #[test]
+    fn ledger_rejects_terminal_phase_with_ambiguous_records() {
+        for outcome in [
+            StepOutcome::Pending,
+            StepOutcome::Skipped {
+                reason: "dispatch state unknown".to_string(),
+            },
+        ] {
+            let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
+            ledger.transition_phase(TxPhase::Preparing).unwrap();
+            ledger
+                .append(
+                    make_key("plan-1", "step-b0"),
+                    outcome,
+                    StepRisk::Low,
+                    "agent",
+                    1_000,
+                )
+                .unwrap();
+            let error = ledger
+                .transition_phase(TxPhase::Aborted)
+                .expect_err("ambiguous execution proof cannot be sealed terminal");
+            assert!(matches!(
+                error,
+                IdempotencyError::AmbiguousTerminalTransition { .. }
+            ));
+            assert_eq!(ledger.phase(), TxPhase::Preparing);
+        }
+    }
+
+    #[test]
+    fn ledger_deserialize_rejects_header_record_identity_mismatch() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger
+            .append(
+                make_key("plan-1", "step-b0"),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent",
+                1_000,
+            )
+            .unwrap();
+
+        let mut wrong_execution = serde_json::to_value(&ledger).unwrap();
+        wrong_execution["records"][0]["execution_id"] = serde_json::json!("exec-other");
+        let error = serde_json::from_value::<TxExecutionLedger>(wrong_execution).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match ledger execution_id")
+        );
+
+        let mut wrong_plan = serde_json::to_value(&ledger).unwrap();
+        wrong_plan["records"][0]["idem_key"] =
+            serde_json::to_value(make_key("plan-other", "step-b0")).unwrap();
+        let error = serde_json::from_value::<TxExecutionLedger>(wrong_plan).unwrap_err();
+        assert!(error.to_string().contains("does not match ledger plan_id"));
+    }
+
+    #[test]
+    fn ledger_deserialize_rejects_terminal_ambiguous_outcome() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger
+            .append(
+                make_key("plan-1", "step-b0"),
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "agent",
+                1_000,
+            )
+            .unwrap();
+        let mut value = serde_json::to_value(&ledger).unwrap();
+        value["phase"] = serde_json::json!("aborted");
+
+        let error = serde_json::from_value::<TxExecutionLedger>(value).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("terminal TxExecutionLedger contains ambiguous")
+        );
     }
 
     #[test]
@@ -2362,15 +4710,21 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_non_monotonic_ordinals_ft_ddm8k() {
-        // Forged: records have ordinals 0, 5, 2 (not 0..len).
+        // Forged: records have ordinals 0, 5, 2 (not 0..len). Keep the
+        // timestamps independently monotonic so this fixture isolates the
+        // ordinal-density trust-boundary check instead of being rejected first
+        // by the stricter timestamp high-water invariant.
         let r0 = build_record("p", "s0", 0, "");
-        let r5 = build_record("p", "s5", 5, "anyhash"); // hash chain doesn't matter for this gate
-        let r2 = build_record("p", "s2", 2, "anyhash");
+        let mut r5 = build_record("p", "s5", 5, "anyhash");
+        r5.timestamp_ms = 1_001;
+        let mut r2 = build_record("p", "s2", 2, "anyhash");
+        r2.timestamp_ms = 1_002;
         let json = ledger_json(&[r0, r5, r2], 6, "anyhash");
         let err = serde_json::from_str::<TxExecutionLedger>(&json)
             .expect_err("br-ft-ddm8k: non-monotonic ordinals must be rejected");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("dense 0..len") || err.to_string().contains("ordinal"),
+            message.contains("br-ft-ddm8k") && message.contains("dense 0..len"),
             "br-ft-ddm8k: error must reference ordinal density; got {err}"
         );
     }
@@ -2529,12 +4883,77 @@ mod tests {
             guard.record(
                 &key,
                 "exec-1",
-                StepOutcome::Success { result: None },
+                StepOutcome::Failed {
+                    error_code: "retryable".to_string(),
+                    error_message: "retry after ttl".to_string(),
+                    compensated: false,
+                },
                 i as u64 * 1000,
             );
         }
         guard.evict_before(2500);
         assert_eq!(guard.len(), 2); // s3 (3000) and s4 (4000) remain.
+    }
+
+    #[test]
+    fn dedup_bulk_eviction_keeps_entry_and_order_indexes_in_sync() {
+        const ENTRY_COUNT: usize = 4_096;
+        let mut guard = DeduplicationGuard::new(ENTRY_COUNT);
+        for index in 0..ENTRY_COUNT {
+            let key = make_key("bulk-plan", &format!("step-{index}"));
+            guard.record(
+                &key,
+                "exec-bulk",
+                StepOutcome::Failed {
+                    error_code: "retryable".to_string(),
+                    error_message: "expired".to_string(),
+                    compensated: false,
+                },
+                index as u64,
+            );
+        }
+
+        guard.evict_before(ENTRY_COUNT as u64);
+
+        assert!(guard.entries.is_empty());
+        assert!(guard.order.is_empty());
+    }
+
+    #[test]
+    fn dedup_ttl_never_expires_pending_or_durable_terminal_proof() {
+        let mut guard = DeduplicationGuard::new(10);
+        let pending = make_key("p1", "pending");
+        let success = make_key("p1", "success");
+        let compensated = make_key("p1", "compensated");
+        let failed = make_key("p1", "failed");
+        guard.record(&pending, "exec-1", StepOutcome::Pending, 1);
+        guard.record(&success, "exec-1", StepOutcome::Success { result: None }, 2);
+        guard.record(
+            &compensated,
+            "exec-1",
+            StepOutcome::Compensated {
+                original_outcome: Box::new(StepOutcome::Success { result: None }),
+                compensation_result: "done".to_string(),
+            },
+            3,
+        );
+        guard.record(
+            &failed,
+            "exec-1",
+            StepOutcome::Failed {
+                error_code: "retryable".to_string(),
+                error_message: "retry".to_string(),
+                compensated: false,
+            },
+            4,
+        );
+
+        guard.evict_before(10_000);
+
+        assert!(guard.check(&pending).is_some());
+        assert!(guard.check(&success).is_some());
+        assert!(guard.check(&compensated).is_some());
+        assert!(guard.check(&failed).is_none());
     }
 
     #[test]
@@ -2613,7 +5032,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_skipped_steps_remain_pending() {
+    fn resume_skipped_steps_fail_closed_for_reconciliation() {
         let plan = make_plan(2);
         let mut ledger = TxExecutionLedger::new("exec-1", "test-plan", plan.plan_hash);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
@@ -2635,10 +5054,7 @@ mod tests {
         }
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
-        assert_eq!(
-            ctx.recommendation,
-            ResumeRecommendation::ContinueFromCheckpoint
-        );
+        assert_eq!(ctx.recommendation, ResumeRecommendation::CompensateAndAbort);
         assert!(ctx.completed_steps.is_empty());
         assert_eq!(ctx.remaining_steps.len(), 2);
     }
@@ -2727,13 +5143,13 @@ mod tests {
                 expected_failed: 1,
             },
             Case {
-                name: "pause_suspended_skips_remain_replayable",
+                name: "pause_suspended_skips_require_reconciliation",
                 outcomes: &[
                     OutcomeSpec::Skipped("pause_suspended"),
                     OutcomeSpec::Skipped("pause_suspended"),
                     OutcomeSpec::Skipped("pause_suspended"),
                 ],
-                expected_recommendation: ResumeRecommendation::ContinueFromCheckpoint,
+                expected_recommendation: ResumeRecommendation::CompensateAndAbort,
                 expected_remaining: 3,
                 expected_completed: 0,
                 expected_failed: 0,
@@ -2873,6 +5289,18 @@ mod tests {
         assert_eq!(ledger.execution_id(), "exec-1");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn store_reports_whether_cross_process_durability_is_available() {
+        let in_memory = IdempotencyStore::new(IdempotencyPolicy::default());
+        assert!(!in_memory.is_durable());
+
+        let ft_dir = durable_test_dir("is-durable");
+        let durable = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).unwrap();
+        assert!(durable.is_durable());
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
     #[test]
     fn store_duplicate_ledger_rejected() {
         let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
@@ -2899,7 +5327,11 @@ mod tests {
         let outcome = StepOutcome::Success { result: None };
 
         // No dedup hit before recording.
-        assert!(store.check_dedup(&key).is_none());
+        assert!(
+            store
+                .peek_cached_outcome(&key, store.logical_clock_ms())
+                .is_none()
+        );
 
         // Record execution.
         store
@@ -2914,11 +5346,15 @@ mod tests {
             .unwrap();
 
         // Dedup hit after recording.
-        assert_eq!(store.check_dedup(&key), Some(&outcome));
+        assert_eq!(
+            store.peek_cached_outcome(&key, store.logical_clock_ms()),
+            Some(&outcome)
+        );
     }
 
     // ── ft-iz1ki: durable store restart-safety ──────────────────────────
 
+    #[cfg(not(windows))]
     #[test]
     fn open_persists_and_reloads_ledger_for_restart_dedup() {
         let ft_dir =
@@ -2937,15 +5373,17 @@ mod tests {
                 .create_ledger("txe-1000", &plan)
                 .expect("create ledger");
             store
-                .record_execution(
-                    "txe-1000",
-                    key.clone(),
-                    outcome.clone(),
-                    StepRisk::Low,
-                    "agent",
-                    1000,
-                )
-                .expect("record execution");
+                .transition_phase("txe-1000", TxPhase::Preparing)
+                .expect("persist preparing phase");
+            record_durable_outcome(
+                &mut store,
+                "txe-1000",
+                key.clone(),
+                outcome.clone(),
+                StepRisk::Low,
+                "agent",
+                1_000,
+            );
             // Spool file must exist on disk.
             assert!(
                 ft_dir.join("tx_ledgers").join("txe-1000.json").is_file(),
@@ -2960,11 +5398,1124 @@ mod tests {
             let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
                 .expect("reopen store");
             assert_eq!(
-                reopened.check_dedup(&key),
+                reopened.peek_cached_outcome(&key, reopened.logical_clock_ms()),
                 Some(&outcome),
                 "reloaded ledger must satisfy dedup after restart"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn restart_rebuilds_dedup_from_terminal_ledgers_beyond_active_budget() {
+        let ft_dir = durable_test_dir("all-terminal-dedup");
+        let plan = make_plan(4);
+        let policy = IdempotencyPolicy {
+            dedup_capacity: 16,
+            max_active_ledgers: 1,
+            ..IdempotencyPolicy::default()
+        };
+        let mut expected = Vec::new();
+
+        {
+            let mut store = IdempotencyStore::open(&ft_dir, policy.clone()).expect("open store");
+            for (index, step) in plan.steps.iter().enumerate() {
+                let execution_id = format!("txe-terminal-{index}");
+                let key = make_key("test-plan", &step.id);
+                let outcome = StepOutcome::Success {
+                    result: Some(format!("result-{index}")),
+                };
+                store
+                    .create_ledger(&execution_id, &plan)
+                    .expect("create terminal ledger");
+                store
+                    .transition_phase(&execution_id, TxPhase::Preparing)
+                    .expect("transition to preparing");
+                record_durable_outcome(
+                    &mut store,
+                    &execution_id,
+                    key.clone(),
+                    outcome.clone(),
+                    StepRisk::Low,
+                    "agent",
+                    1_000 + u64::try_from(index).expect("index fits u64"),
+                );
+                store
+                    .transition_phase(&execution_id, TxPhase::Committing)
+                    .expect("transition to committing");
+                store
+                    .transition_phase(&execution_id, TxPhase::Completed)
+                    .expect("transition to completed");
+                store
+                    .archive_ledger(&execution_id)
+                    .expect("archive terminal ledger");
+                expected.push((key, outcome));
+            }
+            assert_eq!(store.active_count(), 0);
+        }
+
+        let reopened = IdempotencyStore::open(&ft_dir, policy).expect("reopen terminal spool");
+        assert_eq!(reopened.active_count(), 0);
+        for (key, outcome) in &expected {
+            assert_eq!(
+                reopened.peek_cached_outcome(key, reopened.logical_clock_ms()),
+                Some(outcome),
+                "every terminal ledger must rebuild replay proof even beyond the old reload budget"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_rebuilds_bounded_dedup_by_record_timestamp_not_filename() {
+        let ft_dir = durable_test_dir("dedup-rebuild-order");
+        let spool = ft_dir.join("tx_ledgers");
+        std::fs::create_dir_all(&spool).expect("create spool");
+        let plan = make_plan(3);
+        let fixtures = [
+            ("txe-z-old", 100_u64, 0_usize),
+            ("txe-a-middle", 200, 1),
+            ("txe-m-newest", 300, 2),
+        ];
+        let mut keys = Vec::new();
+        for (execution_id, timestamp_ms, step_index) in fixtures {
+            let key = make_key("test-plan", &plan.steps[step_index].id);
+            let mut ledger = TxExecutionLedger::new(execution_id, &plan.plan_id, plan.plan_hash);
+            ledger.transition_phase(TxPhase::Preparing).unwrap();
+            ledger
+                .append(
+                    key.clone(),
+                    StepOutcome::Success {
+                        result: Some(execution_id.to_string()),
+                    },
+                    StepRisk::Low,
+                    "agent",
+                    timestamp_ms,
+                )
+                .unwrap();
+            ledger.transition_phase(TxPhase::Committing).unwrap();
+            ledger.transition_phase(TxPhase::Completed).unwrap();
+            std::fs::write(
+                spool.join(format!("{execution_id}.json")),
+                serde_json::to_vec_pretty(&ledger).unwrap(),
+            )
+            .expect("write ledger fixture");
+            keys.push(key);
+        }
+
+        let reopened = IdempotencyStore::open(
+            &ft_dir,
+            IdempotencyPolicy {
+                dedup_capacity: 2,
+                max_active_ledgers: 1,
+                ..IdempotencyPolicy::default()
+            },
+        )
+        .expect("rebuild bounded replay index");
+        let now_ms = reopened.logical_clock_ms();
+        assert!(reopened.peek_cached_outcome(&keys[0], now_ms).is_none());
+        assert!(reopened.peek_cached_outcome(&keys[1], now_ms).is_some());
+        assert!(reopened.peek_cached_outcome(&keys[2], now_ms).is_some());
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_archive_retains_spool_proof_across_reopen() {
+        let ft_dir = durable_test_dir("archive-retains-proof");
+        let plan = make_plan(1);
+        let execution_id = "txe-archive-proof";
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let outcome = StepOutcome::Compensated {
+            original_outcome: Box::new(StepOutcome::Success { result: None }),
+            compensation_result: "rolled-back".to_string(),
+        };
+        let spool_path = ft_dir
+            .join("tx_ledgers")
+            .join(format!("{execution_id}.json"));
+
+        {
+            let mut store =
+                IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+            store
+                .create_ledger(execution_id, &plan)
+                .expect("create ledger");
+            store
+                .transition_phase(execution_id, TxPhase::Preparing)
+                .expect("transition to preparing");
+            record_durable_outcome(
+                &mut store,
+                execution_id,
+                key.clone(),
+                outcome.clone(),
+                StepRisk::Low,
+                "agent",
+                1_000,
+            );
+            store
+                .transition_phase(execution_id, TxPhase::Committing)
+                .expect("transition to committing");
+            store
+                .transition_phase(execution_id, TxPhase::Completed)
+                .expect("transition to completed");
+            store
+                .archive_ledger(execution_id)
+                .expect("archive terminal ledger");
+            assert_eq!(store.active_count(), 0);
+            assert!(spool_path.is_file(), "archive must retain durable proof");
+        }
+
+        let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("reopen archived spool");
+        assert_eq!(reopened.active_count(), 0);
+        assert_eq!(
+            reopened.peek_cached_outcome(&key, reopened.logical_clock_ms()),
+            Some(&outcome)
+        );
+        assert!(spool_path.is_file(), "reopen must not consume spool proof");
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_fails_closed_when_nonterminal_ledgers_exceed_active_policy() {
+        let ft_dir = durable_test_dir("active-overflow");
+        let plan = make_plan(1);
+        {
+            let mut store = IdempotencyStore::open(
+                &ft_dir,
+                IdempotencyPolicy {
+                    max_active_ledgers: 2,
+                    ..IdempotencyPolicy::default()
+                },
+            )
+            .expect("open wide store");
+            store.create_ledger("txe-active-a", &plan).unwrap();
+            store.create_ledger("txe-active-b", &plan).unwrap();
+        }
+
+        let error = IdempotencyStore::open(
+            &ft_dir,
+            IdempotencyPolicy {
+                max_active_ledgers: 1,
+                ..IdempotencyPolicy::default()
+            },
+        )
+        .expect_err("startup must not discard a resumable ledger");
+        assert_eq!(
+            error,
+            IdempotencyError::ActiveLedgerLimitExceeded {
+                max_active_ledgers: 1
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_duplicate_create_collision_leaves_no_recovery_artifacts() {
+        let ft_dir = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-create-collision";
+        let mut winner = IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default())
+            .expect("open winning store");
+        let mut stale_loser = IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default())
+            .expect("open stale losing store");
+
+        winner
+            .create_ledger(execution_id, &plan)
+            .expect("publish winning ledger");
+        let ledger_path = ft_dir
+            .path()
+            .join("tx_ledgers")
+            .join(format!("{execution_id}.json"));
+        let winning_bytes = std::fs::read(&ledger_path).expect("read winning ledger");
+
+        for _ in 0..16 {
+            let error = stale_loser
+                .create_ledger(execution_id, &plan)
+                .expect_err("no-clobber loser must report duplicate execution");
+            assert_eq!(
+                error,
+                IdempotencyError::DuplicateExecution {
+                    key: execution_id.to_string()
+                }
+            );
+        }
+
+        assert_eq!(
+            std::fs::read(&ledger_path).expect("reread winning ledger"),
+            winning_bytes,
+            "losing creates must not alter the authoritative ledger"
+        );
+        let recovery_artifacts = std::fs::read_dir(ft_dir.path().join("tx_ledgers"))
+            .expect("list durable spool")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(".tx-ledger-") && name.ends_with(".recovery.tmp")
+            })
+            .count();
+        assert_eq!(recovery_artifacts, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_durable_store_fails_before_creating_namespace() {
+        let workspace = tempfile::tempdir().expect("create workspace directory");
+        let anchor = workspace.path().join(".ft");
+
+        let error = IdempotencyStore::open(&anchor, IdempotencyPolicy::default())
+            .expect_err("Windows durability must fail closed before effects");
+        let IdempotencyError::LedgerPersist { reason } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(reason.contains("unsupported on Windows"));
+        assert!(
+            !anchor.exists(),
+            "unsupported durable acquisition must not create its namespace"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_workspace_anchor_rename_does_not_redirect_ledger_writes() {
+        // Replacing the caller-declared `.ft` control-plane anchor is outside
+        // the documented same-UID threat boundary. Within that boundary this
+        // test proves the compatibility store never redirects I/O by
+        // re-resolving its former ambient path.
+        let workspace = tempfile::tempdir().expect("create workspace directory");
+        let anchor = workspace.path().join(".ft");
+        std::fs::create_dir(&anchor).expect("create workspace control directory");
+        let pinned = Dir::open_ambient_dir(&anchor, cap_std::ambient_authority())
+            .expect("pin workspace control directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-pinned-anchor";
+        let mut store = IdempotencyStore::open_in_pinned_dir(
+            pinned,
+            anchor.clone(),
+            IdempotencyPolicy::default(),
+        )
+        .expect("open pinned durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create ledger through pinned anchor");
+
+        let moved_anchor = workspace.path().join(".ft-moved");
+        std::fs::rename(&anchor, &moved_anchor).expect("move pinned control directory");
+        let replacement_spool = anchor.join(TX_LEDGER_DIR_NAME);
+        std::fs::create_dir_all(&replacement_spool).expect("create replacement namespace");
+        let replacement_ledger = replacement_spool.join(format!("{execution_id}.json"));
+        let sentinel = b"replacement namespace sentinel";
+        std::fs::write(&replacement_ledger, sentinel).expect("write replacement sentinel");
+
+        store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .expect("write remains relative to pinned anchor");
+
+        assert_eq!(
+            std::fs::read(&replacement_ledger).expect("read replacement sentinel"),
+            sentinel,
+            "ambient replacement namespace must remain untouched"
+        );
+        let moved_ledger = moved_anchor
+            .join(TX_LEDGER_DIR_NAME)
+            .join(format!("{execution_id}.json"));
+        let persisted: TxExecutionLedger = serde_json::from_slice(
+            &std::fs::read(&moved_ledger).expect("read ledger through moved anchor path"),
+        )
+        .expect("deserialize pinned ledger");
+        assert_eq!(persisted.phase(), TxPhase::Preparing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_tx_ledgers_directory_fails_closed_without_touching_replacement() {
+        let anchor = tempfile::tempdir().expect("create workspace control directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-spool-substitution";
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create initial ledger");
+
+        let spool = anchor.path().join(TX_LEDGER_DIR_NAME);
+        let moved_spool = anchor.path().join("tx_ledgers-moved");
+        std::fs::rename(&spool, &moved_spool).expect("move pinned ledger spool");
+        std::fs::create_dir(&spool).expect("install replacement ledger spool");
+        let replacement_ledger = spool.join(format!("{execution_id}.json"));
+        let sentinel = b"replacement spool sentinel";
+        std::fs::write(&replacement_ledger, sentinel).expect("write replacement sentinel");
+
+        let error = store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .expect_err("substituted pinned spool must fail closed");
+        let IdempotencyError::LedgerPersist { reason } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(
+            reason.contains("no longer names the pinned filesystem object"),
+            "unexpected reason: {reason}"
+        );
+        assert_eq!(
+            std::fs::read(&replacement_ledger).expect("read replacement sentinel"),
+            sentinel,
+            "failed mutation must not touch the replacement spool"
+        );
+        assert!(
+            moved_spool.join(format!("{execution_id}.json")).is_file(),
+            "original pinned ledger remains available for recovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_replace_rejects_substituted_symlink_leaf_without_clobbering_it() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-symlink-substitution";
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create initial ledger");
+
+        let spool = anchor.path().join(TX_LEDGER_DIR_NAME);
+        let ledger_path = spool.join(format!("{execution_id}.json"));
+        let original_path = spool.join(format!("{execution_id}.original"));
+        std::fs::rename(&ledger_path, &original_path).expect("retain original ledger fixture");
+        let sentinel_path = anchor.path().join("unrelated-sentinel");
+        let sentinel = b"must not be overwritten";
+        std::fs::write(&sentinel_path, sentinel).expect("write unrelated sentinel");
+        std::os::unix::fs::symlink(&sentinel_path, &ledger_path)
+            .expect("substitute ledger symlink");
+
+        let error = store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .expect_err("substituted symlink ledger must fail closed");
+        assert!(
+            matches!(&error, IdempotencyError::LedgerPersist { .. }),
+            "unexpected error: {error:?}"
+        );
+
+        assert_eq!(
+            std::fs::read(&sentinel_path).expect("read unrelated sentinel"),
+            sentinel,
+            "ledger publication must never write through the substituted symlink"
+        );
+        let metadata =
+            std::fs::symlink_metadata(&ledger_path).expect("inspect substituted ledger leaf");
+        assert!(
+            metadata.file_type().is_symlink(),
+            "failed mutation must preserve the substituted symlink entry"
+        );
+        assert!(
+            original_path.is_file(),
+            "original fixture remains inspectable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_replace_rejects_single_link_regular_substitution_after_locked_read() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-regular-substitution";
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create initial ledger");
+
+        let spool = anchor.path().join(TX_LEDGER_DIR_NAME);
+        let ledger_path = spool.join(format!("{execution_id}.json"));
+        let original_path = spool.join(format!("{execution_id}.original"));
+        let hook_ledger_path = ledger_path.clone();
+        let hook_original_path = original_path.clone();
+        let sentinel = b"single-link foreign ledger sentinel".to_vec();
+        let hook_sentinel = sentinel.clone();
+        let _hook_guard = set_ledger_pre_replace_test_hook(move || {
+            std::fs::rename(&hook_ledger_path, &hook_original_path)
+                .expect("move authorized ledger after locked read");
+            std::fs::write(&hook_ledger_path, hook_sentinel)
+                .expect("install single-link foreign ledger leaf");
+        });
+
+        let error = store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .expect_err("foreign replacement ledger must fail closed");
+        let IdempotencyError::LedgerPersist { reason } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(
+            reason.contains(
+                "no longer names the exact filesystem object read under the execution lock"
+            ),
+            "unexpected reason: {reason}"
+        );
+        assert!(
+            reason.contains("recovery artifact name durably retained"),
+            "replacement mismatch must retain a synchronized recovery artifact: {reason}"
+        );
+        assert_eq!(
+            std::fs::read(&ledger_path).expect("read foreign ledger sentinel"),
+            sentinel,
+            "failed publication must not clobber the foreign regular file"
+        );
+        let original: TxExecutionLedger = serde_json::from_slice(
+            &std::fs::read(&original_path).expect("read original authorized ledger"),
+        )
+        .expect("deserialize original authorized ledger");
+        assert_eq!(original.phase(), TxPhase::Planned);
+        assert_eq!(
+            ledger_recovery_artifacts(&spool).len(),
+            1,
+            "failed replacement must retain exactly one recovery artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_replace_rejects_missing_destination_after_locked_read() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-missing-replacement";
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create initial ledger");
+
+        let spool = anchor.path().join(TX_LEDGER_DIR_NAME);
+        let ledger_path = spool.join(format!("{execution_id}.json"));
+        let original_path = spool.join(format!("{execution_id}.original"));
+        let hook_ledger_path = ledger_path.clone();
+        let hook_original_path = original_path.clone();
+        let _hook_guard = set_ledger_pre_replace_test_hook(move || {
+            std::fs::rename(&hook_ledger_path, &hook_original_path)
+                .expect("move authorized ledger after locked read");
+        });
+
+        let error = store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .expect_err("missing replacement destination must fail closed");
+        let IdempotencyError::LedgerPersist { reason } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(
+            reason.contains("recovery artifact name durably retained"),
+            "missing destination must retain a synchronized recovery artifact: {reason}"
+        );
+        assert!(
+            !ledger_path.exists(),
+            "failed publication must not recreate the missing destination"
+        );
+        let original: TxExecutionLedger = serde_json::from_slice(
+            &std::fs::read(&original_path).expect("read original authorized ledger"),
+        )
+        .expect("deserialize original authorized ledger");
+        assert_eq!(original.phase(), TxPhase::Planned);
+        assert_eq!(
+            ledger_recovery_artifacts(&spool).len(),
+            1,
+            "failed replacement must retain exactly one recovery artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_replace_succeeds_when_locked_identity_is_unchanged() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-unchanged-replacement";
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create initial ledger");
+
+        store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .expect("unchanged locked ledger identity must publish");
+
+        let ledger_path = anchor
+            .path()
+            .join(TX_LEDGER_DIR_NAME)
+            .join(format!("{execution_id}.json"));
+        let persisted: TxExecutionLedger =
+            serde_json::from_slice(&std::fs::read(&ledger_path).expect("read replaced ledger"))
+                .expect("deserialize replaced ledger");
+        assert_eq!(persisted.phase(), TxPhase::Preparing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_open_rejects_multi_link_ledger_leaf() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-hardlink-substitution";
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create initial ledger");
+        drop(store);
+
+        let ledger_path = anchor
+            .path()
+            .join(TX_LEDGER_DIR_NAME)
+            .join(format!("{execution_id}.json"));
+        let alias_path = anchor
+            .path()
+            .join(TX_LEDGER_DIR_NAME)
+            .join(format!("{execution_id}.alias"));
+        std::fs::hard_link(&ledger_path, &alias_path).expect("add hostile hard link");
+
+        let error = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect_err("multi-link durable leaf must fail closed");
+        let IdempotencyError::LedgerPersist { reason } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(reason.contains("hard links"), "unexpected reason: {reason}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_open_rejects_fifo_ledger_leaf_without_blocking() {
+        let anchor = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(1);
+        let execution_id = "txe-fifo-substitution";
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger(execution_id, &plan)
+            .expect("create initial ledger");
+        drop(store);
+
+        let ledger_path = anchor
+            .path()
+            .join(TX_LEDGER_DIR_NAME)
+            .join(format!("{execution_id}.json"));
+        let original_path = ledger_path.with_extension("original");
+        std::fs::rename(&ledger_path, &original_path).expect("retain original ledger fixture");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&ledger_path)
+            .status()
+            .expect("run mkfifo for hostile ledger fixture");
+        assert!(status.success(), "mkfifo must create the hostile fixture");
+
+        let error = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect_err("FIFO durable leaf must fail closed without waiting for a writer");
+        let IdempotencyError::LedgerPersist { reason } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(
+            reason.contains("not a regular file"),
+            "unexpected reason: {reason}"
+        );
+        assert!(original_path.is_file());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_failed_outcome_expires_only_after_ttl_on_reopen() {
+        let ft_dir = tempfile::tempdir().expect("create durable store directory");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..IdempotencyPolicy::default()
+        };
+        let plan = make_plan(1);
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let failed = StepOutcome::Failed {
+            error_code: "retryable".to_string(),
+            error_message: "try again after ttl".to_string(),
+            compensated: false,
+        };
+
+        {
+            let mut first = IdempotencyStore::open(ft_dir.path(), policy.clone())
+                .expect("open first durable store");
+            first
+                .create_ledger("txe-failed-source", &plan)
+                .expect("create source ledger");
+            first
+                .transition_phase("txe-failed-source", TxPhase::Preparing)
+                .expect("prepare source ledger");
+            record_durable_outcome(
+                &mut first,
+                "txe-failed-source",
+                key.clone(),
+                failed.clone(),
+                StepRisk::Low,
+                "agent-source",
+                1_000,
+            );
+        }
+
+        let mut restarted = IdempotencyStore::open(ft_dir.path(), policy)
+            .expect("reopen durable store after failure");
+        restarted
+            .create_ledger("txe-failed-retry", &plan)
+            .expect("create distinct retry execution");
+        let retrograde = restarted
+            .acquire_durable_reservation("txe-failed-retry", &key, 999)
+            .expect_err("time before the durable high-water mark must fail closed");
+        assert_eq!(
+            retrograde,
+            IdempotencyError::RetrogradeTimestamp {
+                observed_ms: 999,
+                high_water_ms: 1_000
+            }
+        );
+
+        let boundary = restarted
+            .acquire_durable_reservation("txe-failed-retry", &key, 1_100)
+            .expect("ttl boundary reservation");
+        assert_eq!(boundary.observed_outcome(), Some(&failed));
+        drop(boundary);
+
+        let expired = restarted
+            .acquire_durable_reservation("txe-failed-retry", &key, 1_101)
+            .expect("post-ttl reservation");
+        assert!(
+            expired.observed_outcome().is_none(),
+            "a retryable failure expires strictly after timestamp + ttl"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_skipped_outcome_expires_only_after_ttl_on_reopen() {
+        let ft_dir = tempfile::tempdir().expect("create durable store directory");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..IdempotencyPolicy::default()
+        };
+        let plan = make_plan(1);
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let skipped = StepOutcome::Skipped {
+            reason: "retryable precondition".to_string(),
+        };
+
+        {
+            let store =
+                IdempotencyStore::open(ft_dir.path(), policy.clone()).expect("open fixture store");
+            let mut source =
+                TxExecutionLedger::new("txe-skipped-source", &plan.plan_id, plan.plan_hash);
+            source
+                .transition_phase(TxPhase::Preparing)
+                .expect("prepare skipped fixture");
+            source
+                .append(
+                    key.clone(),
+                    skipped.clone(),
+                    StepRisk::Low,
+                    "agent-source",
+                    1_000,
+                )
+                .expect("append historical skipped fixture");
+            store
+                .persist_new_ledger_snapshot(&source)
+                .expect("persist skipped fixture");
+        }
+
+        let mut restarted =
+            IdempotencyStore::open(ft_dir.path(), policy).expect("reopen durable store after skip");
+        restarted
+            .create_ledger("txe-skipped-retry", &plan)
+            .expect("create distinct retry execution");
+        let boundary = restarted
+            .acquire_durable_reservation("txe-skipped-retry", &key, 1_100)
+            .expect("ttl boundary reservation");
+        assert_eq!(boundary.observed_outcome(), Some(&skipped));
+        drop(boundary);
+
+        let expired = restarted
+            .acquire_durable_reservation("txe-skipped-retry", &key, 1_101)
+            .expect("post-ttl reservation");
+        assert!(
+            expired.observed_outcome().is_none(),
+            "a retryable skip expires strictly after timestamp + ttl"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_key_reservation_refreshes_a_stale_second_store_under_lock() {
+        let ft_dir = durable_test_dir("cross-process-reservation");
+        let plan = make_plan(1);
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let outcome = StepOutcome::Success {
+            result: Some("committed-once".to_string()),
+        };
+        let mut first = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("open first process store");
+        let mut stale_second = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("open stale second process store");
+        first
+            .create_ledger("txe-first-process", &plan)
+            .expect("create first ledger");
+        first
+            .transition_phase("txe-first-process", TxPhase::Preparing)
+            .expect("transition first ledger");
+
+        let mut reservation = first
+            .acquire_durable_reservation("txe-first-process", &key, 1_000)
+            .expect("first process acquires key");
+        assert!(reservation.observed_outcome().is_none());
+        let blocked = stale_second
+            .acquire_durable_reservation("txe-first-process", &key, 1_000)
+            .expect_err("second process must not acquire a live key lease");
+        assert!(matches!(
+            blocked,
+            IdempotencyError::ReservationInProgress { .. }
+        ));
+        first
+            .record_execution_reserved(
+                &mut reservation,
+                "txe-first-process",
+                key.clone(),
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "agent",
+                1_000,
+            )
+            .expect("durably reserve before dispatch");
+        first
+            .complete_execution_reserved(
+                reservation,
+                "txe-first-process",
+                key.clone(),
+                outcome.clone(),
+                1_001,
+            )
+            .expect("durably complete while lock is held");
+        let refreshed = stale_second
+            .acquire_durable_reservation("txe-first-process", &key, 1_001)
+            .expect("stale process acquires after first completes");
+        assert_eq!(refreshed.observed_outcome(), Some(&outcome));
+        drop(refreshed);
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_fails_closed_when_valid_named_ledger_cannot_be_read() {
+        let ft_dir = durable_test_dir("unreadable-ledger");
+        let unreadable_path = ft_dir.join("tx_ledgers").join("txe-unreadable.json");
+        std::fs::create_dir_all(&unreadable_path).expect("create directory at ledger path");
+
+        let err = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect_err("a valid-named unreadable ledger must block startup");
+        let reason = match err {
+            IdempotencyError::LedgerPersist { reason } => reason,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(
+            reason.contains("read ledger"),
+            "unexpected reason: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_fails_closed_on_malformed_valid_named_ledger_with_no_active_capacity() {
+        let ft_dir = durable_test_dir("malformed-ledger");
+        let spool = ft_dir.join("tx_ledgers");
+        std::fs::create_dir_all(&spool).expect("create ledger spool");
+        std::fs::write(spool.join("txe-malformed.json"), b"{not-json")
+            .expect("write malformed ledger fixture");
+        let policy = IdempotencyPolicy {
+            // Terminal ledgers would consume no active capacity, but every
+            // valid-named spool file must still be integrity-checked.
+            max_active_ledgers: 1,
+            ..IdempotencyPolicy::default()
+        };
+
+        let err = IdempotencyStore::open(&ft_dir, policy)
+            .expect_err("a malformed valid-named ledger must block startup");
+        let reason = match err {
+            IdempotencyError::LedgerPersist { reason } => reason,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(
+            reason.contains("deserialize ledger"),
+            "unexpected reason: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn open_fails_closed_on_broken_persisted_hash_chain() {
+        let ft_dir = durable_test_dir("broken-chain");
+        let plan = make_plan(2);
+        {
+            let mut store =
+                IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+            store
+                .create_ledger("txe-chain", &plan)
+                .expect("create ledger");
+            store
+                .transition_phase("txe-chain", TxPhase::Preparing)
+                .expect("persist preparing phase");
+            for (index, step) in plan.steps.iter().enumerate() {
+                record_durable_outcome(
+                    &mut store,
+                    "txe-chain",
+                    make_key("test-plan", &step.id),
+                    StepOutcome::Success { result: None },
+                    StepRisk::Low,
+                    "agent-original",
+                    1_000 + u64::try_from(index).expect("step index fits in u64"),
+                );
+            }
+        }
+
+        let path = ft_dir.join("tx_ledgers").join("txe-chain.json");
+        let bytes = std::fs::read(&path).expect("read persisted ledger");
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("parse persisted ledger fixture");
+        persisted["records"][0]["agent_id"] =
+            serde_json::Value::String("agent-tampered".to_string());
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&persisted).expect("serialize tampered fixture"),
+        )
+        .expect("write tampered ledger fixture");
+
+        let err = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect_err("a broken persisted hash chain must block startup");
+        let reason = match err {
+            IdempotencyError::LedgerPersist { reason } => reason,
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert!(
+            reason.contains("deserialize ledger") || reason.contains("verify ledger hash chain"),
+            "unexpected reason: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn terminal_phase_remains_durable_but_is_not_active_after_reload() {
+        let ft_dir = durable_test_dir("terminal-phase");
+        let plan = make_plan(1);
+        {
+            let mut store =
+                IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+            store
+                .create_ledger("txe-terminal", &plan)
+                .expect("create ledger");
+            assert_eq!(
+                store
+                    .transition_phase("txe-terminal", TxPhase::Preparing)
+                    .expect("persist preparing phase"),
+                TxPhase::Planned
+            );
+            assert_eq!(
+                store
+                    .transition_phase("txe-terminal", TxPhase::Committing)
+                    .expect("persist committing phase"),
+                TxPhase::Preparing
+            );
+            assert_eq!(
+                store
+                    .transition_phase("txe-terminal", TxPhase::Completed)
+                    .expect("persist terminal phase"),
+                TxPhase::Committing
+            );
+        }
+
+        let spool_path = ft_dir.join("tx_ledgers").join("txe-terminal.json");
+        assert!(spool_path.is_file(), "terminal ledger remains durable");
+        let persisted: TxExecutionLedger =
+            serde_json::from_slice(&std::fs::read(&spool_path).expect("read terminal ledger"))
+                .expect("deserialize terminal ledger");
+        assert_eq!(persisted.phase(), TxPhase::Completed);
+
+        let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("reopen durable store");
+        assert_eq!(reopened.active_count(), 0);
+        assert!(reopened.get_ledger("txe-terminal").is_none());
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn store_transition_phase_persist_failure_keeps_previous_phase() {
+        let ft_dir = durable_test_dir("phase-write-failure");
+        let plan = make_plan(1);
+        let mut store =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+        store
+            .create_ledger("txe-write-failure", &plan)
+            .expect("create ledger");
+        store.fail_persist_writes = true;
+
+        let err = store
+            .transition_phase("txe-write-failure", TxPhase::Preparing)
+            .expect_err("phase transition must fail when its snapshot cannot be written");
+        assert!(matches!(err, IdempotencyError::LedgerPersist { .. }));
+        assert_eq!(
+            store
+                .get_ledger("txe-write-failure")
+                .expect("ledger remains tracked")
+                .phase(),
+            TxPhase::Planned,
+            "a failed copy-on-write publish must not expose the candidate phase"
+        );
+
+        store.fail_persist_writes = false;
+        drop(store);
+        let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("reopen durable store");
+        assert_eq!(
+            reopened
+                .get_ledger("txe-write-failure")
+                .expect("reloaded ledger")
+                .phase(),
+            TxPhase::Planned
+        );
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn record_persist_failure_keeps_ledger_and_dedup_unchanged() {
+        let ft_dir = durable_test_dir("record-write-failure");
+        let plan = make_plan(1);
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let mut store =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+        store
+            .create_ledger("txe-record-failure", &plan)
+            .expect("create ledger");
+        store
+            .transition_phase("txe-record-failure", TxPhase::Preparing)
+            .expect("transition ledger");
+        let mut reservation = store
+            .acquire_durable_reservation("txe-record-failure", &key, 1_000)
+            .expect("acquire reservation before persistence fault");
+        store.fail_persist_writes = true;
+
+        let error = store
+            .record_execution_reserved(
+                &mut reservation,
+                "txe-record-failure",
+                key.clone(),
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "agent",
+                1_000,
+            )
+            .expect_err("record must fail when candidate cannot persist");
+        assert!(matches!(error, IdempotencyError::LedgerPersist { .. }));
+        assert_eq!(
+            store
+                .get_ledger("txe-record-failure")
+                .expect("ledger remains active")
+                .record_count(),
+            0
+        );
+        assert!(
+            store
+                .peek_cached_outcome(&key, store.logical_clock_ms())
+                .is_none()
+        );
+
+        store.fail_persist_writes = false;
+        drop(reservation);
+        drop(store);
+        let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("reopen durable store");
+        assert_eq!(
+            reopened
+                .get_ledger("txe-record-failure")
+                .expect("reloaded ledger")
+                .record_count(),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn completion_persist_failure_preserves_pending_in_memory_and_on_disk() {
+        let ft_dir = durable_test_dir("completion-write-failure");
+        let plan = make_plan(1);
+        let key = make_key("test-plan", &plan.steps[0].id);
+        let mut store =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+        store
+            .create_ledger("txe-completion-failure", &plan)
+            .expect("create ledger");
+        store
+            .transition_phase("txe-completion-failure", TxPhase::Preparing)
+            .expect("transition ledger");
+        let mut reservation = store
+            .acquire_durable_reservation("txe-completion-failure", &key, 1_000)
+            .expect("acquire durable reservation");
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                "txe-completion-failure",
+                key.clone(),
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "agent",
+                1_000,
+            )
+            .expect("persist pending reservation");
+        store.fail_persist_writes = true;
+
+        let error = store
+            .complete_execution_reserved(
+                reservation,
+                "txe-completion-failure",
+                key.clone(),
+                StepOutcome::Success { result: None },
+                1_001,
+            )
+            .expect_err("completion must fail when candidate cannot persist");
+        assert!(matches!(error, IdempotencyError::LedgerPersist { .. }));
+        assert_eq!(
+            store.peek_cached_outcome(&key, store.logical_clock_ms()),
+            Some(&StepOutcome::Pending)
+        );
+        assert_eq!(
+            store
+                .get_ledger("txe-completion-failure")
+                .and_then(|ledger| ledger.get_outcome(&key)),
+            Some(&StepOutcome::Pending)
+        );
+
+        store.fail_persist_writes = false;
+        drop(store);
+        let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("reopen durable store");
+        assert_eq!(
+            reopened.peek_cached_outcome(&key, reopened.logical_clock_ms()),
+            Some(&StepOutcome::Pending)
+        );
 
         let _ = std::fs::remove_dir_all(&ft_dir);
     }
@@ -2978,6 +6529,9 @@ mod tests {
         store
             .create_ledger("txe-2000", &plan)
             .expect("create ledger");
+        store
+            .transition_phase("txe-2000", TxPhase::Preparing)
+            .expect("transition ledger");
         store
             .record_execution(
                 "txe-2000",
@@ -3034,8 +6588,88 @@ mod tests {
         assert_eq!(store.active_count(), 0);
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn store_archived_terminal_ledger_keeps_replay_dedup_until_ttl() {
+    fn abort_and_archive_matching_ledgers_is_plan_hash_scoped_and_durable() {
+        let ft_dir = durable_test_dir("retire-matching");
+        let matching_plan = make_plan(1);
+        let different_plan = make_plan(2);
+        let matching_id = "txe-matching";
+        let different_id = "txe-different-hash";
+        {
+            let mut store =
+                IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+            store
+                .create_ledger(matching_id, &matching_plan)
+                .expect("create matching ledger");
+            store
+                .transition_phase(matching_id, TxPhase::Preparing)
+                .expect("transition matching ledger");
+            store
+                .transition_phase(matching_id, TxPhase::Committing)
+                .expect("transition matching ledger to committing");
+            store
+                .create_ledger(different_id, &different_plan)
+                .expect("create different-hash ledger");
+
+            let retired = store
+                .abort_and_archive_matching_ledgers(&matching_plan.plan_id, matching_plan.plan_hash)
+                .expect("retire matching execution");
+            assert_eq!(retired, vec![matching_id.to_string()]);
+            assert!(store.get_ledger(matching_id).is_none());
+            assert!(store.get_ledger(different_id).is_some());
+        }
+
+        let matching_path = ft_dir
+            .join("tx_ledgers")
+            .join(format!("{matching_id}.json"));
+        let matching: TxExecutionLedger =
+            serde_json::from_slice(&std::fs::read(&matching_path).expect("read retired ledger"))
+                .expect("deserialize retired ledger");
+        assert_eq!(matching.phase(), TxPhase::Aborted);
+
+        let reopened = IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default())
+            .expect("reopen durable store");
+        assert!(reopened.get_ledger(matching_id).is_none());
+        assert!(reopened.get_ledger(different_id).is_some());
+
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn abort_and_archive_persist_failure_does_not_mutate_active_map() {
+        let ft_dir = durable_test_dir("retire-write-failure");
+        let plan = make_plan(1);
+        let mut store =
+            IdempotencyStore::open(&ft_dir, IdempotencyPolicy::default()).expect("open store");
+        store
+            .create_ledger("txe-retire-failure", &plan)
+            .expect("create ledger");
+        store
+            .transition_phase("txe-retire-failure", TxPhase::Preparing)
+            .expect("transition ledger");
+        store.fail_persist_writes = true;
+
+        let error = store
+            .abort_and_archive_matching_ledgers(&plan.plan_id, plan.plan_hash)
+            .expect_err("retirement must fail when terminal snapshot cannot persist");
+        assert!(matches!(error, IdempotencyError::LedgerPersist { .. }));
+        assert_eq!(store.active_count(), 1);
+        assert_eq!(
+            store
+                .get_ledger("txe-retire-failure")
+                .expect("ledger remains active")
+                .phase(),
+            TxPhase::Preparing
+        );
+
+        store.fail_persist_writes = false;
+        let _ = std::fs::remove_dir_all(&ft_dir);
+    }
+
+    #[test]
+    fn store_archived_terminal_ledger_keeps_sticky_replay_dedup() {
         let mut store = IdempotencyStore::new(IdempotencyPolicy {
             dedup_ttl_ms: 10_000,
             ..IdempotencyPolicy::default()
@@ -3077,7 +6711,10 @@ mod tests {
 
         assert_eq!(archived.phase(), TxPhase::Completed);
         assert_eq!(store.active_count(), 0);
-        assert_eq!(store.check_dedup(&key), Some(&outcome));
+        assert_eq!(
+            store.peek_cached_outcome(&key, store.logical_clock_ms()),
+            Some(&outcome)
+        );
     }
 
     #[test]
@@ -3137,18 +6774,26 @@ mod tests {
             .unwrap();
 
         // Dedup entry exists.
-        assert!(store.check_dedup(&key).is_some());
+        assert!(
+            store
+                .peek_cached_outcome(&key, store.logical_clock_ms())
+                .is_some()
+        );
 
         // Evict entries older than 2000.
         store.evict_stale(2000);
 
-        // Still in ledger (not evicted from there), but global dedup evicted.
-        // The check_dedup also looks at ledgers, so it will still find it.
-        assert!(store.check_dedup(&key).is_some());
+        // A successful external effect is sticky replay proof and is not
+        // evicted by TTL; active-ledger lookup independently retains it too.
+        assert!(
+            store
+                .peek_cached_outcome(&key, store.logical_clock_ms())
+                .is_some()
+        );
     }
 
     #[test]
-    fn store_expired_replay_dedup_does_not_erase_resume_evidence() {
+    fn sticky_replay_proof_does_not_expire_or_erase_resume_evidence() {
         let mut store = IdempotencyStore::new(IdempotencyPolicy {
             dedup_ttl_ms: 100,
             ..IdempotencyPolicy::default()
@@ -3193,10 +6838,17 @@ mod tests {
             .unwrap();
 
         assert!(
-            store.check_dedup(&old_key).is_none(),
-            "dedup replay must expire against the store logical clock"
+            matches!(
+                store.peek_cached_outcome(&old_key, store.logical_clock_ms()),
+                Some(StepOutcome::Success { result: Some(result) }) if result == "old"
+            ),
+            "durable success proof must not age into permission to redispatch"
         );
-        assert!(store.check_dedup(&newer_key).is_some());
+        assert!(
+            store
+                .peek_cached_outcome(&newer_key, store.logical_clock_ms())
+                .is_some()
+        );
 
         let ctx = store.resume_context("exec-1", &plan).unwrap();
         assert_eq!(
@@ -3266,7 +6918,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_dedup_ttl_expires_global_and_active_ledger_hits_ft_u3s72() {
+    fn policy_dedup_ttl_expires_retryable_failures_ft_u3s72() {
         let policy = IdempotencyPolicy {
             dedup_ttl_ms: 10,
             ..IdempotencyPolicy::default()
@@ -3280,13 +6932,21 @@ mod tests {
             .record_execution(
                 "exec-1",
                 old_key.clone(),
-                StepOutcome::Success { result: None },
+                StepOutcome::Failed {
+                    error_code: "retryable".to_string(),
+                    error_message: "retry after ttl".to_string(),
+                    compensated: false,
+                },
                 StepRisk::Low,
                 "agent-a",
                 100,
             )
             .unwrap();
-        assert!(store.check_dedup(&old_key).is_some());
+        assert!(
+            store
+                .peek_cached_outcome(&old_key, store.logical_clock_ms())
+                .is_some()
+        );
 
         let fresh_key = IdempotencyKey::new("test-plan", &plan.steps[1].id, "fresh");
         store
@@ -3301,8 +6961,54 @@ mod tests {
             .unwrap();
 
         assert!(
-            store.check_dedup(&old_key).is_none(),
-            "dedup_ttl_ms must apply to active-ledger hits as well as the global guard"
+            store
+                .peek_cached_outcome(&old_key, store.logical_clock_ms())
+                .is_none(),
+            "dedup_ttl_ms must expire retryable failures in active and global lookup"
+        );
+    }
+
+    #[test]
+    fn store_rejects_retrograde_timestamp_before_mutating_ledger() {
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        let plan = make_plan(2);
+        store.create_ledger("exec-1", &plan).unwrap();
+        store.create_ledger("exec-2", &plan).unwrap();
+        let first_key = IdempotencyKey::new("test-plan", &plan.steps[0].id, "first");
+        store
+            .record_execution(
+                "exec-1",
+                first_key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent",
+                100,
+            )
+            .unwrap();
+        let retrograde_key = IdempotencyKey::new("test-plan", &plan.steps[1].id, "retrograde");
+
+        let error = store
+            .record_execution(
+                "exec-2",
+                retrograde_key.clone(),
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "agent",
+                99,
+            )
+            .expect_err("retrograde timestamp must fail closed");
+        assert_eq!(
+            error,
+            IdempotencyError::RetrogradeTimestamp {
+                observed_ms: 99,
+                high_water_ms: 100
+            }
+        );
+        assert_eq!(store.get_ledger("exec-2").unwrap().record_count(), 0);
+        assert!(
+            store
+                .peek_cached_outcome(&retrograde_key, store.logical_clock_ms())
+                .is_none()
         );
     }
 
@@ -3551,7 +7257,7 @@ mod tests {
         assert!(ledger.verify_chain().chain_intact);
 
         let json = serde_json::to_string(&ledger).unwrap();
-        let mutated = json.replace("agent-original", "agent-impostor");
+        let mutated = json.replacen("agent-original", "agent-impostor", 1);
         let mut tampered: TxExecutionLedger = serde_json::from_str(&mutated).unwrap();
         tampered.rebuild_index();
         let result = tampered.verify_chain();
@@ -3640,22 +7346,34 @@ mod tests {
         assert_eq!(back.agent_id, "agent-x");
     }
 
-    // ── FNV-1a hash tests ──
+    // ── SHA-256 canonical hash tests ──
 
     #[test]
-    fn fnv1a_deterministic() {
-        assert_eq!(fnv1a_hash("hello"), fnv1a_hash("hello"));
+    fn sha256_domain_digest_is_deterministic() {
+        assert_eq!(
+            sha256_domain_digest(b"domain", &[b"hello"]),
+            sha256_domain_digest(b"domain", &[b"hello"])
+        );
     }
 
     #[test]
-    fn fnv1a_different_inputs() {
-        assert_ne!(fnv1a_hash("hello"), fnv1a_hash("world"));
+    fn sha256_domain_digest_separates_domains_and_inputs() {
+        assert_ne!(
+            sha256_domain_digest(b"domain-a", &[b"hello"]),
+            sha256_domain_digest(b"domain-b", &[b"hello"])
+        );
+        assert_ne!(
+            sha256_domain_digest(b"domain", &[b"hello"]),
+            sha256_domain_digest(b"domain", &[b"world"])
+        );
     }
 
     #[test]
-    fn fnv1a_empty() {
-        // FNV-1a of empty string is the offset basis.
-        assert_eq!(fnv1a_hash(""), 0xcbf29ce484222325);
+    fn sha256_domain_digest_length_delimits_components() {
+        assert_ne!(
+            sha256_domain_digest(b"domain", &[b"a|b", b"c", b"d"]),
+            sha256_domain_digest(b"domain", &[b"a", b"b", b"c|d"])
+        );
     }
 
     // ── Integration: full tx lifecycle ──
@@ -3676,7 +7394,11 @@ mod tests {
             let key = IdempotencyKey::new("test-plan", &step.id, &step.description);
 
             // Check dedup (should be None first time).
-            assert!(store.check_dedup(&key).is_none());
+            assert!(
+                store
+                    .peek_cached_outcome(&key, store.logical_clock_ms())
+                    .is_none()
+            );
 
             store
                 .record_execution(
@@ -3692,7 +7414,11 @@ mod tests {
                 .unwrap();
 
             // Dedup should now hit.
-            assert!(store.check_dedup(&key).is_some());
+            assert!(
+                store
+                    .peek_cached_outcome(&key, store.logical_clock_ms())
+                    .is_some()
+            );
         }
 
         // Complete.
@@ -3794,7 +7520,7 @@ mod tests {
 
         // Second execution (replay). The key should dedup across instances.
         store.create_ledger("exec-2", &plan).unwrap();
-        let dedup = store.check_dedup(&key);
+        let dedup = store.peek_cached_outcome(&key, store.logical_clock_ms());
         assert!(dedup.is_some());
         assert!(matches!(dedup.unwrap(), StepOutcome::Success { .. }));
     }

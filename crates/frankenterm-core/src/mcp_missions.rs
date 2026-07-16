@@ -159,7 +159,7 @@ pub(super) fn mcp_default_mission_tx_file_path(
     let layout = config
         .workspace_layout(None)
         .map_err(McpToolError::from_error)?;
-    Ok(layout.ft_dir.join("mission").join("tx-active.json"))
+    resolve_workspace_scoped_path(&layout.root, ".ft/mission/tx-active.json")
 }
 
 pub(super) fn mcp_resolve_mission_tx_file_path(
@@ -188,13 +188,16 @@ pub(super) fn mcp_resolve_mission_tx_file_path(
 /// `~/.ssh/id_rsa` and trigger arbitrary-file read, or supply an absolute
 /// path and overwrite anything the watcher UID can write.
 ///
-/// This helper enforces three gates:
+/// This helper enforces four gates:
 /// 1. Reject any `..` component in the user-supplied path.
 /// 2. Relative paths are joined to the workspace root; absolute paths
 ///    are accepted only if they canonicalize inside the workspace.
 /// 3. The resolved path's nearest existing ancestor must canonicalize
 ///    inside the workspace root (supports save paths where the target
 ///    file does not yet exist).
+/// 4. The returned path is rebuilt from that canonical ancestor plus any
+///    unresolved suffix, freezing existing symlink resolution instead of
+///    returning the caller-controlled alias that was merely validated.
 pub(super) fn resolve_workspace_scoped_path(
     workspace_root: &Path,
     user_path: &str,
@@ -285,7 +288,21 @@ pub(super) fn resolve_workspace_scoped_path(
         ));
     }
 
-    Ok(candidate)
+    let unresolved_suffix = candidate.strip_prefix(ancestor).map_err(|err| {
+        McpToolError::new(
+            MCP_ERR_INVALID_ARGS,
+            format!(
+                "failed to bind path {} to its canonical ancestor {}: {err}",
+                candidate.display(),
+                ancestor.display()
+            ),
+            Some(
+                "contract_file and mission_file must resolve unambiguously inside the workspace."
+                    .to_string(),
+            ),
+        )
+    })?;
+    Ok(ancestor_canon.join(unresolved_suffix))
 }
 
 pub(super) fn mcp_load_mission_tx_contract_from_path(
@@ -339,51 +356,30 @@ pub(super) fn mcp_load_mission_tx_contract_from_path(
 }
 
 pub(super) fn mcp_save_mission_tx_contract_to_path(
+    guard: &crate::tx_execution::TxContractLockGuard,
     path: &Path,
     contract: &crate::plan::MissionTxContract,
 ) -> std::result::Result<(), McpToolError> {
-    let json = serde_json::to_string_pretty(contract).map_err(|err| {
-        McpToolError::new(
-            "robot.tx_serialize_failed",
-            format!("Failed to serialize tx contract: {err}"),
-            None,
-        )
-    })?;
+    crate::tx_execution::save_tx_contract_atomic(guard, path, contract).map_err(|err| {
+        use crate::tx_execution::TxContractStoreErrorKind;
 
-    // [ft-wxqbt] Atomic write: dump to <path>.tmp in the same directory,
-    // then std::fs::rename over the target. POSIX + NTFS both guarantee
-    // that rename is atomic — the tx contract is either the old contents
-    // or the new contents, never a truncated halfway state. Direct
-    // std::fs::write would open+truncate+write; a crash between truncate
-    // and final write leaves a partial JSON file that
-    // mcp_load_mission_tx_contract_from_path cannot parse, losing the
-    // entire contract. Same pattern used by config_profiles.rs:129-135,
-    // recorder_storage.rs:1061, rulesets.rs:182, wal_engine.rs:892.
-    let tmp_path = unique_mcp_json_tmp_path(path);
-    std::fs::write(&tmp_path, &json).map_err(|err| {
-        McpToolError::new(
-            "robot.tx_write_failed",
+        let code = match err.kind() {
+            TxContractStoreErrorKind::Validation => "robot.tx_validation_failed",
+            TxContractStoreErrorKind::Serialization => "robot.tx_serialize_failed",
+            TxContractStoreErrorKind::TooLarge => "robot.tx_oversize",
+            TxContractStoreErrorKind::InProgress
+            | TxContractStoreErrorKind::Lock
+            | TxContractStoreErrorKind::Write
+            | TxContractStoreErrorKind::Sync
+            | TxContractStoreErrorKind::Rename => "robot.tx_write_failed",
+        };
+        let hint = err.recovery_path().map(|recovery_path| {
             format!(
-                "Failed to write tx contract temp file {}: {err}",
-                tmp_path.display()
-            ),
-            None,
-        )
-    })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        // Best-effort cleanup: don't leak the tmp file if the rename
-        // fails (e.g. cross-device). The outer error carries the real
-        // diagnostic.
-        let _ = std::fs::remove_file(&tmp_path);
-        McpToolError::new(
-            "robot.tx_write_failed",
-            format!(
-                "Failed to rename tx contract temp file {} -> {}: {err}",
-                tmp_path.display(),
-                path.display()
-            ),
-            None,
-        )
+                "A transaction recovery artifact was retained through the pinned contract parent; {} is only its last-known display path and may no longer resolve after a namespace change. Validate durable ledger evidence and the artifact's completeness and contents before recovery.",
+                recovery_path.display()
+            )
+        });
+        McpToolError::new(code, err.to_string(), hint)
     })
 }
 
@@ -423,7 +419,7 @@ pub(super) fn mcp_default_mission_file_path(
     let layout = config
         .workspace_layout(None)
         .map_err(McpToolError::from_error)?;
-    Ok(layout.ft_dir.join("mission").join("active.json"))
+    resolve_workspace_scoped_path(&layout.root, ".ft/mission/active.json")
 }
 
 pub(super) fn mcp_resolve_mission_file_path(
@@ -1434,15 +1430,23 @@ mod tests {
     fn save_tx_contract_is_atomic_rename_ft_wxqbt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tx-active.json");
-        let tmp_path = path.with_extension("json.tmp");
+        let baseline = make_tx_contract(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&baseline).unwrap()).unwrap();
+        let guard = crate::tx_execution::acquire_tx_contract_lock(dir.path(), &path).unwrap();
 
-        // First save: creates the target file.
+        // First save replaces the existing authoritative contract.
         let contract = make_tx_contract(3);
-        super::mcp_save_mission_tx_contract_to_path(&path, &contract).unwrap();
+        super::mcp_save_mission_tx_contract_to_path(&guard, &path, &contract).unwrap();
         assert!(path.exists(), "target file must exist after save");
         assert!(
-            !tmp_path.exists(),
-            "ft-wxqbt: {}.tmp must not linger after successful rename",
+            !std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".recovery.tmp")
+            }),
+            "ft-wxqbt: recovery temp must not linger after successful rename: {}",
             path.display()
         );
 
@@ -1457,10 +1461,16 @@ mod tests {
         // atomically. Old contents must be gone; .tmp must still
         // be absent.
         let contract2 = make_tx_contract(5);
-        super::mcp_save_mission_tx_contract_to_path(&path, &contract2).unwrap();
+        super::mcp_save_mission_tx_contract_to_path(&guard, &path, &contract2).unwrap();
         assert!(
-            !tmp_path.exists(),
-            "ft-wxqbt: .tmp must not linger on overwrite"
+            !std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".recovery.tmp")
+            }),
+            "ft-wxqbt: recovery temp must not linger on overwrite"
         );
         let on_disk2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1479,14 +1489,14 @@ mod tests {
     }
 
     #[test]
-    fn tx_contract_tmp_paths_are_unique_per_save_attempt() {
+    fn mission_tmp_paths_are_unique_per_save_attempt() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx-active.json");
+        let path = dir.path().join("mission.json");
 
         let first = super::unique_mcp_json_tmp_path(&path);
         let second = super::unique_mcp_json_tmp_path(&path);
 
-        assert_ne!(first, second, "tx temp paths must not collide");
+        assert_ne!(first, second, "mission temp paths must not collide");
         assert_eq!(first.parent(), path.parent());
         assert_eq!(second.parent(), path.parent());
         assert_ne!(first, path.with_extension("json.tmp"));
@@ -1583,10 +1593,10 @@ mod tests {
         std::fs::write(root.join("mission/contract.json"), "{}").expect("write fixture");
         let resolved =
             resolve_workspace_scoped_path(root, "mission/contract.json").expect("valid relative");
-        assert!(
-            resolved.ends_with("mission/contract.json"),
-            "resolved path should end with supplied relative: {}",
-            resolved.display()
+        assert_eq!(
+            resolved,
+            root.join("mission/contract.json").canonicalize().unwrap(),
+            "existing targets must return their canonical identity"
         );
     }
 
@@ -1600,7 +1610,14 @@ mod tests {
         std::fs::create_dir_all(root.join("mission")).expect("mkdir");
         let resolved =
             resolve_workspace_scoped_path(root, "mission/not-yet.json").expect("valid save path");
-        assert!(resolved.ends_with("mission/not-yet.json"));
+        assert_eq!(
+            resolved,
+            root.join("mission")
+                .canonicalize()
+                .unwrap()
+                .join("not-yet.json"),
+            "save targets must retain their unresolved suffix beneath the canonical ancestor"
+        );
     }
 
     #[test]
@@ -1612,7 +1629,50 @@ mod tests {
         let abs = root.join("mission/inside.json");
         let resolved = resolve_workspace_scoped_path(root, &abs.to_string_lossy())
             .expect("absolute path inside root must be accepted");
-        assert!(resolved.ends_with("mission/inside.json"));
+        assert_eq!(resolved, abs.canonicalize().unwrap());
+    }
+
+    /// The authorization result is also the I/O identity. Retargeting an
+    /// intermediate symlink after resolution must not redirect a subsequent
+    /// read to a different in-workspace file.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_existing_path_survives_intermediate_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path();
+        let original_dir = workspace_root.join("original");
+        let foreign_dir = workspace_root.join("foreign");
+        std::fs::create_dir_all(&original_dir).expect("create original directory");
+        std::fs::create_dir_all(&foreign_dir).expect("create foreign directory");
+        std::fs::write(original_dir.join("contract.json"), "original")
+            .expect("write original contract");
+        std::fs::write(foreign_dir.join("contract.json"), "foreign")
+            .expect("write foreign contract");
+
+        let active_alias = workspace_root.join("active");
+        let replacement_alias = workspace_root.join("active-next");
+        symlink(&original_dir, &active_alias).expect("create original alias");
+        symlink(&foreign_dir, &replacement_alias).expect("create replacement alias");
+
+        let resolved = resolve_workspace_scoped_path(workspace_root, "active/contract.json")
+            .expect("resolve original alias");
+        assert_eq!(
+            resolved,
+            original_dir.join("contract.json").canonicalize().unwrap()
+        );
+
+        std::fs::rename(&replacement_alias, &active_alias).expect("retarget alias atomically");
+        assert_eq!(
+            std::fs::read_to_string(&resolved).expect("read frozen identity"),
+            "original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(active_alias.join("contract.json"))
+                .expect("read retargeted alias"),
+            "foreign"
+        );
     }
 
     /// [ft-security-mcp-path-traversal regression — session 2026-04-21]

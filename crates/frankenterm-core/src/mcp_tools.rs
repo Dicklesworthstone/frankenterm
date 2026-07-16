@@ -1,17 +1,63 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
 use std::cell::RefCell;
-use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-#[cfg(all(test, unix))]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
+#[cfg(all(test, unix))]
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use serde::de::DeserializeOwned;
 
+use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
+use super::mcp_types::{
+    self, AccountsParams, AccountsRefreshParams, AttentionParams, AwaitEventParams,
+    CassSearchParams, CassStatusParams, CassViewParams, EventsAnnotateParams, EventsLabelParams,
+    EventsParams, EventsTriageParams, GetTextParams, McpAccountInfo, McpAccountsData,
+    McpAccountsRefreshData, McpAwaitConditionStatus, McpAwaitEventData, McpEnvelope, McpEventItem,
+    McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
+    McpMissionExplainData, McpMissionStateData, McpPaneState, McpReleaseData, McpReservationInfo,
+    McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
+    McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData, McpTxPlanData,
+    McpTxRollbackData, McpTxRunData, McpTxShowData, McpWaitForData, McpWorkflowRunData,
+    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
+    MissionResumeParams, MissionStateParams, OperatingEnvelopeParams, RehearsalScoreParams,
+    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
+    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
+    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams, apply_tail_truncation,
+    now_ms,
+};
+#[allow(unused_imports)]
+use super::{
+    AccountRecord, ActionKind, ActorKind, AgentProvider, AgentType, ApprovalStore, CassAgent,
+    CassClient, CassError, CassSearchOptions, CassSearchResult, CassStatus, CassViewOptions,
+    CassViewResult, CautClient, CautService, Config, DecisionContext, EventQuery,
+    HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
+    HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
+    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
+    MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
+    MCP_ERR_WORKFLOW, McpToolError, Osc133State, PaneCapabilities, PaneFilterConfig, PaneInfo,
+    PaneReservation, PaneWaiter, PatternEngine, PolicyDecision, PolicyEngine, PolicyGatedInjector,
+    PolicyInput, SearchQueryDefaults, SearchQueryInput, SharedRateLimiter, StorageHandle,
+    UnifiedSearchMode, WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow,
+    WorkflowExecutionResult, approval_command, build_mcp_shared_rate_limiter,
+    build_mcp_workflow_assembly, build_policy_engine_with_shared_rate_limiter,
+    default_wezterm_handle, effective_search_fusion_backend, effective_search_fusion_weights,
+    effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
+    map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
+    mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
+    mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
+    mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
+    mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
+    mcp_tx_transition_info, parse_cass_agent, parse_caut_service, parse_unified_search_query,
+    policy_reason, record_mcp_audit_sync, redact_mcp_args, reservation_to_mcp_info,
+    resolve_alt_screen_state, resolve_workspace_id, to_storage_search_options,
+};
+use super::{
+    MCP_REFRESH_COOLDOWN_MS, check_refresh_cooldown, injection_from_decision,
+    resolve_pane_capabilities,
+};
 use crate::attention_router::{
     AttentionRouterSourceAdapterInput, AttentionRouterSurface,
     build_attention_router_surface_payload,
@@ -45,57 +91,6 @@ use crate::robot_types::{
 };
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use crate::storage::EventStreamQuery;
-use fs2::FileExt;
-
-use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
-use super::mcp_types::{
-    self, AccountsParams, AccountsRefreshParams, AttentionParams, AwaitEventParams,
-    CassSearchParams, CassStatusParams, CassViewParams, EventsAnnotateParams, EventsLabelParams,
-    EventsParams, EventsTriageParams, GetTextParams, McpAccountInfo, McpAccountsData,
-    McpAccountsRefreshData, McpAwaitConditionStatus, McpAwaitEventData, McpEnvelope, McpEventItem,
-    McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
-    McpMissionExplainData, McpMissionStateData, McpPaneState, McpReleaseData, McpReservationInfo,
-    McpReservationsData, McpReserveData, McpRuleItem, McpRuleMatchItem, McpRuleTraceInfo,
-    McpRulesListData, McpRulesTestData, McpSearchData, McpSearchHit, McpSendData, McpTxPlanData,
-    McpTxRollbackData, McpTxRunData, McpTxShowData, McpWaitForData, McpWorkflowRunData,
-    MissionAbortParams, MissionExplainParams, MissionObjectivePlanParams, MissionPauseParams,
-    MissionResumeParams, MissionStateParams, OperatingEnvelopeParams, RehearsalScoreParams,
-    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
-    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
-    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams, apply_tail_truncation,
-    now_ms,
-};
-#[allow(unused_imports)]
-use super::{
-    AccountRecord, ActionKind, ActorKind, AgentProvider, AgentType, ApprovalStore, CassAgent,
-    CassClient, CassError, CassSearchOptions, CassSearchResult, CassStatus, CassViewOptions,
-    CassViewResult, CautClient, CautService, Config, DecisionContext, EventQuery,
-    HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,
-    HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
-    MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
-    MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-    MCP_ERR_WORKFLOW, McpToolError, Osc133State, PaneCapabilities,
-    PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter, PatternEngine, PolicyDecision,
-    PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults, SearchQueryInput,
-    SharedRateLimiter, StorageHandle, UnifiedSearchMode, WaitOptions, WaitResult, WeztermError,
-    WeztermHandleSource, Workflow,
-    WorkflowExecutionResult, approval_command, build_mcp_shared_rate_limiter,
-    build_mcp_workflow_assembly, build_policy_engine_with_shared_rate_limiter,
-    default_wezterm_handle, effective_search_fusion_backend, effective_search_fusion_weights,
-    effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
-    map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
-    mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
-    mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
-    mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
-    mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
-    mcp_tx_transition_info, parse_cass_agent, parse_caut_service, parse_unified_search_query,
-    policy_reason, record_mcp_audit_sync, redact_mcp_args, reservation_to_mcp_info,
-    resolve_alt_screen_state, resolve_workspace_id, to_storage_search_options,
-};
-use super::{
-    MCP_REFRESH_COOLDOWN_MS, check_refresh_cooldown, injection_from_decision,
-    resolve_pane_capabilities,
-};
 use crate::workflows::ManualWorkflowRunOutcome;
 
 /// br-ft-pgjat: route silent `record_audit_action_redacted_with_cx`
@@ -685,102 +680,103 @@ fn validate_cass_timeout_secs(
     Some(envelope_to_content(envelope))
 }
 
-static MCP_TX_CONTRACT_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-struct McpTxContractLockGuard {
-    key: PathBuf,
-    _file: File,
-}
-
-impl Drop for McpTxContractLockGuard {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self._file);
-        if let Ok(mut locks) = MCP_TX_CONTRACT_LOCKS.lock() {
-            locks.remove(&self.key);
-        }
-    }
-}
-
-fn canonical_tx_lock_key(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn tx_contract_lock_path(path: &Path) -> PathBuf {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("lock");
-    path.with_extension(format!("{extension}.lock"))
-}
-
-fn release_mcp_tx_contract_lock_key(key: &Path) {
-    if let Ok(mut locks) = MCP_TX_CONTRACT_LOCKS.lock() {
-        locks.remove(key);
-    }
-}
-
 fn acquire_mcp_tx_contract_lock(
+    workspace_root: &Path,
     path: &Path,
-) -> std::result::Result<McpTxContractLockGuard, McpToolError> {
-    let key = canonical_tx_lock_key(path);
-    let mut locks = MCP_TX_CONTRACT_LOCKS.lock().map_err(|_| {
-        McpToolError::new(
-            "robot.tx_lock_failed",
-            "Failed to lock tx contract registry".to_string(),
-            Some("Retry the tx operation; the in-process lock registry was poisoned.".to_string()),
-        )
-    })?;
-
-    if !locks.insert(key.clone()) {
-        return Err(McpToolError::new(
-            "robot.tx_in_progress",
-            format!("Tx contract is already being executed: {}", path.display()),
-            Some(
-                "Wait for the in-flight wa.tx_run or wa.tx_rollback call for this contract to finish."
-                    .to_string(),
-            ),
-        ));
-    }
-
-    let lock_path = tx_contract_lock_path(&key);
-    let file = match OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(file) => file,
+) -> std::result::Result<crate::tx_execution::TxContractLockGuard, McpToolError> {
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(McpToolError::new(
+                "robot.tx_not_found",
+                format!("Tx contract file not found: {}", path.display()),
+                Some("Pass contract_file or create .ft/mission/tx-active.json.".to_string()),
+            ));
+        }
         Err(err) => {
-            release_mcp_tx_contract_lock_key(&key);
             return Err(McpToolError::new(
                 "robot.tx_lock_failed",
                 format!(
-                    "Failed to open tx contract lock file {}: {err}",
-                    lock_path.display()
+                    "Failed to inspect tx contract before locking {}: {err}",
+                    path.display()
                 ),
-                None,
+                Some("Fix access to the transaction contract path, then retry.".to_string()),
             ));
         }
-    };
-
-    if let Err(err) = FileExt::try_lock_exclusive(&file) {
-        release_mcp_tx_contract_lock_key(&key);
-        return Err(McpToolError::new(
-            "robot.tx_in_progress",
-            format!(
-                "Tx contract is already being executed: {} ({err})",
-                path.display()
-            ),
-            Some(format!(
-                "Wait for the process holding {} to finish.",
-                lock_path.display()
-            )),
-        ));
     }
+    crate::tx_execution::acquire_tx_contract_lock(workspace_root, path).map_err(|err| {
+        let in_progress = err.kind() == crate::tx_execution::TxContractStoreErrorKind::InProgress;
+        McpToolError::new(
+            if in_progress {
+                "robot.tx_in_progress"
+            } else {
+                "robot.tx_lock_failed"
+            },
+            err.to_string(),
+            Some(if in_progress {
+                "Wait for the in-flight transaction mutation to finish, then retry.".to_string()
+            } else {
+                "Fix access to the transaction contract lock file, then retry.".to_string()
+            }),
+        )
+    })
+}
 
-    Ok(McpTxContractLockGuard { key, _file: file })
+fn load_mcp_tx_contract_from_guard(
+    guard: &crate::tx_execution::TxContractLockGuard,
+) -> std::result::Result<crate::plan::MissionTxContract, McpToolError> {
+    let path = guard.authoritative_path();
+    let raw = guard.read_authoritative_contract_bytes().map_err(|err| {
+        let oversize = err.kind() == crate::tx_execution::TxContractStoreErrorKind::TooLarge;
+        McpToolError::new(
+            if oversize {
+                "robot.tx_oversize"
+            } else {
+                "robot.tx_read_failed"
+            },
+            err.to_string(),
+            Some(if oversize {
+                "Reduce the transaction contract below the supported byte limit before retrying."
+                    .to_string()
+            } else {
+                "The pinned transaction object or control-plane anchor is no longer safe; resolve the namespace change and retry."
+                    .to_string()
+            }),
+        )
+    })?;
+    let contract: crate::plan::MissionTxContract = serde_json::from_slice(&raw).map_err(|err| {
+        McpToolError::new(
+            "robot.tx_invalid_json",
+            format!("Invalid tx contract JSON in {}: {err}", path.display()),
+            Some("Ensure the file matches the MissionTxContract schema.".to_string()),
+        )
+    })?;
+    contract.validate().map_err(|err| {
+        McpToolError::new(
+            "robot.tx_validation_failed",
+            format!("Tx contract validation failed: {err}"),
+            Some("Inspect contract via wa.tx_show include_contract=true.".to_string()),
+        )
+    })?;
+    Ok(contract)
+}
+
+fn authorize_mcp_tx_contract_for_effects(
+    guard: &crate::tx_execution::TxContractLockGuard,
+    authoritative_path: &Path,
+) -> std::result::Result<(), McpToolError> {
+    guard.authorizes(authoritative_path).map_err(|err| {
+        McpToolError::new(
+            "robot.tx_lock_failed",
+            format!(
+                "Transaction contract authorization changed before external effect dispatch: {err}"
+            ),
+            Some(
+                "No transaction effect was dispatched; resolve and lock the authoritative contract again before retrying."
+                    .to_string(),
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -791,7 +787,67 @@ fn tx_run_test_wezterm_override_slot()
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-fn tx_run_wezterm_handle() -> crate::wezterm::WeztermHandle {
+#[cfg(test)]
+std::thread_local! {
+    static TX_CONTRACT_POST_LOCK_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+    static TX_CONTRACT_POST_AUTH_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+    static TX_CONTRACT_WORKSPACE_TEST_ROOT: RefCell<Option<PathBuf>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_tx_contract_post_lock_test_hook(hook: Option<Box<dyn FnOnce()>>) {
+    TX_CONTRACT_POST_LOCK_TEST_HOOK.with(|slot| {
+        *slot.borrow_mut() = hook;
+    });
+}
+
+#[cfg(test)]
+fn run_tx_contract_post_lock_test_hook() {
+    let hook = TX_CONTRACT_POST_LOCK_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn set_tx_contract_post_auth_test_hook(hook: Option<Box<dyn FnOnce()>>) {
+    TX_CONTRACT_POST_AUTH_TEST_HOOK.with(|slot| {
+        *slot.borrow_mut() = hook;
+    });
+}
+
+#[cfg(test)]
+fn run_tx_contract_post_auth_test_hook() {
+    let hook = TX_CONTRACT_POST_AUTH_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+fn tx_mutation_workspace_layout(config: &Config) -> crate::Result<crate::config::WorkspaceLayout> {
+    #[cfg(test)]
+    if let Some(root) = TX_CONTRACT_WORKSPACE_TEST_ROOT.with(|slot| slot.borrow().as_ref().cloned())
+    {
+        return Ok(crate::config::WorkspaceLayout::new(
+            root,
+            &config.storage,
+            &config.ipc,
+        ));
+    }
+    config.workspace_layout(None)
+}
+
+#[cfg(test)]
+fn set_tx_contract_workspace_test_root(root: Option<PathBuf>) {
+    TX_CONTRACT_WORKSPACE_TEST_ROOT.with(|slot| {
+        *slot.borrow_mut() = root;
+    });
+}
+
+fn tx_run_wezterm_handle(config: &Config) -> crate::wezterm::WeztermHandle {
     #[cfg(test)]
     if let Some(handle) = tx_run_test_wezterm_override_slot()
         .lock()
@@ -801,18 +857,31 @@ fn tx_run_wezterm_handle() -> crate::wezterm::WeztermHandle {
         return handle;
     }
 
-    default_wezterm_handle()
+    crate::wezterm::wezterm_handle_from_config(config)
 }
 
-fn mcp_tx_outcome_for_state(state: crate::plan::MissionTxState) -> crate::plan::TxOutcome {
-    match state {
-        crate::plan::MissionTxState::Committed => crate::plan::TxOutcome::Committed,
-        crate::plan::MissionTxState::RolledBack | crate::plan::MissionTxState::Compensated => {
-            crate::plan::TxOutcome::Compensated
-        }
-        crate::plan::MissionTxState::Failed => crate::plan::TxOutcome::Failed,
-        _ => crate::plan::TxOutcome::Pending,
+fn mcp_tx_contract_save_failure_after_effects(
+    save_err: McpToolError,
+    completion_context: &str,
+    retry_tool: &str,
+    effect_label: &str,
+) -> McpToolError {
+    let mut hint = format!(
+        "Do not retry {retry_tool} until inspecting the durable tx idempotency ledger and any transaction recovery artifact; retrying now is unsafe because {effect_label} may already exist."
+    );
+    if let Some(recovery_hint) = save_err.hint {
+        hint.push(' ');
+        hint.push_str(&recovery_hint);
     }
+
+    McpToolError::new(
+        save_err.code,
+        format!(
+            "{completion_context}, but updated transaction evidence could not be confirmed durably persisted: {}. {effect_label} may already exist.",
+            save_err.message
+        ),
+        Some(hint),
+    )
 }
 
 fn mcp_send_text_policy_input(
@@ -6004,6 +6073,18 @@ impl ToolHandler for WaTxRunTool {
             return deny;
         }
 
+        let layout = match tx_mutation_workspace_layout(self.config.as_ref()) {
+            Ok(layout) => layout,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_CONFIG,
+                    format!("Failed to resolve workspace layout: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
         let contract_path = match mcp_resolve_mission_tx_file_path(
             self.config.as_ref(),
             params.contract_file.as_deref(),
@@ -6015,7 +6096,7 @@ impl ToolHandler for WaTxRunTool {
                 return envelope_to_content(envelope);
             }
         };
-        let _contract_lock = match acquire_mcp_tx_contract_lock(&contract_path) {
+        let contract_lock = match acquire_mcp_tx_contract_lock(&layout.root, &contract_path) {
             Ok(lock) => lock,
             Err(err) => {
                 let envelope =
@@ -6023,7 +6104,10 @@ impl ToolHandler for WaTxRunTool {
                 return envelope_to_content(envelope);
             }
         };
-        let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+        let authoritative_contract_path = contract_lock.authoritative_path().to_path_buf();
+        #[cfg(test)]
+        run_tx_contract_post_lock_test_hook();
+        let contract = match load_mcp_tx_contract_from_guard(&contract_lock) {
             Ok(contract) => contract,
             Err(err) => {
                 let envelope =
@@ -6057,24 +6141,12 @@ impl ToolHandler for WaTxRunTool {
         }
 
         let now_ms = mcp_now_ms_i64();
-        let layout = match self.config.workspace_layout(None) {
-            Ok(layout) => layout,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_CONFIG,
-                    format!("Failed to resolve workspace layout: {err}"),
-                    None,
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
         let runtime = match CompatRuntimeBuilder::current_thread().build() {
             Ok(runtime) => runtime,
             Err(err) => {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_STORAGE,
-                    format!("Tokio runtime init failed: {err}"),
+                    format!("Runtime init failed: {err}"),
                     None,
                     elapsed_ms(start),
                 );
@@ -6114,11 +6186,12 @@ impl ToolHandler for WaTxRunTool {
             Arc::clone(&self.policy_rate_limiter),
         );
         let prepare_context = crate::plan::TxPrepareEvaluationContext::new(workspace_id)
-            .with_surface(PolicySurface::Mcp);
+            .with_surface(PolicySurface::Mcp)
+            .with_actor(crate::policy::ActorKind::Mcp);
         let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
         let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage));
         let executor = crate::tx_execution::PaneStepExecutor::new(
-            tx_run_wezterm_handle(),
+            tx_run_wezterm_handle(self.config.as_ref()),
             RefCell::new(policy_engine),
             approvals,
             targets,
@@ -6134,28 +6207,82 @@ impl ToolHandler for WaTxRunTool {
             },
         );
 
-        let mut persisted_contract = contract.clone();
-        let execution = match execution_engine.execute(&mut persisted_contract, now_ms) {
-            Ok(execution) => execution,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    "robot.tx_execution_failed",
-                    format!("tx execution failed: {err}"),
-                    None,
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
-        if let Err(err) = mcp_save_mission_tx_contract_to_path(&contract_path, &persisted_contract)
+        if let Err(err) =
+            authorize_mcp_tx_contract_for_effects(&contract_lock, &authoritative_contract_path)
         {
             let envelope =
                 McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
             return envelope_to_content(envelope);
         }
+        #[cfg(test)]
+        run_tx_contract_post_auth_test_hook();
+        let mut idem_store = match contract_lock
+            .open_idempotency_store(crate::tx_idempotency::IdempotencyPolicy::default())
+        {
+            Ok(store) => store,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_STORAGE,
+                    format!("failed to open durable tx idempotency store: {err}"),
+                    Some(
+                        "Fix access to the tx_ledgers directory; no transaction step was dispatched."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let mut persisted_contract = contract.clone();
+        let execution_result =
+            execution_engine.execute_with_store(&mut persisted_contract, &mut idem_store, now_ms);
+        let save_result = mcp_save_mission_tx_contract_to_path(
+            &contract_lock,
+            &authoritative_contract_path,
+            &persisted_contract,
+        );
+        let execution = match (execution_result, save_result) {
+            (Ok(execution), Ok(())) => execution,
+            (Ok(_), Err(save_err)) => {
+                let err = mcp_tx_contract_save_failure_after_effects(
+                    save_err,
+                    "Transaction execution completed",
+                    "wa.tx_run",
+                    "external transaction effects",
+                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+            (Err(execution_err), Ok(())) => {
+                let envelope = McpEnvelope::<()>::error(
+                    "robot.tx_execution_failed",
+                    format!(
+                        "tx execution failed after persisting available transaction evidence: {execution_err}"
+                    ),
+                    Some(
+                        "Inspect wa.tx_show(include_contract=true) before retrying; external effects may have occurred."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+            (Err(execution_err), Err(save_err)) => {
+                let err = mcp_tx_contract_save_failure_after_effects(
+                    save_err,
+                    &format!("Transaction execution failed ({execution_err})"),
+                    "wa.tx_run",
+                    "external transaction effects",
+                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
 
         let data = McpTxRunData {
-            contract_file: contract_path.display().to_string(),
+            contract_file: authoritative_contract_path.display().to_string(),
             tx_id: contract.intent.tx_id.0.clone(),
             plan_id: contract.plan.plan_id.0.clone(),
             prepare_report: execution.prepare_report,
@@ -6247,6 +6374,18 @@ impl ToolHandler for WaTxRollbackTool {
             return deny;
         }
 
+        let layout = match tx_mutation_workspace_layout(self.config.as_ref()) {
+            Ok(layout) => layout,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_CONFIG,
+                    format!("Failed to resolve workspace layout: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
         let contract_path = match mcp_resolve_mission_tx_file_path(
             self.config.as_ref(),
             params.contract_file.as_deref(),
@@ -6258,7 +6397,7 @@ impl ToolHandler for WaTxRollbackTool {
                 return envelope_to_content(envelope);
             }
         };
-        let _contract_lock = match acquire_mcp_tx_contract_lock(&contract_path) {
+        let contract_lock = match acquire_mcp_tx_contract_lock(&layout.root, &contract_path) {
             Ok(lock) => lock,
             Err(err) => {
                 let envelope =
@@ -6266,7 +6405,10 @@ impl ToolHandler for WaTxRollbackTool {
                 return envelope_to_content(envelope);
             }
         };
-        let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+        let authoritative_contract_path = contract_lock.authoritative_path().to_path_buf();
+        #[cfg(test)]
+        run_tx_contract_post_lock_test_hook();
+        let contract = match load_mcp_tx_contract_from_guard(&contract_lock) {
             Ok(contract) => contract,
             Err(err) => {
                 let envelope =
@@ -6306,50 +6448,146 @@ impl ToolHandler for WaTxRollbackTool {
             );
             return envelope_to_content(envelope);
         }
-        let comp_inputs = mcp_build_tx_compensation_inputs(
-            &commit_report,
-            params.fail_compensation_for_step.as_deref(),
-            now_ms,
-        );
-        let mut compensating_contract = contract.clone();
-        compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
-        compensating_contract
-            .receipts
-            .clone_from(&contract.receipts);
-        let compensation_report = match crate::plan::execute_compensation_phase(
-            &compensating_contract,
-            &commit_report,
-            &comp_inputs,
-            now_ms,
-        ) {
-            Ok(report) => report,
+        let runtime = match CompatRuntimeBuilder::current_thread().build() {
+            Ok(runtime) => runtime,
             Err(err) => {
                 let envelope = McpEnvelope::<()>::error(
-                    "robot.tx_execution_failed",
-                    format!("rollback compensation failed: {err}"),
+                    MCP_ERR_STORAGE,
+                    format!("Runtime init failed: {err}"),
                     None,
                     elapsed_ms(start),
                 );
                 return envelope_to_content(envelope);
             }
         };
-
-        let final_state = compensation_report.outcome.target_tx_state();
-        let mut persisted_contract = contract.clone();
-        persisted_contract.lifecycle_state = final_state;
-        persisted_contract.outcome = mcp_tx_outcome_for_state(final_state);
-        persisted_contract
-            .receipts
-            .extend(compensation_report.receipts.clone());
-        if let Err(err) = mcp_save_mission_tx_contract_to_path(&contract_path, &persisted_contract)
+        let storage = match runtime.block_on(async {
+            let rollback_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            StorageHandle::new_with_cx(&rollback_cx, &layout.db_path.to_string_lossy()).await
+        }) {
+            Ok(storage) => storage,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_STORAGE,
+                    format!("Failed to open tx storage: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let workspace_id = match resolve_workspace_id(self.config.as_ref()) {
+            Ok(workspace_id) => workspace_id,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_CONFIG,
+                    format!("Failed to resolve workspace id: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let policy_engine = build_policy_engine_with_shared_rate_limiter(
+            self.config.as_ref(),
+            false,
+            Arc::clone(&self.policy_rate_limiter),
+        );
+        let prepare_context = crate::plan::TxPrepareEvaluationContext::new(workspace_id)
+            .with_surface(PolicySurface::Mcp)
+            .with_actor(crate::policy::ActorKind::Mcp);
+        let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
+        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage));
+        let executor = crate::tx_execution::PaneStepExecutor::new(
+            tx_run_wezterm_handle(self.config.as_ref()),
+            RefCell::new(policy_engine),
+            approvals,
+            targets,
+            prepare_context,
+        );
+        let execution_engine = crate::tx_execution::TxExecutionEngine::new(
+            executor,
+            crate::tx_execution::TxExecutionConfig {
+                fail_compensation_for_step: params.fail_compensation_for_step.clone(),
+                ..crate::tx_execution::TxExecutionConfig::default()
+            },
+        );
+        if let Err(err) =
+            authorize_mcp_tx_contract_for_effects(&contract_lock, &authoritative_contract_path)
         {
             let envelope =
                 McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
             return envelope_to_content(envelope);
         }
+        #[cfg(test)]
+        run_tx_contract_post_auth_test_hook();
+        let mut idem_store = match contract_lock
+            .open_idempotency_store(crate::tx_idempotency::IdempotencyPolicy::default())
+        {
+            Ok(store) => store,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_STORAGE,
+                    format!("failed to open durable tx idempotency store: {err}"),
+                    Some(
+                        "Fix access to the tx_ledgers directory; no compensation was dispatched."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let mut persisted_contract = contract.clone();
+        let rollback_result =
+            execution_engine.rollback_with_store(&mut persisted_contract, &mut idem_store, now_ms);
+        let save_result = mcp_save_mission_tx_contract_to_path(
+            &contract_lock,
+            &authoritative_contract_path,
+            &persisted_contract,
+        );
+        let compensation_report = match (rollback_result, save_result) {
+            (Ok(result), Ok(())) => result.compensation_report,
+            (Ok(_), Err(save_err)) => {
+                let err = mcp_tx_contract_save_failure_after_effects(
+                    save_err,
+                    "Transaction compensation completed",
+                    "wa.tx_rollback",
+                    "compensation effects",
+                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+            (Err(rollback_err), Ok(())) => {
+                let envelope = McpEnvelope::<()>::error(
+                    "robot.tx_execution_failed",
+                    format!(
+                        "rollback failed after persisting available transaction evidence: {rollback_err}"
+                    ),
+                    Some(
+                        "Inspect wa.tx_show(include_contract=true) before retrying; compensation effects may have occurred."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+            (Err(rollback_err), Err(save_err)) => {
+                let err = mcp_tx_contract_save_failure_after_effects(
+                    save_err,
+                    &format!("Transaction compensation failed ({rollback_err})"),
+                    "wa.tx_rollback",
+                    "compensation effects",
+                );
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let final_state = persisted_contract.lifecycle_state;
 
         let data = McpTxRollbackData {
-            contract_file: contract_path.display().to_string(),
+            contract_file: authoritative_contract_path.display().to_string(),
             tx_id: contract.intent.tx_id.0.clone(),
             plan_id: contract.plan.plan_id.0.clone(),
             final_state,
@@ -9143,7 +9381,7 @@ mod tests {
         merge_distributed_remote_mcp_states, redact_mcp_output_secrets,
         redact_mcp_pane_state_fields, redact_mcp_wait_pattern_for_output,
         serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
-        validate_cass_timeout_secs,
+        tx_run_wezterm_handle, validate_cass_timeout_secs,
     };
     use crate::mcp::mcp_types::{IpcPaneState, McpPaneState, StateParams};
     use crate::mcp::set_mcp_test_pane_state_override;
@@ -9192,6 +9430,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp-tools-test.db");
         (dir, Arc::new(path))
+    }
+
+    fn workspace_tempdir() -> TempDir {
+        tempfile::tempdir_in(std::env::current_dir().expect("current workspace directory"))
+            .expect("workspace-scoped temporary directory")
     }
 
     fn safe_test_ipc_pane_state(pane_id: u64) -> IpcPaneState {
@@ -9256,20 +9499,56 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = handle;
     }
 
-    struct TxRunWeztermOverrideGuard;
+    fn tx_run_test_wezterm_override_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct TxRunWeztermOverrideGuard {
+        _serialization_guard: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl Drop for TxRunWeztermOverrideGuard {
         fn drop(&mut self) {
+            super::set_tx_contract_post_lock_test_hook(None);
+            super::set_tx_contract_post_auth_test_hook(None);
+            super::set_tx_contract_workspace_test_root(None);
             set_tx_run_test_wezterm_override(None);
         }
     }
 
+    fn install_tx_contract_post_lock_test_hook(hook: impl FnOnce() + 'static) {
+        super::set_tx_contract_post_lock_test_hook(Some(Box::new(hook)));
+    }
+
+    fn install_tx_contract_post_auth_test_hook(hook: impl FnOnce() + 'static) {
+        super::set_tx_contract_post_auth_test_hook(Some(Box::new(hook)));
+    }
+
     fn install_tx_run_mock_wezterm() -> (TxRunWeztermOverrideGuard, Arc<crate::wezterm::MockWezterm>)
     {
+        let serialization_guard = tx_run_test_wezterm_override_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mock = Arc::new(crate::wezterm::MockWezterm::new());
         let handle: crate::wezterm::WeztermHandle = mock.clone();
         set_tx_run_test_wezterm_override(Some(handle));
-        (TxRunWeztermOverrideGuard, mock)
+        (
+            TxRunWeztermOverrideGuard {
+                _serialization_guard: serialization_guard,
+            },
+            mock,
+        )
+    }
+
+    fn lock_tx_run_test_wezterm_override() -> TxRunWeztermOverrideGuard {
+        let serialization_guard = tx_run_test_wezterm_override_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_tx_run_test_wezterm_override(None);
+        TxRunWeztermOverrideGuard {
+            _serialization_guard: serialization_guard,
+        }
     }
 
     fn seed_tx_run_real_targets(db_path: &Path, mock: &Arc<crate::wezterm::MockWezterm>) {
@@ -9314,6 +9593,16 @@ mod tests {
                 .await;
             }
         });
+    }
+
+    fn tx_run_mock_pane_content(mock: &Arc<crate::wezterm::MockWezterm>, pane_id: u64) -> String {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            mock.pane_state(pane_id)
+                .await
+                .unwrap_or_else(|| panic!("mock pane {pane_id} should exist"))
+                .content
+        })
     }
 
     fn seed_event(db_path: &Path) -> i64 {
@@ -9402,6 +9691,16 @@ mod tests {
 
     fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
         let tx_id = TxId("tx:test".to_string());
+        let outcome = match state {
+            MissionTxState::Committed => TxOutcome::Committed,
+            MissionTxState::Failed => TxOutcome::Failed,
+            MissionTxState::Compensated | MissionTxState::RolledBack => TxOutcome::Compensated,
+            MissionTxState::Draft
+            | MissionTxState::Planned
+            | MissionTxState::Prepared
+            | MissionTxState::Committing
+            | MissionTxState::Compensating => TxOutcome::Pending,
+        };
         MissionTxContract {
             tx_version: MISSION_TX_SCHEMA_VERSION,
             intent: TxIntent {
@@ -9475,23 +9774,103 @@ mod tests {
                 ],
             },
             lifecycle_state: state,
-            outcome: TxOutcome::Pending,
+            outcome,
             receipts: Vec::new(),
         }
     }
 
     fn write_tx_contract(dir: &TempDir, state: MissionTxState) -> std::path::PathBuf {
+        super::set_tx_contract_workspace_test_root(Some(dir.path().to_path_buf()));
         let path = dir.path().join("tx-contract.json");
         let contract = sample_tx_contract(state);
         std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
         path
     }
 
+    fn write_tx_contract_with_proven_commit_receipts(
+        dir: &TempDir,
+        db_path: &Path,
+        fail_step: Option<&str>,
+    ) -> std::path::PathBuf {
+        super::set_tx_contract_workspace_test_root(Some(dir.path().to_path_buf()));
+        let path = dir.path().join("tx-contract-with-proven-receipts.json");
+        let config = config_with_db_path(db_path);
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        let storage = runtime
+            .block_on(async { StorageHandle::new(&db_path.to_string_lossy()).await })
+            .expect("tx fixture storage should open");
+        let rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        let policy_engine =
+            build_policy_engine_with_shared_rate_limiter(config.as_ref(), false, rate_limiter);
+        let workspace_id =
+            super::resolve_workspace_id(config.as_ref()).expect("fixture workspace should resolve");
+        let prepare_context = crate::plan::TxPrepareEvaluationContext::new(workspace_id)
+            .with_surface(PolicySurface::Mcp)
+            .with_actor(crate::policy::ActorKind::Mcp);
+        let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
+        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage));
+        let executor = crate::tx_execution::PaneStepExecutor::new(
+            tx_run_wezterm_handle(config.as_ref()),
+            std::cell::RefCell::new(policy_engine),
+            approvals,
+            targets,
+            prepare_context,
+        );
+        let engine = crate::tx_execution::TxExecutionEngine::new(
+            executor,
+            crate::tx_execution::TxExecutionConfig {
+                auto_compensate: false,
+                fail_step: fail_step.map(str::to_string),
+                ..crate::tx_execution::TxExecutionConfig::default()
+            },
+        );
+        let mut store = crate::tx_idempotency::IdempotencyStore::open(
+            &dir.path().join(".ft"),
+            crate::tx_idempotency::IdempotencyPolicy::default(),
+        )
+        .expect("durable tx fixture store should open");
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        let execution = engine
+            .execute_with_store(&mut contract, &mut store, mcp_now_ms_i64())
+            .expect("proof-linked fixture execution should complete");
+
+        assert!(execution.compensation_report.is_none());
+        if fail_step.is_some() {
+            assert_eq!(execution.final_state, MissionTxState::Failed);
+            assert_eq!(contract.lifecycle_state, MissionTxState::Failed);
+            assert_eq!(contract.outcome, TxOutcome::Failed);
+            assert_eq!(
+                execution
+                    .commit_report
+                    .as_ref()
+                    .expect("partial commit report")
+                    .committed_count,
+                1
+            );
+        } else {
+            assert_eq!(execution.final_state, MissionTxState::Committed);
+            assert_eq!(contract.lifecycle_state, MissionTxState::Committed);
+            assert_eq!(contract.outcome, TxOutcome::Committed);
+            assert_eq!(
+                execution
+                    .commit_report
+                    .as_ref()
+                    .expect("full commit report")
+                    .committed_count,
+                3
+            );
+        }
+        assert_eq!(contract.receipts.len(), 3);
+        std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        path
+    }
+
     fn write_tx_contract_with_partial_commit_receipts(dir: &TempDir) -> std::path::PathBuf {
+        super::set_tx_contract_workspace_test_root(Some(dir.path().to_path_buf()));
         let path = dir.path().join("tx-contract-with-receipts.json");
         let mut contract = sample_tx_contract(MissionTxState::Failed);
         let commit_report = execute_commit_phase(
-            &sample_tx_contract(MissionTxState::Prepared),
+            &sample_tx_contract(MissionTxState::Committing),
             &[
                 TxCommitStepInput {
                     step_id: TxStepId("tx-step:1".to_string()),
@@ -9520,6 +9899,49 @@ mod tests {
             10_500,
         )
         .expect("commit report");
+        contract.receipts = commit_report.receipts;
+        std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        path
+    }
+
+    fn write_tx_contract_with_full_commit_receipts(dir: &TempDir) -> std::path::PathBuf {
+        super::set_tx_contract_workspace_test_root(Some(dir.path().to_path_buf()));
+        let path = dir
+            .path()
+            .join("tx-contract-with-full-commit-receipts.json");
+        let mut contract = sample_tx_contract(MissionTxState::Committed);
+        let commit_report = execute_commit_phase(
+            &sample_tx_contract(MissionTxState::Committing),
+            &[
+                TxCommitStepInput {
+                    step_id: TxStepId("tx-step:1".to_string()),
+                    success: true,
+                    reason_code: "commit_step_succeeded".to_string(),
+                    error_code: None,
+                    completed_at_ms: 10_001,
+                },
+                TxCommitStepInput {
+                    step_id: TxStepId("tx-step:2".to_string()),
+                    success: true,
+                    reason_code: "commit_step_succeeded".to_string(),
+                    error_code: None,
+                    completed_at_ms: 10_002,
+                },
+                TxCommitStepInput {
+                    step_id: TxStepId("tx-step:3".to_string()),
+                    success: true,
+                    reason_code: "commit_step_succeeded".to_string(),
+                    error_code: None,
+                    completed_at_ms: 10_003,
+                },
+            ],
+            MissionKillSwitchLevel::Off,
+            false,
+            10_500,
+        )
+        .expect("full commit report");
+        assert_eq!(commit_report.committed_count, 3);
+        assert_eq!(commit_report.receipts.len(), 3);
         contract.receipts = commit_report.receipts;
         std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
         path
@@ -11228,6 +11650,60 @@ mod tests {
     }
 
     #[test]
+    fn tx_run_wezterm_handle_preserves_test_override_with_config() {
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        let expected: crate::wezterm::WeztermHandle = mock;
+
+        let actual = tx_run_wezterm_handle(config().as_ref());
+
+        assert!(
+            Arc::ptr_eq(&actual, &expected),
+            "the test override must take precedence over config-backed mux construction"
+        );
+    }
+
+    #[test]
+    fn tx_contract_save_failure_after_effects_marks_retry_unsafe() {
+        for (completion_context, retry_tool, effect_label) in [
+            (
+                "Transaction execution completed",
+                "wa.tx_run",
+                "external transaction effects",
+            ),
+            (
+                "Transaction compensation completed",
+                "wa.tx_rollback",
+                "compensation effects",
+            ),
+        ] {
+            let err = super::mcp_tx_contract_save_failure_after_effects(
+                super::McpToolError::new(
+                    "robot.tx_write_failed",
+                    "disk full".to_string(),
+                    Some("Recovery artifact: /tmp/tx.recovery.tmp".to_string()),
+                ),
+                completion_context,
+                retry_tool,
+                effect_label,
+            );
+
+            assert_eq!(err.code, "robot.tx_write_failed");
+            assert!(err.message.contains(completion_context));
+            assert!(err.message.contains("disk full"));
+            assert!(
+                err.message
+                    .contains(&format!("{effect_label} may already exist"))
+            );
+            let hint = err.hint.expect("unsafe-retry guidance");
+            assert!(hint.contains(&format!("Do not retry {retry_tool}")));
+            assert!(hint.contains("durable tx idempotency ledger"));
+            assert!(hint.contains("transaction recovery artifact"));
+            assert!(hint.contains("retrying now is unsafe"));
+            assert!(hint.contains("/tmp/tx.recovery.tmp"));
+        }
+    }
+
+    #[test]
     fn tx_tool_names_stable() {
         let expected = ["wa.tx_plan", "wa.tx_show", "wa.tx_run", "wa.tx_rollback"];
         let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
@@ -11242,7 +11718,7 @@ mod tests {
 
     #[test]
     fn tx_show_tool_include_contract_returns_embedded_contract() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxShowTool::new(config());
 
@@ -11279,7 +11755,7 @@ mod tests {
 
     #[test]
     fn tx_run_tool_rejects_unknown_fail_step_with_guidance() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxRunTool::new(config());
 
@@ -11305,16 +11781,21 @@ mod tests {
 
     #[test]
     fn tx_contract_lock_rejects_parallel_same_contract_execution() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
-        let first = super::acquire_mcp_tx_contract_lock(&contract_path)
+        let first = super::acquire_mcp_tx_contract_lock(dir.path(), &contract_path)
             .expect("first lock acquisition should succeed");
+        let lock_dir = dir.path().join(".ft").join("tx_contract_locks");
         assert!(
-            super::tx_contract_lock_path(&contract_path).exists(),
-            "tx contract lock file should be created next to the contract"
+            lock_dir.is_dir()
+                && std::fs::read_dir(&lock_dir)
+                    .expect("list workspace-global contract locks")
+                    .count()
+                    == 1,
+            "one workspace-global tx contract sidecar should be retained"
         );
 
-        let second = super::acquire_mcp_tx_contract_lock(&contract_path);
+        let second = super::acquire_mcp_tx_contract_lock(dir.path(), &contract_path);
         assert!(
             second.is_err(),
             "second lock acquisition should fail while first is held"
@@ -11325,16 +11806,602 @@ mod tests {
         assert_eq!(err.code, "robot.tx_in_progress");
 
         drop(first);
-        super::acquire_mcp_tx_contract_lock(&contract_path)
+        super::acquire_mcp_tx_contract_lock(dir.path(), &contract_path)
             .expect("lock should be released when guard drops");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_run_uses_locked_canonical_contract_after_intermediate_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let (_db_dir, db_path) = temp_db_path();
+        let original_dir = workspace_tempdir();
+        let foreign_dir = workspace_tempdir();
+        let alias_dir = workspace_tempdir();
+        let original_path = write_tx_contract(&original_dir, MissionTxState::Planned);
+        let contract_name = original_path.file_name().unwrap().to_owned();
+
+        let mut foreign_contract = sample_tx_contract(MissionTxState::Planned);
+        for (index, step) in foreign_contract.plan.steps.iter_mut().enumerate() {
+            if let StepAction::SendText { text, .. } = &mut step.action {
+                *text = format!("foreign-step-{}", index + 1);
+            }
+        }
+        let foreign_path = foreign_dir.path().join(&contract_name);
+        let foreign_before = serde_json::to_vec_pretty(&foreign_contract).unwrap();
+        std::fs::write(&foreign_path, &foreign_before).unwrap();
+
+        let active_alias = alias_dir.path().join("active");
+        let replacement_alias = alias_dir.path().join("active-next");
+        symlink(original_dir.path(), &active_alias).unwrap();
+        symlink(foreign_dir.path(), &replacement_alias).unwrap();
+
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let active_alias_for_hook = active_alias.clone();
+        install_tx_contract_post_lock_test_hook(move || {
+            std::fs::rename(&replacement_alias, &active_alias_for_hook)
+                .expect("retarget contract parent alias after lock");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRunTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": active_alias.join(&contract_name).display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(
+            envelope["data"]["contract_file"],
+            original_path.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3");
+        for pane_id in 1..=3 {
+            assert!(
+                !tx_run_mock_pane_content(&mock, pane_id).contains("foreign-step"),
+                "retargeted contract must not dispatch a foreign pane effect"
+            );
+        }
+        assert!(original_dir.path().join(".ft").join("tx_ledgers").is_dir());
+        assert!(
+            !foreign_dir.path().join(".ft").join("tx_ledgers").exists(),
+            "retargeted directory must not receive the durable ledger"
+        );
+        assert_eq!(std::fs::read(&foreign_path).unwrap(), foreign_before);
+        assert_eq!(
+            mcp_load_mission_tx_contract_from_path(&original_path)
+                .unwrap()
+                .lifecycle_state,
+            MissionTxState::Committed
+        );
+        assert_eq!(
+            active_alias.join(&contract_name).canonicalize().unwrap(),
+            foreign_path.canonicalize().unwrap(),
+            "the attacker-controlled alias should actually have been retargeted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_run_post_lock_parent_detach_fails_before_effects() {
+        let (_db_dir, db_path) = temp_db_path();
+        let workspace = workspace_tempdir();
+        super::set_tx_contract_workspace_test_root(Some(workspace.path().to_path_buf()));
+        let active_dir = workspace.path().join("active");
+        let foreign_dir = workspace.path().join("foreign");
+        let detached_dir = workspace.path().join("active-detached");
+        std::fs::create_dir(&active_dir).unwrap();
+        std::fs::create_dir(&foreign_dir).unwrap();
+        let contract_path = active_dir.join("tx-contract.json");
+        let baseline =
+            serde_json::to_vec_pretty(&sample_tx_contract(MissionTxState::Planned)).unwrap();
+        std::fs::write(&contract_path, &baseline).unwrap();
+        let foreign_path = foreign_dir.join("tx-contract.json");
+        let foreign_sentinel = b"foreign contract sentinel".to_vec();
+        std::fs::write(&foreign_path, &foreign_sentinel).unwrap();
+
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let active_for_hook = active_dir.clone();
+        install_tx_contract_post_lock_test_hook(move || {
+            std::fs::rename(&active_for_hook, &detached_dir)
+                .expect("detach contract parent after lock");
+            std::fs::rename(&foreign_dir, &active_for_hook)
+                .expect("install foreign parent after lock");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRunTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], "robot.tx_lock_failed");
+        for pane_id in 1..=3 {
+            assert_eq!(tx_run_mock_pane_content(&mock, pane_id), "");
+        }
+        assert_eq!(
+            std::fs::read(active_dir.join("tx-contract.json")).unwrap(),
+            foreign_sentinel
+        );
+        assert_eq!(
+            std::fs::read(
+                workspace
+                    .path()
+                    .join("active-detached")
+                    .join("tx-contract.json")
+            )
+            .unwrap(),
+            baseline
+        );
+        assert!(!workspace.path().join(".ft").join("tx_ledgers").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_run_post_lock_transient_parent_detach_restored_before_auth_succeeds() {
+        let (_db_dir, db_path) = temp_db_path();
+        let workspace = workspace_tempdir();
+        super::set_tx_contract_workspace_test_root(Some(workspace.path().to_path_buf()));
+        let active_dir = workspace.path().join("active");
+        let foreign_dir = workspace.path().join("foreign");
+        let detached_dir = workspace.path().join("active-detached");
+        let displaced_foreign_dir = workspace.path().join("foreign-displaced");
+        std::fs::create_dir(&active_dir).unwrap();
+        std::fs::create_dir(&foreign_dir).unwrap();
+        let contract_path = active_dir.join("tx-contract.json");
+        std::fs::write(
+            &contract_path,
+            serde_json::to_vec_pretty(&sample_tx_contract(MissionTxState::Planned)).unwrap(),
+        )
+        .unwrap();
+        let foreign_path = foreign_dir.join("tx-contract.json");
+        let foreign_sentinel = b"transient foreign contract sentinel".to_vec();
+        std::fs::write(&foreign_path, &foreign_sentinel).unwrap();
+
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let active_for_hook = active_dir.clone();
+        install_tx_contract_post_lock_test_hook(move || {
+            std::fs::rename(&active_for_hook, &detached_dir)
+                .expect("transiently detach contract parent");
+            std::fs::rename(&foreign_dir, &active_for_hook)
+                .expect("transiently install foreign parent");
+            std::fs::rename(&active_for_hook, &displaced_foreign_dir)
+                .expect("move transient foreign parent aside");
+            std::fs::rename(&detached_dir, &active_for_hook)
+                .expect("restore original parent before authorization");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRunTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3");
+        assert_eq!(
+            std::fs::read(
+                workspace
+                    .path()
+                    .join("foreign-displaced")
+                    .join("tx-contract.json")
+            )
+            .unwrap(),
+            foreign_sentinel
+        );
+        assert!(workspace.path().join(".ft").join("tx_ledgers").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_run_post_auth_parent_detach_returns_error_without_foreign_save() {
+        let (_db_dir, db_path) = temp_db_path();
+        let workspace = workspace_tempdir();
+        super::set_tx_contract_workspace_test_root(Some(workspace.path().to_path_buf()));
+        let active_dir = workspace.path().join("active");
+        let foreign_dir = workspace.path().join("foreign");
+        let detached_dir = workspace.path().join("active-detached");
+        std::fs::create_dir(&active_dir).unwrap();
+        std::fs::create_dir(&foreign_dir).unwrap();
+        let contract_path = active_dir.join("tx-contract.json");
+        std::fs::write(
+            &contract_path,
+            serde_json::to_vec_pretty(&sample_tx_contract(MissionTxState::Planned)).unwrap(),
+        )
+        .unwrap();
+
+        let foreign_contract = sample_tx_contract(MissionTxState::Planned);
+        let foreign_path = foreign_dir.join("tx-contract.json");
+        let foreign_before = serde_json::to_vec_pretty(&foreign_contract).unwrap();
+        std::fs::write(&foreign_path, &foreign_before).unwrap();
+
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let active_for_hook = active_dir.clone();
+        install_tx_contract_post_auth_test_hook(move || {
+            std::fs::rename(&active_for_hook, &detached_dir)
+                .expect("detach authorized contract parent after authorization");
+            std::fs::rename(&foreign_dir, &active_for_hook)
+                .expect("install foreign parent after authorization");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRunTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error text")
+                .contains("namespace-detached")
+        );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3");
+        assert_eq!(
+            std::fs::read(active_dir.join("tx-contract.json")).unwrap(),
+            foreign_before
+        );
+        assert_eq!(
+            mcp_load_mission_tx_contract_from_path(
+                &workspace
+                    .path()
+                    .join("active-detached")
+                    .join("tx-contract.json")
+            )
+            .unwrap()
+            .lifecycle_state,
+            MissionTxState::Committed
+        );
+        assert!(workspace.path().join(".ft").join("tx_ledgers").is_dir());
+
+        let retry_envelope = parse_json_content(
+            WaTxRunTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": active_dir
+                            .join("tx-contract.json")
+                            .display()
+                            .to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+        assert_eq!(retry_envelope["ok"], true);
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_run_post_auth_basename_substitution_preserves_foreign_sentinel_and_recovery() {
+        let (_db_dir, db_path) = temp_db_path();
+        let workspace = workspace_tempdir();
+        let contract_path = write_tx_contract(&workspace, MissionTxState::Planned);
+        let detached_contract = workspace.path().join("tx-contract-original-detached.json");
+        let baseline = std::fs::read(&contract_path).unwrap();
+        let foreign_sentinel = b"post-auth foreign basename sentinel".to_vec();
+
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let contract_for_hook = contract_path.clone();
+        let sentinel_for_hook = foreign_sentinel.clone();
+        install_tx_contract_post_auth_test_hook(move || {
+            std::fs::rename(&contract_for_hook, &detached_contract)
+                .expect("detach authorized contract basename after authorization");
+            std::fs::write(&contract_for_hook, &sentinel_for_hook)
+                .expect("install foreign basename sentinel after authorization");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRunTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error text")
+                .contains("basename no longer names the pre-effect authorized inode")
+        );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3");
+        assert_eq!(std::fs::read(&contract_path).unwrap(), foreign_sentinel);
+        assert_eq!(
+            std::fs::read(workspace.path().join("tx-contract-original-detached.json")).unwrap(),
+            baseline
+        );
+        let recovery_paths = std::fs::read_dir(workspace.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".recovery.tmp"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovery_paths.len(), 1);
+        let recovered = mcp_load_mission_tx_contract_from_path(&recovery_paths[0]).unwrap();
+        assert_eq!(recovered.lifecycle_state, MissionTxState::Committed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_rollback_uses_locked_canonical_contract_after_intermediate_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let (_db_dir, db_path) = temp_db_path();
+        let original_dir = workspace_tempdir();
+        let foreign_dir = workspace_tempdir();
+        let alias_dir = workspace_tempdir();
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let original_path =
+            write_tx_contract_with_proven_commit_receipts(&original_dir, &db_path, None);
+        let contract_name = original_path.file_name().unwrap().to_owned();
+
+        let mut foreign_contract = mcp_load_mission_tx_contract_from_path(&original_path).unwrap();
+        for (index, compensation) in foreign_contract.plan.compensations.iter_mut().enumerate() {
+            if let StepAction::SendText { text, .. } = &mut compensation.action {
+                *text = format!("foreign-undo-{}", index + 1);
+            }
+        }
+        let foreign_path = foreign_dir.path().join(&contract_name);
+        let foreign_before = serde_json::to_vec_pretty(&foreign_contract).unwrap();
+        std::fs::write(&foreign_path, &foreign_before).unwrap();
+
+        let active_alias = alias_dir.path().join("active");
+        let replacement_alias = alias_dir.path().join("active-next");
+        symlink(original_dir.path(), &active_alias).unwrap();
+        symlink(foreign_dir.path(), &replacement_alias).unwrap();
+        let active_alias_for_hook = active_alias.clone();
+        install_tx_contract_post_lock_test_hook(move || {
+            std::fs::rename(&replacement_alias, &active_alias_for_hook)
+                .expect("retarget contract parent alias after lock");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRollbackTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": active_alias.join(&contract_name).display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(
+            envelope["data"]["contract_file"],
+            original_path.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3undo-3");
+        for pane_id in 1..=3 {
+            assert!(
+                !tx_run_mock_pane_content(&mock, pane_id).contains("foreign-undo"),
+                "retargeted contract must not dispatch a foreign compensation effect"
+            );
+        }
+        assert!(original_dir.path().join(".ft").join("tx_ledgers").is_dir());
+        assert!(
+            !foreign_dir.path().join(".ft").join("tx_ledgers").exists(),
+            "retargeted directory must not receive the durable rollback ledger"
+        );
+        assert_eq!(std::fs::read(&foreign_path).unwrap(), foreign_before);
+        assert_eq!(
+            mcp_load_mission_tx_contract_from_path(&original_path)
+                .unwrap()
+                .lifecycle_state,
+            MissionTxState::RolledBack
+        );
+        assert_eq!(
+            active_alias.join(&contract_name).canonicalize().unwrap(),
+            foreign_path.canonicalize().unwrap(),
+            "the attacker-controlled alias should actually have been retargeted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_rollback_post_auth_parent_detach_returns_error_without_foreign_save() {
+        let (_db_dir, db_path) = temp_db_path();
+        let workspace = workspace_tempdir();
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let root_contract =
+            write_tx_contract_with_proven_commit_receipts(&workspace, &db_path, None);
+        let active_dir = workspace.path().join("active");
+        let foreign_dir = workspace.path().join("foreign");
+        let detached_dir = workspace.path().join("active-detached");
+        std::fs::create_dir(&active_dir).unwrap();
+        std::fs::create_dir(&foreign_dir).unwrap();
+        let contract_path = active_dir.join("tx-contract.json");
+        std::fs::rename(&root_contract, &contract_path).unwrap();
+
+        let mut foreign_contract = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        for (index, compensation) in foreign_contract.plan.compensations.iter_mut().enumerate() {
+            if let StepAction::SendText { text, .. } = &mut compensation.action {
+                *text = format!("foreign-undo-{}", index + 1);
+            }
+        }
+        let foreign_path = foreign_dir.join("tx-contract.json");
+        let foreign_before = serde_json::to_vec_pretty(&foreign_contract).unwrap();
+        std::fs::write(&foreign_path, &foreign_before).unwrap();
+
+        let active_for_hook = active_dir.clone();
+        install_tx_contract_post_auth_test_hook(move || {
+            std::fs::rename(&active_for_hook, &detached_dir)
+                .expect("detach authorized rollback parent after authorization");
+            std::fs::rename(&foreign_dir, &active_for_hook)
+                .expect("install foreign rollback parent after authorization");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRollbackTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error text")
+                .contains("namespace-detached")
+        );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3undo-3");
+        assert_eq!(
+            std::fs::read(active_dir.join("tx-contract.json")).unwrap(),
+            foreign_before
+        );
+        assert_eq!(
+            mcp_load_mission_tx_contract_from_path(
+                &workspace
+                    .path()
+                    .join("active-detached")
+                    .join("tx-contract.json")
+            )
+            .unwrap()
+            .lifecycle_state,
+            MissionTxState::RolledBack
+        );
+        assert!(workspace.path().join(".ft").join("tx_ledgers").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tx_rollback_post_auth_basename_substitution_preserves_foreign_sentinel_and_recovery() {
+        let (_db_dir, db_path) = temp_db_path();
+        let workspace = workspace_tempdir();
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let contract_path =
+            write_tx_contract_with_proven_commit_receipts(&workspace, &db_path, None);
+        let detached_contract = workspace
+            .path()
+            .join("tx-rollback-contract-original-detached.json");
+        let baseline = std::fs::read(&contract_path).unwrap();
+        let foreign_sentinel = b"post-auth foreign rollback basename sentinel".to_vec();
+
+        let contract_for_hook = contract_path.clone();
+        let detached_for_hook = detached_contract.clone();
+        let sentinel_for_hook = foreign_sentinel.clone();
+        install_tx_contract_post_auth_test_hook(move || {
+            std::fs::rename(&contract_for_hook, &detached_for_hook)
+                .expect("detach authorized rollback contract basename after authorization");
+            std::fs::write(&contract_for_hook, &sentinel_for_hook)
+                .expect("install foreign rollback basename sentinel after authorization");
+        });
+
+        let envelope = parse_json_content(
+            WaTxRollbackTool::new(config_with_db_path(&db_path))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert!(
+            envelope["error"]
+                .as_str()
+                .expect("error text")
+                .contains("basename no longer names the pre-effect authorized inode")
+        );
+        assert!(
+            envelope["hint"]
+                .as_str()
+                .expect("unsafe-retry hint")
+                .contains("Do not retry wa.tx_rollback")
+        );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3undo-3");
+        assert_eq!(std::fs::read(&contract_path).unwrap(), foreign_sentinel);
+        assert_eq!(std::fs::read(&detached_contract).unwrap(), baseline);
+        let recovery_paths = std::fs::read_dir(workspace.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".recovery.tmp"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovery_paths.len(), 1);
+        let recovered = mcp_load_mission_tx_contract_from_path(&recovery_paths[0]).unwrap();
+        assert_eq!(recovered.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(recovered.outcome, TxOutcome::Compensated);
+        assert!(workspace.path().join(".ft").join("tx_ledgers").is_dir());
     }
 
     #[test]
     fn tx_run_tool_denies_when_real_prepare_targets_are_missing() {
         let (_db_dir, db_path) = temp_db_path();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxRunTool::new(config_with_db_path(&db_path));
+        let _guard = lock_tx_run_test_wezterm_override();
 
         let envelope = parse_json_content(
             tool.call(
@@ -11361,7 +12428,7 @@ mod tests {
     #[test]
     fn tx_run_tool_partial_failure_triggers_compensation_and_compensated_state() {
         let (_db_dir, db_path) = temp_db_path();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxRunTool::new(config_with_db_path(&db_path));
         let (_guard, mock) = install_tx_run_mock_wezterm();
@@ -11405,7 +12472,7 @@ mod tests {
     #[test]
     fn tx_run_tool_first_step_failure_persists_compensated_state() {
         let (_db_dir, db_path) = temp_db_path();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxRunTool::new(config_with_db_path(&db_path));
         let (_guard, mock) = install_tx_run_mock_wezterm();
@@ -11436,10 +12503,180 @@ mod tests {
     }
 
     #[test]
-    fn tx_rollback_tool_returns_compensated_state_for_synthetic_commit_report() {
-        let dir = tempfile::tempdir().unwrap();
+    fn tx_tools_full_success_run_show_rollback_converges_persisted_receipts_and_effects() {
+        let (_db_dir, db_path) = temp_db_path();
+        let dir = workspace_tempdir();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let config = config_with_db_path(&db_path);
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+
+        let run = parse_json_content(
+            WaTxRunTool::new(Arc::clone(&config))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(run["ok"], true);
+        assert_eq!(run["data"]["prepare_report"]["outcome"], "all_ready");
+        assert_eq!(run["data"]["commit_report"]["outcome"], "fully_committed");
+        assert_eq!(run["data"]["commit_report"]["committed_count"], 3);
+        assert!(run["data"]["compensation_report"].is_null());
+        assert_eq!(run["data"]["final_state"], "committed");
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3");
+
+        let committed_receipts = run["data"]["commit_report"]["receipts"]
+            .as_array()
+            .expect("run commit receipts")
+            .clone();
+        assert_eq!(committed_receipts.len(), 3);
+        for (index, (receipt, step_id)) in committed_receipts
+            .iter()
+            .zip(["tx-step:1", "tx-step:2", "tx-step:3"])
+            .enumerate()
+        {
+            assert_eq!(receipt["seq"].as_u64(), Some(index as u64 + 1));
+            assert_eq!(receipt["phase"], "commit");
+            assert_eq!(receipt["step_id"], step_id);
+            assert_eq!(receipt["outcome"], "committed");
+        }
+
+        let persisted_after_run: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&contract_path).expect("persisted run contract should be readable"),
+        )
+        .expect("persisted run contract should be valid JSON");
+        assert_eq!(persisted_after_run["lifecycle_state"], "committed");
+        assert_eq!(persisted_after_run["outcome"], "committed");
+        assert_eq!(
+            persisted_after_run["receipts"]
+                .as_array()
+                .expect("persisted receipt array"),
+            &committed_receipts
+        );
+
+        let show = parse_json_content(
+            WaTxShowTool::new(Arc::clone(&config))
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string(),
+                        "include_contract": true
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(show["ok"], true);
+        assert_eq!(show["data"]["lifecycle_state"], "committed");
+        assert_eq!(show["data"]["receipt_count"], 3);
+        assert_eq!(show["data"]["contract"], persisted_after_run);
+
+        let rollback = parse_json_content(
+            WaTxRollbackTool::new(config)
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "contract_file": contract_path.display().to_string()
+                    }),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(rollback["ok"], true);
+        assert_eq!(rollback["data"]["final_state"], "rolled_back");
+        assert_eq!(
+            rollback["data"]["compensation_report"]["outcome"],
+            "fully_rolled_back"
+        );
+        assert_eq!(
+            rollback["data"]["compensation_report"]["compensated_count"],
+            3
+        );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3undo-3");
+
+        let compensation_receipts = rollback["data"]["compensation_report"]["receipts"]
+            .as_array()
+            .expect("rollback compensation receipts")
+            .clone();
+        assert_eq!(compensation_receipts.len(), 3);
+        for (index, (receipt, step_id)) in compensation_receipts
+            .iter()
+            .zip(["tx-step:3", "tx-step:2", "tx-step:1"])
+            .enumerate()
+        {
+            assert_eq!(receipt["seq"].as_u64(), Some(index as u64 + 4));
+            assert_eq!(receipt["phase"], "compensate");
+            assert_eq!(receipt["step_id"], step_id);
+            assert_eq!(receipt["outcome"], "compensated");
+        }
+
+        let persisted_after_rollback =
+            mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(
+            persisted_after_rollback.lifecycle_state,
+            MissionTxState::RolledBack
+        );
+        assert_eq!(persisted_after_rollback.outcome, TxOutcome::Compensated);
+        assert_eq!(persisted_after_rollback.receipts.len(), 6);
+        assert_eq!(
+            &persisted_after_rollback.receipts[..3],
+            committed_receipts.as_slice()
+        );
+        assert_eq!(
+            &persisted_after_rollback.receipts[3..],
+            compensation_receipts.as_slice()
+        );
+    }
+
+    #[test]
+    fn tx_rollback_tool_rejects_committed_contract_without_commit_receipts() {
+        let dir = workspace_tempdir();
         let contract_path = write_tx_contract(&dir, MissionTxState::Committed);
         let tool = WaTxRollbackTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert_eq!(
+            envelope["error"],
+            "rollback requires commit receipts, got none for tx state committed"
+        );
+        assert_eq!(
+            envelope["hint"],
+            "Use wa.tx_show(include_contract=true) and ensure the contract includes commit receipts for the steps that actually committed."
+        );
+
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::Committed);
+        assert!(persisted.receipts.is_empty());
+    }
+
+    #[test]
+    fn tx_rollback_tool_executes_real_compensations_for_full_commit_receipts() {
+        let (_db_dir, db_path) = temp_db_path();
+        let dir = workspace_tempdir();
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let contract_path = write_tx_contract_with_proven_commit_receipts(&dir, &db_path, None);
+        let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -11462,17 +12699,88 @@ mod tests {
             envelope["data"]["compensation_report"]["compensated_count"],
             3
         );
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3undo-3");
 
         let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
         assert_eq!(persisted.lifecycle_state, MissionTxState::RolledBack);
         assert_eq!(persisted.outcome, TxOutcome::Compensated);
-        assert!(!persisted.receipts.is_empty());
+        assert_eq!(persisted.receipts.len(), 6);
+    }
+
+    #[test]
+    fn tx_rollback_tool_persists_failure_then_retries_only_failed_compensation() {
+        let (_db_dir, db_path) = temp_db_path();
+        let dir = workspace_tempdir();
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let contract_path = write_tx_contract_with_proven_commit_receipts(&dir, &db_path, None);
+        let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
+
+        let first = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string(),
+                    "fail_compensation_for_step": "tx-step:1"
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["data"]["final_state"], "failed");
+        assert_eq!(
+            first["data"]["compensation_report"]["outcome"],
+            "compensation_failed"
+        );
+        assert_eq!(first["data"]["compensation_report"]["compensated_count"], 2);
+        assert_eq!(first["data"]["compensation_report"]["failed_count"], 1);
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3undo-3");
+
+        let failed_contract = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(failed_contract.lifecycle_state, MissionTxState::Failed);
+        assert_eq!(failed_contract.outcome, TxOutcome::Failed);
+        assert_eq!(failed_contract.receipts.len(), 6);
+
+        // Rollback execution IDs currently include millisecond wall time. Cross
+        // the next clock tick so this retry has a distinct durable ledger ID.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let retry = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(retry["ok"], true);
+        assert_eq!(retry["data"]["final_state"], "rolled_back");
+        assert_eq!(
+            retry["data"]["compensation_report"]["outcome"],
+            "fully_rolled_back"
+        );
+        assert_eq!(retry["data"]["compensation_report"]["compensated_count"], 1);
+        assert_eq!(retry["data"]["compensation_report"]["failed_count"], 0);
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "step-2undo-2");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "step-3undo-3");
+
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(persisted.outcome, TxOutcome::Compensated);
+        assert_eq!(persisted.receipts.len(), 7);
     }
 
     #[test]
     fn tx_rollback_tool_rejects_unknown_compensation_step_with_guidance() {
-        let dir = tempfile::tempdir().unwrap();
-        let contract_path = write_tx_contract(&dir, MissionTxState::Committed);
+        let dir = workspace_tempdir();
+        let contract_path = write_tx_contract_with_full_commit_receipts(&dir);
         let tool = WaTxRollbackTool::new(config());
 
         let envelope = parse_json_content(
@@ -11500,9 +12808,13 @@ mod tests {
 
     #[test]
     fn tx_rollback_tool_uses_receipts_to_compensate_only_committed_steps() {
-        let dir = tempfile::tempdir().unwrap();
-        let contract_path = write_tx_contract_with_partial_commit_receipts(&dir);
-        let tool = WaTxRollbackTool::new(config());
+        let (_db_dir, db_path) = temp_db_path();
+        let dir = workspace_tempdir();
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let contract_path =
+            write_tx_contract_with_proven_commit_receipts(&dir, &db_path, Some("tx-step:2"));
+        let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
 
         let envelope = parse_json_content(
             tool.call(
@@ -11522,6 +12834,14 @@ mod tests {
         assert_eq!(envelope["data"]["compensation_report"]["failed_count"], 0);
         assert_eq!(envelope["data"]["compensation_report"]["skipped_count"], 0);
         assert_eq!(envelope["data"]["final_state"], "rolled_back");
+        assert_eq!(tx_run_mock_pane_content(&mock, 1), "step-1undo-1");
+        assert_eq!(tx_run_mock_pane_content(&mock, 2), "");
+        assert_eq!(tx_run_mock_pane_content(&mock, 3), "");
+
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(persisted.outcome, TxOutcome::Compensated);
+        assert_eq!(persisted.receipts.len(), 4);
     }
 
     #[test]
