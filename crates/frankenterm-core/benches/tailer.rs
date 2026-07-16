@@ -46,6 +46,12 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
         name: "tailer/capture_cadence_round5",
         budget: "round-5 M7 cadence A/B via FT_MOONSHOT_INGEST_CADENCE_MODEL=predictive",
     },
+    bench_common::BenchBudget {
+        name: "tailer/spawn_ready_scan_only",
+        budget: "ft-1dhvq residual per-tick cost: spawn_ready over N all-NotDue tailers \
+                 (the O(#panes) scan the 10ms capture tick pays even when native push \
+                 covers every pane)",
+    },
 ];
 
 type PaneFuture<'a> = Pin<Box<dyn Future<Output = frankenterm_core::Result<String>> + Send + 'a>>;
@@ -376,6 +382,76 @@ fn bench_capture_cadence_round5(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_spawn_ready_scan_only(c: &mut Criterion) {
+    // ft-1dhvq: the capture loop's next_spawn_tick fires every 10ms and calls
+    // spawn_ready, which iterates EVERY active tailer even when native push
+    // feeds ingress and no pane is poll-due. This measures that residual
+    // all-NotDue scan in isolation so the "is it a hot frame?" gate can be
+    // adjudicated against the 10ms tick budget (scan_cost / 10ms = fraction
+    // of one core burned per watcher at N panes).
+    let runtime = build_runtime();
+    let mut group = c.benchmark_group("tailer/spawn_ready_scan_only");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(2));
+
+    for pane_count in [50_u64, 200, 1000] {
+        // Build a supervisor whose tailers are ALL inside a (huge) min-interval
+        // backoff window: one full poll round runs first, so every subsequent
+        // spawn_ready call takes the NotDue path for every pane — the exact
+        // residual state under native push coverage.
+        let mut supervisor = runtime.block_on(async {
+            let source = Arc::new(FixedPayloadSource::new(Arc::new(String::new())));
+            let (tx, _rx) = mpsc::channel((pane_count as usize).saturating_mul(2).max(8));
+            let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+            let registry = Arc::new(RwLock::new(PaneRegistry::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            {
+                let mut guard = cursors.write().await;
+                for pane_id in 1..=pane_count {
+                    guard.insert(pane_id, PaneCursor::new(pane_id));
+                }
+            }
+            let mut supervisor = TailerSupervisor::new(
+                TailerConfig {
+                    min_interval: Duration::from_secs(3_600),
+                    max_interval: Duration::from_secs(7_200),
+                    max_concurrent: 16,
+                    send_timeout: Duration::from_millis(200),
+                    capture_timeout: Duration::from_secs(1),
+                    ..Default::default()
+                },
+                tx,
+                cursors,
+                registry,
+                shutdown,
+                source,
+            );
+            supervisor.sync_tailers(&make_panes(pane_count));
+            let mut poll_tasks = TailerPollTaskSet::new();
+            supervisor.spawn_ready(&mut poll_tasks);
+            while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
+                supervisor.handle_poll_result(pane_id, outcome);
+            }
+            supervisor
+        });
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(pane_count),
+            &pane_count,
+            |b, _| {
+                b.iter(|| {
+                    let mut poll_tasks = TailerPollTaskSet::new();
+                    supervisor.spawn_ready(&mut poll_tasks);
+                    black_box(&poll_tasks);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_config() -> Criterion {
     bench_common::emit_bench_artifacts("tailer", BUDGETS);
     Criterion::default().configure_from_args()
@@ -389,6 +465,7 @@ criterion_group!(
         bench_concurrent_capture_round,
         bench_capture_event_channel,
         bench_timeout_overhead,
-        bench_capture_cadence_round5
+        bench_capture_cadence_round5,
+        bench_spawn_ready_scan_only
 );
 criterion_main!(benches);
