@@ -74,7 +74,7 @@ use super::{
     HandleProcessTriageLifecycle, HandleSessionEnd, HandleUsageLimits, InjectionResult,
     MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
     MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE, MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM,
-    MCP_ERR_WORKFLOW, ManualWorkflowRunOutcome, McpToolError, Osc133State, PaneCapabilities,
+    MCP_ERR_WORKFLOW, McpToolError, Osc133State, PaneCapabilities,
     PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter, PatternEngine, PolicyDecision,
     PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults, SearchQueryInput,
     SharedRateLimiter, StorageHandle, UnifiedSearchMode, WaitOptions, WaitResult, WeztermError,
@@ -96,6 +96,7 @@ use super::{
     MCP_REFRESH_COOLDOWN_MS, check_refresh_cooldown, injection_from_decision,
     resolve_pane_capabilities,
 };
+use crate::workflows::ManualWorkflowRunOutcome;
 
 /// br-ft-pgjat: route silent `record_audit_action_redacted_with_cx`
 /// failures through the same observability counter as ft-luav8's

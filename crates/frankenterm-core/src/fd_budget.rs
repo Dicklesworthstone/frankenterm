@@ -470,7 +470,7 @@ impl FdBudget {
     fn add_allocated(&self, fds: u64) {
         let _ = self
             .total_allocated
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(current.saturating_add(fds))
             });
     }
@@ -478,7 +478,7 @@ impl FdBudget {
     fn subtract_allocated(&self, fds: u64) {
         let _ = self
             .total_allocated
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(current.saturating_sub(fds))
             });
     }

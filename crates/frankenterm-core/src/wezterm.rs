@@ -7528,7 +7528,7 @@ fn mark_mock_id_seen(counter: &AtomicU64, id: u64) {
 
 fn allocate_mock_id(counter: &AtomicU64, label: &str) -> crate::Result<u64> {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
             current.checked_add(1)
         })
         .map_err(|current| {

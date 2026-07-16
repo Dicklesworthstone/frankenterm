@@ -1667,7 +1667,7 @@ impl WriteCommandSender {
     }
 
     fn mark_command_dequeued(counter: &AtomicUsize) {
-        let _ = counter.fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |depth| {
+        let _ = counter.try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |depth| {
             depth.checked_sub(1)
         });
     }

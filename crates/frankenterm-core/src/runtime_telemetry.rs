@@ -152,7 +152,7 @@ fn runtime_telemetry_epoch_millis(now: SystemTime, context: &'static str) -> u64
 
 fn record_runtime_telemetry_clock_anomaly(context: &'static str, skew: Duration) {
     let anomaly_count = RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             Some(count.saturating_add(1))
         })
         .unwrap_or(u64::MAX)
