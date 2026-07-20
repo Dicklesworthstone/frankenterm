@@ -286,6 +286,11 @@ cp "$MUX_SERVER_BINARY" "$APP_BUNDLE/Contents/MacOS/frankenterm-mux-server"
 echo "Installing ft CLI..."
 cp "$FT_BINARY" "$APP_BUNDLE/Contents/MacOS/ft"
 
+# --- Guard (GH #70): bundled defaults must be generic/local-only (no live
+#     remote hosts, SSH keys, or proxy commands that auto-connect on first
+#     launch). Fails the bundle if the defaults regress. ---
+bash "$PROJECT_ROOT/scripts/check_bundled_default_config_generic.sh"
+
 # --- Copy default config ---
 DEFAULT_CONFIG="$PROJECT_ROOT/crates/frankenterm-gui/frankenterm.toml"
 if [ -f "$DEFAULT_CONFIG" ]; then
