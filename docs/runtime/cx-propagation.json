@@ -40,7 +40,7 @@
       "wrapper_exempt": 5
     },
     "other": {
-      "covered": 388,
+      "covered": 390,
       "exempt_file": 43,
       "files": [
         "alerts.rs",
@@ -103,8 +103,8 @@
         "web_framework.rs",
         "wezterm.rs"
       ],
-      "total": 814,
-      "uncovered": 16,
+      "total": 818,
+      "uncovered": 18,
       "wrapper_exempt": 367
     },
     "tx": {
@@ -128,7 +128,7 @@
       "wrapper_exempt": 5
     },
     "workflow": {
-      "covered": 35,
+      "covered": 36,
       "exempt_file": 0,
       "files": [
         "workflows/account_steps.rs",
@@ -141,12 +141,12 @@
         "workflows/runner.rs",
         "workflows/wait_execution.rs"
       ],
-      "total": 63,
+      "total": 64,
       "uncovered": 2,
       "wrapper_exempt": 26
     }
   },
-  "generated_at": "2026-07-13T11:57:09Z",
+  "generated_at": "2026-07-20T11:42:58Z",
   "labruntime_coverage": {
     "by_bucket": {
       "capture": {
@@ -204,10 +204,10 @@
   },
   "schema_version": 2,
   "totals": {
-    "covered_sites": 442,
+    "covered_sites": 445,
     "exempt_file_sites": 43,
-    "total_sites": 913,
-    "uncovered_sites": 19,
+    "total_sites": 918,
+    "uncovered_sites": 21,
     "wrapper_exempt_sites": 409
   }
 }
