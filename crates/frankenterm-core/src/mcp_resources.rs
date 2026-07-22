@@ -1579,9 +1579,8 @@ fn load_swarm_scent_tx_intents(
         }
     };
 
-    let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
-        Ok(contract) => contract,
-        Err(err) if err.code == "robot.tx_not_found" => {
+    match contract_path.try_exists() {
+        Ok(false) => {
             return (
                 Vec::new(),
                 SwarmScentSourceStatus::live(
@@ -1593,6 +1592,23 @@ fn load_swarm_scent_tx_intents(
                 ),
             );
         }
+        Ok(true) => {}
+        Err(err) => {
+            return (
+                Vec::new(),
+                SwarmScentSourceStatus::unavailable(
+                    "tx_intents",
+                    format!(
+                        "Inspect active mission tx contract path {}: {err}",
+                        contract_path.display()
+                    ),
+                ),
+            );
+        }
+    }
+
+    let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
+        Ok(contract) => contract,
         Err(err) => {
             return (
                 Vec::new(),

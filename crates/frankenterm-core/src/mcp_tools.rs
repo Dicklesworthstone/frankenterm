@@ -688,14 +688,14 @@ fn acquire_mcp_tx_contract_lock(
         Ok(true) => {}
         Ok(false) => {
             return Err(McpToolError::new(
-                "robot.tx_not_found",
+                MCP_ERR_WORKFLOW,
                 format!("Tx contract file not found: {}", path.display()),
                 Some("Pass contract_file or create .ft/mission/tx-active.json.".to_string()),
             ));
         }
         Err(err) => {
             return Err(McpToolError::new(
-                "robot.tx_lock_failed",
+                MCP_ERR_STORAGE,
                 format!(
                     "Failed to inspect tx contract before locking {}: {err}",
                     path.display()
@@ -708,9 +708,9 @@ fn acquire_mcp_tx_contract_lock(
         let in_progress = err.kind() == crate::tx_execution::TxContractStoreErrorKind::InProgress;
         McpToolError::new(
             if in_progress {
-                "robot.tx_in_progress"
+                MCP_ERR_WORKFLOW
             } else {
-                "robot.tx_lock_failed"
+                MCP_ERR_STORAGE
             },
             err.to_string(),
             Some(if in_progress {
@@ -730,9 +730,9 @@ fn load_mcp_tx_contract_from_guard(
         let oversize = err.kind() == crate::tx_execution::TxContractStoreErrorKind::TooLarge;
         McpToolError::new(
             if oversize {
-                "robot.tx_oversize"
+                MCP_ERR_INVALID_ARGS
             } else {
-                "robot.tx_read_failed"
+                MCP_ERR_STORAGE
             },
             err.to_string(),
             Some(if oversize {
@@ -746,14 +746,14 @@ fn load_mcp_tx_contract_from_guard(
     })?;
     let contract: crate::plan::MissionTxContract = serde_json::from_slice(&raw).map_err(|err| {
         McpToolError::new(
-            "robot.tx_invalid_json",
+            MCP_ERR_INVALID_ARGS,
             format!("Invalid tx contract JSON in {}: {err}", path.display()),
             Some("Ensure the file matches the MissionTxContract schema.".to_string()),
         )
     })?;
     contract.validate().map_err(|err| {
         McpToolError::new(
-            "robot.tx_validation_failed",
+            MCP_ERR_INVALID_ARGS,
             format!("Tx contract validation failed: {err}"),
             Some("Inspect contract via wa.tx_show include_contract=true.".to_string()),
         )
@@ -767,7 +767,7 @@ fn authorize_mcp_tx_contract_for_effects(
 ) -> std::result::Result<(), McpToolError> {
     guard.authorizes(authoritative_path).map_err(|err| {
         McpToolError::new(
-            "robot.tx_lock_failed",
+            MCP_ERR_STORAGE,
             format!(
                 "Transaction contract authorization changed before external effect dispatch: {err}"
             ),
@@ -6256,7 +6256,7 @@ impl ToolHandler for WaTxRunTool {
             }
             (Err(execution_err), Ok(())) => {
                 let envelope = McpEnvelope::<()>::error(
-                    "robot.tx_execution_failed",
+                    MCP_ERR_WORKFLOW,
                     format!(
                         "tx execution failed after persisting available transaction evidence: {execution_err}"
                     ),
@@ -6298,6 +6298,21 @@ impl ToolHandler for WaTxRunTool {
 pub(super) struct WaTxRollbackTool {
     config: Arc<Config>,
     policy_rate_limiter: SharedRateLimiter,
+}
+
+fn mcp_tx_rollback_proof_error(
+    kind: crate::tx_execution::RollbackProofKind,
+) -> (&'static str, &'static str) {
+    match kind {
+        crate::tx_execution::RollbackProofKind::Missing => (
+            MCP_ERR_WORKFLOW,
+            "Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace .ft/tx_ledgers records first: missing durable proof does not establish that an external effect was absent. For future new transactions, execute commits through MCP wa.tx_run, `ft tx run`, or `ft robot tx run` so receipts and authoritative proofs are persisted together; do not fabricate receipts.",
+        ),
+        crate::tx_execution::RollbackProofKind::Conflict => (
+            MCP_ERR_WORKFLOW,
+            "Do not blindly rerun the commit or rollback. Inspect and reconcile the contract receipts with the workspace .ft/tx_ledgers records first; ambiguous or contradictory durable state may represent an external effect that was already dispatched.",
+        ),
+    }
 }
 
 impl WaTxRollbackTool {
@@ -6426,7 +6441,7 @@ impl ToolHandler for WaTxRollbackTool {
                     MCP_ERR_INVALID_ARGS,
                     err,
                     Some(
-                        "Use wa.tx_show(include_contract=true) and ensure the contract includes commit receipts for the steps that actually committed."
+                        "Use wa.tx_show(include_contract=true) to inspect persisted commit receipts. Do not rerun the commit or rollback solely to repair missing receipts: durable state may represent an external effect that was already dispatched. Reconcile the contract with the workspace .ft/tx_ledgers records; do not fabricate receipts."
                             .to_string(),
                     ),
                     elapsed_ms(start),
@@ -6538,8 +6553,37 @@ impl ToolHandler for WaTxRollbackTool {
             }
         };
         let mut persisted_contract = contract.clone();
-        let rollback_result =
-            execution_engine.rollback_with_store(&mut persisted_contract, &mut idem_store, now_ms);
+        let rollback_result = match execution_engine.rollback_with_store(
+            &mut persisted_contract,
+            &mut idem_store,
+            now_ms,
+        ) {
+            Err(
+                rollback_err @ crate::tx_execution::TxExecutionError::RollbackProof { kind, .. },
+            ) => {
+                let (error_code, hint) = mcp_tx_rollback_proof_error(kind);
+                let envelope = McpEnvelope::<()>::error(
+                    error_code,
+                    format!("rollback rejected before compensation dispatch: {rollback_err}"),
+                    Some(hint.to_string()),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+            Err(rollback_err @ crate::tx_execution::TxExecutionError::InProgress(_)) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_WORKFLOW,
+                    format!("rollback deferred before compensation dispatch: {rollback_err}"),
+                    Some(
+                        "Wait for the in-flight transaction mutation to finish, then retry."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+            result => result,
+        };
         let save_result = mcp_save_mission_tx_contract_to_path(
             &contract_lock,
             &authoritative_contract_path,
@@ -6560,7 +6604,7 @@ impl ToolHandler for WaTxRollbackTool {
             }
             (Err(rollback_err), Ok(())) => {
                 let envelope = McpEnvelope::<()>::error(
-                    "robot.tx_execution_failed",
+                    MCP_ERR_WORKFLOW,
                     format!(
                         "rollback failed after persisting available transaction evidence: {rollback_err}"
                     ),
@@ -9385,9 +9429,9 @@ mod tests {
     };
     use crate::mcp::mcp_types::{IpcPaneState, McpPaneState, StateParams};
     use crate::mcp::set_mcp_test_pane_state_override;
-    #[cfg(unix)]
     use crate::mcp_error::{
         MCP_ERR_CASS, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
+        MCP_ERR_STORAGE, MCP_ERR_WORKFLOW,
     };
     use crate::plan::{
         ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId,
@@ -9865,50 +9909,15 @@ mod tests {
         path
     }
 
-    fn write_tx_contract_with_partial_commit_receipts(dir: &TempDir) -> std::path::PathBuf {
-        super::set_tx_contract_workspace_test_root(Some(dir.path().to_path_buf()));
-        let path = dir.path().join("tx-contract-with-receipts.json");
-        let mut contract = sample_tx_contract(MissionTxState::Failed);
-        let commit_report = execute_commit_phase(
-            &sample_tx_contract(MissionTxState::Committing),
-            &[
-                TxCommitStepInput {
-                    step_id: TxStepId("tx-step:1".to_string()),
-                    success: true,
-                    reason_code: "commit_step_succeeded".to_string(),
-                    error_code: None,
-                    completed_at_ms: 10_001,
-                },
-                TxCommitStepInput {
-                    step_id: TxStepId("tx-step:2".to_string()),
-                    success: false,
-                    reason_code: "commit_step_failed_injected".to_string(),
-                    error_code: Some("FTX3999".to_string()),
-                    completed_at_ms: 10_002,
-                },
-                TxCommitStepInput {
-                    step_id: TxStepId("tx-step:3".to_string()),
-                    success: true,
-                    reason_code: "commit_step_succeeded".to_string(),
-                    error_code: None,
-                    completed_at_ms: 10_003,
-                },
-            ],
-            MissionKillSwitchLevel::Off,
-            false,
-            10_500,
-        )
-        .expect("commit report");
-        contract.receipts = commit_report.receipts;
-        std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
-        path
-    }
-
-    fn write_tx_contract_with_full_commit_receipts(dir: &TempDir) -> std::path::PathBuf {
+    /// Builds receipt-only commit claims for argument-preflight tests.
+    ///
+    /// This fixture deliberately has no matching durable execution proofs, so
+    /// callers must reject the request before rollback execution can begin.
+    fn write_tx_contract_with_receipt_only_commit_claims(dir: &TempDir) -> std::path::PathBuf {
         super::set_tx_contract_workspace_test_root(Some(dir.path().to_path_buf()));
         let path = dir
             .path()
-            .join("tx-contract-with-full-commit-receipts.json");
+            .join("tx-contract-with-receipt-only-commit-claims.json");
         let mut contract = sample_tx_contract(MissionTxState::Committed);
         let commit_report = execute_commit_phase(
             &sample_tx_contract(MissionTxState::Committing),
@@ -11678,7 +11687,7 @@ mod tests {
         ] {
             let err = super::mcp_tx_contract_save_failure_after_effects(
                 super::McpToolError::new(
-                    "robot.tx_write_failed",
+                    MCP_ERR_STORAGE,
                     "disk full".to_string(),
                     Some("Recovery artifact: /tmp/tx.recovery.tmp".to_string()),
                 ),
@@ -11687,7 +11696,7 @@ mod tests {
                 effect_label,
             );
 
-            assert_eq!(err.code, "robot.tx_write_failed");
+            assert_eq!(err.code, MCP_ERR_STORAGE);
             assert!(err.message.contains(completion_context));
             assert!(err.message.contains("disk full"));
             assert!(
@@ -11803,7 +11812,7 @@ mod tests {
         let Err(err) = second else {
             return;
         };
-        assert_eq!(err.code, "robot.tx_in_progress");
+        assert_eq!(err.code, MCP_ERR_WORKFLOW);
 
         drop(first);
         super::acquire_mcp_tx_contract_lock(dir.path(), &contract_path)
@@ -11930,7 +11939,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(envelope["error_code"], "robot.tx_lock_failed");
+        assert_eq!(envelope["error_code"], MCP_ERR_STORAGE);
         for pane_id in 1..=3 {
             assert_eq!(tx_run_mock_pane_content(&mock, pane_id), "");
         }
@@ -12060,7 +12069,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert_eq!(envelope["error_code"], MCP_ERR_STORAGE);
         assert!(
             envelope["error"]
                 .as_str()
@@ -12139,7 +12148,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert_eq!(envelope["error_code"], MCP_ERR_STORAGE);
         assert!(
             envelope["error"]
                 .as_str()
@@ -12295,7 +12304,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert_eq!(envelope["error_code"], MCP_ERR_STORAGE);
         assert!(
             envelope["error"]
                 .as_str()
@@ -12360,7 +12369,7 @@ mod tests {
         );
 
         assert_eq!(envelope["ok"], false);
-        assert_eq!(envelope["error_code"], "robot.tx_write_failed");
+        assert_eq!(envelope["error_code"], MCP_ERR_STORAGE);
         assert!(
             envelope["error"]
                 .as_str()
@@ -12661,7 +12670,7 @@ mod tests {
         );
         assert_eq!(
             envelope["hint"],
-            "Use wa.tx_show(include_contract=true) and ensure the contract includes commit receipts for the steps that actually committed."
+            "Use wa.tx_show(include_contract=true) to inspect persisted commit receipts. Do not rerun the commit or rollback solely to repair missing receipts: durable state may represent an external effect that was already dispatched. Reconcile the contract with the workspace .ft/tx_ledgers records; do not fabricate receipts."
         );
 
         let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
@@ -12746,9 +12755,8 @@ mod tests {
         assert_eq!(failed_contract.outcome, TxOutcome::Failed);
         assert_eq!(failed_contract.receipts.len(), 6);
 
-        // Rollback execution IDs currently include millisecond wall time. Cross
-        // the next clock tick so this retry has a distinct durable ledger ID.
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        // The process/time nonce in rollback execution IDs guarantees a
+        // distinct durable retry ledger even within the same millisecond.
         let retry = parse_json_content(
             tool.call(
                 &test_mcp_context(),
@@ -12780,7 +12788,7 @@ mod tests {
     #[test]
     fn tx_rollback_tool_rejects_unknown_compensation_step_with_guidance() {
         let dir = workspace_tempdir();
-        let contract_path = write_tx_contract_with_full_commit_receipts(&dir);
+        let contract_path = write_tx_contract_with_receipt_only_commit_claims(&dir);
         let tool = WaTxRollbackTool::new(config());
 
         let envelope = parse_json_content(
@@ -12807,7 +12815,117 @@ mod tests {
     }
 
     #[test]
-    fn tx_rollback_tool_uses_receipts_to_compensate_only_committed_steps() {
+    fn tx_rollback_tool_rejects_receipt_only_commit_claims_before_dispatch() {
+        let dir = workspace_tempdir();
+        let contract_path = write_tx_contract_with_receipt_only_commit_claims(&dir);
+        let original_contract = std::fs::read(&contract_path).expect("read forged contract");
+        let tool = WaTxRollbackTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"], MCP_ERR_WORKFLOW,
+            "MCP envelopes must use the published FT-MCP taxonomy: {envelope}"
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rejected before compensation dispatch")
+        );
+        assert_eq!(
+            envelope["hint"],
+            "Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace .ft/tx_ledgers records first: missing durable proof does not establish that an external effect was absent. For future new transactions, execute commits through MCP wa.tx_run, `ft tx run`, or `ft robot tx run` so receipts and authoritative proofs are persisted together; do not fabricate receipts."
+        );
+        assert_eq!(
+            std::fs::read(&contract_path).expect("reread forged contract"),
+            original_contract,
+            "proof rejection must leave the contract byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn tx_rollback_tool_maps_real_durable_conflict_without_dispatch() {
+        let (_db_dir, db_path) = temp_db_path();
+        let dir = workspace_tempdir();
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
+        let contract_path = write_tx_contract_with_proven_commit_receipts(&dir, &db_path, None);
+        let mut contract = mcp_load_mission_tx_contract_from_path(&contract_path)
+            .expect("load proven transaction fixture");
+        let receipt = contract
+            .receipts
+            .iter_mut()
+            .find(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                    && receipt.get("step_id").and_then(serde_json::Value::as_str)
+                        == Some("tx-step:1")
+            })
+            .expect("tx-step:1 commit receipt");
+        receipt["outcome"] = serde_json::json!("failed");
+        receipt["reason_code"] = serde_json::json!("forged_commit_failure");
+        receipt["error_code"] = serde_json::json!("FTX3999");
+        receipt["decision_path"] = serde_json::json!("forged_receipt_history");
+        std::fs::write(
+            &contract_path,
+            serde_json::to_vec_pretty(&contract).expect("serialize contradictory receipt fixture"),
+        )
+        .expect("persist contradictory receipt fixture");
+        let original_contract =
+            std::fs::read(&contract_path).expect("read contradictory receipt fixture");
+        let original_panes = (1..=3)
+            .map(|pane_id| tx_run_mock_pane_content(&mock, pane_id))
+            .collect::<Vec<_>>();
+        let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"], MCP_ERR_WORKFLOW,
+            "MCP envelopes must use the published FT-MCP taxonomy: {envelope}"
+        );
+        assert!(
+            envelope["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Rollback proof conflict")
+        );
+        let hint = envelope["hint"].as_str().unwrap_or_default();
+        assert!(hint.contains("Do not blindly rerun"));
+        assert!(hint.contains("already dispatched"));
+        assert_eq!(
+            std::fs::read(&contract_path).expect("reread rejected conflict fixture"),
+            original_contract
+        );
+        assert_eq!(
+            (1..=3)
+                .map(|pane_id| tx_run_mock_pane_content(&mock, pane_id))
+                .collect::<Vec<_>>(),
+            original_panes,
+            "proof conflict must not dispatch compensation"
+        );
+    }
+
+    #[test]
+    fn tx_rollback_tool_compensates_only_durably_committed_steps() {
         let (_db_dir, db_path) = temp_db_path();
         let dir = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();

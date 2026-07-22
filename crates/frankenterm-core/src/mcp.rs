@@ -1829,13 +1829,13 @@ mod tests {
         let missing_path = temp_root.join("missing.json");
         let missing = mcp_load_mission_tx_contract_from_path(&missing_path)
             .expect_err("missing path should fail");
-        assert_eq!(missing.code, "robot.tx_not_found");
+        assert_eq!(missing.code, MCP_ERR_WORKFLOW);
 
         let invalid_json_path = temp_root.join("invalid.json");
         std::fs::write(&invalid_json_path, "{broken").expect("write invalid json");
         let invalid = mcp_load_mission_tx_contract_from_path(&invalid_json_path)
             .expect_err("invalid json should fail");
-        assert_eq!(invalid.code, "robot.tx_invalid_json");
+        assert_eq!(invalid.code, MCP_ERR_INVALID_ARGS);
 
         let mut invalid_contract = sample_mcp_tx_contract();
         invalid_contract.plan.steps.clear();
@@ -1847,7 +1847,7 @@ mod tests {
         .expect("write invalid contract");
         let validation = mcp_load_mission_tx_contract_from_path(&invalid_contract_path)
             .expect_err("invalid contract should fail validation");
-        assert_eq!(validation.code, "robot.tx_validation_failed");
+        assert_eq!(validation.code, MCP_ERR_INVALID_ARGS);
 
         let valid_contract = sample_mcp_tx_contract();
         let valid_contract_path = temp_root.join("valid-contract.json");

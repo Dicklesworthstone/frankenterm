@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Config;
-use crate::mcp_error::{MCP_ERR_INVALID_ARGS, McpToolError};
+use crate::mcp_error::{
+    MCP_ERR_INTERNAL, MCP_ERR_INVALID_ARGS, MCP_ERR_STORAGE, MCP_ERR_WORKFLOW, McpToolError,
+};
 
 use super::{
     McpMissionAssignmentCounters, McpMissionAssignmentData, McpMissionFailureCatalogEntry,
@@ -312,23 +314,19 @@ pub(super) fn mcp_load_mission_tx_contract_from_path(
     // OOM DoS from a hostile `.ft/mission/tx-active.json` shipped in a
     // cloned repo. See `read_capped_file` docstring.
     //
-    // Preserve the historical `robot.tx_not_found` error code + hint on
-    // the NotFound path so callers that pattern-match on it continue
-    // to work; for all other I/O errors we surface `robot.tx_read_failed`
-    // and oversize rejections use `robot.tx_oversize`.
+    // Transaction helpers feed MCP tool envelopes, so every failure must use
+    // the stable FT-MCP namespace. Missing workflow state is distinct from
+    // storage I/O, while hostile/invalid payloads are invalid arguments.
     let raw = match read_capped_file(
         path,
         MAX_TX_CONTRACT_BYTES,
-        "robot.tx_read_failed",
-        "robot.tx_oversize",
+        MCP_ERR_STORAGE,
+        MCP_ERR_INVALID_ARGS,
     ) {
         Ok(raw) => raw,
-        Err(err)
-            if err.code == "robot.tx_read_failed"
-                && err.message.starts_with("File not found: ") =>
-        {
+        Err(err) if err.code == MCP_ERR_STORAGE && err.message.starts_with("File not found: ") => {
             return Err(McpToolError::new(
-                "robot.tx_not_found",
+                MCP_ERR_WORKFLOW,
                 format!("Tx contract file not found: {}", path.display()),
                 Some("Pass contract_file or create .ft/mission/tx-active.json.".to_string()),
             ));
@@ -338,7 +336,7 @@ pub(super) fn mcp_load_mission_tx_contract_from_path(
 
     let contract: crate::plan::MissionTxContract = serde_json::from_str(&raw).map_err(|err| {
         McpToolError::new(
-            "robot.tx_invalid_json",
+            MCP_ERR_INVALID_ARGS,
             format!("Invalid tx contract JSON in {}: {err}", path.display()),
             Some("Ensure the file matches the MissionTxContract schema.".to_string()),
         )
@@ -346,7 +344,7 @@ pub(super) fn mcp_load_mission_tx_contract_from_path(
 
     contract.validate().map_err(|err| {
         McpToolError::new(
-            "robot.tx_validation_failed",
+            MCP_ERR_INVALID_ARGS,
             format!("Tx contract validation failed: {err}"),
             Some("Inspect contract via wa.tx_show include_contract=true.".to_string()),
         )
@@ -364,14 +362,25 @@ pub(super) fn mcp_save_mission_tx_contract_to_path(
         use crate::tx_execution::TxContractStoreErrorKind;
 
         let code = match err.kind() {
-            TxContractStoreErrorKind::Validation => "robot.tx_validation_failed",
-            TxContractStoreErrorKind::Serialization => "robot.tx_serialize_failed",
-            TxContractStoreErrorKind::TooLarge => "robot.tx_oversize",
-            TxContractStoreErrorKind::InProgress
+            TxContractStoreErrorKind::Validation | TxContractStoreErrorKind::Serialization => {
+                MCP_ERR_INTERNAL
+            }
+            TxContractStoreErrorKind::TooLarge
+            | TxContractStoreErrorKind::InProgress
             | TxContractStoreErrorKind::Lock
             | TxContractStoreErrorKind::Write
             | TxContractStoreErrorKind::Sync
-            | TxContractStoreErrorKind::Rename => "robot.tx_write_failed",
+            | TxContractStoreErrorKind::Rename => MCP_ERR_STORAGE,
+        };
+        let message = if code == MCP_ERR_INTERNAL {
+            tracing::error!(
+                error = %err,
+                error_kind = ?err.kind(),
+                "server-generated transaction contract could not be serialized safely"
+            );
+            "Internal transaction contract persistence error".to_string()
+        } else {
+            err.to_string()
         };
         let hint = err.recovery_path().map(|recovery_path| {
             format!(
@@ -379,7 +388,7 @@ pub(super) fn mcp_save_mission_tx_contract_to_path(
                 recovery_path.display()
             )
         });
-        McpToolError::new(code, err.to_string(), hint)
+        McpToolError::new(code, message, hint)
     })
 }
 
@@ -688,7 +697,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        MCP_ERR_INVALID_ARGS, MissionStateParams, mcp_build_mission_assignments,
+        MCP_ERR_INVALID_ARGS, MCP_ERR_WORKFLOW, MissionStateParams, mcp_build_mission_assignments,
         mcp_load_mission_from_path, mcp_load_mission_tx_contract_from_path,
         mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions,
         mcp_parse_mission_kill_switch, mcp_resolve_mission_file_path,
@@ -1304,7 +1313,7 @@ mod tests {
     fn load_tx_contract_not_found() {
         let path = Path::new("/nonexistent/tx-active.json");
         let err = mcp_load_mission_tx_contract_from_path(path).unwrap_err();
-        assert_eq!(err.code, "robot.tx_not_found");
+        assert_eq!(err.code, MCP_ERR_WORKFLOW);
         assert!(err.hint.is_some());
     }
 
@@ -1329,7 +1338,7 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
 
         let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
-        assert_eq!(err.code, "robot.tx_oversize");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
         assert!(
             err.message
                 .contains(&format!("{}", super::MAX_TX_CONTRACT_BYTES)),
@@ -1368,7 +1377,7 @@ mod tests {
         let path = dir.path().join("tx.json");
         std::fs::write(&path, "not json").unwrap();
         let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
-        assert_eq!(err.code, "robot.tx_invalid_json");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
     }
 
     #[test]
@@ -1381,7 +1390,7 @@ mod tests {
         let json = serde_json::to_string(&contract).unwrap();
         std::fs::write(&path, json).unwrap();
         let err = mcp_load_mission_tx_contract_from_path(&path).unwrap_err();
-        assert_eq!(err.code, "robot.tx_validation_failed");
+        assert_eq!(err.code, MCP_ERR_INVALID_ARGS);
     }
 
     #[test]
