@@ -173,6 +173,10 @@ impl IdempotencyKey {
     pub fn step_id(&self) -> &str {
         &self.step_id
     }
+
+    const fn is_compensation(&self) -> bool {
+        matches!(self.key_kind, IdempotencyKeyKind::Compensation)
+    }
 }
 
 impl std::fmt::Display for IdempotencyKey {
@@ -1301,29 +1305,157 @@ impl ResumeContext {
 
 // ── Idempotency Store ────────────────────────────────────────────────────────
 
-/// Exclusive cross-process lease for one idempotency key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProofBarrierMode {
+    Shared,
+    Exclusive,
+}
+
+/// Plan-scoped cross-process barrier for durable idempotency proof reads.
 ///
-/// The backing file lock is released when this value is dropped. Durable tx
-/// engines must keep the reservation alive from the post-lock dedup decision,
-/// through the durable `Pending` write and external dispatch, until the
-/// terminal outcome has been durably completed.
+/// Ordinary single-key writers hold this barrier shared before taking their
+/// exclusive key lock. Atomic rollback proof preflight holds it exclusive,
+/// which freezes every durable outcome for the plan while requiring only one
+/// file descriptor regardless of the number of commit/compensation keys.
+#[derive(Debug)]
+struct ProofBarrierGuard {
+    plan_id: String,
+    mode: ProofBarrierMode,
+    lock_dir: Arc<Dir>,
+    lock_name: PathBuf,
+    spool_display: PathBuf,
+    _lock_file: File,
+}
+
+/// Optional per-key component of a durable lease.
+///
+/// Single-key writers own one of these beneath a shared plan barrier. Batch
+/// proof leases need no key file: their shared `Arc<ProofBarrierGuard>` owns
+/// the plan's exclusive barrier for the entire operation.
+#[derive(Debug)]
+struct DurableKeyLockGuard {
+    lock_dir: Arc<Dir>,
+    lock_name: PathBuf,
+    spool_display: PathBuf,
+    _lock_file: File,
+}
+
+/// Key-only lease used to make durable proof preflight atomic with later
+/// execution-bound mutation.
+///
+/// The live-spool outcome is refreshed after the applicable barrier/lock is
+/// acquired and remains stable for as long as this value is alive. The lease
+/// intentionally owns no execution lock, so callers can bind selected leases
+/// only after the complete proof set has been validated.
+#[derive(Debug)]
+pub(crate) struct DurableKeyLease {
+    idem_key: IdempotencyKey,
+    observed_outcome: Option<StepOutcome>,
+    key_lock: Option<DurableKeyLockGuard>,
+    proof_barrier: Arc<ProofBarrierGuard>,
+}
+
+impl DurableKeyLease {
+    /// Durable outcome observed while the plan barrier and any required key
+    /// lock were continuously held.
+    #[must_use]
+    pub(crate) fn observed_outcome(&self) -> Option<&StepOutcome> {
+        self.observed_outcome.as_ref()
+    }
+
+    /// Whether this lease owns the exact requested key.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn authorizes(&self, idem_key: &IdempotencyKey) -> bool {
+        &self.idem_key == idem_key
+    }
+}
+
+/// Canonically ordered logical key leases protected by one plan barrier.
+///
+/// Construction validates the complete input set before taking the exclusive
+/// barrier, then scans every durable ledger exactly once. Individual leases
+/// can be removed and bound to an execution while this set retains the barrier
+/// independently, so consuming the final logical lease cannot unfreeze proof
+/// before the rollback operation returns.
+#[derive(Debug)]
+pub(crate) struct DurableKeyLeaseSet {
+    leases: BTreeMap<IdempotencyKey, DurableKeyLease>,
+    proof_barrier: Arc<ProofBarrierGuard>,
+}
+
+impl DurableKeyLeaseSet {
+    /// Number of logical key leases currently retained by the set.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.leases.len()
+    }
+
+    /// Whether every acquired key lease has been consumed or released.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    #[cfg(test)]
+    fn key_lock_count(&self) -> usize {
+        self.leases
+            .values()
+            .filter(|lease| lease.key_lock.is_some())
+            .count()
+    }
+
+    #[cfg(test)]
+    fn uses_one_exclusive_barrier(&self) -> bool {
+        self.proof_barrier.mode == ProofBarrierMode::Exclusive
+            && self.leases.values().all(|lease| {
+                Arc::ptr_eq(&self.proof_barrier, &lease.proof_barrier)
+                    && lease.proof_barrier.mode == ProofBarrierMode::Exclusive
+            })
+    }
+
+    /// Inspect a held logical lease without releasing the plan barrier.
+    #[must_use]
+    pub(crate) fn get(&self, idem_key: &IdempotencyKey) -> Option<&DurableKeyLease> {
+        debug_assert_eq!(self.proof_barrier.mode, ProofBarrierMode::Exclusive);
+        self.leases.get(idem_key)
+    }
+
+    /// Remove one logical lease for execution binding while the set retains
+    /// the shared exclusive plan barrier.
+    pub(crate) fn take(&mut self, idem_key: &IdempotencyKey) -> Option<DurableKeyLease> {
+        debug_assert_eq!(self.proof_barrier.mode, ProofBarrierMode::Exclusive);
+        self.leases.remove(idem_key)
+    }
+}
+
+/// Cross-process mutation lease for one idempotency key.
+///
+/// Ordinary writers retain a shared plan barrier plus an exclusive key lock;
+/// atomic proof batches retain their exclusive plan barrier without opening a
+/// per-key lock. Durable tx engines keep the reservation alive from the
+/// post-lock dedup decision, through the durable `Pending` write and external
+/// dispatch, until the terminal outcome has been durably completed.
 #[derive(Debug)]
 pub struct IdempotencyReservation {
     idem_key: String,
     execution_id: String,
     observed_outcome: Option<StepOutcome>,
     pending_recorded: bool,
-    key_lock_dir: Arc<Dir>,
-    key_lock_name: PathBuf,
     // Fields drop in declaration order. Release the execution lock first while
-    // the key lease is still held, preserving the key-then-execution lifecycle
-    // through the final instant of reservation ownership.
+    // the optional key lease and plan barrier are still held, preserving the
+    // barrier-then-key-then-execution lifecycle through the final instant of
+    // reservation ownership.
     execution_lock: ExecutionLedgerLock,
-    _lock_file: File,
+    key_lock: Option<DurableKeyLockGuard>,
+    proof_barrier: Arc<ProofBarrierGuard>,
 }
 
 impl IdempotencyReservation {
-    /// Durable outcome observed while holding the key's exclusive lock.
+    /// Durable outcome observed while holding the plan barrier and any
+    /// required per-key lock.
     ///
     /// `None` permits a new Pending append only when the target execution does
     /// not already contain this key (normally a freshly-created retry
@@ -1345,10 +1477,12 @@ impl IdempotencyReservation {
 
 /// Exclusive cross-process lock for one execution ledger.
 ///
-/// Durable lock order is always idempotency-key lock first, execution lock
-/// second. Operations that do not hold a key lock (create, phase transition,
-/// archive, abort) take only the execution lock. This prevents different-key
-/// writers from publishing stale whole-ledger snapshots over each other.
+/// Durable writer lock order is always plan barrier first, optional
+/// idempotency-key lock second, and execution lock last. Operations that do
+/// not publish outcomes (create, phase transition, archive, abort) take only
+/// the execution lock. This prevents different-key writers from publishing
+/// stale whole-ledger snapshots over each other while allowing an atomic batch
+/// proof reader to freeze one plan without consuming one descriptor per key.
 #[derive(Debug)]
 struct ExecutionLedgerLock {
     execution_id: String,
@@ -1455,6 +1589,8 @@ pub struct IdempotencyStore {
     durable_spool: Option<DurableSpool>,
     #[cfg(test)]
     fail_persist_writes: bool,
+    #[cfg(test)]
+    durable_refresh_scan_count: usize,
 }
 
 const TX_LEDGER_DIR_NAME: &str = "tx_ledgers";
@@ -1775,11 +1911,11 @@ fn retain_failed_ledger_temp(
 fn open_directory_sync_file(dir: &Dir, display_path: &Path) -> Result<File, IdempotencyError> {
     #[cfg(not(windows))]
     let file =
-        dir.try_clone()
-            .map(Dir::into_std_file)
+        dir.open(".")
+            .map(CapFile::into_std)
             .map_err(|err| IdempotencyError::LedgerPersist {
                 reason: format!(
-                    "clone pinned directory {} for synchronization: {err}",
+                    "open pinned directory {} for synchronization: {err}",
                     display_path.display()
                 ),
             })?;
@@ -2251,6 +2387,8 @@ impl IdempotencyStore {
             durable_spool: None,
             #[cfg(test)]
             fail_persist_writes: false,
+            #[cfg(test)]
+            durable_refresh_scan_count: 0,
         }
     }
 
@@ -2572,6 +2710,8 @@ impl IdempotencyStore {
             }),
             #[cfg(test)]
             fail_persist_writes: false,
+            #[cfg(test)]
+            durable_refresh_scan_count: 0,
         };
         let spool = store.durable_spool()?;
 
@@ -2705,6 +2845,347 @@ impl IdempotencyStore {
         Ok(store)
     }
 
+    fn acquire_plan_proof_barrier(
+        &self,
+        plan_id: &str,
+        mode: ProofBarrierMode,
+    ) -> Result<Arc<ProofBarrierGuard>, IdempotencyError> {
+        let spool = self.durable_spool()?;
+        let digest =
+            sha256_domain_digest(b"frankenterm.tx.proof-barrier.v1", &[plan_id.as_bytes()]);
+        let lock_name = PathBuf::from(format!("plan-{digest}.proof.lock"));
+        let lock_display = spool.display_path.join(KEY_LOCK_DIR_NAME).join(&lock_name);
+        let options = lock_open_options();
+        let lock_file = spool
+            .key_lock_dir
+            .open_with(&lock_name, &options)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "open {mode:?} transaction proof barrier {} for plan {plan_id:?} without following symlinks: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        let metadata = lock_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect transaction proof barrier {}: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        validate_open_regular_file(&metadata, &lock_display)?;
+        let lock_file = lock_file.into_std();
+        let lock_result = match mode {
+            ProofBarrierMode::Shared => FileExt::try_lock_shared(&lock_file),
+            ProofBarrierMode::Exclusive => FileExt::try_lock_exclusive(&lock_file),
+        };
+        match lock_result {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(IdempotencyError::ReservationInProgress {
+                    key: format!("plan:{plan_id}"),
+                });
+            }
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "acquire {mode:?} transaction proof barrier {} for plan {plan_id:?}: {err}",
+                        lock_display.display()
+                    ),
+                });
+            }
+        }
+        validate_pinned_file_entry(&spool.key_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        Ok(Arc::new(ProofBarrierGuard {
+            plan_id: plan_id.to_string(),
+            mode,
+            lock_dir: Arc::clone(&spool.key_lock_dir),
+            lock_name,
+            spool_display: spool.display_path.clone(),
+            _lock_file: lock_file,
+        }))
+    }
+
+    fn acquire_durable_key_lock(
+        &self,
+        idem_key: &IdempotencyKey,
+    ) -> Result<DurableKeyLockGuard, IdempotencyError> {
+        let spool = self.durable_spool()?;
+        let key_hash = idem_key
+            .as_str()
+            .strip_prefix("txk:v2:")
+            .expect("IdempotencyKey constructors/deserializer enforce txk:v2 prefix");
+        let lock_name = PathBuf::from(format!("{key_hash}.lock"));
+        let lock_display = spool.display_path.join(KEY_LOCK_DIR_NAME).join(&lock_name);
+        let options = lock_open_options();
+        let lock_file = spool
+            .key_lock_dir
+            .open_with(&lock_name, &options)
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "open idempotency key lock {} for {} without following symlinks: {err}",
+                    lock_display.display(),
+                    idem_key.as_str()
+                ),
+            })?;
+        let metadata = lock_file
+            .metadata()
+            .map_err(|err| IdempotencyError::LedgerPersist {
+                reason: format!(
+                    "inspect idempotency key lock {}: {err}",
+                    lock_display.display()
+                ),
+            })?;
+        validate_open_regular_file(&metadata, &lock_display)?;
+        let lock_file = lock_file.into_std();
+        match FileExt::try_lock_exclusive(&lock_file) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(IdempotencyError::ReservationInProgress {
+                    key: idem_key.as_str().to_string(),
+                });
+            }
+            Err(err) => {
+                return Err(IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "acquire idempotency key lock {} for {}: {err}",
+                        lock_display.display(),
+                        idem_key.as_str()
+                    ),
+                });
+            }
+        }
+        validate_pinned_file_entry(&spool.key_lock_dir, &lock_name, &lock_file, &lock_display)?;
+        Ok(DurableKeyLockGuard {
+            lock_dir: Arc::clone(&spool.key_lock_dir),
+            lock_name,
+            spool_display: spool.display_path.clone(),
+            _lock_file: lock_file,
+        })
+    }
+
+    /// Acquire one key-only durable lease and refresh its live-spool outcome
+    /// while the shared plan barrier and exclusive key lock remain held.
+    ///
+    /// This is the ordinary single-key reservation primitive. It does not
+    /// require an execution ledger to exist and performs no transaction ledger
+    /// mutation. Atomic multi-key proof uses one exclusive plan barrier and a
+    /// bulk refresh instead. Callers must either bind the returned lease to an
+    /// execution or retain it until the proof-protected operation is complete.
+    fn acquire_durable_key_lease(
+        &mut self,
+        idem_key: &IdempotencyKey,
+        now_ms: u64,
+    ) -> Result<DurableKeyLease, IdempotencyError> {
+        self.validate_monotonic_timestamp(now_ms)?;
+        let proof_barrier =
+            self.acquire_plan_proof_barrier(idem_key.plan_id(), ProofBarrierMode::Shared)?;
+        let key_lock = self.acquire_durable_key_lock(idem_key)?;
+
+        // Keep both locks alive during the complete live-spool refresh. Any
+        // error drops them in key-then-barrier order; success transfers their
+        // ownership into the returned guard.
+        let observed_outcome = self.refresh_durable_outcome_for_key(idem_key, now_ms)?;
+        Ok(DurableKeyLease {
+            idem_key: idem_key.clone(),
+            observed_outcome,
+            key_lock: Some(key_lock),
+            proof_barrier,
+        })
+    }
+
+    /// Acquire a complete set of durable key leases in canonical key order.
+    ///
+    /// Sorting makes the logical result deterministic. Duplicate, empty, and
+    /// mixed-plan input is rejected before any lock is acquired. The method
+    /// then takes one exclusive plan barrier, verifies every ledger exactly
+    /// once, and creates descriptor-free logical leases for each requested key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyError::LedgerRecordInvariant`] for malformed batch
+    /// input, or propagates a plan-barrier or live-spool refresh error.
+    pub(crate) fn acquire_durable_key_leases(
+        &mut self,
+        keys: impl IntoIterator<Item = IdempotencyKey>,
+        now_ms: u64,
+    ) -> Result<DurableKeyLeaseSet, IdempotencyError> {
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let Some(first_key) = keys.first() else {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "durable key lease batch must not be empty".to_string(),
+            });
+        };
+        if let Some(duplicate) = keys.windows(2).find_map(|pair| {
+            if pair[0] == pair[1] {
+                Some(pair[0].clone())
+            } else {
+                None
+            }
+        }) {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "durable key lease batch contains duplicate idempotency key {duplicate}"
+                ),
+            });
+        }
+        let plan_id = first_key.plan_id().to_string();
+        if let Some(mixed) = keys.iter().find(|key| key.plan_id() != plan_id) {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "durable key lease batch mixes plan {plan_id:?} with plan {:?} for key {}",
+                    mixed.plan_id(),
+                    mixed.as_str()
+                ),
+            });
+        }
+        self.validate_monotonic_timestamp(now_ms)?;
+        let proof_barrier =
+            self.acquire_plan_proof_barrier(&plan_id, ProofBarrierMode::Exclusive)?;
+        let mut observed = self.refresh_durable_outcomes_for_keys(&keys, now_ms)?;
+        let leases = keys
+            .into_iter()
+            .map(|idem_key| {
+                let observed_outcome = observed
+                    .remove(&idem_key)
+                    .expect("bulk refresh returns one entry per requested unique key");
+                let lease = DurableKeyLease {
+                    idem_key: idem_key.clone(),
+                    observed_outcome,
+                    key_lock: None,
+                    proof_barrier: Arc::clone(&proof_barrier),
+                };
+                (idem_key, lease)
+            })
+            .collect();
+        Ok(DurableKeyLeaseSet {
+            leases,
+            proof_barrier,
+        })
+    }
+
+    /// Bind a continuously-held key-only lease to a live execution ledger.
+    ///
+    /// The key outcome is not refreshed again: no supported durable writer can
+    /// change it while `lease` owns its plan barrier (and, for ordinary
+    /// writers, its exclusive key lock). This method adds the execution lock
+    /// last, preserving the global barrier-then-optional-key-then-execution
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store mismatch when the lease came from another store, a
+    /// sealed-ledger error when the target execution is terminal, or propagates
+    /// execution-lock and live-ledger verification errors.
+    pub(crate) fn bind_durable_key_lease(
+        &mut self,
+        execution_id: &str,
+        lease: DurableKeyLease,
+    ) -> Result<IdempotencyReservation, IdempotencyError> {
+        self.validate_proof_barrier_binding(&lease.proof_barrier, &lease.idem_key)?;
+        Self::validate_durable_key_lock_shape(lease.proof_barrier.mode, lease.key_lock.as_ref())?;
+        if let Some(key_lock) = lease.key_lock.as_ref() {
+            self.validate_durable_key_lock(key_lock)?;
+        }
+
+        let execution_lock = self.acquire_execution_lock(execution_id)?;
+        let current = self.read_durable_ledger_locked(&execution_lock)?;
+        if current.ledger.phase().is_terminal() {
+            return Err(IdempotencyError::LedgerSealed {
+                phase: current.ledger.phase(),
+            });
+        }
+        self.ledgers
+            .insert(execution_id.to_string(), current.ledger);
+
+        let DurableKeyLease {
+            idem_key,
+            observed_outcome,
+            key_lock,
+            proof_barrier,
+        } = lease;
+        Ok(IdempotencyReservation {
+            idem_key: idem_key.as_str().to_string(),
+            execution_id: execution_id.to_string(),
+            observed_outcome,
+            pending_recorded: false,
+            execution_lock,
+            key_lock,
+            proof_barrier,
+        })
+    }
+
+    fn validate_proof_barrier_binding(
+        &self,
+        barrier: &ProofBarrierGuard,
+        idem_key: &IdempotencyKey,
+    ) -> Result<(), IdempotencyError> {
+        if barrier.plan_id != idem_key.plan_id() {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "transaction proof barrier for plan {:?} cannot authorize key {} from plan {:?}",
+                    barrier.plan_id,
+                    idem_key.as_str(),
+                    idem_key.plan_id()
+                ),
+            });
+        }
+        let spool = self.durable_spool()?;
+        if !Arc::ptr_eq(&spool.key_lock_dir, &barrier.lock_dir) {
+            return Err(IdempotencyError::ReservationStoreMismatch {
+                reserved_spool: barrier.spool_display.display().to_string(),
+                attempted_spool: spool.display_path.display().to_string(),
+            });
+        }
+        let lock_relative = Path::new(KEY_LOCK_DIR_NAME).join(&barrier.lock_name);
+        validate_pinned_file_entry(
+            &barrier.lock_dir,
+            &barrier.lock_name,
+            &barrier._lock_file,
+            &spool.display(&lock_relative),
+        )
+    }
+
+    fn validate_durable_key_lock_shape(
+        barrier_mode: ProofBarrierMode,
+        key_lock: Option<&DurableKeyLockGuard>,
+    ) -> Result<(), IdempotencyError> {
+        match (barrier_mode, key_lock) {
+            (ProofBarrierMode::Shared, Some(_)) | (ProofBarrierMode::Exclusive, None) => Ok(()),
+            (ProofBarrierMode::Shared, None) => Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "shared transaction proof barrier is missing its exclusive key lock"
+                    .to_string(),
+            }),
+            (ProofBarrierMode::Exclusive, Some(_)) => {
+                Err(IdempotencyError::LedgerRecordInvariant {
+                    reason: "exclusive transaction proof barrier must use descriptor-free logical key leases"
+                        .to_string(),
+                })
+            }
+        }
+    }
+
+    fn validate_durable_key_lock(
+        &self,
+        key_lock: &DurableKeyLockGuard,
+    ) -> Result<(), IdempotencyError> {
+        let spool = self.durable_spool()?;
+        if !Arc::ptr_eq(&spool.key_lock_dir, &key_lock.lock_dir) {
+            return Err(IdempotencyError::ReservationStoreMismatch {
+                reserved_spool: key_lock.spool_display.display().to_string(),
+                attempted_spool: spool.display_path.display().to_string(),
+            });
+        }
+        let lock_relative = Path::new(KEY_LOCK_DIR_NAME).join(&key_lock.lock_name);
+        validate_pinned_file_entry(
+            &key_lock.lock_dir,
+            &key_lock.lock_name,
+            &key_lock._lock_file,
+            &spool.display(&lock_relative),
+        )
+    }
+
     /// Acquire the exclusive durable lease for an idempotency key and refresh
     /// that key's outcome from the live spool while the lease is held.
     ///
@@ -2730,167 +3211,128 @@ impl IdempotencyStore {
         idem_key: &IdempotencyKey,
         now_ms: u64,
     ) -> Result<IdempotencyReservation, IdempotencyError> {
-        self.validate_monotonic_timestamp(now_ms)?;
-        let (key_lock_dir, spool_display) = {
-            let spool = self.durable_spool()?;
-            (Arc::clone(&spool.key_lock_dir), spool.display_path.clone())
-        };
-        let key_hash = idem_key
-            .as_str()
-            .strip_prefix("txk:v2:")
-            .expect("IdempotencyKey constructors/deserializer enforce txk:v2 prefix");
-        let lock_name = PathBuf::from(format!("{key_hash}.lock"));
-        let lock_display = spool_display.join(KEY_LOCK_DIR_NAME).join(&lock_name);
-        let options = lock_open_options();
-        let lock_file = key_lock_dir
-            .open_with(&lock_name, &options)
-            .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "open idempotency key lock {} for {} without following symlinks: {err}",
-                    lock_display.display(),
-                    idem_key.as_str()
-                ),
-            })?;
-        let metadata = lock_file
-            .metadata()
-            .map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "inspect idempotency key lock {}: {err}",
-                    lock_display.display()
-                ),
-            })?;
-        validate_open_regular_file(&metadata, &lock_display)?;
-        let lock_file = lock_file.into_std();
-        match lock_file.try_lock_exclusive() {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err(IdempotencyError::ReservationInProgress {
-                    key: idem_key.as_str().to_string(),
-                });
-            }
-            Err(err) => {
-                return Err(IdempotencyError::LedgerPersist {
-                    reason: format!(
-                        "acquire idempotency key lock {} for {}: {err}",
-                        lock_display.display(),
-                        idem_key.as_str()
-                    ),
-                });
-            }
-        }
-        validate_pinned_file_entry(&key_lock_dir, &lock_name, &lock_file, &lock_display)?;
-
-        // Lock order is key then execution. Holding both through Pending,
-        // dispatch, and terminal completion serializes whole-ledger writers and
-        // prevents an abort/archive process from sealing this execution while
-        // an external effect is in flight.
-        let execution_lock = self.acquire_execution_lock(execution_id)?;
-        let current = self.read_durable_ledger_locked(&execution_lock)?;
-        if current.ledger.phase().is_terminal() {
-            return Err(IdempotencyError::LedgerSealed {
-                phase: current.ledger.phase(),
-            });
-        }
-        self.ledgers
-            .insert(execution_id.to_string(), current.ledger);
-
-        // Keep both files alive before refreshing: any error below drops them
-        // and releases the OS locks, while success transfers ownership to the
-        // reservation returned to the caller.
-        let observed_outcome = self.refresh_durable_outcome_for_key(idem_key, now_ms)?;
-        Ok(IdempotencyReservation {
-            idem_key: idem_key.as_str().to_string(),
-            execution_id: execution_id.to_string(),
-            observed_outcome,
-            pending_recorded: false,
-            key_lock_dir,
-            key_lock_name: lock_name,
-            execution_lock,
-            _lock_file: lock_file,
-        })
+        let lease = self.acquire_durable_key_lease(idem_key, now_ms)?;
+        self.bind_durable_key_lease(execution_id, lease)
     }
 
-    fn refresh_durable_outcome_for_key(
+    /// Re-read one key from every verified durable ledger without mutating the
+    /// spool. This is suitable for fail-closed preflight that accepts only a
+    /// positive sticky outcome: an atomic concurrent completion may make this
+    /// read observe the earlier `Pending` value and reject conservatively, but
+    /// it cannot manufacture `Success`. A `None` result never authorizes a new
+    /// external effect; dispatch paths must use
+    /// [`Self::acquire_durable_reservation`] instead.
+    pub(crate) fn refresh_durable_outcome_for_key(
         &mut self,
         idem_key: &IdempotencyKey,
         now_ms: u64,
     ) -> Result<Option<StepOutcome>, IdempotencyError> {
-        let spool = self.durable_spool()?;
-        let entries = spool
-            .dir
-            .entries()
-            .map_err(|err| IdempotencyError::LedgerPersist {
+        self.refresh_durable_outcomes_for_keys(std::slice::from_ref(idem_key), now_ms)?
+            .remove(idem_key)
+            .ok_or_else(|| IdempotencyError::LedgerRecordInvariant {
                 reason: format!(
-                    "list pinned tx_ledgers directory {} during key refresh: {err}",
-                    spool.display_path.display()
+                    "bulk durable refresh omitted requested idempotency key {}",
+                    idem_key.as_str()
                 ),
-            })?;
-        let mut matching_records = Vec::new();
-        let mut durable_high_water_ms = 0;
-        for entry in entries {
-            let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
-                reason: format!(
-                    "read entry in pinned tx_ledgers directory {}: {err}",
-                    spool.display_path.display()
-                ),
-            })?;
-            let name = PathBuf::from(entry.file_name());
-            if name.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(stem) = name.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            if !is_valid_execution_id(stem) {
-                continue;
-            }
-            let display_path = spool.display(&name);
-            let contents = read_regular_nofollow(&spool.dir, &name, &display_path)?;
-            let ledger = serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
-                IdempotencyError::LedgerPersist {
-                    reason: format!(
-                        "deserialize ledger {} during key refresh: {err}",
-                        display_path.display()
-                    ),
-                }
-            })?;
-            if ledger.execution_id() != stem {
-                return Err(IdempotencyError::LedgerPersist {
-                    reason: format!(
-                        "ledger identity mismatch for {} during key refresh: filename execution_id {stem:?}, payload execution_id {:?}",
-                        display_path.display(),
-                        ledger.execution_id()
-                    ),
-                });
-            }
-            let verification = ledger.verify_chain();
-            if !verification.chain_intact {
-                return Err(IdempotencyError::LedgerPersist {
-                    reason: format!(
-                        "verify ledger hash chain for {} during key refresh: first_break_at={:?}, missing_ordinals={:?}",
-                        display_path.display(),
-                        verification.first_break_at,
-                        verification.missing_ordinals
-                    ),
-                });
-            }
-            durable_high_water_ms = durable_high_water_ms.max(
-                ledger
-                    .records()
-                    .iter()
-                    .map(|record| record.timestamp_ms)
-                    .max()
-                    .unwrap_or(0),
-            );
-            if let Some(record) = ledger.get_record(idem_key) {
-                matching_records.push(DurableOutcomeObservation {
-                    timestamp_ms: record.timestamp_ms,
-                    execution_id: stem.to_string(),
-                    ordinal: record.ordinal,
-                    outcome: record.outcome.clone(),
-                });
-            }
+            })
+    }
+
+    /// Verify the durable spool once and refresh every requested key from that
+    /// single authenticated snapshot.
+    fn refresh_durable_outcomes_for_keys(
+        &mut self,
+        idem_keys: &[IdempotencyKey],
+        now_ms: u64,
+    ) -> Result<BTreeMap<IdempotencyKey, Option<StepOutcome>>, IdempotencyError> {
+        let mut matching_records = idem_keys
+            .iter()
+            .cloned()
+            .map(|key| (key, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        if matching_records.len() != idem_keys.len() {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: "bulk durable refresh contains duplicate idempotency keys".to_string(),
+            });
         }
+        #[cfg(test)]
+        {
+            self.durable_refresh_scan_count = self.durable_refresh_scan_count.saturating_add(1);
+        }
+
+        let durable_high_water_ms = {
+            let spool = self.durable_spool()?;
+            let entries = spool
+                .dir
+                .entries()
+                .map_err(|err| IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "list pinned tx_ledgers directory {} during key refresh: {err}",
+                        spool.display_path.display()
+                    ),
+                })?;
+            let mut durable_high_water_ms = 0;
+            for entry in entries {
+                let entry = entry.map_err(|err| IdempotencyError::LedgerPersist {
+                    reason: format!(
+                        "read entry in pinned tx_ledgers directory {}: {err}",
+                        spool.display_path.display()
+                    ),
+                })?;
+                let name = PathBuf::from(entry.file_name());
+                if name.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(stem) = name.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                if !is_valid_execution_id(stem) {
+                    continue;
+                }
+                let display_path = spool.display(&name);
+                let contents = read_regular_nofollow(&spool.dir, &name, &display_path)?;
+                let ledger =
+                    serde_json::from_slice::<TxExecutionLedger>(&contents).map_err(|err| {
+                        IdempotencyError::LedgerPersist {
+                            reason: format!(
+                                "deserialize ledger {} during key refresh: {err}",
+                                display_path.display()
+                            ),
+                        }
+                    })?;
+                if ledger.execution_id() != stem {
+                    return Err(IdempotencyError::LedgerPersist {
+                        reason: format!(
+                            "ledger identity mismatch for {} during key refresh: filename execution_id {stem:?}, payload execution_id {:?}",
+                            display_path.display(),
+                            ledger.execution_id()
+                        ),
+                    });
+                }
+                let verification = ledger.verify_chain();
+                if !verification.chain_intact {
+                    return Err(IdempotencyError::LedgerPersist {
+                        reason: format!(
+                            "verify ledger hash chain for {} during key refresh: first_break_at={:?}, missing_ordinals={:?}",
+                            display_path.display(),
+                            verification.first_break_at,
+                            verification.missing_ordinals
+                        ),
+                    });
+                }
+                for record in ledger.records() {
+                    durable_high_water_ms = durable_high_water_ms.max(record.timestamp_ms);
+                    if let Some(observations) = matching_records.get_mut(&record.idem_key) {
+                        observations.push(DurableOutcomeObservation {
+                            timestamp_ms: record.timestamp_ms,
+                            execution_id: stem.to_string(),
+                            ordinal: record.ordinal,
+                            outcome: record.outcome.clone(),
+                        });
+                    }
+                }
+            }
+            durable_high_water_ms
+        };
 
         if now_ms < durable_high_water_ms {
             return Err(IdempotencyError::RetrogradeTimestamp {
@@ -2899,20 +3341,29 @@ impl IdempotencyStore {
             });
         }
 
-        let Some(authoritative) = select_authoritative_durable_outcome(idem_key, matching_records)?
-        else {
-            return Ok(None);
-        };
-        if !self.is_fresh_for_dedup(&authoritative.outcome, authoritative.timestamp_ms, now_ms) {
-            return Ok(None);
+        let mut outcomes = BTreeMap::new();
+        for (idem_key, observations) in matching_records {
+            let outcome = match select_authoritative_durable_outcome(&idem_key, observations)? {
+                Some(authoritative)
+                    if self.is_fresh_for_dedup(
+                        &authoritative.outcome,
+                        authoritative.timestamp_ms,
+                        now_ms,
+                    ) =>
+                {
+                    self.dedup.record(
+                        &idem_key,
+                        &authoritative.execution_id,
+                        authoritative.outcome.clone(),
+                        authoritative.timestamp_ms,
+                    );
+                    Some(authoritative.outcome)
+                }
+                Some(_) | None => None,
+            };
+            outcomes.insert(idem_key, outcome);
         }
-        self.dedup.record(
-            idem_key,
-            &authoritative.execution_id,
-            authoritative.outcome.clone(),
-            authoritative.timestamp_ms,
-        );
-        Ok(Some(authoritative.outcome))
+        Ok(outcomes)
     }
 
     /// Flush an explicit ledger snapshot to the durable spool (no-op when
@@ -3163,7 +3614,10 @@ impl IdempotencyStore {
     /// [`Self::record_execution`] for the pre-dispatch `Pending` record. It
     /// binds the mutation to the exact locked key and refuses to overwrite an
     /// outcome observed by the live-spool refresh performed during lease
-    /// acquisition.
+    /// acquisition. The one deliberate exception is a failed or skipped
+    /// compensation: retries reuse the same semantic compensation key while
+    /// holding its lease, so a later durable `Compensated` or ambiguous
+    /// `Pending` fact can never be bypassed through a parallel attempt key.
     pub fn record_execution_reserved(
         &mut self,
         reservation: &mut IdempotencyReservation,
@@ -3188,7 +3642,17 @@ impl IdempotencyStore {
                 execution_id: reservation.execution_id.clone(),
             });
         }
-        if reservation.observed_outcome.is_some() {
+        let retries_failed_compensation = idem_key.is_compensation()
+            && matches!(
+                reservation.observed_outcome.as_ref(),
+                Some(
+                    StepOutcome::Failed {
+                        compensated: false,
+                        ..
+                    } | StepOutcome::Skipped { .. }
+                )
+            );
+        if reservation.observed_outcome.is_some() && !retries_failed_compensation {
             return Err(IdempotencyError::DuplicateExecution {
                 key: idem_key.as_str().to_string(),
             });
@@ -3221,11 +3685,11 @@ impl IdempotencyStore {
     /// Link an already-proven durable outcome into the current recovery
     /// ledger without dispatching the external effect again.
     ///
-    /// This method acquires the normal key-then-execution locks, refreshes the
-    /// authoritative outcome from the complete durable spool, and appends only
-    /// when that proof exactly matches `outcome`. Only Success and Compensated
-    /// facts are linkable; Pending, failure, and skipped states cannot certify
-    /// that a prior effect completed.
+    /// This method acquires the normal shared plan barrier, key lock, then
+    /// execution lock; refreshes the authoritative outcome from the complete
+    /// durable spool; and appends only when that proof exactly matches
+    /// `outcome`. Only Success and Compensated facts are linkable; Pending,
+    /// failure, and skipped states cannot certify that a prior effect completed.
     pub fn record_recovered_execution(
         &mut self,
         execution_id: &str,
@@ -3247,6 +3711,63 @@ impl IdempotencyStore {
         }
         let reservation =
             self.acquire_durable_reservation(execution_id, &idem_key, timestamp_ms)?;
+        self.record_recovered_execution_reserved(
+            reservation,
+            execution_id,
+            idem_key,
+            outcome,
+            risk,
+            agent_id,
+            timestamp_ms,
+        )
+    }
+
+    /// Link an already-proven sticky outcome using a pre-acquired reservation.
+    ///
+    /// This is the recovery counterpart to [`Self::record_execution_reserved`]
+    /// for callers that acquired a complete key-only lease set before the
+    /// execution ledger existed. The reservation is consumed so its key and
+    /// execution locks remain held through durable publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant, binding, or proof-mismatch error when the supplied
+    /// reservation cannot certify `outcome`, or propagates durable ledger
+    /// publication errors.
+    pub(crate) fn record_recovered_execution_reserved(
+        &mut self,
+        reservation: IdempotencyReservation,
+        execution_id: &str,
+        idem_key: IdempotencyKey,
+        outcome: StepOutcome,
+        risk: StepRisk,
+        agent_id: &str,
+        timestamp_ms: u64,
+    ) -> Result<String, IdempotencyError> {
+        if !matches!(
+            &outcome,
+            StepOutcome::Success { .. } | StepOutcome::Compensated { .. }
+        ) {
+            return Err(IdempotencyError::LedgerRecordInvariant {
+                reason: format!(
+                    "recovered proof link for key {idem_key} requires Success or Compensated, got {outcome:?}"
+                ),
+            });
+        }
+        self.validate_reservation_binding(&reservation, &idem_key)?;
+        self.validate_execution_lock(&reservation.execution_lock, execution_id)?;
+        if reservation.execution_id != execution_id {
+            return Err(IdempotencyError::ReservationExecutionMismatch {
+                reserved: reservation.execution_id.clone(),
+                attempted: execution_id.to_string(),
+            });
+        }
+        if reservation.pending_recorded {
+            return Err(IdempotencyError::ReservationAlreadyUsed {
+                key: reservation.idem_key.clone(),
+                execution_id: reservation.execution_id.clone(),
+            });
+        }
         if reservation.observed_outcome.as_ref() != Some(&outcome) {
             return Err(IdempotencyError::RecoveredProofMismatch {
                 key: idem_key.as_str().to_string(),
@@ -3354,9 +3875,7 @@ impl IdempotencyStore {
             });
         }
         let spool = self.durable_spool()?;
-        if !Arc::ptr_eq(&spool.dir, &reservation.execution_lock.spool_dir)
-            || !Arc::ptr_eq(&spool.key_lock_dir, &reservation.key_lock_dir)
-        {
+        if !Arc::ptr_eq(&spool.dir, &reservation.execution_lock.spool_dir) {
             return Err(IdempotencyError::ReservationStoreMismatch {
                 reserved_spool: reservation
                     .execution_lock
@@ -3366,13 +3885,14 @@ impl IdempotencyStore {
                 attempted_spool: spool.display_path.display().to_string(),
             });
         }
-        let lock_relative = Path::new(KEY_LOCK_DIR_NAME).join(&reservation.key_lock_name);
-        validate_pinned_file_entry(
-            &reservation.key_lock_dir,
-            &reservation.key_lock_name,
-            &reservation._lock_file,
-            &spool.display(&lock_relative),
+        self.validate_proof_barrier_binding(&reservation.proof_barrier, idem_key)?;
+        Self::validate_durable_key_lock_shape(
+            reservation.proof_barrier.mode,
+            reservation.key_lock.as_ref(),
         )?;
+        if let Some(key_lock) = reservation.key_lock.as_ref() {
+            self.validate_durable_key_lock(key_lock)?;
+        }
         Ok(())
     }
 
@@ -3742,6 +4262,20 @@ mod tests {
 
     #[cfg(not(windows))]
     static DURABLE_TEST_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_sync_handle_is_synchronizable_for_idempotency_store() {
+        let workspace = tempfile::tempdir().expect("create idempotency sync workspace");
+        let pinned = Dir::open_ambient_dir(workspace.path(), cap_std::ambient_authority())
+            .expect("pin idempotency sync workspace");
+        let sync_file = open_directory_sync_file(&pinned, workspace.path())
+            .expect("open synchronizable idempotency directory handle");
+
+        sync_file
+            .sync_all()
+            .expect("synchronize idempotency directory handle");
+    }
 
     fn make_key(plan: &str, step: &str) -> IdempotencyKey {
         IdempotencyKey::new(plan, step, "action-content")
@@ -6146,6 +6680,484 @@ mod tests {
             expired.observed_outcome().is_none(),
             "a retryable skip expires strictly after timestamp + ttl"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_reservation_retries_only_failed_or_skipped_compensation_keys() {
+        let ft_dir = tempfile::tempdir().expect("create durable store directory");
+        let plan = make_plan(4);
+        let failed_compensation =
+            IdempotencyKey::for_compensation(&plan.plan_id, &plan.steps[0].id, "undo-failed");
+        let skipped_compensation =
+            IdempotencyKey::for_compensation(&plan.plan_id, &plan.steps[1].id, "undo-skipped");
+        let failed_action = make_key(&plan.plan_id, &plan.steps[2].id);
+        let pending_compensation =
+            IdempotencyKey::for_compensation(&plan.plan_id, &plan.steps[3].id, "undo-pending");
+        let failed = StepOutcome::Failed {
+            error_code: "compensation_failed".to_string(),
+            error_message: "retry compensation".to_string(),
+            compensated: false,
+        };
+        let skipped = StepOutcome::Skipped {
+            reason: "retry compensation".to_string(),
+        };
+        let mut store = IdempotencyStore::open(ft_dir.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        store
+            .create_ledger("txe-compensation-source", &plan)
+            .expect("create source ledger");
+        store
+            .transition_phase("txe-compensation-source", TxPhase::Preparing)
+            .expect("prepare source ledger");
+        record_durable_outcome(
+            &mut store,
+            "txe-compensation-source",
+            failed_compensation.clone(),
+            failed.clone(),
+            StepRisk::Low,
+            "agent-source",
+            1_000,
+        );
+        let mut skipped_source = TxExecutionLedger::new(
+            "txe-compensation-skipped-source",
+            &plan.plan_id,
+            plan.plan_hash,
+        );
+        skipped_source
+            .transition_phase(TxPhase::Preparing)
+            .expect("prepare skipped compensation fixture");
+        skipped_source
+            .append(
+                skipped_compensation.clone(),
+                skipped.clone(),
+                StepRisk::Low,
+                "agent-source",
+                1_001,
+            )
+            .expect("append skipped compensation fixture");
+        store
+            .persist_new_ledger_snapshot(&skipped_source)
+            .expect("persist skipped compensation fixture");
+        record_durable_outcome(
+            &mut store,
+            "txe-compensation-source",
+            failed_action.clone(),
+            failed.clone(),
+            StepRisk::Low,
+            "agent-source",
+            1_002,
+        );
+        let mut pending_source = store
+            .acquire_durable_reservation("txe-compensation-source", &pending_compensation, 1_003)
+            .expect("reserve ambiguous compensation fixture");
+        store
+            .record_execution_reserved(
+                &mut pending_source,
+                "txe-compensation-source",
+                pending_compensation.clone(),
+                StepOutcome::Pending,
+                StepRisk::Low,
+                "agent-source",
+                1_003,
+            )
+            .expect("persist ambiguous compensation fixture");
+        drop(pending_source);
+
+        store
+            .create_ledger("txe-compensation-retry", &plan)
+            .expect("create retry ledger");
+        for (idem_key, expected, timestamp_ms) in [
+            (failed_compensation.clone(), &failed, 1_004),
+            (skipped_compensation, &skipped, 1_006),
+        ] {
+            let mut reservation = store
+                .acquire_durable_reservation("txe-compensation-retry", &idem_key, timestamp_ms)
+                .expect("acquire retryable compensation reservation");
+            assert_eq!(reservation.observed_outcome(), Some(expected));
+            store
+                .record_execution_reserved(
+                    &mut reservation,
+                    "txe-compensation-retry",
+                    idem_key.clone(),
+                    StepOutcome::Pending,
+                    StepRisk::Low,
+                    "agent-retry",
+                    timestamp_ms,
+                )
+                .expect("failed or skipped compensation must admit same-key retry");
+            store
+                .complete_execution_reserved(
+                    reservation,
+                    "txe-compensation-retry",
+                    idem_key,
+                    StepOutcome::Compensated {
+                        original_outcome: Box::new(StepOutcome::Success { result: None }),
+                        compensation_result: "undo complete".to_string(),
+                    },
+                    timestamp_ms + 1,
+                )
+                .expect("complete retried compensation");
+        }
+
+        for idem_key in [failed_action, pending_compensation, failed_compensation] {
+            let mut reservation = store
+                .acquire_durable_reservation("txe-compensation-retry", &idem_key, 1_008)
+                .expect("acquire negative-boundary reservation");
+            let error = store
+                .record_execution_reserved(
+                    &mut reservation,
+                    "txe-compensation-retry",
+                    idem_key.clone(),
+                    StepOutcome::Pending,
+                    StepRisk::Low,
+                    "agent-retry",
+                    1_008,
+                )
+                .expect_err("non-retryable durable outcome must remain deduplicated");
+            assert_eq!(
+                error,
+                IdempotencyError::DuplicateExecution {
+                    key: idem_key.as_str().to_string()
+                }
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_key_lease_batch_canonicalizes_input_and_rejects_duplicates() {
+        let anchor = tempfile::tempdir().expect("create durable key lease workspace");
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        let mut expected = vec![
+            IdempotencyKey::for_compensation("test-plan", "step-c", "undo-c"),
+            IdempotencyKey::new("test-plan", "step-a", "commit-a"),
+            IdempotencyKey::for_compensation("test-plan", "step-b", "undo-b"),
+        ];
+        expected.sort_unstable();
+
+        let leases = store
+            .acquire_durable_key_leases(expected.iter().rev().cloned(), 1_000)
+            .expect("reverse caller order must canonicalize before acquisition");
+        assert_eq!(leases.len(), expected.len());
+        assert_eq!(
+            leases.leases.keys().cloned().collect::<Vec<_>>(),
+            expected,
+            "held lease order must be the canonical IdempotencyKey order"
+        );
+        assert!(leases.uses_one_exclusive_barrier());
+        assert_eq!(leases.key_lock_count(), 0);
+        drop(leases);
+
+        let duplicate = IdempotencyKey::new("test-plan", "step-duplicate", "commit");
+        let error = store
+            .acquire_durable_key_leases(vec![duplicate.clone(), duplicate.clone()], 1_000)
+            .expect_err("duplicate batch keys must fail before lock acquisition");
+        assert!(matches!(
+            error,
+            IdempotencyError::LedgerRecordInvariant { ref reason }
+                if reason.contains(duplicate.as_str())
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn plan_proof_barrier_serializes_batch_against_same_plan_writers_only() {
+        let anchor = tempfile::tempdir().expect("create durable key lease workspace");
+        let mut first = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open first store");
+        let mut second = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open second store");
+        let mut contender = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open contender store");
+        let same_plan_a = IdempotencyKey::new("plan-a", "step-a", "commit-a");
+        let same_plan_b = IdempotencyKey::new("plan-a", "step-b", "commit-b");
+        let same_plan_unlisted = IdempotencyKey::new("plan-a", "step-c", "commit-c");
+        let other_plan = IdempotencyKey::new("plan-b", "step-a", "commit-a");
+
+        let shared_a = first
+            .acquire_durable_key_lease(&same_plan_a, 1_000)
+            .expect("first same-plan writer acquires a shared barrier");
+        let shared_b = second
+            .acquire_durable_key_lease(&same_plan_b, 1_000)
+            .expect("different same-plan key shares the plan barrier");
+        let error = contender
+            .acquire_durable_key_leases(vec![same_plan_a.clone(), same_plan_b.clone()], 1_000)
+            .expect_err("exclusive batch barrier must wait for same-plan writers");
+        assert!(matches!(
+            error,
+            IdempotencyError::ReservationInProgress { ref key }
+                if key == "plan:plan-a"
+        ));
+        drop(shared_b);
+        drop(shared_a);
+
+        let batch = contender
+            .acquire_durable_key_leases(vec![same_plan_a, same_plan_b], 1_000)
+            .expect("batch acquires after shared same-plan writers release");
+        let blocked_unlisted = first
+            .acquire_durable_key_lease(&same_plan_unlisted, 1_000)
+            .expect_err("exclusive plan barrier blocks even an unlisted same-plan key");
+        assert!(matches!(
+            blocked_unlisted,
+            IdempotencyError::ReservationInProgress { ref key }
+                if key == "plan:plan-a"
+        ));
+        let unrelated = second
+            .acquire_durable_key_lease(&other_plan, 1_000)
+            .expect("plan-scoped barrier must not serialize an unrelated plan");
+        drop(unrelated);
+        drop(batch);
+
+        first
+            .acquire_durable_key_lease(&same_plan_unlisted, 1_000)
+            .expect("same-plan writer acquires after exclusive batch releases");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_key_lease_batch_rejects_mixed_plans_before_lock_or_scan() {
+        let anchor = tempfile::tempdir().expect("create durable key lease workspace");
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        let plan_a = IdempotencyKey::new("plan-a", "step-a", "commit-a");
+        let plan_b = IdempotencyKey::new("plan-b", "step-b", "commit-b");
+        let scans_before = store.durable_refresh_scan_count;
+
+        let error = store
+            .acquire_durable_key_leases(vec![plan_a, plan_b], 1_000)
+            .expect_err("one atomic proof batch cannot span plan barriers");
+        assert!(matches!(
+            error,
+            IdempotencyError::LedgerRecordInvariant { ref reason }
+                if reason.contains("mixes plan")
+        ));
+        assert_eq!(store.durable_refresh_scan_count, scans_before);
+
+        let empty_error = store
+            .acquire_durable_key_leases(Vec::new(), 1_000)
+            .expect_err("empty proof batch has no plan barrier to authenticate");
+        assert!(matches!(
+            empty_error,
+            IdempotencyError::LedgerRecordInvariant { ref reason }
+                if reason.contains("must not be empty")
+        ));
+        assert_eq!(store.durable_refresh_scan_count, scans_before);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_key_lease_batch_uses_one_descriptor_and_one_scan_for_thousand_keys() {
+        let anchor = tempfile::tempdir().expect("create durable key lease workspace");
+        let mut store = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open durable store");
+        let keys = (0..1_000)
+            .map(|index| {
+                IdempotencyKey::new(
+                    "large-plan",
+                    &format!("step-{index}"),
+                    &format!("commit-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let scans_before = store.durable_refresh_scan_count;
+
+        let leases = store
+            .acquire_durable_key_leases(keys, 1_000)
+            .expect("large proof set must not consume one descriptor per key");
+        assert_eq!(leases.len(), 1_000);
+        assert_eq!(leases.key_lock_count(), 0);
+        assert!(leases.uses_one_exclusive_barrier());
+        assert_eq!(store.durable_refresh_scan_count, scans_before + 1);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_key_lease_batch_releases_barrier_after_bulk_scan_error() {
+        let anchor = tempfile::tempdir().expect("create durable key lease workspace");
+        let plan = make_plan(1);
+        let key = make_key(&plan.plan_id, &plan.steps[0].id);
+        let mut source = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open source store");
+        let mut stale = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open stale store before durable high-water advances");
+        source
+            .create_ledger("txe-barrier-error-source", &plan)
+            .expect("create source ledger");
+        source
+            .transition_phase("txe-barrier-error-source", TxPhase::Preparing)
+            .expect("prepare source ledger");
+        record_durable_outcome(
+            &mut source,
+            "txe-barrier-error-source",
+            key.clone(),
+            StepOutcome::Success {
+                result: Some("committed".to_string()),
+            },
+            StepRisk::Low,
+            "agent-source",
+            2_000,
+        );
+
+        let error = stale
+            .acquire_durable_key_leases(vec![key.clone()], 1_000)
+            .expect_err("bulk scan must reject a retrograde stale-process timestamp");
+        assert_eq!(
+            error,
+            IdempotencyError::RetrogradeTimestamp {
+                observed_ms: 1_000,
+                high_water_ms: 2_000,
+            }
+        );
+
+        let mut probe = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open post-error probe");
+        probe
+            .acquire_durable_key_leases(vec![key], 2_000)
+            .expect("bulk-scan error must release the exclusive plan barrier");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn durable_key_lease_spans_contention_ledger_creation_and_recovered_link() {
+        let anchor = tempfile::tempdir().expect("create durable key lease workspace");
+        let plan = make_plan(1);
+        let key =
+            IdempotencyKey::for_compensation(&plan.plan_id, &plan.steps[0].id, "rollback-complete");
+        let outcome = StepOutcome::Compensated {
+            original_outcome: Box::new(StepOutcome::Success {
+                result: Some("committed".to_string()),
+            }),
+            compensation_result: "rollback-complete".to_string(),
+        };
+        let mut first = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open first durable store");
+        first
+            .create_ledger("txe-key-lease-source", &plan)
+            .expect("create source ledger");
+        first
+            .transition_phase("txe-key-lease-source", TxPhase::Preparing)
+            .expect("transition source ledger");
+        let mut stale_second = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open stale second store");
+        let mut source_reservation = first
+            .acquire_durable_reservation("txe-key-lease-source", &key, 1_000)
+            .expect("reserve source compensation key");
+        first
+            .record_execution_reserved(
+                &mut source_reservation,
+                "txe-key-lease-source",
+                key.clone(),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "agent-source",
+                1_000,
+            )
+            .expect("persist source Pending");
+        first
+            .complete_execution_reserved(
+                source_reservation,
+                "txe-key-lease-source",
+                key.clone(),
+                outcome.clone(),
+                1_001,
+            )
+            .expect("persist source compensated outcome");
+
+        let mut leases = first
+            .acquire_durable_key_leases(vec![key.clone()], 1_001)
+            .expect("acquire proof lease before the recovery ledger exists");
+        assert_eq!(
+            leases.get(&key).and_then(DurableKeyLease::observed_outcome),
+            Some(&outcome)
+        );
+        let blocked = stale_second
+            .acquire_durable_key_leases(vec![key.clone()], 1_001)
+            .expect_err("second store must remain blocked by the key-only lease");
+        assert!(matches!(
+            blocked,
+            IdempotencyError::ReservationInProgress { .. }
+        ));
+
+        first
+            .create_ledger("txe-key-lease-recovery", &plan)
+            .expect("create recovery ledger while the proof lease is held");
+        first
+            .transition_phase("txe-key-lease-recovery", TxPhase::Preparing)
+            .expect("transition recovery ledger while the proof lease is held");
+        let lease = leases.take(&key).expect("held recovery key lease");
+        assert!(lease.authorizes(&key));
+        assert!(leases.is_empty());
+        let reservation = first
+            .bind_durable_key_lease("txe-key-lease-recovery", lease)
+            .expect("bind the continuously-held key lease to recovery execution");
+        first
+            .record_recovered_execution_reserved(
+                reservation,
+                "txe-key-lease-recovery",
+                key.clone(),
+                outcome.clone(),
+                StepRisk::High,
+                "agent-recovery",
+                1_001,
+            )
+            .expect("link recovered proof without reacquiring its key lock");
+        assert_eq!(
+            first
+                .get_ledger("txe-key-lease-recovery")
+                .and_then(|ledger| ledger.get_outcome(&key)),
+            Some(&outcome)
+        );
+        drop(leases);
+
+        let refreshed = stale_second
+            .acquire_durable_key_leases(vec![key.clone()], 1_001)
+            .expect("second store acquires after recovered publication releases the lease");
+        assert_eq!(
+            refreshed
+                .get(&key)
+                .and_then(DurableKeyLease::observed_outcome),
+            Some(&outcome)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn batch_logical_lease_rejects_reopened_store_binding_and_releases_barrier() {
+        let anchor = tempfile::tempdir().expect("create durable key lease workspace");
+        let key = IdempotencyKey::new("test-plan", "step-a", "commit-a");
+        let mut owner = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open lease-owning store");
+        let mut reopened = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open distinct store instance over same durable path");
+        let mut probe = IdempotencyStore::open(anchor.path(), IdempotencyPolicy::default())
+            .expect("open post-error probe");
+        let mut leases = owner
+            .acquire_durable_key_leases(vec![key.clone()], 1_000)
+            .expect("acquire batch logical lease");
+        let lease = leases.take(&key).expect("take logical lease for binding");
+
+        let error = reopened
+            .bind_durable_key_lease("txe-foreign-store", lease)
+            .expect_err("a lease is bound to the exact pinned store instance that acquired it");
+        assert!(matches!(
+            error,
+            IdempotencyError::ReservationStoreMismatch { .. }
+        ));
+        let blocked = probe
+            .acquire_durable_key_leases(vec![key.clone()], 1_000)
+            .expect_err("lease set still owns the batch barrier after a bind error");
+        assert!(matches!(
+            blocked,
+            IdempotencyError::ReservationInProgress { ref key }
+                if key == "plan:test-plan"
+        ));
+        drop(leases);
+
+        probe
+            .acquire_durable_key_leases(vec![key], 1_000)
+            .expect("dropping the lease set releases its plan barrier after bind failure");
     }
 
     #[cfg(not(windows))]

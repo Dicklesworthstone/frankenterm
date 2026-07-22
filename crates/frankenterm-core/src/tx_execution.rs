@@ -26,8 +26,8 @@ use crate::plan::{
 };
 use crate::runtime_async::CompatRuntime;
 use crate::tx_idempotency::{
-    IdempotencyKey, IdempotencyPolicy, IdempotencyStore, ResumeRecommendation, StepOutcome,
-    TxExecutionLedger, TxPhase,
+    DurableKeyLeaseSet, IdempotencyError, IdempotencyKey, IdempotencyPolicy, IdempotencyStore,
+    ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
 };
 use crate::tx_observability::{
     TxEventKind, TxForensicBundle, TxObservabilityConfig, TxObservabilityEvent,
@@ -107,6 +107,27 @@ static TX_CONTRACT_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static TX_EXECUTION_NONCE: AtomicU64 = AtomicU64::new(0);
 static TX_CONTRACT_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static ROLLBACK_POST_PROOF_LEASE_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_rollback_post_proof_lease_test_hook(hook: Option<Box<dyn FnOnce()>>) {
+    ROLLBACK_POST_PROOF_LEASE_TEST_HOOK.with(|slot| {
+        *slot.borrow_mut() = hook;
+    });
+}
+
+#[cfg(test)]
+fn run_rollback_post_proof_lease_test_hook() {
+    let hook = ROLLBACK_POST_PROOF_LEASE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// Stable classification for transaction contract lock and persistence errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -842,15 +863,23 @@ fn workspace_root_lock_name(relative_contract_path: &Path) -> OsString {
 
 #[cfg(not(windows))]
 fn open_directory_sync_file(dir: &CapDir, display: &Path) -> Result<File, TxContractStoreError> {
-    let file = dir.try_clone().map(CapDir::into_std_file).map_err(|err| {
-        TxContractStoreError::new(
-            TxContractStoreErrorKind::Lock,
-            format!(
-                "failed to clone transaction directory sync handle {}: {err}",
-                display.display()
-            ),
-        )
-    })?;
+    // `CapDir` may internally hold an `O_PATH` descriptor on Linux. Such a
+    // descriptor is suitable for capability-relative lookup but `fsync(2)`
+    // rejects it with `EBADF`. Re-open `.` read-only through the already pinned
+    // capability so the returned descriptor names the same directory and is
+    // synchronizable on every supported Unix target.
+    let file = dir
+        .open(".")
+        .map(cap_std::fs::File::into_std)
+        .map_err(|err| {
+            TxContractStoreError::new(
+                TxContractStoreErrorKind::Lock,
+                format!(
+                    "failed to open transaction directory sync handle {}: {err}",
+                    display.display()
+                ),
+            )
+        })?;
 
     let std_identity = std_object_identity(&file.metadata().map_err(|err| {
         TxContractStoreError::new(
@@ -2666,7 +2695,6 @@ fn commit_idempotency_key(
 fn compensation_idempotency_key(
     contract: &MissionTxContract,
     step_id: &str,
-    attempt: u32,
 ) -> Result<IdempotencyKey, TxExecutionError> {
     let compensation = contract
         .plan
@@ -2679,7 +2707,7 @@ fn compensation_idempotency_key(
             ))
         })?;
     let fingerprint = format!(
-        "rollback:{}:{}:attempt={attempt}",
+        "rollback:{}:{}",
         contract.compute_hash(),
         compensation.action.canonical_string()
     );
@@ -2688,6 +2716,50 @@ fn compensation_idempotency_key(
         step_id,
         &fingerprint,
     ))
+}
+
+fn rollback_proof_idempotency_keys(
+    contract: &MissionTxContract,
+    commit_report: &TxCommitReport,
+) -> Result<Vec<IdempotencyKey>, TxExecutionError> {
+    let mut keys = contract
+        .plan
+        .steps
+        .iter()
+        .map(|step| commit_idempotency_key(contract, &step.step_id.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    for step_result in commit_report.step_results.iter().filter(|result| {
+        result.outcome.is_committed()
+            || matches!(
+                &result.outcome,
+                crate::plan::TxCommitStepOutcome::Skipped { reason_code }
+                    if reason_code == "already_compensated"
+            )
+    }) {
+        keys.push(compensation_idempotency_key(
+            contract,
+            &step_result.step_id.0,
+        )?);
+    }
+    Ok(keys)
+}
+
+fn classify_rollback_proof_lease_error(error: IdempotencyError) -> TxExecutionError {
+    match error {
+        IdempotencyError::LedgerIndexCorrupt { reason } => TxExecutionError::RollbackProof {
+            kind: RollbackProofKind::Conflict,
+            step_id: "durable-proof-set".to_string(),
+            detail: format!(
+                "authoritative durable proof index is contradictory: {reason}; reconcile the ledger before rollback"
+            ),
+        },
+        IdempotencyError::ReservationInProgress { key } => TxExecutionError::InProgress(format!(
+            "another transaction mutation currently owns durable proof key {key}"
+        )),
+        other => TxExecutionError::LedgerWrite(format!(
+            "failed to acquire atomic rollback proof leases before mutation: {other}"
+        )),
+    }
 }
 
 fn validate_execution_recovery_entry(
@@ -3101,6 +3173,28 @@ pub struct TxExecutionEngine<E: StepExecutor> {
     event_seq: std::cell::Cell<u64>,
 }
 
+/// One-shot proof that every compensation effect which may dispatch passed
+/// the complete prepare-gate set before transaction state was mutated.
+///
+/// This private value is load-bearing: `run_compensation_phase` cannot be
+/// called without a permit, which prevents future entry paths from silently
+/// bypassing compensation policy/approval/reservation/liveness gates. Gate
+/// events are retained here until the compensation runner begins, then emitted
+/// before `CompensationStarted` so vector order remains monotonic by sequence.
+struct CompensationDispatchPermit {
+    execution_id: String,
+    plan_id: String,
+    contract_hash: String,
+    step_ids: HashSet<String>,
+    gate_events: Vec<TxObservabilityEvent>,
+}
+
+impl CompensationDispatchPermit {
+    fn authorizes(&self, step_id: &str) -> bool {
+        self.step_ids.contains(step_id)
+    }
+}
+
 struct TxLedgerRecordingContext<'a> {
     execution_id: &'a str,
     ledger: &'a mut TxExecutionLedger,
@@ -3176,6 +3270,11 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
     /// Execute an explicit rollback with durable cross-process compensation
     /// deduplication before any external side effect dispatch.
     ///
+    /// Contract receipts identify rollback candidates, but only a live-spool
+    /// durable commit `Success` authorizes compensation. Likewise, a receipt
+    /// that claims prior compensation is diagnostic until the spool proves the
+    /// matching durable `Compensated` outcome.
+    ///
     /// # Errors
     ///
     /// Returns an error when rollback proof is invalid, the durable ledger
@@ -3209,10 +3308,59 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             .validate()
             .map_err(TxExecutionError::InvalidContract)?;
         validate_tx_contract_state_outcome(contract).map_err(TxExecutionError::InvalidContract)?;
-        let commit_report = mission_tx_rollback_commit_report(contract, now_ms)
+        let logical_now_ms = checked_logical_now_ms(now_ms)?;
+        let mut commit_report = mission_tx_rollback_commit_report(contract, now_ms)
             .map_err(TxExecutionError::CompensationPhase)?;
-        validate_receipt_sequence_capacity(contract, commit_report.committed_count)?;
+        let mut rollback_proof_leases = None;
+        let mut prevalidated_original_commit_outcomes = None;
+        if let Some(store) = store.as_deref_mut() {
+            let (outcomes, leases) = Self::acquire_atomic_compensation_proof(
+                contract,
+                &mut commit_report,
+                store,
+                logical_now_ms,
+            )?;
+            prevalidated_original_commit_outcomes = Some(outcomes);
+            rollback_proof_leases = Some(leases);
+        }
+        validate_receipt_sequence_capacity(
+            contract,
+            Self::compensation_receipt_headroom(
+                contract,
+                &commit_report,
+                rollback_proof_leases.as_ref(),
+            )?,
+        )?;
+        #[cfg(test)]
+        run_rollback_post_proof_lease_test_hook();
         let execution_id = unique_execution_id("rollback", now_ms);
+        let mut events = Vec::new();
+        let mut decision_path = "rollback".to_string();
+        let economic_hard_stop = contract
+            .economic_hard_stop_decision_current(now_ms)
+            .map_err(TxExecutionError::InvalidContract)?;
+        let effective_kill_switch = if economic_hard_stop.is_some() {
+            MissionKillSwitchLevel::HardStop
+        } else {
+            self.config.kill_switch
+        };
+        // Gate the complete compensation set exactly once before any durable
+        // ledger or caller-owned contract mutation. Gate evaluation may
+        // consume scoped one-shot approvals, so repeating it per step would be
+        // semantically wrong; dispatch uses this prepared decision just as the
+        // normal prepare/commit path does.
+        let gate_report = Self::compensation_gate_report(
+            contract,
+            &commit_report,
+            rollback_proof_leases.as_ref(),
+        )?;
+        let compensation_permit = self.validate_compensation_dispatch(
+            contract,
+            &gate_report,
+            &execution_id,
+            effective_kill_switch,
+            now_ms,
+        )?;
         let plan_id = contract.plan.plan_id.0.clone();
         let compiled_plan = compiled_plan_from_contract(contract);
         let mut ledger = TxExecutionLedger::new(&execution_id, &plan_id, compiled_plan.plan_hash);
@@ -3248,16 +3396,6 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
         contract.lifecycle_state = MissionTxState::Compensating;
         contract.outcome = TxOutcome::Pending;
-        let mut events = Vec::new();
-        let mut decision_path = "rollback".to_string();
-        let economic_hard_stop = contract
-            .economic_hard_stop_decision_current(now_ms)
-            .map_err(TxExecutionError::InvalidContract)?;
-        let effective_kill_switch = if economic_hard_stop.is_some() {
-            MissionKillSwitchLevel::HardStop
-        } else {
-            self.config.kill_switch
-        };
         let (
             report,
             compensation_idem_keys,
@@ -3269,8 +3407,10 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &execution_id,
             &mut events,
             &mut decision_path,
-            effective_kill_switch,
+            compensation_permit,
             store.as_deref_mut(),
+            prevalidated_original_commit_outcomes.as_ref(),
+            rollback_proof_leases.as_mut(),
             now_ms,
         )?;
 
@@ -3328,7 +3468,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         validate_execution_recovery_entry(contract, store.as_deref())?;
         validate_receipt_sequence_capacity(
             contract,
-            contract.plan.steps.len().checked_mul(2).ok_or_else(|| {
+            contract.plan.steps.len().checked_mul(3).ok_or_else(|| {
                 TxExecutionError::InvalidContract(
                     "transaction step count overflow while reserving receipt headroom".to_string(),
                 )
@@ -3472,7 +3612,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
         // Phase 2: Commit
         contract.lifecycle_state = MissionTxState::Committing;
-        let (commit_report, recovery_requires_compensation) = if recovering_rejected_prepare {
+        let (mut commit_report, recovery_requires_compensation) = if recovering_rejected_prepare {
             let unresolved_reason_code = match &prepare_report.outcome {
                 TxPrepareOutcome::Denied => "prepare_denied_recovery_unresolved",
                 TxPrepareOutcome::RequireApproval => "prepare_approval_recovery_unresolved",
@@ -3540,6 +3680,31 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         // Phase 3: Compensate (if needed)
         let compensation_report =
             if Self::should_run_compensation(&commit_report, self.config.auto_compensate) {
+                let mut compensation_proof_leases = None;
+                let mut prevalidated_original_commit_outcomes = None;
+                if let Some(durable_store) = store.as_deref_mut() {
+                    let (outcomes, leases) = Self::acquire_atomic_compensation_proof(
+                        contract,
+                        &mut commit_report,
+                        durable_store,
+                        checked_logical_now_ms(now_ms)?,
+                    )?;
+                    prevalidated_original_commit_outcomes = Some(outcomes);
+                    compensation_proof_leases = Some(leases);
+                }
+                let gate_report = Self::compensation_gate_report(
+                    contract,
+                    &commit_report,
+                    compensation_proof_leases.as_ref(),
+                )?;
+                let compensation_permit = self.validate_compensation_dispatch(
+                    contract,
+                    &gate_report,
+                    &execution_id,
+                    effective_kill_switch,
+                    now_ms,
+                )?;
+
                 contract.lifecycle_state = MissionTxState::Compensating;
                 contract.outcome = TxOutcome::Pending;
                 transition_execution_ledger_pair(
@@ -3560,8 +3725,10 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     &execution_id,
                     &mut events,
                     &mut decision_path,
-                    effective_kill_switch,
+                    compensation_permit,
                     store.as_deref_mut(),
+                    prevalidated_original_commit_outcomes.as_ref(),
+                    compensation_proof_leases.as_mut(),
                     now_ms,
                 )?;
 
@@ -4080,8 +4247,10 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         execution_id: &str,
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
-        kill_switch: MissionKillSwitchLevel,
+        mut dispatch_permit: CompensationDispatchPermit,
         store: Option<&mut IdempotencyStore>,
+        prevalidated_original_commit_outcomes: Option<&HashMap<String, StepOutcome>>,
+        preacquired_rollback_proof_leases: Option<&mut DurableKeyLeaseSet>,
         now_ms: i64,
     ) -> Result<
         (
@@ -4092,6 +4261,20 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         ),
         TxExecutionError,
     > {
+        if dispatch_permit.execution_id != execution_id
+            || dispatch_permit.plan_id != contract.plan.plan_id.0
+            || dispatch_permit.contract_hash != contract.compute_hash()
+        {
+            return Err(TxExecutionError::InvalidContract(format!(
+                "compensation dispatch permit context mismatch: permit execution {:?} plan {:?} contract {}, attempted execution {execution_id:?} plan {:?} contract {}",
+                dispatch_permit.execution_id,
+                dispatch_permit.plan_id,
+                dispatch_permit.contract_hash,
+                contract.plan.plan_id.0,
+                contract.compute_hash()
+            )));
+        }
+        events.append(&mut dispatch_permit.gate_events);
         events.push(self.make_event(
             TxEventKind::CompensationStarted,
             TxObservabilityPhase::Compensate,
@@ -4101,7 +4284,6 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             TxPhase::Compensating,
             now_ms,
         ));
-
         let (
             comp_inputs,
             compensation_idem_keys,
@@ -4112,8 +4294,9 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             commit_report,
             execution_id,
             store,
-            events,
-            kill_switch,
+            prevalidated_original_commit_outcomes,
+            preacquired_rollback_proof_leases,
+            &dispatch_permit,
             now_ms,
         )?;
 
@@ -4206,31 +4389,18 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         contract: &MissionTxContract,
         commit_report: &TxCommitReport,
         execution_id: &str,
-        events: &mut Vec<TxObservabilityEvent>,
         kill_switch: MissionKillSwitchLevel,
         now_ms: i64,
-    ) -> Result<(), TxExecutionError> {
-        let outstanding = commit_report
-            .step_results
-            .iter()
-            .filter(|result| result.outcome.is_committed())
-            .map(|result| result.step_id.0.as_str())
-            .collect::<HashSet<_>>();
+    ) -> Result<CompensationDispatchPermit, TxExecutionError> {
+        let outstanding = self.validated_compensation_batch(commit_report)?;
         if outstanding.is_empty() {
-            return Ok(());
-        }
-        if self.config.paused {
-            return Err(TxExecutionError::CompensationPhase(
-                "compensation dispatch is suspended while transaction execution is paused"
-                    .to_string(),
-            ));
-        }
-        if outstanding.len() > self.config.max_steps_per_batch {
-            return Err(TxExecutionError::CompensationPhase(format!(
-                "compensation batch has {} steps, exceeding configured maximum {}",
-                outstanding.len(),
-                self.config.max_steps_per_batch
-            )));
+            return Ok(CompensationDispatchPermit {
+                execution_id: execution_id.to_string(),
+                plan_id: contract.plan.plan_id.0.clone(),
+                contract_hash: contract.compute_hash(),
+                step_ids: HashSet::new(),
+                gate_events: Vec::new(),
+            });
         }
 
         // Evaluate policy, approval, reservation, and liveness against the
@@ -4264,7 +4434,14 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         gate_contract.plan.preconditions.clear();
 
         let gate_inputs = self.executor.evaluate_gates(&gate_contract, now_ms);
-        self.record_prepare_gate_events(&gate_contract, execution_id, events, &gate_inputs, now_ms);
+        let mut gate_events = Vec::new();
+        self.record_prepare_gate_events(
+            &gate_contract,
+            execution_id,
+            &mut gate_events,
+            &gate_inputs,
+            now_ms,
+        );
         let report = evaluate_prepare_phase(
             &gate_contract.intent.tx_id,
             &gate_contract.plan,
@@ -4279,7 +4456,175 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                 report.outcome
             )));
         }
-        Ok(())
+        Ok(CompensationDispatchPermit {
+            execution_id: execution_id.to_string(),
+            plan_id: contract.plan.plan_id.0.clone(),
+            contract_hash: contract.compute_hash(),
+            step_ids: outstanding.into_iter().map(str::to_string).collect(),
+            gate_events,
+        })
+    }
+
+    fn compensation_gate_report(
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        durable_leases: Option<&DurableKeyLeaseSet>,
+    ) -> Result<TxCommitReport, TxExecutionError> {
+        let Some(durable_leases) = durable_leases else {
+            return Ok(commit_report.clone());
+        };
+        let mut gate_report = commit_report.clone();
+        for result in &mut gate_report.step_results {
+            if !result.outcome.is_committed() {
+                continue;
+            }
+            let idem_key = compensation_idempotency_key(contract, &result.step_id.0)?;
+            let observed = durable_leases
+                .get(&idem_key)
+                .ok_or_else(|| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "atomic compensation proof lease set is missing key for step {}",
+                        result.step_id.0
+                    ))
+                })?
+                .observed_outcome();
+            match observed {
+                Some(StepOutcome::Compensated { .. }) => {
+                    result.outcome = crate::plan::TxCommitStepOutcome::Skipped {
+                        reason_code: "durable_compensation_recovery".to_string(),
+                    };
+                    result
+                        .decision_path
+                        .push_str("->durable_compensation_recovery");
+                }
+                Some(
+                    StepOutcome::Failed {
+                        compensated: false, ..
+                    }
+                    | StepOutcome::Skipped { .. },
+                )
+                | None => {}
+                Some(other) => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: result.step_id.0.clone(),
+                        detail: format!(
+                            "authoritative durable compensation state {other:?} cannot produce a dispatch permit"
+                        ),
+                    });
+                }
+            }
+        }
+        gate_report.committed_count = gate_report
+            .step_results
+            .iter()
+            .filter(|result| result.outcome.is_committed())
+            .count();
+        gate_report.failed_count = gate_report
+            .step_results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.outcome,
+                    crate::plan::TxCommitStepOutcome::Failed { .. }
+                )
+            })
+            .count();
+        gate_report.skipped_count = gate_report
+            .step_results
+            .iter()
+            .filter(|result| result.outcome.is_skipped())
+            .count();
+        Ok(gate_report)
+    }
+
+    fn compensation_receipt_headroom(
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        durable_leases: Option<&DurableKeyLeaseSet>,
+    ) -> Result<usize, TxExecutionError> {
+        let mut headroom = 0usize;
+        for result in commit_report
+            .step_results
+            .iter()
+            .filter(|result| result.outcome.is_committed())
+        {
+            let needs_receipt = if let Some(durable_leases) = durable_leases {
+                let idem_key = compensation_idempotency_key(contract, &result.step_id.0)?;
+                match durable_leases
+                    .get(&idem_key)
+                    .ok_or_else(|| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "atomic compensation proof lease set is missing receipt-capacity key for step {}",
+                            result.step_id.0
+                        ))
+                    })?
+                    .observed_outcome()
+                {
+                    Some(StepOutcome::Compensated { .. }) => !latest_tx_receipt_matches(
+                        contract,
+                        "compensate",
+                        &result.step_id.0,
+                        "compensated",
+                    ),
+                    Some(
+                        StepOutcome::Failed {
+                            compensated: false, ..
+                        }
+                        | StepOutcome::Skipped { .. },
+                    )
+                    | None => true,
+                    Some(other) => {
+                        return Err(TxExecutionError::RollbackProof {
+                            kind: RollbackProofKind::Conflict,
+                            step_id: result.step_id.0.clone(),
+                            detail: format!(
+                                "authoritative durable compensation state {other:?} cannot reserve receipt capacity"
+                            ),
+                        });
+                    }
+                }
+            } else {
+                true
+            };
+            if needs_receipt {
+                headroom = headroom.checked_add(1).ok_or_else(|| {
+                    TxExecutionError::InvalidContract(
+                        "compensation receipt headroom count overflow".to_string(),
+                    )
+                })?;
+            }
+        }
+        Ok(headroom)
+    }
+
+    fn validated_compensation_batch<'a>(
+        &self,
+        commit_report: &'a TxCommitReport,
+    ) -> Result<HashSet<&'a str>, TxExecutionError> {
+        let outstanding = commit_report
+            .step_results
+            .iter()
+            .filter(|result| result.outcome.is_committed())
+            .map(|result| result.step_id.0.as_str())
+            .collect::<HashSet<_>>();
+        if outstanding.is_empty() {
+            return Ok(outstanding);
+        }
+        if self.config.paused {
+            return Err(TxExecutionError::CompensationPhase(
+                "compensation dispatch is suspended while transaction execution is paused"
+                    .to_string(),
+            ));
+        }
+        if outstanding.len() > self.config.max_steps_per_batch {
+            return Err(TxExecutionError::CompensationPhase(format!(
+                "compensation batch has {} steps, exceeding configured maximum {}",
+                outstanding.len(),
+                self.config.max_steps_per_batch
+            )));
+        }
+        Ok(outstanding)
     }
 
     fn commit_inputs_with_dedup(
@@ -4397,14 +4742,297 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         Ok(commit_inputs)
     }
 
+    fn acquire_atomic_compensation_proof(
+        contract: &MissionTxContract,
+        commit_report: &mut TxCommitReport,
+        store: &mut IdempotencyStore,
+        logical_now_ms: u64,
+    ) -> Result<(HashMap<String, StepOutcome>, DurableKeyLeaseSet), TxExecutionError> {
+        let proof_keys = rollback_proof_idempotency_keys(contract, commit_report)?;
+        let leases = store
+            .acquire_durable_key_leases(proof_keys, logical_now_ms)
+            .map_err(classify_rollback_proof_lease_error)?;
+        let outcomes = Self::authoritative_commit_outcomes_with_leases(contract, &leases)?;
+        Self::restore_durable_already_compensated_candidates(commit_report, &outcomes)?;
+        Self::validate_authoritative_compensation_outcomes_with_leases(
+            contract,
+            commit_report,
+            &outcomes,
+            &leases,
+        )?;
+        Ok((outcomes, leases))
+    }
+
+    fn authoritative_commit_outcomes_with_leases(
+        contract: &MissionTxContract,
+        leases: &DurableKeyLeaseSet,
+    ) -> Result<HashMap<String, StepOutcome>, TxExecutionError> {
+        Self::authoritative_commit_outcomes_from_observer(contract, |idem_key, step_id| {
+            leases
+                .get(idem_key)
+                .map(|lease| lease.observed_outcome().cloned())
+                .ok_or_else(|| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "atomic rollback proof lease set is missing commit key for step {step_id}"
+                    ))
+                })
+        })
+    }
+
+    fn authoritative_commit_outcomes_from_observer<F>(
+        contract: &MissionTxContract,
+        mut observe: F,
+    ) -> Result<HashMap<String, StepOutcome>, TxExecutionError>
+    where
+        F: FnMut(&IdempotencyKey, &str) -> Result<Option<StepOutcome>, TxExecutionError>,
+    {
+        let receipt_candidate_step_ids = contract
+            .receipts
+            .iter()
+            .filter_map(|receipt| {
+                if receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                    && receipt.get("outcome").and_then(serde_json::Value::as_str)
+                        == Some("committed")
+                {
+                    receipt
+                        .get("step_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<_>>();
+        let mut outcomes = HashMap::new();
+        for step in &contract.plan.steps {
+            let step_id = &step.step_id.0;
+            let is_receipt_candidate = receipt_candidate_step_ids.contains(step_id);
+            let idem_key = commit_idempotency_key(contract, step_id)?;
+            let observed = observe(&idem_key, step_id)?;
+            match observed {
+                Some(outcome @ StepOutcome::Success { .. }) if is_receipt_candidate => {
+                    outcomes.insert(step_id.clone(), outcome);
+                }
+                Some(StepOutcome::Success { .. }) => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: step_id.clone(),
+                        detail:
+                            "authoritative durable commit Success is omitted or downgraded by the contract receipt history; reconcile the contract and ledger before rollback"
+                                .to_string(),
+                    });
+                }
+                Some(other) if is_receipt_candidate => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: step_id.clone(),
+                        detail: format!(
+                            "rollback requires authoritative durable commit Success, got {other:?}"
+                        ),
+                    });
+                }
+                None if is_receipt_candidate => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Missing,
+                        step_id: step_id.clone(),
+                        detail:
+                            "rollback receipt identifies a commit candidate but no authoritative durable commit Success exists"
+                                .to_string(),
+                    });
+                }
+                Some(other)
+                    if matches!(
+                        &other,
+                        StepOutcome::Pending
+                            | StepOutcome::Compensated { .. }
+                            | StepOutcome::Failed {
+                                compensated: true,
+                                ..
+                            }
+                    ) =>
+                {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: step_id.clone(),
+                        detail: format!(
+                            "authoritative durable commit state {other:?} is ambiguous or impossible while the receipt history does not identify a committed effect; reconcile the contract and ledger before rollback"
+                        ),
+                    });
+                }
+                Some(
+                    StepOutcome::Failed {
+                        compensated: false, ..
+                    }
+                    | StepOutcome::Skipped { .. },
+                )
+                | None => {}
+                Some(other) => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: step_id.clone(),
+                        detail: format!(
+                            "authoritative durable commit state {other:?} is ambiguous or impossible while the receipt history does not identify a committed effect; reconcile the contract and ledger before rollback"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(outcomes)
+    }
+
+    fn validate_authoritative_compensation_outcomes_with_leases(
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        original_commit_outcomes: &HashMap<String, StepOutcome>,
+        leases: &DurableKeyLeaseSet,
+    ) -> Result<(), TxExecutionError> {
+        Self::validate_authoritative_compensation_outcomes_from_observer(
+            contract,
+            commit_report,
+            original_commit_outcomes,
+            |idem_key, step_id| {
+                leases
+                    .get(idem_key)
+                    .map(|lease| lease.observed_outcome().cloned())
+                    .ok_or_else(|| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "atomic rollback proof lease set is missing compensation key for step {step_id}"
+                        ))
+                    })
+            },
+        )
+    }
+
+    fn validate_authoritative_compensation_outcomes_from_observer<F>(
+        contract: &MissionTxContract,
+        commit_report: &TxCommitReport,
+        original_commit_outcomes: &HashMap<String, StepOutcome>,
+        mut observe: F,
+    ) -> Result<(), TxExecutionError>
+    where
+        F: FnMut(&IdempotencyKey, &str) -> Result<Option<StepOutcome>, TxExecutionError>,
+    {
+        for step_result in commit_report
+            .step_results
+            .iter()
+            .filter(|result| result.outcome.is_committed())
+        {
+            let idem_key = compensation_idempotency_key(contract, &step_result.step_id.0)?;
+            let observed = observe(&idem_key, &step_result.step_id.0)?;
+            match observed {
+                Some(StepOutcome::Compensated {
+                    original_outcome, ..
+                }) => {
+                    let expected = original_commit_outcomes.get(&step_result.step_id.0);
+                    if expected != Some(original_outcome.as_ref()) {
+                        return Err(TxExecutionError::RollbackProof {
+                            kind: RollbackProofKind::Conflict,
+                            step_id: step_result.step_id.0.clone(),
+                            detail: format!(
+                                "authoritative durable compensation proof embeds original outcome {:?}, but the separately proven commit outcome is {expected:?}; reconcile the contract and ledger before rollback",
+                                original_outcome.as_ref()
+                            ),
+                        });
+                    }
+                }
+                Some(
+                    StepOutcome::Failed {
+                        compensated: false, ..
+                    }
+                    | StepOutcome::Skipped { .. },
+                )
+                | None => {}
+                Some(other) => {
+                    return Err(TxExecutionError::RollbackProof {
+                        kind: RollbackProofKind::Conflict,
+                        step_id: step_result.step_id.0.clone(),
+                        detail: format!(
+                            "authoritative durable compensation state {other:?} is ambiguous or impossible; reconcile the contract and ledger before rollback"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_durable_already_compensated_candidates(
+        commit_report: &mut TxCommitReport,
+        original_commit_outcomes: &HashMap<String, StepOutcome>,
+    ) -> Result<(), TxExecutionError> {
+        let mut restored = 0usize;
+        for step_result in &mut commit_report.step_results {
+            let already_compensated = matches!(
+                &step_result.outcome,
+                crate::plan::TxCommitStepOutcome::Skipped { reason_code }
+                    if reason_code == "already_compensated"
+            );
+            if !already_compensated {
+                continue;
+            }
+            if !matches!(
+                original_commit_outcomes.get(&step_result.step_id.0),
+                Some(StepOutcome::Success { .. })
+            ) {
+                return Err(TxExecutionError::RollbackProof {
+                    kind: RollbackProofKind::Conflict,
+                    step_id: step_result.step_id.0.clone(),
+                    detail:
+                        "already-compensated receipt lacks authoritative durable commit Success"
+                            .to_string(),
+                });
+            }
+            step_result.outcome = crate::plan::TxCommitStepOutcome::Committed {
+                reason_code: "durable_commit_success".to_string(),
+            };
+            step_result.decision_path =
+                "rollback_receipt_candidate->durable_commit_success".to_string();
+            restored = restored.checked_add(1).ok_or_else(|| {
+                TxExecutionError::InvalidContract(
+                    "durable rollback candidate count overflow".to_string(),
+                )
+            })?;
+        }
+        if restored == 0 {
+            return Ok(());
+        }
+        commit_report.committed_count = commit_report
+            .committed_count
+            .checked_add(restored)
+            .ok_or_else(|| {
+                TxExecutionError::InvalidContract(
+                    "durable rollback committed count overflow".to_string(),
+                )
+            })?;
+        commit_report.skipped_count = commit_report
+            .skipped_count
+            .checked_sub(restored)
+            .ok_or_else(|| {
+                TxExecutionError::InvalidContract(
+                    "durable rollback skipped count underflow".to_string(),
+                )
+            })?;
+        let (outcome, reason_code) = if commit_report.failed_count == 0 {
+            (TxCommitOutcome::FullyCommitted, "fully_committed")
+        } else if commit_report.committed_count == 0 {
+            (TxCommitOutcome::ImmediateFailure, "immediate_failure")
+        } else {
+            (TxCommitOutcome::PartialFailure, "partial_failure")
+        };
+        commit_report.outcome = outcome;
+        commit_report.reason_code = reason_code.to_string();
+        Ok(())
+    }
+
     fn compensation_inputs_with_dedup(
         &self,
         contract: &MissionTxContract,
         commit_report: &TxCommitReport,
         execution_id: &str,
         store: Option<&mut IdempotencyStore>,
-        events: &mut Vec<TxObservabilityEvent>,
-        kill_switch: MissionKillSwitchLevel,
+        prevalidated_original_commit_outcomes: Option<&HashMap<String, StepOutcome>>,
+        mut preacquired_rollback_proof_leases: Option<&mut DurableKeyLeaseSet>,
+        dispatch_permit: &CompensationDispatchPermit,
         now_ms: i64,
     ) -> Result<
         (
@@ -4416,15 +5044,42 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         TxExecutionError,
     > {
         let logical_now_ms = checked_logical_now_ms(now_ms)?;
+        if store.is_some()
+            && (prevalidated_original_commit_outcomes.is_none()
+                || preacquired_rollback_proof_leases.is_none())
+        {
+            return Err(TxExecutionError::LedgerWrite(
+                "durable compensation requires a continuously held atomic proof set acquired before mutation"
+                    .to_string(),
+            ));
+        }
+        let original_commit_outcomes =
+            if let Some(prevalidated) = prevalidated_original_commit_outcomes {
+                prevalidated.clone()
+            } else {
+                commit_report
+                    .step_results
+                    .iter()
+                    .filter(|result| result.outcome.is_committed())
+                    .map(|result| {
+                        committed_step_success_outcome(result)
+                            .map(|outcome| (result.step_id.0.clone(), outcome))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()?
+            };
         let Some(store) = store else {
-            self.validate_compensation_dispatch(
-                contract,
-                commit_report,
-                execution_id,
-                events,
-                kill_switch,
-                now_ms,
-            )?;
+            for step_result in commit_report
+                .step_results
+                .iter()
+                .filter(|result| result.outcome.is_committed())
+            {
+                if !dispatch_permit.authorizes(&step_result.step_id.0) {
+                    return Err(TxExecutionError::CompensationPhase(format!(
+                        "compensation step {} lacks a pre-mutation dispatch permit",
+                        step_result.step_id.0
+                    )));
+                }
+            }
             let inputs = self.executor.execute_compensations(
                 contract,
                 commit_report,
@@ -4434,27 +5089,16 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             let keys = inputs
                 .iter()
                 .map(|input| {
-                    compensation_idempotency_key(contract, &input.for_step_id.0, 0)
+                    compensation_idempotency_key(contract, &input.for_step_id.0)
                         .map(|key| (input.for_step_id.0.clone(), key))
                 })
                 .collect::<Result<HashMap<_, _>, TxExecutionError>>()?;
-            let original_commit_outcomes = commit_report
-                .step_results
-                .iter()
-                .filter(|result| result.outcome.is_committed())
-                .map(|result| {
-                    committed_step_success_outcome(result)
-                        .map(|outcome| (result.step_id.0.clone(), outcome))
-                })
-                .collect::<Result<HashMap<_, _>, _>>()?;
             return Ok((inputs, keys, HashMap::new(), original_commit_outcomes));
         };
 
         let mut compensation_inputs = Vec::new();
         let mut compensation_keys = HashMap::new();
         let mut authoritative_recovery_outcomes = HashMap::new();
-        let mut original_commit_outcomes = HashMap::new();
-        const MAX_COMPENSATION_ATTEMPTS: u32 = 1024;
 
         'steps: for step_result in commit_report
             .step_results
@@ -4462,146 +5106,171 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             .rev()
             .filter(|result| result.outcome.is_committed())
         {
-            let commit_idem_key = commit_idempotency_key(contract, &step_result.step_id.0)?;
-            let original_commit_outcome =
-                match store.peek_cached_outcome(&commit_idem_key, logical_now_ms) {
-                    Some(outcome @ StepOutcome::Success { .. }) => outcome.clone(),
-                    Some(other) => {
-                        return Err(TxExecutionError::DedupConflict {
-                            step_id: step_result.step_id.0.clone(),
-                            outcome: format!(
-                                "compensation requires prior successful commit proof, got {other:?}"
-                            ),
-                        });
-                    }
-                    None => committed_step_success_outcome(step_result)?,
-                };
-            original_commit_outcomes.insert(
-                step_result.step_id.0.clone(),
-                original_commit_outcome.clone(),
-            );
-            for attempt in 0..=MAX_COMPENSATION_ATTEMPTS {
-                let idem_key =
-                    compensation_idempotency_key(contract, &step_result.step_id.0, attempt)?;
-                let mut reservation = store
+            let original_commit_outcome = original_commit_outcomes
+                .get(&step_result.step_id.0)
+                .cloned()
+                .ok_or_else(|| TxExecutionError::DedupConflict {
+                    step_id: step_result.step_id.0.clone(),
+                    outcome: "compensation candidate lacks authoritative commit Success"
+                        .to_string(),
+                })?;
+            if !matches!(&original_commit_outcome, StepOutcome::Success { .. }) {
+                return Err(TxExecutionError::DedupConflict {
+                    step_id: step_result.step_id.0.clone(),
+                    outcome: format!(
+                        "compensation candidate requires authoritative commit Success, got {original_commit_outcome:?}"
+                    ),
+                });
+            }
+            let idem_key = compensation_idempotency_key(contract, &step_result.step_id.0)?;
+            let risk = compensation_step_risk(contract, step_result.step_id.0.as_str());
+            let agent_id = format!("agent-{}", step_result.step_id.0);
+            let mut reservation = if let Some(leases) =
+                preacquired_rollback_proof_leases.as_deref_mut()
+            {
+                let lease = leases.take(&idem_key).ok_or_else(|| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "atomic rollback proof lease set lost compensation key for step {}",
+                        step_result.step_id.0
+                    ))
+                })?;
+                store
+                    .bind_durable_key_lease(execution_id, lease)
+                    .map_err(|err| {
+                        TxExecutionError::LedgerWrite(format!(
+                            "failed to bind pre-acquired durable compensation lease for step {}: {err}",
+                            step_result.step_id.0
+                        ))
+                    })?
+            } else {
+                store
                     .acquire_durable_reservation(execution_id, &idem_key, logical_now_ms)
                     .map_err(|err| {
                         TxExecutionError::LedgerWrite(format!(
-                            "failed to acquire durable reservation for compensation step {} attempt {attempt}: {err}",
+                            "failed to acquire durable reservation for compensation step {}: {err}",
                             step_result.step_id.0
                         ))
-                    })?;
-                match reservation.observed_outcome() {
-                    Some(outcome @ StepOutcome::Compensated { .. }) => {
-                        compensation_inputs.push(deduped_compensation_input(
-                            &step_result.step_id,
-                            outcome,
-                            now_ms,
-                        )?);
-                        authoritative_recovery_outcomes
-                            .insert(step_result.step_id.0.clone(), outcome.clone());
-                        compensation_keys.insert(step_result.step_id.0.clone(), idem_key);
-                        continue 'steps;
-                    }
-                    Some(StepOutcome::Failed { .. } | StepOutcome::Skipped { .. }) => continue,
-                    Some(other) => {
-                        return Err(TxExecutionError::DedupConflict {
-                            step_id: step_result.step_id.0.clone(),
-                            outcome: format!("{other:?}"),
-                        });
-                    }
-                    None => {}
+                    })?
+            };
+            match reservation.observed_outcome() {
+                Some(outcome @ StepOutcome::Compensated { .. }) => {
+                    let recovered_outcome = outcome.clone();
+                    compensation_inputs.push(deduped_compensation_input(
+                        &step_result.step_id,
+                        &recovered_outcome,
+                        now_ms,
+                    )?);
+                    store
+                        .record_recovered_execution_reserved(
+                            reservation,
+                            execution_id,
+                            idem_key.clone(),
+                            recovered_outcome.clone(),
+                            risk,
+                            &agent_id,
+                            logical_now_ms,
+                        )
+                        .map_err(|err| {
+                            TxExecutionError::LedgerWrite(format!(
+                                "failed to link recovered durable compensation proof for step {}: {err}",
+                                step_result.step_id.0
+                            ))
+                        })?;
+                    authoritative_recovery_outcomes
+                        .insert(step_result.step_id.0.clone(), recovered_outcome);
+                    compensation_keys.insert(step_result.step_id.0.clone(), idem_key);
+                    continue 'steps;
                 }
-
-                let mut dispatch_report = commit_report.clone();
-                dispatch_report.step_results = vec![step_result.clone()];
-                self.validate_compensation_dispatch(
-                    contract,
-                    &dispatch_report,
-                    execution_id,
-                    events,
-                    kill_switch,
-                    now_ms,
-                )?;
-
-                let risk = compensation_step_risk(contract, step_result.step_id.0.as_str());
-                let agent_id = format!("agent-{}", step_result.step_id.0);
-                store
-                    .record_execution_reserved(
-                        &mut reservation,
-                        execution_id,
-                        idem_key.clone(),
-                        StepOutcome::Pending,
-                        risk,
-                        &agent_id,
-                        logical_now_ms,
-                    )
-                    .map_err(|err| {
-                        TxExecutionError::LedgerWrite(format!(
-                            "failed to reserve compensation step {} attempt {attempt} before dispatch: {err}",
-                            step_result.step_id.0
-                        ))
-                    })?;
-                compensation_keys.insert(step_result.step_id.0.clone(), idem_key.clone());
-
-                let mut dispatched = self.executor.execute_compensations(
-                    contract,
-                    &dispatch_report,
-                    self.config.fail_compensation_for_step.as_deref(),
-                    now_ms,
-                );
-                if dispatched.len() != 1 || dispatched[0].for_step_id != step_result.step_id {
-                    return Err(TxExecutionError::CompensationPhase(format!(
-                        "step executor returned {} results while dispatching compensation for step {}",
-                        dispatched.len(),
-                        step_result.step_id.0
-                    )));
-                }
-                let input = dispatched.remove(0);
-                let succeeded = input.success;
-                let outcome = if succeeded {
-                    StepOutcome::Compensated {
-                        original_outcome: Box::new(original_commit_outcome.clone()),
-                        compensation_result: "rollback_complete".to_string(),
-                    }
-                } else {
+                Some(
                     StepOutcome::Failed {
-                        error_code: "compensation_failed".to_string(),
-                        error_message: format!(
-                            "Compensation for step {} failed",
-                            step_result.step_id.0
-                        ),
-                        compensated: false,
+                        compensated: false, ..
                     }
-                };
-                store
-                    .complete_execution_reserved(
-                        reservation,
-                        execution_id,
-                        idem_key,
-                        outcome,
-                        logical_now_ms,
-                    )
-                    .map_err(|err| {
-                        TxExecutionError::LedgerWrite(format!(
-                            "compensation for step {} was dispatched but its terminal outcome could not be durably recorded; later compensations were not dispatched: {err}",
-                            step_result.step_id.0
-                        ))
-                    })?;
-                compensation_inputs.push(input);
-                if !succeeded {
-                    break 'steps;
+                    | StepOutcome::Skipped { .. },
+                )
+                | None => {}
+                Some(other) => {
+                    return Err(TxExecutionError::DedupConflict {
+                        step_id: step_result.step_id.0.clone(),
+                        outcome: format!("{other:?}"),
+                    });
                 }
-                continue 'steps;
             }
 
-            return Err(TxExecutionError::DedupConflict {
-                step_id: step_result.step_id.0.clone(),
-                outcome: format!(
-                    "all {} deterministic compensation attempts are exhausted",
-                    MAX_COMPENSATION_ATTEMPTS + 1
-                ),
-            });
+            if !dispatch_permit.authorizes(&step_result.step_id.0) {
+                return Err(TxExecutionError::CompensationPhase(format!(
+                    "compensation step {} lacks a pre-mutation dispatch permit",
+                    step_result.step_id.0
+                )));
+            }
+
+            let mut dispatch_report = commit_report.clone();
+            dispatch_report.step_results = vec![step_result.clone()];
+            store
+                .record_execution_reserved(
+                    &mut reservation,
+                    execution_id,
+                    idem_key.clone(),
+                    StepOutcome::Pending,
+                    risk,
+                    &agent_id,
+                    logical_now_ms,
+                )
+                .map_err(|err| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "failed to reserve compensation step {} before dispatch: {err}",
+                        step_result.step_id.0
+                    ))
+                })?;
+            compensation_keys.insert(step_result.step_id.0.clone(), idem_key.clone());
+
+            let mut dispatched = self.executor.execute_compensations(
+                contract,
+                &dispatch_report,
+                self.config.fail_compensation_for_step.as_deref(),
+                now_ms,
+            );
+            if dispatched.len() != 1 || dispatched[0].for_step_id != step_result.step_id {
+                return Err(TxExecutionError::CompensationPhase(format!(
+                    "step executor returned {} results while dispatching compensation for step {}",
+                    dispatched.len(),
+                    step_result.step_id.0
+                )));
+            }
+            let input = dispatched.remove(0);
+            let succeeded = input.success;
+            let outcome = if succeeded {
+                StepOutcome::Compensated {
+                    original_outcome: Box::new(original_commit_outcome),
+                    compensation_result: "rollback_complete".to_string(),
+                }
+            } else {
+                StepOutcome::Failed {
+                    error_code: "compensation_failed".to_string(),
+                    error_message: format!(
+                        "Compensation for step {} failed",
+                        step_result.step_id.0
+                    ),
+                    compensated: false,
+                }
+            };
+            store
+                .complete_execution_reserved(
+                    reservation,
+                    execution_id,
+                    idem_key,
+                    outcome,
+                    logical_now_ms,
+                )
+                .map_err(|err| {
+                    TxExecutionError::LedgerWrite(format!(
+                        "compensation for step {} was dispatched but its terminal outcome could not be durably recorded; later compensations were not dispatched: {err}",
+                        step_result.step_id.0
+                    ))
+                })?;
+            compensation_inputs.push(input);
+            if !succeeded {
+                break 'steps;
+            }
         }
 
         Ok((
@@ -4843,7 +5512,31 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     continue;
                 }
 
-                let outcome = if outcome_str == "compensated" {
+                let outcome = if let Some(recovered) = context
+                    .authoritative_recovery_outcomes
+                    .and_then(|outcomes| outcomes.get(step_id))
+                {
+                    let equivalent = matches!(
+                        (outcome_str, recovered),
+                        ("compensated", StepOutcome::Compensated { .. })
+                            | (
+                                "failed",
+                                StepOutcome::Failed {
+                                    compensated: false,
+                                    ..
+                                }
+                            )
+                    );
+                    if !equivalent {
+                        return Err(TxExecutionError::DedupConflict {
+                            step_id: step_id.to_string(),
+                            outcome: format!(
+                                "authoritative recovered compensation outcome {recovered:?} conflicts with report outcome {outcome_str}"
+                            ),
+                        });
+                    }
+                    recovered.clone()
+                } else if outcome_str == "compensated" {
                     let original_outcome = original_commit_outcomes
                         .get(step_id)
                         .cloned()
@@ -5557,6 +6250,24 @@ fn resume_terminal_outcome(
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
+/// Classification for an explicit rollback proof failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackProofKind {
+    /// The receipt identifies a commit candidate, but no durable record exists.
+    Missing,
+    /// Durable state is ambiguous or contradicts the persisted receipt history.
+    Conflict,
+}
+
+impl RollbackProofKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
 /// Errors from the tx execution engine.
 #[derive(Debug, Clone)]
 pub enum TxExecutionError {
@@ -5572,6 +6283,8 @@ pub enum TxExecutionError {
     CompensationPhase(String),
     /// Idempotency ledger write or terminalization failed.
     LedgerWrite(String),
+    /// Another process currently owns a durable transaction proof/mutation lock.
+    InProgress(String),
     /// Ledger not found for resume.
     LedgerNotFound(String),
     /// Resume would replay already executed work without a checkpoint-aware executor.
@@ -5581,6 +6294,12 @@ pub enum TxExecutionError {
     },
     /// A cross-instance dedup record exists but is not safe to replay as a successful input.
     DedupConflict { step_id: String, outcome: String },
+    /// A rollback receipt claim lacks proof or conflicts with durable commit state.
+    RollbackProof {
+        kind: RollbackProofKind,
+        step_id: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for TxExecutionError {
@@ -5592,6 +6311,7 @@ impl std::fmt::Display for TxExecutionError {
             Self::CommitPhase(msg) => write!(f, "Commit phase error: {msg}"),
             Self::CompensationPhase(msg) => write!(f, "Compensation phase error: {msg}"),
             Self::LedgerWrite(msg) => write!(f, "Ledger write error: {msg}"),
+            Self::InProgress(msg) => write!(f, "Transaction in progress: {msg}"),
             Self::LedgerNotFound(id) => write!(f, "Ledger not found: {id}"),
             Self::UnsafeResume {
                 execution_id,
@@ -5605,6 +6325,17 @@ impl std::fmt::Display for TxExecutionError {
                 f,
                 "Dedup conflict for step {step_id}: prior outcome {outcome} cannot be replayed as a successful side-effect input"
             ),
+            Self::RollbackProof {
+                kind,
+                step_id,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "Rollback proof {} for step {step_id}: {detail}",
+                    kind.label()
+                )
+            }
         }
     }
 }
@@ -5627,6 +6358,20 @@ mod tests {
     use std::rc::Rc;
 
     type RecordedStepIds = Rc<RefCell<Vec<String>>>;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_sync_handle_is_synchronizable_for_contract_store() {
+        let workspace = tempfile::tempdir().expect("create contract sync workspace");
+        let pinned = CapDir::open_ambient_dir(workspace.path(), cap_std::ambient_authority())
+            .expect("pin contract sync workspace");
+        let sync_file = open_directory_sync_file(&pinned, workspace.path())
+            .expect("open synchronizable contract directory handle");
+
+        sync_file
+            .sync_all()
+            .expect("synchronize contract directory handle");
+    }
 
     fn make_test_contract(num_steps: usize) -> MissionTxContract {
         let steps: Vec<TxStep> = (0..num_steps)
@@ -5686,6 +6431,24 @@ mod tests {
         (dir, store)
     }
 
+    fn durable_ledger_file_snapshot(
+        store_dir: &Path,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(store_dir.join("tx_ledgers"))
+            .expect("read durable ledger spool")
+            .map(|entry| entry.expect("read durable ledger spool entry"))
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .map(|entry| {
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .expect("durable ledger file name is UTF-8");
+                let bytes = std::fs::read(entry.path()).expect("read durable ledger file");
+                (name, bytes)
+            })
+            .collect()
+    }
+
     fn record_durable_test_outcome(
         store: &mut IdempotencyStore,
         execution_id: &str,
@@ -5724,12 +6487,8 @@ mod tests {
         commit_idempotency_key(contract, step_id).unwrap()
     }
 
-    fn test_compensation_key(
-        contract: &MissionTxContract,
-        step_id: &str,
-        attempt: u32,
-    ) -> IdempotencyKey {
-        compensation_idempotency_key(contract, step_id, attempt).unwrap()
+    fn test_compensation_key(contract: &MissionTxContract, step_id: &str) -> IdempotencyKey {
+        compensation_idempotency_key(contract, step_id).unwrap()
     }
 
     #[test]
@@ -6236,6 +6995,107 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct CompensationGateAuditExecutor {
+        compensation_gate_calls: Rc<RefCell<usize>>,
+        dispatched_steps: RecordedStepIds,
+        deny_compensation_gates: bool,
+    }
+
+    impl CompensationGateAuditExecutor {
+        fn new(deny_compensation_gates: bool) -> (Self, Rc<RefCell<usize>>, RecordedStepIds) {
+            let compensation_gate_calls = Rc::new(RefCell::new(0));
+            let dispatched_steps = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    compensation_gate_calls: Rc::clone(&compensation_gate_calls),
+                    dispatched_steps: Rc::clone(&dispatched_steps),
+                    deny_compensation_gates,
+                },
+                compensation_gate_calls,
+                dispatched_steps,
+            )
+        }
+    }
+
+    impl StepExecutor for CompensationGateAuditExecutor {
+        fn evaluate_gates(
+            &self,
+            contract: &MissionTxContract,
+            _now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            let is_compensation_gate = contract.plan.compensations.is_empty();
+            let mut gates = crate::plan::tx_prepare_gate_inputs_allow_all(contract);
+            if is_compensation_gate {
+                *self.compensation_gate_calls.borrow_mut() += 1;
+                if self.deny_compensation_gates {
+                    for gate in &mut gates {
+                        gate.policy_passed = false;
+                        gate.policy_reason_code = Some("compensation_policy_denied".to_string());
+                    }
+                }
+            }
+            gates
+        }
+
+        fn execute_steps(
+            &self,
+            contract: &MissionTxContract,
+            fail_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            crate::plan::mission_tx_commit_step_inputs(contract, fail_step, now_ms)
+        }
+
+        fn execute_compensations(
+            &self,
+            _contract: &MissionTxContract,
+            commit_report: &TxCommitReport,
+            fail_for_step: Option<&str>,
+            now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            self.dispatched_steps.borrow_mut().extend(
+                commit_report
+                    .step_results
+                    .iter()
+                    .filter(|result| result.outcome.is_committed())
+                    .map(|result| result.step_id.0.clone()),
+            );
+            crate::plan::mission_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
+        }
+    }
+
+    struct NoFreshCompensationExecutor;
+
+    impl StepExecutor for NoFreshCompensationExecutor {
+        fn evaluate_gates(
+            &self,
+            _contract: &MissionTxContract,
+            _now_ms: i64,
+        ) -> Vec<TxPrepareGateInput> {
+            panic!("dedup-only compensation recovery must not evaluate fresh dispatch gates")
+        }
+
+        fn execute_steps(
+            &self,
+            _contract: &MissionTxContract,
+            _fail_step: Option<&str>,
+            _now_ms: i64,
+        ) -> Vec<TxCommitStepInput> {
+            panic!("rollback-only executor must not dispatch commit steps")
+        }
+
+        fn execute_compensations(
+            &self,
+            _contract: &MissionTxContract,
+            _commit_report: &TxCommitReport,
+            _fail_for_step: Option<&str>,
+            _now_ms: i64,
+        ) -> Vec<TxCompensationStepInput> {
+            panic!("dedup-only compensation recovery must not dispatch an external effect")
+        }
+    }
+
+    #[derive(Clone)]
     struct SelectivePrepareDenyExecutor {
         denied_step_id: String,
         committed_steps: RecordedStepIds,
@@ -6355,6 +7215,83 @@ mod tests {
         assert!(matches!(err, TxExecutionError::InvalidContract(_)));
         assert!(err.to_string().contains("insufficient headroom"));
         assert!(dispatched_steps.borrow().is_empty());
+    }
+
+    #[test]
+    fn recovery_receipt_headroom_is_rejected_before_fresh_dispatch() -> Result<(), String> {
+        let mut contract = make_test_contract(3);
+        contract.receipts.push(serde_json::json!({
+            "seq": u64::MAX - 6,
+            "phase": "lifecycle",
+            "tx_id": contract.intent.tx_id.0.clone(),
+            "plan_id": contract.plan.plan_id.0.clone(),
+            "state": "planned",
+            "step_id": null,
+            "outcome": "state_checkpoint",
+            "emitted_at_ms": 1_000,
+            "reason_code": "checkpoint",
+            "error_code": null,
+            "decision_path": "test"
+        }));
+
+        let (store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("prior-near-sequence-exhaustion", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        store
+            .transition_phase("prior-near-sequence-exhaustion", TxPhase::Preparing)
+            .map_err(|err| err.to_string())?;
+        store
+            .transition_phase("prior-near-sequence-exhaustion", TxPhase::Committing)
+            .map_err(|err| err.to_string())?;
+        for (step_id, timestamp_ms) in [("step-0", 5_000), ("step-1", 5_001)] {
+            record_durable_test_outcome(
+                &mut store,
+                "prior-near-sequence-exhaustion",
+                test_commit_key(&contract, step_id),
+                StepOutcome::Success {
+                    result: Some(format!("recovered_{step_id}")),
+                },
+                StepRisk::High,
+                &format!("agent-{step_id}"),
+                timestamp_ms,
+            )?;
+        }
+        store
+            .transition_phase("prior-near-sequence-exhaustion", TxPhase::Aborted)
+            .map_err(|err| err.to_string())?;
+        store
+            .archive_ledger("prior-near-sequence-exhaustion")
+            .map_err(|err| err.to_string())?;
+
+        let original_contract = serde_json::to_vec(&contract).map_err(|err| err.to_string())?;
+        let original_spool = durable_ledger_file_snapshot(store_dir.path());
+        let (executor, dispatched_steps) = RecordingExecutor::new();
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                fail_step: Some("step-2".to_string()),
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let error = engine
+            .execute_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("three-phase receipt headroom must fail before recovery or dispatch");
+
+        assert!(matches!(error, TxExecutionError::InvalidContract(_)));
+        assert!(error.to_string().contains("insufficient headroom"));
+        assert!(dispatched_steps.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_vec(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert_eq!(
+            durable_ledger_file_snapshot(store_dir.path()),
+            original_spool
+        );
+        Ok(())
     }
 
     #[test]
@@ -6872,7 +7809,7 @@ mod tests {
         ));
         assert!(matches!(
             store.peek_cached_outcome(
-                &test_compensation_key(&contract, "step-1", 0),
+                &test_compensation_key(&contract, "step-1"),
                 6_000
             ),
             Some(StepOutcome::Compensated {
@@ -7013,9 +7950,505 @@ mod tests {
     }
 
     #[test]
-    fn failed_compensation_uses_a_new_attempt_key_and_retries_only_outstanding_work()
-    -> Result<(), String> {
+    fn durable_rollback_rejects_receipt_only_commit_claims_before_mutation() -> Result<(), String> {
+        let mut contract = make_test_contract(1);
+        let synthetic = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        synthetic
+            .execute(&mut contract, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
         let (_store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("txe-existing-before-forged-rollback", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        store
+            .transition_phase("txe-existing-before-forged-rollback", TxPhase::Preparing)
+            .map_err(|err| err.to_string())?;
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let rollback_engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+
+        let error = rollback_engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("receipt-only commit claims must not authorize durable compensation");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Missing,
+                ref step_id,
+                ref detail,
+            } if step_id == "step-0" && detail.contains("no authoritative durable commit Success")
+        ));
+        assert!(dispatched_steps.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert_eq!(store.active_count(), 1);
+        assert_eq!(
+            store
+                .get_ledger("txe-existing-before-forged-rollback")
+                .expect("pre-existing ledger must remain active")
+                .phase(),
+            TxPhase::Preparing
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_rejects_downgraded_receipt_before_mutation() -> Result<(), String> {
+        let (store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(2);
+        let commit_engine =
+            TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        commit_engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_spool = durable_ledger_file_snapshot(store_dir.path());
+
+        let downgraded = contract
+            .receipts
+            .iter_mut()
+            .find(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                    && receipt.get("step_id").and_then(serde_json::Value::as_str) == Some("step-0")
+            })
+            .expect("step-0 commit receipt");
+        downgraded["outcome"] = serde_json::json!("failed");
+        downgraded["reason_code"] = serde_json::json!("forged_commit_failure");
+        downgraded["error_code"] = serde_json::json!("FTX3999");
+        downgraded["decision_path"] = serde_json::json!("forged_receipt_history");
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let rollback_engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let error = rollback_engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("receipt history must not hide an authoritative durable commit Success");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                ref step_id,
+                ref detail,
+            } if step_id == "step-0" && detail.contains("omitted or downgraded")
+        ));
+        assert!(dispatched_steps.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert!(
+            store
+                .peek_cached_outcome(&test_compensation_key(&contract, "step-0"), 6_000)
+                .is_none(),
+            "proof conflict must not reserve or dispatch compensation"
+        );
+        assert_eq!(
+            durable_ledger_file_snapshot(store_dir.path()),
+            original_spool,
+            "proof conflict must not create, retire, or rewrite a durable execution ledger"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_holds_commit_and_compensation_proof_leases_before_mutation()
+    -> Result<(), String> {
+        let (store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+
+        let commit_key = test_commit_key(&contract, "step-0");
+        let compensation_key = test_compensation_key(&contract, "step-0");
+        let mut contender = IdempotencyStore::open(store_dir.path(), IdempotencyPolicy::default())
+            .map_err(|err| err.to_string())?;
+        set_rollback_post_proof_lease_test_hook(Some(Box::new(move || {
+            for (kind, key) in [("commit", commit_key), ("compensation", compensation_key)] {
+                let error = contender
+                    .acquire_durable_reservation("txe-contending-rollback", &key, 6_000)
+                    .expect_err("atomic rollback proof lease must reject a concurrent writer");
+                assert!(
+                    matches!(
+                        error,
+                        crate::tx_idempotency::IdempotencyError::ReservationInProgress { .. }
+                    ),
+                    "{kind} key contention must fail at the held proof lease, got {error}"
+                );
+            }
+        })));
+
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let result = TxExecutionEngine::new(executor, TxExecutionConfig::default())
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .map_err(|err| err.to_string())?;
+
+        assert!(result.compensation_report.is_fully_rolled_back());
+        assert_eq!(dispatched_steps.borrow().as_slice(), ["step-0".to_string()]);
+        assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
+        assert_eq!(contract.outcome, TxOutcome::Compensated);
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_classifies_pending_commit_proof_as_conflict() -> Result<(), String> {
+        let mut contract = make_test_contract(1);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute(&mut contract, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+        let (store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        let execution_id = "txe-pending-before-rollback";
+        store
+            .create_ledger(execution_id, &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .map_err(|err| err.to_string())?;
+        let commit_key = test_commit_key(&contract, "step-0");
+        let mut reservation = store
+            .acquire_durable_reservation(execution_id, &commit_key, 5_500)
+            .map_err(|err| err.to_string())?;
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                execution_id,
+                commit_key.clone(),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "agent-step-0",
+                5_500,
+            )
+            .map_err(|err| err.to_string())?;
+        drop(reservation);
+        let original_spool = durable_ledger_file_snapshot(store_dir.path());
+
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let error = TxExecutionEngine::new(executor, TxExecutionConfig::default())
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("ambiguous Pending commit proof must block rollback");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                ref step_id,
+                ref detail,
+            } if step_id == "step-0" && detail.contains("Pending")
+        ));
+        assert!(dispatched_steps.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&commit_key, 6_000),
+            Some(StepOutcome::Pending)
+        ));
+        assert_eq!(store.active_count(), 1);
+        assert_eq!(
+            durable_ledger_file_snapshot(store_dir.path()),
+            original_spool,
+            "Pending proof conflict must preserve the exact source ledger bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_rejects_pending_commit_hidden_by_failed_receipt_before_mutation()
+    -> Result<(), String> {
+        let mut contract = make_test_contract(1);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute(&mut contract, 5_000)
+            .map_err(|err| err.to_string())?;
+        let receipt = contract
+            .receipts
+            .iter_mut()
+            .find(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                    && receipt.get("step_id").and_then(serde_json::Value::as_str) == Some("step-0")
+            })
+            .expect("step-0 commit receipt");
+        receipt["outcome"] = serde_json::json!("failed");
+        receipt["reason_code"] = serde_json::json!("forged_commit_failure");
+        receipt["error_code"] = serde_json::json!("FTX3999");
+        receipt["decision_path"] = serde_json::json!("forged_receipt_history");
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+
+        let (_store_dir, mut store) = durable_store();
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        let execution_id = "txe-hidden-pending-before-rollback";
+        store
+            .create_ledger(execution_id, &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .map_err(|err| err.to_string())?;
+        let commit_key = test_commit_key(&contract, "step-0");
+        let mut reservation = store
+            .acquire_durable_reservation(execution_id, &commit_key, 5_500)
+            .map_err(|err| err.to_string())?;
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                execution_id,
+                commit_key.clone(),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "agent-step-0",
+                5_500,
+            )
+            .map_err(|err| err.to_string())?;
+        drop(reservation);
+
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let error = TxExecutionEngine::new(executor, TxExecutionConfig::default())
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("hidden Pending commit proof must block rollback");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                ref step_id,
+                ref detail,
+            } if step_id == "step-0"
+                && detail.contains("does not identify a committed effect")
+        ));
+        assert!(dispatched_steps.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&commit_key, 6_000),
+            Some(StepOutcome::Pending)
+        ));
+        assert_eq!(store.active_count(), 1);
+        assert_eq!(
+            store
+                .get_ledger(execution_id)
+                .expect("ambiguous source ledger must remain active")
+                .phase(),
+            TxPhase::Preparing
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_rejects_pending_compensation_before_mutation() -> Result<(), String> {
+        let (_store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        let execution_id = "txe-pending-compensation-before-rollback";
+        store
+            .create_ledger(execution_id, &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        store
+            .transition_phase(execution_id, TxPhase::Preparing)
+            .map_err(|err| err.to_string())?;
+        let compensation_key = test_compensation_key(&contract, "step-0");
+        let mut reservation = store
+            .acquire_durable_reservation(execution_id, &compensation_key, 5_500)
+            .map_err(|err| err.to_string())?;
+        store
+            .record_execution_reserved(
+                &mut reservation,
+                execution_id,
+                compensation_key.clone(),
+                StepOutcome::Pending,
+                StepRisk::High,
+                "agent-step-0",
+                5_500,
+            )
+            .map_err(|err| err.to_string())?;
+        drop(reservation);
+
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let error = TxExecutionEngine::new(executor, TxExecutionConfig::default())
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("Pending compensation proof must block rollback before mutation");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                ref step_id,
+                ref detail,
+            } if step_id == "step-0"
+                && detail.contains("durable compensation state Pending")
+        ));
+        assert!(dispatched_steps.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert!(matches!(
+            store.peek_cached_outcome(&compensation_key, 6_000),
+            Some(StepOutcome::Pending)
+        ));
+        assert_eq!(store.active_count(), 1);
+        assert_eq!(
+            store
+                .get_ledger(execution_id)
+                .expect("ambiguous compensation ledger must remain active")
+                .phase(),
+            TxPhase::Preparing
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_rejects_compensation_proof_with_mismatched_original_outcome()
+    -> Result<(), String> {
+        let (store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        let execution_id = "txe-mismatched-compensation-proof";
+        store
+            .create_ledger(execution_id, &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        for phase in [
+            TxPhase::Preparing,
+            TxPhase::Committing,
+            TxPhase::Compensating,
+        ] {
+            store
+                .transition_phase(execution_id, phase)
+                .map_err(|err| err.to_string())?;
+        }
+        record_durable_test_outcome(
+            &mut store,
+            execution_id,
+            test_compensation_key(&contract, "step-0"),
+            StepOutcome::Compensated {
+                original_outcome: Box::new(StepOutcome::Failed {
+                    error_code: "forged_original".to_string(),
+                    error_message: "commit never succeeded".to_string(),
+                    compensated: false,
+                }),
+                compensation_result: "forged_undo".to_string(),
+            },
+            StepRisk::High,
+            "agent-step-0",
+            5_500,
+        )?;
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+        let original_spool = durable_ledger_file_snapshot(store_dir.path());
+
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let error = TxExecutionEngine::new(executor, TxExecutionConfig::default())
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("mismatched embedded original outcome must fail closed");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                ref step_id,
+                ref detail,
+            } if step_id == "step-0" && detail.contains("embeds original outcome")
+        ));
+        assert!(dispatched_steps.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert_eq!(
+            durable_ledger_file_snapshot(store_dir.path()),
+            original_spool,
+            "proof conflict must not mutate existing ledger evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_rejects_missing_compensation_before_ledger_mutation() -> Result<(), String>
+    {
+        let (_store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        contract.plan.compensations.clear();
+        let engine = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+
+        let error = engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("missing compensation action must fail before rollback mutation");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::InvalidContract(ref message)
+                if message.contains("no compensation action for committed step step-0")
+        ));
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert_eq!(store.active_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn forged_compensation_receipt_cannot_suppress_durable_undo() -> Result<(), String> {
+        let (_store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        let commit_engine =
+            TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        commit_engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+
+        let mut receipt_donor = contract.clone();
+        let forged = commit_engine
+            .rollback(&mut receipt_donor, 6_000)
+            .map_err(|err| err.to_string())?;
+        let mut forged_contract = contract;
+        forged_contract
+            .receipts
+            .extend(forged.compensation_report.receipts);
+
+        let (executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let rollback_engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let result = rollback_engine
+            .rollback_with_store(&mut forged_contract, &mut store, 7_000)
+            .map_err(|err| err.to_string())?;
+
+        assert_eq!(dispatched_steps.borrow().as_slice(), ["step-0"]);
+        assert!(result.compensation_report.is_fully_rolled_back());
+        assert!(matches!(
+            store.peek_cached_outcome(&test_compensation_key(&forged_contract, "step-0"), 7_000),
+            Some(StepOutcome::Compensated { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_compensation_reuses_stable_key_and_sticky_success_survives_ttl() -> Result<(), String>
+    {
+        let store_dir = tempfile::tempdir().expect("durable tx store tempdir");
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 100,
+            ..IdempotencyPolicy::default()
+        };
+        let mut store = IdempotencyStore::open(store_dir.path(), policy.clone())
+            .map_err(|err| err.to_string())?;
         let mut contract = make_test_contract(2);
         let commit_engine =
             TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
@@ -7023,8 +8456,9 @@ mod tests {
             .execute_with_store(&mut contract, &mut store, 5_000)
             .map_err(|err| err.to_string())?;
 
+        let (failing_executor, dispatched_steps) = CompensationRecordingExecutor::new(false);
         let failing_rollback = TxExecutionEngine::new(
-            SyntheticStepExecutor,
+            failing_executor,
             TxExecutionConfig {
                 fail_compensation_for_step: Some("step-1".to_string()),
                 ..TxExecutionConfig::default()
@@ -7035,35 +8469,63 @@ mod tests {
             .map_err(|err| err.to_string())?;
         assert_eq!(first.compensation_report.failed_count, 1);
         assert!(matches!(
-            store.peek_cached_outcome(&test_compensation_key(&contract, "step-1", 0), 6_000),
+            store.peek_cached_outcome(&test_compensation_key(&contract, "step-1"), 6_000),
             Some(StepOutcome::Failed { .. })
         ));
         assert!(
             store
-                .peek_cached_outcome(&test_compensation_key(&contract, "step-0", 0), 6_000)
+                .peek_cached_outcome(&test_compensation_key(&contract, "step-0"), 6_000)
                 .is_none(),
             "later compensation must not be reserved after the first failure"
         );
+        let contract_before_successful_retry = contract.clone();
+        drop(store);
+        let mut store = IdempotencyStore::open(store_dir.path(), policy.clone())
+            .map_err(|err| err.to_string())?;
 
-        let retry_engine =
-            TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        let (retry_executor, retry_dispatched_steps) = CompensationRecordingExecutor::new(false);
+        let retry_engine = TxExecutionEngine::new(retry_executor, TxExecutionConfig::default());
         let retry = retry_engine
-            .rollback_with_store(&mut contract, &mut store, 7_000)
+            .rollback_with_store(&mut contract, &mut store, 6_050)
             .map_err(|err| err.to_string())?;
 
         assert!(retry.compensation_report.is_fully_rolled_back());
         assert_eq!(retry.compensation_report.compensated_count, 2);
         assert_eq!(contract.lifecycle_state, MissionTxState::RolledBack);
         assert!(matches!(
-            store.peek_cached_outcome(&test_compensation_key(&contract, "step-1", 1), 7_000),
+            store.peek_cached_outcome(&test_compensation_key(&contract, "step-1"), 6_050),
             Some(StepOutcome::Compensated { .. })
         ));
         assert!(matches!(
-            store.peek_cached_outcome(&test_compensation_key(&contract, "step-0", 0), 7_000),
+            store.peek_cached_outcome(&test_compensation_key(&contract, "step-0"), 6_050),
             Some(StepOutcome::Compensated { .. })
         ));
         assert!(!retry.events.is_empty());
         assert_eq!(retry.execution_id, retry.ledger.execution_id());
+        assert_eq!(dispatched_steps.borrow().as_slice(), ["step-1"]);
+        assert_eq!(
+            retry_dispatched_steps.borrow().as_slice(),
+            ["step-1", "step-0"]
+        );
+
+        drop(store);
+        let mut store =
+            IdempotencyStore::open(store_dir.path(), policy).map_err(|err| err.to_string())?;
+        contract = contract_before_successful_retry;
+        let (recovery_executor, recovery_dispatched_steps) =
+            CompensationRecordingExecutor::new(false);
+        let recovery_engine =
+            TxExecutionEngine::new(recovery_executor, TxExecutionConfig::default());
+        let recovered = recovery_engine
+            .rollback_with_store(&mut contract, &mut store, 7_000)
+            .map_err(|err| err.to_string())?;
+
+        assert!(recovered.compensation_report.is_fully_rolled_back());
+        assert!(recovery_dispatched_steps.borrow().is_empty());
+        assert!(matches!(
+            store.peek_cached_outcome(&test_compensation_key(&contract, "step-1"), 7_000),
+            Some(StepOutcome::Compensated { .. })
+        ));
         Ok(())
     }
 
@@ -7096,12 +8558,12 @@ mod tests {
         record_durable_test_outcome(
             &mut store,
             "compensation-before-contract-save",
-            test_compensation_key(&contract, "step-0", 0),
+            test_compensation_key(&contract, "step-0"),
             StepOutcome::Compensated {
                 original_outcome: Box::new(StepOutcome::Success {
                     result: Some("committed".to_string()),
                 }),
-                compensation_result: "rollback_complete".to_string(),
+                compensation_result: "provider_specific_undo_receipt".to_string(),
             },
             StepRisk::High,
             "agent-step-0",
@@ -7135,6 +8597,31 @@ mod tests {
         // already carries the equivalent latest receipt must not duplicate it.
         contract.lifecycle_state = MissionTxState::Compensating;
         contract.outcome = TxOutcome::Pending;
+        let mut duplicate_commit_report = commit_report.clone();
+        let (duplicate_original_proof, mut duplicate_proof_leases) =
+            TxExecutionEngine::<SyntheticStepExecutor>::acquire_atomic_compensation_proof(
+                &contract,
+                &mut duplicate_commit_report,
+                &mut store,
+                8_000,
+            )
+            .map_err(|err| err.to_string())?;
+        let duplicate_gate_report =
+            TxExecutionEngine::<SyntheticStepExecutor>::compensation_gate_report(
+                &contract,
+                &duplicate_commit_report,
+                Some(&duplicate_proof_leases),
+            )
+            .map_err(|err| err.to_string())?;
+        let duplicate_permit = engine
+            .validate_compensation_dispatch(
+                &contract,
+                &duplicate_gate_report,
+                "receipt-recovery-probe",
+                MissionKillSwitchLevel::Off,
+                8_000,
+            )
+            .map_err(|err| err.to_string())?;
         store
             .create_ledger("receipt-recovery-probe", &compiled_plan)
             .map_err(|err| err.to_string())?;
@@ -7157,12 +8644,14 @@ mod tests {
         ) = engine
             .run_compensation_phase(
                 &contract,
-                &commit_report,
+                &duplicate_commit_report,
                 "receipt-recovery-probe",
                 &mut events,
                 &mut decision_path,
-                MissionKillSwitchLevel::Off,
+                duplicate_permit,
                 Some(&mut store),
+                Some(&duplicate_original_proof),
+                Some(&mut duplicate_proof_leases),
                 8_000,
             )
             .map_err(|err| err.to_string())?;
@@ -7209,7 +8698,10 @@ mod tests {
             store
                 .get_ledger("receipt-recovery-probe")
                 .and_then(|ledger| ledger.get_outcome(compensation_key)),
-            Some(StepOutcome::Compensated { .. })
+            Some(StepOutcome::Compensated {
+                compensation_result,
+                ..
+            }) if compensation_result == "provider_specific_undo_receipt"
         ));
         Ok(())
     }
@@ -7259,6 +8751,308 @@ mod tests {
                 "rejected rollback safety gate dispatched compensation"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_proof_lease_errors_preserve_conflict_and_contention_semantics() {
+        let conflict = classify_rollback_proof_lease_error(IdempotencyError::LedgerIndexCorrupt {
+            reason: "two sticky outcomes disagree".to_string(),
+        });
+        assert!(matches!(
+            conflict,
+            TxExecutionError::RollbackProof {
+                kind: RollbackProofKind::Conflict,
+                ref step_id,
+                ref detail,
+            } if step_id == "durable-proof-set"
+                && detail.contains("two sticky outcomes disagree")
+                && detail.contains("reconcile")
+        ));
+
+        let contention =
+            classify_rollback_proof_lease_error(IdempotencyError::ReservationInProgress {
+                key: "plan:test-plan".to_string(),
+            });
+        assert!(matches!(
+            contention,
+            TxExecutionError::InProgress(ref detail)
+                if detail.contains("plan:test-plan")
+        ));
+    }
+
+    #[test]
+    fn durable_rollback_gate_denial_preserves_contract_and_spool_exactly() -> Result<(), String> {
+        let (store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(2);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+        let original_spool = durable_ledger_file_snapshot(store_dir.path());
+        let (executor, gate_calls, dispatched) = CompensationGateAuditExecutor::new(true);
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+
+        let error = engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("full compensation gate denial must stop before rollback mutation");
+
+        assert!(matches!(error, TxExecutionError::CompensationPhase(_)));
+        assert_eq!(*gate_calls.borrow(), 1);
+        assert!(dispatched.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract
+        );
+        assert_eq!(
+            durable_ledger_file_snapshot(store_dir.path()),
+            original_spool,
+            "gate denial must not create, retire, transition, or append a rollback ledger"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_compensation_uses_exactly_one_gate_batch_and_monotonic_events() {
+        let mut contract = make_test_contract(2);
+        let (executor, gate_calls, dispatched) = CompensationGateAuditExecutor::new(false);
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                fail_step: Some("step-1".to_string()),
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let result = engine
+            .execute(&mut contract, 5_000)
+            .expect("approved automatic compensation succeeds");
+
+        assert_eq!(*gate_calls.borrow(), 1);
+        assert_eq!(dispatched.borrow().as_slice(), ["step-0"]);
+        assert!(result.compensation_report.is_some());
+        assert!(
+            result
+                .events
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+        );
+    }
+
+    #[test]
+    fn automatic_compensation_gate_denial_blocks_nondurable_dispatch() {
+        let mut contract = make_test_contract(2);
+        let (executor, gate_calls, dispatched) = CompensationGateAuditExecutor::new(true);
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                fail_step: Some("step-1".to_string()),
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let error = engine
+            .execute(&mut contract, 5_000)
+            .expect_err("denied automatic compensation must fail closed");
+
+        assert!(matches!(error, TxExecutionError::CompensationPhase(_)));
+        assert_eq!(*gate_calls.borrow(), 1);
+        assert!(dispatched.borrow().is_empty());
+        assert_eq!(contract.lifecycle_state, MissionTxState::Failed);
+        assert_eq!(contract.outcome, TxOutcome::Failed);
+        assert!(!contract.receipts.iter().any(|receipt| {
+            receipt.get("phase").and_then(serde_json::Value::as_str) == Some("compensate")
+        }));
+    }
+
+    #[test]
+    fn automatic_compensation_gate_denial_blocks_durable_mutation() -> Result<(), String> {
+        let (_store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(2);
+        let (executor, gate_calls, dispatched) = CompensationGateAuditExecutor::new(true);
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                fail_step: Some("step-1".to_string()),
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let error = engine
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .expect_err("denied durable automatic compensation must fail closed");
+
+        assert!(matches!(error, TxExecutionError::CompensationPhase(_)));
+        assert_eq!(*gate_calls.borrow(), 1);
+        assert!(dispatched.borrow().is_empty());
+        assert_eq!(contract.lifecycle_state, MissionTxState::Failed);
+        assert_eq!(contract.outcome, TxOutcome::Failed);
+        assert_eq!(store.active_count(), 1);
+        assert!(
+            store
+                .peek_cached_outcome(&test_compensation_key(&contract, "step-0"), 5_000)
+                .is_none(),
+            "gate denial must not reserve a durable compensation key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dedup_only_rollback_recovery_ignores_fresh_dispatch_gates() -> Result<(), String> {
+        let (_store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_commit_outcome = store
+            .peek_cached_outcome(&test_commit_key(&contract, "step-0"), 6_000)
+            .cloned()
+            .ok_or_else(|| "missing authoritative commit outcome".to_string())?;
+        let compiled_plan = compiled_plan_from_contract(&contract);
+        store
+            .create_ledger("dedup-only-compensation-source", &compiled_plan)
+            .map_err(|err| err.to_string())?;
+        for phase in [
+            TxPhase::Preparing,
+            TxPhase::Committing,
+            TxPhase::Compensating,
+        ] {
+            store
+                .transition_phase("dedup-only-compensation-source", phase)
+                .map_err(|err| err.to_string())?;
+        }
+        record_durable_test_outcome(
+            &mut store,
+            "dedup-only-compensation-source",
+            test_compensation_key(&contract, "step-0"),
+            StepOutcome::Compensated {
+                original_outcome: Box::new(original_commit_outcome),
+                compensation_result: "provider_undo_complete".to_string(),
+            },
+            StepRisk::High,
+            "agent-step-0",
+            6_000,
+        )?;
+        let engine = TxExecutionEngine::new(
+            NoFreshCompensationExecutor,
+            TxExecutionConfig {
+                paused: true,
+                max_steps_per_batch: 0,
+                kill_switch: MissionKillSwitchLevel::HardStop,
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let result = engine
+            .rollback_with_store(&mut contract, &mut store, 7_000)
+            .map_err(|err| err.to_string())?;
+
+        assert!(result.compensation_report.is_fully_rolled_back());
+        assert!(contract.receipts.iter().any(|receipt| {
+            receipt.get("phase").and_then(serde_json::Value::as_str) == Some("compensate")
+                && receipt.get("step_id").and_then(serde_json::Value::as_str) == Some("step-0")
+                && receipt.get("outcome").and_then(serde_json::Value::as_str) == Some("compensated")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn dedup_only_rollback_with_existing_receipt_needs_zero_sequence_headroom() -> Result<(), String>
+    {
+        let (_store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(1);
+        let synthetic = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default());
+        synthetic
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        synthetic
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .map_err(|err| err.to_string())?;
+        let compensation_receipt = contract
+            .receipts
+            .iter_mut()
+            .rev()
+            .find(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) == Some("compensate")
+                    && receipt.get("step_id").and_then(serde_json::Value::as_str) == Some("step-0")
+                    && receipt.get("outcome").and_then(serde_json::Value::as_str)
+                        == Some("compensated")
+            })
+            .ok_or_else(|| "missing authoritative compensation receipt".to_string())?;
+        compensation_receipt["seq"] = serde_json::json!(u64::MAX);
+        contract.lifecycle_state = MissionTxState::Compensating;
+        contract.outcome = TxOutcome::Pending;
+        let receipt_count = contract.receipts.len();
+        let engine = TxExecutionEngine::new(
+            NoFreshCompensationExecutor,
+            TxExecutionConfig {
+                paused: true,
+                max_steps_per_batch: 0,
+                kill_switch: MissionKillSwitchLevel::HardStop,
+                ..TxExecutionConfig::default()
+            },
+        );
+
+        let result = engine
+            .rollback_with_store(&mut contract, &mut store, 7_000)
+            .map_err(|err| err.to_string())?;
+
+        assert!(result.compensation_report.receipts.is_empty());
+        assert_eq!(contract.receipts.len(), receipt_count);
+        assert_eq!(
+            contract
+                .receipts
+                .iter()
+                .filter(|receipt| {
+                    receipt.get("phase").and_then(serde_json::Value::as_str) == Some("compensate")
+                        && receipt.get("step_id").and_then(serde_json::Value::as_str)
+                            == Some("step-0")
+                })
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_rollback_rejects_oversize_compensation_batch_before_mutation() -> Result<(), String>
+    {
+        let (store_dir, mut store) = durable_store();
+        let mut contract = make_test_contract(2);
+        TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .map_err(|err| err.to_string())?;
+        let original_contract = serde_json::to_value(&contract).map_err(|err| err.to_string())?;
+        let original_spool = durable_ledger_file_snapshot(store_dir.path());
+
+        let (executor, dispatched) = CompensationRecordingExecutor::new(false);
+        let engine = TxExecutionEngine::new(
+            executor,
+            TxExecutionConfig {
+                max_steps_per_batch: 1,
+                ..TxExecutionConfig::default()
+            },
+        );
+        let error = engine
+            .rollback_with_store(&mut contract, &mut store, 6_000)
+            .expect_err("durable rollback must enforce the full compensation batch limit");
+
+        assert!(matches!(
+            error,
+            TxExecutionError::CompensationPhase(ref detail)
+                if detail.contains("compensation batch has 2 steps")
+        ));
+        assert!(dispatched.borrow().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).map_err(|err| err.to_string())?,
+            original_contract,
+            "batch rejection must precede caller-owned contract mutation"
+        );
+        assert_eq!(
+            durable_ledger_file_snapshot(store_dir.path()),
+            original_spool,
+            "batch rejection must precede durable ledger mutation"
+        );
         Ok(())
     }
 
@@ -7850,7 +9644,7 @@ mod tests {
             })],
         };
         let mut events = Vec::new();
-        let compensation_key = compensation_idempotency_key(&contract, "step-0", 0).unwrap();
+        let compensation_key = compensation_idempotency_key(&contract, "step-0").unwrap();
         let compensation_keys = HashMap::from([("step-0".to_string(), compensation_key)]);
         let original_commit_outcomes = HashMap::from([(
             "step-0".to_string(),
@@ -8341,7 +10135,7 @@ mod tests {
         record_durable_test_outcome(
             &mut store,
             "exec-1",
-            compensation_idempotency_key(&contract, "step-0", 0).unwrap(),
+            compensation_idempotency_key(&contract, "step-0").unwrap(),
             StepOutcome::Compensated {
                 original_outcome: Box::new(StepOutcome::Success { result: None }),
                 compensation_result: "rollback_complete".into(),

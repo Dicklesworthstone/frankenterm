@@ -4568,11 +4568,13 @@ fn validate_persisted_tx_receipts(
 
 /// Build the commit report a rollback surface should compensate against.
 ///
-/// Rollback must compensate only the steps that are proven to have committed.
-/// Commit receipts are the sole source of truth. Successful commit and
-/// compensation receipts are sticky effect-state facts: later failed/skipped
-/// retries are diagnostic and cannot erase an already-applied or already-undone
-/// effect. The returned report retains one result per plan step.
+/// Reconstructs rollback candidates from the contract's receipt history.
+/// Successful commit and compensation receipts are sticky candidate facts:
+/// later failed/skipped retries are diagnostic and cannot erase an earlier
+/// claim. An effectful durable caller must additionally corroborate commit and
+/// compensation outcomes against its live durable execution spool before
+/// dispatch or deduplication. The returned report retains one result per plan
+/// step.
 pub fn mission_tx_rollback_commit_report(
     contract: &MissionTxContract,
     completed_at_ms: i64,
