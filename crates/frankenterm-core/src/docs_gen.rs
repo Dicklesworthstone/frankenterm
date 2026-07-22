@@ -549,6 +549,8 @@ const STANDARD_ROBOT_ERROR_CODES: &[&str] = &[
     "robot.tx_invalid_json",
     "robot.tx_validation_failed",
     "robot.tx_execution_failed",
+    "robot.tx_rollback_proof_conflict",
+    "robot.tx_rollback_proof_missing",
     "robot.tx_error",
     "robot.internal_error",
     "robot.timeout",
@@ -627,6 +629,12 @@ fn error_code_description(code: &str) -> &'static str {
         "robot.tx_invalid_json" => "Transaction contract file contained invalid JSON",
         "robot.tx_validation_failed" => "Transaction contract failed validation",
         "robot.tx_execution_failed" => "Transaction prepare, commit, or compensation phase failed",
+        "robot.tx_rollback_proof_conflict" => {
+            "Transaction rollback proof conflicts with ambiguous or contradictory durable state"
+        }
+        "robot.tx_rollback_proof_missing" => {
+            "Transaction rollback receipt lacks matching authoritative durable commit proof"
+        }
         "robot.tx_error" => "Transaction command failed for an unspecified reason",
         "robot.internal_error" => "Unexpected internal error while handling the robot command",
         "robot.timeout" => "Operation timed out",

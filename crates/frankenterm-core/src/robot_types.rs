@@ -495,6 +495,12 @@ pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
         "robot.tx_oversize" | "robot.mission_oversize" => {
             "Payload exceeds the configured size cap; split the request or raise the limit."
         }
+        "robot.tx_rollback_proof_missing" => {
+            "Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace .ft/tx_ledgers records first: missing durable proof does not establish that an external effect was absent. For future new transactions, execute commits through MCP wa.tx_run, `ft tx run`, or `ft robot tx run` so receipts and authoritative proofs are persisted together; do not fabricate receipts."
+        }
+        "robot.tx_rollback_proof_conflict" => {
+            "Do not blindly rerun the commit or rollback. Inspect and reconcile the contract receipts with the workspace .ft/tx_ledgers records first; ambiguous or contradictory durable state may represent an external effect that was already dispatched."
+        }
         // Mission lifecycle
         "robot.mission_kill_switch_activated" => {
             "Clear the killswitch via `ft mission unkill` after investigating the trip cause."
@@ -3856,6 +3862,18 @@ mod tests {
                 .unwrap()
                 .is_retryable()
         );
+        assert!(
+            !ErrorCode::parse("robot.tx_rollback_proof_missing")
+                .unwrap()
+                .is_retryable(),
+            "receipt-only rollback claims require authoritative commit proof, not blind retry"
+        );
+        assert!(
+            !ErrorCode::parse("robot.tx_rollback_proof_conflict")
+                .unwrap()
+                .is_retryable(),
+            "contradictory durable state requires reconciliation, not blind retry"
+        );
     }
 
     /// Verify the current emitted robot error-code surface still maps to the
@@ -3922,6 +3940,8 @@ mod tests {
             ("robot.tx_not_found", ErrorCategory::Workflow),
             ("robot.tx_oversize", ErrorCategory::Workflow),
             ("robot.tx_read_failed", ErrorCategory::Workflow),
+            ("robot.tx_rollback_proof_conflict", ErrorCategory::Workflow),
+            ("robot.tx_rollback_proof_missing", ErrorCategory::Workflow),
             ("robot.tx_serialize_failed", ErrorCategory::Workflow),
             ("robot.tx_validation_failed", ErrorCategory::Workflow),
             ("robot.tx_write_failed", ErrorCategory::Workflow),
@@ -4934,6 +4954,8 @@ mod tests {
             "robot.tx_lock_failed",
             "robot.tx_in_progress",
             "robot.tx_oversize",
+            "robot.tx_rollback_proof_conflict",
+            "robot.tx_rollback_proof_missing",
             "robot.mission_oversize",
             "robot.mission_kill_switch_activated",
             "robot.mission_reservation_conflict",

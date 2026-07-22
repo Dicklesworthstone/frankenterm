@@ -1366,6 +1366,8 @@ fn robot_envelope_schema_tracks_current_core_error_codes() {
         "robot.tx_invalid_json",
         "robot.tx_validation_failed",
         "robot.tx_execution_failed",
+        "robot.tx_rollback_proof_conflict",
+        "robot.tx_rollback_proof_missing",
         "robot.tx_error",
         "robot.internal_error",
         "robot.timeout",
