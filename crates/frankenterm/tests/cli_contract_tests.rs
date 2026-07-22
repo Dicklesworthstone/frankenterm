@@ -18,9 +18,8 @@ mod wezterm_subprocess;
 #[cfg(unix)]
 use frankenterm_core::approval::ApprovalScope;
 use frankenterm_core::plan::{
-    MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
-    MissionTxState, StepAction, TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId,
-    TxStep, TxStepId, execute_commit_phase, mission_tx_commit_step_inputs,
+    MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
+    TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxStep, TxStepId,
 };
 #[cfg(unix)]
 use frankenterm_core::policy::{
@@ -428,7 +427,7 @@ fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
     }
 }
 
-fn write_default_tx_contract(dir: &TempDir, state: MissionTxState) -> std::path::PathBuf {
+fn write_default_tx_contract(dir: &TempDir) -> std::path::PathBuf {
     let path = dir
         .path()
         .join(".ft")
@@ -436,22 +435,7 @@ fn write_default_tx_contract(dir: &TempDir, state: MissionTxState) -> std::path:
         .join("tx-active.json");
     std::fs::create_dir_all(path.parent().expect("tx contract parent"))
         .expect("create mission dir");
-    let mut contract = sample_tx_contract(state);
-    if state == MissionTxState::Committed {
-        let mut committing = contract.clone();
-        committing.lifecycle_state = MissionTxState::Committing;
-        committing.outcome = TxOutcome::Pending;
-        let inputs = mission_tx_commit_step_inputs(&committing, None, 1_700_000_000_001);
-        contract.receipts = execute_commit_phase(
-            &committing,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            1_700_000_000_001,
-        )
-        .expect("build committed tx fixture receipts")
-        .receipts;
-    }
+    let contract = sample_tx_contract(MissionTxState::Planned);
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&contract).expect("serialize tx contract"),
@@ -485,10 +469,7 @@ fn executable_send_text_contract(
 }
 
 #[cfg(unix)]
-fn write_executable_send_text_tx_contract(
-    dir: &TempDir,
-    state: MissionTxState,
-) -> std::path::PathBuf {
+fn write_executable_send_text_tx_contract(dir: &TempDir) -> std::path::PathBuf {
     let path = dir
         .path()
         .join(".ft")
@@ -496,27 +477,12 @@ fn write_executable_send_text_tx_contract(
         .join("tx-active.json");
     std::fs::create_dir_all(path.parent().expect("tx contract parent"))
         .expect("create mission dir");
-    let mut contract = executable_send_text_contract(
-        sample_tx_contract(state),
+    let contract = executable_send_text_contract(
+        sample_tx_contract(MissionTxState::Planned),
         0,
         "tx-test-commit",
         "tx-test-compensate",
     );
-    if state == MissionTxState::Committed {
-        let mut committing = contract.clone();
-        committing.lifecycle_state = MissionTxState::Committing;
-        committing.outcome = TxOutcome::Pending;
-        let inputs = mission_tx_commit_step_inputs(&committing, None, 1_700_000_000_001);
-        contract.receipts = execute_commit_phase(
-            &committing,
-            &inputs,
-            MissionKillSwitchLevel::Off,
-            false,
-            1_700_000_000_001,
-        )
-        .expect("build committed executable tx fixture receipts")
-        .receipts;
-    }
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&contract).expect("serialize executable tx contract"),
@@ -696,19 +662,39 @@ esac
         serde_json::from_slice(&output.stdout).expect("ft transaction stdout should be valid JSON")
     }
 
-    fn approve_robot_run(&self, workspace: &str, contract_path: &std::path::Path) {
+    fn approve_robot_run(workspace: &str, contract_path: &std::path::Path) {
         let contract: MissionTxContract = serde_json::from_slice(
             &std::fs::read(contract_path).expect("read robot transaction contract for approvals"),
         )
         .expect("deserialize robot transaction contract for approvals");
         let db_path = std::path::Path::new(workspace).join(".ft").join("ft.db");
         let conn = rusqlite::Connection::open(&db_path).expect("open robot approval fixture DB");
-        let now_ms = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock before epoch")
-            .as_millis() as i64;
+            .expect("system clock before epoch");
+        let now_ms = now.as_millis() as i64;
+        let approval_nonce = now.as_nanos();
 
+        let mut gated_steps = Vec::with_capacity(contract.plan.steps.len().saturating_mul(2));
         for step in &contract.plan.steps {
+            gated_steps.push(("commit", step.clone()));
+            let compensation = contract
+                .plan
+                .compensations
+                .iter()
+                .find(|compensation| compensation.for_step_id == step.step_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "robot transaction approval fixture requires compensation for {}",
+                        step.step_id.0
+                    )
+                });
+            let mut compensation_step = step.clone();
+            compensation_step.action = compensation.action.clone();
+            gated_steps.push(("compensation", compensation_step));
+        }
+
+        for (phase, step) in &gated_steps {
             let StepAction::SendText {
                 pane_id,
                 text,
@@ -737,14 +723,17 @@ esac
                   pane_id, action_fingerprint, plan_hash, plan_version, risk_summary) \
                  VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, NULL, NULL, ?8)",
                 rusqlite::params![
-                    format!("tx-cli-stub-approval-{}", step.ordinal),
+                    format!(
+                        "tx-cli-stub-{phase}-approval-{}-{approval_nonce}",
+                        step.ordinal
+                    ),
                     now_ms,
                     now_ms.saturating_add(600_000),
                     scope.workspace_id(),
                     scope.action_kind(),
                     scope.pane_id(),
                     scope.action_fingerprint(),
-                    "isolated CLI transaction fixture approval"
+                    format!("isolated CLI transaction {phase} approval")
                 ],
             )
             .expect("seed scoped robot transaction approval");
@@ -3052,7 +3041,7 @@ fn contract_help_lists_core_commands() {
 #[test]
 fn contract_tx_plan_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let contract_path = write_default_tx_contract(&dir);
     let payload = run_wa_json(&ws, &["tx", "plan", "--format", "json"]);
 
     assert_eq!(payload["ok"], true);
@@ -3073,7 +3062,7 @@ fn contract_tx_plan_json_envelope() {
 #[test]
 fn contract_tx_show_include_contract_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let contract_path = write_default_tx_contract(&dir);
     let payload = run_wa_json(
         &ws,
         &["tx", "show", "--include-contract", "--format", "json"],
@@ -3102,7 +3091,7 @@ fn contract_tx_show_include_contract_json_envelope() {
 fn contract_tx_run_partial_failure_json_envelope() {
     let (dir, ws) = setup_workspace();
     let wezterm_stub = TxWeztermCliStub::new(&dir);
-    let contract_path = write_executable_send_text_tx_contract(&dir, MissionTxState::Planned);
+    let contract_path = write_executable_send_text_tx_contract(&dir);
     let authoritative_contract_path = contract_path
         .canonicalize()
         .expect("canonicalize locked tx contract");
@@ -3184,7 +3173,7 @@ fn contract_tx_run_partial_failure_json_envelope() {
 #[test]
 fn contract_tx_run_invalid_fail_step_json_error_envelope() {
     let (dir, ws) = setup_workspace();
-    write_default_tx_contract(&dir, MissionTxState::Planned);
+    write_default_tx_contract(&dir);
 
     let output = wa_cmd_for(&ws)
         .args([
@@ -3222,7 +3211,7 @@ fn contract_tx_run_invalid_fail_step_json_error_envelope() {
 #[test]
 fn contract_robot_tx_plan_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let contract_path = write_default_tx_contract(&dir);
     let payload = run_wa_json(&ws, &["robot", "--format", "json", "tx", "plan"]);
 
     assert_eq!(payload["ok"], true);
@@ -3247,7 +3236,7 @@ fn contract_robot_tx_plan_json_envelope() {
 #[test]
 fn contract_no_mock_control_plane_receipts_cover_read_and_policy_gated_robot_paths() {
     let (dir, ws) = setup_workspace();
-    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let contract_path = write_default_tx_contract(&dir);
     let cleanup_expectation =
         "TempDir guard owns isolated workspace cleanup; no repository files are removed.";
 
@@ -3356,7 +3345,7 @@ fn contract_no_mock_control_plane_receipts_cover_read_and_policy_gated_robot_pat
 #[test]
 fn contract_robot_tx_show_include_contract_json_envelope() {
     let (dir, ws) = setup_workspace();
-    let contract_path = write_default_tx_contract(&dir, MissionTxState::Planned);
+    let contract_path = write_default_tx_contract(&dir);
     let payload = run_wa_json(
         &ws,
         &[
@@ -3393,8 +3382,8 @@ fn contract_robot_tx_show_include_contract_json_envelope() {
 fn contract_robot_tx_run_partial_failure_json_envelope() {
     let (dir, ws) = setup_workspace();
     let wezterm_stub = TxWeztermCliStub::new(&dir);
-    let contract_path = write_executable_send_text_tx_contract(&dir, MissionTxState::Planned);
-    wezterm_stub.approve_robot_run(&ws, &contract_path);
+    let contract_path = write_executable_send_text_tx_contract(&dir);
+    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
     let authoritative_contract_path = contract_path
         .canonicalize()
         .expect("canonicalize locked tx contract");
@@ -3495,7 +3484,7 @@ fn contract_robot_tx_run_partial_failure_json_envelope() {
 #[test]
 fn contract_robot_tx_run_paused_json_envelope() {
     let (dir, ws) = setup_workspace();
-    write_default_tx_contract(&dir, MissionTxState::Planned);
+    write_default_tx_contract(&dir);
     let payload = run_wa_json(&ws, &["robot", "--format", "json", "tx", "run", "--paused"]);
 
     assert_eq!(payload["ok"], true);
@@ -3528,7 +3517,7 @@ fn contract_robot_tx_run_paused_json_envelope() {
 #[test]
 fn contract_robot_tx_run_safe_mode_json_envelope() {
     let (dir, ws) = setup_workspace();
-    write_default_tx_contract(&dir, MissionTxState::Planned);
+    write_default_tx_contract(&dir);
     let payload = run_wa_json(
         &ws,
         &[
@@ -3574,9 +3563,25 @@ fn contract_robot_tx_run_safe_mode_json_envelope() {
 fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
     let (dir, ws) = setup_workspace();
     let wezterm_stub = TxWeztermCliStub::new(&dir);
-    // A `Planned` tx has no applied steps. Seed a Committed contract with real
-    // commit receipts so rollback is constrained to proven external effects.
-    write_executable_send_text_tx_contract(&dir, MissionTxState::Committed);
+    // Exercise the real durable run path first: receipts alone are not proof
+    // that the external commit effects happened.
+    let contract_path = write_executable_send_text_tx_contract(&dir);
+    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
+    let run_payload = wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "run"]);
+    assert_eq!(run_payload["ok"], true);
+    assert_eq!(run_payload["data"]["final_state"], "committed");
+    assert_eq!(run_payload["data"]["commit_report"]["committed_count"], 3);
+    let persisted_after_run: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&contract_path).expect("read transaction after commit"),
+    )
+    .expect("parse transaction after commit");
+    assert_eq!(
+        persisted_after_run["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(3),
+        "the durable commit must persist exactly three receipts"
+    );
 
     let fail_payload = wezterm_stub.run_json(
         &ws,
@@ -3622,11 +3627,27 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
         Some(3)
     );
     assert_eq!(fail_data["final_state"].as_str(), Some("failed"));
+    let persisted_after_failed_rollback: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&contract_path).expect("read transaction after failed rollback"),
+    )
+    .expect("parse transaction after failed rollback");
+    assert_eq!(
+        persisted_after_failed_rollback["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(6),
+        "the failed rollback must retain all commit and compensation receipts"
+    );
     wezterm_stub.assert_effects(&[
+        "0\ttx-test-commit:tx-step:1",
+        "0\ttx-test-commit:tx-step:2",
+        "0\ttx-test-commit:tx-step:3",
         "0\ttx-test-compensate:tx-step:3",
         "0\ttx-test-compensate:tx-step:2",
     ]);
 
+    // Approval consumption is not wired yet (ft-0rlfq.9), so the original
+    // scoped approvals remain active across this compensation retry.
     let recovery_payload =
         wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
 
@@ -3661,17 +3682,97 @@ fn contract_robot_tx_rollback_failure_and_recovery_json_envelopes() {
         Some(1)
     );
     assert_eq!(recovery_data["final_state"].as_str(), Some("rolled_back"));
+    let persisted_after_recovery: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&contract_path).expect("read transaction after rollback recovery"),
+    )
+    .expect("parse transaction after rollback recovery");
+    assert_eq!(
+        persisted_after_recovery["receipts"]
+            .as_array()
+            .map(std::vec::Vec::len),
+        Some(7),
+        "rollback recovery must append only the one newly compensated receipt"
+    );
     wezterm_stub.assert_effects(&[
+        "0\ttx-test-commit:tx-step:1",
+        "0\ttx-test-commit:tx-step:2",
+        "0\ttx-test-commit:tx-step:3",
         "0\ttx-test-compensate:tx-step:3",
         "0\ttx-test-compensate:tx-step:2",
         "0\ttx-test-compensate:tx-step:1",
     ]);
 }
 
+#[cfg(unix)]
+#[test]
+fn contract_robot_tx_rollback_conflict_is_serialized_without_dispatch_or_mutation() {
+    let (dir, ws) = setup_workspace();
+    let wezterm_stub = TxWeztermCliStub::new(&dir);
+    let contract_path = write_executable_send_text_tx_contract(&dir);
+    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
+
+    let run_payload = wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "run"]);
+    assert_eq!(run_payload["ok"], true);
+    assert_eq!(run_payload["data"]["final_state"], "committed");
+
+    let mut contradictory_contract: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&contract_path).expect("read committed transaction contract"),
+    )
+    .expect("parse committed transaction contract");
+    let receipt = contradictory_contract["receipts"]
+        .as_array_mut()
+        .expect("committed transaction receipts")
+        .iter_mut()
+        .find(|receipt| receipt["phase"] == "commit" && receipt["step_id"] == "tx-step:1")
+        .expect("tx-step:1 commit receipt");
+    receipt["outcome"] = serde_json::json!("failed");
+    receipt["reason_code"] = serde_json::json!("forged_commit_failure");
+    receipt["error_code"] = serde_json::json!("FTX3999");
+    receipt["decision_path"] = serde_json::json!("contradictory_process_boundary_fixture");
+    std::fs::write(
+        &contract_path,
+        serde_json::to_vec_pretty(&contradictory_contract)
+            .expect("serialize contradictory transaction contract"),
+    )
+    .expect("write contradictory transaction contract");
+    let contradictory_bytes =
+        std::fs::read(&contract_path).expect("snapshot contradictory transaction contract");
+
+    let rollback_payload =
+        wezterm_stub.run_json(&ws, &["robot", "--format", "json", "tx", "rollback"]);
+
+    assert_eq!(rollback_payload["ok"], false);
+    assert_eq!(
+        rollback_payload["error_code"],
+        "robot.tx_rollback_proof_conflict"
+    );
+    assert!(
+        rollback_payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rejected before compensation dispatch")
+    );
+    let hint = rollback_payload["hint"]
+        .as_str()
+        .expect("rollback proof conflict hint");
+    assert!(hint.contains("Do not blindly rerun the commit or rollback"));
+    assert!(hint.contains("external effect may already have been dispatched"));
+    assert_eq!(
+        std::fs::read(&contract_path).expect("reread rejected transaction contract"),
+        contradictory_bytes,
+        "proof conflict must leave the authoritative contract byte-for-byte unchanged"
+    );
+    wezterm_stub.assert_effects(&[
+        "0\ttx-test-commit:tx-step:1",
+        "0\ttx-test-commit:tx-step:2",
+        "0\ttx-test-commit:tx-step:3",
+    ]);
+}
+
 #[test]
 fn contract_robot_tx_run_invalid_fail_step_json_error_envelope() {
     let (dir, ws) = setup_workspace();
-    write_default_tx_contract(&dir, MissionTxState::Planned);
+    write_default_tx_contract(&dir);
     let payload = run_wa_json(
         &ws,
         &[
@@ -3910,7 +4011,7 @@ fn contract_ft_0rlfq_robot_run_human_show_robot_rollback_persists_contract_and_l
     let (dir, ws) = setup_workspace();
     let wezterm_stub = TxWeztermCliStub::new(&dir);
     let contract_path = write_ft_0rlfq_tx_contract(&dir);
-    wezterm_stub.approve_robot_run(&ws, &contract_path);
+    TxWeztermCliStub::approve_robot_run(&ws, &contract_path);
 
     let run_payload = run_ft_0rlfq_json(
         &ws,

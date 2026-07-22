@@ -270,7 +270,7 @@ esac
         command
     }
 
-    fn approve_contract(&self, workspace: &Path, contract: &MissionTxContract) {
+    fn approve_contract(workspace: &Path, contract: &MissionTxContract) {
         let db_path = Config::default().effective_db_path(workspace);
         let conn = rusqlite::Connection::open(&db_path).expect("open steering approval DB");
         let now_ms = system_now_ms();
@@ -527,10 +527,13 @@ fn steer_run_executes_bound_contract_and_uses_workspace_global_ledger() {
     let w = workspace();
     let stub = SteerWeztermCliStub::new(&w);
     let (contract_path, contract) = write_executable_tx_contract(&w);
+    let authoritative_contract_path = contract_path
+        .canonicalize()
+        .expect("canonicalize locked steering transaction contract");
     let tx_hash = contract.compute_hash();
     let receipt = persist_bound_receipt(&w, &contract);
     assert_eq!(receipt.tx_contract_hash.as_deref(), Some(tx_hash.as_str()));
-    stub.approve_contract(w.path(), &contract);
+    SteerWeztermCliStub::approve_contract(w.path(), &contract);
 
     let out = stdout(
         stub.command(w.path())
@@ -556,7 +559,7 @@ fn steer_run_executes_bound_contract_and_uses_workspace_global_ledger() {
     assert_eq!(v["live_tx_hash"].as_str(), Some(tx_hash.as_str()), "{out}");
     assert_eq!(
         v["contract_file"].as_str(),
-        Some(contract_path.to_string_lossy().as_ref()),
+        Some(authoritative_contract_path.to_string_lossy().as_ref()),
         "{out}"
     );
     assert_eq!(v["tx"]["final_state"], "committed", "{out}");
@@ -651,7 +654,15 @@ fn steer_run_refuses_expired_receipt_typed() {
     let id = plan_receipt_id(w.path(), &["--ttl-ms", "0"]);
     let out = stdout(
         ft(w.path())
-            .args(["steer", "run", "--receipt", &id, "--format", "json"])
+            .args([
+                "steer",
+                "run",
+                "--receipt",
+                &id,
+                "--dry-run",
+                "--format",
+                "json",
+            ])
             .assert()
             .failure(),
     );

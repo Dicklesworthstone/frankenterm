@@ -38225,7 +38225,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     ROBOT_ERR_INVALID_ARGS,
                                                     err,
                                                     Some(
-                                                        "Run `ft robot tx show --include-contract` and ensure the contract includes commit receipts for the steps that actually committed."
+                                                        "Run `ft robot tx show --include-contract` to inspect persisted commit receipts. Do not rerun the commit or rollback solely to repair missing receipts: durable state may represent an external effect that was already dispatched. Reconcile the contract with the workspace `.ft/tx_ledgers` records; do not fabricate receipts."
                                                             .to_string(),
                                                     ),
                                                     elapsed_ms(start),
@@ -56181,6 +56181,11 @@ struct MissionCommandError {
 #[derive(Debug)]
 enum TxCommandExecutionError {
     Execution(String),
+    InProgress(String),
+    RollbackProof {
+        kind: frankenterm_core::tx_execution::RollbackProofKind,
+        message: String,
+    },
     ContractLock {
         context: String,
         source: frankenterm_core::tx_execution::TxContractStoreError,
@@ -56194,6 +56199,20 @@ enum TxCommandExecutionError {
 impl TxCommandExecutionError {
     fn execution(message: impl Into<String>) -> Self {
         Self::Execution(message.into())
+    }
+
+    fn in_progress(message: impl Into<String>) -> Self {
+        Self::InProgress(message.into())
+    }
+
+    fn rollback_proof(
+        kind: frankenterm_core::tx_execution::RollbackProofKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::RollbackProof {
+            kind,
+            message: message.into(),
+        }
     }
 
     fn contract_lock(
@@ -56220,7 +56239,7 @@ impl TxCommandExecutionError {
         &self,
     ) -> Option<&frankenterm_core::tx_execution::TxContractStoreError> {
         match self {
-            Self::Execution(_) => None,
+            Self::Execution(_) | Self::InProgress(_) | Self::RollbackProof { .. } => None,
             Self::ContractLock { source, .. } | Self::ContractStore { source, .. } => Some(source),
         }
     }
@@ -56230,6 +56249,8 @@ impl std::fmt::Display for TxCommandExecutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Execution(message) => f.write_str(message),
+            Self::InProgress(message) => f.write_str(message),
+            Self::RollbackProof { message, .. } => f.write_str(message),
             Self::ContractLock { context, source } | Self::ContractStore { context, source } => {
                 write!(f, "{context}: {source}")
             }
@@ -57313,7 +57334,25 @@ fn execute_tx_rollback_with_executor<E: frankenterm_core::tx_execution::StepExec
                 source,
             )
         })?;
-    let rollback_result = engine.rollback_with_store(contract, &mut idem_store, now_ms);
+    let rollback_result = match engine.rollback_with_store(contract, &mut idem_store, now_ms) {
+        Err(
+            rollback_err @ frankenterm_core::tx_execution::TxExecutionError::RollbackProof {
+                kind,
+                ..
+            },
+        ) => {
+            return Err(TxCommandExecutionError::rollback_proof(
+                kind,
+                format!("rollback rejected before compensation dispatch: {rollback_err}"),
+            ));
+        }
+        Err(rollback_err @ frankenterm_core::tx_execution::TxExecutionError::InProgress(_)) => {
+            return Err(TxCommandExecutionError::in_progress(format!(
+                "rollback deferred before compensation dispatch: {rollback_err}"
+            )));
+        }
+        result => result,
+    };
     let save_result = frankenterm_core::tx_execution::save_tx_contract_atomic(
         contract_lock,
         authoritative_contract_path,
@@ -57933,6 +57972,23 @@ fn tx_command_error_hint(error: &TxCommandExecutionError) -> Option<String> {
             "Do not retry this transaction mutation until inspecting the workspace-global durable tx idempotency ledger and reconciling any external effects. The contract path is only a last-known display path after a namespace change and may now resolve to stale or foreign data."
                 .to_string(),
         ),
+        TxCommandExecutionError::RollbackProof {
+            kind: frankenterm_core::tx_execution::RollbackProofKind::Missing,
+            ..
+        } => Some(
+            "Rollback was rejected before compensation dispatch. Do not rerun the commit or rollback. Inspect and reconcile the contract receipts, external effects, and workspace `.ft/tx_ledgers` records first: missing durable proof does not establish that an external effect was absent. For future new transactions, execute commits through `ft tx run`, `ft robot tx run`, or MCP `wa.tx_run` so receipts and authoritative proofs are persisted together; do not fabricate receipts."
+                .to_string(),
+        ),
+        TxCommandExecutionError::RollbackProof {
+            kind: frankenterm_core::tx_execution::RollbackProofKind::Conflict,
+            ..
+        } => Some(
+            "Rollback was rejected before compensation dispatch because the receipt history conflicts with ambiguous or contradictory durable state. Do not blindly rerun the commit or rollback: inspect and reconcile the contract receipts with the workspace `.ft/tx_ledgers` records first, because an external effect may already have been dispatched."
+                .to_string(),
+        ),
+        TxCommandExecutionError::InProgress(_) => {
+            Some("Wait for the in-flight transaction mutation to finish, then retry.".to_string())
+        }
         TxCommandExecutionError::Execution(_) => None,
     }
 }
@@ -57940,6 +57996,15 @@ fn tx_command_error_hint(error: &TxCommandExecutionError) -> Option<String> {
 fn robot_tx_command_error_code(error: &TxCommandExecutionError) -> &'static str {
     match error {
         TxCommandExecutionError::Execution(_) => "robot.tx_execution_failed",
+        TxCommandExecutionError::InProgress(_) => "robot.tx_in_progress",
+        TxCommandExecutionError::RollbackProof {
+            kind: frankenterm_core::tx_execution::RollbackProofKind::Missing,
+            ..
+        } => "robot.tx_rollback_proof_missing",
+        TxCommandExecutionError::RollbackProof {
+            kind: frankenterm_core::tx_execution::RollbackProofKind::Conflict,
+            ..
+        } => "robot.tx_rollback_proof_conflict",
         TxCommandExecutionError::ContractLock { source, .. } => {
             robot_tx_error_code(tx_contract_lock_mission_error_code(source.kind()))
         }
@@ -57954,6 +58019,20 @@ fn mission_tx_command_error(error: TxCommandExecutionError) -> MissionCommandErr
         TxCommandExecutionError::Execution(_) => {
             (MISSION_EXIT_VALIDATION, "mission.tx.execution_failed")
         }
+        TxCommandExecutionError::InProgress(_) => {
+            (MISSION_EXIT_VALIDATION, "mission.tx.in_progress")
+        }
+        TxCommandExecutionError::RollbackProof {
+            kind: frankenterm_core::tx_execution::RollbackProofKind::Missing,
+            ..
+        } => (MISSION_EXIT_VALIDATION, "mission.tx.rollback_proof_missing"),
+        TxCommandExecutionError::RollbackProof {
+            kind: frankenterm_core::tx_execution::RollbackProofKind::Conflict,
+            ..
+        } => (
+            MISSION_EXIT_VALIDATION,
+            "mission.tx.rollback_proof_conflict",
+        ),
         TxCommandExecutionError::ContractLock { source, .. } => (
             if source.kind() == frankenterm_core::tx_execution::TxContractStoreErrorKind::InProgress
             {
@@ -58961,7 +59040,7 @@ async fn handle_tx_command(
                         error_code: "mission.tx.rollback_receipts_required",
                         message: err,
                         hint: Some(
-                            "Run `ft tx show --include-contract` and ensure the contract includes commit receipts for the steps that actually committed."
+                            "Run `ft tx show --include-contract` to inspect persisted commit receipts. Do not rerun the commit or rollback solely to repair missing receipts: durable state may represent an external effect that was already dispatched. Reconcile the contract with the workspace `.ft/tx_ledgers` records; do not fabricate receipts."
                                 .to_string(),
                         ),
                     },
@@ -69588,6 +69667,149 @@ reason = "overly conservative pending threshold"
         let mission_err = mission_tx_command_error(err);
         assert_eq!(mission_err.error_code, "mission.tx.lock_failed");
         assert_eq!(mission_err.exit_code, MISSION_EXIT_IO);
+    }
+
+    #[test]
+    fn tx_rollback_helper_classifies_missing_durable_commit_proof_before_compensation() {
+        let mut contract = sample_robot_tx_contract();
+        frankenterm_core::tx_execution::TxExecutionEngine::new(
+            RecordingStepExecutor::default(),
+            frankenterm_core::tx_execution::TxExecutionConfig::default(),
+        )
+        .execute(&mut contract, 8_383)
+        .expect("synthetic execution should produce receipt-only commit claims");
+        let original_contract = serde_json::to_value(&contract).expect("serialize forged contract");
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        let executor = RecordingStepExecutor::default();
+
+        let err = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut contract,
+            None,
+            9_393,
+        )
+        .expect_err("receipt-only commit claims must fail rollback proof validation");
+
+        assert!(matches!(
+            &err,
+            TxCommandExecutionError::RollbackProof {
+                kind: frankenterm_core::tx_execution::RollbackProofKind::Missing,
+                ..
+            }
+        ));
+        assert!(
+            executor.recorded_calls().is_empty(),
+            "proof rejection must happen before compensation dispatch"
+        );
+        assert_eq!(
+            serde_json::to_value(&contract).expect("serialize rejected contract"),
+            original_contract,
+            "proof rejection must not mutate the transaction contract"
+        );
+        assert_eq!(
+            robot_tx_command_error_code(&err),
+            "robot.tx_rollback_proof_missing"
+        );
+        assert!(
+            tx_command_error_hint(&err)
+                .expect("rollback proof failure should provide remediation")
+                .contains("Do not rerun the commit or rollback")
+        );
+        assert!(
+            tx_command_error_hint(&err)
+                .expect("rollback proof failure should provide remediation")
+                .contains(
+                    "missing durable proof does not establish that an external effect was absent"
+                )
+        );
+        let mission_err = mission_tx_command_error(err);
+        assert_eq!(mission_err.error_code, "mission.tx.rollback_proof_missing");
+        assert_eq!(mission_err.exit_code, MISSION_EXIT_VALIDATION);
+    }
+
+    #[test]
+    fn tx_rollback_helper_maps_real_durable_conflict_without_mutation() {
+        let mut contract = sample_robot_tx_contract();
+        let (_dir, contract_path) = persisted_robot_tx_contract(&contract);
+        let contract_lock = lock_robot_tx_contract_fixture(&contract_path);
+        execute_tx_run_with_executor(
+            RecordingStepExecutor::default(),
+            contract_lock.authoritative_path(),
+            Some(&contract_lock),
+            &mut contract,
+            frankenterm_core::plan::MissionKillSwitchLevel::Off,
+            false,
+            None,
+            false,
+            8_383,
+        )
+        .expect("setup execution should persist durable commit proof");
+        let receipt = contract
+            .receipts
+            .iter_mut()
+            .find(|receipt| {
+                receipt.get("phase").and_then(serde_json::Value::as_str) == Some("commit")
+                    && receipt.get("step_id").and_then(serde_json::Value::as_str)
+                        == Some("tx-step:1")
+            })
+            .expect("tx-step:1 commit receipt");
+        receipt["outcome"] = serde_json::json!("failed");
+        receipt["reason_code"] = serde_json::json!("forged_commit_failure");
+        receipt["error_code"] = serde_json::json!("FTX3999");
+        receipt["decision_path"] = serde_json::json!("forged_receipt_history");
+        frankenterm_core::tx_execution::save_tx_contract_atomic(
+            &contract_lock,
+            contract_lock.authoritative_path(),
+            &contract,
+        )
+        .expect("persist contradictory receipt fixture");
+        let original_contract =
+            serde_json::to_value(&contract).expect("serialize conflict fixture");
+        let original_bytes = std::fs::read(contract_lock.authoritative_path())
+            .expect("read contradictory receipt fixture");
+        let executor = RecordingStepExecutor::default();
+
+        let err = execute_tx_rollback_with_executor(
+            executor.clone(),
+            contract_lock.authoritative_path(),
+            &contract_lock,
+            &mut contract,
+            None,
+            9_393,
+        )
+        .expect_err("contradictory durable commit proof must fail rollback");
+
+        assert_eq!(
+            robot_tx_command_error_code(&err),
+            "robot.tx_rollback_proof_conflict"
+        );
+        assert!(matches!(
+            &err,
+            TxCommandExecutionError::RollbackProof {
+                kind: frankenterm_core::tx_execution::RollbackProofKind::Conflict,
+                ..
+            }
+        ));
+        assert!(executor.recorded_calls().is_empty());
+        assert_eq!(
+            serde_json::to_value(&contract).expect("serialize rejected conflict fixture"),
+            original_contract
+        );
+        assert_eq!(
+            std::fs::read(contract_lock.authoritative_path())
+                .expect("reread rejected conflict fixture"),
+            original_bytes
+        );
+        let hint = tx_command_error_hint(&err)
+            .expect("rollback proof conflict should provide reconciliation guidance");
+        assert!(hint.contains("Do not blindly rerun"));
+        assert!(hint.contains("external effect may already have been dispatched"));
+        let mission_err = mission_tx_command_error(err);
+        assert_eq!(mission_err.error_code, "mission.tx.rollback_proof_conflict");
+        assert_eq!(mission_err.exit_code, MISSION_EXIT_VALIDATION);
     }
 
     #[test]
