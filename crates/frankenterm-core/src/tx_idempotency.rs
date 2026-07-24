@@ -361,11 +361,21 @@ impl StepOutcome {
 
 /// Record of a single step execution within a tx instance.
 ///
-/// Records form a hash chain: each record includes the hash of the previous record,
-/// enabling tamper detection (consistent with `recorder_audit.rs`).
+/// Records form a hash chain: each record includes the domain-separated
+/// SHA-256 of the previous record (consistent with `recorder_audit.rs`).
 /// Appended records are stable except for the write-ahead path, which may
 /// upgrade `StepOutcome::Pending` to the terminal outcome and then re-hash the
 /// affected suffix.
+///
+/// Scope of the guarantee (ft-vtdk4): the chain is **unkeyed**, so it detects
+/// truncation, partial writes, reordering, and edits that do not recompute the
+/// chain — including the serde-roundtrip tip mutation `verify_chain` checks
+/// for. It is not evidence against an adversary who can write the spool, since
+/// that adversary can recompute every hash. Same-UID write access to the
+/// workspace `.ft` directory is outside the guarantee, exactly as it is for the
+/// contract store (see the residual-risk note on `save_tx_contract_atomic`).
+/// Claiming more would require an authenticated MAC or signature, which needs a
+/// key-management story this crate does not have.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepExecutionRecord {
     /// Monotonic ordinal within this tx ledger.
