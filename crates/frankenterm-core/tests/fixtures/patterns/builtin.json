@@ -91,7 +91,7 @@
   },
   {
     "name": "claude_compaction_negative",
-    "text": "Conversation compacted tokens to tokens",
+    "text": "Conversation compaction is disabled for this session",
     "expected_rule_ids": [],
     "negative_for": "claude_code.compaction"
   },

@@ -290,9 +290,34 @@ static AWS_SECRET_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Generic Bearer tokens in Authorization headers.
+///
+/// The value charset carries base64's `/`, `+`, and `=` for the same reason
+/// the generic key/token/secret patterns below do (see the ft-5o6u5 note):
+/// without them the match stops at the first `/` or `+` and the remainder of
+/// the credential is emitted in cleartext. `Bearer AbC+dEf…` previously did
+/// not match at all (only 3 chars precede the `+`, so `{20,}` could never be
+/// satisfied), leaking the whole token.
 static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:authorization["']?\s*[:=]\s*["']?bearer\s+|bearer\s+)[a-zA-Z0-9._-]{20,}"#)
-        .expect("Bearer token regex")
+    Regex::new(
+        r#"(?i)(?:authorization["']?\s*[:=]\s*["']?bearer\s+|bearer\s+)[a-zA-Z0-9._/+=-]{20,}"#,
+    )
+    .expect("Bearer token regex")
+});
+
+/// HTTP Basic credentials in Authorization headers.
+///
+/// `Authorization` was already a streaming anchor, but the only header regex
+/// was [`BEARER_TOKEN`], which requires the literal `bearer`. A routine
+/// `curl -v` transcript containing
+/// `Authorization: Basic dXNlcjpzdXBlcnNlY3JldA==` therefore flowed through
+/// completely unredacted — and base64-decodes straight back to `user:password`.
+///
+/// The `authorization` prefix is mandatory (unlike the bare-`bearer` arm
+/// above) because `basic` is an ordinary English word: an optional-prefix
+/// form would redact prose like `basic troubleshooting`.
+static HTTP_BASIC_AUTH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)authorization["']?\s*[:=]\s*["']?basic\s+[A-Za-z0-9+/]{8,}={0,2}"#)
+        .expect("HTTP basic auth regex")
 });
 
 // ft-5o6u5: generic key/token/secret value charsets must accept base64
@@ -303,28 +328,54 @@ static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
 // surfaces. The charset still excludes whitespace and quote characters so
 // the match terminates at the value boundary.
 
+// Two shape fixes apply to all four generic keyed patterns below.
+//
+// 1. A closing quote may sit between the key name and the delimiter. Every
+//    one of these regexes went straight from the keyword to `\s*[=:]`, so a
+//    JSON body — `{"api_key": "…"}`, `{"token": "…"}` — never matched, while
+//    the bare `api_key=…` form always did. JSON is the dominant shape in a
+//    pane (curl output, API responses, config dumps), so this was the widest
+//    of the gaps. The value side already tolerated `['"]?`; the key side now
+//    does too.
+//
+// 2. The keyword guard on `token`/`secret` has two arms. The first,
+//    `(?:^|[^A-Za-z])`, keeps the keyword from matching inside a longer
+//    all-lowercase word. (Under a global `(?i)` the original `[^a-z]` already
+//    meant `[^A-Za-z]`, because regex-syntax case-folds a class before
+//    negating it; the class is now written out so the intent survives the
+//    flag change.) That guard on its own rejected every camelCase key name:
+//    in `clientSecret` or `accessToken` the character before the keyword is a
+//    letter, so nothing matched and the credential was emitted byte-identical
+//    — snake_case always worked, which is why the gap stayed invisible in the
+//    corpus. Matching a `[a-z0-9]` → uppercase-initial keyword transition
+//    covers the camelCase form without loosening the lowercase-word guard.
+
 /// Generic API keys with common prefixes.
 static GENERIC_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:api[_-]?key|apikey)\s*[=:]\s*['"]?([a-zA-Z0-9_/+=-]{16,})['"]?"#)
+    Regex::new(r#"(?i)(?:api[_-]?key|apikey)['"]?\s*[=:]\s*['"]?([a-zA-Z0-9_/+=-]{16,})['"]?"#)
         .expect("Generic API key regex")
 });
 
 /// Generic token assignments.
 static GENERIC_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:^|[^a-z])token\s*[=:]\s*['"]?([a-zA-Z0-9._/+=-]{16,})['"]?"#)
-        .expect("Generic token regex")
+    Regex::new(
+        r#"(?:(?:^|[^A-Za-z])(?i:token)|[a-z0-9](?:Token|TOKEN))['"]?\s*[=:]\s*['"]?([a-zA-Z0-9._/+=-]{16,})['"]?"#,
+    )
+    .expect("Generic token regex")
 });
 
 /// Generic password assignments (password=..., password: ...).
 static GENERIC_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)password\s*[=:]\s*(?:'[^']{4,}'|"[^"]{4,}"|[^\s'"]{4,})"#)
+    Regex::new(r#"(?i)password['"]?\s*[=:]\s*(?:'[^']{4,}'|"[^"]{4,}"|[^\s'"]{4,})"#)
         .expect("Generic password regex")
 });
 
 /// Generic secret assignments.
 static GENERIC_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:^|[^a-z])secret\s*[=:]\s*['"]?([a-zA-Z0-9_/+=-]{8,})['"]?"#)
-        .expect("Generic secret regex")
+    Regex::new(
+        r#"(?:(?:^|[^A-Za-z])(?i:secret)|[a-z0-9](?:Secret|SECRET))['"]?\s*[=:]\s*['"]?([a-zA-Z0-9_/+=-]{8,})['"]?"#,
+    )
+    .expect("Generic secret regex")
 });
 
 /// Device codes (OAuth device flow) - typically 8+ alphanumeric chars displayed to user.
@@ -449,8 +500,19 @@ static GITLAB_TOKEN: LazyLock<Regex> =
 /// Twilio account SIDs: `AC` + 32 hex chars (case-insensitive).
 /// SIDs are not strictly secret but pair with auth tokens; redact for
 /// audit-chain hygiene.
+///
+/// Anchored at a leading word boundary, for the same false-positive reason
+/// [`STRIPE_KEY`] carries one: unanchored, a bare uppercase-hex digest that
+/// happens to contain `AC` in its first 30 positions had 34 of its 64
+/// characters overwritten, corrupting persisted history.
+///
+/// No *trailing* `\b`: a real SID is exactly `AC` + 32 hex, but operators
+/// paste over-long hex runs, and requiring an exact-32 boundary made those
+/// match nothing at all. The keyed-value leak that motivated looking here is
+/// fixed by sequencing instead — see the ordering note on this entry in
+/// [`SECRET_PATTERNS`].
 static TWILIO_ACCOUNT_SID: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"AC[a-fA-F0-9]{32}").expect("Twilio account SID regex"));
+    LazyLock::new(|| Regex::new(r"\bAC[a-fA-F0-9]{32}").expect("Twilio account SID regex"));
 
 /// SendGrid API keys: `SG.<22 chars>.<43 chars>`. Distinctive 3-part
 /// format with `SG.` prefix.
@@ -543,16 +605,16 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
         regex: &BEARER_TOKEN,
     },
     SecretPattern {
+        name: "http_basic_auth",
+        regex: &HTTP_BASIC_AUTH,
+    },
+    SecretPattern {
         name: "slack_token",
         regex: &SLACK_TOKEN,
     },
     SecretPattern {
         name: "stripe_key",
         regex: &STRIPE_KEY,
-    },
-    SecretPattern {
-        name: "twilio_account_sid",
-        regex: &TWILIO_ACCOUNT_SID,
     },
     SecretPattern {
         name: "sendgrid_key",
@@ -615,6 +677,19 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "generic_secret",
         regex: &GENERIC_SECRET,
+    },
+    // Runs AFTER the generic keyed patterns, unlike every other provider
+    // regex. `SECRET_PATTERNS` is applied as a sequence of `replace_all`
+    // passes, and this one matches a bare `AC`+hex run with no key name to
+    // anchor it. Sequenced early, `api_key=AC<48 hex>` had its first 34
+    // characters rewritten to `[REDACTED]`; `generic_api_key` then saw a value
+    // beginning with `[`, which is outside its value charset, so it did not
+    // match and the trailing 16 characters of the real key leaked. Running
+    // last lets the keyed patterns claim a keyed value whole, while a bare SID
+    // — which no generic pattern matches — is still caught here.
+    SecretPattern {
+        name: "twilio_account_sid",
+        regex: &TWILIO_ACCOUNT_SID,
     },
 ];
 
@@ -1220,6 +1295,21 @@ impl StreamingRedactor {
         let suffix_lower = suffix.to_ascii_lowercase();
         let mut earliest = current_boundary;
 
+        // NOTE (ft-aznq6): the two "partial thing at the end" rules below are
+        // re-applied at every boundary `stable_emit_boundary` proposes, not
+        // just at the true end of `pending`. That makes the boundary walk
+        // backwards one byte per fixed-point iteration through a trailing run
+        // of anchor-initial characters, each iteration re-scanning the whole
+        // tail window — quadratic, and on a long run it does not finish.
+        //
+        // Gating them to `current_boundary == self.pending.len()` fixes the
+        // cost but is NOT correct on its own: the repeated walk-back is what
+        // keeps a key name like `auth_` `token=…` together across a chunk
+        // split, and dropping it breaks the streaming-equals-batch equivalence
+        // that `streaming_redactor_never_leaks_any_corpus_positive_across_splits`
+        // pins. A correct fix has to compute the maximal retainable trailing
+        // run in one pass instead of iterating a one-byte rule. Tracked in
+        // ft-aznq6 with the full diagnosis.
         for anchor in STREAMING_SECRET_ANCHORS {
             let anchor_lower = anchor.to_ascii_lowercase();
             if let Some(offset) = suffix_lower.rfind(anchor_lower.as_str()) {

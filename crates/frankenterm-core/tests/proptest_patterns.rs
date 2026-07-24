@@ -1758,6 +1758,7 @@ proptest! {
             bloom_rejects: br,
             candidate_rules_evaluated: cre,
             regex_evaluations: re,
+            regex_scan_errors: 0,
             top_rule_hits: SpaceSavingSnapshot::default(),
         };
         let json = serde_json::to_string(&snap).unwrap();

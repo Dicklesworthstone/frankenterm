@@ -102,6 +102,7 @@ fn snapshot_serde_roundtrip() {
         bloom_rejects: 70,
         candidate_rules_evaluated: 20,
         regex_evaluations: 18,
+        regex_scan_errors: 0,
         top_rule_hits: SpaceSavingSnapshot::default(),
     };
     let json = serde_json::to_string(&snap).expect("serialize");
@@ -167,6 +168,7 @@ proptest! {
             bloom_rejects: bloom_rej,
             candidate_rules_evaluated: candidates,
             regex_evaluations: regex_evals,
+            regex_scan_errors: 0,
             top_rule_hits: SpaceSavingSnapshot::default(),
         };
 
@@ -196,6 +198,7 @@ proptest! {
             bloom_rejects: bloom_rejects.min(bloom_checks),
             candidate_rules_evaluated,
             regex_evaluations: regex_evaluations.min(candidate_rules_evaluated),
+            regex_scan_errors: 0,
             top_rule_hits: SpaceSavingSnapshot::default(),
         };
 

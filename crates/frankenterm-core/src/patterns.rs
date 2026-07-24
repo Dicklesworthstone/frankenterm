@@ -78,6 +78,15 @@ pub struct PatternTelemetry {
     candidate_rules_evaluated: AtomicU64,
     /// Total regex evaluations performed
     regex_evaluations: AtomicU64,
+    /// Total rule scans abandoned because the regex engine returned an error
+    /// (in practice `BacktrackLimitExceeded`) instead of a match.
+    ///
+    /// `fancy_regex`'s `captures_iter` stops on the first error and reports
+    /// end-of-iteration thereafter, so one error discards **every remaining
+    /// match of that rule in that segment**. Without this counter the outcome
+    /// is indistinguishable from "the rule did not match" — the silent
+    /// state-loss class tracked by ft-luav8 / ft-skec1 / ft-tpdl5 / ft-wzk10.
+    regex_scan_errors: AtomicU64,
     /// Bounded top-K sketch of matched rule IDs for hotspot diagnostics.
     top_rule_hits: Mutex<SpaceSavingTopK<String>>,
 }
@@ -98,8 +107,20 @@ impl PatternTelemetry {
             bloom_rejects: AtomicU64::new(0),
             candidate_rules_evaluated: AtomicU64::new(0),
             regex_evaluations: AtomicU64::new(0),
+            regex_scan_errors: AtomicU64::new(0),
             top_rule_hits: Mutex::new(SpaceSavingTopK::new(rule_hit_capacity)),
         }
+    }
+
+    /// Record that a rule's regex scan ended in an engine error, discarding
+    /// any matches it had not yet yielded. See [`Self::regex_scan_errors`].
+    fn record_regex_scan_error(&self, rule_id: &str, error: &fancy_regex::Error) {
+        self.regex_scan_errors.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            rule_id,
+            %error,
+            "pattern regex scan aborted; remaining matches for this rule in this segment are lost"
+        );
     }
 
     fn top_rule_hits_guard(&self) -> MutexGuard<'_, SpaceSavingTopK<String>> {
@@ -145,6 +166,7 @@ impl PatternTelemetry {
             bloom_rejects: self.bloom_rejects.load(Ordering::Relaxed),
             candidate_rules_evaluated: self.candidate_rules_evaluated.load(Ordering::Relaxed),
             regex_evaluations: self.regex_evaluations.load(Ordering::Relaxed),
+            regex_scan_errors: self.regex_scan_errors.load(Ordering::Relaxed),
             top_rule_hits,
         }
     }
@@ -175,6 +197,10 @@ pub struct PatternTelemetrySnapshot {
     pub bloom_rejects: u64,
     pub candidate_rules_evaluated: u64,
     pub regex_evaluations: u64,
+    /// Rule scans abandoned mid-stream by a regex engine error. Any non-zero
+    /// steady-state rate means detections are being dropped silently.
+    #[serde(default)]
+    pub regex_scan_errors: u64,
     #[serde(default)]
     pub top_rule_hits: SpaceSavingSnapshot<String>,
 }
@@ -4346,8 +4372,10 @@ impl PatternEngine {
             return Vec::new();
         };
 
+        // No cross-segment tail on the context-free entry point, so there is
+        // no overlap window to prefer an anchor outside of.
         let (mut indices, matched_anchor_by_rule) =
-            Self::collect_candidate_rules(index, text, matcher);
+            Self::collect_candidate_rules(index, text, matcher, 0);
 
         #[cfg(test)]
         {
@@ -4378,8 +4406,12 @@ impl PatternEngine {
                     .regex_evaluations
                     .fetch_add(1, Ordering::Relaxed);
                 for capture_result in regex.captures_iter(text) {
-                    let Ok(captures) = capture_result else {
-                        continue;
+                    let captures = match capture_result {
+                        Ok(captures) => captures,
+                        Err(error) => {
+                            self.telemetry.record_regex_scan_error(&rule.id, &error);
+                            break;
+                        }
                     };
 
                     let extracted = Self::extract_captures(compiled, &captures);
@@ -4497,12 +4529,12 @@ impl PatternEngine {
             });
 
         let (mut indices, matched_anchor_by_rule) = if let Some(shard) = agent_shard {
-            Self::collect_candidate_rules_sharded(index, &input_text, shard)
+            Self::collect_candidate_rules_sharded(index, &input_text, shard, overlap_len)
         } else {
             let Some(matcher) = index.anchor_matcher.as_ref() else {
                 return Vec::new();
             };
-            Self::collect_candidate_rules(index, &input_text, matcher)
+            Self::collect_candidate_rules(index, &input_text, matcher, overlap_len)
         };
 
         if indices.is_empty() {
@@ -4536,8 +4568,12 @@ impl PatternEngine {
                     .fetch_add(1, Ordering::Relaxed);
 
                 for capture_result in regex.captures_iter(&input_text) {
-                    let Ok(captures) = capture_result else {
-                        continue;
+                    let captures = match capture_result {
+                        Ok(captures) => captures,
+                        Err(error) => {
+                            self.telemetry.record_regex_scan_error(&rule.id, &error);
+                            break;
+                        }
                     };
 
                     let span = captures
@@ -4819,8 +4855,12 @@ impl PatternEngine {
                     .fetch_add(1, Ordering::Relaxed);
 
                 for capture_result in regex.captures_iter(text) {
-                    let Ok(captures) = capture_result else {
-                        continue;
+                    let captures = match capture_result {
+                        Ok(captures) => captures,
+                        Err(error) => {
+                            self.telemetry.record_regex_scan_error(&rule.id, &error);
+                            break;
+                        }
                     };
                     any_capture = true;
 
@@ -4956,10 +4996,41 @@ impl PatternEngine {
         (detections, traces)
     }
 
+    /// Record whether `candidate` should replace the anchor occurrence already
+    /// stored for a rule.
+    ///
+    /// Only one occurrence per rule is retained, and for an anchor-only rule
+    /// (`regex: None`) that single span is what the caller tests against the
+    /// cross-segment overlap window. Keeping the *first* occurrence
+    /// unconditionally meant a rule whose earliest hit lands in the
+    /// carried-over tail was skipped outright — including a genuinely new
+    /// occurrence later in the same input. A rate limit that fires, ages past
+    /// the dedup TTL, and then fires again produced **zero** detections the
+    /// second time.
+    ///
+    /// So an occurrence that ends inside the overlap yields to one that does
+    /// not. Regex-bearing rules were never affected (they iterate every match
+    /// and filter per match), and the trace entry point already walked all
+    /// anchors — this brings the plain entry point in line with both.
+    ///
+    /// With `overlap_len == 0` no stored span can satisfy `prev_end <= 0`, so
+    /// the first-wins behavior is preserved exactly for non-overlap callers.
+    fn anchor_supersedes_recorded(
+        recorded: Option<AnchorMatchRef>,
+        candidate_end: usize,
+        overlap_len: usize,
+    ) -> bool {
+        match recorded {
+            None => true,
+            Some((_, (_, prev_end))) => prev_end <= overlap_len && candidate_end > overlap_len,
+        }
+    }
+
     fn collect_candidate_rules(
         index: &EngineIndex,
         text: &str,
         matcher: &AhoCorasick,
+        overlap_len: usize,
     ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
         let mut candidate_rules = Vec::new();
         let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
@@ -4985,10 +5056,14 @@ impl PatternEngine {
 
             let anchor_match = (anchor_idx, (matched.start(), matched.end()));
             for &idx in rule_indices {
-                if matched_anchor_by_rule[idx].is_none() {
-                    candidate_rules.push(idx);
-                    matched_anchor_by_rule[idx] = Some(anchor_match);
+                let recorded = matched_anchor_by_rule[idx];
+                if !Self::anchor_supersedes_recorded(recorded, matched.end(), overlap_len) {
+                    continue;
                 }
+                if recorded.is_none() {
+                    candidate_rules.push(idx);
+                }
+                matched_anchor_by_rule[idx] = Some(anchor_match);
             }
         }
 
@@ -5008,6 +5083,7 @@ impl PatternEngine {
         index: &EngineIndex,
         text: &str,
         shard: &AgentShard,
+        overlap_len: usize,
     ) -> (Vec<usize>, Vec<Option<AnchorMatchRef>>) {
         let mut candidate_rules = Vec::new();
         let mut matched_anchor_by_rule = vec![None; index.compiled_rules.len()];
@@ -5020,10 +5096,14 @@ impl PatternEngine {
 
             let anchor_match = (global_anchor_idx, (matched.start(), matched.end()));
             for &idx in rule_indices {
-                if matched_anchor_by_rule[idx].is_none() {
-                    candidate_rules.push(idx);
-                    matched_anchor_by_rule[idx] = Some(anchor_match);
+                let recorded = matched_anchor_by_rule[idx];
+                if !Self::anchor_supersedes_recorded(recorded, matched.end(), overlap_len) {
+                    continue;
                 }
+                if recorded.is_none() {
+                    candidate_rules.push(idx);
+                }
+                matched_anchor_by_rule[idx] = Some(anchor_match);
             }
         }
 
@@ -9733,6 +9813,59 @@ description = "Project lint warning"
         assert!(!reemitted, "should not re-emit from overlap/dedup");
     }
 
+    /// A rule whose earliest anchor hit lands in the carried-over overlap must
+    /// still fire on a genuinely new occurrence later in the same input.
+    ///
+    /// `collect_candidate_rules` keeps one anchor span per rule, and the
+    /// anchor-only branch tests that single span against the overlap window.
+    /// Recording the *first* hit unconditionally made the second occurrence
+    /// invisible — the whole rule was skipped. Concretely: an agent hits its
+    /// usage limit, the detection ages past the dedup TTL, the agent hits the
+    /// limit again, and the second event is never emitted. Regex-bearing rules
+    /// were never affected because they filter per match.
+    #[test]
+    fn anchor_only_rule_fires_on_new_occurrence_after_one_in_overlap() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.usage.reached",
+            "LIMIT_REACHED",
+            None,
+        )]);
+
+        // The state after a prior scan that already reported this anchor,
+        // with the dedup entry aged out by TTL. Seeded directly because
+        // `clear_seen` also drops the tail buffer, which would remove the
+        // overlap window this regression is about.
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "LIMIT_REACHED\n".to_string();
+
+        let detections = engine.detect_with_context("LIMIT_REACHED\n", &mut ctx);
+        assert!(
+            detections.iter().any(|d| d.rule_id == "codex.usage.reached"),
+            "a genuinely new occurrence must fire even though an earlier hit \
+             sits inside the overlap window"
+        );
+    }
+
+    /// The complement: when *every* occurrence is inside the overlap there is
+    /// nothing new, and the rule must stay silent.
+    #[test]
+    fn anchor_only_rule_stays_silent_when_all_occurrences_are_in_overlap() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.usage.reached",
+            "LIMIT_REACHED",
+            None,
+        )]);
+
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "LIMIT_REACHED\n".to_string();
+
+        let detections = engine.detect_with_context("nothing interesting here\n", &mut ctx);
+        assert!(
+            !detections.iter().any(|d| d.rule_id == "codex.usage.reached"),
+            "an occurrence carried only by the overlap must not re-fire"
+        );
+    }
+
     #[test]
     fn tail_buffer_utf8_trim_respects_byte_cap() {
         let mut text = None;
@@ -10694,7 +10827,8 @@ rules:
         ];
 
         for (text, should_match) in corpus {
-            let (candidate_rules, _) = PatternEngine::collect_candidate_rules(index, text, matcher);
+            let (candidate_rules, _) =
+                PatternEngine::collect_candidate_rules(index, text, matcher, 0);
             assert_eq!(
                 !candidate_rules.is_empty(),
                 should_match,
@@ -10757,7 +10891,7 @@ rules:
         label: &str,
     ) {
         let (mphf_indices, mphf_anchors) =
-            PatternEngine::collect_candidate_rules(index, text, matcher);
+            PatternEngine::collect_candidate_rules(index, text, matcher, 0);
         let (oracle_indices, oracle_anchors) =
             collect_candidate_rules_hashmap_oracle(index, text, matcher);
         assert_eq!(
@@ -11116,6 +11250,7 @@ rules:
             bloom_rejects: 50,
             candidate_rules_evaluated: 45,
             regex_evaluations: 40,
+            regex_scan_errors: 0,
             top_rule_hits: SpaceSavingSnapshot::default(),
         };
         let json = serde_json::to_string(&snap).unwrap();

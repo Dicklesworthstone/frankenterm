@@ -994,6 +994,50 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "bearer abcdefghij1234567890abcdefghij",
             "bearer_token",
         ),
+        // Base64 bearer values: before the charset carried `+`, `/` and `=`,
+        // this input could not satisfy `{20,}` at all (only `AbC` precedes
+        // the first `+`), so the whole credential was emitted in cleartext.
+        pos(
+            "bearer_base64_value",
+            "bearer",
+            "base64 body with + / = padding",
+            "Authorization: Bearer AbC+dEfGhIjKlMnOpQr/StUvWxYz0123456789==",
+            "Bearer AbC+dEfGhIjKlMnOpQr/StUvWxYz0123456789==",
+            "bearer_token",
+        ),
+        // -----------------------------------------------------
+        // HTTP Basic
+        // -----------------------------------------------------
+        pos(
+            "basic_auth_header",
+            "basic",
+            "Authorization: Basic <base64> from curl -v output",
+            "> Authorization: Basic dXNlcjpzdXBlcnNlY3JldA==",
+            "Authorization: Basic dXNlcjpzdXBlcnNlY3JldA==",
+            "http_basic_auth",
+        ),
+        pos(
+            "basic_auth_lowercase",
+            "basic",
+            "case-insensitive header and scheme",
+            "authorization: basic YWRtaW46aHVudGVyMg==",
+            "authorization: basic YWRtaW46aHVudGVyMg==",
+            "http_basic_auth",
+        ),
+        pos(
+            "basic_auth_quoted_config",
+            "basic",
+            "quoted header value in a config/JSON body",
+            r#"{"Authorization": "Basic Zm9vOmJhcmJhemJhcXV1eA=="}"#,
+            r#"Authorization": "Basic Zm9vOmJhcmJhemJhcXV1eA=="#,
+            "http_basic_auth",
+        ),
+        neg(
+            "basic_auth_prose",
+            "negative",
+            "'basic' as an ordinary English word must not redact prose",
+            "See the docs for basic troubleshooting of authorization failures.",
+        ),
         // -----------------------------------------------------
         // Slack
         // -----------------------------------------------------
@@ -1434,6 +1478,35 @@ pub fn synthesized_corpus() -> Vec<RedactorTestVector> {
             "client_secret=AAAA/BBBB+CCCC=DDDD12",
             "AAAA/BBBB+CCCC=DDDD12",
             "generic_secret",
+        ),
+        // camelCase + JSON-quoted key shapes. Both were byte-identical
+        // passthroughs before: the keyword guard rejected a preceding letter
+        // (`clientSecret`), and the key side did not tolerate a closing quote
+        // before the delimiter (`"secret": …`). snake_case with a bare `=`
+        // always worked, which is why the corpus never caught it.
+        pos(
+            "generic_secret_camel_case_json",
+            "generic",
+            "camelCase JSON key — clientSecret",
+            r#"{"clientSecret":"abcd1234EFGH5678"}"#,
+            "abcd1234EFGH5678",
+            "generic_secret",
+        ),
+        pos(
+            "generic_token_camel_case_json",
+            "generic",
+            "camelCase JSON key — accessToken",
+            r#"{"accessToken": "0123456789abcdefghij"}"#,
+            "0123456789abcdefghij",
+            "generic_token",
+        ),
+        pos(
+            "generic_api_key_json_quoted",
+            "generic",
+            "JSON-quoted api_key with a closing quote before the colon",
+            r#"{"api_key": "AAAABBBBCCCCDDDD1234"}"#,
+            "AAAABBBBCCCCDDDD1234",
+            "generic_api_key",
         ),
         // -----------------------------------------------------
         // Cross-cutting negatives — lookalikes that must NOT
