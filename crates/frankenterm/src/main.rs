@@ -69672,8 +69672,14 @@ reason = "overly conservative pending threshold"
     #[test]
     fn tx_rollback_helper_classifies_missing_durable_commit_proof_before_compensation() {
         let mut contract = sample_robot_tx_contract();
+        // ft-3lqyu / ft-0rlfq.8: the storeless `execute` entrypoint is
+        // restricted to sealed non-effectful executors, so the receipt-only
+        // commit claims this fixture forges are built with the synthetic
+        // executor. It produces identical inputs to `RecordingStepExecutor`
+        // (both delegate to the same `plan` builders); only the call
+        // recording — unused here — differs.
         frankenterm_core::tx_execution::TxExecutionEngine::new(
-            RecordingStepExecutor::default(),
+            frankenterm_core::tx_execution::SyntheticStepExecutor,
             frankenterm_core::tx_execution::TxExecutionConfig::default(),
         )
         .execute(&mut contract, 8_383)

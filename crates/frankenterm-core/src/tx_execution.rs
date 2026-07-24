@@ -1868,8 +1868,94 @@ pub trait StepExecutor {
     ) -> Vec<TxCompensationStepInput>;
 }
 
+mod effect_seal {
+    /// Sealed supertrait of [`super::NonEffectfulStepExecutor`]. It lives in a
+    /// private module so the set of executors that may dispatch through the
+    /// storeless engine entrypoints is enumerated in this file and nowhere
+    /// else — no downstream crate can widen it.
+    pub trait NonEffectful {}
+}
+
+/// Witness that a [`StepExecutor`] dispatches **no** external side effects:
+/// no pane writes, no lock acquisition, no storage mutation, no workflow runs.
+///
+/// Only such an executor may use the storeless
+/// [`TxExecutionEngine::execute`] / [`TxExecutionEngine::rollback`]
+/// entrypoints. Those run without a durable idempotency spool, and therefore
+/// without a write-ahead `Pending` record, per-key/execution locks, durable
+/// replay proof, or crash reconciliation. Pairing a *real* effect executor
+/// with them would dispatch external effects outside the exactly-once
+/// boundary that `*_with_store` enforces (ft-3lqyu / ft-0rlfq.8).
+///
+/// The trait is sealed via the private [`effect_seal::NonEffectful`]
+/// supertrait, so `frankenterm-core` is the only crate that can classify an
+/// executor as non-effectful. [`PaneStepExecutor`] deliberately does **not**
+/// implement it; real dispatch must go through
+/// [`TxExecutionEngine::execute_with_store`],
+/// [`TxExecutionEngine::rollback_with_store`], or
+/// [`TxExecutionEngine::resume`], each of which rejects a non-durable spool.
+pub trait NonEffectfulStepExecutor: StepExecutor + effect_seal::NonEffectful {}
+
+impl<E> NonEffectfulStepExecutor for E where E: StepExecutor + effect_seal::NonEffectful {}
+
+/// Compile-time canary for the effect seal. Accepts only executors that
+/// satisfy [`NonEffectfulStepExecutor`].
+///
+/// # Examples
+///
+/// Accepts the synthetic executor:
+///
+/// ```
+/// use frankenterm_core::tx_execution::{assert_non_effectful_executor, SyntheticStepExecutor};
+///
+/// assert_non_effectful_executor(&SyntheticStepExecutor);
+/// ```
+///
+/// Rejects an out-of-crate executor, however it is implemented — the seal is
+/// what stops a downstream crate from declaring its own effectful executor
+/// safe for the storeless entrypoints:
+///
+/// ```compile_fail
+/// use frankenterm_core::plan::{
+///     MissionTxContract, TxCommitReport, TxCommitStepInput, TxCompensationStepInput,
+///     TxPrepareGateInput,
+/// };
+/// use frankenterm_core::tx_execution::{assert_non_effectful_executor, StepExecutor};
+///
+/// struct ForeignExecutor;
+///
+/// impl StepExecutor for ForeignExecutor {
+///     fn evaluate_gates(&self, _c: &MissionTxContract, _n: i64) -> Vec<TxPrepareGateInput> {
+///         Vec::new()
+///     }
+///     fn execute_steps(
+///         &self,
+///         _c: &MissionTxContract,
+///         _f: Option<&str>,
+///         _n: i64,
+///     ) -> Vec<TxCommitStepInput> {
+///         Vec::new()
+///     }
+///     fn execute_compensations(
+///         &self,
+///         _c: &MissionTxContract,
+///         _r: &TxCommitReport,
+///         _f: Option<&str>,
+///         _n: i64,
+///     ) -> Vec<TxCompensationStepInput> {
+///         Vec::new()
+///     }
+/// }
+///
+/// assert_non_effectful_executor(&ForeignExecutor);
+/// ```
+#[inline]
+pub fn assert_non_effectful_executor<E: NonEffectfulStepExecutor + ?Sized>(_executor: &E) {}
+
 /// Synthetic step executor that produces deterministic results for testing.
 pub struct SyntheticStepExecutor;
+
+impl effect_seal::NonEffectful for SyntheticStepExecutor {}
 
 impl StepExecutor for SyntheticStepExecutor {
     fn evaluate_gates(
@@ -1900,9 +1986,18 @@ impl StepExecutor for SyntheticStepExecutor {
     }
 }
 
-/// Step executor that wires the prepare phase to the real policy engine,
-/// approval store, and target-state providers while keeping deterministic
-/// commit/compensation behavior for tx execution scaffolding.
+/// Prepare-phase gate evaluator wired to the real policy engine, approval
+/// store, and target-state providers.
+///
+/// This is deliberately **not** a [`StepExecutor`] (ft-0rlfq.8). It used to
+/// implement the full trait, with `execute_steps` / `execute_compensations`
+/// synthesizing *successful* commit and compensation inputs without
+/// dispatching anything. That combination is a false-success footgun: it
+/// performs real prepare gates, so it reads as the production executor, but
+/// any engine driven by it mints receipts for effects that never happened.
+/// Restricting it to gate evaluation removes the footgun at the type level —
+/// the only consumer is [`PaneStepExecutor`], which delegates `evaluate_gates`
+/// here and dispatches commit/compensation against real panes itself.
 pub struct PolicyPrepareStepExecutor<P, A, T> {
     policy: P,
     approvals: A,
@@ -1927,13 +2022,18 @@ impl<P, A, T> PolicyPrepareStepExecutor<P, A, T> {
     }
 }
 
-impl<P, A, T> StepExecutor for PolicyPrepareStepExecutor<P, A, T>
+impl<P, A, T> PolicyPrepareStepExecutor<P, A, T>
 where
     P: TxPreparePolicyAuthorizer,
     A: TxPrepareApprovalChecker,
     T: TxPrepareTargetLookup,
 {
-    fn evaluate_gates(&self, contract: &MissionTxContract, now_ms: i64) -> Vec<TxPrepareGateInput> {
+    /// Evaluate the real prepare-phase gates for every step in `contract`.
+    pub fn evaluate_gates(
+        &self,
+        contract: &MissionTxContract,
+        now_ms: i64,
+    ) -> Vec<TxPrepareGateInput> {
         crate::plan::mission_tx_prepare_gate_inputs(
             contract,
             &self.policy,
@@ -1942,25 +2042,6 @@ where
             &self.prepare_context,
             now_ms,
         )
-    }
-
-    fn execute_steps(
-        &self,
-        contract: &MissionTxContract,
-        fail_step: Option<&str>,
-        now_ms: i64,
-    ) -> Vec<TxCommitStepInput> {
-        crate::plan::mission_tx_commit_step_inputs(contract, fail_step, now_ms)
-    }
-
-    fn execute_compensations(
-        &self,
-        _contract: &MissionTxContract,
-        commit_report: &TxCommitReport,
-        fail_for_step: Option<&str>,
-        now_ms: i64,
-    ) -> Vec<TxCompensationStepInput> {
-        crate::plan::mission_tx_compensation_inputs(commit_report, fail_for_step, now_ms)
     }
 }
 
@@ -3204,18 +3285,22 @@ struct TxLedgerRecordingContext<'a> {
     now_ms: i64,
 }
 
-impl<E: StepExecutor> TxExecutionEngine<E> {
-    /// Create a new execution engine.
-    #[must_use]
-    pub fn new(executor: E, config: TxExecutionConfig) -> Self {
-        Self {
-            executor,
-            config,
-            event_seq: std::cell::Cell::new(0),
-        }
-    }
-
-    /// Execute the full tx lifecycle on the given contract.
+/// Storeless entrypoints — simulation only.
+///
+/// These run the full lifecycle **without** a durable idempotency spool: no
+/// write-ahead `Pending` record, no per-key or execution locks, no durable
+/// replay proof, and no crash reconciliation. That is sound only for an
+/// executor that dispatches nothing externally, so the bound is
+/// [`NonEffectfulStepExecutor`] rather than [`StepExecutor`]
+/// (ft-3lqyu / ft-0rlfq.8). Effectful executors — [`PaneStepExecutor`] above
+/// all — must use [`TxExecutionEngine::execute_with_store`],
+/// [`TxExecutionEngine::rollback_with_store`], or
+/// [`TxExecutionEngine::resume`].
+impl<E: NonEffectfulStepExecutor> TxExecutionEngine<E> {
+    /// Simulate the full tx lifecycle on the given contract.
+    ///
+    /// Receipts produced here prove contract/lifecycle bookkeeping only; they
+    /// are not evidence that any external effect occurred.
     ///
     /// # Errors
     ///
@@ -3226,6 +3311,36 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         now_ms: i64,
     ) -> Result<TxExecutionResult, TxExecutionError> {
         self.execute_inner(contract, now_ms, None)
+    }
+
+    /// Simulate an explicit rollback of the given contract.
+    ///
+    /// The contract is mutated with compensation receipts and its terminal
+    /// lifecycle/outcome before this method returns, but no compensation
+    /// effect is dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if committed work cannot be proven from receipts, the
+    /// contract is already terminal, or compensation/reporting fails.
+    pub fn rollback(
+        &self,
+        contract: &mut MissionTxContract,
+        now_ms: i64,
+    ) -> Result<TxRollbackExecutionResult, TxExecutionError> {
+        self.rollback_inner(contract, now_ms, None)
+    }
+}
+
+impl<E: StepExecutor> TxExecutionEngine<E> {
+    /// Create a new execution engine.
+    #[must_use]
+    pub fn new(executor: E, config: TxExecutionConfig) -> Self {
+        Self {
+            executor,
+            config,
+            event_seq: std::cell::Cell::new(0),
+        }
     }
 
     /// Execute the full tx lifecycle while consulting and updating a cross-instance
@@ -3248,23 +3363,6 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             ));
         }
         self.execute_inner(contract, now_ms, Some(store))
-    }
-
-    /// Execute an explicit rollback using the configured real step executor.
-    ///
-    /// The authoritative contract is mutated with compensation receipts and
-    /// its terminal lifecycle/outcome before this method returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if committed work cannot be proven from receipts, the
-    /// contract is already terminal, or compensation/reporting fails.
-    pub fn rollback(
-        &self,
-        contract: &mut MissionTxContract,
-        now_ms: i64,
-    ) -> Result<TxRollbackExecutionResult, TxExecutionError> {
-        self.rollback_inner(contract, now_ms, None)
     }
 
     /// Execute an explicit rollback with durable cross-process compensation
@@ -6359,6 +6457,64 @@ mod tests {
 
     type RecordedStepIds = Rc<RefCell<Vec<String>>>;
 
+    // ── ft-3lqyu / ft-0rlfq.8: effect seal ──────────────────────────────
+    //
+    // The storeless `execute`/`rollback` entrypoints run with no durable
+    // idempotency spool: no write-ahead `Pending` record, no per-key or
+    // execution lock, no crash reconciliation. The seal below is what keeps
+    // an effectful executor off those paths. The mechanical negative proof
+    // is the `compile_fail` doctest on `assert_non_effectful_executor`; the
+    // tests here pin the positive side and the runtime fail-closed half.
+
+    #[test]
+    fn synthetic_executor_satisfies_the_effect_seal() {
+        assert_non_effectful_executor(&SyntheticStepExecutor);
+    }
+
+    #[test]
+    fn execute_with_store_rejects_a_non_durable_spool() {
+        let mut contract = make_test_contract(1);
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+        assert!(!store.is_durable());
+
+        let err = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .execute_with_store(&mut contract, &mut store, 5_000)
+            .expect_err("in-memory spool must not authorize commit dispatch");
+
+        assert!(
+            matches!(&err, TxExecutionError::InvalidContract(msg) if msg.contains("durable")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            contract.lifecycle_state,
+            MissionTxState::Planned,
+            "a rejected execution must not advance contract lifecycle"
+        );
+        assert!(
+            contract.receipts.is_empty(),
+            "a rejected execution must not mint receipts"
+        );
+    }
+
+    #[test]
+    fn rollback_with_store_rejects_a_non_durable_spool() {
+        let mut contract = make_test_contract(1);
+        let mut store = IdempotencyStore::new(IdempotencyPolicy::default());
+
+        let err = TxExecutionEngine::new(SyntheticStepExecutor, TxExecutionConfig::default())
+            .rollback_with_store(&mut contract, &mut store, 5_000)
+            .expect_err("in-memory spool must not authorize compensation dispatch");
+
+        assert!(
+            matches!(&err, TxExecutionError::InvalidContract(msg) if msg.contains("durable")),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            contract.receipts.is_empty(),
+            "a rejected rollback must not mint compensation receipts"
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn directory_sync_handle_is_synchronizable_for_contract_store() {
@@ -6429,6 +6585,23 @@ mod tests {
         let store = IdempotencyStore::open(dir.path(), IdempotencyPolicy::default())
             .expect("open durable tx store");
         (dir, store)
+    }
+
+    /// Run a full lifecycle against a throwaway durable spool.
+    ///
+    /// The `integration_*` fixtures below drive a real [`PaneStepExecutor`],
+    /// which dispatches against (mock-backed) panes. The storeless
+    /// [`TxExecutionEngine::execute`] is sealed to non-effectful executors
+    /// (ft-3lqyu / ft-0rlfq.8), so those fixtures go through the same durable
+    /// entrypoint production uses. Each call gets a fresh spool, so no prior
+    /// outcome is ever observed and every step dispatches exactly once.
+    fn execute_durable<E: StepExecutor>(
+        engine: &TxExecutionEngine<E>,
+        contract: &mut MissionTxContract,
+        now_ms: i64,
+    ) -> Result<TxExecutionResult, TxExecutionError> {
+        let (_spool, mut store) = durable_store();
+        engine.execute_with_store(contract, &mut store, now_ms)
     }
 
     fn durable_ledger_file_snapshot(
@@ -6815,6 +6988,11 @@ mod tests {
 
     struct CommitDispatchPanicExecutor;
 
+    // Every executor below builds its inputs from the `plan` helpers and
+    // dispatches nothing externally, so each is a genuine
+    // `NonEffectfulStepExecutor` and may drive the storeless entrypoints.
+    impl effect_seal::NonEffectful for CommitDispatchPanicExecutor {}
+
     impl StepExecutor for CommitDispatchPanicExecutor {
         fn evaluate_gates(
             &self,
@@ -6861,6 +7039,8 @@ mod tests {
         }
     }
 
+    impl effect_seal::NonEffectful for RecordingExecutor {}
+
     impl StepExecutor for RecordingExecutor {
         fn evaluate_gates(
             &self,
@@ -6898,6 +7078,8 @@ mod tests {
     }
 
     struct MalformedPrepareGateExecutor;
+
+    impl effect_seal::NonEffectful for MalformedPrepareGateExecutor {}
 
     impl StepExecutor for MalformedPrepareGateExecutor {
         fn evaluate_gates(
@@ -6950,6 +7132,8 @@ mod tests {
             )
         }
     }
+
+    impl effect_seal::NonEffectful for CompensationRecordingExecutor {}
 
     impl StepExecutor for CompensationRecordingExecutor {
         fn evaluate_gates(
@@ -7017,6 +7201,8 @@ mod tests {
         }
     }
 
+    impl effect_seal::NonEffectful for CompensationGateAuditExecutor {}
+
     impl StepExecutor for CompensationGateAuditExecutor {
         fn evaluate_gates(
             &self,
@@ -7065,6 +7251,8 @@ mod tests {
     }
 
     struct NoFreshCompensationExecutor;
+
+    impl effect_seal::NonEffectful for NoFreshCompensationExecutor {}
 
     impl StepExecutor for NoFreshCompensationExecutor {
         fn evaluate_gates(
@@ -7117,6 +7305,8 @@ mod tests {
             )
         }
     }
+
+    impl effect_seal::NonEffectful for SelectivePrepareDenyExecutor {}
 
     impl StepExecutor for SelectivePrepareDenyExecutor {
         fn evaluate_gates(
@@ -9736,6 +9926,8 @@ mod tests {
 
     struct DenyingExecutor;
 
+    impl effect_seal::NonEffectful for DenyingExecutor {}
+
     impl StepExecutor for DenyingExecutor {
         fn evaluate_gates(
             &self,
@@ -9797,6 +9989,8 @@ mod tests {
     }
 
     struct ApprovalBlockingExecutor;
+
+    impl effect_seal::NonEffectful for ApprovalBlockingExecutor {}
 
     impl StepExecutor for ApprovalBlockingExecutor {
         fn evaluate_gates(
@@ -10331,6 +10525,63 @@ mod tests {
             TxPrepareEvaluationContext::new("test-workspace"),
         )
         .with_fleet_controller(controller)
+    }
+
+    /// ft-3lqyu / ft-0rlfq.8: the real effect executor must be unable to
+    /// dispatch without durable idempotency authority.
+    ///
+    /// The compile-time half is the effect seal — `PaneStepExecutor` has no
+    /// `effect_seal::NonEffectful` impl, so `engine.execute(..)` /
+    /// `engine.rollback(..)` do not resolve for it at all. (Uncommenting the
+    /// `engine.execute` line below is a type error, not a runtime failure.)
+    /// This test pins the runtime half: the only entrypoints that *do*
+    /// resolve reject a non-durable spool before any pane is touched.
+    #[test]
+    fn pane_executor_cannot_dispatch_without_durable_authority() {
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async { mock.add_default_pane(0).await });
+
+        let executor = make_pane_executor(mock.clone() as WeztermHandle);
+        let engine = TxExecutionEngine::new(executor, TxExecutionConfig::default());
+        let mut contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::SendText {
+                pane_id: 0,
+                text: "must-not-reach-the-pane".to_string(),
+                paste_mode: None,
+            },
+        )]);
+
+        // Compile-time seal (would not build):
+        //     engine.execute(&mut contract, 5_000);
+
+        let mut volatile = IdempotencyStore::new(IdempotencyPolicy::default());
+        let err = engine
+            .execute_with_store(&mut contract, &mut volatile, 5_000)
+            .expect_err("a non-durable spool must not authorize pane dispatch");
+        assert!(
+            matches!(&err, TxExecutionError::InvalidContract(msg) if msg.contains("durable")),
+            "unexpected error: {err:?}"
+        );
+
+        // MockWezterm::send_text echoes into the pane's content, so an empty
+        // content proves no send ever reached the pane.
+        let content = rt.block_on(async {
+            mock.pane_state(0)
+                .await
+                .expect("pane 0 exists")
+                .content
+                .clone()
+        });
+        assert!(
+            content.is_empty(),
+            "no text may reach the pane when durable authority is absent; got {content:?}"
+        );
+        assert_eq!(contract.lifecycle_state, MissionTxState::Planned);
+        assert!(contract.receipts.is_empty());
     }
 
     #[test]
@@ -11364,7 +11615,7 @@ mod tests {
             ),
         ]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         assert_eq!(result.final_state, MissionTxState::Committed);
         assert_eq!(result.outcome, TxOutcome::Committed);
         let commit = result.commit_report.unwrap();
@@ -11394,7 +11645,7 @@ mod tests {
             },
         )]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         assert_eq!(result.final_state, MissionTxState::Committed);
         assert_eq!(result.outcome, TxOutcome::Committed);
     }
@@ -11447,7 +11698,7 @@ mod tests {
             )],
         );
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         // Partial failure: step 1 committed, step 2 failed
         assert_eq!(result.final_state, MissionTxState::RolledBack);
         assert_eq!(result.outcome, TxOutcome::Compensated);
@@ -11514,7 +11765,7 @@ mod tests {
             ),
         ]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         // This fixture has no compensation actions. Keep the test focused on
         // deterministic failure injection rather than asking the engine to
         // synthesize an unproven rollback action.
@@ -11545,7 +11796,7 @@ mod tests {
             },
         )]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         // Should have at least prepare and commit events
         assert!(
             result.events.len() >= 2,
@@ -11582,7 +11833,7 @@ mod tests {
             },
         )]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         // Prepare phase should pass with allow-all policy
         assert!(
             result.prepare_report.outcome.commit_eligible(),
@@ -11622,7 +11873,7 @@ mod tests {
             },
         )]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         assert_eq!(result.final_state, MissionTxState::Failed);
         assert_eq!(result.outcome, TxOutcome::Failed);
         let commit = result.commit_report.expect("commit report");
@@ -11675,7 +11926,7 @@ mod tests {
             ),
         ]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         assert_eq!(result.final_state, MissionTxState::Failed);
         assert_eq!(result.outcome, TxOutcome::Failed);
         let commit = result.commit_report.expect("commit report");
@@ -11709,7 +11960,7 @@ mod tests {
             },
         )]);
 
-        let result = engine.execute(&mut contract, 5000).unwrap();
+        let result = execute_durable(&engine, &mut contract, 5000).unwrap();
         // Ledger should be populated after execution
         assert!(
             !result.ledger.execution_id().is_empty(),
