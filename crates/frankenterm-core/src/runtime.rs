@@ -2902,21 +2902,49 @@ impl ObservationRuntime {
                             let reg = registry.read().await;
                             reg.observed_pane_ids().into_iter().collect()
                         };
-                        let RuntimePaneStateCompaction {
-                            cursors: cursor_gc,
-                            detection_contexts: context_gc,
-                            pane_activity_tracker: activity_gc,
-                        } = {
+                        let (
+                            RuntimePaneStateCompaction {
+                                cursors: cursor_gc,
+                                detection_contexts: context_gc,
+                                pane_activity_tracker: activity_gc,
+                            },
+                            live_cursor_state,
+                        ) = {
                             let mut cursors_guard = cursors.write().await;
                             let mut contexts_guard = detection_contexts.write().await;
                             let mut tracker_guard = pane_activity_tracker.write().await;
-                            compact_runtime_pane_state(
+                            let compaction = compact_runtime_pane_state(
                                 &mut cursors_guard,
                                 &mut contexts_guard,
                                 &mut tracker_guard,
                                 &active_panes,
-                            )
+                            );
+                            // ft-c87rx: snapshot the capture-advanced fields
+                            // while we already hold this guard, so the
+                            // registry publish below needs no second
+                            // acquisition and never overlaps the registry
+                            // lock. Post-compaction, so retired panes are
+                            // already gone from the snapshot.
+                            let live: Vec<crate::ingest::LiveCursorState> = cursors_guard
+                                .values()
+                                .map(crate::ingest::LiveCursorState::from)
+                                .collect();
+                            (compaction, live)
                         };
+
+                        // Publish the live capture state into the registry's
+                        // cursors. Without this the registry's copy stays at
+                        // its initial values forever, and `plan.rs` hands the
+                        // policy engine `alt_screen: Some(false)` /
+                        // `has_recent_gap: false` for every pane — a
+                        // fail-open on exactly the two conditions those gates
+                        // exist to catch.
+                        if !live_cursor_state.is_empty() {
+                            registry
+                                .write()
+                                .await
+                                .publish_live_cursor_state(&live_cursor_state);
+                        }
                         if cursor_gc.removed_entries > 0
                             || context_gc.removed_entries > 0
                             || activity_gc.removed_entries > 0

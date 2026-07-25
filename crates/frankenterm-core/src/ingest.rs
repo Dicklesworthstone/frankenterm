@@ -565,6 +565,33 @@ pub struct PaneCursor {
     pub in_alt_screen: bool,
 }
 
+/// The capture-advanced fields of a [`PaneCursor`], lifted out so the
+/// observation runtime can hand them to
+/// [`PaneRegistry::publish_live_cursor_state`] without holding both the
+/// runtime cursor lock and the registry lock at the same time (ft-c87rx).
+///
+/// Deliberately excludes `last_snapshot`: it is unbounded pane text, the
+/// registry has no use for it, and copying it every discovery tick for every
+/// pane would be a real cost at fleet scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveCursorState {
+    pub pane_id: u64,
+    pub next_seq: u64,
+    pub in_gap: bool,
+    pub in_alt_screen: bool,
+}
+
+impl From<&PaneCursor> for LiveCursorState {
+    fn from(cursor: &PaneCursor) -> Self {
+        Self {
+            pane_id: cursor.pane_id,
+            next_seq: cursor.next_seq,
+            in_gap: cursor.in_gap,
+            in_alt_screen: cursor.in_alt_screen,
+        }
+    }
+}
+
 impl PaneCursor {
     /// Create a new cursor for a pane
     #[must_use]
@@ -1272,6 +1299,34 @@ impl PaneRegistry {
     /// Get mutable cursor for a pane
     pub fn get_cursor_mut(&mut self, pane_id: u64) -> Option<&mut PaneCursor> {
         self.cursors.get_mut(&pane_id)
+    }
+
+    /// Publish live capture state from the observation runtime into the
+    /// registry's cursors (ft-c87rx).
+    ///
+    /// The registry owns the *observation lifecycle* of a cursor — creating it
+    /// when a pane becomes observed, retiring it into `resume_next_seq` when it
+    /// stops — but the capture pipeline advances a separate map, so the fields
+    /// that change during capture were frozen at their initial values for the
+    /// life of the process. That is a policy fail-open, not just stale
+    /// telemetry: `plan.rs` feeds `in_alt_screen` and `in_gap` into
+    /// `PaneCapabilities`, so a rule meant to refuse a send into an
+    /// alt-screen app, or into a pane with a recent capture gap, was
+    /// evaluating a permanent `false`.
+    ///
+    /// Called once per discovery tick from a snapshot taken under the runtime
+    /// cursor lock, so the two locks are never held at once and the published
+    /// state is at most one discovery interval stale. Only panes the registry
+    /// already tracks are updated; a snapshot entry for an untracked pane is
+    /// ignored rather than resurrecting a retired cursor.
+    pub fn publish_live_cursor_state(&mut self, snapshot: &[LiveCursorState]) {
+        for live in snapshot {
+            if let Some(cursor) = self.cursors.get_mut(&live.pane_id) {
+                cursor.next_seq = live.next_seq;
+                cursor.in_gap = live.in_gap;
+                cursor.in_alt_screen = live.in_alt_screen;
+            }
+        }
     }
 
     /// Get trauma guard state for a pane.
@@ -4417,6 +4472,90 @@ mod tests {
         registry.discovery_tick(panes);
 
         // Observed panes should have cursors
+        assert!(registry.get_cursor(1).is_some());
+    }
+
+    /// ft-c87rx: the registry's cursors are what `ipc.rs` and `plan.rs` read,
+    /// and the capture pipeline advances a different map. Publishing is the
+    /// only thing that keeps them from reporting their initial values forever.
+    #[test]
+    fn publish_live_cursor_state_updates_capture_advanced_fields() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(1, "vim", Some("/home"))]);
+
+        let before = registry.get_cursor(1).expect("observed pane has a cursor");
+        assert!(!before.in_gap, "fixture starts clean");
+        assert!(!before.in_alt_screen);
+        assert_eq!(before.next_seq, 0);
+
+        registry.publish_live_cursor_state(&[LiveCursorState {
+            pane_id: 1,
+            next_seq: 42,
+            in_gap: true,
+            in_alt_screen: true,
+        }]);
+
+        let after = registry.get_cursor(1).expect("cursor still tracked");
+        assert!(
+            after.in_gap,
+            "a capture-emitted gap must reach the policy-facing cursor"
+        );
+        assert!(after.in_alt_screen);
+        assert_eq!(after.next_seq, 42);
+    }
+
+    /// The policy gate reads these two fields through
+    /// `PaneCapabilities::from_ingest_state`. Pin the end-to-end mapping so a
+    /// pane with a live capture gap cannot present as safe to write to.
+    #[test]
+    fn published_gap_state_reaches_policy_capabilities() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(7, "vim", Some("/home"))]);
+
+        let clean = registry.get_cursor(7).expect("cursor");
+        let clean_caps = crate::policy::PaneCapabilities::from_ingest_state(
+            None,
+            Some(clean.in_alt_screen),
+            clean.in_gap,
+        );
+        assert!(!clean_caps.has_recent_gap);
+        assert_eq!(clean_caps.alt_screen, Some(false));
+
+        registry.publish_live_cursor_state(&[LiveCursorState {
+            pane_id: 7,
+            next_seq: 3,
+            in_gap: true,
+            in_alt_screen: true,
+        }]);
+
+        let live = registry.get_cursor(7).expect("cursor");
+        let caps = crate::policy::PaneCapabilities::from_ingest_state(
+            None,
+            Some(live.in_alt_screen),
+            live.in_gap,
+        );
+        assert!(
+            caps.has_recent_gap,
+            "policy must see the capture gap, not a permanent false"
+        );
+        assert_eq!(caps.alt_screen, Some(true));
+    }
+
+    /// A snapshot entry for a pane the registry has already retired must not
+    /// resurrect a cursor — the registry owns the observation lifecycle.
+    #[test]
+    fn publish_live_cursor_state_ignores_untracked_panes() {
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+
+        registry.publish_live_cursor_state(&[LiveCursorState {
+            pane_id: 999,
+            next_seq: 5,
+            in_gap: true,
+            in_alt_screen: true,
+        }]);
+
+        assert!(registry.get_cursor(999).is_none());
         assert!(registry.get_cursor(1).is_some());
     }
 
