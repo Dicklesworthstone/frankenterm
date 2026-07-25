@@ -230,16 +230,49 @@ static STREAMING_ANCHOR_AUTOMATON: LazyLock<AhoCorasick> = LazyLock::new(|| {
         .expect("streaming anchor automaton")
 });
 
-/// Every [`STREAMING_SECRET_ANCHORS`] occurrence in `pending` as
-/// `(start, len)`, ascending by start (ft-aznq6).
+/// Anchors that open a pattern with no bounded span (ft-5lz32).
+///
+/// Every other catalog pattern becomes undetectable within a bounded amount of
+/// text — a fixed-shape token dies at the first byte outside its charset, and a
+/// keyed `key=value` match is already complete once the value reaches its
+/// minimum length. The armoured blocks are different: `SSH_PRIVATE_KEY` and the
+/// PGP patterns only match once the closing `-----END …-----` line arrives, so
+/// an armoured block is undetectable for as long as it is unterminated. Those
+/// occurrences are exempt from the retention floor; everything else is not.
+const UNBOUNDED_SPAN_ANCHORS: &[&str] = &["-----BEGIN "];
+
+fn anchor_span_is_unbounded(anchor: &str) -> bool {
+    UNBOUNDED_SPAN_ANCHORS.contains(&anchor)
+}
+
+/// A [`STREAMING_SECRET_ANCHORS`] occurrence found in the pending buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AnchorOccurrence {
+    /// Byte offset of the first anchor byte within `pending`.
+    start: usize,
+    /// Byte length of the matched anchor.
+    len: usize,
+    /// Whether the pattern this anchor opens can span unbounded text
+    /// (see [`UNBOUNDED_SPAN_ANCHORS`]).
+    unbounded_span: bool,
+}
+
+/// Every [`STREAMING_SECRET_ANCHORS`] occurrence in `pending`, ascending by
+/// start (ft-aznq6).
 ///
 /// Overlapping matches are all reported: `sk-` and `sk-ant-` both start at the
 /// same byte, and a missed occurrence would let the emit boundary advance past
 /// a partial secret.
-fn streaming_anchor_occurrences(pending: &str) -> Vec<(usize, usize)> {
-    let mut occurrences: Vec<(usize, usize)> = STREAMING_ANCHOR_AUTOMATON
+fn streaming_anchor_occurrences(pending: &str) -> Vec<AnchorOccurrence> {
+    let mut occurrences: Vec<AnchorOccurrence> = STREAMING_ANCHOR_AUTOMATON
         .find_overlapping_iter(pending)
-        .map(|found| (found.start(), found.end() - found.start()))
+        .map(|found| AnchorOccurrence {
+            start: found.start(),
+            len: found.end() - found.start(),
+            unbounded_span: anchor_span_is_unbounded(
+                STREAMING_SECRET_ANCHORS[found.pattern().as_usize()],
+            ),
+        })
         .collect();
     occurrences.sort_unstable();
     occurrences
@@ -1307,10 +1340,35 @@ impl StreamingRedactor {
         let detections = self.redactor.detect(self.pending.as_str());
         // ft-aznq6: one automaton pass, reused by every fixed-point iteration.
         let anchor_occurrences = streaming_anchor_occurrences(self.pending.as_str());
+        // ft-5lz32: the tail window is supposed to bound how much text is held
+        // back for the next chunk, but the anchor rule re-centres its window on
+        // each boundary it proposes, so a stream whose anchors are closer
+        // together than the window chains all the way to byte 0. `AC`, `token`
+        // and `secret` are anchors and occur in ordinary English, so ordinary
+        // output emitted nothing at all and `pending` grew to
+        // `max_pending_bytes` — reaching the forced-overflow path, whose own
+        // contract cannot guarantee that partial secrets weren't emitted
+        // unredacted. Anchor-derived retention is therefore floored here.
+        //
+        // Emitting at the floor is safe because the emitted prefix is itself
+        // redacted: splitting a secret only leaks when the pattern needs more
+        // context than the retained window to become detectable at all, and
+        // every catalog pattern except the armoured blocks is detectable within
+        // far less than `effective_tail_bytes`. Armoured blocks are exempt (see
+        // `UNBOUNDED_SPAN_ANCHORS`), and complete detections are applied below
+        // the floor unconditionally.
+        let retention_floor = boundary.saturating_sub(self.effective_tail_bytes());
 
         loop {
-            let mut next_boundary =
-                self.earliest_secret_like_suffix_start(boundary, &detections, &anchor_occurrences);
+            // The floor is applied inside each retention rule rather than to
+            // their combined result, so the unbounded-span exemption and the
+            // complete-detection rules below can still reach past it.
+            let mut next_boundary = self.earliest_secret_like_suffix_start(
+                boundary,
+                &detections,
+                &anchor_occurrences,
+                retention_floor,
+            );
             for (_, start, end) in &detections {
                 if *start < next_boundary && next_boundary < *end {
                     next_boundary = next_boundary.min(*start);
@@ -1331,7 +1389,8 @@ impl StreamingRedactor {
         &self,
         current_boundary: usize,
         detections: &[(&'static str, usize, usize)],
-        anchor_occurrences: &[(usize, usize)],
+        anchor_occurrences: &[AnchorOccurrence],
+        retention_floor: usize,
     ) -> usize {
         if current_boundary == 0 || self.pending.is_empty() {
             return current_boundary;
@@ -1366,6 +1425,7 @@ impl StreamingRedactor {
             current_boundary,
             detections,
             anchor_occurrences,
+            retention_floor,
         ));
 
         // ft-aznq6: retain the whole trailing run of partial-anchor /
@@ -1396,6 +1456,7 @@ impl StreamingRedactor {
             self.pending.as_str(),
             current_boundary,
             self.effective_tail_bytes(),
+            retention_floor,
         ));
 
         floor_char_boundary(self.pending.as_str(), earliest)
@@ -1411,7 +1472,8 @@ impl StreamingRedactor {
         &self,
         current_boundary: usize,
         detections: &[(&'static str, usize, usize)],
-        anchor_occurrences: &[(usize, usize)],
+        anchor_occurrences: &[AnchorOccurrence],
+        retention_floor: usize,
     ) -> usize {
         let pending = self.pending.as_str();
         let tail_bytes = self.effective_tail_bytes();
@@ -1420,30 +1482,49 @@ impl StreamingRedactor {
 
         while idx > 0 {
             idx -= 1;
-            let (start, len) = anchor_occurrences[idx];
+            let occurrence = anchor_occurrences[idx];
 
             // Occurrences are ascending, so `start` only decreases from here.
             // An anchor straddling the boundary was never visible to the
             // windowed scan this replaces; skip it and keep descending.
-            if start + len > boundary {
+            if occurrence.start + occurrence.len > boundary {
                 continue;
             }
 
-            let scan_start =
-                floor_char_boundary(pending, boundary.saturating_sub(tail_bytes));
-            if start < scan_start {
-                // Outside the window, and every remaining occurrence is further
-                // left, so the chain has reached its fixed point.
-                break;
+            // ft-5lz32: an unbounded-span anchor retains regardless of the scan
+            // window and the retention floor. An unterminated armoured block is
+            // undetectable until its `-----END …-----` line arrives, so emitting
+            // any part of it emits private-key material in plaintext. Before
+            // this, the windowed scan silently stopped seeing the `-----BEGIN `
+            // anchor once the block outgrew the window, and the block survived
+            // only when its base64 body happened to contain other anchors —
+            // which is luck, not a guarantee. Unbounded retention here is
+            // bounded by `max_pending_bytes`, and the forced-emission counter is
+            // the visible signal when that bound is hit.
+            //
+            // Everything else must respect both bounds: a bounded pattern that
+            // started before the floor is either already a complete detection
+            // (the detection rules handle those, unclamped) or can no longer be
+            // completed by bytes that have not arrived yet.
+            if !occurrence.unbounded_span {
+                let scan_start =
+                    floor_char_boundary(pending, boundary.saturating_sub(tail_bytes));
+                if occurrence.start < scan_start || occurrence.start < retention_floor {
+                    continue;
+                }
             }
 
             let covered_by_complete_detection = detections.iter().any(|(_, det_start, det_end)| {
                 *det_end < boundary
-                    && ((*det_start <= start && start < *det_end)
-                        || keyed_anchor_reaches_detection_value(pending, start + len, *det_start))
+                    && ((*det_start <= occurrence.start && occurrence.start < *det_end)
+                        || keyed_anchor_reaches_detection_value(
+                            pending,
+                            occurrence.start + occurrence.len,
+                            *det_start,
+                        ))
             });
             if !covered_by_complete_detection {
-                boundary = start;
+                boundary = occurrence.start;
             }
         }
 
@@ -1513,9 +1594,19 @@ fn trailing_generic_token_or_secret_boundary_start(
 /// quadratic. Cost is one byte-table lookup per retained byte in the common
 /// case, and at most `sum(anchor.len())` byte comparisons for a byte that only
 /// continues a multi-byte anchor prefix.
-fn retainable_trailing_run_start(pending: &str, current_boundary: usize, tail_limit: usize) -> usize {
+fn retainable_trailing_run_start(
+    pending: &str,
+    current_boundary: usize,
+    tail_limit: usize,
+    retention_floor: usize,
+) -> usize {
     let mut boundary = current_boundary.min(pending.len());
-    while boundary > 0 && retains_trailing_secret_fragment(pending, boundary, tail_limit) {
+    // ft-5lz32: a truncated anchor prefix is at most `longest_streaming_anchor_len()`
+    // bytes; a run longer than the tail window is retained only because the rule
+    // re-fires at each position, so stop at the floor.
+    while boundary > retention_floor
+        && retains_trailing_secret_fragment(pending, boundary, tail_limit)
+    {
         boundary -= 1;
     }
     boundary
@@ -2497,11 +2588,20 @@ mod tests {
             .with_tail_bytes(64)
             .with_max_pending_bytes(TEST_CAP);
 
-        // Adversarial pattern: "rk_AAAAAAAA" repeated. Each chunk
-        // contains anchor occurrences that previously kept the
-        // boundary stuck at the earliest anchor position, growing
-        // pending without bound.
-        let runaway = "rk_AAAAAAAA".repeat(64); // 11 bytes × 64 = 704 bytes per chunk.
+        // ft-5lz32 changed the input this test uses. The original input was a
+        // repeated `"rk_AAAAAAAA"` anchor stream, which grew pending without
+        // bound because every anchor occurrence pulled the emit boundary back
+        // and the chain walked below the tail window. That growth was itself the
+        // ft-5lz32 defect: such a stream now drains (pinned by
+        // `ft_5lz32_repeated_anchor_stream_drains_without_forced_emission`), so
+        // it can no longer reach the overflow path.
+        //
+        // What genuinely cannot drain is an unterminated armoured block: the PEM
+        // patterns only match once `-----END …-----` arrives, so the block is
+        // undetectable and must be retained in full. That is the remaining
+        // legitimate route to the ft-4socw cap, and this test now uses it.
+        let mut runaway = String::from("-----BEGIN RSA PRIVATE KEY-----\n");
+        runaway.push_str(&"MIIEowIBAAKCAQEAvOhL0mE3sk9wQ\n".repeat(24));
         for _ in 0..50 {
             let _ = streaming.redact_chunk(runaway.as_bytes());
             assert!(
@@ -2515,12 +2615,51 @@ mod tests {
         let count = super::streaming_redactor_pending_overflow_count();
         assert!(
             count > 0,
-            "br-ft-4socw: runaway anchor stream must trigger forced \
+            "br-ft-4socw: a stream that cannot drain must trigger forced \
              emission at least once; got count={count}"
         );
 
         // Drain pending so subsequent tests start fresh.
         let _ = streaming.finish();
+    }
+
+    /// ft-5lz32: a repeated-anchor stream must now drain instead of growing to
+    /// the pending cap. This is the input the ft-4socw overflow test used to
+    /// rely on; the growth it modelled was the defect, not the design.
+    #[test]
+    fn ft_5lz32_repeated_anchor_stream_drains_without_forced_emission() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        const TEST_CAP: usize = 1024;
+        let mut streaming = StreamingRedactor::new()
+            .with_tail_bytes(64)
+            .with_max_pending_bytes(TEST_CAP);
+
+        let runaway = "rk_AAAAAAAA".repeat(64); // 704 bytes per chunk.
+        let mut streamed = Vec::new();
+        for _ in 0..50 {
+            streamed.extend_from_slice(&streaming.redact_chunk(runaway.as_bytes()).bytes);
+            assert!(
+                streaming.pending_bytes() <= TEST_CAP,
+                "pending must stay inside the cap without forced emission; got {}",
+                streaming.pending_bytes()
+            );
+        }
+        streamed.extend_from_slice(&streaming.finish().bytes);
+
+        assert_eq!(
+            super::streaming_redactor_pending_overflow_count(),
+            0,
+            "an anchor stream must drain on its own rather than reaching the \
+             forced-emission path and its weaker guarantee"
+        );
+        let batch = Redactor::new().redact(&runaway.repeat(50));
+        assert_eq!(
+            String::from_utf8(streamed).expect("streamed output is utf8"),
+            batch,
+            "draining must not change what the stream redacts to"
+        );
     }
 
     /// Reference implementation of the pre-ft-aznq6 retention rules: apply the
@@ -2618,8 +2757,10 @@ mod tests {
                 let effective = streaming.effective_tail_bytes();
 
                 let occurrences = super::streaming_anchor_occurrences(case);
+                // Floor 0: this test pins the collapse against the loop it
+                // replaced, so it must not also apply the ft-5lz32 clamp.
                 let actual =
-                    streaming.anchor_occurrence_chain_start(case.len(), &[], &occurrences);
+                    streaming.anchor_occurrence_chain_start(case.len(), &[], &occurrences, 0);
                 let expected = reference_anchor_occurrence_chain(case, case.len(), effective);
 
                 assert_eq!(
@@ -2664,8 +2805,10 @@ mod tests {
         for case in cases {
             for tail_limit in [0_usize, 1, 2, 8, 64, super::STREAMING_ANCHOR_TAIL_FLOOR, 4096] {
                 let expected = reference_per_byte_retention_walk(case, case.len(), tail_limit);
+                // Floor 0: pins the collapse against the loop it replaced,
+                // without the ft-5lz32 clamp.
                 let actual =
-                    super::retainable_trailing_run_start(case, case.len(), tail_limit);
+                    super::retainable_trailing_run_start(case, case.len(), tail_limit, 0);
                 assert_eq!(
                     actual, expected,
                     "run collapse diverged from the per-byte walk for {case:?} \
@@ -2692,8 +2835,9 @@ mod tests {
 
         let mut streaming = StreamingRedactor::new();
         let started = std::time::Instant::now();
+        let mut streamed = 0usize;
         for _ in 0..(TOTAL / CHUNK) {
-            let _ = streaming.redact_chunk(chunk.as_bytes());
+            streamed += streaming.redact_chunk(chunk.as_bytes()).bytes.len();
         }
         let flushed = streaming.finish();
         let elapsed = started.elapsed();
@@ -2709,9 +2853,17 @@ mod tests {
              path must not fire"
         );
         assert_eq!(
-            flushed.bytes.len(),
+            streamed + flushed.bytes.len(),
             TOTAL,
             "no output may be lost across the run"
+        );
+        // ft-5lz32: the run is retained only up to the tail window, so most of
+        // it is emitted during streaming rather than held to finish().
+        assert!(
+            flushed.bytes.len() <= super::DEFAULT_STREAMING_REDACTOR_TAIL_BYTES,
+            "retention must stay within the tail window; {} bytes were still \
+             pending at finish()",
+            flushed.bytes.len()
         );
     }
 
@@ -2729,8 +2881,9 @@ mod tests {
 
         let mut streaming = StreamingRedactor::new();
         let started = std::time::Instant::now();
+        let mut streamed = 0usize;
         for _ in 0..(TOTAL / CHUNK) {
-            let _ = streaming.redact_chunk(chunk.as_bytes());
+            streamed += streaming.redact_chunk(chunk.as_bytes()).bytes.len();
         }
         let flushed = streaming.finish();
         let elapsed = started.elapsed();
@@ -2740,7 +2893,123 @@ mod tests {
             "200 KiB of separator bytes must stream in bounded time; took {elapsed:?}"
         );
         assert_eq!(super::streaming_redactor_pending_overflow_count(), 0);
-        assert_eq!(flushed.bytes.len(), TOTAL);
+        assert_eq!(streamed + flushed.bytes.len(), TOTAL);
+        assert!(flushed.bytes.len() <= super::DEFAULT_STREAMING_REDACTOR_TAIL_BYTES);
+    }
+
+    /// ft-5lz32: ordinary output must actually drain while streaming.
+    ///
+    /// Before the retention floor, anchor occurrences chained below the tail
+    /// window on every chunk — `AC` alone occurs in `cached`, `package` and
+    /// `backtrace` — so the emit boundary sat at 0 and 205 KiB of secret-free
+    /// build output was still buffered at `finish()`. `pending` then grew to the
+    /// 8 MiB cap on any real pane and took the forced-overflow path, whose own
+    /// contract cannot guarantee partial secrets weren't emitted unredacted.
+    #[test]
+    fn ft_5lz32_ordinary_prose_drains_while_streaming() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        let line = "   Compiling frankenterm-core v0.12.0 (cached package, backtrace off)\n";
+        let chunk = line.repeat(60);
+        let total = chunk.len() * 50;
+
+        let mut streaming = StreamingRedactor::new();
+        let mut streamed_bytes = 0usize;
+        let mut peak_pending = 0usize;
+        for _ in 0..50 {
+            streamed_bytes += streaming.redact_chunk(chunk.as_bytes()).bytes.len();
+            peak_pending = peak_pending.max(streaming.pending_bytes());
+        }
+        let tail_cap = super::DEFAULT_STREAMING_REDACTOR_TAIL_BYTES;
+        let flushed = streaming.finish();
+
+        assert!(
+            peak_pending <= tail_cap + chunk.len(),
+            "retention must stay within the tail window (plus the in-flight chunk); \
+             peak pending was {peak_pending} for a {tail_cap}-byte window"
+        );
+        assert!(
+            streamed_bytes >= total / 2,
+            "most of {total} bytes must be emitted during streaming, not held to \
+             finish(); only {streamed_bytes} were emitted, {} flushed at the end",
+            flushed.bytes.len()
+        );
+        assert_eq!(super::streaming_redactor_pending_overflow_count(), 0);
+    }
+
+    /// ft-5lz32: the retention floor must not open a leak. A secret that arrives
+    /// after a long secret-free prefix — so the floor has been clamping for many
+    /// chunks — must still be redacted, and the streamed output must equal what
+    /// batch redaction produces for the same text.
+    #[test]
+    fn ft_5lz32_secret_after_clamped_prefix_is_still_redacted() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        let prefix = "   Compiling frankenterm-core v0.12.0 (cached package, backtrace off)\n"
+            .repeat(1200); // ~84 KiB: comfortably past the 64 KiB window.
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+        let full = format!("{prefix}{secret}");
+
+        // The filler must itself be secret-free, so any difference from batch
+        // output below is attributable to the clamp rather than to a
+        // false-positive detection being split by a chunk boundary.
+        assert_eq!(
+            Redactor::new().redact(&prefix),
+            prefix,
+            "test filler must contain no detections"
+        );
+
+        let mut streaming = StreamingRedactor::new();
+        let mut streamed = Vec::new();
+        // Split every chunk boundary at 4 KiB, including inside the secret.
+        for chunk in full.as_bytes().chunks(4096) {
+            streamed.extend_from_slice(&streaming.redact_chunk(chunk).bytes);
+        }
+        streamed.extend_from_slice(&streaming.finish().bytes);
+
+        let batch = Redactor::new().redact(&full);
+        let streamed_text = String::from_utf8(streamed).expect("streamed output is utf8");
+
+        assert!(
+            !streamed_text.contains("sk-ant-api03-AAAA"),
+            "the secret must not survive the clamped stream"
+        );
+        assert_eq!(
+            streamed_text, batch,
+            "streaming across a clamped prefix must match batch redaction"
+        );
+    }
+
+    /// ft-5lz32: armoured blocks are exempt from the retention floor. A PEM
+    /// private key is only detectable once its `-----END …-----` line arrives,
+    /// so clamping retention inside the block would emit the key body in
+    /// plaintext. Uses a small tail window so the block outgrows it cheaply.
+    #[test]
+    fn ft_5lz32_unterminated_armour_block_is_retained_past_the_floor() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        let body = "MIIEowIBAAKCAQEAvOhL0mE3sk9wQ\n".repeat(32); // ~928 bytes of base64
+        let block = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n{body}-----END RSA PRIVATE KEY-----\n"
+        );
+
+        let mut streaming = StreamingRedactor::new().with_tail_bytes(128);
+        let mut streamed = Vec::new();
+        for chunk in block.as_bytes().chunks(64) {
+            streamed.extend_from_slice(&streaming.redact_chunk(chunk).bytes);
+        }
+        streamed.extend_from_slice(&streaming.finish().bytes);
+
+        let streamed_text = String::from_utf8(streamed).expect("streamed output is utf8");
+        assert!(
+            !streamed_text.contains("MIIEowIBAAKCAQEAvOhL0mE3sk9wQ"),
+            "an unterminated armour block must stay retained until its END line \
+             arrives; got: {streamed_text}"
+        );
+        assert_eq!(streamed_text, Redactor::new().redact(&block));
     }
 
     /// ft-aznq6: cost of ordinary secret-free prose through the streaming path.
