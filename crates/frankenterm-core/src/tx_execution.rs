@@ -3795,6 +3795,30 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
                     &commit_report,
                     compensation_proof_leases.as_ref(),
                 )?;
+                // Deferral and denial are different verdicts and must leave
+                // different contract states.
+                //
+                // A *deferred* batch — execution paused, or more outstanding
+                // steps than `max_steps_per_batch` — means compensation is
+                // still owed and merely has to wait. `commit_report.outcome
+                // .target_tx_state()` above already wrote the commit-phase
+                // verdict (`Failed` for a partial failure), and transitioning
+                // to `Compensating` only after the dispatch gate meant a
+                // deferral returned with the contract terminally `Failed`
+                // while a durable effect was live and un-compensated —
+                // nothing recorded that rollback was still due. Record it
+                // before failing.
+                //
+                // A gate *denial* is the opposite: policy, approval, or
+                // liveness decided compensation must not run at all, so the
+                // terminal commit verdict stands and the contract must not
+                // claim a rollback is pending.
+                if let Err(deferred) = self.validated_compensation_batch(&gate_report) {
+                    contract.lifecycle_state = MissionTxState::Compensating;
+                    contract.outcome = TxOutcome::Pending;
+                    return Err(deferred);
+                }
+
                 let compensation_permit = self.validate_compensation_dispatch(
                     contract,
                     &gate_report,
