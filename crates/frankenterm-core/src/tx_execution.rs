@@ -8775,8 +8775,20 @@ mod tests {
             "compensation-before-contract-save",
             test_compensation_key(&contract, "step-0"),
             StepOutcome::Compensated {
+                // Must be the outcome the engine would actually have written
+                // at commit time: `record_commit_results_to_ledger` stores
+                // `Success { result: Some(input.reason_code) }`, and the
+                // reason code for a successful synthetic commit is
+                // `commit_step_succeeded`. Seeding the *receipt* vocabulary
+                // ("committed") describes a history no commit path can
+                // produce, so the engine's exact cross-check against the
+                // separately proven commit outcome correctly rejected it as a
+                // rollback proof conflict. The check is load-bearing — a
+                // durable compensation proof whose embedded original outcome
+                // disagrees with the proven commit outcome means the ledger
+                // and the contract describe different histories.
                 original_outcome: Box::new(StepOutcome::Success {
-                    result: Some("committed".to_string()),
+                    result: Some("commit_step_succeeded".to_string()),
                 }),
                 compensation_result: "provider_specific_undo_receipt".to_string(),
             },
