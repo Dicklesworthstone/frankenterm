@@ -6580,6 +6580,31 @@ mod tests {
         std::fs::write(path, serde_json::to_vec_pretty(contract).unwrap()).unwrap();
     }
 
+    /// A tempdir whose path is already canonical.
+    ///
+    /// `acquire_tx_contract_lock` binds the guard to the *canonicalized*
+    /// contract path, and `save_tx_contract_atomic` refuses every other
+    /// spelling of it (`verify_logical_path`) — that refusal is the point of
+    /// the guard. Production callers therefore always pass
+    /// `guard.authoritative_path()`.
+    ///
+    /// A contract-store test that builds its own path from
+    /// `tempfile::tempdir()` only agrees with the guard when TMPDIR contains
+    /// no symlink. On the remote RCH workers it does: the repo is mounted at a
+    /// different root, so `tempdir()` hands back an alias and every test in
+    /// this family failed with a `Lock` error unrelated to the behavior under
+    /// test — making the whole contract-store suite unprovable remotely
+    /// (ft-ehcqr). Canonicalizing the root once keeps these tests testing the
+    /// store rather than the host's path layout.
+    fn canonical_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("contract store tempdir");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize contract store tempdir root");
+        (dir, root)
+    }
+
     fn durable_store() -> (tempfile::TempDir, IdempotencyStore) {
         let dir = tempfile::tempdir().expect("durable tx store tempdir");
         let store = IdempotencyStore::open(dir.path(), IdempotencyPolicy::default())
@@ -6809,12 +6834,12 @@ mod tests {
     fn atomic_save_preserves_authoritative_file_mode() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx.json");
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("tx.json");
         let contract = make_test_contract(1);
         write_authoritative_contract(&path, &contract);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let guard = acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
 
         save_tx_contract_atomic(&guard, &path, &contract).unwrap();
 
@@ -6826,11 +6851,11 @@ mod tests {
 
     #[test]
     fn oversize_post_execution_snapshot_is_retained_for_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx.json");
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("tx.json");
         let baseline = make_test_contract(1);
         write_authoritative_contract(&path, &baseline);
-        let guard = acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
         let mut oversized = baseline.clone();
         let StepAction::SendText { text, .. } = &mut oversized.plan.steps[0].action else {
             unreachable!("test fixture uses send_text")
@@ -6855,12 +6880,12 @@ mod tests {
 
     #[test]
     fn pre_rename_failure_retains_deserializable_recovery_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx.json");
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("tx.json");
         let baseline = make_test_contract(1);
         let replacement = make_test_contract(2);
         write_authoritative_contract(&path, &baseline);
-        let guard = acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
 
         let err = save_tx_contract_atomic_impl(&guard, &path, &replacement, |point| {
             if point == TxContractSaveFaultPoint::BeforeAtomicReplace {
@@ -6887,14 +6912,14 @@ mod tests {
 
     #[test]
     fn post_effect_destination_substitution_preserves_foreign_sentinel_and_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx.json");
-        let original_detached = dir.path().join("tx-original-detached.json");
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("tx.json");
+        let original_detached = root.join("tx-original-detached.json");
         let baseline = make_test_contract(1);
         let replacement = make_test_contract(2);
         let foreign_sentinel = b"foreign transaction sentinel".to_vec();
         write_authoritative_contract(&path, &baseline);
-        let guard = acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
         guard.authorizes(guard.authoritative_path()).unwrap();
 
         let mut substituted = false;
@@ -6928,13 +6953,13 @@ mod tests {
 
     #[test]
     fn file_sync_failure_retains_deserializable_snapshot_without_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx.json");
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("tx.json");
         let baseline = make_test_contract(1);
         let replacement = make_test_contract(2);
         write_authoritative_contract(&path, &baseline);
         let authoritative_before = std::fs::read(&path).unwrap();
-        let guard = acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
 
         let err = save_tx_contract_atomic_impl(&guard, &path, &replacement, |point| {
             if point == TxContractSaveFaultPoint::BeforeFileSync {
@@ -6958,12 +6983,12 @@ mod tests {
 
     #[test]
     fn parent_sync_failure_reports_that_authoritative_bytes_were_replaced() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx.json");
+        let (_dir, root) = canonical_tempdir();
+        let path = root.join("tx.json");
         let baseline = make_test_contract(1);
         let replacement = make_test_contract(2);
         write_authoritative_contract(&path, &baseline);
-        let guard = acquire_tx_contract_lock(dir.path(), &path).unwrap();
+        let guard = acquire_tx_contract_lock(&root, &path).unwrap();
 
         let err = save_tx_contract_atomic_impl(&guard, &path, &replacement, |point| {
             if point == TxContractSaveFaultPoint::ParentDirectorySync {

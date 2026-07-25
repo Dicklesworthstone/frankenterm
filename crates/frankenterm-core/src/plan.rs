@@ -4787,6 +4787,35 @@ fn tx_increment_receipt_seq(previous_seq: u64) -> Result<u64, String> {
         .ok_or_else(|| format!("transaction receipt sequence overflow after seq {previous_seq}"))
 }
 
+/// Whether the newest receipt for `(phase, step_id)` already records `outcome`.
+///
+/// Mirrors the commit phase's duplicate-receipt guard in
+/// `tx_execution::latest_tx_receipt_matches`. A rollback that is satisfied
+/// entirely by durable dedup re-derives the same compensation outcome the
+/// contract already carries, and appending a second identical receipt is both
+/// redundant and, at the sequence ceiling, fatal: the compensation phase
+/// allocated a sequence number unconditionally, so a contract whose last
+/// receipt sat at `u64::MAX` failed with a sequence overflow even though it
+/// needed no new receipt at all.
+fn tx_latest_receipt_matches(
+    contract: &MissionTxContract,
+    phase: &str,
+    step_id: &str,
+    outcome: &str,
+) -> bool {
+    contract
+        .receipts
+        .iter()
+        .rev()
+        .find(|receipt| {
+            receipt.get("phase").and_then(serde_json::Value::as_str) == Some(phase)
+                && receipt.get("step_id").and_then(serde_json::Value::as_str) == Some(step_id)
+        })
+        .is_some_and(|receipt| {
+            receipt.get("outcome").and_then(serde_json::Value::as_str) == Some(outcome)
+        })
+}
+
 // Tx receipts keep sequencing, policy, and proof metadata explicit.
 #[allow(clippy::too_many_arguments)]
 fn tx_build_receipt(
@@ -5417,20 +5446,29 @@ pub fn execute_compensation_phase(
             completed_at_ms,
         });
 
-        next_seq = tx_increment_receipt_seq(next_seq)?;
-        receipts.push(tx_build_receipt(
-            next_seq,
-            "compensate",
-            &contract.intent.tx_id,
-            &contract.plan.plan_id,
-            contract.lifecycle_state,
-            Some(&committed_step.step_id),
-            outcome,
-            &reason_code,
-            error_code.as_deref(),
-            &decision_path,
-            completed_at_ms,
-        ));
+        // Suppress a receipt that merely restates the outcome the contract
+        // already records for this step, exactly as the commit phase does. A
+        // dedup-only rollback re-derives the authoritative compensation
+        // outcome from the durable ledger, so without this guard it appended a
+        // duplicate receipt — and allocated a sequence number to do it, which
+        // fails closed with a sequence overflow when the existing receipt sits
+        // at the ceiling. A genuinely missing receipt still gets minted.
+        if !tx_latest_receipt_matches(contract, "compensate", &committed_step.step_id.0, outcome) {
+            next_seq = tx_increment_receipt_seq(next_seq)?;
+            receipts.push(tx_build_receipt(
+                next_seq,
+                "compensate",
+                &contract.intent.tx_id,
+                &contract.plan.plan_id,
+                contract.lifecycle_state,
+                Some(&committed_step.step_id),
+                outcome,
+                &reason_code,
+                error_code.as_deref(),
+                &decision_path,
+                completed_at_ms,
+            ));
+        }
     }
 
     let all_ok = failed_count == 0;
