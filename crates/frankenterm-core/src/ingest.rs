@@ -1892,10 +1892,51 @@ fn hash_text(text: &str) -> u64 {
     stable_hash(text.as_bytes())
 }
 
+/// Overlap length above which continuity is taken on faith (ft-r5xkf).
+///
+/// At or beyond this many bytes an exact suffix/prefix match is strong enough
+/// evidence on its own; below it the overlap has to carry some content (see
+/// [`overlap_is_plausible`]).
+pub const MIN_PLAUSIBLE_OVERLAP_BYTES: usize = 8;
+
+/// Whether a suffix/prefix match is evidence that two snapshots are continuous
+/// (ft-r5xkf).
+///
+/// The overlap search accepts any byte-border down to length one, and one byte
+/// is not evidence of anything. `get_text` output is newline-terminated and a
+/// leading blank line is routine after `clear` or a terminal reset, so
+/// `previous = "…line B\n"` against `current = "\n$ fresh\n"` matched on the
+/// single shared `\n` and was reported as a clean `Content` delta. When
+/// thousands of lines scroll off between polls and the boundary bytes happen to
+/// coincide, that silently loses the scrollback and records no gap — defeating
+/// the explicit-gap guarantee the capture pipeline is built on.
+///
+/// The discriminator is what the overlap *is*, not how long it is. A pure
+/// length floor is wrong: `"hello world"` -> `"world peace"` overlaps by five
+/// bytes and `"x🚀"` -> `"🚀y"` by four, and both are genuine continuations this
+/// crate pins as such. What the false match has instead is a boundary-noise
+/// overlap: a single byte, or nothing but whitespace — exactly the characters
+/// that sit at the end of one capture and the start of the next by default.
+///
+/// So: accept a long overlap unconditionally, and accept a short one only when
+/// it carries at least one non-whitespace byte and is more than a single byte.
+///
+/// Plausibility is monotone in the direction callers need. A shorter border is
+/// a prefix of a longer one, so if the maximal border is implausible (one byte,
+/// or all whitespace) every shorter border is too — checking the maximal border
+/// alone is sufficient, in both search arms.
+fn overlap_is_plausible(overlap: &str) -> bool {
+    overlap.len() >= MIN_PLAUSIBLE_OVERLAP_BYTES
+        || (overlap.len() >= 2 && overlap.bytes().any(|byte| !byte.is_ascii_whitespace()))
+}
+
 /// Extract delta from current vs previous content.
 ///
 /// This is designed for the "sliding window" case (polling successive snapshots):
 /// it finds the largest overlap where a suffix of `previous` matches a prefix of `current`.
+///
+/// A border shorter than [`min_acceptable_overlap`] is refused as coincidental
+/// and reported as an explicit gap (ft-r5xkf).
 #[must_use]
 pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
     extract_delta_with_overlap_mode(
@@ -2000,6 +2041,14 @@ pub fn extract_delta_with_overlap_mode(
     // resulting `DeltaResult` — including every `reason` string — is byte-identical.
     if linear {
         return match kmp_longest_overlap(search_window.as_bytes(), current.as_bytes()) {
+            // ft-r5xkf: the maximal border is the best evidence available, so if
+            // even it is boundary noise, no acceptable border exists.
+            Some(overlap_len) if !overlap_is_plausible(&current[..overlap_len]) => {
+                DeltaResult::Gap {
+                    reason: "overlap_implausible".to_string(),
+                    content: current.to_string(),
+                }
+            }
             Some(overlap_len) => {
                 // `overlap_len` is always a `current` char boundary for a true
                 // byte-border (see `kmp_longest_overlap`), so this slice never panics.
@@ -2041,6 +2090,16 @@ pub fn extract_delta_with_overlap_mode(
         // search_window[pos..] has length overlap_len
         // current[..overlap_len] has length overlap_len
         if search_window[pos..] == current[..overlap_len] {
+            // ft-r5xkf: candidates are examined longest-first, so this is the
+            // maximal border. If even it is boundary noise, every shorter
+            // candidate is too, and no acceptable border exists.
+            if !overlap_is_plausible(&current[..overlap_len]) {
+                return DeltaResult::Gap {
+                    reason: "overlap_implausible".to_string(),
+                    content: current.to_string(),
+                };
+            }
+
             let delta = &current[overlap_len..];
             if delta.is_empty() {
                 return DeltaResult::Gap {
@@ -3398,6 +3457,79 @@ mod tests {
         assert!(matches!(result, DeltaResult::Content(ref s) if s == "line4\n"));
     }
 
+    /// ft-r5xkf: a one-byte coincidence at the capture boundary is not evidence
+    /// of continuity. `get_text` output is newline-terminated and a leading
+    /// blank line is routine after `clear`, so this shape occurs in normal
+    /// operation — and reporting it as a clean delta silently discards whatever
+    /// scrolled off in between, with no gap recorded.
+    #[test]
+    fn ft_r5xkf_single_newline_coincidence_is_a_gap() {
+        let previous = "history line A\nhistory line B\n";
+        let current = "\n$ fresh\n";
+
+        match extract_delta(previous, current, 4096) {
+            DeltaResult::Gap { reason, content } => {
+                assert_eq!(reason, "overlap_implausible");
+                assert_eq!(content, current, "gap content must carry the full capture");
+            }
+            other => panic!("expected an explicit gap, got {other:?}"),
+        }
+    }
+
+    /// ft-r5xkf: whitespace-only overlaps of any length are boundary noise too —
+    /// a run of blank lines at the end of one capture and the start of the next
+    /// says nothing about continuity.
+    #[test]
+    fn ft_r5xkf_whitespace_only_overlap_is_a_gap() {
+        assert!(matches!(
+            extract_delta("output done\n\n", "\n\n$ next\n", 4096),
+            DeltaResult::Gap { .. }
+        ));
+    }
+
+    /// ft-r5xkf: the guard must not reclassify genuine continuations. These are
+    /// the shapes the crate pins elsewhere — short ASCII words, multibyte
+    /// boundaries, and full-line overlaps — all well under the 8-byte
+    /// take-on-faith length.
+    #[test]
+    fn ft_r5xkf_short_but_contentful_overlaps_stay_deltas() {
+        let cases = [
+            ("hello world", "world peace", " peace"),
+            ("ab│─", "│─cd", "cd"),
+            ("x🚀", "🚀y", "y"),
+            ("head aaa", "aaa tail", " tail"),
+            ("00 alpha\n01 beta\n", "01 beta\n02 gamma\n", "02 gamma\n"),
+        ];
+
+        for (previous, current, expected_delta) in cases {
+            match extract_delta(previous, current, 4096) {
+                DeltaResult::Content(delta) => assert_eq!(
+                    delta, expected_delta,
+                    "genuine continuation {previous:?} -> {current:?} must stay a delta"
+                ),
+                other => panic!("expected Content for {previous:?} -> {current:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// ft-r5xkf: the plausibility rule is a property of the overlap text, so it
+    /// is checkable directly. A single byte is never enough; two or more bytes
+    /// need something that is not whitespace; long overlaps are taken on faith.
+    #[test]
+    fn ft_r5xkf_overlap_plausibility_rule() {
+        assert!(!overlap_is_plausible(""));
+        assert!(!overlap_is_plausible("\n"));
+        assert!(!overlap_is_plausible("a"));
+        assert!(!overlap_is_plausible("\r\n"));
+        assert!(!overlap_is_plausible("   "));
+        assert!(overlap_is_plausible("ab"));
+        assert!(overlap_is_plausible(" x"));
+        assert!(overlap_is_plausible("🚀"));
+        // Eight bytes is taken on faith even when it is all whitespace: at that
+        // length a coincidental match is no longer boundary noise.
+        assert!(overlap_is_plausible("        "));
+    }
+
     #[test]
     fn extract_delta_gap_on_in_place_edit() {
         let prev = "hello\nworld\n";
@@ -3555,6 +3687,15 @@ mod tests {
         }
 
         match best_overlap {
+            // ft-r5xkf: mirrors the production plausibility rule. `best_overlap`
+            // is the maximal border, so if it is boundary noise there is no
+            // acceptable one.
+            Some(overlap_len) if !super::overlap_is_plausible(&current[..overlap_len]) => {
+                DeltaResult::Gap {
+                    reason: "overlap_implausible".to_string(),
+                    content: current.to_string(),
+                }
+            }
             Some(overlap_len) => {
                 let delta = &current[overlap_len..];
                 if delta.is_empty() {
