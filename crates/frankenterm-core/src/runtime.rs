@@ -4155,12 +4155,18 @@ async fn handle_native_event(
 
             if observed {
                 let next_seq = max_seq.map_or(0, |seq| seq + 1);
+                // ft-6lso5: same as the discovery path — a pane id the mux
+                // reports as created can already have output in storage (a
+                // daemon restart while the pane lived on), and a cursor built
+                // without an anchor re-emits that whole scrollback as a fresh
+                // delta on its first capture.
+                let resume_anchor = load_resume_anchor(storage, runtime_cx, pane_id).await;
 
                 {
                     let mut cursors_guard = cursors.write().await;
-                    cursors_guard
-                        .entry(pane_id)
-                        .or_insert_with(|| PaneCursor::from_seq(pane_id, next_seq));
+                    cursors_guard.entry(pane_id).or_insert_with(|| {
+                        PaneCursor::from_seq(pane_id, next_seq).with_resume_anchor(resume_anchor)
+                    });
                 }
 
                 {
