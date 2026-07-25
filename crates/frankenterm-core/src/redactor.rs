@@ -1,5 +1,6 @@
 //! Secret redaction for read, export, and audit surfaces.
 
+use aho_corasick::AhoCorasick;
 use regex::{Regex, RegexSet};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,6 +192,58 @@ const fn longest_streaming_anchor_len() -> usize {
 /// [`StreamingRedactor::with_tail_bytes`] knob safe to tune below it without
 /// re-opening that cross-boundary leak.
 const STREAMING_ANCHOR_TAIL_FLOOR: usize = longest_streaming_anchor_len() + 16;
+
+/// Lookup table of bytes that begin some [`STREAMING_SECRET_ANCHORS`] entry,
+/// in either ASCII case (ft-aznq6).
+///
+/// The partial-anchor retention rule fires on a single trailing byte whenever
+/// that byte is an anchor's first character, which is by far the common case.
+/// A table turns that test into one load instead of a rescan of the whole tail
+/// window, which is what made the backwards walk quadratic.
+const fn anchor_initial_byte_table() -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < STREAMING_SECRET_ANCHORS.len() {
+        let bytes = STREAMING_SECRET_ANCHORS[i].as_bytes();
+        if !bytes.is_empty() {
+            table[bytes[0].to_ascii_lowercase() as usize] = true;
+            table[bytes[0].to_ascii_uppercase() as usize] = true;
+        }
+        i += 1;
+    }
+    table
+}
+
+static ANCHOR_INITIAL_BYTES: [bool; 256] = anchor_initial_byte_table();
+
+/// Case-insensitive multi-pattern automaton over [`STREAMING_SECRET_ANCHORS`]
+/// (ft-aznq6).
+///
+/// The anchor-occurrence rule needs every occurrence in the pending buffer, and
+/// it needs them repeatedly as the emit boundary walks left. Finding them with
+/// one `rfind` per anchor per boundary re-scanned the whole tail window ~78
+/// times per step; one automaton pass collects them all in a single scan.
+static STREAMING_ANCHOR_AUTOMATON: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(STREAMING_SECRET_ANCHORS)
+        .expect("streaming anchor automaton")
+});
+
+/// Every [`STREAMING_SECRET_ANCHORS`] occurrence in `pending` as
+/// `(start, len)`, ascending by start (ft-aznq6).
+///
+/// Overlapping matches are all reported: `sk-` and `sk-ant-` both start at the
+/// same byte, and a missed occurrence would let the emit boundary advance past
+/// a partial secret.
+fn streaming_anchor_occurrences(pending: &str) -> Vec<(usize, usize)> {
+    let mut occurrences: Vec<(usize, usize)> = STREAMING_ANCHOR_AUTOMATON
+        .find_overlapping_iter(pending)
+        .map(|found| (found.start(), found.end() - found.start()))
+        .collect();
+    occurrences.sort_unstable();
+    occurrences
+}
 
 /// Pattern definition for secret detection.
 struct SecretPattern {
@@ -1252,9 +1305,12 @@ impl StreamingRedactor {
     fn stable_emit_boundary(&self) -> usize {
         let mut boundary = self.pending.len();
         let detections = self.redactor.detect(self.pending.as_str());
+        // ft-aznq6: one automaton pass, reused by every fixed-point iteration.
+        let anchor_occurrences = streaming_anchor_occurrences(self.pending.as_str());
 
         loop {
-            let mut next_boundary = self.earliest_secret_like_suffix_start(boundary, &detections);
+            let mut next_boundary =
+                self.earliest_secret_like_suffix_start(boundary, &detections, &anchor_occurrences);
             for (_, start, end) in &detections {
                 if *start < next_boundary && next_boundary < *end {
                     next_boundary = next_boundary.min(*start);
@@ -1275,75 +1331,123 @@ impl StreamingRedactor {
         &self,
         current_boundary: usize,
         detections: &[(&'static str, usize, usize)],
+        anchor_occurrences: &[(usize, usize)],
     ) -> usize {
         if current_boundary == 0 || self.pending.is_empty() {
             return current_boundary;
         }
 
-        let scan_start = floor_char_boundary(
-            self.pending.as_str(),
-            current_boundary.saturating_sub(self.effective_tail_bytes()),
-        );
-        let suffix = &self.pending.as_str()[scan_start..current_boundary];
+        let mut earliest = current_boundary;
+
         // br-ft-zbnz4: anchors are matched case-insensitively. The keyed secret
         // patterns are `(?i)` (e.g. `API_KEY=`, `TOKEN=`, `MISTRAL_API_KEY=`,
         // `AWS_SECRET_ACCESS_KEY=`), so an UPPERCASE env-var-style key name split
         // across a chunk boundary must still trigger tail retention; a
-        // case-sensitive `rfind` missed those and leaked the split value.
-        // `to_ascii_lowercase` preserves byte length (every anchor is ASCII), so
-        // offsets in `suffix_lower` map 1:1 back into `self.pending`.
-        let suffix_lower = suffix.to_ascii_lowercase();
-        let mut earliest = current_boundary;
-
-        // NOTE (ft-aznq6): the two "partial thing at the end" rules below are
-        // re-applied at every boundary `stable_emit_boundary` proposes, not
-        // just at the true end of `pending`. That makes the boundary walk
-        // backwards one byte per fixed-point iteration through a trailing run
-        // of anchor-initial characters, each iteration re-scanning the whole
-        // tail window — quadratic, and on a long run it does not finish.
+        // case-sensitive scan missed those and leaked the split value. The
+        // automaton behind `anchor_occurrences` is built with
+        // `ascii_case_insensitive(true)`.
         //
-        // Gating them to `current_boundary == self.pending.len()` fixes the
-        // cost but is NOT correct on its own: the repeated walk-back is what
-        // keeps a key name like `auth_` `token=…` together across a chunk
-        // split, and dropping it breaks the streaming-equals-batch equivalence
-        // that `streaming_redactor_never_leaks_any_corpus_positive_across_splits`
-        // pins. A correct fix has to compute the maximal retainable trailing
-        // run in one pass instead of iterating a one-byte rule. Tracked in
-        // ft-aznq6 with the full diagnosis.
-        for anchor in STREAMING_SECRET_ANCHORS {
-            let anchor_lower = anchor.to_ascii_lowercase();
-            if let Some(offset) = suffix_lower.rfind(anchor_lower.as_str()) {
-                let candidate = scan_start + offset;
-                let candidate_value_start = candidate + anchor.len();
-                let covered_by_complete_detection = detections.iter().any(|(_, start, end)| {
-                    *end < current_boundary
-                        && ((*start <= candidate && candidate < *end)
-                            || keyed_anchor_reaches_detection_value(
-                                self.pending.as_str(),
-                                candidate_value_start,
-                                *start,
-                            ))
-                });
-                if !covered_by_complete_detection {
-                    earliest = earliest.min(candidate);
-                }
-            }
+        // ft-aznq6: an anchor occurrence inside the scan window pulls the
+        // boundary back to its start, and the rule then applies again at the
+        // new boundary — so this is a chain, and the caller's fixed-point loop
+        // used to re-derive one link of it per iteration by re-scanning the
+        // whole tail window once per anchor (~4.6 MB per link). Short anchors
+        // like `AC` occur in ordinary English, so a 200 KiB run of plain build
+        // output took minutes. Walking the precomputed occurrence list instead
+        // collapses the whole chain in one descending pass.
+        //
+        // The collapse is exact: if the rule fires at boundary `b` and moves to
+        // occurrence `p`, then every position `q` in `(p, b)` still has `p`
+        // inside its own window (`p >= b - tail >= q - tail`) and still sees it
+        // as uncovered (coverage requires a detection ending before the
+        // boundary, and lowering the boundary only shrinks that set), so no
+        // fixed point of the rule can be skipped by the jump.
+        earliest = earliest.min(self.anchor_occurrence_chain_start(
+            current_boundary,
+            detections,
+            anchor_occurrences,
+        ));
 
-            for prefix_len in 1..anchor.len() {
-                let prefix = &anchor_lower[..prefix_len];
-                if suffix_lower.ends_with(prefix) {
-                    earliest = earliest.min(current_boundary - prefix.len());
-                }
-            }
-        }
-
-        if let Some(boundary_start) =
-            trailing_generic_token_or_secret_boundary_start(self.pending.as_str(), current_boundary)
-        {
-            earliest = earliest.min(boundary_start);
-        }
+        // ft-aznq6: retain the whole trailing run of partial-anchor /
+        // separator bytes in a single backward pass.
+        //
+        // The two rules folded into `retainable_trailing_run_start` (a
+        // truncated anchor prefix at the end of `pending`, and a trailing `_`
+        // or `-`) each move the boundary back by only a few bytes, and the
+        // caller re-applies them at every boundary its fixed-point loop
+        // proposes. Evaluating them one boundary at a time therefore walked
+        // backwards a byte at a time through any trailing run of
+        // anchor-initial characters, re-lowercasing the whole tail window and
+        // re-running ~78 `rfind` scans of it per byte of progress: ~4.6 MB
+        // scanned per byte. `print('a' * 1_000_000)` never returned, and
+        // because the boundary can reach 0, `pending` never drained and grew
+        // to `max_pending_bytes`, degrading a cost bug into the
+        // forced-overflow path's weaker redaction guarantee.
+        //
+        // Collapsing the run in one pass is not an approximation. If
+        // `pending[b-p..b]` equals an anchor's `p`-byte prefix then for every
+        // `0 < q < p` the boundary `b-q` ends with that anchor's `(p-q)`-byte
+        // prefix, so the same rule fires there and lands no later than `b-p`.
+        // Every position the per-byte walk would have visited therefore also
+        // retains, and no jump can skip over a non-retaining position — the
+        // walk's fixed point is exactly the last position where neither rule
+        // fires, which is what this computes.
+        earliest = earliest.min(retainable_trailing_run_start(
+            self.pending.as_str(),
+            current_boundary,
+            self.effective_tail_bytes(),
+        ));
 
         floor_char_boundary(self.pending.as_str(), earliest)
+    }
+
+    /// Walk the anchor-occurrence retention rule to its fixed point (ft-aznq6).
+    ///
+    /// Starting at `current_boundary`, repeatedly move to the start of the
+    /// latest anchor occurrence that is fully inside the scan window and is not
+    /// already covered by a complete detection. Returns the first boundary whose
+    /// window holds no such occurrence.
+    fn anchor_occurrence_chain_start(
+        &self,
+        current_boundary: usize,
+        detections: &[(&'static str, usize, usize)],
+        anchor_occurrences: &[(usize, usize)],
+    ) -> usize {
+        let pending = self.pending.as_str();
+        let tail_bytes = self.effective_tail_bytes();
+        let mut boundary = current_boundary;
+        let mut idx = anchor_occurrences.len();
+
+        while idx > 0 {
+            idx -= 1;
+            let (start, len) = anchor_occurrences[idx];
+
+            // Occurrences are ascending, so `start` only decreases from here.
+            // An anchor straddling the boundary was never visible to the
+            // windowed scan this replaces; skip it and keep descending.
+            if start + len > boundary {
+                continue;
+            }
+
+            let scan_start =
+                floor_char_boundary(pending, boundary.saturating_sub(tail_bytes));
+            if start < scan_start {
+                // Outside the window, and every remaining occurrence is further
+                // left, so the chain has reached its fixed point.
+                break;
+            }
+
+            let covered_by_complete_detection = detections.iter().any(|(_, det_start, det_end)| {
+                *det_end < boundary
+                    && ((*det_start <= start && start < *det_end)
+                        || keyed_anchor_reaches_detection_value(pending, start + len, *det_start))
+            });
+            if !covered_by_complete_detection {
+                boundary = start;
+            }
+        }
+
+        boundary
     }
 
     fn effective_tail_bytes(&self) -> usize {
@@ -1398,6 +1502,69 @@ fn trailing_generic_token_or_secret_boundary_start(
     let boundary_start = current_boundary - 1;
     let byte = pending.as_bytes()[boundary_start];
     matches!(byte, b'_' | b'-').then_some(boundary_start)
+}
+
+/// Start of the maximal trailing run of bytes the partial-anchor and
+/// trailing-separator retention rules would walk back over (ft-aznq6).
+///
+/// Returns the highest `boundary <= current_boundary` at which neither rule
+/// fires, which is the fixed point of applying them repeatedly — see the call
+/// site for why iterating them one boundary at a time is equivalent but
+/// quadratic. Cost is one byte-table lookup per retained byte in the common
+/// case, and at most `sum(anchor.len())` byte comparisons for a byte that only
+/// continues a multi-byte anchor prefix.
+fn retainable_trailing_run_start(pending: &str, current_boundary: usize, tail_limit: usize) -> usize {
+    let mut boundary = current_boundary.min(pending.len());
+    while boundary > 0 && retains_trailing_secret_fragment(pending, boundary, tail_limit) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+/// Whether `pending[..boundary]` ends with something worth holding back for the
+/// next chunk: a `_`/`-` separator, or a truncated [`STREAMING_SECRET_ANCHORS`]
+/// prefix (ft-aznq6).
+///
+/// `tail_limit` mirrors [`StreamingRedactor::effective_tail_bytes`]: a fragment
+/// longer than the scan window could not have been seen by the windowed scan it
+/// replaces, so it must not retain here either.
+fn retains_trailing_secret_fragment(pending: &str, boundary: usize, tail_limit: usize) -> bool {
+    debug_assert!(boundary > 0 && boundary <= pending.len());
+
+    // The separator rule reads the byte before the boundary directly and is not
+    // window-limited.
+    if trailing_generic_token_or_secret_boundary_start(pending, boundary).is_some() {
+        return true;
+    }
+
+    if tail_limit == 0 {
+        return false;
+    }
+
+    let bytes = pending.as_bytes();
+    // Fast path: a single trailing byte that starts some anchor. This covers
+    // every `prefix_len == 1` match, which is what a long run of ordinary
+    // letters hits.
+    if ANCHOR_INITIAL_BYTES[bytes[boundary - 1] as usize] {
+        return true;
+    }
+
+    // Slow path: the trailing bytes continue an anchor prefix without being an
+    // anchor's own first byte (`"aw"` for `aws_secret_access_key`). Bounded by
+    // the longest anchor, and only reached for bytes the table rejected.
+    let fragment_cap = longest_streaming_anchor_len().min(tail_limit);
+    let window_start = boundary.saturating_sub(fragment_cap);
+    let tail = &bytes[window_start..boundary];
+    STREAMING_SECRET_ANCHORS.iter().any(|anchor| {
+        let anchor_bytes = anchor.as_bytes();
+        // `prefix_len == anchor.len()` is a complete anchor, which the
+        // occurrence scan already handles; only truncated prefixes retain here.
+        (2..anchor_bytes.len())
+            .filter(|prefix_len| *prefix_len <= tail.len())
+            .any(|prefix_len| {
+                tail[tail.len() - prefix_len..].eq_ignore_ascii_case(&anchor_bytes[..prefix_len])
+            })
+    })
 }
 
 impl Default for StreamingRedactor {
@@ -2354,6 +2521,264 @@ mod tests {
 
         // Drain pending so subsequent tests start fresh.
         let _ = streaming.finish();
+    }
+
+    /// Reference implementation of the pre-ft-aznq6 retention rules: apply the
+    /// truncated-anchor-prefix and trailing-separator rules one boundary at a
+    /// time until they stop moving, re-scanning the tail window every step.
+    ///
+    /// This is the semantics [`retainable_trailing_run_start`] replaces, kept in
+    /// the test module so the equivalence claim is pinned rather than asserted.
+    fn reference_per_byte_retention_walk(
+        pending: &str,
+        current_boundary: usize,
+        tail_limit: usize,
+    ) -> usize {
+        let mut boundary = current_boundary.min(pending.len());
+        loop {
+            let mut next = boundary;
+            if boundary > 0 {
+                let scan_start =
+                    super::floor_char_boundary(pending, boundary.saturating_sub(tail_limit));
+                let suffix_lower = pending[scan_start..boundary].to_ascii_lowercase();
+                for anchor in super::STREAMING_SECRET_ANCHORS {
+                    let anchor_lower = anchor.to_ascii_lowercase();
+                    for prefix_len in 1..anchor.len() {
+                        if suffix_lower.ends_with(&anchor_lower[..prefix_len]) {
+                            next = next.min(boundary - prefix_len);
+                        }
+                    }
+                }
+                if let Some(start) =
+                    super::trailing_generic_token_or_secret_boundary_start(pending, boundary)
+                {
+                    next = next.min(start);
+                }
+            }
+
+            if next == boundary {
+                return boundary;
+            }
+            boundary = next;
+        }
+    }
+
+    /// Reference implementation of the pre-ft-aznq6 anchor-occurrence rule:
+    /// re-scan the windowed tail once per anchor, take the earliest last
+    /// occurrence, and repeat from there.
+    fn reference_anchor_occurrence_chain(
+        pending: &str,
+        current_boundary: usize,
+        tail_limit: usize,
+    ) -> usize {
+        let mut boundary = current_boundary;
+        loop {
+            let mut earliest = boundary;
+            if boundary > 0 && !pending.is_empty() {
+                let scan_start =
+                    super::floor_char_boundary(pending, boundary.saturating_sub(tail_limit));
+                let suffix_lower = pending[scan_start..boundary].to_ascii_lowercase();
+                for anchor in super::STREAMING_SECRET_ANCHORS {
+                    let anchor_lower = anchor.to_ascii_lowercase();
+                    if let Some(offset) = suffix_lower.rfind(anchor_lower.as_str()) {
+                        earliest = earliest.min(scan_start + offset);
+                    }
+                }
+            }
+            if earliest == boundary {
+                return boundary;
+            }
+            boundary = earliest;
+        }
+    }
+
+    /// ft-aznq6: the precomputed-occurrence chain walk must land exactly where
+    /// the repeated windowed `rfind` scan it replaced landed (no detections
+    /// present, which is the case the coverage rule leaves untouched).
+    #[test]
+    fn ft_aznq6_anchor_chain_matches_repeated_window_scan() {
+        let cases = [
+            "",
+            "no anchors at all: 12345",
+            "one token here",
+            "   Compiling frankenterm-core v0.12.0 (cached package, backtrace off)\n",
+            "cached package backtrace cached package backtrace cached package",
+            "sk-ant-api03-xxxx",
+            "https://example.test/callback?code=abc",
+            "AC AC AC AC AC AC AC AC",
+            "trailing multibyte é and an ac before it",
+        ];
+
+        for case in cases {
+            for tail_limit in [1_usize, 4, 16, super::STREAMING_ANCHOR_TAIL_FLOOR, 65536] {
+                let mut streaming = StreamingRedactor::new()
+                    .with_tail_bytes(tail_limit)
+                    .with_max_pending_bytes(super::DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES);
+                streaming.pending.push_lossy_decoded(case.as_bytes());
+                let effective = streaming.effective_tail_bytes();
+
+                let occurrences = super::streaming_anchor_occurrences(case);
+                let actual =
+                    streaming.anchor_occurrence_chain_start(case.len(), &[], &occurrences);
+                let expected = reference_anchor_occurrence_chain(case, case.len(), effective);
+
+                assert_eq!(
+                    actual, expected,
+                    "anchor chain diverged for {case:?} at tail_limit={tail_limit} \
+                     (effective={effective})"
+                );
+            }
+        }
+    }
+
+    /// ft-aznq6: the single-pass run collapse must land exactly where the
+    /// per-byte walk it replaced landed. Retaining less would leak a split
+    /// secret; retaining more would change where output is cut.
+    #[test]
+    fn ft_aznq6_run_collapse_matches_per_byte_walk() {
+        let cases = [
+            "",
+            "a",
+            "x",
+            "1",
+            "aaaa",
+            "auth_t",
+            "auth_token=",
+            "aws_",
+            "aws_secret_access_ke",
+            "plain log line 42",
+            "value ends in dash-",
+            "value ends in underscore_",
+            "-----BEGIN ",
+            "----",
+            "code=",
+            "Authorization: Bearer ab",
+            "trailing multibyte é",
+            "é",
+            "mixed AIza-aaa_bbb-",
+            "DATADOG_API_KE",
+            "no fragment here.",
+            "ends with digit 7",
+        ];
+
+        for case in cases {
+            for tail_limit in [0_usize, 1, 2, 8, 64, super::STREAMING_ANCHOR_TAIL_FLOOR, 4096] {
+                let expected = reference_per_byte_retention_walk(case, case.len(), tail_limit);
+                let actual =
+                    super::retainable_trailing_run_start(case, case.len(), tail_limit);
+                assert_eq!(
+                    actual, expected,
+                    "run collapse diverged from the per-byte walk for {case:?} \
+                     at tail_limit={tail_limit}"
+                );
+            }
+        }
+    }
+
+    /// ft-aznq6: a long run of anchor-initial bytes used to walk the emit
+    /// boundary backwards one byte per fixed-point iteration, re-scanning the
+    /// whole tail window each step (~4.6 MB scanned per byte of progress), so
+    /// `print('a' * 1_000_000)` never returned from `redact_chunk`.
+    #[test]
+    fn ft_aznq6_long_anchor_initial_run_streams_in_bounded_time() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        // 'a' begins several anchors (api_key, apikey, access_token, …), so
+        // every position in the run satisfies the partial-anchor rule.
+        const CHUNK: usize = 4096;
+        const TOTAL: usize = 200 * 1024;
+        let chunk = "a".repeat(CHUNK);
+
+        let mut streaming = StreamingRedactor::new();
+        let started = std::time::Instant::now();
+        for _ in 0..(TOTAL / CHUNK) {
+            let _ = streaming.redact_chunk(chunk.as_bytes());
+        }
+        let flushed = streaming.finish();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "200 KiB of anchor-initial bytes must stream in bounded time; took {elapsed:?}"
+        );
+        assert_eq!(
+            super::streaming_redactor_pending_overflow_count(),
+            0,
+            "200 KiB is far below the pending cap, so the weaker forced-emission \
+             path must not fire"
+        );
+        assert_eq!(
+            flushed.bytes.len(),
+            TOTAL,
+            "no output may be lost across the run"
+        );
+    }
+
+    /// ft-aznq6: same defect via the trailing-separator rule. A long `-----`
+    /// separator line stepped back 5 bytes per iteration (prefixes of
+    /// `-----BEGIN `), which is ~20k full-window rescans for 100k bytes.
+    #[test]
+    fn ft_aznq6_long_separator_run_streams_in_bounded_time() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        const CHUNK: usize = 4096;
+        const TOTAL: usize = 200 * 1024;
+        let chunk = "-".repeat(CHUNK);
+
+        let mut streaming = StreamingRedactor::new();
+        let started = std::time::Instant::now();
+        for _ in 0..(TOTAL / CHUNK) {
+            let _ = streaming.redact_chunk(chunk.as_bytes());
+        }
+        let flushed = streaming.finish();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "200 KiB of separator bytes must stream in bounded time; took {elapsed:?}"
+        );
+        assert_eq!(super::streaming_redactor_pending_overflow_count(), 0);
+        assert_eq!(flushed.bytes.len(), TOTAL);
+    }
+
+    /// ft-aznq6: cost of ordinary secret-free prose through the streaming path.
+    ///
+    /// This is the *other* rule in the same function: the anchor-occurrence scan
+    /// pulls the boundary back to the earliest anchor occurrence in its window,
+    /// one full-window rescan per occurrence. Short anchors like `AC` occur in
+    /// ordinary English, so this measures the common path rather than an
+    /// adversarial one. Prints its own timing so the cost is on the record; the
+    /// assertion is a loose regression guard, not an SLO.
+    #[test]
+    fn ft_aznq6_ordinary_prose_streams_in_bounded_time() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        // Realistic build/agent output: no secrets, but plenty of short-anchor
+        // substrings ("ac" in "cache"/"package", "code=" absent, etc.).
+        let line = "   Compiling frankenterm-core v0.12.0 (cached package, backtrace off)\n";
+        let chunk = line.repeat(60); // ~4 KiB
+        let total = chunk.len() * 50; // ~200 KiB
+
+        let mut streaming = StreamingRedactor::new();
+        let started = std::time::Instant::now();
+        for _ in 0..50 {
+            let _ = streaming.redact_chunk(chunk.as_bytes());
+        }
+        let flushed = streaming.finish();
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "[ft-aznq6] ordinary prose: {} KiB in {elapsed:?} ({} bytes flushed at end)",
+            total / 1024,
+            flushed.bytes.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "200 KiB of ordinary prose must stream in bounded time; took {elapsed:?}"
+        );
     }
 
     #[test]
