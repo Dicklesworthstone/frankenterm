@@ -345,16 +345,30 @@ proptest! {
         overlap_size in arb_overlap_size(),
     ) {
         if let DeltaResult::Content(delta) = extract_delta(&previous, &current, overlap_size) {
-            prop_assert!(
-                delta.len() < current.len(),
-                "Content delta.len()={} must be strictly < current.len()={} \
-                 (overlap is always >= 1 byte when Content is returned); \
-                 delta={:?}, current={:?}",
-                delta.len(),
-                current.len(),
-                delta,
-                current
-            );
+            if previous.is_empty() {
+                // First capture for a pane: there is no baseline to overlap
+                // against, so `extract_delta` returns the whole capture and the
+                // strictly-shorter form cannot hold. The rationale above missed
+                // this branch, so the property failed for any generated or
+                // shrunk `previous = ""` — pinning the branch explicitly instead
+                // of leaving the guard with a hole in it.
+                prop_assert_eq!(
+                    delta.as_str(),
+                    current.as_str(),
+                    "a first capture must return the whole snapshot"
+                );
+            } else {
+                prop_assert!(
+                    delta.len() < current.len(),
+                    "Content delta.len()={} must be strictly < current.len()={} \
+                     (overlap is always >= 1 byte when Content is returned); \
+                     delta={:?}, current={:?}",
+                    delta.len(),
+                    current.len(),
+                    delta,
+                    current
+                );
+            }
         }
     }
 

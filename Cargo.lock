@@ -4222,6 +4222,7 @@ dependencies = [
 name = "frankenterm-redactor"
 version = "0.12.0"
 dependencies = [
+ "aho-corasick",
  "proptest",
  "regex",
  "serde",
@@ -13653,80 +13654,80 @@ source = "git+https://github.com/Dicklesworthstone/rich_rust?rev=a4c3735ab62ffb7
 
 [[patch.unused]]
 name = "fsqlite"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-ast"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-btree"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-core"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-error"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-ext-fts5"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-ext-icu"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-ext-json"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-ext-misc"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-ext-rtree"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-func"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-mvcc"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-observability"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-pager"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-parser"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-planner"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-types"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-vdbe"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-vfs"
-version = "0.1.15"
+version = "0.1.19"
 
 [[patch.unused]]
 name = "fsqlite-wal"
-version = "0.1.15"
+version = "0.1.19"

@@ -15,6 +15,10 @@ categories = ["development-tools"]
 workspace = true
 
 [dependencies]
+# ft-aznq6: the shared `redactor.rs` source finds streaming anchor occurrences
+# with a single case-insensitive Aho-Corasick pass, so this shim crate needs the
+# same dependency `frankenterm-core` has.
+aho-corasick = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive", "std", "alloc"] }
 serde_json = { workspace = true }

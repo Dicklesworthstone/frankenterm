@@ -2818,11 +2818,21 @@ impl ObservationRuntime {
                                     .unwrap_or(None);
 
                                 let next_seq = max_seq.map_or(0, |s| s + 1);
+                                // ft-6lso5: on a restart this pane is "new" to
+                                // the registry but not to storage. Without an
+                                // anchor into what is already persisted, the
+                                // first capture re-emits the pane's whole
+                                // scrollback as a fresh delta.
+                                let resume_anchor =
+                                    load_resume_anchor(&storage, &loop_cx, pane_id).await;
 
                                 {
                                     let mut cursors = cursors.write().await;
-                                    cursors
-                                        .insert(pane_id, PaneCursor::from_seq(pane_id, next_seq));
+                                    cursors.insert(
+                                        pane_id,
+                                        PaneCursor::from_seq(pane_id, next_seq)
+                                            .with_resume_anchor(resume_anchor),
+                                    );
                                 }
 
                                 {
@@ -2929,6 +2939,12 @@ impl ObservationRuntime {
                                 .await
                                 .unwrap_or(None);
                             let next_seq = resumed_capture_next_seq(max_seq, resume_next_seq);
+                            // ft-6lso5: same reasoning as the new-pane arm —
+                            // the compacted cursor took its snapshot baseline
+                            // with it, so anchor the resumed capture against
+                            // what is already persisted.
+                            let resume_anchor =
+                                load_resume_anchor(&storage, &loop_cx, pane_id).await;
 
                             let created = {
                                 // Lock order: cursors (rank 1) before
@@ -2939,6 +2955,7 @@ impl ObservationRuntime {
                                 resume_runtime_pane_state(
                                     pane_id,
                                     next_seq,
+                                    resume_anchor,
                                     &mut cursors_guard,
                                     &mut contexts_guard,
                                 )
@@ -4604,6 +4621,68 @@ fn compact_runtime_pane_state(
     }
 }
 
+/// How many of a pane's most recent stored segments to read when building a
+/// resume anchor (ft-6lso5).
+///
+/// Segments are capped at `IngestTuning::DEFAULT_MAX_PERSIST_SEGMENT_BYTES`
+/// (64 KiB) but are usually far smaller, so this is a bound on the read rather
+/// than a target: the assembled text is truncated to
+/// [`crate::ingest::RESUME_ANCHOR_BYTES`] regardless.
+const RESUME_ANCHOR_SEGMENT_LIMIT: usize = 32;
+
+/// Assemble the tail of a pane's persisted output for use as a resume anchor
+/// (ft-6lso5).
+///
+/// Returns an empty string when nothing is stored for the pane (a genuinely new
+/// pane) or when the read fails — an absent anchor degrades to the pre-ft-6lso5
+/// behaviour of treating the first capture as fresh content, which is wrong but
+/// no worse than refusing to capture.
+async fn load_resume_anchor(storage: &StorageHandle, cx: &crate::cx::Cx, pane_id: u64) -> String {
+    let segments = match storage
+        .get_segments_with_cx(cx, pane_id, RESUME_ANCHOR_SEGMENT_LIMIT)
+        .await
+    {
+        Ok(segments) => segments,
+        Err(error) => {
+            warn!(
+                pane_id,
+                error = %error,
+                "Failed to read stored segments for resume anchor; first capture may re-emit \
+                 already-stored output"
+            );
+            return String::new();
+        }
+    };
+
+    assemble_resume_anchor(segments)
+}
+
+/// Concatenate stored segments (newest first, as `get_segments` returns them)
+/// into the trailing text used as a resume anchor (ft-6lso5).
+fn assemble_resume_anchor(segments: Vec<crate::storage::Segment>) -> String {
+    let mut ordered = segments;
+    // `get_segments` returns `seq DESC`; the anchor is the text in capture
+    // order.
+    ordered.sort_by_key(|segment| segment.seq);
+
+    let mut tail = String::new();
+    for segment in ordered {
+        tail.push_str(&segment.content);
+        if tail.len() > crate::ingest::RESUME_ANCHOR_BYTES * 2 {
+            // Keep the working string bounded on panes with large segments;
+            // only the trailing window can ever matter.
+            let trimmed = crate::ingest::resume_anchor_tail(
+                &tail,
+                crate::ingest::RESUME_ANCHOR_BYTES,
+            )
+            .to_string();
+            tail = trimmed;
+        }
+    }
+
+    crate::ingest::resume_anchor_tail(&tail, crate::ingest::RESUME_ANCHOR_BYTES).to_string()
+}
+
 /// Sequence number a re-admitted pane must resume capture at (ft-0kdi9).
 ///
 /// Two independent records survive an observation gap and either can be the
@@ -4639,12 +4718,15 @@ fn resumed_capture_next_seq(max_persisted_seq: Option<u64>, resume_next_seq: u64
 fn resume_runtime_pane_state(
     pane_id: u64,
     next_seq: u64,
+    resume_anchor: String,
     cursors: &mut HashMap<u64, PaneCursor>,
     detection_contexts: &mut HashMap<u64, DetectionContext>,
 ) -> bool {
     let created = match cursors.entry(pane_id) {
         std::collections::hash_map::Entry::Vacant(vacant) => {
-            vacant.insert(PaneCursor::from_seq(pane_id, next_seq));
+            vacant.insert(
+                PaneCursor::from_seq(pane_id, next_seq).with_resume_anchor(resume_anchor),
+            );
             true
         }
         std::collections::hash_map::Entry::Occupied(_) => false,
@@ -7881,6 +7963,7 @@ mod tests {
         let created = resume_runtime_pane_state(
             7,
             next_seq,
+            "already stored tail\n".to_string(),
             &mut cursors,
             &mut detection_contexts,
         );
@@ -7896,6 +7979,13 @@ mod tests {
             Some(7),
             "the detection context compaction dropped must be rebuilt too"
         );
+        // ft-6lso5: the rebuilt cursor has no snapshot baseline, so it must
+        // carry an anchor into already-persisted output or the next capture
+        // re-emits the pane's whole scrollback.
+        assert!(
+            cursors.get(&7).is_some_and(PaneCursor::has_resume_anchor),
+            "a rebuilt cursor must be anchored against stored output"
+        );
     }
 
     /// ft-0kdi9: resume must never rewind a cursor that is still live, which is
@@ -7906,7 +7996,13 @@ mod tests {
         let mut cursors = HashMap::from([(7_u64, PaneCursor::from_seq(7, 99))]);
         let mut detection_contexts: HashMap<u64, DetectionContext> = HashMap::new();
 
-        let created = resume_runtime_pane_state(7, 5, &mut cursors, &mut detection_contexts);
+        let created = resume_runtime_pane_state(
+            7,
+            5,
+            "tail\n".to_string(),
+            &mut cursors,
+            &mut detection_contexts,
+        );
 
         assert!(!created);
         assert_eq!(
@@ -7917,6 +8013,62 @@ mod tests {
         assert!(
             detection_contexts.contains_key(&7),
             "a missing detection context is still rebuilt"
+        );
+    }
+
+    /// ft-6lso5: the resume anchor is the tail of persisted output in capture
+    /// order. `get_segments` returns newest-first, so assembling it in the
+    /// returned order would produce text that never appears in the pane and the
+    /// anchor would never match.
+    #[test]
+    fn ft_6lso5_assemble_resume_anchor_restores_capture_order() {
+        fn segment(seq: u64, content: &str) -> crate::storage::Segment {
+            crate::storage::Segment {
+                id: i64::try_from(seq).expect("test seq fits i64"),
+                pane_id: 3,
+                seq,
+                content: content.to_string(),
+                content_len: content.len(),
+                content_hash: None,
+                captured_at: 0,
+            }
+        }
+
+        // Newest-first, as the storage query returns them.
+        let segments = vec![
+            segment(2, "third\n"),
+            segment(1, "second\n"),
+            segment(0, "first\n"),
+        ];
+
+        assert_eq!(
+            assemble_resume_anchor(segments),
+            "first\nsecond\nthird\n",
+            "anchor must read in capture order to match the pane's scrollback"
+        );
+        assert_eq!(assemble_resume_anchor(Vec::new()), "");
+    }
+
+    /// ft-6lso5: the anchor is bounded, and truncation keeps the *trailing*
+    /// bytes — the newest output is what the next capture will still show.
+    #[test]
+    fn ft_6lso5_assemble_resume_anchor_keeps_bounded_tail() {
+        let big = "x".repeat(crate::ingest::RESUME_ANCHOR_BYTES * 3);
+        let segments = vec![crate::storage::Segment {
+            id: 1,
+            pane_id: 3,
+            seq: 0,
+            content: format!("{big}TAIL"),
+            content_len: big.len() + 4,
+            content_hash: None,
+            captured_at: 0,
+        }];
+
+        let anchor = assemble_resume_anchor(segments);
+        assert!(anchor.len() <= crate::ingest::RESUME_ANCHOR_BYTES);
+        assert!(
+            anchor.ends_with("TAIL"),
+            "truncation must keep the newest output"
         );
     }
 

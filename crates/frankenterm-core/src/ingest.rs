@@ -592,6 +592,14 @@ pub struct PaneCursor {
     pub in_gap: bool,
     /// Whether we're currently in alternate screen buffer
     pub in_alt_screen: bool,
+    /// Tail of already-persisted output, used exactly once to re-anchor the
+    /// first capture on a cursor that resumed without a snapshot baseline
+    /// (ft-6lso5).
+    ///
+    /// Private: consumed by [`Self::capture_snapshot`] on first use, and a
+    /// caller that could overwrite it after capture started would silently
+    /// re-anchor mid-stream. Set it with [`Self::with_resume_anchor`].
+    resume_anchor: Option<String>,
 }
 
 /// The capture-advanced fields of a [`PaneCursor`], lifted out so the
@@ -632,6 +640,7 @@ impl PaneCursor {
             last_hash: None,
             in_gap: false,
             in_alt_screen: false,
+            resume_anchor: None,
         }
     }
 
@@ -645,7 +654,41 @@ impl PaneCursor {
             last_hash: None,
             in_gap: false,
             in_alt_screen: false,
+            resume_anchor: None,
         }
+    }
+
+    /// Attach the tail of already-persisted output so the first capture can be
+    /// anchored against it instead of being re-emitted whole (ft-6lso5).
+    ///
+    /// A cursor built from a stored `next_seq` has no snapshot baseline, so
+    /// `extract_delta` took the `previous.is_empty()` branch and returned the
+    /// pane's entire current scrollback as a normal `Delta`. Every observed pane
+    /// re-stored everything it had already stored on every daemon restart, with
+    /// no gap marker to tell any consumer a discontinuity had occurred — search
+    /// returned each line twice and replay showed each command twice.
+    ///
+    /// The anchor cannot simply be assigned to `last_snapshot`: delta extraction
+    /// matches a *suffix* of the baseline against a *prefix* of the capture, and
+    /// the persisted tail is the newest content while a capture's prefix is its
+    /// oldest. The first capture instead locates the anchor inside the new text
+    /// and emits only what follows it; see [`Self::capture_snapshot`].
+    ///
+    /// An empty anchor is ignored — nothing has been persisted, so there is
+    /// nothing to resume from and the pane is genuinely new.
+    #[must_use]
+    pub fn with_resume_anchor(mut self, anchor: impl Into<String>) -> Self {
+        let anchor = anchor.into();
+        if !anchor.is_empty() {
+            self.resume_anchor = Some(anchor);
+        }
+        self
+    }
+
+    /// Whether this cursor still carries an unconsumed resume anchor (ft-6lso5).
+    #[must_use]
+    pub fn has_resume_anchor(&self) -> bool {
+        self.resume_anchor.is_some()
     }
 
     /// Get the last assigned sequence number.
@@ -756,7 +799,18 @@ impl PaneCursor {
         // Save old snapshot for comparison before updating
         let previous_snapshot = std::mem::take(&mut self.last_snapshot);
 
-        let delta = extract_delta(&previous_snapshot, current_snapshot, overlap_size);
+        // ft-6lso5: a cursor resumed from storage has no baseline, so the
+        // ordinary path would classify the pane's whole scrollback as a fresh
+        // delta and store it a second time. Anchor against what is already
+        // persisted instead. The anchor is consumed here whether or not it
+        // matched: it describes the state at resume time, and after this
+        // capture `last_snapshot` is authoritative.
+        let delta = match self.resume_anchor.take() {
+            Some(anchor) if previous_snapshot.is_empty() => {
+                resume_delta_from_anchor(&anchor, current_snapshot)
+            }
+            _ => extract_delta(&previous_snapshot, current_snapshot, overlap_size),
+        };
 
         // Update snapshot state regardless; capture is derived from these snapshots.
         self.last_snapshot = current_snapshot.to_string();
@@ -1930,12 +1984,63 @@ fn overlap_is_plausible(overlap: &str) -> bool {
         || (overlap.len() >= 2 && overlap.bytes().any(|byte| !byte.is_ascii_whitespace()))
 }
 
+/// Bytes of already-persisted output kept as a resume anchor (ft-6lso5).
+///
+/// Long enough that a match inside a scrollback is not a coincidence — the
+/// anchor is located by substring search, so it has to be distinctive — and
+/// short enough that loading it per pane at startup is cheap. Roughly forty
+/// terminal lines.
+pub const RESUME_ANCHOR_BYTES: usize = 4 * 1024;
+
+/// Delta for the first capture on a cursor resumed from storage (ft-6lso5).
+///
+/// The anchor is the tail of what has already been persisted for this pane, so
+/// everything after its last occurrence in the new capture is exactly the output
+/// that arrived while nothing was watching. Uses the *last* occurrence: a tail
+/// that repeats (a prompt line, a progress banner) must resume from the most
+/// recent one, otherwise the intervening output would be stored twice.
+///
+/// A missing anchor means the persisted tail is no longer in the pane's
+/// scrollback — it scrolled off, or the pane was cleared. That is a real
+/// discontinuity and is reported as one rather than being papered over.
+#[must_use]
+fn resume_delta_from_anchor(anchor: &str, current: &str) -> DeltaResult {
+    match current.rfind(anchor) {
+        Some(position) => {
+            let delta = &current[position + anchor.len()..];
+            if delta.is_empty() {
+                // Everything the pane still shows is already stored.
+                DeltaResult::NoChange
+            } else {
+                DeltaResult::Content(delta.to_string())
+            }
+        }
+        None => DeltaResult::Gap {
+            reason: "resume_anchor_not_found".to_string(),
+            content: current.to_string(),
+        },
+    }
+}
+
+/// Trailing `max_bytes` of `text`, snapped to a UTF-8 boundary (ft-6lso5).
+#[must_use]
+pub fn resume_anchor_tail(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 /// Extract delta from current vs previous content.
 ///
 /// This is designed for the "sliding window" case (polling successive snapshots):
 /// it finds the largest overlap where a suffix of `previous` matches a prefix of `current`.
 ///
-/// A border shorter than [`min_acceptable_overlap`] is refused as coincidental
+/// A border that [`overlap_is_plausible`] rejects is treated as boundary noise
 /// and reported as an explicit gap (ft-r5xkf).
 #[must_use]
 pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
@@ -3595,10 +3700,17 @@ mod tests {
     fn extract_delta_small_overlap_falls_back_when_probe_anchor_absent() {
         // Regression guard for f2c41fbd: if a future overlap-probe path picks
         // a prefix byte that never appears in the search window, it still has
-        // to find the real 1-byte suffix/prefix overlap instead of reporting a
-        // gap. `tailx` → `xnext` exercises that shape directly.
-        let prev = "tailx";
-        let cur = "xnext";
+        // to find the real, short suffix/prefix overlap instead of reporting a
+        // gap. `tailxy` → `xynext` exercises that shape directly: the overlap's
+        // first byte occurs exactly once in the search window, at its end.
+        //
+        // ft-r5xkf changed the vehicle, not the guard. This case used to use a
+        // one-byte overlap (`tailx` → `xnext`), and a one-byte border is now
+        // deliberately refused as boundary noise — see
+        // `ft_r5xkf_single_newline_coincidence_is_a_gap`. Two contentful bytes
+        // exercise the same probe path while staying an acceptable border.
+        let prev = "tailxy";
+        let cur = "xynext";
         let result = extract_delta(prev, cur, 1024);
         assert!(matches!(result, DeltaResult::Content(ref s) if s == "next"));
     }
@@ -3891,6 +4003,114 @@ mod tests {
         );
         assert_eq!(cursor.last_snapshot, windows.last().unwrap().to_string());
         assert_eq!(cursor.next_seq, windows.len() as u64);
+    }
+
+    /// ft-6lso5: after a restart the cursor resumes from a stored `next_seq`
+    /// with no snapshot baseline. Without an anchor the first capture returned
+    /// the pane's entire scrollback as a fresh `Delta`, so every observed pane
+    /// re-stored everything it had already stored, on every restart, with no
+    /// gap marker to say a discontinuity had happened.
+    #[test]
+    fn ft_6lso5_resumed_cursor_emits_only_output_captured_while_away() {
+        // Pane already has "$ echo hello\nhello\n" stored as seq 0..=1.
+        let mut cursor =
+            PaneCursor::from_seq(3, 2).with_resume_anchor("$ echo hello\nhello\n");
+        assert!(cursor.has_resume_anchor());
+
+        let segment = cursor
+            .capture_snapshot("$ echo hello\nhello\n$ echo bye\nbye\n", 1024, None)
+            .expect("new output must be captured");
+
+        assert_eq!(segment.kind, CapturedSegmentKind::Delta);
+        assert_eq!(
+            segment.content, "$ echo bye\nbye\n",
+            "only output produced while the daemon was down may be stored"
+        );
+        assert_eq!(segment.seq, 2, "sequence continues from storage");
+        assert!(
+            !cursor.has_resume_anchor(),
+            "the anchor describes resume time and must be consumed once"
+        );
+
+        // Subsequent captures use the ordinary snapshot path.
+        let next = cursor
+            .capture_snapshot("$ echo hello\nhello\n$ echo bye\nbye\nmore\n", 1024, None)
+            .expect("second capture");
+        assert_eq!(next.content, "more\n");
+        assert_eq!(next.kind, CapturedSegmentKind::Delta);
+    }
+
+    /// ft-6lso5: a pane that produced nothing while the daemon was down must
+    /// produce no segment at all, rather than re-storing its scrollback.
+    #[test]
+    fn ft_6lso5_resumed_cursor_with_no_new_output_emits_nothing() {
+        let mut cursor = PaneCursor::from_seq(3, 2).with_resume_anchor("$ echo hello\nhello\n");
+
+        assert!(
+            cursor
+                .capture_snapshot("$ echo hello\nhello\n", 1024, None)
+                .is_none(),
+            "nothing new means nothing to store"
+        );
+        assert_eq!(cursor.next_seq, 2, "no sequence number may be consumed");
+    }
+
+    /// ft-6lso5: if the persisted tail is no longer in the pane's scrollback the
+    /// discontinuity is real, and must be recorded as a gap instead of being
+    /// silently re-stored as a delta.
+    #[test]
+    fn ft_6lso5_resumed_cursor_reports_a_gap_when_the_anchor_scrolled_off() {
+        let mut cursor = PaneCursor::from_seq(3, 2).with_resume_anchor("$ echo hello\nhello\n");
+
+        let segment = cursor
+            .capture_snapshot("totally different scrollback\n", 1024, None)
+            .expect("discontinuity must be captured");
+
+        match segment.kind {
+            CapturedSegmentKind::Gap { ref reason } => {
+                assert_eq!(reason, "resume_anchor_not_found");
+            }
+            other => panic!("expected an explicit gap, got {other:?}"),
+        }
+        assert_eq!(segment.content, "totally different scrollback\n");
+        assert!(cursor.in_gap, "cursor must record that it is in a gap");
+    }
+
+    /// ft-6lso5: a tail that repeats in the scrollback (a prompt line, a
+    /// progress banner) must resume from its most recent occurrence, or the
+    /// output in between is stored twice — the very duplication being fixed.
+    #[test]
+    fn ft_6lso5_repeated_anchor_resumes_from_the_last_occurrence() {
+        let mut cursor = PaneCursor::from_seq(3, 5).with_resume_anchor("$ ");
+
+        let segment = cursor
+            .capture_snapshot("$ one\n$ two\n$ three\n", 1024, None)
+            .expect("capture");
+
+        assert_eq!(segment.content, "three\n");
+    }
+
+    /// ft-6lso5: an empty anchor means nothing is persisted, so the pane is
+    /// genuinely new and the whole capture is legitimately fresh content.
+    #[test]
+    fn ft_6lso5_empty_anchor_is_ignored() {
+        let mut cursor = PaneCursor::from_seq(3, 0).with_resume_anchor("");
+        assert!(!cursor.has_resume_anchor());
+
+        let segment = cursor.capture_snapshot("first output\n", 1024, None).expect("capture");
+        assert_eq!(segment.content, "first output\n");
+        assert_eq!(segment.kind, CapturedSegmentKind::Delta);
+    }
+
+    /// ft-6lso5: the anchor tail is byte-bounded and must never split a
+    /// multibyte character.
+    #[test]
+    fn ft_6lso5_resume_anchor_tail_snaps_to_char_boundary() {
+        assert_eq!(resume_anchor_tail("short", 64), "short");
+        assert_eq!(resume_anchor_tail("abcdef", 3), "def");
+        // '🌍' is 4 bytes; a 2-byte window cannot include it partially.
+        assert_eq!(resume_anchor_tail("ab🌍", 2), "");
+        assert_eq!(resume_anchor_tail("ab🌍", 4), "🌍");
     }
 
     #[test]
