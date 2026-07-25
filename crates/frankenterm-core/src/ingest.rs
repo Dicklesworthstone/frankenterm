@@ -261,6 +261,22 @@ impl ObservationDecision {
     }
 }
 
+/// Result of re-deciding a tracked pane's observation state (ft-0kdi9).
+///
+/// Returned by [`PaneRegistry::re_evaluate_observation`] so callers can mirror
+/// the transition into whatever capture-side state they own. The registry's own
+/// cursor map is not the one the capture pipeline reads; a caller that drops
+/// this value keeps the registry consistent but leaves any sibling map stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationTransition {
+    /// Pane is untracked, or its observation state did not change.
+    Unchanged,
+    /// Pane went `Ignored` -> `Observed`; capture state must be re-created.
+    Resumed,
+    /// Pane went `Observed` -> `Ignored`; capture state may be retired.
+    Retired,
+}
+
 // =============================================================================
 // Extended Pane Entry
 // =============================================================================
@@ -493,6 +509,17 @@ pub struct DiscoveryDiff {
     pub changed_panes: Vec<u64>,
     /// Panes whose fingerprint changed (new generation)
     pub new_generations: Vec<u64>,
+    /// Panes that flipped `Ignored` -> `Observed` on this tick (ft-0kdi9).
+    ///
+    /// An already-tracked pane can re-enter observation at any time, because
+    /// [`PaneRegistry::decide_observation`] re-runs the filter against the
+    /// live title/cwd on every tick. Such a pane is *not* in
+    /// [`Self::new_panes`] — the registry entry already existed — so a
+    /// consumer that only creates per-pane capture state for `new_panes`
+    /// silently never re-creates it. The observation runtime compacts its own
+    /// cursor map against the observed set, so without this signal capture for
+    /// the pane stays dead for the life of the process.
+    pub re_observed_panes: Vec<u64>,
 }
 
 impl DiscoveryDiff {
@@ -503,6 +530,7 @@ impl DiscoveryDiff {
             && self.closed_panes.is_empty()
             && self.changed_panes.is_empty()
             && self.new_generations.is_empty()
+            && self.re_observed_panes.is_empty()
     }
 
     /// Total number of changes
@@ -512,6 +540,7 @@ impl DiscoveryDiff {
             + self.closed_panes.len()
             + self.changed_panes.len()
             + self.new_generations.len()
+            + self.re_observed_panes.len()
     }
 }
 
@@ -1118,6 +1147,11 @@ impl PaneRegistry {
                     }
 
                     if is_observed && !was_observed {
+                        // ft-0kdi9: report the resumption so the observation
+                        // runtime can re-create the capture-side state it
+                        // dropped when this pane went unobserved. The registry
+                        // cursor below is not the one the tailer reads.
+                        diff.re_observed_panes.push(pane_id);
                         self.cursors.insert(
                             pane_id,
                             PaneCursor::from_seq(pane_id, entry.resume_next_seq),
@@ -1379,37 +1413,47 @@ impl PaneRegistry {
     }
 
     /// Re-evaluate observation decision for a pane (e.g., after filter change)
-    pub fn re_evaluate_observation(&mut self, pane_id: u64) {
+    ///
+    /// Returns the transition that occurred. A `Resumed` result means the
+    /// caller must re-create any capture-side per-pane state it owns outside
+    /// this registry — see [`ObservationTransition`] and ft-0kdi9.
+    pub fn re_evaluate_observation(&mut self, pane_id: u64) -> ObservationTransition {
         // Clone the PaneInfo to avoid borrow conflicts
         let pane_info = match self.entries.get(&pane_id) {
             Some(entry) => entry.info.clone(),
-            None => return,
+            None => return ObservationTransition::Unchanged,
         };
 
         let new_decision = self.decide_observation(&pane_info);
 
-        if let Some(entry) = self.entries.get_mut(&pane_id) {
-            let was_observed = entry.should_observe();
-            let is_observed = new_decision.is_observed();
+        let Some(entry) = self.entries.get_mut(&pane_id) else {
+            return ObservationTransition::Unchanged;
+        };
 
-            if entry.observation != new_decision {
-                entry.observation = new_decision;
-                entry.decision_at = epoch_ms();
-            }
+        let was_observed = entry.should_observe();
+        let is_observed = new_decision.is_observed();
 
-            // Update cursor state
-            if is_observed && !was_observed {
-                // Now observed - resume monotonic sequencing instead of restarting at zero.
-                self.cursors.insert(
-                    pane_id,
-                    PaneCursor::from_seq(pane_id, entry.resume_next_seq),
-                );
-            } else if !is_observed && was_observed {
-                // Now ignored - preserve the next sequence number for future resumption.
-                if let Some(cursor) = self.cursors.remove(&pane_id) {
-                    entry.resume_next_seq = cursor.next_seq;
-                }
+        if entry.observation != new_decision {
+            entry.observation = new_decision;
+            entry.decision_at = epoch_ms();
+        }
+
+        // Update cursor state
+        if is_observed && !was_observed {
+            // Now observed - resume monotonic sequencing instead of restarting at zero.
+            self.cursors.insert(
+                pane_id,
+                PaneCursor::from_seq(pane_id, entry.resume_next_seq),
+            );
+            ObservationTransition::Resumed
+        } else if !is_observed && was_observed {
+            // Now ignored - preserve the next sequence number for future resumption.
+            if let Some(cursor) = self.cursors.remove(&pane_id) {
+                entry.resume_next_seq = cursor.next_seq;
             }
+            ObservationTransition::Retired
+        } else {
+            ObservationTransition::Unchanged
         }
     }
 
@@ -4809,6 +4853,105 @@ mod tests {
         assert!(!entry.should_observe());
         assert_eq!(entry.info.title.as_deref(), Some("vim"));
         assert_eq!(entry.observation.ignore_reason(), Some("exclude-vim"));
+    }
+
+    /// ft-0kdi9: an Observed -> Ignored -> Observed round trip must report the
+    /// resumption in the diff and resume at the retired sequence number.
+    ///
+    /// The diff signal is the load-bearing half: the observation runtime keeps
+    /// its own cursor map, compacts it against the observed set, and only
+    /// creates cursors for `new_panes`. A re-observed pane is not a new pane, so
+    /// without `re_observed_panes` the runtime never re-creates the cursor and
+    /// every subsequent poll for that pane is discarded.
+    #[test]
+    fn ft_0kdi9_discovery_tick_reports_re_observed_pane_and_resumes_next_seq() {
+        use crate::config::{PaneFilterConfig, PaneFilterRule};
+
+        let mut filter = PaneFilterConfig::default();
+        filter.exclude.push(PaneFilterRule {
+            id: "exclude-vim".to_string(),
+            domain: None,
+            title: Some("vim".to_string()),
+            cwd: None,
+        });
+
+        let mut registry = PaneRegistry::with_filter(filter);
+
+        // Tick 1: first sighting is a new pane, not a resumption.
+        let diff = registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+        assert_eq!(diff.new_panes, vec![1]);
+        assert!(diff.re_observed_panes.is_empty());
+        registry.get_cursor_mut(1).unwrap().next_seq = 7;
+
+        // Tick 2: the title matches an exclude rule, so the pane retires.
+        let diff = registry.discovery_tick(vec![make_pane(1, "vim", Some("/home"))]);
+        assert!(diff.re_observed_panes.is_empty());
+        assert!(registry.get_cursor(1).is_none());
+        assert_eq!(registry.entries.get(&1).unwrap().resume_next_seq, 7);
+
+        // Tick 3: the title reverts. The pane is observed again but is NOT in
+        // `new_panes`, which is exactly the case that used to be invisible.
+        let diff = registry.discovery_tick(vec![make_pane(1, "bash", Some("/home"))]);
+        assert!(
+            diff.new_panes.is_empty(),
+            "a re-observed pane must not be reported as newly discovered"
+        );
+        assert_eq!(
+            diff.re_observed_panes,
+            vec![1],
+            "Ignored -> Observed must be reported so capture state can be rebuilt"
+        );
+        assert!(!diff.is_empty());
+        // The title is part of the pane fingerprint, so reverting it is also a
+        // new generation. That arm deliberately does not touch the cursor, which
+        // is why the resumption needs its own signal.
+        assert_eq!(diff.new_generations, vec![1]);
+        assert_eq!(diff.change_count(), 2);
+        assert!(registry.entries.get(&1).unwrap().should_observe());
+        assert_eq!(
+            registry.get_cursor(1).map(|cursor| cursor.next_seq),
+            Some(7),
+            "capture must resume at the retired sequence number, not restart at 0"
+        );
+    }
+
+    /// ft-0kdi9: `re_evaluate_observation` reports the transition so callers
+    /// that own capture-side state outside this registry can mirror it.
+    #[test]
+    fn ft_0kdi9_re_evaluate_observation_reports_transition() {
+        use crate::config::{PaneFilterConfig, PaneFilterRule};
+
+        let mut registry = PaneRegistry::new();
+        registry.discovery_tick(vec![make_pane(1, "vim", Some("/home"))]);
+        assert_eq!(
+            registry.re_evaluate_observation(1),
+            ObservationTransition::Unchanged
+        );
+
+        let mut filter = PaneFilterConfig::default();
+        filter.exclude.push(PaneFilterRule {
+            id: "exclude-vim".to_string(),
+            domain: None,
+            title: Some("vim".to_string()),
+            cwd: None,
+        });
+        registry.filter_config = filter;
+        assert_eq!(
+            registry.re_evaluate_observation(1),
+            ObservationTransition::Retired
+        );
+
+        registry.filter_config = PaneFilterConfig::default();
+        assert_eq!(
+            registry.re_evaluate_observation(1),
+            ObservationTransition::Resumed
+        );
+
+        assert_eq!(
+            registry.re_evaluate_observation(404),
+            ObservationTransition::Unchanged,
+            "an untracked pane has no transition to report"
+        );
     }
 
     #[test]

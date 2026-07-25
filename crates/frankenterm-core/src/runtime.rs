@@ -2898,6 +2898,77 @@ impl ObservationRuntime {
                             );
                         }
 
+                        // ft-0kdi9: re-admit panes the observation filter had
+                        // excluded. A pane whose title/cwd changes (`sudo —
+                        // password`, `vim`, …) is marked Ignored on one tick and
+                        // Observed again on a later one, and the compaction below
+                        // deletes the runtime cursor of every unobserved pane.
+                        // Such a pane is not in `diff.new_panes` — the registry
+                        // entry already existed — so the new-pane arm above never
+                        // runs for it and nothing re-creates the cursor. The
+                        // tailer keeps polling it (it is observed again) and every
+                        // poll takes the `None` branch and returns
+                        // `PollOutcome::NoCursor`, so capture stays dead for the
+                        // rest of the daemon's life with no error and no event.
+                        for pane_id in diff.re_observed_panes.iter().copied() {
+                            // The registry retired the pane's last known
+                            // `next_seq` into `resume_next_seq`, but that value is
+                            // published from the capture pipeline once per
+                            // discovery tick, so it can lag by one interval.
+                            // Storage is authoritative for what actually
+                            // persisted; take whichever is further along so seq
+                            // stays monotonic and cannot collide with an existing
+                            // row.
+                            let resume_next_seq = {
+                                let reg = registry.read().await;
+                                reg.get_entry(pane_id)
+                                    .map_or(0, |entry| entry.resume_next_seq)
+                            };
+                            let max_seq = storage
+                                .get_max_seq_with_cx(&loop_cx, pane_id)
+                                .await
+                                .unwrap_or(None);
+                            let next_seq = resumed_capture_next_seq(max_seq, resume_next_seq);
+
+                            let created = {
+                                // Lock order: cursors (rank 1) before
+                                // detection_contexts, same as the compaction
+                                // block below.
+                                let mut cursors_guard = cursors.write().await;
+                                let mut contexts_guard = detection_contexts.write().await;
+                                resume_runtime_pane_state(
+                                    pane_id,
+                                    next_seq,
+                                    &mut cursors_guard,
+                                    &mut contexts_guard,
+                                )
+                            };
+
+                            if created {
+                                info!(
+                                    pane_id = pane_id,
+                                    next_seq = next_seq,
+                                    resume_next_seq = resume_next_seq,
+                                    "Resumed observing pane (observation filter re-admitted it)"
+                                );
+                                if let Some(ref adapter) = replay_capture {
+                                    adapter.capture_lifecycle(
+                                        pane_id,
+                                        crate::recording::RecorderLifecyclePhase::CaptureStarted,
+                                        None,
+                                        serde_json::json!({
+                                            "reason": "observation_resumed",
+                                        }),
+                                    );
+                                }
+                            } else {
+                                debug!(
+                                    pane_id = pane_id,
+                                    "Pane re-observed with capture cursor still live"
+                                );
+                            }
+                        }
+
                         let active_panes: HashSet<u64> = {
                             let reg = registry.read().await;
                             reg.observed_pane_ids().into_iter().collect()
@@ -2960,11 +3031,13 @@ impl ObservationRuntime {
                         if !diff.new_panes.is_empty()
                             || !diff.closed_panes.is_empty()
                             || !diff.new_generations.is_empty()
+                            || !diff.re_observed_panes.is_empty()
                         {
                             debug!(
                                 new = diff.new_panes.len(),
                                 closed = diff.closed_panes.len(),
                                 restarted = diff.new_generations.len(),
+                                re_observed = diff.re_observed_panes.len(),
                                 "Pane discovery tick"
                             );
                         }
@@ -4529,6 +4602,61 @@ fn compact_runtime_pane_state(
         detection_contexts: compact_u64_map(detection_contexts, active_panes),
         pane_activity_tracker: compact_u64_map(pane_activity_tracker, active_panes),
     }
+}
+
+/// Sequence number a re-admitted pane must resume capture at (ft-0kdi9).
+///
+/// Two independent records survive an observation gap and either can be the
+/// further-along one:
+///
+/// * `max_persisted_seq` — the highest seq actually committed to storage for
+///   this pane. Authoritative for collision avoidance: resuming at or below it
+///   would re-use a sequence number a row already owns.
+/// * `resume_next_seq` — what the registry retired when the pane went
+///   unobserved. Fed from the capture pipeline once per discovery tick, so it
+///   can lag storage by an interval, but it can also *lead* storage when
+///   segments were captured and not yet flushed.
+///
+/// Taking the maximum keeps `next_seq` monotonic against both.
+fn resumed_capture_next_seq(max_persisted_seq: Option<u64>, resume_next_seq: u64) -> u64 {
+    max_persisted_seq
+        .map_or(0, |seq| seq.saturating_add(1))
+        .max(resume_next_seq)
+}
+
+/// Re-create the capture-side state for a pane the observation filter
+/// re-admitted (ft-0kdi9).
+///
+/// The inverse of [`compact_runtime_pane_state`], which drops this state for
+/// every unobserved pane. Returns `true` when a cursor was created. An existing
+/// cursor is left untouched: it means capture never actually stopped (the
+/// Ignored window closed before any compaction ran), and overwriting it with a
+/// cursor derived from storage would rewind `next_seq` and re-emit sequence
+/// numbers that are already persisted.
+///
+/// Callers must hold the `cursors` guard before the `detection_contexts` guard
+/// (lock-order rank 1 first).
+fn resume_runtime_pane_state(
+    pane_id: u64,
+    next_seq: u64,
+    cursors: &mut HashMap<u64, PaneCursor>,
+    detection_contexts: &mut HashMap<u64, DetectionContext>,
+) -> bool {
+    let created = match cursors.entry(pane_id) {
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            vacant.insert(PaneCursor::from_seq(pane_id, next_seq));
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(_) => false,
+    };
+
+    detection_contexts.entry(pane_id).or_insert_with(|| {
+        let mut ctx = DetectionContext::new();
+        ctx.pane_id = Some(pane_id);
+        ctx
+    });
+
+    created
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -7723,6 +7851,90 @@ mod tests {
         assert!(!detection_contexts.contains_key(&2));
         assert!(pane_activity_tracker.contains_key(&1));
         assert!(!pane_activity_tracker.contains_key(&2));
+    }
+
+    /// ft-0kdi9: the full Observed -> Ignored -> Observed round trip at the
+    /// runtime-state layer. Compaction drops the cursor while the pane is
+    /// unobserved (this part always worked); the resume must put it back at the
+    /// right sequence number (this part did not exist, so capture stayed dead).
+    #[test]
+    fn ft_0kdi9_compaction_then_resume_restores_capture_cursor_at_next_seq() {
+        let mut cursors = HashMap::from([(7_u64, PaneCursor::from_seq(7, 42))]);
+        let mut detection_contexts = HashMap::from([(7_u64, DetectionContext::new())]);
+        let mut pane_activity_tracker: HashMap<u64, PaneActivityState> = HashMap::new();
+
+        // Pane 7's title starts matching an exclude rule: it is no longer in
+        // the observed set, so the discovery tick compacts its state away.
+        let stats = compact_runtime_pane_state(
+            &mut cursors,
+            &mut detection_contexts,
+            &mut pane_activity_tracker,
+            &HashSet::new(),
+        );
+        assert_eq!(stats.cursors.removed_entries, 1);
+        assert!(!cursors.contains_key(&7));
+        assert!(!detection_contexts.contains_key(&7));
+
+        // The title reverts. The registry retired next_seq=42 and storage holds
+        // seq 41, so both records agree the next segment is 42.
+        let next_seq = resumed_capture_next_seq(Some(41), 42);
+        let created = resume_runtime_pane_state(
+            7,
+            next_seq,
+            &mut cursors,
+            &mut detection_contexts,
+        );
+
+        assert!(created, "a compacted pane must get a fresh cursor");
+        assert_eq!(
+            cursors.get(&7).map(|cursor| cursor.next_seq),
+            Some(42),
+            "capture must resume where it left off, not restart at 0"
+        );
+        assert_eq!(
+            detection_contexts.get(&7).and_then(|ctx| ctx.pane_id),
+            Some(7),
+            "the detection context compaction dropped must be rebuilt too"
+        );
+    }
+
+    /// ft-0kdi9: resume must never rewind a cursor that is still live, which is
+    /// what happens when the Ignored window closes inside a single discovery
+    /// interval and no compaction ran in between.
+    #[test]
+    fn ft_0kdi9_resume_leaves_a_live_cursor_untouched() {
+        let mut cursors = HashMap::from([(7_u64, PaneCursor::from_seq(7, 99))]);
+        let mut detection_contexts: HashMap<u64, DetectionContext> = HashMap::new();
+
+        let created = resume_runtime_pane_state(7, 5, &mut cursors, &mut detection_contexts);
+
+        assert!(!created);
+        assert_eq!(
+            cursors.get(&7).map(|cursor| cursor.next_seq),
+            Some(99),
+            "rewinding a live cursor would re-emit persisted sequence numbers"
+        );
+        assert!(
+            detection_contexts.contains_key(&7),
+            "a missing detection context is still rebuilt"
+        );
+    }
+
+    /// ft-0kdi9: the resume sequence number is the max of both surviving
+    /// records, because either one can be the further-along value.
+    #[test]
+    fn ft_0kdi9_resumed_capture_next_seq_takes_the_further_along_record() {
+        // Nothing persisted, nothing retired: start at the beginning.
+        assert_eq!(resumed_capture_next_seq(None, 0), 0);
+        // Storage leads: the registry's retired value lagged by an interval.
+        assert_eq!(resumed_capture_next_seq(Some(41), 0), 42);
+        // The registry leads: segments were captured but not yet flushed.
+        assert_eq!(resumed_capture_next_seq(None, 7), 7);
+        assert_eq!(resumed_capture_next_seq(Some(41), 50), 50);
+        // Equal records agree.
+        assert_eq!(resumed_capture_next_seq(Some(41), 42), 42);
+        // Saturation must not wrap to 0 and hand back a colliding seq.
+        assert_eq!(resumed_capture_next_seq(Some(u64::MAX), 0), u64::MAX);
     }
 
     #[test]

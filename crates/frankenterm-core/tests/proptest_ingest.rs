@@ -512,13 +512,19 @@ proptest! {
         closed_panes in arb_pane_vec(),
         changed_panes in arb_pane_vec(),
         new_generations in arb_pane_vec(),
+        re_observed_panes in arb_pane_vec(),
     ) {
-        let expected = new_panes.len() + closed_panes.len() + changed_panes.len() + new_generations.len();
+        let expected = new_panes.len()
+            + closed_panes.len()
+            + changed_panes.len()
+            + new_generations.len()
+            + re_observed_panes.len();
         let diff = DiscoveryDiff {
             new_panes,
             closed_panes,
             changed_panes,
             new_generations,
+            re_observed_panes,
         };
         prop_assert_eq!(diff.change_count(), expected, "change_count mismatch");
     }
@@ -527,14 +533,15 @@ proptest! {
     #[test]
     fn discovery_diff_non_empty_when_has_panes(
         panes in proptest::collection::vec(arb_pane_id(), 1..10),
-        which in 0u8..4,
+        which in 0u8..5,
     ) {
         let mut diff = DiscoveryDiff::default();
         match which {
             0 => diff.new_panes = panes,
             1 => diff.closed_panes = panes,
             2 => diff.changed_panes = panes,
-            _ => diff.new_generations = panes,
+            3 => diff.new_generations = panes,
+            _ => diff.re_observed_panes = panes,
         }
         prop_assert!(!diff.is_empty(), "diff with panes should not be empty");
     }
@@ -546,17 +553,20 @@ proptest! {
         closed_panes in arb_pane_vec(),
         changed_panes in arb_pane_vec(),
         new_generations in arb_pane_vec(),
+        re_observed_panes in arb_pane_vec(),
     ) {
         let diff = DiscoveryDiff {
             new_panes: new_panes.clone(),
             closed_panes: closed_panes.clone(),
             changed_panes: changed_panes.clone(),
             new_generations: new_generations.clone(),
+            re_observed_panes: re_observed_panes.clone(),
         };
         let all_empty = new_panes.is_empty()
             && closed_panes.is_empty()
             && changed_panes.is_empty()
-            && new_generations.is_empty();
+            && new_generations.is_empty()
+            && re_observed_panes.is_empty();
         prop_assert_eq!(diff.is_empty(), all_empty, "is_empty should match all-empty check");
     }
 }
@@ -1106,14 +1116,17 @@ proptest! {
         closed in arb_pane_vec(),
         changed in arb_pane_vec(),
         gens in arb_pane_vec(),
+        re_observed in arb_pane_vec(),
     ) {
         let diff = DiscoveryDiff {
             new_panes: new.clone(),
             closed_panes: closed.clone(),
             changed_panes: changed.clone(),
             new_generations: gens.clone(),
+            re_observed_panes: re_observed.clone(),
         };
-        let expected = new.len() + closed.len() + changed.len() + gens.len();
+        let expected =
+            new.len() + closed.len() + changed.len() + gens.len() + re_observed.len();
         prop_assert_eq!(diff.change_count(), expected);
         let should_be_empty = expected == 0;
         prop_assert_eq!(diff.is_empty(), should_be_empty);

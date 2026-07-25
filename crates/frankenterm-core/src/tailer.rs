@@ -154,6 +154,21 @@ pub struct TailerMetrics {
     pub no_change_captures: u64,
     /// Number of overflow GAP segments emitted due to sustained backpressure
     pub overflow_gaps_emitted: u64,
+    /// Number of polls skipped because the pane had no capture cursor (ft-0kdi9).
+    ///
+    /// A pane is only polled while the registry reports it observed, so this
+    /// counter is *not* an expected steady-state outcome: it means the pane is
+    /// observed but the capture-side cursor map has no entry for it, and every
+    /// poll for that pane is discarding output. Before ft-0kdi9 this was the
+    /// only poll outcome with neither a counter nor a warn-level log, which is
+    /// what let an `Observed -> Ignored -> Observed` pane die silently.
+    ///
+    /// Forensic verification contract:
+    ///     no_cursor_polls > 0  =>  at least one observed pane lost capture
+    /// A non-zero value with a matching `last_reason_code = no_cursor` row in
+    /// the scheduler snapshot identifies the affected pane. Same observability
+    /// defect family as ft-luav8 / ft-skec1 / ft-tpdl5 / ft-wzk10.
+    pub no_cursor_polls: u64,
 }
 
 /// Metrics for supervisor operations.
@@ -1829,13 +1844,30 @@ where
                     debug!(pane_id, "Overflow GAP emitted");
                 }
                 PollOutcome::NoCursor => {
+                    // ft-0kdi9: a pane is only polled while it is observed, so
+                    // a missing cursor is a lost-capture bug, not routine
+                    // scheduling. Warn on entry into the state (a dead pane
+                    // polls at the backoff cadence forever, so warning every
+                    // time would be a log storm) and always count it.
+                    let first_occurrence =
+                        tailer.last_reason_code != CaptureSkipReason::NoCursor;
                     tailer.record_poll_outcome(
                         false,
                         false,
                         CaptureSkipReason::NoCursor,
                         &self.config,
                     );
-                    trace!(pane_id, "Tailer poll skipped (no cursor)");
+                    self.metrics.no_cursor_polls += 1;
+                    if first_occurrence {
+                        warn!(
+                            pane_id,
+                            no_cursor_polls = self.metrics.no_cursor_polls,
+                            "Tailer poll skipped: pane is observed but has no capture cursor; \
+                             output is being discarded until a cursor is re-created"
+                        );
+                    } else {
+                        debug!(pane_id, "Tailer poll skipped (no cursor, still)");
+                    }
                 }
                 PollOutcome::ChannelClosed => {
                     tailer.record_poll_outcome(
@@ -3079,6 +3111,50 @@ mod tests {
         supervisor.handle_poll_result(1, PollOutcome::Backpressure);
 
         assert!(supervisor.tailers.get(&1).unwrap().overflow_gap_pending);
+    }
+
+    /// ft-0kdi9: a `NoCursor` poll means an observed pane is discarding output.
+    /// It used to be the only poll outcome with neither a counter nor a
+    /// warn-level log, which is what let capture die silently after an
+    /// `Observed -> Ignored -> Observed` round trip.
+    #[test]
+    fn ft_0kdi9_no_cursor_polls_are_counted() {
+        let config = TailerConfig::default();
+        let (tx, _rx) = mpsc::channel(10);
+        let cursors = Arc::new(RwLock::new(HashMap::new()));
+        let registry = Arc::new(RwLock::new(crate::ingest::PaneRegistry::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(StaticSource);
+
+        let mut supervisor = TailerSupervisor::new(config, tx, cursors, registry, shutdown, source);
+
+        // The pane is observed (it has a tailer) but the shared cursor map is
+        // empty — exactly the post-compaction state of a re-observed pane.
+        let mut panes = HashMap::new();
+        panes.insert(1, make_pane(1));
+        supervisor.sync_tailers(&panes);
+        assert_eq!(supervisor.metrics().no_cursor_polls, 0);
+
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoCursor);
+        assert_eq!(supervisor.metrics().no_cursor_polls, 1);
+        assert_eq!(
+            supervisor.tailers.get(&1).unwrap().last_reason_code,
+            CaptureSkipReason::NoCursor
+        );
+
+        // Every repeat is counted, so the counter measures how much output was
+        // discarded rather than only that it happened once.
+        for _ in 0..4 {
+            supervisor.capturing_panes.insert(1);
+            supervisor.handle_poll_result(1, PollOutcome::NoCursor);
+        }
+        assert_eq!(supervisor.metrics().no_cursor_polls, 5);
+
+        // A healthy outcome must not bump it.
+        supervisor.capturing_panes.insert(1);
+        supervisor.handle_poll_result(1, PollOutcome::NoChange);
+        assert_eq!(supervisor.metrics().no_cursor_polls, 5);
     }
 
     #[test]
@@ -4797,9 +4873,20 @@ mod tests {
 
     #[test]
     fn detect_mode_with_socket_path_config() {
-        // discover_mux_socket requires the path to exist on disk.
+        // `discover_mux_socket` requires a real unix-domain socket, not merely
+        // an existing path (a9e67ef23, "require real mux socket paths"). This
+        // test used to create a regular file with `fs::write`, which that commit
+        // made unusable, so it has asserted Streaming against a path the
+        // implementation correctly rejects ever since. Bind a listener instead
+        // so the streaming branch is genuinely exercised; the companion test
+        // below pins the regular-file rejection.
         let sock_path =
             std::env::temp_dir().join(format!("ft-test-mux-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        #[cfg(unix)]
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path)
+            .expect("bind temp mux socket");
+        #[cfg(not(unix))]
         std::fs::write(&sock_path, b"").expect("create temp socket file");
 
         let mut config = crate::config::Config::default();
@@ -4821,6 +4908,33 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// A regular file at the configured mux-socket path must not enable
+    /// streaming capture: connecting to it can never succeed, so treating it as
+    /// a mux socket would silently disable capture for every pane
+    /// (a9e67ef23 tightened this; nothing pinned it until now).
+    #[test]
+    fn detect_mode_with_regular_file_socket_path_is_rejected() {
+        let file_path =
+            std::env::temp_dir().join(format!("ft-test-not-a-mux-{}.sock", std::process::id()));
+        std::fs::write(&file_path, b"").expect("create temp regular file");
+
+        // Asserted at the discovery level rather than through
+        // `detect_tailer_mode`, because discovery falls back to
+        // `WEZTERM_UNIX_SOCKET` and canonical paths: on a host with a live mux
+        // the mode could legitimately be Streaming for an unrelated socket. The
+        // invariant under test is narrower — this path must not be the one
+        // accepted.
+        let discovered =
+            crate::wezterm::discover_mux_socket(Some(file_path.to_string_lossy().as_ref()));
+        assert_ne!(
+            discovered.as_deref(),
+            Some(file_path.as_path()),
+            "a regular file must never be accepted as a mux socket"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
@@ -5200,12 +5314,14 @@ mod tests {
             capture_timeouts: 2,
             no_change_captures: 7,
             overflow_gaps_emitted: 1,
+            no_cursor_polls: 4,
         };
         assert_eq!(m.events_sent, 10);
         assert_eq!(m.send_timeouts, 3);
         assert_eq!(m.capture_timeouts, 2);
         assert_eq!(m.no_change_captures, 7);
         assert_eq!(m.overflow_gaps_emitted, 1);
+        assert_eq!(m.no_cursor_polls, 4);
     }
 
     #[test]
