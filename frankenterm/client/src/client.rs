@@ -1453,12 +1453,34 @@ impl Client {
                 let base_interval = Duration::from_millis(cfg.client_reconnect_base_interval_ms);
                 let max_interval = Duration::from_millis(cfg.client_reconnect_max_interval_ms);
 
+                let max_attempts = cfg.client_reconnect_max_attempts;
+                let healthy_session =
+                    Duration::from_millis(cfg.client_reconnect_healthy_session_ms);
+
                 let mut backoff = base_interval;
+                // One connection window for the whole domain, opened lazily on
+                // the first disconnect. It used to be constructed inside the
+                // loop, so every reconnect cycle spawned a *new* window: a
+                // host that accepts the connection and then immediately drops
+                // the session cycles forever, and the user gets an endless
+                // stream of "Reconnecting..." windows at startup.
+                let mut reconnect_ui: Option<ConnectionUI> = None;
+                // Cycles since the last connection that stayed up long enough
+                // to count as recovered. Bounds the churn above.
+                let mut failed_cycles: u32 = 0;
                 loop {
+                    let session_started = std::time::Instant::now();
                     let (thread_result, returned_reconnectable, returned_receiver) =
                         client_thread(reconnectable, local_domain_id, receiver);
                     reconnectable = returned_reconnectable;
                     receiver = returned_receiver;
+                    // A session that survived long enough is a genuine
+                    // recovery, not churn: forget the earlier failures so a
+                    // long-lived domain can still reconnect indefinitely
+                    // across ordinary transient drops.
+                    if session_started.elapsed() >= healthy_session {
+                        failed_cycles = 0;
+                    }
                     if let Err(e) = thread_result {
                         if !reconnectable.reconnectable() || local_domain_id.is_none() {
                             log::debug!("client thread ended: {}", e);
@@ -1496,9 +1518,33 @@ impl Client {
                             break;
                         }
 
-                        let mut ui = ConnectionUI::new();
-                        ui.title("FrankenTerm: Reconnecting...");
+                        failed_cycles = failed_cycles.saturating_add(1);
+                        if max_attempts != 0 && failed_cycles > max_attempts {
+                            log::error!(
+                                "giving up on domain {local_domain_id}: {failed_cycles} \
+                                 reconnect cycles without a session lasting {healthy_session:?} \
+                                 (last error: {e}). Raise \
+                                 client_reconnect_max_attempts to keep retrying."
+                            );
+                            if let Some(ui) = reconnect_ui.as_ref() {
+                                ui.output_str(&format!(
+                                    "Giving up after {failed_cycles} reconnect attempts: {e}\n"
+                                ));
+                            }
+                            break;
+                        }
 
+                        let ui = reconnect_ui.get_or_insert_with(|| {
+                            let ui = ConnectionUI::new();
+                            ui.title("FrankenTerm: Reconnecting...");
+                            ui
+                        });
+
+                        // Bounded, unlike before: a host that is simply down
+                        // never returns Ok here, and an unbounded loop meant
+                        // the domain retried until the app exited.
+                        let mut reconnected = false;
+                        let mut dial_attempts: u32 = 0;
                         loop {
                             ui.sleep_with_reason(
                                 &format!("client disconnected {}; will reconnect", e),
@@ -1507,17 +1553,28 @@ impl Client {
                             .ok();
                             let initial = false;
                             let no_auto_start = true; // Don't auto-start on a reconnect
-                            match reconnectable.connect(initial, &mut ui, no_auto_start) {
+                            match reconnectable.connect(initial, ui, no_auto_start) {
                                 Ok(_) => {
                                     backoff = base_interval;
                                     log::error!("Reconnected!");
+                                    let reattach_ui = ui.clone();
                                     promise::spawn::spawn_into_main_thread(async move {
-                                        ClientDomain::reattach(local_domain_id, ui).await.ok();
+                                        ClientDomain::reattach(local_domain_id, reattach_ui)
+                                            .await
+                                            .ok();
                                     })
                                     .detach();
+                                    reconnected = true;
                                     break;
                                 }
                                 Err(err) => {
+                                    dial_attempts = dial_attempts.saturating_add(1);
+                                    if max_attempts != 0 && dial_attempts >= max_attempts {
+                                        ui.output_str(&format!(
+                                            "giving up after {dial_attempts} attempts: {err}\n"
+                                        ));
+                                        break;
+                                    }
                                     backoff = (backoff + backoff).min(max_interval);
                                     ui.output_str(&format!(
                                         "problem reconnecting: {}; will reconnect in {:?}\n",
@@ -1525,6 +1582,14 @@ impl Client {
                                     ));
                                 }
                             }
+                        }
+                        if !reconnected {
+                            log::error!(
+                                "giving up on domain {local_domain_id}: could not reconnect \
+                                 after {dial_attempts} attempts (last error: {e}). Raise \
+                                 client_reconnect_max_attempts to keep retrying."
+                            );
+                            break;
                         }
                     } else {
                         log::error!("client_thread returned without any error condition");

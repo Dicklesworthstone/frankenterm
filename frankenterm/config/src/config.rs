@@ -604,6 +604,27 @@ pub struct Config {
     #[dynamic(default = "default_client_reconnect_max_interval_ms")]
     pub client_reconnect_max_interval_ms: u64,
 
+    /// How many times a client domain may re-enter the reconnect loop before
+    /// giving up on it for this session. Default: 3. Set to 0 for unlimited.
+    ///
+    /// This bounds *cycles*, not the retries inside one cycle: reconnecting to
+    /// a host that accepts the connection and then immediately drops the
+    /// session is the failure mode this exists for. Each such cycle used to
+    /// reset the backoff and open a fresh connection window, so a machine that
+    /// was down but still reachable produced an endless stream of windows.
+    ///
+    /// A connection that stays up for at least
+    /// `client_reconnect_healthy_session_ms` is treated as genuinely
+    /// recovered and resets the counter, so ordinary transient drops over a
+    /// long session still reconnect indefinitely.
+    #[dynamic(default = "default_client_reconnect_max_attempts")]
+    pub client_reconnect_max_attempts: u32,
+
+    /// How long a reconnected session must survive before it counts as
+    /// recovered and resets `client_reconnect_max_attempts`. Default: 30000.
+    #[dynamic(default = "default_client_reconnect_healthy_session_ms")]
+    pub client_reconnect_healthy_session_ms: u64,
+
     /// Base poll interval for pane rendering in milliseconds. Default: 20.
     #[dynamic(default = "default_render_base_poll_interval_ms")]
     pub render_base_poll_interval_ms: u64,
@@ -2052,6 +2073,14 @@ fn default_client_reconnect_base_interval_ms() -> u64 {
 
 fn default_client_reconnect_max_interval_ms() -> u64 {
     10000
+}
+
+fn default_client_reconnect_max_attempts() -> u32 {
+    3
+}
+
+fn default_client_reconnect_healthy_session_ms() -> u64 {
+    30_000
 }
 
 fn default_render_base_poll_interval_ms() -> u64 {
