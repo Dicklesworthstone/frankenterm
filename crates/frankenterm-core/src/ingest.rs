@@ -1890,12 +1890,11 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         );
     }
 
-    // This call is authoritative, including when it returns `None` (ft-5yi36).
-    // `record_gap` derives the gap's bounds from `MAX(seq)` for the pane, so it
-    // must run BEFORE the append: afterwards the new segment is itself the
-    // maximum and the bounds come out one segment too late. `None` means the
-    // pane has no prior segment, i.e. there is no boundary between two stored
-    // segments for the gap to sit in — a correct answer, not a failed attempt.
+    // This call runs BEFORE the append for a reason (ft-5yi36): `record_gap`
+    // derives the gap's bounds from `MAX(seq)` for the pane, so afterwards the
+    // new segment is itself the maximum and the bounds come out one segment too
+    // late. `None` here means the pane has no prior segment — see the retry
+    // below for why that case is still recorded despite imprecise bounds.
     let gap = match &bounded_segment.kind {
         CapturedSegmentKind::Gap { reason } => {
             storage
@@ -1920,19 +1919,39 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         )
         .await?;
 
-    // ft-5yi36: there used to be a post-append retry here for the `gap.is_none()`
-    // case. It could only ever fire when the pane had no prior segment — the one
-    // situation where `None` is the right answer — and in that situation it was
-    // always wrong: `append_segment` had just assigned seq 0, so `MAX(seq)` was
-    // 0 and the row landed as (seq_before=0, seq_after=1). That claims the
-    // missing output lies between segments 0 and 1, a boundary which is in fact
-    // contiguous, so a reconstructor inserts the marker one segment too late and
-    // treats a good boundary as broken. `output_gaps.seq_before`/`seq_after` are
-    // both NOT NULL and the explicit-bounds path requires seq_after > seq_before,
-    // so a gap that precedes every stored segment cannot be expressed honestly —
-    // and a wrong row is worse than no row. The discontinuity is still carried by
-    // the stored segment itself.
+    // ft-5yi36 (open, analysis recorded here so it is not re-litigated): this
+    // retry fires only when the pre-append call returned `None`, which happens
+    // only when the pane had no prior segment. The bounds it then produces are
+    // imprecise — `append_segment` has just assigned seq 0, so `MAX(seq)` is 0
+    // and the row lands as (seq_before=0, seq_after=1), which reads as "content
+    // is missing between segments 0 and 1" when the discontinuity actually
+    // precedes segment 0.
+    //
+    // Dropping the retry to avoid the imprecise row was tried and REVERTED: it
+    // makes a pane's first-ever gap, and the truncation gap of a pane's first
+    // oversized segment, record nothing at all — no `output_gaps` row and no
+    // `GapDetected` event, since the runtime publishes that event only when this
+    // field is `Some`. Silently losing the only durable record of a
+    // discontinuity is the exact failure class the capture pipeline exists to
+    // prevent, and three tests pin it deliberately
+    // (`fresh_eyes_persist_initial_gap_records_gap_after_first_segment_exists`,
+    // its `_with_cx` sibling, and
+    // `persist_captured_oversized_delta_records_truncation_gap`).
+    //
+    // A correct fix needs an honest encoding for a leading gap, which
+    // `output_gaps` cannot express today: `seq_before` and `seq_after` are both
+    // NOT NULL and the explicit-bounds path requires `seq_after > seq_before`,
+    // so "nothing precedes this" has no representation. That is a schema and
+    // consumer-contract decision, not a local edit.
     let mut gap = gap;
+
+    if gap.is_none()
+        && let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind
+    {
+        gap = storage
+            .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
+            .await?;
+    }
 
     if stored.seq != bounded_segment.seq {
         let discontinuity_reason = format!(
@@ -2068,8 +2087,7 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
     // whenever the window is large enough for the quadratic path to be a risk,
     // independently of the `FT_MOONSHOT_DELTA_LINEAR_OVERLAP` gate.
     let window = overlap_size.min(previous.len()).min(current.len());
-    let linear =
-        delta_linear_overlap_enabled() || window >= LINEAR_OVERLAP_SEARCH_THRESHOLD_BYTES;
+    let linear = delta_linear_overlap_enabled() || window >= LINEAR_OVERLAP_SEARCH_THRESHOLD_BYTES;
     extract_delta_with_overlap_mode(previous, current, overlap_size, linear)
 }
 
@@ -3680,8 +3698,11 @@ mod tests {
         rest.push_str(&new_line);
 
         // The daemon's overlap_size now tracks RuntimeConfig::default().
-        match extract_delta(&previous, &rest, crate::runtime::RuntimeConfig::default().overlap_size)
-        {
+        match extract_delta(
+            &previous,
+            &rest,
+            crate::runtime::RuntimeConfig::default().overlap_size,
+        ) {
             DeltaResult::Content(delta) => assert_eq!(delta, new_line),
             other => panic!("a scrolled snapshot must produce a delta, got {other:?}"),
         }
