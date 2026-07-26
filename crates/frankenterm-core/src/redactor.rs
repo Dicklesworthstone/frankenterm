@@ -1507,8 +1507,7 @@ impl StreamingRedactor {
             // (the detection rules handle those, unclamped) or can no longer be
             // completed by bytes that have not arrived yet.
             if !occurrence.unbounded_span {
-                let scan_start =
-                    floor_char_boundary(pending, boundary.saturating_sub(tail_bytes));
+                let scan_start = floor_char_boundary(pending, boundary.saturating_sub(tail_bytes));
                 if occurrence.start < scan_start || occurrence.start < retention_floor {
                     continue;
                 }
@@ -2803,12 +2802,19 @@ mod tests {
         ];
 
         for case in cases {
-            for tail_limit in [0_usize, 1, 2, 8, 64, super::STREAMING_ANCHOR_TAIL_FLOOR, 4096] {
+            for tail_limit in [
+                0_usize,
+                1,
+                2,
+                8,
+                64,
+                super::STREAMING_ANCHOR_TAIL_FLOOR,
+                4096,
+            ] {
                 let expected = reference_per_byte_retention_walk(case, case.len(), tail_limit);
                 // Floor 0: pins the collapse against the loop it replaced,
                 // without the ft-5lz32 clamp.
-                let actual =
-                    super::retainable_trailing_run_start(case, case.len(), tail_limit, 0);
+                let actual = super::retainable_trailing_run_start(case, case.len(), tail_limit, 0);
                 assert_eq!(
                     actual, expected,
                     "run collapse diverged from the per-byte walk for {case:?} \
@@ -2947,8 +2953,8 @@ mod tests {
         let _guard = streaming_overflow_test_lock();
         super::reset_streaming_redactor_pending_overflow_count_for_test();
 
-        let prefix = "   Compiling frankenterm-core v0.12.0 (cached package, backtrace off)\n"
-            .repeat(1200); // ~84 KiB: comfortably past the 64 KiB window.
+        let prefix =
+            "   Compiling frankenterm-core v0.12.0 (cached package, backtrace off)\n".repeat(1200); // ~84 KiB: comfortably past the 64 KiB window.
         let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
         let full = format!("{prefix}{secret}");
 
@@ -2992,9 +2998,8 @@ mod tests {
         super::reset_streaming_redactor_pending_overflow_count_for_test();
 
         let body = "MIIEowIBAAKCAQEAvOhL0mE3sk9wQ\n".repeat(32); // ~928 bytes of base64
-        let block = format!(
-            "-----BEGIN RSA PRIVATE KEY-----\n{body}-----END RSA PRIVATE KEY-----\n"
-        );
+        let block =
+            format!("-----BEGIN RSA PRIVATE KEY-----\n{body}-----END RSA PRIVATE KEY-----\n");
 
         let mut streaming = StreamingRedactor::new().with_tail_bytes(128);
         let mut streamed = Vec::new();

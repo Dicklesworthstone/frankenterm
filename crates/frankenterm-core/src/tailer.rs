@@ -1849,8 +1849,7 @@ where
                     // scheduling. Warn on entry into the state (a dead pane
                     // polls at the backoff cadence forever, so warning every
                     // time would be a log storm) and always count it.
-                    let first_occurrence =
-                        tailer.last_reason_code != CaptureSkipReason::NoCursor;
+                    let first_occurrence = tailer.last_reason_code != CaptureSkipReason::NoCursor;
                     tailer.record_poll_outcome(
                         false,
                         false,
@@ -4884,8 +4883,8 @@ mod tests {
             std::env::temp_dir().join(format!("ft-test-mux-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock_path);
         #[cfg(unix)]
-        let _listener = std::os::unix::net::UnixListener::bind(&sock_path)
-            .expect("bind temp mux socket");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&sock_path).expect("bind temp mux socket");
         #[cfg(not(unix))]
         std::fs::write(&sock_path, b"").expect("create temp socket file");
 

@@ -4677,11 +4677,9 @@ fn assemble_resume_anchor(segments: Vec<crate::storage::Segment>) -> String {
         if tail.len() > crate::ingest::RESUME_ANCHOR_BYTES * 2 {
             // Keep the working string bounded on panes with large segments;
             // only the trailing window can ever matter.
-            let trimmed = crate::ingest::resume_anchor_tail(
-                &tail,
-                crate::ingest::RESUME_ANCHOR_BYTES,
-            )
-            .to_string();
+            let trimmed =
+                crate::ingest::resume_anchor_tail(&tail, crate::ingest::RESUME_ANCHOR_BYTES)
+                    .to_string();
             tail = trimmed;
         }
     }
@@ -4730,9 +4728,8 @@ fn resume_runtime_pane_state(
 ) -> bool {
     let created = match cursors.entry(pane_id) {
         std::collections::hash_map::Entry::Vacant(vacant) => {
-            vacant.insert(
-                PaneCursor::from_seq(pane_id, next_seq).with_resume_anchor(resume_anchor),
-            );
+            vacant
+                .insert(PaneCursor::from_seq(pane_id, next_seq).with_resume_anchor(resume_anchor));
             true
         }
         std::collections::hash_map::Entry::Occupied(_) => false,
