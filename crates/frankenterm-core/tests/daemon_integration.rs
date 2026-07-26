@@ -255,6 +255,81 @@ fn gaps_are_recorded_for_gap_segments() {
         assert!(r2.gap.is_some(), "Gap segment should create a gap record");
         let gap = r2.gap.unwrap();
         assert_eq!(gap.reason, "overlap_not_found");
+        assert_eq!(
+            (gap.seq_before, gap.seq_after),
+            (0, 1),
+            "a gap between two stored segments is bounded by them"
+        );
+
+        storage.shutdown().await.expect("shutdown");
+    });
+}
+
+/// ft-5yi36: a gap that is a pane's FIRST segment must not invent bounds.
+///
+/// `record_gap` derives bounds from `MAX(seq)`, so it correctly returns `None`
+/// when the pane has no prior segment — there is no boundary between two stored
+/// segments for the gap to sit in. A post-append retry used to fire in exactly
+/// that case and write (seq_before=0, seq_after=1), which claims the missing
+/// output lies between segments 0 and 1 — a boundary that is in fact contiguous.
+/// A reconstructor would place the missing-output marker one segment too late
+/// and treat a good boundary as broken.
+///
+/// Reachable in production via `emit_overflow_gap("backpressure_overflow")`
+/// before any successful capture, and via `StreamIngester::process_output`'s
+/// `emit_gap("stream_overflow")`.
+#[test]
+fn ft_5yi36_first_segment_gap_records_no_invented_bounds() {
+    run_async_test(async {
+        let (_dir, db_path) = temp_db();
+        let storage = StorageHandle::new(&db_path).await.expect("create storage");
+
+        storage
+            .upsert_pane(test_pane(5))
+            .await
+            .expect("upsert pane");
+
+        let ts = now_ms();
+
+        // The pane's very first segment is a gap — nothing was captured before it.
+        let first = synthetic_gap(5, 0, "partial output\n", "backpressure_overflow", ts);
+        let result = persist_captured_segment(&storage, &first)
+            .await
+            .expect("persist first-segment gap");
+
+        assert!(
+            result.gap.is_none(),
+            "a gap preceding every stored segment has no two segments to sit between; \
+             got {:?}",
+            result.gap
+        );
+
+        // And no row may have been written behind our back.
+        let gaps: Vec<_> = storage
+            .get_gaps()
+            .await
+            .expect("read gaps")
+            .into_iter()
+            .filter(|gap| gap.pane_id == 5)
+            .collect();
+        assert!(
+            gaps.is_empty(),
+            "no output_gaps row may be manufactured for a first-segment gap; got {gaps:?}"
+        );
+
+        // The segment itself still carries the content, so the discontinuity is
+        // not lost — only the row with unrepresentable bounds is.
+        let segments = storage.get_segments(5, 10).await.expect("read segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].seq, 0);
+
+        // A later gap, now that a prior segment exists, is bounded normally.
+        let second = synthetic_gap(5, 1, "more output\n", "overlap_not_found", ts + 100);
+        let later = persist_captured_segment(&storage, &second)
+            .await
+            .expect("persist second gap");
+        let later_gap = later.gap.expect("a gap after a stored segment is recordable");
+        assert_eq!((later_gap.seq_before, later_gap.seq_after), (0, 1));
 
         storage.shutdown().await.expect("shutdown");
     });

@@ -29665,7 +29665,11 @@ async fn run_distributed_agent(
         discovery_interval: Duration::from_secs(5),
         capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
         min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
-        overlap_size: 4096,
+        // ft-li2hc: must NOT be a small fixed budget. A sliding snapshot needs a
+        // border as long as the retained prefix, so a 4 KiB cap against
+        // whole-scrollback captures turned every post-scroll poll into a
+        // full-snapshot gap. Track the crate default instead of hardcoding.
+        overlap_size: RuntimeConfig::default().overlap_size,
         pane_filter: config.ingest.panes.clone(),
         pane_priorities: config.ingest.priorities.clone(),
         capture_budgets: config.ingest.budgets.clone(),
@@ -30360,7 +30364,9 @@ async fn run_watcher(
         discovery_interval: Duration::from_millis(poll_interval),
         capture_interval: Duration::from_millis(config.ingest.poll_interval_ms),
         min_capture_interval: Duration::from_millis(config.ingest.min_poll_interval_ms),
-        overlap_size: 4096, // Default overlap window size
+        // ft-li2hc: see the sibling watch path — a fixed 4 KiB cap cannot reach
+        // back far enough to match a scrolled snapshot.
+        overlap_size: RuntimeConfig::default().overlap_size,
         pane_filter: config.ingest.panes.clone(),
         pane_priorities: config.ingest.priorities.clone(),
         capture_budgets: config.ingest.budgets.clone(),

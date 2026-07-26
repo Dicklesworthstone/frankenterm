@@ -1890,7 +1890,13 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         );
     }
 
-    let mut gap = match &bounded_segment.kind {
+    // This call is authoritative, including when it returns `None` (ft-5yi36).
+    // `record_gap` derives the gap's bounds from `MAX(seq)` for the pane, so it
+    // must run BEFORE the append: afterwards the new segment is itself the
+    // maximum and the bounds come out one segment too late. `None` means the
+    // pane has no prior segment, i.e. there is no boundary between two stored
+    // segments for the gap to sit in — a correct answer, not a failed attempt.
+    let gap = match &bounded_segment.kind {
         CapturedSegmentKind::Gap { reason } => {
             storage
                 .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
@@ -1914,13 +1920,19 @@ pub async fn persist_captured_segment_with_zone_with_cx(
         )
         .await?;
 
-    if gap.is_none()
-        && let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind
-    {
-        gap = storage
-            .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
-            .await?;
-    }
+    // ft-5yi36: there used to be a post-append retry here for the `gap.is_none()`
+    // case. It could only ever fire when the pane had no prior segment — the one
+    // situation where `None` is the right answer — and in that situation it was
+    // always wrong: `append_segment` had just assigned seq 0, so `MAX(seq)` was
+    // 0 and the row landed as (seq_before=0, seq_after=1). That claims the
+    // missing output lies between segments 0 and 1, a boundary which is in fact
+    // contiguous, so a reconstructor inserts the marker one segment too late and
+    // treats a good boundary as broken. `output_gaps.seq_before`/`seq_after` are
+    // both NOT NULL and the explicit-bounds path requires seq_after > seq_before,
+    // so a gap that precedes every stored segment cannot be expressed honestly —
+    // and a wrong row is worse than no row. The discontinuity is still carried by
+    // the stored segment itself.
+    let mut gap = gap;
 
     if stored.seq != bounded_segment.seq {
         let discontinuity_reason = format!(
@@ -2044,13 +2056,30 @@ pub fn resume_anchor_tail(text: &str, max_bytes: usize) -> &str {
 /// and reported as an explicit gap (ft-r5xkf).
 #[must_use]
 pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> DeltaResult {
-    extract_delta_with_overlap_mode(
-        previous,
-        current,
-        overlap_size,
-        delta_linear_overlap_enabled(),
-    )
+    // ft-li2hc: the search window has to be able to reach a whole snapshot,
+    // because a sliding capture needs a border of `previous.len() - scrolled`
+    // bytes — it grows with the SNAPSHOT, not with the amount of new output. A
+    // window that large is unsafe for the legacy nested-memchr search, whose
+    // worst case is quadratic when the first byte repeats across the window
+    // (a screen of box-drawing characters or a progress bar does exactly that).
+    // The KMP search is single-pass and proven byte-identical to the legacy one
+    // (see `kmp_longest_overlap` and
+    // `proptest_ingest_delta_linear_overlap_equivalence`), so it is used
+    // whenever the window is large enough for the quadratic path to be a risk,
+    // independently of the `FT_MOONSHOT_DELTA_LINEAR_OVERLAP` gate.
+    let window = overlap_size.min(previous.len()).min(current.len());
+    let linear =
+        delta_linear_overlap_enabled() || window >= LINEAR_OVERLAP_SEARCH_THRESHOLD_BYTES;
+    extract_delta_with_overlap_mode(previous, current, overlap_size, linear)
 }
+
+/// Window size at or above which the overlap search always uses the linear
+/// (KMP) path rather than the legacy nested-memchr scan (ft-li2hc).
+///
+/// Below this the quadratic worst case is bounded by a small constant and the
+/// legacy path stays in charge, preserving the shipping default for every
+/// existing small-window caller.
+pub const LINEAR_OVERLAP_SEARCH_THRESHOLD_BYTES: usize = 64 * 1024;
 
 /// Q3 moonshot gate env var (`ingest.delta_linear_overlap`, default false).
 ///
@@ -2131,6 +2160,18 @@ pub fn extract_delta_with_overlap_mode(
 
     // Limit overlap search to a bounded suffix/prefix window.
     let max_overlap = overlap_size.min(previous.len()).min(current.len());
+    // ft-li2hc: remember whether the CAP is what bounded the search, rather than
+    // the operands. When it is, a failed search means "this window could not
+    // reach far enough back", which is a different fact from "these two
+    // snapshots share no border" and must not be reported as the same reason:
+    // the first is a configuration limit an operator can raise, the second is
+    // real content loss.
+    let window_truncated_search = max_overlap < previous.len().min(current.len());
+    let no_border_reason = if window_truncated_search {
+        "overlap_window_exhausted"
+    } else {
+        "overlap_not_found"
+    };
     let mut search_start = previous.len() - max_overlap;
     // Snap forward to the next valid UTF-8 char boundary to avoid panicking
     // on multi-byte characters (Cyrillic=2B, box-drawing=3B, emoji=4B).
@@ -2168,7 +2209,7 @@ pub fn extract_delta_with_overlap_mode(
                 }
             }
             None => DeltaResult::Gap {
-                reason: "overlap_not_found".to_string(),
+                reason: no_border_reason.to_string(),
                 content: current.to_string(),
             },
         };
@@ -2218,7 +2259,7 @@ pub fn extract_delta_with_overlap_mode(
     }
 
     DeltaResult::Gap {
-        reason: "overlap_not_found".to_string(),
+        reason: no_border_reason.to_string(),
         content: current.to_string(),
     }
 }
@@ -3617,6 +3658,95 @@ mod tests {
         }
     }
 
+    /// ft-li2hc: a scrolled snapshot at realistic scrollback size must still
+    /// produce a delta.
+    ///
+    /// The required border length is `previous.len() - scrolled_bytes` — it grows
+    /// with the SNAPSHOT, not with the amount of new output — so a fixed 4 KiB
+    /// cap against whole-scrollback captures made every post-scroll poll a gap
+    /// carrying the entire snapshot: a spurious gap marker where nothing was
+    /// lost, plus the whole scrollback re-persisted, re-redacted, re-indexed and
+    /// re-scanned every tick.
+    #[test]
+    fn ft_li2hc_scrolled_snapshot_at_scrollback_size_yields_content() {
+        // The bead's hand-verified shape: 140 lines of 61 bytes = 8540 bytes,
+        // then the first line drops off and one new line arrives.
+        let lines: Vec<String> = (0..140)
+            .map(|i| format!("line{i:04} {:>50}\n", format!("payload-{i}")))
+            .collect();
+        let previous: String = lines.concat();
+        let mut rest: String = lines[1..].concat();
+        let new_line = format!("line{:04} {:>50}\n", 140, "payload-140");
+        rest.push_str(&new_line);
+
+        // The daemon's overlap_size now tracks RuntimeConfig::default().
+        match extract_delta(&previous, &rest, crate::runtime::RuntimeConfig::default().overlap_size)
+        {
+            DeltaResult::Content(delta) => assert_eq!(delta, new_line),
+            other => panic!("a scrolled snapshot must produce a delta, got {other:?}"),
+        }
+    }
+
+    /// ft-li2hc: when the cap is what stopped the search, say so. "This window
+    /// could not reach far enough back" is an operator-actionable configuration
+    /// fact; "these snapshots share no border" is content loss. Reporting both
+    /// as `overlap_not_found` made a tuning problem look like data loss.
+    #[test]
+    fn ft_li2hc_window_exhaustion_is_a_distinct_reason() {
+        let lines: Vec<String> = (0..140)
+            .map(|i| format!("line{i:04} {:>50}\n", format!("payload-{i}")))
+            .collect();
+        let previous: String = lines.concat();
+        let mut rest: String = lines[1..].concat();
+        rest.push_str(&format!("line{:04} {:>50}\n", 140, "payload-140"));
+
+        // The old daemon value: too small to reach the border.
+        match extract_delta(&previous, &rest, 4096) {
+            DeltaResult::Gap { reason, content } => {
+                assert_eq!(reason, "overlap_window_exhausted");
+                assert_eq!(content, rest);
+            }
+            other => panic!("expected a window-exhaustion gap, got {other:?}"),
+        }
+
+        // The bead's minimal shape, same fact at three bytes.
+        match extract_delta("L1\nL2\nL3\n", "L2\nL3\nL4\n", 3) {
+            DeltaResult::Gap { reason, .. } => assert_eq!(reason, "overlap_window_exhausted"),
+            other => panic!("expected a window-exhaustion gap, got {other:?}"),
+        }
+
+        // A genuine no-border case keeps the original reason: the window covered
+        // everything it could and there simply is no shared border.
+        match extract_delta("abc", "xyz", 1024) {
+            DeltaResult::Gap { reason, .. } => assert_eq!(reason, "overlap_not_found"),
+            other => panic!("expected a no-border gap, got {other:?}"),
+        }
+    }
+
+    /// ft-li2hc: a window big enough to be dangerous for the quadratic search
+    /// must route to the linear one, whatever the moonshot gate says.
+    #[test]
+    fn ft_li2hc_large_windows_use_the_linear_search() {
+        // Adversarial for the legacy path: every byte in the window matches the
+        // first byte of `current`, so it probes every position.
+        let previous = "a".repeat(LINEAR_OVERLAP_SEARCH_THRESHOLD_BYTES + 1024);
+        let mut current = previous[512..].to_string();
+        current.push_str("tail\n");
+
+        let started = std::time::Instant::now();
+        let result = extract_delta(&previous, &current, usize::MAX);
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, DeltaResult::Content(ref delta) if delta == "tail\n"),
+            "expected the scrolled tail, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "a large window must not fall into the quadratic scan; took {elapsed:?}"
+        );
+    }
+
     /// ft-r5xkf: the plausibility rule is a property of the overlap text, so it
     /// is checkable directly. A single byte is never enough; two or more bytes
     /// need something that is not whitespace; long overlaps are taken on faith.
@@ -3778,6 +3908,13 @@ mod tests {
         }
 
         let max_overlap = overlap_size.min(previous.len()).min(current.len());
+        // ft-li2hc: mirror the production distinction between "no border exists"
+        // and "the window could not reach far enough back".
+        let no_border_reason = if max_overlap < previous.len().min(current.len()) {
+            "overlap_window_exhausted"
+        } else {
+            "overlap_not_found"
+        };
         let current_boundaries = utf8_boundaries(current);
         let previous_boundaries = utf8_boundaries(previous);
         let mut best_overlap: Option<usize> = None;
@@ -3820,7 +3957,7 @@ mod tests {
                 }
             }
             None => DeltaResult::Gap {
-                reason: "overlap_not_found".to_string(),
+                reason: no_border_reason.to_string(),
                 content: current.to_string(),
             },
         }
@@ -4013,8 +4150,7 @@ mod tests {
     #[test]
     fn ft_6lso5_resumed_cursor_emits_only_output_captured_while_away() {
         // Pane already has "$ echo hello\nhello\n" stored as seq 0..=1.
-        let mut cursor =
-            PaneCursor::from_seq(3, 2).with_resume_anchor("$ echo hello\nhello\n");
+        let mut cursor = PaneCursor::from_seq(3, 2).with_resume_anchor("$ echo hello\nhello\n");
         assert!(cursor.has_resume_anchor());
 
         let segment = cursor
@@ -4097,7 +4233,9 @@ mod tests {
         let mut cursor = PaneCursor::from_seq(3, 0).with_resume_anchor("");
         assert!(!cursor.has_resume_anchor());
 
-        let segment = cursor.capture_snapshot("first output\n", 1024, None).expect("capture");
+        let segment = cursor
+            .capture_snapshot("first output\n", 1024, None)
+            .expect("capture");
         assert_eq!(segment.content, "first output\n");
         assert_eq!(segment.kind, CapturedSegmentKind::Delta);
     }

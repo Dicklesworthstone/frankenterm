@@ -2590,8 +2590,20 @@ Troubleshooting "ft is behind":
 
 - Check `ft status` (or `ft robot state`) for last-seen timestamps and pane
   observation state.
-- Inspect logs for backpressure warnings (capture queue full) and GAP reasons
-  like `overlap_not_found` or `seq_discontinuity`.
+- Inspect logs for backpressure warnings (capture queue full) and GAP reasons.
+  The ones an operator is most likely to see, and what each means:
+  - `overlap_not_found` — the new snapshot shares no border with the previous
+    one. Content was lost, or the pane was reset.
+  - `overlap_implausible` — a border existed but was only boundary noise (a
+    single byte, or nothing but whitespace), which is not evidence of
+    continuity. Treated as a gap rather than reported as a clean delta.
+  - `resume_anchor_not_found` — the first capture after a restart could not
+    find already-persisted output in the pane's current scrollback, so the
+    intervening content had scrolled off or the pane was cleared.
+  - `content_changed_without_append` — the snapshot changed in place rather
+    than growing (an editor repaint, a progress line rewrite).
+  - `alt_screen_toggled` / `current_empty` / `seq_discontinuity` — alt-screen
+    transition, an empty capture, and a storage sequence mismatch.
 - Use `ft events` / `ft robot events` to confirm whether gap events are being
   emitted for a specific pane.
 - If available in your build, `ft doctor` / `ft triage` should summarize ingest
