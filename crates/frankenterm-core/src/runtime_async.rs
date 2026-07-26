@@ -4093,14 +4093,36 @@ mod tests {
     // NEW TESTS: Timeout edge cases
     // ========================================================================
 
+    /// `Duration::ZERO` is not a non-blocking poll.
+    ///
+    /// The deadline is the instant the timeout future is *constructed*, so by
+    /// the time it is first polled the ambient clock has normally passed it and
+    /// the timeout reports `Elapsed` without ever polling the inner future. It
+    /// only prefers ready inner work at exactly `now == deadline`.
+    ///
+    /// This test used to be `timeout_zero_duration_with_immediate_future_succeeds`
+    /// and asserted the opposite. That assertion was a coin flip on whether the
+    /// clock ticked between construction and first poll — it held on an idle
+    /// machine and failed as soon as the suite ran to completion under load
+    /// (ft-nam3s). So the load-independent half of the contract is what gets
+    /// pinned here: a zero-duration timeout elapses rather than hanging.
+    ///
+    /// The rest of the repo already treats `Duration::ZERO` as invalid input —
+    /// the search_bridge validation gate rejects such timeouts outright
+    /// (br-ft-qfklb), and the snapshot scheduler shipped exactly this footgun as
+    /// a shutdown poll and consequently never observed shutdown (ft-83kc7). Do
+    /// not "fix" this back into a success assertion; use a real poll instead.
     #[test]
-    fn timeout_zero_duration_with_immediate_future_succeeds() {
+    fn timeout_zero_duration_elapses_rather_than_polling_inner_future() {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
-            // Zero timeout but future completes immediately: should succeed
-            let result = timeout(Duration::ZERO, async { 42 }).await;
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap(), 42);
+            // `pending` can never complete, so `Ok` is unreachable by
+            // construction and the outcome cannot depend on machine load.
+            let result = timeout(Duration::ZERO, std::future::pending::<u32>()).await;
+            assert!(
+                result.is_err(),
+                "a zero-duration timeout must elapse, never block"
+            );
         });
     }
 

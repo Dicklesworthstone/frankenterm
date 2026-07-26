@@ -1312,9 +1312,20 @@ mod tests {
             assert_eq!(result.windows_created, 0);
             assert_eq!(result.tabs_created, 0);
             assert_eq!(result.panes_created, 0);
+            // [ft-nam3s] Derive the expected text from the same error the mock
+            // returns. This used to be a hardcoded "Runtime error: …" literal,
+            // which staled the moment `Error::RuntimeOperation` gained its
+            // `operation` field (error.rs:188).
             assert_eq!(
                 result.failed_panes,
-                vec![(1, "Runtime error: simulated spawn failure".to_string())]
+                vec![(
+                    1,
+                    test_runtime_error(
+                        "restore_layout.test.spawn_targeted",
+                        "simulated spawn failure"
+                    )
+                    .to_string()
+                )]
             );
         });
     }
@@ -1357,7 +1368,11 @@ mod tests {
             assert!(result.pane_id_map.contains_key(&1));
             assert_eq!(
                 result.failed_panes,
-                vec![(2, "Runtime error: simulated split failure".to_string())]
+                vec![(
+                    2,
+                    test_runtime_error("restore_layout.test.split_pane", "simulated split failure")
+                        .to_string()
+                )]
             );
         });
     }
@@ -1405,7 +1420,11 @@ mod tests {
             assert!(result.pane_id_map.contains_key(&3));
             assert_eq!(
                 result.failed_panes,
-                vec![(2, "Runtime error: simulated split failure".to_string())]
+                vec![(
+                    2,
+                    test_runtime_error("restore_layout.test.split_pane", "simulated split failure")
+                        .to_string()
+                )]
             );
 
             let first_tab_pane = inner.pane_state(result.pane_id_map[&1]).await.unwrap();

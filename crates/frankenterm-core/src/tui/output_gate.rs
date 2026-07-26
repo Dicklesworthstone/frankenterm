@@ -927,8 +927,30 @@ pub(crate) mod tests {
 
     #[test]
     fn gate_phase_from_u8_unknown_values_default_inactive() {
-        for v in [3u8, 10, 100, 128, 254, 255] {
-            assert_eq!(GatePhase::from_u8(v), GatePhase::Inactive);
+        // [ft-nam3s] Derive the unknown set from the live discriminants and
+        // sweep the whole u8 range. This test used to hardcode `3` as
+        // "unknown"; adding `InlineActive = 3` made that literal wrong while
+        // the test still looked correct.
+        let known = [
+            GatePhase::Inactive,
+            GatePhase::Active,
+            GatePhase::Suspended,
+            GatePhase::InlineActive,
+        ];
+        for v in u8::MIN..=u8::MAX {
+            if known.iter().any(|phase| *phase as u8 == v) {
+                assert_eq!(
+                    GatePhase::from_u8(v) as u8,
+                    v,
+                    "known discriminant {v} must round-trip"
+                );
+                continue;
+            }
+            assert_eq!(
+                GatePhase::from_u8(v),
+                GatePhase::Inactive,
+                "unknown discriminant {v} must fall back to Inactive"
+            );
         }
     }
 

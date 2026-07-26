@@ -304,6 +304,18 @@ pub(super) fn resolve_workspace_scoped_path(
             ),
         )
     })?;
+
+    // [ft-nam3s] When the target itself exists the loop above breaks on its
+    // first iteration, so `ancestor == candidate` and the suffix is empty.
+    // `PathBuf::join("")` does NOT return the receiver unchanged: it pushes
+    // MAIN_SEPARATOR and then nothing, yielding `…/contract.json/`. That path
+    // compares equal to the clean one (`Path`'s `PartialEq` walks components
+    // and discards trailing separators, which is why the regression tests
+    // below could not see this) but `open(2)`/`stat(2)` reject it with
+    // ENOTDIR, breaking every tx/mission tool whose contract file exists.
+    if unresolved_suffix.as_os_str().is_empty() {
+        return Ok(ancestor_canon);
+    }
     Ok(ancestor_canon.join(unresolved_suffix))
 }
 
@@ -1570,6 +1582,20 @@ mod tests {
 
     // ── ft-security-mcp-path-traversal regression suite ─────────────
 
+    /// `Path`'s `PartialEq` compares `components()`, which silently discards a
+    /// trailing separator — so `assert_eq!` calls `…/c.json/` equal to
+    /// `…/c.json`. Resolved paths are handed straight to `open(2)`, which
+    /// rejects the former with ENOTDIR. Compare the raw `OsStr` so a resolver
+    /// that emits an unusable path cannot pass (see ft-nam3s).
+    #[track_caller]
+    fn assert_path_identity(actual: &Path, expected: &Path) {
+        assert_eq!(
+            actual.as_os_str(),
+            expected.as_os_str(),
+            "resolved path must match byte-for-byte, not merely component-wise"
+        );
+    }
+
     #[test]
     fn resolve_workspace_scoped_path_rejects_parent_dir_component() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1602,10 +1628,40 @@ mod tests {
         std::fs::write(root.join("mission/contract.json"), "{}").expect("write fixture");
         let resolved =
             resolve_workspace_scoped_path(root, "mission/contract.json").expect("valid relative");
-        assert_eq!(
-            resolved,
-            root.join("mission/contract.json").canonicalize().unwrap(),
-            "existing targets must return their canonical identity"
+        assert_path_identity(
+            &resolved,
+            &root.join("mission/contract.json").canonicalize().unwrap(),
+        );
+    }
+
+    /// A resolved path is an I/O identity, not just a containment verdict:
+    /// every caller feeds it straight to `File::open` / `try_exists`. Assert
+    /// the usable property directly so no future normalization slip can
+    /// return a path that authorizes but cannot be opened (ft-nam3s).
+    #[test]
+    fn resolve_workspace_scoped_path_returns_an_openable_path_for_existing_targets() {
+        const FIXTURE_BODY: &str = "{\"marker\":\"ft-nam3s\"}";
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("mission")).expect("mkdir mission/");
+        std::fs::write(root.join("mission/contract.json"), FIXTURE_BODY).expect("write fixture");
+
+        let resolved =
+            resolve_workspace_scoped_path(root, "mission/contract.json").expect("valid relative");
+
+        let rendered = resolved.as_os_str().to_string_lossy();
+        assert!(
+            !rendered.ends_with(std::path::MAIN_SEPARATOR),
+            "resolved file path must not carry a trailing separator, got {rendered:?}"
+        );
+        // `open(2)` is the operation every caller actually performs, and it is
+        // the one that rejects a trailing separator with ENOTDIR.
+        let body = std::fs::read_to_string(&resolved).expect("resolved path must be openable");
+        assert_eq!(body, FIXTURE_BODY, "resolved path must address the fixture");
+        assert!(
+            resolved.try_exists().expect("try_exists must not error"),
+            "resolved path must stat cleanly"
         );
     }
 
@@ -1619,13 +1675,13 @@ mod tests {
         std::fs::create_dir_all(root.join("mission")).expect("mkdir");
         let resolved =
             resolve_workspace_scoped_path(root, "mission/not-yet.json").expect("valid save path");
-        assert_eq!(
-            resolved,
-            root.join("mission")
+        assert_path_identity(
+            &resolved,
+            &root
+                .join("mission")
                 .canonicalize()
                 .unwrap()
                 .join("not-yet.json"),
-            "save targets must retain their unresolved suffix beneath the canonical ancestor"
         );
     }
 
@@ -1638,7 +1694,7 @@ mod tests {
         let abs = root.join("mission/inside.json");
         let resolved = resolve_workspace_scoped_path(root, &abs.to_string_lossy())
             .expect("absolute path inside root must be accepted");
-        assert_eq!(resolved, abs.canonicalize().unwrap());
+        assert_path_identity(&resolved, &abs.canonicalize().unwrap());
     }
 
     /// The authorization result is also the I/O identity. Retargeting an

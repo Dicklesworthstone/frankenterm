@@ -9058,10 +9058,10 @@ mod tests {
 
     #[test]
     fn focus_traversal_full_cycle() {
-        // Tab through all 8 views and verify focus resets each time
+        // Tab through every view and verify focus resets each time.
         let mut model = make_model(MockQuery::healthy());
         model.view_state.focus = FocusRegion::FilterBar;
-        for _ in 0..8 {
+        for _ in 0..View::all().len() {
             let tab = ftui::KeyEvent {
                 code: ftui::KeyCode::Tab,
                 kind: ftui::KeyEventKind::Press,
@@ -9607,6 +9607,23 @@ mod tests {
             self.press(ftui::KeyCode::Char(ch))
         }
 
+        /// Tab forward until `target` is the current view.
+        ///
+        /// [ft-nam3s] Tests used to hardcode the Tab count between two views
+        /// (`// Timeline -> Home`). Adding `View::Deck` lengthened the cycle
+        /// and silently staled every one of them. Bound the walk by the view
+        /// count and derive the stop condition instead, so a new view costs
+        /// nothing here.
+        fn tab_to(&mut self, target: View) {
+            for _ in 0..View::all().len() {
+                if self.model.view_state.current_view == target {
+                    return;
+                }
+                self.press(ftui::KeyCode::Tab);
+            }
+            self.assert_view(target);
+        }
+
         /// Capture the current frame as text. Returns snapshot index.
         fn capture(&mut self) -> usize {
             self.capture_idx()
@@ -9685,21 +9702,17 @@ mod tests {
         s.capture();
         s.assert_view(View::Home);
 
-        // Tab through all views
-        let expected = [
-            View::Panes,
-            View::Events,
-            View::Triage,
-            View::History,
-            View::Search,
-            View::Help,
-            View::Timeline,
-            View::Home, // wraps
-        ];
-        for &view in &expected {
+        // Tab once per view, asserting each step follows View::next() and
+        // that a full lap wraps back to the starting view. Derived rather
+        // than hardcoded so adding a view extends the tour automatically
+        // (ft-nam3s).
+        let mut expected = View::Home;
+        for _ in 0..View::all().len() {
+            expected = expected.next();
             s.press(ftui::KeyCode::Tab);
-            s.assert_view(view);
+            s.assert_view(expected);
         }
+        s.assert_view(View::Home);
     }
 
     #[test]
@@ -10077,21 +10090,15 @@ mod tests {
         s.press(ftui::KeyCode::Escape);
         assert!(s.model.view_state.history.filter_input.text().is_empty());
 
-        // 4. Panes (Tab from History through Search/Help/Timeline/Home, then '2')
-        s.press(ftui::KeyCode::Tab); // History -> Search
-        s.press(ftui::KeyCode::Tab); // Search -> Help
-        s.press(ftui::KeyCode::Tab); // Help -> Timeline
-        s.press(ftui::KeyCode::Tab); // Timeline -> Home
+        // 4. Panes (Tab forward from History back around to Home, then '2')
+        s.tab_to(View::Home);
         s.char('2'); // Home -> Panes
         s.assert_view(View::Panes);
         s.press(ftui::KeyCode::Down);
         s.capture();
 
-        // 5. Search (Tab from Panes through Events/Triage/History)
-        s.press(ftui::KeyCode::Tab); // Panes -> Events
-        s.press(ftui::KeyCode::Tab); // Events -> Triage
-        s.press(ftui::KeyCode::Tab); // Triage -> History
-        s.press(ftui::KeyCode::Tab); // History -> Search
+        // 5. Search (Tab forward from Panes)
+        s.tab_to(View::Search);
         s.assert_view(View::Search);
         for ch in "error".chars() {
             s.char(ch);
@@ -10099,10 +10106,8 @@ mod tests {
         s.capture();
         assert_eq!(s.model.search_input.text(), "error");
 
-        // 6. Back to Home (Tab through Help/Timeline)
-        s.press(ftui::KeyCode::Tab); // Search -> Help
-        s.press(ftui::KeyCode::Tab); // Help -> Timeline
-        s.press(ftui::KeyCode::Tab); // Timeline -> Home
+        // 6. Back to Home (Tab forward through the remaining views)
+        s.tab_to(View::Home);
         s.assert_view(View::Home);
         s.capture();
     }
@@ -10114,13 +10119,18 @@ mod tests {
         // Scenario: Rapidly switch between all views via Tab 100 times
         // Tab always works globally, unlike digits which are consumed in some views.
         let mut s = E2eSession::new(MockQuery::healthy());
-        for _ in 0..100 {
+        const TABS: usize = 100;
+        for _ in 0..TABS {
             s.press(ftui::KeyCode::Tab);
         }
-        // 100 tabs from Home: 100 % 8 = 4 -> should be on History (Home+4)
-        // Home->Panes->Events->Triage->History->Search->Help->Timeline->Home...
-        // 100 mod 8 = 4 (0-indexed from Home): Panes(1), Events(2), Triage(3), History(4)
-        s.assert_view(View::History);
+        // Where 100 Tabs land depends on the cycle length, so walk the same
+        // number of View::next() steps rather than hardcoding a modulus
+        // against a view count that changes (ft-nam3s).
+        let mut expected = View::Home;
+        for _ in 0..TABS {
+            expected = expected.next();
+        }
+        s.assert_view(expected);
         s.capture();
     }
 
@@ -10311,7 +10321,8 @@ mod tests {
         // Scenario: 100 Tab presses with real data — stress the view routing
         let mut s = E2eSession::new(MockQuery::with_events());
 
-        for i in 0..100 {
+        const TABS: usize = 100;
+        for i in 0..TABS {
             s.press(ftui::KeyCode::Tab);
             // Capture every 10th frame to exercise rendering
             if i % 10 == 0 {
@@ -10320,10 +10331,13 @@ mod tests {
             }
         }
 
-        // 100 tabs through 8 views = 100 mod 8 = position 4
-        // Views: Home(0), Panes(1), Events(2), Triage(3), History(4), Search(5), Help(6), Timeline(7)
-        // 100 % 8 = 4 → History
-        s.assert_view(View::History);
+        // Derived from View::next() rather than a modulus against a
+        // hardcoded view count (ft-nam3s).
+        let mut expected = View::Home;
+        for _ in 0..TABS {
+            expected = expected.next();
+        }
+        s.assert_view(expected);
     }
 
     #[test]
