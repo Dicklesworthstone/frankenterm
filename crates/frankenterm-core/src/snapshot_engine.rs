@@ -945,12 +945,30 @@ impl SnapshotEngine {
                     self.maybe_run_session_cleanup(cx, &mut last_session_cleanup)
                         .await;
 
-                    // ft-xbnl0.2.3 tick 297: cx-first timeouts in intelligent scheduler.
-                    let shutdown_check_fut = shutdown.changed(cx);
-                    if crate::runtime_async::timeout_with_cx(cx, Duration::ZERO, shutdown_check_fut)
-                        .await
-                        .is_ok()
-                    {
+                    // ft-83kc7: read the shutdown FLAG, do not wait for a change
+                    // event with a zero-duration timeout.
+                    //
+                    // This was `timeout_with_cx(cx, Duration::ZERO,
+                    // shutdown.changed(cx))`, intended as a non-blocking poll.
+                    // A zero-duration timeout cannot do that: the deadline is
+                    // the instant the future is built, so by the time it is
+                    // first polled the ambient clock has usually passed it, and
+                    // `TimeoutFuture` returns `Elapsed` *without polling the
+                    // inner future at all* (it only prefers ready inner work at
+                    // `now == deadline`). The shutdown signal was therefore
+                    // never observed, this loop never exited, and every test
+                    // that spawns the intelligent scheduler and awaits its
+                    // handle hung forever — all ten of them. The same fact is
+                    // already recorded for the search bridge under br-ft-qfklb:
+                    // a `Duration::ZERO` timeout "fires immediately, before any
+                    // work".
+                    //
+                    // The flag is what this check actually wants: `changed()`
+                    // reports an edge, and an edge can be missed, whereas the
+                    // value is monotonic for a shutdown latch. Shutdown latency
+                    // stays bounded by the trigger wait-step below (<= 250 ms),
+                    // exactly as the previous code intended.
+                    if *shutdown.borrow() {
                         tracing::info!("snapshot engine shutting down");
                         break;
                     }
@@ -2526,6 +2544,37 @@ mod tests {
         .unwrap()
     }
 
+    /// Wait until the scheduler has written `expected` checkpoints (ft-83kc7).
+    ///
+    /// The scheduler tests used to sleep a fixed 100 ms and assert immediately.
+    /// That is the sleep-and-hope pattern this project rejects by design
+    /// ("Event-Driven, Not Time-Based"), and it was only ever passing by
+    /// accident: while the intelligent scheduler could not observe shutdown,
+    /// each of these tests wedged at its final `handle.await` and stopped
+    /// competing for CPU. With the hang fixed they all run concurrently, doing
+    /// real SQLite work on a shared worker, and 100 ms stopped being enough —
+    /// four of them failed their *startup* assertion.
+    ///
+    /// Polling for the condition removes the guess. It fails with the same
+    /// message shape as the assertion it replaces, so a genuine "capture did not
+    /// happen" bug still reports clearly rather than timing out silently.
+    async fn await_checkpoint_count(db_path: &str, expected: i64, label: &str) {
+        const WAIT_BUDGET: Duration = Duration::from_secs(10);
+        const POLL_STEP: Duration = Duration::from_millis(20);
+
+        let deadline = Instant::now() + WAIT_BUDGET;
+        let mut observed = checkpoint_count(db_path);
+        while observed < expected && Instant::now() < deadline {
+            sleep(POLL_STEP).await;
+            observed = checkpoint_count(db_path);
+        }
+
+        assert_eq!(
+            observed, expected,
+            "{label}: expected {expected} checkpoint(s) within {WAIT_BUDGET:?}, saw {observed}"
+        );
+    }
+
     fn counting_pane_provider()
     -> impl Fn()
         -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<PaneInfo>>> + Send>>
@@ -2554,9 +2603,8 @@ mod tests {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
-            sleep(Duration::from_millis(100)).await;
-            let after_startup = checkpoint_count(db_path.as_str());
-            assert_eq!(after_startup, 1, "startup capture");
+            // ft-83kc7: wait for the startup capture rather than guessing at it.
+            await_checkpoint_count(db_path.as_str(), 1, "startup capture").await;
 
             // Sum = 4.0 < threshold(5.0)
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
@@ -2850,9 +2898,8 @@ mod tests {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
-            sleep(Duration::from_millis(100)).await;
-            let after_startup = checkpoint_count(db_path.as_str());
-            assert_eq!(after_startup, 1, "startup capture");
+            // ft-83kc7: wait for the startup capture rather than guessing at it.
+            await_checkpoint_count(db_path.as_str(), 1, "startup capture").await;
 
             // Accumulate 2.0 < 5.0 threshold
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
@@ -2910,8 +2957,8 @@ mod tests {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
-            sleep(Duration::from_millis(100)).await;
-            assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup only");
+            // ft-83kc7: wait for the startup capture rather than guessing at it.
+            await_checkpoint_count(db_path.as_str(), 1, "startup only").await;
 
             // Send non-accumulating triggers
             let _ = engine.emit_trigger(SnapshotTrigger::Manual);
@@ -2934,6 +2981,47 @@ mod tests {
         });
     }
 
+    /// ft-83kc7: the intelligent scheduler must exit when shutdown is signalled.
+    ///
+    /// It did not. The shutdown check was a `Duration::ZERO` timeout wrapped
+    /// around `shutdown.changed()`, which returns `Elapsed` without polling the
+    /// inner future once the ambient clock has passed the (immediately-expired)
+    /// deadline — so the signal was never observed and the loop ran forever.
+    /// Every test that spawns this scheduler and awaits its handle hung, which
+    /// is what made an unfiltered `--lib` run impossible once DB-backed tests
+    /// started working at all.
+    ///
+    /// The assertion is wrapped in a timeout so a regression FAILS this test
+    /// instead of wedging the whole suite the way the original defect did.
+    #[test]
+    fn ft_83kc7_intelligent_scheduler_exits_on_shutdown() {
+        run_async_test(async {
+            let (_tmp, db_path) = setup_test_db();
+            let engine = Arc::new(SnapshotEngine::new(
+                db_path.clone(),
+                intelligent_config(5.0),
+            ));
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let e2 = engine.clone();
+            let handle = crate::runtime_async::task::spawn(async move {
+                e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
+            });
+
+            // Let the scheduler reach its loop (startup capture + first
+            // session-cleanup pass) before signalling.
+            sleep(Duration::from_millis(150)).await;
+            shutdown_tx.send(true).expect("shutdown send");
+
+            // The loop re-checks the flag once per trigger wait-step (250 ms),
+            // so a few seconds is generous while still bounding a regression.
+            timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("intelligent scheduler must observe shutdown and exit")
+                .expect("scheduler task must not panic");
+        });
+    }
+
     #[test]
     fn intelligent_exact_threshold_boundary() {
         run_async_test(async {
@@ -2950,8 +3038,8 @@ mod tests {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
-            sleep(Duration::from_millis(100)).await;
-            assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
+            // ft-83kc7: wait for the startup capture rather than guessing at it.
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::WorkCompleted); // +2.0
             sleep(Duration::from_millis(50)).await;
@@ -3020,8 +3108,8 @@ mod tests {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
-            sleep(Duration::from_millis(100)).await;
-            assert_eq!(checkpoint_count(db_path.as_str()), 1, "startup");
+            // ft-83kc7: wait for the startup capture rather than guessing at it.
+            await_checkpoint_count(db_path.as_str(), 1, "startup").await;
 
             let _ = engine.emit_trigger(SnapshotTrigger::HazardThreshold);
             sleep(Duration::from_millis(100)).await;
