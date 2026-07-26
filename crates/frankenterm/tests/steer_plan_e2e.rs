@@ -306,7 +306,13 @@ esac
                     now_ms.saturating_add(600_000),
                     scope.workspace_id(),
                     scope.action_kind(),
-                    scope.pane_id(),
+                    // `ApprovalScope::pane_id` is `Option<u64>`, and rusqlite
+                    // implements `ToSql` for signed integers only — SQLite has no
+                    // unsigned type. Bind the same value the production insert
+                    // path binds.
+                    scope
+                        .pane_id()
+                        .map(|pane_id| i64::try_from(pane_id).expect("pane id fits i64")),
                     scope.action_fingerprint(),
                     "isolated bound steering transaction fixture"
                 ],
