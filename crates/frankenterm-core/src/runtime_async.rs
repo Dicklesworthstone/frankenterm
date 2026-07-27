@@ -2225,18 +2225,33 @@ pub struct RuntimeBuilder {
     inner: asupersync::runtime::RuntimeBuilder,
 }
 
+/// Default blocking-pool ceiling for wrapper-built runtimes (ft-7p1bx).
+///
+/// asupersync's `BlockingPoolConfig` defaults to `max_threads: 0`, which
+/// means NO blocking pool — and `asupersync::runtime::spawn_blocking`
+/// under an ambient `Cx` without a pool runs the closure INLINE on the
+/// executor thread. On a current-thread runtime that freezes the entire
+/// async world for the duration of the blocking work: timers don't fire,
+/// cancel watchers can't poll, `timeout(..)` can't elapse. Every wrapper
+/// preset therefore configures a real pool. Threads spawn on demand
+/// (min 0) and are reaped after the pool's idle timeout, so idle cost is
+/// zero; the ceiling is deterministic and host-independent.
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 16;
+
 impl RuntimeBuilder {
     #[must_use]
     pub fn current_thread() -> Self {
         Self {
-            inner: asupersync::runtime::RuntimeBuilder::current_thread(),
+            inner: asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, DEFAULT_MAX_BLOCKING_THREADS),
         }
     }
 
     #[must_use]
     pub fn multi_thread() -> Self {
         Self {
-            inner: asupersync::runtime::RuntimeBuilder::new(),
+            inner: asupersync::runtime::RuntimeBuilder::new()
+                .blocking_threads(0, DEFAULT_MAX_BLOCKING_THREADS),
         }
     }
 
@@ -2244,6 +2259,21 @@ impl RuntimeBuilder {
     pub fn worker_threads(self, n: usize) -> Self {
         Self {
             inner: self.inner.worker_threads(n),
+        }
+    }
+
+    /// Bound the blocking pool (tokio-parity knob).
+    ///
+    /// The wrapper presets already configure an on-demand pool of up to
+    /// [`DEFAULT_MAX_BLOCKING_THREADS`]; callers with heavier blocking
+    /// fan-out (bulk SQLite scans, process bridges) can raise the ceiling.
+    /// A `max` of 0 would drop the pool entirely and revert
+    /// `spawn_blocking` to inline-on-executor execution, so it is clamped
+    /// to 1.
+    #[must_use]
+    pub fn max_blocking_threads(self, max: usize) -> Self {
+        Self {
+            inner: self.inner.blocking_threads(0, max.max(1)),
         }
     }
 
@@ -4656,6 +4686,32 @@ mod tests {
             assert!(
                 !work_ran.load(Ordering::SeqCst),
                 "blocking closure must not have been scheduled when pre-cancelled"
+            );
+        });
+    }
+
+    /// ft-7p1bx: pins the blocking-pool regression directly. asupersync's
+    /// `spawn_blocking` with an ambient `Cx` but NO blocking pool runs the
+    /// closure INLINE on the executor thread — which froze the runtime for
+    /// the duration of any blocking work (timers stalled, cancel watchers
+    /// starved). The wrapper presets must configure a real pool so blocking
+    /// work leaves the executor thread.
+    #[test]
+    fn spawn_blocking_runs_off_the_executor_thread() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let executor_thread = std::thread::current().id();
+            let blocking_thread = spawn_blocking(std::thread::current)
+                .await
+                .expect("blocking closure should complete")
+                .id();
+            assert_ne!(
+                executor_thread, blocking_thread,
+                "spawn_blocking must run on the blocking pool, not inline on the \
+                 executor thread (inline execution freezes timers and cancel watchers)"
             );
         });
     }

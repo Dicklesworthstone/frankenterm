@@ -1080,7 +1080,11 @@ fn record_mcp_audit_sync(
     if let Err(e) = std::thread::Builder::new()
         .name("ft-mcp-audit".to_string())
         .spawn(move || {
-            let rt = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+            // ft-7p1bx: route through the canonical runtime_async builder so
+            // this runtime gets a real blocking pool — the bare asupersync
+            // builder ships max_blocking_threads=0, which degrades
+            // spawn_blocking to inline-on-executor execution.
+            let rt = match crate::runtime_async::RuntimeBuilder::current_thread().build() {
                 Ok(r) => r,
                 Err(e) => {
                     // br-ft-luav8: silent failure point #2.
