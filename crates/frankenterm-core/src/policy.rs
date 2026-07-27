@@ -6947,6 +6947,28 @@ impl PolicyEngine {
         ) {
             // Deny if in alt-screen mode (vim, less, htop, etc.)
             if input.capabilities.alt_screen == Some(true) {
+                // [safety].block_alt_screen routes UNTRUSTED alt-screen sends
+                // through the approval workflow instead of the flat deny
+                // below, so an operator can deliberately approve a robot
+                // driving a fullscreen TUI. It must be evaluated before the
+                // unconditional deny or it can never fire (ft-0eby0: this
+                // gate previously sat after the deny return and was
+                // structurally dead). Trusted actors keep the hard deny —
+                // pinned by authorize_denies_send_in_alt_screen_even_for_human.
+                if self.block_alt_screen && !input.actor.is_trusted() {
+                    context.record_rule(
+                        "policy.block_alt_screen",
+                        true,
+                        Some("require_approval"),
+                        Some("pane in alternate screen".to_string()),
+                    );
+                    context.set_determining_rule("policy.block_alt_screen");
+                    return PolicyDecision::require_approval_with_rule(
+                        "Pane is in the alternate screen (fullscreen app) - approval required before sending",
+                        "policy.block_alt_screen",
+                    )
+                    .with_context(context);
+                }
                 context.record_rule(
                     "policy.alt_screen",
                     true,
@@ -7084,38 +7106,9 @@ impl PolicyEngine {
             );
         }
 
-        // Block sends to alternate-screen panes ([safety].block_alt_screen).
-        // A fullscreen TUI (vim/less/htop) in the alt screen interprets injected
-        // text as app keystrokes, not shell input, so sending into it is unsafe.
-        // The flag is honored here (it was previously dead: configured but never
-        // enforced, and `is_input_safe` — which checks alt_screen — was never
-        // called on a production path). Untrusted actors require approval;
-        // trusted actors (operator) may deliberately drive a TUI.
-        if self.block_alt_screen
-            && matches!(
-                input.action,
-                ActionKind::SendText
-                    | ActionKind::SendControl
-                    | ActionKind::SendCtrlC
-                    | ActionKind::SendCtrlD
-                    | ActionKind::SendCtrlZ
-            )
-            && input.capabilities.alt_screen == Some(true)
-            && !input.actor.is_trusted()
-        {
-            context.record_rule(
-                "policy.block_alt_screen",
-                true,
-                Some("require_approval"),
-                Some("pane in alternate screen".to_string()),
-            );
-            context.set_determining_rule("policy.block_alt_screen");
-            return PolicyDecision::require_approval_with_rule(
-                "Pane is in the alternate screen (fullscreen app) - approval required before sending",
-                "policy.block_alt_screen",
-            )
-            .with_context(context);
-        }
+        // The [safety].block_alt_screen gate is evaluated inside the
+        // alt-screen check above (ft-0eby0): it must run before the
+        // unconditional alt-screen deny, otherwise it is unreachable.
 
         // Check reservation conflicts
         if input.action.is_mutating() && input.capabilities.is_reserved {
@@ -11330,12 +11323,18 @@ mod tests {
         // Regression: [safety].block_recent_gap was a documented config option
         // with NO real field — the recent-gap gate fired unconditionally and the
         // toggle could not disable it. The flag is now real and honored.
+        //
+        // The capabilities start from prompt() (alt_screen = Some(false),
+        // prompt_active = true) so the earlier fail-closed
+        // policy.alt_screen_unknown gate — which legitimately outranks the
+        // recent-gap gate for untrusted actors — cannot shadow the toggle
+        // under test (ft-0eby0).
         let make = || {
             PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
                 .with_pane(1)
                 .with_capabilities(PaneCapabilities {
                     has_recent_gap: true,
-                    ..Default::default()
+                    ..PaneCapabilities::prompt()
                 })
         };
 
