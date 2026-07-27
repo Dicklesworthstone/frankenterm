@@ -5767,20 +5767,24 @@ mod tests {
             model.triage_count,
         );
 
-        // Check system status rows (starting at row 2 after title+separator)
+        // 80x22 is the Compact viewport class (width < 96): the status
+        // block renders canonical uppercase status words and abbreviates
+        // "Database" to "DB" ("  Watcher RUNNING  DB OK").
         let mut found_watcher = false;
         let mut found_db = false;
+        let mut rows = Vec::new();
         for r in 0..22 {
             let text = read_row(&frame, r);
-            if text.contains("Watcher") && text.contains("running") {
+            if text.contains("Watcher") && text.contains("RUNNING") {
                 found_watcher = true;
             }
-            if text.contains("Database") && text.contains("ok") {
+            if text.contains("DB") && text.contains("OK") {
                 found_db = true;
             }
+            rows.push(text);
         }
-        assert!(found_watcher, "Watcher status not found");
-        assert!(found_db, "Database status not found");
+        assert!(found_watcher, "Watcher status not found in:\n{rows:#?}");
+        assert!(found_db, "DB status not found in:\n{rows:#?}");
     }
 
     #[test]
@@ -5839,15 +5843,19 @@ mod tests {
             model.triage_count,
         );
 
+        // 80x22 is the Compact viewport class: the quick-help block renders
+        // the compact key legend "  Tab views | j/k move | Enter | ? help |
+        // q quit" (lowercase key legend, no standalone "Quit").
         let mut found_help = false;
+        let mut rows = Vec::new();
         for r in 0..22 {
             let text = read_row(&frame, r);
-            if text.contains("Tab") && text.contains("Quit") {
+            if text.contains("Tab views") && text.contains("q quit") {
                 found_help = true;
-                break;
             }
+            rows.push(text);
         }
-        assert!(found_help, "Quick help not found");
+        assert!(found_help, "Quick help not found in:\n{rows:#?}");
     }
 
     #[test]
@@ -6200,14 +6208,20 @@ mod tests {
             PaneRenderFilters::default(),
         );
 
+        // 100x28 is the side-by-side (non-stacked) layout: row 0 is the list
+        // border title, row 1 the lowercase column header, row 2 the filter
+        // summary line (which is where the active-filter state, including
+        // "domain=all", stays visible to the operator).
         let row0 = read_row(&frame, 0);
-        assert!(row0.contains("Panes (3/3)"));
-        assert!(row0.contains("domain=all"));
+        assert!(row0.contains("Panes (3/3)"), "row0: {row0:?}");
 
         let row1 = read_row(&frame, 1);
-        assert!(row1.contains("ID"));
-        assert!(row1.contains("Agent"));
-        assert!(row1.contains("State"));
+        assert!(row1.contains("id"), "row1: {row1:?}");
+        assert!(row1.contains("agent"), "row1: {row1:?}");
+        assert!(row1.contains("state"), "row1: {row1:?}");
+
+        let row2 = read_row(&frame, 2);
+        assert!(row2.contains("domain=all"), "row2: {row2:?}");
     }
 
     #[test]
@@ -6231,10 +6245,13 @@ mod tests {
             PaneRenderFilters::default(),
         );
 
-        // Pane rows start at row 2
-        let row2 = read_row(&frame, 2);
-        assert!(row2.contains("0")); // pane_id
-        assert!(row2.contains("PromptAc")); // state (truncated)
+        // Rows 0-2 are border title, column header, and filter summary; the
+        // header block is 3 rows tall in the side-by-side layout, so the
+        // first pane row lands on row 4 (border consumes row 0, header rows
+        // 1-3 start inside the border at y=1).
+        let row4 = read_row(&frame, 4);
+        assert!(row4.contains("0"), "row4: {row4:?}"); // pane_id
+        assert!(row4.contains("PromptActive"), "row4: {row4:?}"); // state column
     }
 
     #[test]
@@ -6326,7 +6343,9 @@ mod tests {
             PaneRenderFilters::default(),
         );
 
-        let detail_row = first_row_containing(&frame, 22, "Pane Details")
+        // The stacked (narrow) layout titles the detail block "Selected
+        // Pane"; "Pane Details" is the side-by-side layout's title.
+        let detail_row = first_row_containing(&frame, 22, "Selected Pane")
             .expect("compact panes layout should still show detail header");
         assert!(
             detail_row >= 10,
