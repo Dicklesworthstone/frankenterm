@@ -847,6 +847,28 @@ fn set_tx_contract_workspace_test_root(root: Option<PathBuf>) {
     });
 }
 
+/// Pre-resolve pane capabilities for every pane a tx contract references.
+///
+/// The MCP tx surface has no live ingest registry, so prepare gates would
+/// otherwise evaluate against `PaneCapabilities::unknown()` — which fails
+/// `PromptActive` preconditions closed and forces the untrusted MCP actor
+/// into approval on every `SendText` step even when prompt and alt-screen
+/// evidence exists. This resolves the same evidence chain used by `wa.send`
+/// and `wa.get_text`: OSC-133 prompt state from stored segments, alt-screen
+/// and gap state from the watcher IPC, reservations from storage.
+async fn resolve_tx_prepare_capabilities(
+    config: &Config,
+    storage: &StorageHandle,
+    contract: &crate::plan::MissionTxContract,
+) -> std::collections::HashMap<u64, PaneCapabilities> {
+    let mut capabilities = std::collections::HashMap::new();
+    for pane_id in contract.referenced_pane_ids() {
+        let resolution = resolve_pane_capabilities(config, Some(storage), pane_id).await;
+        capabilities.insert(pane_id, resolution.capabilities);
+    }
+    capabilities
+}
+
 fn tx_run_wezterm_handle(config: &Config) -> crate::wezterm::WeztermHandle {
     #[cfg(test)]
     if let Some(handle) = tx_run_test_wezterm_override_slot()
@@ -6189,7 +6211,13 @@ impl ToolHandler for WaTxRunTool {
             .with_surface(PolicySurface::Mcp)
             .with_actor(crate::policy::ActorKind::Mcp);
         let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
-        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage));
+        let resolved_capabilities = runtime.block_on(resolve_tx_prepare_capabilities(
+            self.config.as_ref(),
+            &storage,
+            &contract,
+        ));
+        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
+            .with_resolved_capabilities(resolved_capabilities);
         let executor = crate::tx_execution::PaneStepExecutor::new(
             tx_run_wezterm_handle(self.config.as_ref()),
             RefCell::new(policy_engine),
@@ -6511,7 +6539,13 @@ impl ToolHandler for WaTxRollbackTool {
             .with_surface(PolicySurface::Mcp)
             .with_actor(crate::policy::ActorKind::Mcp);
         let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
-        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage));
+        let resolved_capabilities = runtime.block_on(resolve_tx_prepare_capabilities(
+            self.config.as_ref(),
+            &storage,
+            &contract,
+        ));
+        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
+            .with_resolved_capabilities(resolved_capabilities);
         let executor = crate::tx_execution::PaneStepExecutor::new(
             tx_run_wezterm_handle(self.config.as_ref()),
             RefCell::new(policy_engine),
@@ -9595,7 +9629,21 @@ mod tests {
         }
     }
 
-    fn seed_tx_run_real_targets(db_path: &Path, mock: &Arc<crate::wezterm::MockWezterm>) {
+    /// Seed panes 1..=3 as real, prompt-active prepare targets.
+    ///
+    /// "Real" means every evidence source the prepare gates consult is
+    /// populated: a fresh observed `panes` row (liveness), an OSC-133 prompt
+    /// marker segment (the `PromptActive` precondition), a watcher pane-state
+    /// override reporting normal screen with no capture gap (the untrusted
+    /// MCP actor's alt-screen policy gate), and a live mock mux pane (step
+    /// dispatch). Callers must hold the returned override guards for the
+    /// duration of the tool call, binding them AFTER the wezterm override
+    /// guard so they drop while the tx serialization mutex is still held.
+    #[must_use]
+    fn seed_tx_run_real_targets(
+        db_path: &Path,
+        mock: &Arc<crate::wezterm::MockWezterm>,
+    ) -> Vec<crate::mcp::McpTestPaneStateOverrideGuard> {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
@@ -9621,6 +9669,10 @@ mod tests {
                     })
                     .await
                     .expect("pane record should seed");
+                storage
+                    .append_segment(pane_id, "\u{1b}]133;A\u{7}$ ", None)
+                    .await
+                    .expect("prompt evidence segment should seed");
                 mock.add_pane(crate::wezterm::MockPane {
                     pane_id,
                     window_id: pane_id,
@@ -9637,6 +9689,9 @@ mod tests {
                 .await;
             }
         });
+        (1..=3u64)
+            .map(|pane_id| set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id)))
+            .collect()
     }
 
     fn tx_run_mock_pane_content(mock: &Arc<crate::wezterm::MockWezterm>, pane_id: u64) -> String {
@@ -9852,7 +9907,14 @@ mod tests {
             .with_surface(PolicySurface::Mcp)
             .with_actor(crate::policy::ActorKind::Mcp);
         let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
-        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage));
+        let mut contract = sample_tx_contract(MissionTxState::Planned);
+        let resolved_capabilities = runtime.block_on(super::resolve_tx_prepare_capabilities(
+            config.as_ref(),
+            &storage,
+            &contract,
+        ));
+        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage))
+            .with_resolved_capabilities(resolved_capabilities);
         let executor = crate::tx_execution::PaneStepExecutor::new(
             tx_run_wezterm_handle(config.as_ref()),
             std::cell::RefCell::new(policy_engine),
@@ -9873,7 +9935,6 @@ mod tests {
             crate::tx_idempotency::IdempotencyPolicy::default(),
         )
         .expect("durable tx fixture store should open");
-        let mut contract = sample_tx_contract(MissionTxState::Planned);
         let execution = engine
             .execute_with_store(&mut contract, &mut store, mcp_now_ms_i64())
             .expect("proof-linked fixture execution should complete");
@@ -11847,7 +11908,7 @@ mod tests {
         symlink(foreign_dir.path(), &replacement_alias).unwrap();
 
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let active_alias_for_hook = active_alias.clone();
         install_tx_contract_post_lock_test_hook(move || {
             std::fs::rename(&replacement_alias, &active_alias_for_hook)
@@ -11918,7 +11979,7 @@ mod tests {
         std::fs::write(&foreign_path, &foreign_sentinel).unwrap();
 
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let active_for_hook = active_dir.clone();
         install_tx_contract_post_lock_test_hook(move || {
             std::fs::rename(&active_for_hook, &detached_dir)
@@ -11983,7 +12044,7 @@ mod tests {
         std::fs::write(&foreign_path, &foreign_sentinel).unwrap();
 
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let active_for_hook = active_dir.clone();
         install_tx_contract_post_lock_test_hook(move || {
             std::fs::rename(&active_for_hook, &detached_dir)
@@ -12048,7 +12109,7 @@ mod tests {
         std::fs::write(&foreign_path, &foreign_before).unwrap();
 
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let active_for_hook = active_dir.clone();
         install_tx_contract_post_auth_test_hook(move || {
             std::fs::rename(&active_for_hook, &detached_dir)
@@ -12126,7 +12187,7 @@ mod tests {
         let foreign_sentinel = b"post-auth foreign basename sentinel".to_vec();
 
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let contract_for_hook = contract_path.clone();
         let sentinel_for_hook = foreign_sentinel.clone();
         install_tx_contract_post_auth_test_hook(move || {
@@ -12188,7 +12249,7 @@ mod tests {
         let foreign_dir = workspace_tempdir();
         let alias_dir = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let original_path =
             write_tx_contract_with_proven_commit_receipts(&original_dir, &db_path, None);
         let contract_name = original_path.file_name().unwrap().to_owned();
@@ -12263,7 +12324,7 @@ mod tests {
         let (_db_dir, db_path) = temp_db_path();
         let workspace = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let root_contract =
             write_tx_contract_with_proven_commit_receipts(&workspace, &db_path, None);
         let active_dir = workspace.path().join("active");
@@ -12338,7 +12399,7 @@ mod tests {
         let (_db_dir, db_path) = temp_db_path();
         let workspace = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let contract_path =
             write_tx_contract_with_proven_commit_receipts(&workspace, &db_path, None);
         let detached_contract = workspace
@@ -12441,7 +12502,7 @@ mod tests {
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxRunTool::new(config_with_db_path(&db_path));
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
 
         let envelope = parse_json_content(
             tool.call(
@@ -12485,7 +12546,7 @@ mod tests {
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let tool = WaTxRunTool::new(config_with_db_path(&db_path));
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
 
         let envelope = parse_json_content(
             tool.call(
@@ -12518,7 +12579,7 @@ mod tests {
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
         let config = config_with_db_path(&db_path);
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
 
         let run = parse_json_content(
             WaTxRunTool::new(Arc::clone(&config))
@@ -12683,7 +12744,7 @@ mod tests {
         let (_db_dir, db_path) = temp_db_path();
         let dir = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let contract_path = write_tx_contract_with_proven_commit_receipts(&dir, &db_path, None);
         let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
 
@@ -12723,7 +12784,7 @@ mod tests {
         let (_db_dir, db_path) = temp_db_path();
         let dir = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let contract_path = write_tx_contract_with_proven_commit_receipts(&dir, &db_path, None);
         let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));
 
@@ -12858,7 +12919,7 @@ mod tests {
         let (_db_dir, db_path) = temp_db_path();
         let dir = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let contract_path = write_tx_contract_with_proven_commit_receipts(&dir, &db_path, None);
         let mut contract = mcp_load_mission_tx_contract_from_path(&contract_path)
             .expect("load proven transaction fixture");
@@ -12929,7 +12990,7 @@ mod tests {
         let (_db_dir, db_path) = temp_db_path();
         let dir = workspace_tempdir();
         let (_guard, mock) = install_tx_run_mock_wezterm();
-        seed_tx_run_real_targets(&db_path, &mock);
+        let _pane_state_overrides = seed_tx_run_real_targets(&db_path, &mock);
         let contract_path =
             write_tx_contract_with_proven_commit_receipts(&dir, &db_path, Some("tx-step:2"));
         let tool = WaTxRollbackTool::new(config_with_db_path(&db_path));

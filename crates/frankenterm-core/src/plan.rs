@@ -3272,6 +3272,33 @@ impl MissionTxContract {
     }
 
     /// Latest token-budget attachment carried by this contract, if any.
+    /// All pane ids referenced by plan steps, preconditions, and compensations.
+    ///
+    /// This is the set prepare-gate evidence must cover: callers that
+    /// pre-resolve pane capabilities (see
+    /// [`StorageBackedPrepareTargetLookup::with_resolved_capabilities`])
+    /// resolve exactly these panes.
+    #[must_use]
+    pub fn referenced_pane_ids(&self) -> std::collections::BTreeSet<u64> {
+        let mut pane_ids = std::collections::BTreeSet::new();
+        for step in &self.plan.steps {
+            if let Some(pane_id) = tx_prepare_pane_id(&step.action) {
+                pane_ids.insert(pane_id);
+            }
+        }
+        for precondition in &self.plan.preconditions {
+            if let TxPrecondition::PromptActive { pane_id } = precondition {
+                pane_ids.insert(*pane_id);
+            }
+        }
+        for compensation in &self.plan.compensations {
+            if let Some(pane_id) = tx_prepare_pane_id(&compensation.action) {
+                pane_ids.insert(pane_id);
+            }
+        }
+        pane_ids
+    }
+
     pub fn token_budget_attachment(&self) -> Result<Option<MissionTokenBudgetAttachment>, String> {
         let mut attachment = None;
         for receipt in &self.receipts {
@@ -3848,6 +3875,7 @@ pub trait TxPrepareTargetLookup {
 pub struct StorageBackedPrepareTargetLookup<'a> {
     registry: Option<&'a crate::ingest::PaneRegistry>,
     storage: Option<&'a crate::storage::StorageHandle>,
+    resolved_capabilities: HashMap<u64, PaneCapabilities>,
 }
 
 impl<'a> StorageBackedPrepareTargetLookup<'a> {
@@ -3856,7 +3884,30 @@ impl<'a> StorageBackedPrepareTargetLookup<'a> {
         registry: Option<&'a crate::ingest::PaneRegistry>,
         storage: Option<&'a crate::storage::StorageHandle>,
     ) -> Self {
-        Self { registry, storage }
+        Self {
+            registry,
+            storage,
+            resolved_capabilities: HashMap::new(),
+        }
+    }
+
+    /// Supply pre-resolved pane capabilities for the storage-backed path.
+    ///
+    /// A bare `panes` row carries no prompt/alt-screen evidence, and prepare
+    /// gates fail closed on unknown capabilities: `PromptActive` preconditions
+    /// can never pass and untrusted actors are forced into approval on every
+    /// `SendText` step. Callers without a live ingest registry (the MCP tx
+    /// surface) resolve capabilities from the same evidence chain as the other
+    /// MCP surfaces (OSC-133 prompt state from stored segments, alt-screen/gap
+    /// from the watcher IPC) and hand the result in here. The registry path is
+    /// unaffected — live ingest state stays authoritative when present.
+    #[must_use]
+    pub fn with_resolved_capabilities(
+        mut self,
+        resolved_capabilities: HashMap<u64, PaneCapabilities>,
+    ) -> Self {
+        self.resolved_capabilities = resolved_capabilities;
+        self
     }
 
     fn reservation_state(&self, pane_id: u64) -> (Option<String>, Option<String>) {
@@ -3915,7 +3966,11 @@ impl TxPrepareTargetLookup for StorageBackedPrepareTargetLookup<'_> {
         let (reserved_by, reservation_lookup_error) = self.reservation_state(pane_id);
         Ok(Some(TxPrepareTargetSnapshot {
             pane_id,
-            capabilities: PaneCapabilities::unknown(),
+            capabilities: self
+                .resolved_capabilities
+                .get(&pane_id)
+                .cloned()
+                .unwrap_or_else(PaneCapabilities::unknown),
             last_seen_at_ms: Some(pane.last_seen_at),
             observed: pane.observed,
             known_dead: false,
