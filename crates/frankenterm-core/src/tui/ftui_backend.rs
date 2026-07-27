@@ -3050,6 +3050,11 @@ fn render_panes_view(
 
     let selected_profile = filters.selected_profile.unwrap_or("default");
     let active_profile = filters.active_profile.unwrap_or("default");
+    // The side-by-side list is ~62% of the terminal width, so a single
+    // verbose summary line truncates at common widths (100 cols left
+    // "domain=…"/profile state invisible, ft-u3989). Split it across the
+    // two header rows below the column header instead; stacked mode keeps
+    // its single compact line.
     let filter_summary = if stacked_mode {
         format!(
             "q='{}' uh={} bm={} ag={} dom={} prof={}/{} ({})",
@@ -3064,17 +3069,20 @@ fn render_panes_view(
         )
     } else {
         format!(
-            "filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
-            filters.query,
-            filters.unhandled_only,
-            filters.bookmarked_only,
+            "filter='{}' unhandled={} bookmarked={}",
+            filters.query, filters.unhandled_only, filters.bookmarked_only,
+        )
+    };
+    let filter_summary_overflow = (!stacked_mode).then(|| {
+        format!(
+            "agent={} domain={} profile={} active={} ({})",
             filters.agent_filter.unwrap_or("all"),
             filters.domain_filter.unwrap_or("all"),
             selected_profile,
             active_profile,
             filters.profile_count,
         )
-    };
+    });
 
     let list_header_height = if ultra_compact || list_inner.height < 6 {
         2
@@ -3116,6 +3124,18 @@ fn render_panes_view(
             header_area.x,
             header_area.y + 1,
             &truncate_str(&filter_summary, header_width as usize),
+            CellStyle::new().fg(color_gray()),
+            header_area.width,
+        );
+    }
+    if header_area.height > 2
+        && let Some(overflow) = filter_summary_overflow.as_deref()
+    {
+        write_styled_clipped(
+            frame,
+            header_area.x,
+            header_area.y + 2,
+            &truncate_str(overflow, header_width as usize),
             CellStyle::new().fg(color_gray()),
             header_area.width,
         );
@@ -6209,9 +6229,10 @@ mod tests {
         );
 
         // 100x28 is the side-by-side (non-stacked) layout: row 0 is the list
-        // border title, row 1 the lowercase column header, row 2 the filter
-        // summary line (which is where the active-filter state, including
-        // "domain=all", stays visible to the operator).
+        // border title, row 1 the lowercase column header, and the filter
+        // summary spans rows 2-3 (the list panel is ~62% of the width, so a
+        // single verbose line truncated away the domain/profile state —
+        // splitting keeps every active filter operator-visible).
         let row0 = read_row(&frame, 0);
         assert!(row0.contains("Panes (3/3)"), "row0: {row0:?}");
 
@@ -6221,7 +6242,12 @@ mod tests {
         assert!(row1.contains("state"), "row1: {row1:?}");
 
         let row2 = read_row(&frame, 2);
-        assert!(row2.contains("domain=all"), "row2: {row2:?}");
+        assert!(row2.contains("unhandled=false"), "row2: {row2:?}");
+
+        let row3 = read_row(&frame, 3);
+        assert!(row3.contains("agent=all"), "row3: {row3:?}");
+        assert!(row3.contains("domain=all"), "row3: {row3:?}");
+        assert!(row3.contains("profile=default"), "row3: {row3:?}");
     }
 
     #[test]

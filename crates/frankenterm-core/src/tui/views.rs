@@ -1084,18 +1084,25 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
             profile_count
         )
     } else {
+        // Mirrors the ftui backend (ft-u3989): the side-by-side list is
+        // ~62% of the terminal width, so the verbose one-line summary
+        // truncated away domain/profile state at common widths. Split it
+        // across two header rows instead.
         format!(
-            "filter='{}' unhandled={} bookmarked={} agent={} domain={} profile={} active={} ({})",
-            state.panes_filter_query,
-            state.panes_unhandled_only,
-            state.panes_bookmarked_only,
+            "filter='{}' unhandled={} bookmarked={}",
+            state.panes_filter_query, state.panes_unhandled_only, state.panes_bookmarked_only,
+        )
+    };
+    let filter_summary_overflow = (!stacked_mode).then(|| {
+        format!(
+            "agent={} domain={} profile={} active={} ({})",
             state.panes_agent_filter.as_deref().unwrap_or("all"),
             state.panes_domain_filter.as_deref().unwrap_or("all"),
             selected_profile_name,
             active_profile_name,
             profile_count
         )
-    };
+    });
     let header_width = usize::from(list_chunks[0].width.saturating_sub(1)).max(1);
     let columns = if ultra_compact {
         "id ag st u title"
@@ -1104,14 +1111,20 @@ pub fn render_panes_view(state: &ViewState, area: Rect, buf: &mut Buffer) {
     } else {
         "id  bm      agent    state          unhandled  title"
     };
-    Paragraph::new(vec![
+    let mut header_lines = vec![
         Line::from(truncate_str(columns, header_width)),
         Line::from(Span::styled(
             truncate_str(&filter_summary, header_width),
             Style::default().fg(Color::Gray),
         )),
-    ])
-    .render(list_chunks[0], buf);
+    ];
+    if let Some(overflow) = filter_summary_overflow.as_deref() {
+        header_lines.push(Line::from(Span::styled(
+            truncate_str(overflow, header_width),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    Paragraph::new(header_lines).render(list_chunks[0], buf);
 
     if filtered_indices.is_empty() {
         Paragraph::new(Span::styled(
