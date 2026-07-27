@@ -1084,6 +1084,7 @@ fn record_mcp_audit_sync(
             // this runtime gets a real blocking pool — the bare asupersync
             // builder ships max_blocking_threads=0, which degrades
             // spawn_blocking to inline-on-executor execution.
+            use crate::runtime_async::CompatRuntime as _;
             let rt = match crate::runtime_async::RuntimeBuilder::current_thread().build() {
                 Ok(r) => r,
                 Err(e) => {
