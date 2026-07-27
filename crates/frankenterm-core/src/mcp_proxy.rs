@@ -1587,6 +1587,12 @@ mod tests {
 
     #[test]
     fn compose_proxy_tools_selection_error_falls_back_when_non_strict() {
+        // ft-0eby0: this call takes the soft no-db path and BUMPS the
+        // process-global unaudited-degraded-skip counter, so it must hold
+        // the counter lock like every other bumper — it was the one
+        // unguarded bumper racing the reset/assert windows of the guarded
+        // counter tests.
+        let _guard = proxy_counter_test_lock();
         let mut config = Config::default();
         config.mcp_client.enabled = true;
         config.mcp_client.proxy_enabled = true;
@@ -1603,6 +1609,10 @@ mod tests {
 
     #[test]
     fn compose_proxy_tools_selection_error_fails_when_strict() {
+        // ft-0eby0: strict mode errors before the counter bump today, but
+        // hold the lock anyway so a future gate reorder cannot silently
+        // reintroduce the unguarded-bumper race.
+        let _guard = proxy_counter_test_lock();
         let mut config = Config::default();
         config.mcp_client.enabled = true;
         config.mcp_client.proxy_enabled = true;

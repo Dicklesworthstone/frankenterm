@@ -55,6 +55,21 @@ fn record_mission_event_log_normalization() {
     MISSION_EVENT_LOG_NORMALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// ft-0eby0: test lock for `MISSION_EVENT_LOG_NORMALIZATION_COUNT`.
+/// The counter is process-global and the suite runs tests in
+/// parallel, so every test that resets or asserts it — and every
+/// test that deserializes a mismatched/stale input (which bumps
+/// it) — must hold this lock.
+#[cfg(test)]
+static MISSION_EVENT_NORMALIZATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn mission_event_normalization_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    MISSION_EVENT_NORMALIZATION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ── Event kind taxonomy ─────────────────────────────────────────────────────
 
 /// Top-level mission event kind.
@@ -1546,6 +1561,7 @@ mod tests {
 
     #[test]
     fn event_log_deserialize_normalizes_stale_sequence_ft_jaqyc() {
+        let _guard = mission_event_normalization_test_lock();
         reset_mission_event_log_normalization_count_for_test();
         let mut log = small_log(10);
         for i in 0..3 {
@@ -1610,6 +1626,7 @@ mod tests {
         // Plant a malformed JSON where kind is AssignmentEmitted
         // (Dispatch phase) but phase claims Lifecycle. The healed
         // event must report the canonical phase regardless.
+        let _guard = mission_event_normalization_test_lock();
         reset_mission_event_log_normalization_count_for_test();
 
         let event = MissionEvent::new(MissionEventInput {
@@ -1645,6 +1662,7 @@ mod tests {
 
     #[test]
     fn deserialize_does_not_normalize_consistent_event_ft_a05f3() {
+        let _guard = mission_event_normalization_test_lock();
         reset_mission_event_log_normalization_count_for_test();
 
         let event = MissionEvent::new(MissionEventInput {
@@ -1675,6 +1693,7 @@ mod tests {
         // mismatched stored phase. This test confirms the heal
         // propagates through the events_by_phase / count_by_phase
         // codepath.
+        let _guard = mission_event_normalization_test_lock();
         reset_mission_event_log_normalization_count_for_test();
 
         let event = MissionEvent::new(MissionEventInput {
@@ -1775,6 +1794,11 @@ mod tests {
             });
             let mut json = serde_json::to_value(&event).unwrap();
             json["phase"] = serde_json::json!(phase_label);
+            // ft-0eby0: this deserialize bumps the process-global
+            // normalization counter on every mismatched case; hold the
+            // shared lock so the absolute assertions in the sibling
+            // counter tests can't observe our bumps.
+            let _guard = mission_event_normalization_test_lock();
             let restored: MissionEvent =
                 serde_json::from_value(json).expect("must always deserialize");
             proptest::prop_assert_eq!(

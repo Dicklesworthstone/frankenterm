@@ -2433,8 +2433,18 @@ pub(crate) enum V0InitStep {
     MigrationsApplied,
 }
 
+// ft-0eby0: the fault plan is THREAD-LOCAL, not process-global. Every
+// fresh-DB open in the whole --lib binary routes through
+// run_v0_init_in_transaction (the ft-7tq4z fresh-path merge), so a
+// process-global fault armed by one test was consumed — and cleared —
+// by whichever unrelated StorageHandle::new landed first on another
+// thread, failing that test AND starving the arming test. The arming
+// test drives initialize_schema directly on its own thread, so a
+// thread-local cannot escape; consumers on writer threads see -1.
 #[cfg(test)]
-static V0_INIT_FAULT_AT: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+thread_local! {
+    static V0_INIT_FAULT_AT: std::cell::Cell<i8> = const { std::cell::Cell::new(-1) };
+}
 
 #[cfg(test)]
 pub(crate) fn set_v0_init_fault_for_test(step: Option<V0InitStep>) {
@@ -2444,12 +2454,12 @@ pub(crate) fn set_v0_init_fault_for_test(step: Option<V0InitStep>) {
         Some(V0InitStep::SchemaSqlApplied) => 1,
         Some(V0InitStep::MigrationsApplied) => 2,
     };
-    V0_INIT_FAULT_AT.store(value, std::sync::atomic::Ordering::SeqCst);
+    V0_INIT_FAULT_AT.with(|cell| cell.set(value));
 }
 
 #[cfg(test)]
 fn check_v0_init_fault(step: V0InitStep) -> Result<()> {
-    let active = V0_INIT_FAULT_AT.load(std::sync::atomic::Ordering::SeqCst);
+    let active = V0_INIT_FAULT_AT.with(std::cell::Cell::get);
     let target = match step {
         V0InitStep::RepairComplete => 0,
         V0InitStep::SchemaSqlApplied => 1,
@@ -2459,7 +2469,7 @@ fn check_v0_init_fault(step: V0InitStep) -> Result<()> {
         // Clear the fault so the test can re-enter the helper and verify
         // success on the second try. Mirrors how a real crash would not
         // re-fire on a subsequent open.
-        V0_INIT_FAULT_AT.store(-1, std::sync::atomic::Ordering::SeqCst);
+        V0_INIT_FAULT_AT.with(|cell| cell.set(-1));
         return Err(StorageError::MigrationFailed(format!(
             "ft-k542h fault injection: forced failure at {step:?}"
         ))
@@ -3743,8 +3753,13 @@ mod tests {
         let mut stmt = conn
             .prepare("SELECT name FROM pragma_index_list('output_segments')")
             .unwrap();
+        // The projection has exactly one column, so the name is at index 0.
+        // Index 1 made every row an InvalidColumnIndex error that
+        // `filter_map(ok)` silently dropped, so this helper always returned
+        // false — and the down-rollback `!has_index` assertion passed
+        // vacuously, hiding it (ft-kccj8).
         let names: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))
+            .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
             .filter_map(std::result::Result::ok)
             .collect();

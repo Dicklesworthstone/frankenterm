@@ -8426,6 +8426,20 @@ fn reset_storage_writer_panics_total_for_test() {
     STORAGE_WRITER_PANICS_TOTAL.store(0, AtomicOrdering::Relaxed);
 }
 
+/// ft-0eby0: test lock for `STORAGE_WRITER_PANICS_TOTAL`. The counter is
+/// process-global; every test that resets it and asserts an absolute
+/// value must hold this lock or a parallel sibling's reset/bump lands
+/// between the bump and the read.
+#[cfg(test)]
+static WRITER_PANIC_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn writer_panic_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITER_PANIC_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct MmapSegmentLine {
     id: i64,
@@ -10402,6 +10416,7 @@ mod writer_io_scheduler_tests {
 
     #[test]
     fn writer_batch_group_commit_panic_rolls_back_open_transaction() {
+        let _counter_guard = writer_panic_counter_test_lock();
         reset_storage_writer_panics_total_for_test();
 
         run_storage_async_test(async {
@@ -10471,6 +10486,7 @@ mod writer_io_scheduler_tests {
 
     #[test]
     fn writer_batch_recovers_from_dispatch_panic_and_fails_undispatched_tail() {
+        let _counter_guard = writer_panic_counter_test_lock();
         reset_storage_writer_panics_total_for_test();
 
         run_storage_async_test(async {
@@ -14574,12 +14590,30 @@ fn parse_pane_bookmark_tags(raw: &str, bookmark_id: i64, pane_id: u64) -> Option
     }
 }
 
+/// ft-0eby0: shared test lock for the parse-drop counter family
+/// (PANE_BOOKMARK_TAGS / WORKFLOW_EXECUTION_ROW / STORAGE_JSON_COL).
+/// The counters are process-global and the umbrella independence
+/// test resets all three at once, so every test that resets or
+/// asserts any of them must hold this ONE lock — per-counter locks
+/// would deadlock the umbrella test and still race the cross-module
+/// resets.
+#[cfg(test)]
+static PARSE_DROP_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn parse_drop_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PARSE_DROP_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod pane_bookmark_tags_parse_drop_tests {
     use super::*;
 
     #[test]
     fn well_formed_tags_no_bump_ft_pewat() {
+        let _guard = parse_drop_counter_test_lock();
         reset_pane_bookmark_tags_parse_drop_count_for_test();
         let tags = parse_pane_bookmark_tags(r#"["urgent","review"]"#, 1, 7);
         assert_eq!(tags, Some(vec!["urgent".to_string(), "review".to_string()]));
@@ -14589,6 +14623,7 @@ mod pane_bookmark_tags_parse_drop_tests {
     #[test]
     fn empty_tags_array_no_bump_ft_pewat() {
         // Boundary: legitimate empty tag list.
+        let _guard = parse_drop_counter_test_lock();
         reset_pane_bookmark_tags_parse_drop_count_for_test();
         let tags = parse_pane_bookmark_tags("[]", 1, 7);
         assert_eq!(tags, Some(Vec::<String>::new()));
@@ -14598,6 +14633,7 @@ mod pane_bookmark_tags_parse_drop_tests {
     #[test]
     fn malformed_tags_bumps_counter_ft_pewat() {
         // br-ft-pewat: a malformed tags value bumps the counter.
+        let _guard = parse_drop_counter_test_lock();
         reset_pane_bookmark_tags_parse_drop_count_for_test();
         let tags = parse_pane_bookmark_tags("{not an array", 42, 100);
         assert!(tags.is_none());
@@ -14617,6 +14653,7 @@ mod workflow_execution_row_parse_drop_tests {
     fn null_column_does_not_bump_ft_lqj5g() {
         // NULL column is legitimate absence; the counter must NOT
         // bump.
+        let _guard = parse_drop_counter_test_lock();
         reset_workflow_execution_row_parse_drop_count_for_test();
         let result: Option<serde_json::Value> =
             parse_workflow_execution_column(None, "wait_condition");
@@ -14626,6 +14663,7 @@ mod workflow_execution_row_parse_drop_tests {
 
     #[test]
     fn well_formed_column_does_not_bump_ft_lqj5g() {
+        let _guard = parse_drop_counter_test_lock();
         reset_workflow_execution_row_parse_drop_count_for_test();
         let result: Option<serde_json::Value> =
             parse_workflow_execution_column(Some(r#"{"key":"value"}"#), "context");
@@ -14637,6 +14675,7 @@ mod workflow_execution_row_parse_drop_tests {
     fn malformed_column_bumps_counter_ft_lqj5g() {
         // br-ft-lqj5g: a malformed JSON column bumps the counter
         // exactly once. Multiple drops accumulate.
+        let _guard = parse_drop_counter_test_lock();
         reset_workflow_execution_row_parse_drop_count_for_test();
         let r1: Option<serde_json::Value> =
             parse_workflow_execution_column(Some("{not json"), "wait_condition");
@@ -14665,6 +14704,7 @@ mod storage_json_col_parse_drop_tests {
     /// fails-to-parse counts as a drop.
     #[test]
     fn null_column_does_not_bump_ft_4d6ic() {
+        let _guard = parse_drop_counter_test_lock();
         reset_storage_json_col_parse_drop_count_for_test();
         let result: Option<serde_json::Value> = parse_storage_json_col(None, "events", "extracted");
         assert!(result.is_none());
@@ -14674,6 +14714,7 @@ mod storage_json_col_parse_drop_tests {
     /// br-ft-4d6ic: well-formed JSON returns Some + does not bump.
     #[test]
     fn well_formed_column_does_not_bump_ft_4d6ic() {
+        let _guard = parse_drop_counter_test_lock();
         reset_storage_json_col_parse_drop_count_for_test();
         let result: Option<serde_json::Value> =
             parse_storage_json_col(Some(r#"{"key":"value"}"#), "events", "extracted");
@@ -14686,6 +14727,7 @@ mod storage_json_col_parse_drop_tests {
     /// signal that JSON-column parse fidelity was degrading.
     #[test]
     fn malformed_column_bumps_counter_ft_4d6ic() {
+        let _guard = parse_drop_counter_test_lock();
         reset_storage_json_col_parse_drop_count_for_test();
         let result: Option<serde_json::Value> =
             parse_storage_json_col(Some("{not json"), "events", "extracted");
@@ -14702,6 +14744,7 @@ mod storage_json_col_parse_drop_tests {
     /// per-pair counters.
     #[test]
     fn drops_accumulate_across_distinct_tables_ft_4d6ic() {
+        let _guard = parse_drop_counter_test_lock();
         reset_storage_json_col_parse_drop_count_for_test();
 
         let _: Option<serde_json::Value> =
@@ -14733,6 +14776,7 @@ mod storage_json_col_parse_drop_tests {
     /// discrimination.
     #[test]
     fn umbrella_counter_independent_of_per_table_counters_ft_4d6ic() {
+        let _guard = parse_drop_counter_test_lock();
         reset_storage_json_col_parse_drop_count_for_test();
         reset_pane_bookmark_tags_parse_drop_count_for_test();
         reset_workflow_execution_row_parse_drop_count_for_test();
@@ -23469,11 +23513,17 @@ fn storage_tick149_search_semantic_cluster_roundtrip() {
             .unwrap();
         assert_eq!(unembedded_other.len(), 2);
 
-        // embedding_stats_with_cx — one embedder, two rows.
+        // embedding_stats_with_cx — assert on the tick149 group rather than
+        // table cardinality: since ft-xx5cl every appended segment is also
+        // auto-embedded by the production writer (fnv1a-hash-128), so the
+        // table legitimately holds a second embedder group (ft-kccj8).
         let stats = storage.embedding_stats_with_cx(&cx).await.unwrap();
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].embedder_id, "embedder-tick149");
-        assert_eq!(stats[0].count, 2);
+        let tick_stats = stats
+            .iter()
+            .find(|row| row.embedder_id == "embedder-tick149")
+            .expect("embedder-tick149 stats row");
+        assert_eq!(tick_stats.dimension, 4);
+        assert_eq!(tick_stats.count, 2);
 
         // semantic_search_with_cx — semantic hit list against our seeded
         // vectors. Exact order is a function of cosine similarity; we just
