@@ -28,6 +28,7 @@
     "frozen": "Numeric target is committed to in the epic. Bench may still be pending; target itself does not move except by a new ADR.",
     "dependency_bound": "Target is reserved for refresh once measurement plumbing lands. Number is operator-provisional until then.",
     "bench_pending": "Source bench file does not yet exist; will land alongside the sub-bead that delivers the implementation.",
+    "bench_present_contract_incomplete": "A source bench exists, but it does not yet emit the declared machine-readable evidence or exercise the production path required for the SLO claim.",
     "substrate_wired": "Source bench/test file exists and emits machine-readable measured/degraded evidence; production SLO proof still requires a retained target-run artifact.",
     "retained_run_validated": "Source bench/test file exists and the retained target-run artifact has passed its release gate without a degraded-substrate override."
   },
@@ -37,14 +38,16 @@
       "title": "Resize FPS",
       "target": "≥60 FPS sustained",
       "target_metric": "p99 frame time ≤ 16.6ms",
-      "scenario": "200-pane fleet, continuous 5s resize gesture",
-      "measurement": "Criterion sample of presented frame intervals",
+      "scenario": "Synthetic 200-pane dirty-row loop with five-second gesture metadata; separate one-terminal 512-line resize correctness assertion",
+      "measurement": "Criterion sample of synthetic dirty-row enumeration cost; does not traverse TermWindow, mux/pane resize, full reflow, shaping, GPU, or display presentation",
       "source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
       "structured_log": "target/criterion/slo-resize_fps.jsonl",
-      "status": "retained_run_validated",
+      "status": "substrate_wired",
+      "proof_scope": "retained_core_substrate_only_live_gui_target_run_pending",
       "retained_evidence": {
-        "status": "retained_run_validated",
-        "follow_up_bead": "ft-tf6g3.3.7",
+        "status": "retained_core_substrate_only_pending_live_target_run",
+        "substrate_bead": "ft-tf6g3.3.7",
+        "follow_up_bead": "ft-interactive-systems-performance-4tenz.3",
         "source_artifact_path": "crates/frankenterm-core/benches/resize_storm.rs",
         "source_artifact_sha256": "ae786cddb6bb4ace280e00cee32a24d29f5b43435247f5e09bd941518c8c21e7",
         "structured_log": "target/criterion/slo-resize_fps.jsonl",
@@ -63,10 +66,10 @@
         "criterion_time_interval_ms": "[3.1410, 3.3148, 3.4337]",
         "max_p99_frame_time_us": 106,
         "max_p95_frame_time_us": 16,
-        "reason": "Remote RCH retained target run passed on vmi1153651 with all 20 evidence rows within the 16.6ms p99 frame-time target; retained JSONL max p99 frame time was 106us."
+        "reason": "Remote RCH retained run passed on vmi1153651 with all 20 evidence rows within the 16.6ms p99 target and a retained maximum p99 of 106us. Code inspection on 2026-07-27 established that this validates the synthetic dirty-row loop only, not live 200-pane TermWindow/mux/reflow/GPU/present FPS."
       },
-      "blocked_by": [],
-      "owner_bead": "ft-tf6g3.3.7"
+      "blocked_by": ["ft-interactive-systems-performance-4tenz.3"],
+      "owner_bead": "ft-interactive-systems-performance-4tenz.3"
     },
     {
       "id": "RQ-S2.input_to_photon_macos",
@@ -89,7 +92,7 @@
         "target_run_attempt": {
           "classification": "target_run_reached_measured_over_target",
           "platform": "macos",
-          "reason": "Native Apple-Silicon macOS run executed outside the Linux-only RCH fleet (frankenterm-gui is structurally un-offloadable: RCH-E307 x11-xcb; RCH_FORCE_LOCAL=1 per the documented gui-crate proof lane). Bench completed exit 0 with real Metal GPU. Confounders: host was an active fleet controller (production GUI ~178% CPU, concurrent builds) and the headless readback path forces a GPU->CPU sync the on-screen CAMetalDrawable path does not pay — the measurement is a conservative upper bound, not a fair test of the 16ms claim.",
+          "reason": "Native Apple-Silicon macOS run executed outside the Linux-only RCH fleet (frankenterm-gui is structurally un-offloadable: RCH-E307 x11-xcb; RCH_FORCE_LOCAL=1 per the documented gui-crate proof lane). Bench completed exit 0 with real Metal GPU. The result is a proxy with opposing confounders: the active fleet-controller load and forced GPU-to-CPU readback add work, while the substrate omits NSEvent delivery, mux/PTY transport, production-window invalidation, display scan-out, and photons. It is neither a pass nor a mathematical upper or lower bound for the 16ms claim.",
           "cargo_reached": true,
           "test_or_bench_reached": true,
           "rch_admission": "not_applicable_native_macos_force_local",
@@ -227,7 +230,8 @@
       "measurement": "End-to-end keystroke timing under output pressure",
       "source_bench": "crates/frankenterm-core/benches/heavy_burst.rs",
       "structured_log": "target/criterion/slo-heavy_burst.jsonl",
-      "status": "bench_pending",
+      "status": "bench_present_contract_incomplete",
+      "status_reason": "The Criterion source exists, but it drives the SustainedBurstHarness deferred-operation model and does not write the declared structured_log or traverse a real key through the client socket, server dispatcher, mux main thread, PTY, and renderer.",
       "blocked_by": ["ft-mpc9b.5.1"],
       "owner_bead": "ft-mpc9b.5.1"
     },
@@ -362,11 +366,12 @@
     }
   ],
   "ci_gate": {
-    "status": "deferred",
+    "status": "deferred_pending_comparable_live_baselines_and_workflow_wiring",
     "blocked_by": [
-      "BR-RC-FOUNDATION.G3.2 (statistical rigor — Mann-Whitney U / Lai-Robbins SPRT)",
-      "≥1 SLO bench landing first to validate the wiring"
+      "Comparable retained live-path target baselines for the hardware classes under test",
+      "Per-PR workflow wiring from renderer SLO artifacts into the shipped ft-perf-gate statistical primitives"
     ],
+    "available_primitives": "ft-tf6g3.10 and crates/ft-perf-gate have landed; multiple SLO benches and retained substrate artifacts exist.",
     "design": {
       "regression_threshold": ">10% p95 worsening triggers fail",
       "sequential_test": "Lai-Robbins SPRT with α=0.05, β=0.10",
@@ -454,6 +459,12 @@
       "date": "2026-06-14",
       "bead": "ft-tf6g3.3.9",
       "note": "Recorded cod_7's fail-closed remote RCH lib probe for RQ-S5: vmi1264463 admitted and compiled cargo test -p frankenterm-core --lib idle_gpu for 36m46s, then exited 130 via user-originated cancellation before test/bench completion. Status remains substrate_wired_pending_rch_target_run because no idle-GPU target-run artifact or GPU-counter sample exists."
+    },
+    {
+      "version": "0.1.11",
+      "date": "2026-07-27",
+      "bead": "ft-interactive-systems-performance-4tenz.1",
+      "note": "Truth reconciliation downgrades RQ-S1 to substrate_wired and scopes its retained evidence to the synthetic dirty-row core substrate; live GUI FPS is blocked on ft-interactive-systems-performance-4tenz.3. RQ-S2 has a retained native-macOS proxy run which measured over target but is not a directional bound. RQ-S6 source exists but its structured-log and production key-to-render contract are incomplete. CI statistical primitives and multiple benches now exist; remaining gate blockers are comparable live baselines and workflow wiring. No SLO claim was upgraded."
     }
   ]
 }

@@ -3885,6 +3885,15 @@ When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
 
 For renderer-overhaul SLOs (resize FPS, input-to-photon, atlas stability, parity SSIM, idle GPU power), see [`docs/perf/resize-quality-slo.md`](docs/perf/resize-quality-slo.md) (with [machine-readable JSON](docs/perf/resize-quality-slo.json)). The upstream-of-render scheduler/reflow stage budgets live in [`docs/resize-performance-slos.md`](docs/resize-performance-slos.md).
 
+The sustained real-systems performance campaign for Mac keypress → LAN mux →
+remote PTY → presented frame, live resize/zoom, and 4h/24h/72h aged sessions
+lives in
+[`docs/perf/mux-long-session-performance-campaign.md`](docs/perf/mux-long-session-performance-campaign.md).
+It explicitly separates core/headless proxy benches from live GUI, transport,
+PTY, Metal, and display evidence; rejected hypotheses and their retry
+predicates live in
+[`docs/perf-ledger/interactive-systems-negative-results.md`](docs/perf-ledger/interactive-systems-negative-results.md).
+
 ---
 
 ## Testing

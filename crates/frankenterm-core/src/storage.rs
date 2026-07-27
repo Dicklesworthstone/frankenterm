@@ -156,9 +156,8 @@ pub mod fleet_mutation_receipts_sql;
 #[cfg(test)]
 pub(crate) use migrations::{
     FtVersion, MIGRATIONS, V0InitStep, apply_migration_plan, apply_migration_step,
-    build_migration_plan, load_ft_meta, previous_migration_version,
-    segment_embeddings_table_is_canonical, set_user_version, set_v0_init_fault_for_test,
-    split_schema_sql_pragmas, table_exists, table_has_column,
+    build_migration_plan, load_ft_meta, segment_embeddings_table_is_canonical, set_user_version,
+    set_v0_init_fault_for_test, split_schema_sql_pragmas, table_exists, table_has_column,
 };
 pub use migrations::{
     Migration, MigrationDirection, MigrationForensicBackendState, MigrationForensicBundle,

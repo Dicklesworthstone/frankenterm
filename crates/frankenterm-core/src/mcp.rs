@@ -1453,6 +1453,11 @@ mod tests {
                 "strict no-db error must name the public degraded constructor: {msg}"
             );
 
+            // ft-0eby0: degraded builds bump the process-global
+            // MCP_BRIDGE_TOOLS_SKIPPED_NO_DB counter (+29 each); hold the
+            // shared lock so mcp_bridge's exact-delta counter tests can't
+            // observe our bumps mid-assertion.
+            let _counter_guard = crate::mcp::mcp_bridge::mcp_bridge_counter_test_lock();
             let server = crate::mcp::build_server_degraded(&config)
                 .expect("public degraded constructor named by the error must be callable");
             let _observed_counter = crate::mcp::mcp_bridge_tools_skipped_no_db_count();
@@ -1474,6 +1479,9 @@ mod tests {
                 "build_server_with_db(None) must stay on the strict error path"
             );
 
+            // ft-0eby0: both builds bump the process-global degraded
+            // counter; hold the shared lock (see mcp_bridge_counter_test_lock).
+            let _counter_guard = crate::mcp::mcp_bridge::mcp_bridge_counter_test_lock();
             let degraded = build_server_degraded(&config)
                 .expect("explicit degraded builder must remain callable");
             let legacy = build_server(&config)
@@ -1619,6 +1627,9 @@ mod tests {
 
     #[test]
     fn mcp_server_without_db_only_exposes_non_storage_attention_resources() {
+        // ft-0eby0: degraded builds bump the process-global counter;
+        // hold the shared mcp_bridge lock.
+        let _counter_guard = crate::mcp::mcp_bridge::mcp_bridge_counter_test_lock();
         let server = build_server_degraded(&Config::default()).expect("build degraded mcp server");
 
         let resources = uri_set(server.resources().into_iter().map(|r| r.uri));
@@ -1917,6 +1928,9 @@ mod tests {
 
     #[test]
     fn non_storage_tools_registered_without_db_including_attention() {
+        // ft-0eby0: degraded builds bump the process-global counter;
+        // hold the shared mcp_bridge lock.
+        let _counter_guard = crate::mcp::mcp_bridge::mcp_bridge_counter_test_lock();
         let server = build_server_degraded(&Config::default()).expect("build degraded mcp server");
         let tool_defs = server.tools();
         let tool_names: BTreeSet<String> = tool_defs.into_iter().map(|t| t.name).collect();

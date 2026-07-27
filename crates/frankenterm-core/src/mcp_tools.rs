@@ -10778,6 +10778,33 @@ mod tests {
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(pane_id).await;
             let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
+            // ft-kccj8: the over-limit call attaches an approval token, and
+            // approval_tokens.pane_id REFERENCES panes(pane_id) — the pane
+            // row must exist in storage or the insert dies on the FK.
+            {
+                let storage = StorageHandle::new(&db.to_string_lossy())
+                    .await
+                    .expect("storage should open");
+                storage
+                    .upsert_pane(crate::storage::PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some("wa-send-rate-limit".to_string()),
+                        cwd: None,
+                        tty_name: None,
+                        first_seen_at: 1_700_000_000_000,
+                        last_seen_at: 1_700_000_000_000,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("pane row should seed");
+                let _ = storage.shutdown().await;
+            }
             let handle = mock as crate::wezterm::WeztermHandle;
             let tool_a = WaSendTool::with_wezterm_handle_and_shared_rate_limiter(
                 Arc::clone(&cfg),
@@ -15004,12 +15031,18 @@ exit 17",
         });
 
         let tool = WaSearchTool::new(config(), Arc::clone(&db));
+        // ft-kccj8: three fixture defects hid the actual br-ft-9ia4p path:
+        // (1) the hyphenated bareword parsed as FTS5 column-filter negation
+        // ("no such column: marker") — quote it as a phrase; (2) the param
+        // key is `pane`, not `pane_id` — serde silently dropped the filter
+        // so the distributed fallback under test never executed; (3) the
+        // response field is `total_hits`, not `total`.
         let envelope = parse_json_content(
             tool.call(
                 &test_mcp_context(),
                 serde_json::json!({
-                    "query": "needle-marker-9ia4p",
-                    "pane_id": pane_id,
+                    "query": "\"needle-marker-9ia4p\"",
+                    "pane": pane_id,
                     "mode": "lexical",
                 }),
             )
@@ -15024,7 +15057,7 @@ exit 17",
             envelope["ok"], true,
             "br-ft-9ia4p: search must succeed for distributed remote panes; got envelope={envelope}"
         );
-        let total = envelope["data"]["total"].as_u64().unwrap_or(0);
+        let total = envelope["data"]["total_hits"].as_u64().unwrap_or(0);
         assert!(
             total >= 1,
             "br-ft-9ia4p: search must return the seeded segment; got total={total} envelope={envelope}"

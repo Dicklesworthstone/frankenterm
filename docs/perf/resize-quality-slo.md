@@ -48,6 +48,7 @@ It is also the schema producers feed into:
 | `frozen` | Numeric target is committed to in the epic. Bench may still be pending; the *number* itself does not move except by a new ADR. |
 | `dependency_bound` | Target is reserved for refresh once measurement plumbing lands. The number is operator-provisional until then. |
 | `bench_pending` | Source bench file does not yet exist; will land alongside the sub-bead that delivers the implementation. |
+| `bench_present_contract_incomplete` | A source bench exists, but it does not yet emit the declared machine-readable evidence or exercise the production path required for the SLO claim. |
 | `substrate_wired` | Source bench/test file exists and emits machine-readable measured/degraded evidence; production SLO proof still requires a retained target-run artifact. |
 | `retained_run_validated` | Source bench/test file exists and the retained target-run artifact has passed its release gate without a degraded-substrate override. |
 
@@ -60,12 +61,12 @@ machine-readable JSON, the README, and the attestation bundle.
 
 | ID | Title | Target | Source bench / test | Owner bead | Status |
 |---|---|---|---|---|---|
-| RQ-S1 | Resize FPS | ≥60 sustained on 200-pane fleet, 5s gesture (p99 frame ≤16.6ms) | `crates/frankenterm-core/benches/resize_storm.rs` | ft-tf6g3.3.7 | retained_run_validated |
-| RQ-S2 | Input-to-photon (macOS) | p95 < 16ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
+| RQ-S1 | Resize FPS | ≥60 sustained on 200-pane fleet, 5s gesture (p99 frame ≤16.6ms) | `crates/frankenterm-core/benches/resize_storm.rs` | ft-interactive-systems-performance-4tenz.3 | substrate_wired |
+| RQ-S2 | Input-to-photon (macOS) | p95 < 16ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired; retained target run measured over target |
 | RQ-S3 | Input-to-photon (Wayland) | p95 < 20ms | `crates/frankenterm-gui/benches/renderer_slo/input_to_photon.rs` | ft-tf6g3.3.2 | substrate_wired |
 | RQ-S4 | Visual artifacts (24h fuzz) | 0 critical from random resize+scroll+content | `tests/renderer_golden/fuzz` | ft-mpc9b.1.6 | bench_pending |
 | RQ-S5 | Idle GPU usage | 0% sustained when no semantic change > 500ms | `crates/frankenterm-core/benches/idle_gpu.rs` | ft-tf6g3.3.9 | substrate_wired |
-| RQ-S6 | Heavy-burst input latency | p95 < 50ms with 1MB/s output across 50 panes | `crates/frankenterm-core/benches/heavy_burst.rs` | ft-mpc9b.5.1 | bench_pending |
+| RQ-S6 | Heavy-burst input latency | p95 < 50ms with 1MB/s output across 50 panes | `crates/frankenterm-core/benches/heavy_burst.rs` | ft-mpc9b.5.1 | bench_present_contract_incomplete |
 | RQ-S7 | Battery drain (24h idle, M2) | ≤5% on a healthy battery | manual lab — `docs/perf/lab/battery_drain_24h.sh` | ft-mpc9b.5.1 | bench_pending |
 | RQ-S8 | Frame skip rate (steady state) | ≥99% frames skipped on idle | `crates/frankenterm-core/benches/steady_state.rs` | ft-mpc9b.5.1 | bench_pending |
 | RQ-S9 | Reflow latency | p95 < 5ms for 1000-line scrollback, 80→200 cols | `crates/frankenterm-core/benches/reflow.rs` | ft-mpc9b.1.2 | dependency_bound (wa-1u90p.1.3) |
@@ -79,20 +80,46 @@ The full machine-readable catalog (with scenarios, structured-log paths, and
 is the single source of truth; this table is generated from it. If the two
 disagree, the JSON wins.
 
+RQ-S1's retained artifact validates the synthetic dirty-row Criterion
+substrate that produced it. The current `resize_storm.rs` timed loop does not
+enter the production TermWindow, mux/pane resize, scrollback reflow, shaping,
+GPU, or display-present path, so it must not be cited as live 200-pane GUI FPS
+or appearance proof. The live proof lane is tracked by
+`ft-interactive-systems-performance-4tenz.3`.
+
+RQ-S6's source file now exists, but it drives a modeled
+`SustainedBurstHarness`, does not write the declared structured log, and does
+not send a real key through the client/server mux, PTY, and renderer. Its
+status therefore records a present but incomplete proof contract rather than
+the obsolete “source file missing” state.
+
 ## Umbrella Closeout Status
 
-`docs/attestations/tui/render-parity.json` now carries the
-`renderer_slo_retained_evidence` ledger used by the G18 umbrella. As of
-2026-06-07, the umbrella is still blocked: RQ-S1/RQ-S10/RQ-S13 have
-retained remote RCH proof, while RQ-S2/RQ-S3/RQ-S5 are substrate-only
-pending target runs. The remaining missing target-run work is split across
-`ft-tf6g3.3.8` and `ft-tf6g3.3.9`.
+`docs/attestations/tui/render-parity.json` carries the
+`renderer_slo_retained_evidence` ledger used by the G18 umbrella. Its current
+ledger was generated on 2026-06-07 and still pins the older catalog hash
+`0888613f...`; it therefore predates the RQ-S1 scope correction, the retained
+over-target RQ-S2 run, and the RQ-S6 status correction recorded here. The
+attestation must be regenerated through `docs/release/attestation-checklist.md`
+under `ft-tf6g3.3.8`; until then, this catalog is the current source of truth
+and the attestation ledger is stale rather than silently authoritative. As of
+2026-07-27, the umbrella is still blocked: RQ-S1/RQ-S10/RQ-S13 have
+retained remote RCH proof for their stated substrates. RQ-S2 now has a retained
+native Apple-silicon target run, but that run measured over the `<16ms` target
+through a loaded-host headless-readback proxy (cold `351.65ms`, Criterion
+steady-state mean/median `33.30/33.54ms`), so it remains non-validating pending
+a quiet on-screen target run. RQ-S3 remains substrate-only and RQ-S5 lacks a
+retained platform GPU-counter run. The remaining target work is split across
+`ft-tf6g3.3.8`, `ft-tf6g3.3.9`, and the live systems campaign
+`ft-interactive-systems-performance-4tenz`.
 
 ## Structured-log contract
 
-Every SLO bench writes JSON-line records that the attestation pipeline
-ingests without further parsing. The path is per-SLO and listed in
-`structured_log` in the JSON catalog.
+Every SLO producer marked `substrate_wired` or `retained_run_validated` must
+write JSON-line records that the attestation pipeline ingests without further
+parsing. The path is per-SLO and listed in `structured_log` in the JSON
+catalog. Entries marked `bench_pending` or
+`bench_present_contract_incomplete` do not satisfy this contract yet.
 
 **Per-iteration record** (one line per Criterion sample):
 
@@ -112,6 +139,9 @@ The input-to-photon substrate emits one `ft.perf.evidence-sample.v1` row to
 `target/criterion/slo-input_to_photon_<platform>.jsonl` before Criterion starts
 sampling. A missing GPU or photon detector is represented as an explicit
 degraded state in the renderer SLO evidence, not as a passing measurement.
+The retained macOS row is explicitly
+`retained_run_over_target_pending_lab_run`; it is evidence that the native
+target was reached and measured over target, not evidence that RQ-S2 passed.
 The operator surfaces for this substrate are `ft doctor --json`
 `.renderer_slos.input_to_photon` and the read-only MCP resource
 `wa://perf/renderer-slo/input_to_photon`.
@@ -140,11 +170,12 @@ substrate-only run.
 ## CI gate (deferred)
 
 A per-PR regression gate is part of the bead's acceptance, but is **not**
-shippable today: the gate needs the statistical-rigor primitive from
-`BR-RC-FOUNDATION.G3.2` (Mann-Whitney U / Lai-Robbins SPRT), and at least
-one SLO bench has to land first to validate the wiring. The design is
-captured in the JSON's `ci_gate` block; the implementation lands once the
-upstream blockers clear.
+shippable today. The statistical primitives (`ft-tf6g3.10` /
+`crates/ft-perf-gate`) and multiple SLO benches now exist. The remaining
+blockers are comparable retained live-path baselines for each hardware class
+and workflow wiring that feeds those artifacts into the statistical gate.
+Proxy, live, and hardware-mismatched rows must not be compared as one
+population. The current state is captured in the JSON's `ci_gate` block.
 
 ## Attestation publishing (deferred)
 

@@ -575,26 +575,27 @@ pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()>
     })
 }
 
+/// br-ft-kske1 + ft-0eby0: crate-visible mutex serializing every test
+/// that constructs a server (degraded or full). The
+/// `MCP_BRIDGE_TOOLS_SKIPPED_NO_DB` counter is process-global, so any
+/// test that calls `reset_..._for_test()` followed by
+/// `build_server_degraded` (or `build_server`) and asserts the
+/// post-build delta MUST hold this lock; otherwise a sibling test that
+/// builds a server in parallel can bump the counter between the reset
+/// and the post-build read, breaking exact-delta assertions. Lives at
+/// module scope (not inside `mod tests`) because the bumping tests in
+/// `crate::mcp::tests` — which build degraded servers too — must take
+/// the SAME lock; while it was tests-private they couldn't, and each of
+/// their builds injected +29 into this module's delta assertions.
+#[cfg(test)]
+pub(crate) fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// br-ft-kske1: module-local mutex serializing every test that
-    /// constructs a server (degraded or full). The
-    /// `MCP_BRIDGE_TOOLS_SKIPPED_NO_DB` counter is process-global,
-    /// so any test that calls `reset_..._for_test()` followed by
-    /// `build_server_degraded` (or `build_server`) and asserts the
-    /// post-build delta MUST hold this lock; otherwise a sibling
-    /// test that builds a server in parallel can bump the counter
-    /// between the reset and the post-build read, breaking exact-
-    /// delta assertions. Tests that only check structural
-    /// properties (tool/resource registration manifests) also
-    /// hold the lock to keep the counter coherent for any
-    /// concurrent reset+read sibling.
-    fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
 
     /// br-ft-647cj: passing `db_path=None` to `build_server_with_db`
     /// is now an explicit error. The silent-degradation path was

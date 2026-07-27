@@ -41,7 +41,7 @@ mod socket_transport {
     #[cfg(unix)]
     pub use crate::runtime_async::unix::{
         AsyncReadExt, AsyncWrite, AsyncWriteExt, UnixListener, UnixStream, bind, buffered, connect,
-        lines, lines_with_max_length, next_line_with_cx,
+        lines_with_max_length, next_line_with_cx,
     };
 
     #[cfg(windows)]
@@ -125,16 +125,10 @@ mod socket_transport {
             BufReader::new(stream)
         }
 
-        #[must_use]
-        pub fn lines<T>(reader: BufReader<T>) -> LineReader<T>
-        where
-            T: AsyncRead + Unpin,
-        {
-            asupersync::io::Lines::new(reader)
-        }
-
         /// Line reader with an explicit maximum line length; mirrors
-        /// `runtime_async::unix::lines_with_max_length` (ft-kccj8).
+        /// `runtime_async::unix::lines_with_max_length` (ft-kccj8: the
+        /// default 64 KiB `Lines::new` cap is below the IPC message
+        /// limit, so every IPC read site passes its budget explicitly).
         #[must_use]
         pub fn lines_with_max_length<T>(reader: BufReader<T>, max_length: usize) -> LineReader<T>
         where

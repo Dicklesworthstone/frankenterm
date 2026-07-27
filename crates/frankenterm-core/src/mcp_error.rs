@@ -138,6 +138,17 @@ pub(crate) fn map_mcp_error(error: &Error) -> (&'static str, Option<String>) {
             MCP_ERR_RESERVATION_CONFLICT,
             Some("Use wa.reservations to inspect or release the conflicting reservation.".to_string()),
         ),
+        // ft-kccj8: an FTS query the lint accepted but SQLite rejected is a
+        // CALLER error, not a DB outage — surfacing it as the redacted
+        // "Storage unavailable" (FT-MCP-0005) made it indistinguishable from
+        // a real outage and unactionable (e.g. hyphenated barewords parse as
+        // FTS5 column-filter negation: "no such column").
+        Error::Storage(StorageError::FtsQueryError(_)) => (
+            MCP_ERR_FTS_QUERY,
+            Some(
+                "Quote the query as a phrase (\"like-this\") or remove FTS5 operator characters (- : * ( ) NEAR/AND/OR/NOT).".to_string(),
+            ),
+        ),
         Error::Storage(_) => (MCP_ERR_STORAGE, None),
         Error::Workflow(_) => (MCP_ERR_WORKFLOW, None),
         Error::Policy(_) => (MCP_ERR_POLICY, None),

@@ -1775,6 +1775,35 @@ fn validate_open_regular_file(
     validate_regular_file(metadata.is_file(), metadata.nlink(), display_path)
 }
 
+/// ft-0eby0: try an advisory-lock acquisition with a short bounded grace
+/// window before reporting contention. Lease release is fd-close based
+/// (the guards have no explicit unlock; the flock drops when the last
+/// duplicated fd closes), and that close can lag the LOGICAL completion
+/// of the releasing operation — guards drop on blocking-pool threads,
+/// and any concurrently forked child holds duplicated fds until its
+/// exec. A genuine holder persists far beyond this ~40 ms window, so
+/// fail-closed contention semantics (and every contention test) are
+/// preserved; only sub-window false positives are absorbed.
+fn try_lock_with_grace<F>(mut attempt: F) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+{
+    const GRACE_DELAYS_MS: [u64; 4] = [2, 5, 10, 25];
+    let mut delays = GRACE_DELAYS_MS.iter();
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => match delays.next() {
+                Some(delay_ms) => {
+                    std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+                }
+                None => return Err(err),
+            },
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn validate_std_open_regular_file(
     metadata: &std::fs::Metadata,
     display_path: &Path,
@@ -2461,7 +2490,7 @@ impl IdempotencyStore {
             })?;
         validate_open_regular_file(&metadata, &lock_display)?;
         let lock_file = lock_file.into_std();
-        match lock_file.try_lock_exclusive() {
+        match try_lock_with_grace(|| lock_file.try_lock_exclusive()) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err(IdempotencyError::ExecutionMutationInProgress {
@@ -2885,10 +2914,10 @@ impl IdempotencyStore {
             })?;
         validate_open_regular_file(&metadata, &lock_display)?;
         let lock_file = lock_file.into_std();
-        let lock_result = match mode {
+        let lock_result = try_lock_with_grace(|| match mode {
             ProofBarrierMode::Shared => FileExt::try_lock_shared(&lock_file),
             ProofBarrierMode::Exclusive => FileExt::try_lock_exclusive(&lock_file),
-        };
+        });
         match lock_result {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2948,7 +2977,7 @@ impl IdempotencyStore {
             })?;
         validate_open_regular_file(&metadata, &lock_display)?;
         let lock_file = lock_file.into_std();
-        match FileExt::try_lock_exclusive(&lock_file) {
+        match try_lock_with_grace(|| FileExt::try_lock_exclusive(&lock_file)) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err(IdempotencyError::ReservationInProgress {
