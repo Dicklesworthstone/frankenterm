@@ -270,7 +270,9 @@ impl DoctrineRule {
         match self.matcher {
             DoctrineMatcher::Regex(pattern) => pattern.is_match(command),
             DoctrineMatcher::CargoProofWithoutFailClosedRch => {
-                CARGO_PROOF_COMMAND.is_match(command) && !has_fail_closed_rch_prefix(command)
+                CARGO_PROOF_COMMAND.is_match(command)
+                    && FRANKENTERM_PROOF_TARGET.is_match(command)
+                    && !has_fail_closed_rch_prefix(command)
             }
         }
     }
@@ -302,6 +304,17 @@ static CARGO_PROOF_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+// The doctrine rule is repo doctrine, not universal product policy: it
+// only applies when the command text itself proves it targets this
+// project (an explicit frankenterm package reference). Generic cargo
+// commands ("cargo build", "cargo fmt --check") must stay allowed at
+// this layer — the actor-aware RCH heavy-compute gate in policy.rs owns
+// the "agents must offload heavy cargo" nuance (ft-0eby0; pinned by
+// allows_safe_commands + robot_light_cargo_without_rch_is_allowed +
+// human_heavy_cargo_without_rch_is_not_forced_through_rch_policy).
+static FRANKENTERM_PROOF_TARGET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:-p|--package)(?:\s+|=)frankenterm(?:-[a-z0-9_-]+)?\b").unwrap()
+});
 static LEGACY_DEFAULT_BRANCH_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
     let branch = legacy_default_branch_name();
     Regex::new(&format!(
@@ -329,7 +342,7 @@ static DOCTRINE_RULES: &[DoctrineRule] = &[
         id: "agents.doctrine:no-local-cargo-proof",
         category: "fail_closed_remote_proof",
         matcher: DoctrineMatcher::CargoProofWithoutFailClosedRch,
-        reason: "Cargo proof commands must run through fail-closed remote rch in this repo",
+        reason: "Frankenterm cargo proof commands must run through fail-closed remote rch",
         suggestions: &[concat!(
             "Prefix with RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 ",
             "rch --no-self-healing exec -- env CARGO_TARGET_DIR=/tmp/ft-<bead>-<pane>-target"
@@ -388,20 +401,59 @@ fn normalize_command_for_guard(command: &str) -> String {
 
     let mut normalized = Vec::with_capacity(tokens.len());
     let mut index = 0;
+    // ft-0eby0: only rewrite git/rm/chmod when the token is in COMMAND
+    // position (start of a simple command). A bare token match anywhere
+    // hoisted subcommand flags into rm(1) flags — `aws s3 rm s3://bucket
+    // --recursive` became `aws s3 rm -r s3://bucket`, which then matched
+    // core.filesystem:rm-rf instead of the cloud pack's own rule.
+    let mut command_position = true;
     while let Some(part) = tokens.get(index) {
-        if part.eq_ignore_ascii_case("git") {
-            index = normalize_git_invocation(&tokens, index, &mut normalized);
-        } else if part.eq_ignore_ascii_case("rm") {
-            index = normalize_rm_invocation(&tokens, index, &mut normalized);
-        } else if part.eq_ignore_ascii_case("chmod") {
-            index = normalize_chmod_invocation(&tokens, index, &mut normalized);
-        } else {
+        if is_command_separator(part) {
             normalized.push(part.clone());
+            command_position = true;
             index += 1;
+            continue;
         }
+        if command_position && part.eq_ignore_ascii_case("git") {
+            index = normalize_git_invocation(&tokens, index, &mut normalized);
+            command_position = false;
+            continue;
+        }
+        if command_position && part.eq_ignore_ascii_case("rm") {
+            index = normalize_rm_invocation(&tokens, index, &mut normalized);
+            command_position = false;
+            continue;
+        }
+        if command_position && part.eq_ignore_ascii_case("chmod") {
+            index = normalize_chmod_invocation(&tokens, index, &mut normalized);
+            command_position = false;
+            continue;
+        }
+        if command_position && !is_command_position_transparent(part) {
+            command_position = false;
+        }
+        normalized.push(part.clone());
+        index += 1;
     }
 
     normalized.join(" ")
+}
+
+/// Tokens that forward command position to the NEXT token: wrapper
+/// commands (`sudo rm …`, `xargs rm …`), wrapper flags (`xargs -0 rm …`),
+/// and environment assignments (`FOO=1 rm …`). Everything else consumes
+/// command position (it IS the command; what follows is its arguments).
+fn is_command_position_transparent(token: &str) -> bool {
+    const WRAPPERS: [&str; 8] = [
+        "sudo", "env", "xargs", "nohup", "time", "timeout", "command", "exec",
+    ];
+    if WRAPPERS
+        .iter()
+        .any(|wrapper| token.eq_ignore_ascii_case(wrapper))
+    {
+        return true;
+    }
+    token.starts_with('-') || token.contains('=')
 }
 
 fn tokenize_command_for_guard(command: &str) -> Vec<String> {
@@ -759,11 +811,27 @@ fn copy_until_separator(tokens: &[String], start: usize, normalized: &mut Vec<St
 // Destructive patterns run over `normalize_command_for_guard`, so GNU long
 // flags such as `--recursive` / `--force` are canonicalized before regex
 // matching instead of every rule carrying every spelling variant.
+//
+// ft-0eby0: the rm(1) rules only apply to COMMAND-POSITION rm. An `rm`
+// subcommand of another tool (`aws s3 rm`, `docker rm -f`) must fall
+// through to that tool's own pack for correct attribution (wrong rule id
+// means wrong reason and wrong remediation in the operator surface).
+// Mirrors the command-position rule in `normalize_command_for_guard`:
+// string start or a separator, then optionally wrapper commands, wrapper
+// flags, and VAR=value assignments.
+const RM_COMMAND_POSITION: &str = concat!(
+    r"(?:^|[;&|]\s+|\b(?:sudo|env|xargs|nohup|time|timeout|command|exec)\s+)",
+    r"(?:(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*"
+);
 static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\brm\s+-[a-z]*(?:r|f)[a-z]*\s+(/\s*$|~\s*$|\$HOME\s*$)").unwrap()
+    Regex::new(&format!(
+        r"(?i){RM_COMMAND_POSITION}rm\s+-[a-z]*(?:r|f)[a-z]*\s+(/\s*$|~\s*$|\$HOME\s*$)"
+    ))
+    .unwrap()
 });
-static RM_RF: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\brm\s+-[a-z]*(?:r|f)[a-z]*\b").unwrap());
+static RM_RF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"(?i){RM_COMMAND_POSITION}rm\s+-[a-z]*(?:r|f)[a-z]*\b")).unwrap()
+});
 static RM_RF_SAFE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*f?[a-z]*\s+)(node_modules|target|__pycache__|\.cache|dist|build|\.next|\.turbo|tmp)\s*(?:;|$|&&|\|\||\||\n)").unwrap()
 });
@@ -1581,9 +1649,13 @@ impl CommandGuard {
             }
 
             // Remove safe patterns (whitelist) from the command before checking destructive ones.
+            // ft-0eby0: replace with a neutral separator, not the empty string —
+            // a safe match can swallow the separator in front of a FOLLOWING
+            // dangerous command ("rm -rf node_modules && rm -rf /"), and the
+            // command-position-anchored rm rules would then miss it.
             let mut check_command = command.to_string();
             for safe in pack.safe_rules {
-                check_command = safe.pattern.replace_all(&check_command, "").to_string();
+                check_command = safe.pattern.replace_all(&check_command, " ; ").to_string();
             }
 
             // Check destructive patterns.
@@ -1704,10 +1776,13 @@ pub fn evaluate_stateless(command: &str) -> Option<(String, String, String, Vec<
             continue;
         }
 
-        // Safe patterns first - replace them with empty string so they don't trigger destructive matches.
+        // Safe patterns first - replace them with a neutral separator so they
+        // don't trigger destructive matches. ft-0eby0: " ; " (not "") so a
+        // safe match cannot swallow the command-position evidence of a
+        // FOLLOWING dangerous command.
         let mut check_command = normalized_command.clone();
         for safe in pack.safe_rules {
-            check_command = safe.pattern.replace_all(&check_command, "").to_string();
+            check_command = safe.pattern.replace_all(&check_command, " ; ").to_string();
         }
 
         // Destructive patterns.
@@ -2087,6 +2162,38 @@ mod tests {
         assert_eq!(d.rule_id(), Some("cloud:aws-s3-rm-recursive"));
     }
 
+    /// ft-0eby0: an `rm` SUBCOMMAND of another tool must be attributed to
+    /// that tool's pack, not to core.filesystem — wrong rule id means wrong
+    /// reason and wrong remediation on the operator surface.
+    #[test]
+    fn rm_subcommands_attribute_to_their_own_pack_ft_0eby0() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("docker rm -f my-container", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("containers:rm-force"));
+    }
+
+    /// ft-0eby0: command-position gating must not weaken real rm(1) coverage
+    /// through wrappers, chains, or safe-rule blanking.
+    #[test]
+    fn command_position_rm_still_blocked_through_wrappers_and_chains_ft_0eby0() {
+        let mut guard = strict_guard();
+
+        let d = guard.evaluate("sudo rm -rf /etc/passwd", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf"));
+
+        let d = guard.evaluate("cd /tmp && rm --recursive --force stuff", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf"));
+
+        // A safe rm must not swallow the separator that proves the FOLLOWING
+        // dangerous rm is at command position.
+        let d = guard.evaluate("rm -rf node_modules && rm -rf /etc", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf"));
+    }
+
     // ========================================================================
     // System pack
     // ========================================================================
@@ -2314,6 +2421,13 @@ mod tests {
              env CARGO_TARGET_DIR=/tmp/ft-example-target cargo test -p frankenterm-core --lib",
         );
         assert!(allowed.is_none());
+
+        // ft-0eby0: the doctrine rule is scoped to commands that provably
+        // target this project. Generic cargo commands are not repo doctrine
+        // territory — the actor-aware RCH heavy-compute policy gate owns
+        // that nuance.
+        assert!(evaluate_stateless("cargo build --workspace").is_none());
+        assert!(evaluate_stateless("cargo fmt --check").is_none());
     }
 
     #[test]
