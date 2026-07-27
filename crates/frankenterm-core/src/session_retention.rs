@@ -205,34 +205,38 @@ fn delete_sessions_by_size(conn: &Connection, max_total_mb: u64) -> Result<usize
 ///
 /// Returns (orphaned_checkpoints, orphaned_pane_states).
 fn cleanup_orphaned_data(conn: &Connection) -> Result<(usize, usize), rusqlite::Error> {
-    // ft-rt6ol: delete orphan CHECKPOINTS first, then orphan pane_state, inside
-    // one transaction. Removing the orphan checkpoints first turns their child
-    // `mux_pane_state` rows into orphans that the second DELETE then collects in
-    // the SAME pass. The previous pane_state-first ordering missed the linked
-    // shape — a checkpoint orphaned from `mux_sessions` that still has
-    // `mux_pane_state` children — because at that point the child's checkpoint
-    // still existed, leaving the pane_state row behind once the checkpoint was
-    // deleted (a data leak when ON DELETE CASCADE is unavailable, e.g. older or
-    // corrupt DBs with `foreign_keys` disabled). The transaction makes both
-    // deletes commit atomically.
+    // ft-rt6ol + ft-kccj8: delete pane_state CHILDREN first, with a predicate
+    // that names both orphan shapes explicitly — rows whose checkpoint is
+    // already gone, and rows whose checkpoint is about to be removed as a
+    // session-orphan below. The previous checkpoint-first ordering relied on
+    // the second DELETE to sweep the linked shape, which is correct with
+    // `foreign_keys` OFF but count-false with it ON: the checkpoint DELETE
+    // cascades the children away and sqlite3_changes() excludes rows removed
+    // by FK actions, so the reported pane_state count came back 0 while the
+    // data was in fact collected. Naming both shapes in one child DELETE is
+    // correct AND correctly counted under either FK setting. The transaction
+    // makes both deletes commit atomically.
     let tx = conn.unchecked_transaction()?;
+
+    // Orphaned pane_state rows: checkpoint already deleted, OR checkpoint is
+    // itself a session-orphan that the next statement removes.
+    let orphan_ps = tx.execute(
+        "DELETE FROM mux_pane_state
+         WHERE checkpoint_id NOT IN (
+             SELECT id FROM session_checkpoints
+         )
+         OR checkpoint_id IN (
+             SELECT id FROM session_checkpoints
+             WHERE session_id NOT IN (SELECT session_id FROM mux_sessions)
+         )",
+        [],
+    )?;
 
     // Orphaned checkpoint rows (session_id references a deleted session).
     let orphan_cp = tx.execute(
         "DELETE FROM session_checkpoints
          WHERE session_id NOT IN (
              SELECT session_id FROM mux_sessions
-         )",
-        [],
-    )?;
-
-    // Orphaned pane_state rows (checkpoint_id references a deleted checkpoint).
-    // Runs AFTER the checkpoint delete, so it also collects the pane_state
-    // children of the checkpoints just removed above.
-    let orphan_ps = tx.execute(
-        "DELETE FROM mux_pane_state
-         WHERE checkpoint_id NOT IN (
-             SELECT id FROM session_checkpoints
          )",
         [],
     )?;
