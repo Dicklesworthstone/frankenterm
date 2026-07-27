@@ -1293,6 +1293,14 @@ for raw in sys.stdin:
     method = request.get("method")
     req_id = request.get("id")
 
+    # JSON-RPC: a message without an id is a notification and MUST NOT
+    # receive any response. The spec-correct `notifications/initialized`
+    # lifecycle message lands here; answering it (even with an error)
+    # desyncs the response stream and the client reads the stray error
+    # as the reply to its next request.
+    if req_id is None:
+        continue
+
     if method == "initialize":
         send({
             "jsonrpc": "2.0",
@@ -1303,8 +1311,6 @@ for raw in sys.stdin:
                 "serverInfo": {"name": "mock-server", "version": "1.0.0"}
             }
         })
-    elif method == "initialized":
-        continue
     elif method == "tools/list":
         send({
             "jsonrpc": "2.0",
