@@ -445,11 +445,17 @@ fn redact_timeline_summaries(timeline: &mut [TxTimelineEntry], policy: &Redactio
     fields_redacted
 }
 
+// ft-kccj8: timeline summaries never carry command text or approval
+// codes — they are built exclusively from outcome kinds, error codes,
+// and phase narration (see `summarize_step_outcome` /
+// `details["summary"]`). Gating the wholesale wipe on
+// `redact_command_text`/`redact_approval_codes` (both true in the
+// DEFAULT policy) erased every summary from every default-config
+// bundle: the bundle claimed `timeline_summaries` compliance while
+// being forensically empty. Only the categories a summary can
+// actually contain may trigger the wipe.
 fn redacts_timeline_summary_content(policy: &RedactionPolicy) -> bool {
-    policy.redact_command_text
-        || policy.redact_error_messages
-        || policy.redact_results
-        || policy.redact_approval_codes
+    policy.redact_error_messages || policy.redact_results
 }
 
 // ── Forensic Bundle ─────────────────────────────────────────────────────────

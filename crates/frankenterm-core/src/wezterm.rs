@@ -1777,8 +1777,12 @@ impl WeztermClient {
             .into());
         }
 
+        // ft-kccj8: keep the "CLI-only backend …" phrase — it is the
+        // documented legacy contract (see the doc comment above) and the one
+        // stable, greppable diagnostic across vendored and non-vendored
+        // builds; the Cx-first refactor had silently dropped it.
         Err(WeztermError::CommandFailed(format!(
-            "tiered scrollback telemetry unavailable for pane {pane_id}: no mux pool configured"
+            "tiered scrollback telemetry unavailable for pane {pane_id}: CLI-only backend does not expose tiered scrollback status (no mux pool configured)"
         ))
         .into())
     }

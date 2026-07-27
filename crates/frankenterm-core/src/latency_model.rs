@@ -312,8 +312,17 @@ impl ServiceCurve {
     }
 
     /// Create a strict constant-rate service curve.
+    ///
+    /// `+∞` is a legal rate: it encodes the min-plus neutral element δ₀
+    /// (`β(0)=0`, `β(t>0)=∞`), which `Pipeline::total_service_curve`
+    /// returns for an empty pipeline. Only NaN and negative rates are
+    /// outside the domain (ft-kccj8: the blanket `is_finite` guard made
+    /// the empty-pipeline identity panic).
     pub fn strict_rate(rate: f64) -> Self {
-        assert!(rate.is_finite(), "rate must be finite");
+        assert!(
+            !rate.is_nan() && rate >= 0.0,
+            "rate must be a non-negative number"
+        );
         ServiceCurve::StrictRate { rate }
     }
 

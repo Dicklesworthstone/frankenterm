@@ -10595,13 +10595,22 @@ not-json
             .iter()
             .find(|entry| entry.file == "incident_manifest.json")
             .expect("incident manifest redaction entry");
-        assert_eq!(manifest_entry.count, 4);
+        // 8 = db_metadata surface + db_metadata warning + recent_events
+        // surface + robot_state degraded surface + robot_state db_read_failed
+        // warning + pane_text_summaries degraded surface +
+        // pane_text_summaries db_read_failed warning + bundle-dir path. The
+        // last four contributors arrived with the ft-9sy9e incident-DB
+        // fallback collectors; a count DROP below this means a
+        // secret-bearing surface stopped being redacted (ft-kccj8).
+        assert_eq!(manifest_entry.count, 8);
         let warnings_entry = report
             .per_file
             .iter()
             .find(|entry| entry.file == "warnings.jsonl")
             .expect("warnings redaction entry");
-        assert_eq!(warnings_entry.count, 1);
+        // db_metadata + robot_state + pane_text_summaries warnings each
+        // embed the secret db path.
+        assert_eq!(warnings_entry.count, 3);
     }
 
     #[test]

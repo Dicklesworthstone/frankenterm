@@ -2064,6 +2064,11 @@ steps:
 
     #[test]
     fn descriptor_conditional_validates_nested_steps() {
+        // ft-kccj8: the invalid regex must sit on a NESTED step — that is
+        // what this test is named for. The old fixture put it on the
+        // conditional's own matcher with empty then_steps, so the
+        // empty-branch guard fired first and the regex validation (already
+        // covered by descriptor_rejects_invalid_regex) was never reached.
         let yaml = r#"
 workflow_schema_version: 1
 name: "cond_validate"
@@ -2072,9 +2077,14 @@ steps:
     id: check
     test_text: "test"
     matcher:
-      kind: regex
-      pattern: "(["
-    then_steps: []
+      kind: substring
+      value: "test"
+    then_steps:
+      - type: wait_for
+        id: nested_wait
+        matcher:
+          kind: regex
+          pattern: "(["
     else_steps: []
 "#;
         let err = WorkflowDescriptor::from_yaml_str(yaml).unwrap_err();
@@ -2088,9 +2098,13 @@ steps:
 workflow_schema_version = 1
 name = "toml_full"
 
+# ft-kccj8: trigger agent_types is a CLOSED set (codex, claude_code,
+# gemini, wezterm, unknown) — runtime matching compares against the
+# AgentType enum Display, so a free-form value is unmatchable dead
+# config and validation rightly rejects it.
 [[triggers]]
 event_types = ["restart.prompt"]
-agent_types = ["custom-agent"]
+agent_types = ["claude_code"]
 
 [[steps]]
 type = "send_text"

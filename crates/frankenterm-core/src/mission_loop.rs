@@ -3355,6 +3355,14 @@ mod tests {
                     track: "f1-mission".to_string(),
                 },
             },
+            // ft-kccj8: neutralize the anti-thrash governor — the test
+            // reads the LATEST per-cycle sample, and with the default
+            // 3-cycle cooldown the second evaluate produces zero
+            // assignments, leaving assignments_by_agent empty.
+            governor_config: GovernorConfig {
+                reassignment_cooldown_cycles: 0,
+                ..GovernorConfig::default()
+            },
             ..MissionLoopConfig::default()
         });
         let issues = vec![
@@ -3558,6 +3566,16 @@ mod tests {
                 max_risky_assignments_per_cycle: 10,
                 max_consecutive_retries_per_bead: 1,
                 ..MissionSafetyEnvelopeConfig::default()
+            },
+            // ft-kccj8: neutralize the anti-thrash governor so the
+            // ENVELOPE retry gate under test is reachable — with the
+            // default 3-cycle cooldown the solver denies the re-assignment
+            // first and the envelope never sees it (mirror of
+            // loop_applies_governor_cooldown_before_solver_ft_efxr6, which
+            // neutralizes the envelope instead).
+            governor_config: GovernorConfig {
+                reassignment_cooldown_cycles: 0,
+                ..GovernorConfig::default()
             },
             ..MissionLoopConfig::default()
         });

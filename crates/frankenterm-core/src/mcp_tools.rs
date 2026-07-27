@@ -10760,6 +10760,14 @@ mod tests {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (_dir, db) = temp_db_path();
+            // ft-kccj8: a distinct pane id (42xx convention) + the IPC
+            // pane-state override, like every sibling that asserts
+            // "allowed" — without it, alt_screen resolves to None (no
+            // watcher socket) and the fail-closed policy.alt_screen_unknown
+            // gate fires before the rate limiter under test. Distinct ids
+            // matter: the override map is process-global and its guard
+            // removes by pane_id.
+            let pane_id = 4_205;
             let mut cfg = Config::default();
             cfg.safety.require_prompt_active = false;
             cfg.safety.rate_limit_per_pane = 2;
@@ -10768,7 +10776,8 @@ mod tests {
             let shared_rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
-            mock.add_default_pane(42).await;
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let handle = mock as crate::wezterm::WeztermHandle;
             let tool_a = WaSendTool::with_wezterm_handle_and_shared_rate_limiter(
                 Arc::clone(&cfg),
@@ -10789,7 +10798,7 @@ mod tests {
                         .call(
                             &test_mcp_context(),
                             serde_json::json!({
-                                "pane_id": 42,
+                                "pane_id": pane_id,
                                 "text": format!("echo attempt-{attempt}")
                             }),
                         )
@@ -10805,7 +10814,7 @@ mod tests {
                     .call(
                         &test_mcp_context(),
                         serde_json::json!({
-                            "pane_id": 42,
+                            "pane_id": pane_id,
                             "text": "echo over-limit"
                         }),
                     )
@@ -10831,6 +10840,9 @@ mod tests {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
             let (_dir, db) = temp_db_path();
+            // ft-kccj8: distinct pane id + IPC pane-state override — see
+            // wa_send_rate_limit_is_shared_across_tool_instances.
+            let pane_id = 4_206;
             let mut cfg = Config::default();
             cfg.safety.require_prompt_active = false;
             cfg.safety.rate_limit_per_pane = 1;
@@ -10838,7 +10850,8 @@ mod tests {
             let cfg = Arc::new(cfg);
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
-            mock.add_default_pane(42).await;
+            mock.add_default_pane(pane_id).await;
+            let _pane_state = set_mcp_test_pane_state_override(safe_test_ipc_pane_state(pane_id));
             let tool = WaSendTool::with_wezterm_handle(
                 Arc::clone(&cfg),
                 Arc::clone(&db),
@@ -10850,7 +10863,7 @@ mod tests {
                     tool.call(
                         &test_mcp_context(),
                         serde_json::json!({
-                            "pane_id": 42,
+                            "pane_id": pane_id,
                             "text": format!("echo preview-{attempt}"),
                             "dry_run": true
                         }),
@@ -10865,7 +10878,7 @@ mod tests {
                 tool.call(
                     &test_mcp_context(),
                     serde_json::json!({
-                        "pane_id": 42,
+                        "pane_id": pane_id,
                         "text": "echo actual"
                     }),
                 )

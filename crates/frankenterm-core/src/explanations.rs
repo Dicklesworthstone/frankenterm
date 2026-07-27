@@ -772,6 +772,7 @@ mod tests {
                     "Add",
                     "Update",
                     "Enable",
+                    "Prefer",
                 ];
                 assert!(
                     valid_starts.iter().any(|s| first_word.starts_with(s)),

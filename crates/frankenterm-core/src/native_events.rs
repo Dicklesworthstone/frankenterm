@@ -55,7 +55,7 @@ mod socket_transport {
     pub use crate::runtime_async::unix::{AsyncWriteExt, connect};
     #[cfg(unix)]
     pub use crate::runtime_async::unix::{
-        UnixListener, UnixStream, bind, buffered, lines, next_line_with_cx,
+        UnixListener, UnixStream, bind, buffered, lines_with_max_length, next_line_with_cx,
     };
 
     #[cfg(windows)]
@@ -141,12 +141,14 @@ mod socket_transport {
             BufReader::new(stream)
         }
 
+        /// Line reader with an explicit maximum line length; mirrors
+        /// `runtime_async::unix::lines_with_max_length` (ft-kccj8).
         #[must_use]
-        pub fn lines<T>(reader: BufReader<T>) -> LineReader<T>
+        pub fn lines_with_max_length<T>(reader: BufReader<T>, max_length: usize) -> LineReader<T>
         where
             T: AsyncRead + Unpin,
         {
-            asupersync::io::Lines::new(reader)
+            asupersync::io::Lines::new_with_max_length(reader, max_length)
         }
 
         pub async fn next_line_with_cx<T>(
@@ -575,7 +577,16 @@ async fn handle_connection_with_cx(
             format!("native handle_connection cancelled pre-read: {err}"),
         )
     })?;
-    let mut lines = socket_transport::lines(socket_transport::buffered(stream));
+    // ft-kccj8: the default lines() cap is 64 KiB — far below
+    // MAX_EVENT_LINE_BYTES (512 KiB) — so the warn-and-skip branch below
+    // was unreachable and any 64 KiB..512 KiB event killed the whole
+    // connection with InvalidData. Cap at 2× so the skip branch has a
+    // real window; lines beyond that still hard-close the connection
+    // (memory stays bounded at ~1 MiB).
+    let mut lines = socket_transport::lines_with_max_length(
+        socket_transport::buffered(stream),
+        MAX_EVENT_LINE_BYTES.saturating_mul(2),
+    );
 
     while let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? {
         if line.len() > MAX_EVENT_LINE_BYTES {

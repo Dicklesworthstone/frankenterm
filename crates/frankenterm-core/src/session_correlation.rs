@@ -782,7 +782,13 @@ fn extract_summary_from_meta(meta: &Value) -> Option<CassSessionSummary> {
 
 fn cass_summary_value_has_known_shape(value: &Value) -> bool {
     let Some(map) = value.as_object() else {
-        return true;
+        // Arrays must be rejected HERE: serde derive deserializes
+        // structs from sequences positionally, and every
+        // CassSessionSummary field is #[serde(default)], so an array
+        // would otherwise "succeed" and fabricate a summary from
+        // garbage. Scalars fall through so the serde type error
+        // (with its diagnostic detail) is what lands in the warn.
+        return !value.is_array();
     };
 
     const KNOWN_CASS_SUMMARY_FIELDS: [&str; 8] = [

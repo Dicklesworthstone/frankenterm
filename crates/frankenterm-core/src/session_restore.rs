@@ -3355,11 +3355,19 @@ mod tests {
 
         assert_eq!(summary.restored_count(), 1);
         assert_eq!(summary.failed_count(), 1);
+        // [ft-nam3s] Derive the expected text from the same error the mock
+        // returns (the ft-kccj8 propagation of the restore_layout.rs fix) —
+        // a hardcoded "Runtime error: …" literal staled the moment
+        // Error::RuntimeOperation gained its operation field.
         assert_eq!(
             summary.layout_result.failed_panes,
             vec![(
                 2,
-                "Runtime error: simulated second-tab spawn failure".to_string()
+                test_runtime_error(
+                    "session_restore.test.spawn_targeted",
+                    "simulated second-tab spawn failure"
+                )
+                .to_string()
             )]
         );
 
@@ -3760,13 +3768,16 @@ mod tests {
         .unwrap();
 
         let err = load_latest_checkpoint(&db_path, "sess-neg-pane").expect_err("negative pane id");
-        assert!(matches!(
-            err,
-            RestoreError::InvalidPersistedValue {
-                field: "mux_pane_state.pane_id",
-                value: -1
-            }
-        ));
+        assert!(
+            matches!(
+                err,
+                RestoreError::InvalidPersistedValue {
+                    field: "mux_pane_state.pane_id",
+                    value: -1
+                }
+            ),
+            "expected InvalidPersistedValue for negative pane_id, got {err:?}"
+        );
     }
 
     #[test]

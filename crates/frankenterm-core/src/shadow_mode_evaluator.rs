@@ -1683,10 +1683,16 @@ mod tests {
         };
         let mut eval = ShadowModeEvaluator::new(config);
 
-        // Two cycles with unexpected executions (low fidelity)
+        // Two cycles with unexpected executions (low fidelity).
+        // evaluate_cycle filters events by cycle_id, so each evaluated bad
+        // cycle needs its OWN event — a single cycle-1 event replayed for
+        // cycles 2 and 4 filters down to an empty (perfect-fidelity) cycle
+        // (ft-kccj8).
         let recs = make_assignment_set(Vec::new());
         let mut bad_log = make_log();
         emit_dispatch(&mut bad_log, 1, "b_extra", "a_extra");
+        emit_dispatch(&mut bad_log, 2, "b_extra", "a_extra");
+        emit_dispatch(&mut bad_log, 4, "b_extra", "a_extra");
         let bad_events = bad_log.events();
 
         eval.evaluate_cycle(1, 1000, &recs, &bad_events);

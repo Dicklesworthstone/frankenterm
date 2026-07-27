@@ -852,10 +852,18 @@ mod tests {
         let original_sum: f64 = (0..n).map(|i| i as f64).sum();
         for target in [3usize, 5, 7, 11] {
             let ds = ts.downsample(target);
-            // Reconstruct chunk sizes from the integer partition.
+            // Reconstruct chunk sizes from the integer partition. The
+            // downsampled points carry the chunk MEAN timestamp, not the
+            // chunk width, so the width must be recomputed from the same
+            // `(i, n, target)` partition arithmetic `downsample` uses —
+            // any overlap or gap in that partition makes Σ widths ≠ n and
+            // breaks the equality below (ft-kccj8).
+            let n_usize = n as usize;
             let mut reconstructed = 0.0;
-            for p in &ds.to_vec() {
-                let size = p.timestamp_ms as f64;
+            for (i, p) in ds.to_vec().iter().enumerate() {
+                let start = (i * n_usize) / target;
+                let end = ((i + 1) * n_usize) / target;
+                let size = (end - start) as f64;
                 reconstructed = p.value.mul_add(size, reconstructed);
             }
             assert!(

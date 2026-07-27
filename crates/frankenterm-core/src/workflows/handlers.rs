@@ -1236,6 +1236,22 @@ impl Workflow for HandleProcessTriageLifecycle {
                     )),
                 },
                 4 => {
+                    // ft-kccj8: a failed apply phase must ABORT the
+                    // lifecycle here — emitting a diff artifact and
+                    // advancing to session/finalize on top of a failed
+                    // mutation is fail-open. The pointer fallback chain
+                    // mirrors the step-5 apply lookup below.
+                    let apply_status = trigger
+                        .pointer("/process_triage/apply/status")
+                        .or_else(|| trigger.pointer("/extracted/triage_apply/status"))
+                        .or_else(|| trigger.pointer("/triage_apply/status"))
+                        .and_then(serde_json::Value::as_str);
+                    if matches!(apply_status, Some("failed" | "error" | "aborted")) {
+                        return StepResult::abort(format!(
+                            "process triage lifecycle: triage apply status indicates failure: {}",
+                            apply_status.unwrap_or("failed")
+                        ));
+                    }
                     let diff = Self::diff_value(&trigger, stats);
                     if !diff.is_object() {
                         return StepResult::abort(
@@ -6234,7 +6250,10 @@ mod tests {
         let prompt = HandleSessionStartContext::build_context_prompt(&trigger, &lookup);
         assert!(prompt.contains("Session startup context bootstrap."));
         assert!(prompt.contains("Related fixes from past sessions (cass):"));
-        assert!(prompt.contains("ft robot cass search \"ft-2l9kn\" --limit 3"));
+        // ft-kccj8: the prompt POSIX-single-quotes the query (see
+        // quote_for_shell_command) so copy-pasted commands can't expand
+        // `$`/backticks; the double-quote expectation was wrong on day one.
+        assert!(prompt.contains("ft robot cass search 'ft-2l9kn' --limit 3"));
     }
 
     #[test]
@@ -8863,7 +8882,9 @@ mod tests {
         assert!(hint.is_some());
         let h = hint.unwrap();
         assert!(h.contains("/tmp/session.jsonl:42"));
-        assert!(h.contains("use rch exec"));
+        // ft-kccj8: the fixture tracks the fail-closed doctrine spelling
+        // (the plain "rch exec" era is over); assert the surviving core.
+        assert!(h.contains("rch --no-self-healing exec --"));
     }
 
     #[test]

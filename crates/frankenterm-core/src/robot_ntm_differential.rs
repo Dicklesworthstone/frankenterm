@@ -658,20 +658,34 @@ fn run_ntm_subprocess(
         process.arg(request.to_string());
     }
 
-    let mut child = process
+    process
         .stdin(match command.request_encoding {
             NtmRequestEncoding::JsonStdin => Stdio::piped(),
             NtmRequestEncoding::Omit | NtmRequestEncoding::JsonArg => Stdio::null(),
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            format!(
-                "failed to spawn ntm subprocess for {family}.{action} ({}): {err}",
-                describe_ntm_command(binary, &command.args)
-            )
-        })?;
+        .stderr(Stdio::piped());
+
+    // ETXTBSY (os error 26) on exec is always transient: either the binary
+    // is briefly open for writing (ntm mid-self-update), or another thread's
+    // fork captured a writable fd for it that its child has not yet
+    // CLOEXEC-closed — the classic multithreaded write-then-exec race. A
+    // short bounded retry converts both into a successful spawn (ft-kccj8).
+    let mut child = {
+        const ETXTBSY: i32 = 26;
+        const RETRY_DELAYS_MS: [u64; 2] = [10, 50];
+        let mut delays = RETRY_DELAYS_MS.iter();
+        loop {
+            match process.spawn() {
+                Ok(child) => break child,
+                Err(err) if err.raw_os_error() == Some(ETXTBSY) => match delays.next() {
+                    Some(delay_ms) => thread::sleep(Duration::from_millis(*delay_ms)),
+                    None => return Err(spawn_error(binary, command, family, action, &err)),
+                },
+                Err(err) => return Err(spawn_error(binary, command, family, action, &err)),
+            }
+        }
+    };
 
     if command.request_encoding == NtmRequestEncoding::JsonStdin {
         let mut stdin = child
@@ -773,6 +787,19 @@ fn describe_ntm_command(binary: &Path, args: &[String]) -> String {
     let mut parts = vec![binary.display().to_string()];
     parts.extend(args.iter().cloned());
     parts.join(" ")
+}
+
+fn spawn_error(
+    binary: &Path,
+    command: &NtmSubprocessCommand,
+    family: &str,
+    action: &str,
+    err: &std::io::Error,
+) -> String {
+    format!(
+        "failed to spawn ntm subprocess for {family}.{action} ({}): {err}",
+        describe_ntm_command(binary, &command.args)
+    )
 }
 
 /// In-memory mock NTM invoker for testing. Indexed by

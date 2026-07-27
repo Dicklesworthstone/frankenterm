@@ -1185,9 +1185,13 @@ mod tests {
         assert_eq!(receipt.statistical_gate.gate_id, "sprt_mean_threshold_v1");
         assert_eq!(receipt.statistical_gate.baseline_sample_count, 2);
         assert_eq!(receipt.statistical_gate.candidate_sample_count, 2);
+        // baseline mean = (1000 + 1100) / 2 = 1050 ms; the default
+        // practical_improvement_bps is 500 (5%), so the threshold is
+        // 1050 × 9500 / 10000 = 997 (floor). The old expectation 945 was
+        // hand-computed with 1000 bps (ft-kccj8).
         assert_eq!(
             receipt.statistical_gate.candidate_better_threshold_ms,
-            Some(945)
+            Some(997)
         );
         assert_eq!(receipt.statistical_gate.candidate_gate.kind, "accept");
         assert_eq!(receipt.statistical_gate.baseline_gate.kind, "reject");

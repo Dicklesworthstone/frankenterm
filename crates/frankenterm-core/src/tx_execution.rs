@@ -1145,6 +1145,34 @@ fn acquire_tx_contract_lock_supported(
         .join(requested_parent_relative)
         .join(&requested_contract_name);
 
+    // Type-check the leaf WITHOUT opening it (fstatat, no follow). Opening a
+    // hostile leaf first is both non-deterministic (a FIFO open can fail with
+    // a platform-dependent errno instead of the typed "not a regular file"
+    // rejection) and — via the canonicalize below, which opens without
+    // O_NONBLOCK — a block-forever-waiting-for-a-writer hazard. The post-open
+    // metadata check further down stays as the TOCTOU confirmation
+    // (ft-kccj8).
+    let leaf_metadata = parent_dir
+        .symlink_metadata(&requested_contract_name)
+        .map_err(|err| {
+            TxContractStoreError::new(
+                TxContractStoreErrorKind::Lock,
+                format!(
+                    "failed to inspect transaction contract {}: {err}",
+                    requested_key.display()
+                ),
+            )
+        })?;
+    if !leaf_metadata.is_file() {
+        return Err(TxContractStoreError::new(
+            TxContractStoreErrorKind::Lock,
+            format!(
+                "transaction contract is not a regular file: {}",
+                requested_key.display()
+            ),
+        ));
+    }
+
     let mut contract_options = CapOpenOptions::new();
     contract_options.read(true).follow(FollowSymlinks::No);
     #[cfg(unix)]

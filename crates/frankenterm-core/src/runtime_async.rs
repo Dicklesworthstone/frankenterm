@@ -1372,6 +1372,21 @@ pub mod unix {
         asupersync::io::Lines::new(reader)
     }
 
+    /// Line reader with an explicit maximum line length.
+    ///
+    /// `lines()` inherits asupersync's 64 KiB default cap, which is
+    /// SMALLER than the default IPC message limit (128 KiB) — callers
+    /// enforcing their own byte budget must pass it explicitly or the
+    /// hidden cap fails their reads with `InvalidData` before their
+    /// own limit logic ever runs (ft-kccj8).
+    #[must_use]
+    pub fn lines_with_max_length<T>(reader: BufReader<T>, max_length: usize) -> LineReader<T>
+    where
+        T: AsyncRead + Unpin,
+    {
+        asupersync::io::Lines::new_with_max_length(reader, max_length)
+    }
+
     pub async fn next_line<T>(lines: &mut LineReader<T>) -> io::Result<Option<String>>
     where
         T: AsyncRead + Unpin,

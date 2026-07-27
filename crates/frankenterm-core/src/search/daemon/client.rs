@@ -482,7 +482,20 @@ mod tests {
                 );
             }
 
-            prop_assert_eq!(started.load(Ordering::Acquire), attempts.min(max_in_flight));
+            // ft-kccj8: `started` is incremented INSIDE the spawned worker
+            // threads; the slot accounting above is deterministic (bumped on
+            // the calling thread before spawn), but the workers themselves
+            // may not have been scheduled yet — with a 1 ms timeout the loop
+            // can finish before the last worker runs its fetch_add. Wait
+            // (bounded) for the workers to actually start before asserting.
+            let expected_started = attempts.min(max_in_flight);
+            for _ in 0..200 {
+                if started.load(Ordering::Acquire) == expected_started {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            prop_assert_eq!(started.load(Ordering::Acquire), expected_started);
             release_guard.release();
             wait_for_transport_drain(&client);
         }

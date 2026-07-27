@@ -41,7 +41,7 @@ mod socket_transport {
     #[cfg(unix)]
     pub use crate::runtime_async::unix::{
         AsyncReadExt, AsyncWrite, AsyncWriteExt, UnixListener, UnixStream, bind, buffered, connect,
-        lines, next_line_with_cx,
+        lines, lines_with_max_length, next_line_with_cx,
     };
 
     #[cfg(windows)]
@@ -133,6 +133,16 @@ mod socket_transport {
             asupersync::io::Lines::new(reader)
         }
 
+        /// Line reader with an explicit maximum line length; mirrors
+        /// `runtime_async::unix::lines_with_max_length` (ft-kccj8).
+        #[must_use]
+        pub fn lines_with_max_length<T>(reader: BufReader<T>, max_length: usize) -> LineReader<T>
+        where
+            T: AsyncRead + Unpin,
+        {
+            asupersync::io::Lines::new_with_max_length(reader, max_length)
+        }
+
         pub async fn next_line_with_cx<T>(
             cx: &crate::cx::Cx,
             lines: &mut LineReader<T>,
@@ -173,7 +183,21 @@ impl IpcRuntimeLimits {
     }
 
     fn message_read_limit_for(max_message_size: usize) -> u64 {
-        u64::try_from(max_message_size.saturating_add(1)).unwrap_or(u64::MAX)
+        u64::try_from(Self::line_cap_for(max_message_size)).unwrap_or(u64::MAX)
+    }
+
+    /// Maximum bytes buffered for one request line: `2·max + 2`.
+    ///
+    /// ft-kccj8: the read bound must comfortably EXCEED the message
+    /// limit so a moderately oversized line (up to 2×) is consumed in
+    /// full — including its trailing newline — before the typed
+    /// "message too large" reply goes out. If the server closes with
+    /// unread bytes still queued, AF_UNIX delivers ECONNRESET to the
+    /// peer and destroys the reply the client was about to read. Lines
+    /// beyond 2× are cut off at the bound (memory stays bounded) and
+    /// the reply becomes best-effort.
+    fn line_cap_for(max_message_size: usize) -> usize {
+        max_message_size.saturating_mul(2).saturating_add(2)
     }
 }
 
@@ -1453,7 +1477,15 @@ async fn handle_client_with_context_with_cx(
 
     let bounded_reader = reader.take(IpcRuntimeLimits::message_read_limit_for(max_message_size));
 
-    let mut lines = socket_transport::lines(socket_transport::buffered(bounded_reader));
+    // ft-kccj8: the line cap must track the configured message limit.
+    // The default `lines()` cap is 64 KiB — smaller than the default
+    // 128 KiB message limit — so oversized (and even legal >64 KiB)
+    // requests died as InvalidData before the `line.len()` check below
+    // could produce the typed "message too large" reply.
+    let mut lines = socket_transport::lines_with_max_length(
+        socket_transport::buffered(bounded_reader),
+        IpcRuntimeLimits::line_cap_for(max_message_size),
+    );
     // Tick 200 (ft-xbnl0.2.3): route the request-line read through
     // next_line_with_cx(&cx, ...) so the pre-read checkpoint honors
     // the caller's explicit cx. Previously used the ambient
@@ -1471,6 +1503,10 @@ async fn handle_client_with_context_with_cx(
             .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
         writer.write_all(response_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
+        // ft-kccj8: flush before close like every other error arm, so
+        // the typed rejection reaches the peer instead of dying in a
+        // buffered writer.
+        writer.flush().await?;
         return Ok(());
     }
 
@@ -1547,7 +1583,13 @@ async fn handle_client_with_context_with_cx(
     let line = {
         let bounded_reader =
             (&mut stream).take(IpcRuntimeLimits::message_read_limit_for(max_message_size));
-        let mut lines = socket_transport::lines(socket_transport::buffered(bounded_reader));
+        // ft-kccj8: cap must track the configured limit (see the unix
+        // handler) — the default 64 KiB lines() cap broke both legal
+        // >64 KiB requests and the typed oversize rejection.
+        let mut lines = socket_transport::lines_with_max_length(
+            socket_transport::buffered(bounded_reader),
+            IpcRuntimeLimits::line_cap_for(max_message_size),
+        );
         let Some(line) = socket_transport::next_line_with_cx(&cx, &mut lines).await? else {
             return Ok(());
         };
@@ -1560,6 +1602,9 @@ async fn handle_client_with_context_with_cx(
             .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
         stream.write_all(response_json.as_bytes()).await?;
         stream.write_all(b"\n").await?;
+        // ft-kccj8: flush before close so the typed rejection is
+        // observable by the peer.
+        stream.flush().await?;
         return Ok(());
     }
 
@@ -2629,10 +2674,19 @@ impl IpcClient {
             message: format!("cancelled before read: {err}"),
         })?;
 
+        // ft-kccj8: responses share the request message-size contract;
+        // the default 64 KiB lines() cap silently failed any response
+        // above it with InvalidData.
         #[cfg(unix)]
-        let mut lines = socket_transport::lines(socket_transport::buffered(reader));
+        let mut lines = socket_transport::lines_with_max_length(
+            socket_transport::buffered(reader),
+            IpcRuntimeLimits::line_cap_for(MAX_MESSAGE_SIZE),
+        );
         #[cfg(windows)]
-        let mut lines = socket_transport::lines(socket_transport::buffered(&mut stream));
+        let mut lines = socket_transport::lines_with_max_length(
+            socket_transport::buffered(&mut stream),
+            IpcRuntimeLimits::line_cap_for(MAX_MESSAGE_SIZE),
+        );
         // Tick 201 (ft-xbnl0.2.3): route the response read through
         // next_line_with_cx(cx, ...) so the pre-read checkpoint
         // observes the caller's explicit cx. Previously used ambient
@@ -2773,7 +2827,12 @@ impl IpcClient {
                 message: format!("failed to flush: {e}"),
             })?;
 
-        let lines = socket_transport::lines(socket_transport::buffered(stream));
+        // ft-kccj8: event lines share the message-size contract; see the
+        // response-read cap above.
+        let lines = socket_transport::lines_with_max_length(
+            socket_transport::buffered(stream),
+            IpcRuntimeLimits::line_cap_for(MAX_MESSAGE_SIZE),
+        );
         Ok(IpcEventStream { lines })
     }
 }

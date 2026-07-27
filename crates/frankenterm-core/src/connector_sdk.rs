@@ -2481,7 +2481,12 @@ mod tests {
 
     #[test]
     fn certification_telemetry_counters_saturate() {
-        let policy = permissive_policy();
+        // ft-kccj8: the good manifest must actually reach Certified for the
+        // `certified` counter saturation to be exercised. A signed manifest
+        // whose author is not in trusted_publishers only ever evaluates to
+        // Conditional trust → ConditionalPass, so the policy must trust the
+        // author.
+        let policy = trusted_policy(&[]);
         let mut pipeline = CertificationPipeline::new(policy);
         pipeline.telemetry.total_runs = u64::MAX;
         pipeline.telemetry.certified = u64::MAX;
@@ -2494,6 +2499,7 @@ mod tests {
         let payload = test_payload();
         let good_manifest = ManifestBuilder::new("good-saturated")
             .version("1.0.0")
+            .author("dev@example.com")
             .publisher_signature("sig")
             .build_with_digest(&payload)
             .unwrap();
