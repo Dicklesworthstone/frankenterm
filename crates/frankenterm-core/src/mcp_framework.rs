@@ -389,11 +389,16 @@ mod tests {
             })),
             version: Some("1.2.3".to_string()),
             tags: vec!["utility".to_string(), "safe".to_string()],
+            // MCP-spec annotation shape: the framework boundary is typed to
+            // the spec (`*Hint` keys, boolean `openWorldHint`), so the seam
+            // guarantees lossless roundtrips for spec-conforming payloads
+            // only. Non-spec payloads fail closed — see
+            // tool_definition_rejects_non_spec_annotation_types.
             annotations: Some(serde_json::json!({
-                "destructive": true,
-                "idempotent": false,
-                "readOnly": false,
-                "openWorldHint": "accepts arbitrary text"
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "readOnlyHint": false,
+                "openWorldHint": true
             })),
         };
 
@@ -406,6 +411,30 @@ mod tests {
 
         assert_eq!(recovered, definition);
         assert!(recovered.is_destructive());
+    }
+
+    #[test]
+    fn tool_definition_rejects_non_spec_annotation_types() {
+        // Per the MCP spec `openWorldHint` is a boolean. The framework seam
+        // must not forward spec-violating annotation payloads to downstream
+        // MCP participants; it fails closed with a typed protocol error.
+        let err = McpClientToolDefinition {
+            name: "echo".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!({
+                "openWorldHint": "accepts arbitrary text"
+            })),
+        }
+        .into_framework()
+        .expect_err("non-spec annotation types should fail framework mapping");
+
+        assert_eq!(err.code, "mcp_client.protocol");
+        assert!(err.message.contains("remote tool annotations"));
     }
 
     #[test]
@@ -443,6 +472,22 @@ mod tests {
 
         assert_eq!(recovered, content);
         assert_eq!(recovered.as_text(), Some("hello from seam test"));
+    }
+
+    #[test]
+    fn content_item_rejects_non_spec_image_shape() {
+        // MCP-spec image content carries base64 `data` + `mimeType`; a
+        // URL-style image is not a spec shape and must fail closed at the
+        // framework boundary rather than being silently dropped or mis-mapped.
+        let err = McpClientContentItem(serde_json::json!({
+            "type": "image",
+            "url": "https://example.com/picture.png",
+        }))
+        .into_framework()
+        .expect_err("non-spec image content should fail framework mapping");
+
+        assert_eq!(err.code, "mcp_client.protocol");
+        assert!(err.message.contains("remote tool content"));
     }
 
     fn arb_opt_string() -> impl Strategy<Value = Option<String>> {
@@ -484,8 +529,8 @@ mod tests {
                 version: version.clone(),
                 tags: tags.clone(),
                 annotations: Some(serde_json::json!({
-                    "destructive": destructive,
-                    "idempotent": !destructive,
+                    "destructiveHint": destructive,
+                    "idempotentHint": !destructive,
                 })),
             };
 
@@ -514,11 +559,12 @@ mod tests {
 
         #[test]
         fn prop_content_item_non_text_has_no_as_text(
-            payload in "[A-Za-z0-9 _.,:/-]{1,32}",
+            payload in "[A-Za-z0-9+/=]{1,32}",
         ) {
             let content = McpClientContentItem(serde_json::json!({
                 "type": "image",
-                "url": format!("https://example.com/{payload}.png"),
+                "data": payload.clone(),
+                "mimeType": "image/png",
             }));
 
             let framework = content.clone().into_framework().expect("into framework");
