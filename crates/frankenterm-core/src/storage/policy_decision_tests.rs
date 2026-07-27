@@ -281,29 +281,72 @@ fn migration_plan_empty_when_at_target() {
 }
 
 #[test]
-fn migration_roundtrip_down_then_up() {
-    let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
+fn downgrade_below_forward_only_floor_fails_closed() {
+    // v1 (baseline), v30 (embedded_at seconds->ms normalization), and v32
+    // (embedded_at DEFAULT repair) are deliberately forward-only
+    // (down_sql: None). build_migration_plan hard-errors when any undone
+    // migration lacks down_sql, so the lowest reachable downgrade target is
+    // the HIGHEST forward-only version. With v32 == SCHEMA_VERSION that
+    // floor equals head: downgrade is structurally impossible and every
+    // below-head target must fail closed with the typed rollback error.
+    for target in [1, 3, 17, SCHEMA_VERSION - 1] {
+        let err = build_migration_plan(SCHEMA_VERSION, target)
+            .expect_err("downgrade below the forward-only floor must fail closed");
+        assert!(
+            err.to_string().contains("Rollback not supported"),
+            "downgrade to {target} must surface the forward-only rollback error, got: {err}"
+        );
+    }
 
-    let downgrade_target = 3;
-    let down_plan = build_migration_plan(SCHEMA_VERSION, downgrade_target).unwrap();
-    apply_migration_plan(&conn, &down_plan).unwrap();
-    assert_eq!(get_user_version(&conn).unwrap(), downgrade_target);
-
-    let up_plan = build_migration_plan(downgrade_target, SCHEMA_VERSION).unwrap();
-    apply_migration_plan(&conn, &up_plan).unwrap();
-    assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+    // Guard on the floor/head relationship (ft-ftwck): if this fails, a new
+    // reversible migration landed above v32 and downgrade head->floor became
+    // reachable again. Restore a real down-then-up roundtrip test for that
+    // reversible tail instead of relaxing this assertion.
+    let forward_only_floor = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.down_sql.is_none())
+        .map(|migration| migration.version)
+        .max()
+        .expect("the v1 baseline is forward-only");
+    assert_eq!(
+        forward_only_floor, SCHEMA_VERSION,
+        "forward-only floor no longer equals head: downgrade to v{forward_only_floor} is now \
+         reachable — add a roundtrip test covering the reversible migrations above it"
+    );
 }
 
 #[test]
 fn migration_v18_preserves_existing_events() {
+    // Downgrading head -> v17 is structurally impossible (the forward-only
+    // floor equals SCHEMA_VERSION), so build the pre-v18 shape directly:
+    // the minimal `panes` + `events` tables the frozen v18 migration
+    // operates on, plus `schema_version` for the migration bookkeeping.
     let conn = Connection::open_in_memory().unwrap();
-    initialize_schema(&conn).unwrap();
-
-    // Downgrade just the newest migration (v18 -> v17).
-    let down_plan = build_migration_plan(SCHEMA_VERSION, 17).unwrap();
-    apply_migration_plan(&conn, &down_plan).unwrap();
-    assert_eq!(get_user_version(&conn).unwrap(), 17);
+    conn.execute_batch(
+        "CREATE TABLE panes (
+             pane_id INTEGER PRIMARY KEY,
+             domain TEXT NOT NULL,
+             first_seen_at INTEGER NOT NULL,
+             last_seen_at INTEGER NOT NULL,
+             observed INTEGER NOT NULL DEFAULT 1
+         );
+         CREATE TABLE events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             pane_id INTEGER NOT NULL REFERENCES panes(pane_id),
+             rule_id TEXT NOT NULL,
+             agent_type TEXT NOT NULL,
+             event_type TEXT NOT NULL,
+             severity TEXT NOT NULL,
+             confidence REAL NOT NULL,
+             detected_at INTEGER NOT NULL
+         );
+         CREATE TABLE schema_version (
+             version INTEGER NOT NULL,
+             applied_at INTEGER NOT NULL,
+             description TEXT
+         );",
+    )
+    .unwrap();
 
     let now_ms = 1_700_000_000_000i64;
 
@@ -326,17 +369,29 @@ fn migration_v18_preserves_existing_events() {
         .unwrap();
     assert_eq!(count_before, 1);
 
-    // Upgrade back to current schema and verify event row is preserved.
-    let up_plan = build_migration_plan(17, SCHEMA_VERSION).unwrap();
-    apply_migration_plan(&conn, &up_plan).unwrap();
-    assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+    // Apply the real v18 migration step and verify the event row survives.
+    let migration = MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 18)
+        .expect("v18 migration exists");
+    apply_migration_step(
+        &conn,
+        &MigrationStep {
+            migration_version: migration.version,
+            resulting_version: migration.version,
+            description: migration.description,
+            direction: MigrationDirection::Up,
+        },
+    )
+    .unwrap();
+    assert_eq!(get_user_version(&conn).unwrap(), 18);
 
     let count_after: i64 = conn
         .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count_after, 1);
 
-    // New columns/tables should exist after upgrade.
+    // New columns/tables should exist after the migration.
     let triage_state: Option<String> = conn
         .query_row("SELECT triage_state FROM events WHERE id = 1", [], |row| {
             row.get(0)
@@ -1105,14 +1160,17 @@ fn policy_denied_audit_roundtrips_all_fields_and_variants() {
 
 #[test]
 fn each_migration_step_can_be_reapplied_without_panicking() {
+    // A fresh DB is SCHEMA_SQL + run_migrations(0): every migration step is
+    // applied ON TOP of the full head schema, so re-application on
+    // already-applied state is a load-bearing property of fresh-DB init —
+    // an unguarded ADD COLUMN here kills startup with "duplicate column
+    // name" (the v29 regression class, c24ce119c). Downgrade-then-reapply
+    // is no longer expressible (the forward-only floor equals head), so
+    // exercise the property directly against the head schema, twice per
+    // step to also cover replay-after-apply.
     for migration in MIGRATIONS.iter().skip(1) {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
-
-        let previous_version = previous_migration_version(migration.version);
-        let down_plan = build_migration_plan(SCHEMA_VERSION, previous_version).unwrap();
-        apply_migration_plan(&conn, &down_plan).unwrap();
-        assert_eq!(get_user_version(&conn).unwrap(), previous_version);
 
         let step = MigrationStep {
             migration_version: migration.version,
@@ -1121,8 +1179,12 @@ fn each_migration_step_can_be_reapplied_without_panicking() {
             direction: MigrationDirection::Up,
         };
 
-        apply_migration_step(&conn, &step)
-            .unwrap_or_else(|err| panic!("first apply failed for v{}: {err}", migration.version));
+        apply_migration_step(&conn, &step).unwrap_or_else(|err| {
+            panic!(
+                "apply on head schema failed for v{}: {err}",
+                migration.version
+            )
+        });
         assert_eq!(get_user_version(&conn).unwrap(), migration.version);
 
         apply_migration_step(&conn, &step)

@@ -2638,6 +2638,15 @@ pub(crate) fn build_migration_plan(from_version: i32, to_version: i32) -> Result
         });
     }
 
+    // Downgrade contract (ft-ftwck): v1, v30, and v32 are deliberately
+    // forward-only (down_sql: None), and the lowest reachable downgrade
+    // target is the HIGHEST forward-only version. With v32 == SCHEMA_VERSION
+    // that floor equals head, so this branch currently rejects every
+    // below-head target and MigrationDirection::Down is unreachable in
+    // production. This is the documented contract, not an oversight; the
+    // guard test downgrade_below_forward_only_floor_fails_closed pins the
+    // floor/head relationship and fails loudly when a reversible migration
+    // above v32 makes downgrade reachable again.
     let mut steps = Vec::new();
     for migration in MIGRATIONS.iter().rev() {
         if migration.version <= to_version || migration.version > from_version {
