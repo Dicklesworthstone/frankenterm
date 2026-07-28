@@ -699,6 +699,10 @@ pub mod topology_orchestration;
 // Re-exported so `crate::traceability_verification::*` and
 // `frankenterm_core::traceability_verification::*` paths continue to resolve.
 pub use frankenterm_core_audit_types::traceability_verification;
+// Product personas, exact fleet qualification points, field journeys, and
+// fail-closed support/evidence verdict validation live with the other
+// portable audit contracts.
+pub use frankenterm_core_audit_types::product_journey_catalog;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;

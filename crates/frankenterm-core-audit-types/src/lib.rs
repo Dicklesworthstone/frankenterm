@@ -14,6 +14,8 @@
 //!   model used for compliance reconstruction.
 //! - [`traceability_verification`] — static traceability matrix
 //!   verification types and gap/coverage analytics.
+//! - [`product_journey_catalog`] — product-persona, exact fleet-point,
+//!   topology, field-journey, and support/evidence truth contract.
 //! - [`policy_decision_log_engine`] — generic bounded decision-log
 //!   mechanics (pre-seed for ft-kldww Phase 2).
 //! - [`recorder_audit_engine`] — generic recorder-audit hash-chain
@@ -83,6 +85,7 @@ pub mod policy_decision_log_engine;
 pub mod proof_doctor;
 pub mod proof_handoff;
 pub mod proof_lane;
+pub mod product_journey_catalog;
 pub mod recorder_audit_engine;
 // [ft-xcsm0 / ft-8nqx0 Phase 4] Recorder + session retention POLICY DTOs.
 // Engines (`RetentionManager`, `cleanup_sessions`) stay in

@@ -1,0 +1,1543 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-product-journey-catalog.json",
+  "$comment": "The designated validator MUST enable draft-2020-12 date-time format assertion in addition to the canonical-Z regex; regex alone does not reject impossible calendar dates.",
+  "title": "FrankenTerm Product Journey Catalog",
+  "description": "Fail-closed, contract-only inventory for product personas, exact fleet qualification points, local and Mac-to-LAN mux topologies, end-to-end field journeys, target-pair qualifications, contradictions, and externally authorized promotion-receipt references.",
+  "type": "object",
+  "required": [
+    "contract_id",
+    "schema_version",
+    "catalog_revision",
+    "source_bead_id",
+    "catalog_claim_state",
+    "personas",
+    "fleet_points",
+    "topologies",
+    "target_classes",
+    "actor_modes",
+    "gates",
+    "journey_definitions",
+    "required_coverage",
+    "variants",
+    "legacy_mappings",
+    "readme_mappings",
+    "contradictions",
+    "review_history",
+    "change_history"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_id": {
+      "type": "string",
+      "const": "ft.product_journey_catalog.v1"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "catalog_revision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_bead_id": {
+      "type": "string",
+      "const": "ft-interactive-swarm-product-convergence-7xqz4.1.1"
+    },
+    "catalog_claim_state": {
+      "type": "string",
+      "const": "contract_only",
+      "description": "Version 1 is a contract inventory only. A schema-valid document cannot mint or validate a support-promotion decision."
+    },
+    "personas": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/persona_definition"
+      }
+    },
+    "fleet_points": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/fleet_point_definition"
+      }
+    },
+    "topologies": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "$ref": "#/$defs/topology_definition"
+      }
+    },
+    "target_classes": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/target_class_definition"
+      }
+    },
+    "actor_modes": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/actor_mode_definition"
+      }
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/gate_definition"
+      }
+    },
+    "journey_definitions": {
+      "type": "array",
+      "minItems": 14,
+      "maxItems": 14,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/journey_definition"
+      }
+    },
+    "required_coverage": {
+      "type": "array",
+      "minItems": 32,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/coverage_key"
+      }
+    },
+    "variants": {
+      "type": "array",
+      "minItems": 32,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/journey_variant"
+      }
+    },
+    "legacy_mappings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/legacy_mapping"
+      }
+    },
+    "readme_mappings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/readme_mapping"
+      }
+    },
+    "contradictions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/contradiction_record"
+      }
+    },
+    "review_history": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/review_record"
+      }
+    },
+    "change_history": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/change_record"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "not": {
+        "properties": {
+          "variants": {
+            "contains": {
+              "type": "object",
+              "required": [
+                "support"
+              ],
+              "properties": {
+                "support": {
+                  "type": "object",
+                  "required": [
+                    "state"
+                  ],
+                  "properties": {
+                    "state": {
+                      "const": "supported"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "variants"
+        ]
+      }
+    },
+    {
+      "not": {
+        "properties": {
+          "contradictions": {
+            "contains": {
+              "type": "object",
+              "required": [
+                "status"
+              ],
+              "properties": {
+                "status": {
+                  "const": "resolved"
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "contradictions"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "catalog_claim_state": {
+      "type": "string",
+      "const": "contract_only"
+    },
+    "product_persona": {
+      "type": "string",
+      "enum": [
+        "interactive_human",
+        "meta_agent_operator",
+        "automation_agent",
+        "incident_responder"
+      ]
+    },
+    "fleet_point": {
+      "type": "string",
+      "enum": [
+        "q002",
+        "q020",
+        "q050",
+        "q200"
+      ]
+    },
+    "topology": {
+      "type": "string",
+      "enum": [
+        "local_only",
+        "mac_lan_remote"
+      ]
+    },
+    "transport": {
+      "type": "string",
+      "enum": [
+        "local_mux",
+        "remote_mux"
+      ]
+    },
+    "support_state": {
+      "type": "string",
+      "enum": [
+        "supported",
+        "conditional",
+        "unavailable"
+      ]
+    },
+    "evidence_state": {
+      "type": "string",
+      "enum": [
+        "proven",
+        "proxy_only",
+        "fixture_only",
+        "skipped_not_proven",
+        "blocked",
+        "missing"
+      ]
+    },
+    "run_verdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "fail",
+        "degraded",
+        "not_run",
+        "target_unavailable"
+      ]
+    },
+    "producer_coverage": {
+      "type": "string",
+      "enum": [
+        "direct",
+        "partial",
+        "gap"
+      ]
+    },
+    "release_requirement": {
+      "type": "string",
+      "const": "required"
+    },
+    "target_mode": {
+      "type": "string",
+      "enum": [
+        "m4_pro_native",
+        "m5_native",
+        "m5_pro_max_native",
+        "threadripper_pro_5995wx_native"
+      ]
+    },
+    "actor_mode": {
+      "type": "string",
+      "enum": [
+        "human_interactive",
+        "meta_agent_supervised",
+        "automation_unattended",
+        "incident_response"
+      ]
+    },
+    "target_availability": {
+      "type": "string",
+      "enum": [
+        "available",
+        "unavailable",
+        "unknown"
+      ]
+    },
+    "freshness_state": {
+      "type": "string",
+      "enum": [
+        "current",
+        "stale",
+        "unknown"
+      ]
+    },
+    "review_authority_kind": {
+      "type": "string",
+      "enum": [
+        "automated_informational",
+        "human_product_owner",
+        "human_visual",
+        "human_accessibility",
+        "human_privacy"
+      ]
+    },
+    "review_disposition": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "changes_requested",
+        "informational"
+      ]
+    },
+    "contradiction_status": {
+      "type": "string",
+      "enum": [
+        "open",
+        "resolved"
+      ]
+    },
+    "stable_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "bead_id": {
+      "type": "string",
+      "pattern": "^ft-[a-z0-9][a-z0-9.-]*$"
+    },
+    "target_class_id": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/stable_id"
+        },
+        {
+          "not": {
+            "pattern": "(?:^|[._-])(?:available|unavailable|unknown)(?:[._-]|$)"
+          }
+        }
+      ],
+      "description": "Availability-neutral stable identifier. Availability belongs in a qualification record, never in the identifier."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullable_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_commit": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "repo_ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!\\./)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+"
+    },
+    "non_empty_strings": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "repo_refs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/repo_ref"
+      }
+    },
+    "retained_refs": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/repo_ref"
+      },
+      "description": "Allow-empty references to retained receipts or artifacts. An empty array records absence; it never inherits authority from source_refs."
+    },
+    "nullable_repo_ref": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/repo_ref"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "bead_refs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/bead_id"
+      }
+    },
+    "stable_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/stable_id"
+      }
+    },
+    "stable_ids_allow_empty": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/stable_id"
+      }
+    },
+    "bead_refs_allow_empty": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/bead_id"
+      }
+    },
+    "target_class_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/target_class_id"
+      }
+    },
+    "personas": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/product_persona"
+      }
+    },
+    "persona_definition": {
+      "type": "object",
+      "required": [
+        "persona",
+        "title",
+        "goals",
+        "success_outcomes",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "persona": {
+          "$ref": "#/$defs/product_persona"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "goals": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "success_outcomes": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "fleet_point_definition": {
+      "type": "object",
+      "required": [
+        "fleet_point",
+        "pane_count",
+        "title",
+        "workload_characteristics",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "fleet_point": {
+          "$ref": "#/$defs/fleet_point"
+        },
+        "pane_count": {
+          "type": "integer",
+          "enum": [
+            2,
+            20,
+            50,
+            200
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workload_characteristics": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "topology_target_posture": {
+      "type": "object",
+      "required": [
+        "controller_modes",
+        "session_host_modes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "controller_modes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/target_mode"
+          }
+        },
+        "session_host_modes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/target_mode"
+          }
+        }
+      }
+    },
+    "topology_definition": {
+      "type": "object",
+      "required": [
+        "topology",
+        "title",
+        "target_posture",
+        "description",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "topology": {
+          "$ref": "#/$defs/topology"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_posture": {
+          "$ref": "#/$defs/topology_target_posture"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "target_class_definition": {
+      "type": "object",
+      "required": [
+        "target_class_id",
+        "title",
+        "target_mode",
+        "platform",
+        "hardware_identity",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target_class_id": {
+          "$ref": "#/$defs/target_class_id"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_mode": {
+          "$ref": "#/$defs/target_mode"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hardware_identity": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "actor_mode_definition": {
+      "type": "object",
+      "required": [
+        "actor_mode",
+        "title",
+        "personas",
+        "description",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "actor_mode": {
+          "$ref": "#/$defs/actor_mode"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "personas": {
+          "$ref": "#/$defs/personas"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "gate_definition": {
+      "type": "object",
+      "required": [
+        "gate_id",
+        "title",
+        "release_requirement",
+        "producer_bead_ids",
+        "evidence_refs",
+        "description",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "gate_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "release_requirement": {
+          "$ref": "#/$defs/release_requirement"
+        },
+        "producer_bead_ids": {
+          "$ref": "#/$defs/bead_refs"
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/retained_refs"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "journey_definition": {
+      "type": "object",
+      "required": [
+        "journey_id",
+        "title",
+        "field_bead_id",
+        "release_requirement",
+        "personas",
+        "setup",
+        "steady_work",
+        "failure_overload",
+        "recovery",
+        "teardown",
+        "user_outcomes",
+        "accessibility_expectations",
+        "privacy_expectations",
+        "evidence_requirements",
+        "source_refs",
+        "gate_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "journey_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "field_bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "release_requirement": {
+          "$ref": "#/$defs/release_requirement"
+        },
+        "personas": {
+          "$ref": "#/$defs/personas"
+        },
+        "setup": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/non_empty_strings"
+            },
+            {
+              "minItems": 2
+            }
+          ],
+          "description": "Ordered lifecycle mapping: setup[0] is identity/preflight before mutation; setup[1..] is clean setup."
+        },
+        "steady_work": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "failure_overload": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "recovery": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "teardown": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "user_outcomes": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "accessibility_expectations": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "privacy_expectations": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "evidence_requirements": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        },
+        "gate_ids": {
+          "$ref": "#/$defs/stable_ids"
+        }
+      }
+    },
+    "coverage_key": {
+      "type": "object",
+      "required": [
+        "persona",
+        "fleet_point",
+        "topology"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "persona": {
+          "$ref": "#/$defs/product_persona"
+        },
+        "fleet_point": {
+          "$ref": "#/$defs/fleet_point"
+        },
+        "topology": {
+          "$ref": "#/$defs/topology"
+        }
+      }
+    },
+    "support_declaration": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "promotion_receipt_ref",
+            "promotion_receipt_sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "supported"
+            },
+            "promotion_receipt_ref": {
+              "$ref": "#/$defs/repo_ref"
+            },
+            "promotion_receipt_sha256": {
+              "$ref": "#/$defs/sha256",
+              "description": "SHA-256 over the exact raw bytes at promotion_receipt_ref. This is an external-receipt digest, never a hash of the catalog file containing this field."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "reason",
+            "constraints",
+            "fallback",
+            "tracking_bead_ids"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "conditional"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            },
+            "constraints": {
+              "$ref": "#/$defs/non_empty_strings"
+            },
+            "fallback": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tracking_bead_ids": {
+              "$ref": "#/$defs/bead_refs"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "reason",
+            "fallback",
+            "tracking_bead_ids"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            },
+            "fallback": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tracking_bead_ids": {
+              "$ref": "#/$defs/bead_refs"
+            }
+          }
+        }
+      ]
+    },
+    "exact_producer_binding": {
+      "type": "object",
+      "required": [
+        "producer_bead_id",
+        "coverage",
+        "actor_mode",
+        "transport",
+        "controller_target_class_ids",
+        "session_host_target_class_ids",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "producer_bead_id": {
+          "$ref": "#/$defs/bead_id"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage_key"
+        },
+        "actor_mode": {
+          "$ref": "#/$defs/actor_mode"
+        },
+        "transport": {
+          "$ref": "#/$defs/transport"
+        },
+        "controller_target_class_ids": {
+          "$ref": "#/$defs/target_class_ids"
+        },
+        "session_host_target_class_ids": {
+          "$ref": "#/$defs/target_class_ids"
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "target_qualification": {
+      "type": "object",
+      "required": [
+        "qualification_id",
+        "controller_target_class_id",
+        "session_host_target_class_id",
+        "transport",
+        "route_identity_ref",
+        "candidate_identity_ref",
+        "availability",
+        "evidence_state",
+        "run_verdict",
+        "freshness_state",
+        "evidence_refs",
+        "blocker_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "qualification_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "controller_target_class_id": {
+          "$ref": "#/$defs/target_class_id"
+        },
+        "session_host_target_class_id": {
+          "$ref": "#/$defs/target_class_id"
+        },
+        "transport": {
+          "$ref": "#/$defs/transport"
+        },
+        "route_identity_ref": {
+          "$ref": "#/$defs/nullable_repo_ref"
+        },
+        "candidate_identity_ref": {
+          "$ref": "#/$defs/nullable_repo_ref"
+        },
+        "availability": {
+          "$ref": "#/$defs/target_availability"
+        },
+        "evidence_state": {
+          "$ref": "#/$defs/evidence_state"
+        },
+        "run_verdict": {
+          "$ref": "#/$defs/run_verdict"
+        },
+        "freshness_state": {
+          "$ref": "#/$defs/freshness_state"
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/retained_refs"
+        },
+        "blocker_refs": {
+          "$ref": "#/$defs/retained_refs"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "freshness_state": {
+                    "enum": [
+                      "current",
+                      "stale"
+                    ]
+                  }
+                },
+                "required": [
+                  "freshness_state"
+                ]
+              },
+              {
+                "properties": {
+                  "evidence_state": {
+                    "enum": [
+                      "proven",
+                      "proxy_only",
+                      "fixture_only"
+                    ]
+                  }
+                },
+                "required": [
+                  "evidence_state"
+                ]
+              },
+              {
+                "properties": {
+                  "run_verdict": {
+                    "enum": [
+                      "pass",
+                      "fail",
+                      "degraded"
+                    ]
+                  }
+                },
+                "required": [
+                  "run_verdict"
+                ]
+              },
+              {
+                "properties": {
+                  "evidence_refs": {
+                    "minItems": 1
+                  }
+                },
+                "required": [
+                  "evidence_refs"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "route_identity_ref": {
+                "$ref": "#/$defs/repo_ref"
+              },
+              "candidate_identity_ref": {
+                "$ref": "#/$defs/repo_ref"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "controller_target_class_id": {
+                    "const": "m5_pro_max_native"
+                  }
+                },
+                "required": [
+                  "controller_target_class_id"
+                ]
+              },
+              {
+                "properties": {
+                  "session_host_target_class_id": {
+                    "const": "m5_pro_max_native"
+                  }
+                },
+                "required": [
+                  "session_host_target_class_id"
+                ]
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "route_identity_ref": {
+                "type": "null"
+              },
+              "candidate_identity_ref": {
+                "type": "null"
+              },
+              "availability": {
+                "const": "unknown"
+              },
+              "evidence_state": {
+                "const": "missing"
+              },
+              "run_verdict": {
+                "const": "not_run"
+              },
+              "freshness_state": {
+                "const": "unknown"
+              },
+              "evidence_refs": {
+                "maxItems": 0
+              },
+              "blocker_refs": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    },
+    "journey_variant": {
+      "type": "object",
+      "required": [
+        "variant_id",
+        "claim_id",
+        "coverage",
+        "journey_ids",
+        "actor_mode",
+        "transport",
+        "support",
+        "producer_coverage",
+        "exact_producer_bindings",
+        "partial_producer_bead_ids",
+        "target_qualifications",
+        "release_requirement",
+        "gate_ids",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "variant_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "claim_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverage_key"
+        },
+        "journey_ids": {
+          "$ref": "#/$defs/stable_ids"
+        },
+        "actor_mode": {
+          "$ref": "#/$defs/actor_mode"
+        },
+        "transport": {
+          "$ref": "#/$defs/transport"
+        },
+        "support": {
+          "$ref": "#/$defs/support_declaration"
+        },
+        "producer_coverage": {
+          "$ref": "#/$defs/producer_coverage"
+        },
+        "exact_producer_bindings": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/exact_producer_binding"
+          },
+          "description": "Allow-empty ownership bindings. Presence records exact producer scope, not execution or proof."
+        },
+        "partial_producer_bead_ids": {
+          "$ref": "#/$defs/bead_refs_allow_empty"
+        },
+        "target_qualifications": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/target_qualification"
+          }
+        },
+        "release_requirement": {
+          "$ref": "#/$defs/release_requirement"
+        },
+        "gate_ids": {
+          "$ref": "#/$defs/stable_ids"
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      }
+    },
+    "legacy_mapping": {
+      "type": "object",
+      "required": [
+        "legacy_id",
+        "journey_ids",
+        "source_refs",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "legacy_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "journey_ids": {
+          "$ref": "#/$defs/stable_ids"
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "readme_mapping": {
+      "type": "object",
+      "required": [
+        "mapping_id",
+        "readme_ref",
+        "claim_text",
+        "claim_sha256",
+        "journey_ids",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "mapping_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "readme_ref": {
+          "$ref": "#/$defs/repo_ref"
+        },
+        "claim_text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "claim_sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "SHA-256 over the UTF-8 bytes of decoded claim_text, excluding JSON quotes and escape syntax and without whitespace, newline, or Unicode normalization."
+        },
+        "journey_ids": {
+          "$ref": "#/$defs/stable_ids"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "review_record": {
+      "type": "object",
+      "required": [
+        "review_id",
+        "reviewed_at_utc",
+        "reviewed_catalog_revision",
+        "reviewed_commit",
+        "reviewer",
+        "authority_kind",
+        "disposition",
+        "scope",
+        "authority_receipt_ref",
+        "authority_receipt_sha256",
+        "notes",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "review_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "reviewed_at_utc": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+        },
+        "reviewed_catalog_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewed_commit": {
+          "$ref": "#/$defs/nullable_commit"
+        },
+        "reviewer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authority_kind": {
+          "$ref": "#/$defs/review_authority_kind"
+        },
+        "disposition": {
+          "$ref": "#/$defs/review_disposition"
+        },
+        "scope": {
+          "$ref": "#/$defs/non_empty_strings"
+        },
+        "authority_receipt_ref": {
+          "$ref": "#/$defs/nullable_repo_ref"
+        },
+        "authority_receipt_sha256": {
+          "$ref": "#/$defs/nullable_sha256",
+          "description": "When non-null, SHA-256 over the exact raw bytes at authority_receipt_ref. This is an external-receipt digest, never a self-hash of this catalog."
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "authority_receipt_ref": {
+                  "type": "null"
+                },
+                "authority_receipt_sha256": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "authority_receipt_ref": {
+                  "$ref": "#/$defs/repo_ref"
+                },
+                "authority_receipt_sha256": {
+                  "$ref": "#/$defs/sha256"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "if": {
+            "properties": {
+              "authority_kind": {
+                "const": "automated_informational"
+              }
+            },
+            "required": [
+              "authority_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reviewed_commit": {
+                "type": "null"
+              },
+              "disposition": {
+                "const": "informational"
+              },
+              "authority_receipt_ref": {
+                "type": "null"
+              },
+              "authority_receipt_sha256": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "disposition": {
+                "enum": [
+                  "approved",
+                  "changes_requested"
+                ]
+              }
+            },
+            "required": [
+              "disposition"
+            ]
+          },
+          "then": false
+        },
+        {
+          "if": {
+            "properties": {
+              "review_id": {
+                "const": "ft.product-journey-review.2026-07-27.initial"
+              }
+            },
+            "required": [
+              "review_id"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reviewed_at_utc": {
+                "const": "2026-07-27T23:04:36Z"
+              },
+              "reviewed_catalog_revision": {
+                "const": "2026-07-27.1"
+              },
+              "reviewed_commit": {
+                "type": "null"
+              },
+              "reviewer": {
+                "const": "Codex systems architecture review"
+              },
+              "authority_kind": {
+                "const": "automated_informational"
+              },
+              "disposition": {
+                "const": "informational"
+              },
+              "scope": {
+                "const": [
+                  "Personas, exact fleet points, mux topologies, target posture, 32-cell coverage, 14 field journeys, lifecycle, visual, accessibility, privacy, dependencies, and known claim drift."
+                ]
+              },
+              "authority_receipt_ref": {
+                "type": "null"
+              },
+              "authority_receipt_sha256": {
+                "type": "null"
+              },
+              "notes": {
+                "const": "AI-authored initial informational review. Commit df4414f5587cccface7edebdee6028ae758f82f8 is only the shared source baseline and does not contain these catalog bytes. Human product-owner approval and later human-locked visual and accessibility reviews remain pending; no cell is supported."
+              },
+              "source_refs": {
+                "const": [
+                  "AGENTS.md",
+                  "README.md",
+                  ".beads/issues.jsonl",
+                  "docs/design/product-journey-contract.md",
+                  "docs/json-schema/ft-product-journey-catalog.json",
+                  "docs/perf/mux-long-session-performance-campaign.md",
+                  "docs/ft-xbnl0-5-4-operator-acceptance-scenarios.json",
+                  "docs/demo-scenarios.md",
+                  "docs/high-scale-operator-rehearsals.md",
+                  "docs/a11y/scenario-corpus.md",
+                  "docs/perf/target-class-hardware.md",
+                  "docs/ft-xbnl0-5-5-closure-metadata.json"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "contradiction_record": {
+      "type": "object",
+      "required": [
+        "contradiction_id",
+        "title",
+        "status",
+        "blocks_all_claims",
+        "affected_claim_ids",
+        "tracking_bead_ids",
+        "source_refs",
+        "resolution_refs",
+        "notes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "contradiction_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "$ref": "#/$defs/contradiction_status"
+        },
+        "blocks_all_claims": {
+          "type": "boolean"
+        },
+        "affected_claim_ids": {
+          "$ref": "#/$defs/stable_ids_allow_empty"
+        },
+        "tracking_bead_ids": {
+          "$ref": "#/$defs/bead_refs"
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        },
+        "resolution_refs": {
+          "$ref": "#/$defs/retained_refs"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "change_record": {
+      "type": "object",
+      "required": [
+        "change_id",
+        "catalog_revision",
+        "changed_at_utc",
+        "summary",
+        "source_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "change_id": {
+          "$ref": "#/$defs/stable_id"
+        },
+        "catalog_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "changed_at_utc": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_refs": {
+          "$ref": "#/$defs/repo_refs"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "change_id": {
+                "const": "change.2026_07_27.1"
+              }
+            },
+            "required": [
+              "change_id"
+            ]
+          },
+          "then": {
+            "properties": {
+              "catalog_revision": {
+                "const": "2026-07-27.1"
+              },
+              "changed_at_utc": {
+                "const": "2026-07-27T23:04:36Z"
+              },
+              "summary": {
+                "const": "Initial contract-only catalog with four product personas, four exact fleet points, two mux topologies, four neutral target identities, four actor modes, thirteen fail-closed gates, fourteen field journeys, thirty-two required cells, exact and partial producer bindings, three target qualifications per cell, content-bound README mappings, and eight open contradictions."
+              },
+              "source_refs": {
+                "const": [
+                  "docs/design/product-journey-contract.md",
+                  "docs/json-schema/ft-product-journey-catalog.json"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
