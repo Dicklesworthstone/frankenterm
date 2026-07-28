@@ -1,4 +1,4 @@
-//! Executable bounded scheduler model for mux delivery classes.
+//! Executable bounded scheduler models for mux delivery classes.
 //!
 //! This module is the scheduling half of `ft.render-delivery-ledger.v1`.  It
 //! deliberately has no live mux wiring: it freezes the admission, capacity,
@@ -21,10 +21,25 @@
 //! continuously ready durable class is selected after at most
 //! [`DELIVERY_MAX_STARVATION_DEQUEUES`] selections from other classes.  FIFO
 //! and stable-key ordering within each class are unaffected by this bound.
+//!
+//! The original [`DeliveryScheduler`] remains the small v1 class-arbitration
+//! model.  It is intentionally preserved because its exact queue and fairness
+//! semantics are useful as a comparison baseline.  It is **not** the authority
+//! for lossless delivery: destructive dequeue cannot represent application
+//! acknowledgement.
+//!
+//! [`DeliveryCoordinator`] is the hardened v2 contract.  It stores only
+//! fixed-size authority handles, charges both slots and resident bytes, admits
+//! multi-effect plans atomically, and retains the authoritative plan until a
+//! generation-and-attempt-bound claim is acknowledged.  A single causal FIFO
+//! with explicit epochs is conservative by design: lifecycle barriers and
+//! telemetry fences may cost concurrency, but can never be overtaken.
 
 use crate::delivery_ledger::DELIVERY_PRIORITY_BURST_LIMIT;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 /// Stable identifier for this executable scheduler contract.
 pub const DELIVERY_SCHEDULER_CONTRACT_VERSION: &str = "ft.delivery-scheduler.v1";
@@ -744,6 +759,1433 @@ where
     }
 }
 
+/// Stable identifier for the acknowledgement-retaining scheduler contract.
+pub const HARDENED_DELIVERY_SCHEDULER_CONTRACT_VERSION: &str = "ft.delivery-coordinator.v2";
+
+/// Number of independently charged durable authority lanes.
+pub const HARDENED_DELIVERY_LANE_COUNT: usize = 8;
+
+/// Fixed-size authority lane used by an exhaustive [`PlannedEffect`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[repr(usize)]
+pub enum AuthorityLane {
+    Lifecycle = 0,
+    State = 1,
+    Render = 2,
+    Topology = 3,
+    Auxiliary = 4,
+    Event = 5,
+    Telemetry = 6,
+    Spool = 7,
+}
+
+impl AuthorityLane {
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Connection-local scheduler generation for durable authority handles.
+///
+/// The producer must never reuse the numeric value while authority handles
+/// from an older connection incarnation can still exist.  Claim and
+/// reservation capabilities carry an additional coordinator-instance identity
+/// and therefore reject cross-instance settlement even if this external
+/// authority-generation precondition is accidentally violated.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SchedulerGeneration(u64);
+
+impl SchedulerGeneration {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Stable key plus incarnation.  Raw pane IDs are insufficient when an ID can
+/// be reused across topology epochs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StableEffectKey {
+    scope: u64,
+    incarnation: u64,
+}
+
+impl StableEffectKey {
+    #[must_use]
+    pub const fn new(scope: u64, incarnation: u64) -> Self {
+        Self { scope, incarnation }
+    }
+
+    #[must_use]
+    pub const fn scope(self) -> u64 {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn incarnation(self) -> u64 {
+        self.incarnation
+    }
+}
+
+/// Fixed-size reference to state owned by a durable journal, snapshot store,
+/// fold accumulator, spool, or external render ledger.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AuthorityHandle {
+    generation: SchedulerGeneration,
+    id: u64,
+    version: u64,
+}
+
+impl AuthorityHandle {
+    #[must_use]
+    pub const fn new(generation: SchedulerGeneration, id: u64, version: u64) -> Self {
+        Self {
+            generation,
+            id,
+            version,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> SchedulerGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn version(self) -> u64 {
+        self.version
+    }
+}
+
+/// Versioned authoritative replacement snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ResyncAuthority {
+    handle: AuthorityHandle,
+    source_version: u64,
+}
+
+impl ResyncAuthority {
+    #[must_use]
+    pub const fn new(handle: AuthorityHandle, source_version: u64) -> Self {
+        Self {
+            handle,
+            source_version,
+        }
+    }
+
+    #[must_use]
+    pub const fn handle(self) -> AuthorityHandle {
+        self.handle
+    }
+
+    #[must_use]
+    pub const fn source_version(self) -> u64 {
+        self.source_version
+    }
+}
+
+/// Claim or resync authority retained by the external render ledger.  The
+/// scheduler arbitrates this fixed-size handle and never independently
+/// coalesces pane dirties or synthesizes its own render replacement snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ExternalRenderAuthority {
+    scheduler_generation: SchedulerGeneration,
+    ledger_generation: u64,
+    ledger_obligation: u64,
+    source_version: u64,
+}
+
+impl ExternalRenderAuthority {
+    #[must_use]
+    pub const fn new(
+        scheduler_generation: SchedulerGeneration,
+        ledger_generation: u64,
+        ledger_obligation: u64,
+        source_version: u64,
+    ) -> Self {
+        Self {
+            scheduler_generation,
+            ledger_generation,
+            ledger_obligation,
+            source_version,
+        }
+    }
+
+    #[must_use]
+    pub const fn scheduler_generation(self) -> SchedulerGeneration {
+        self.scheduler_generation
+    }
+
+    #[must_use]
+    pub const fn ledger_generation(self) -> u64 {
+        self.ledger_generation
+    }
+
+    #[must_use]
+    pub const fn ledger_obligation(self) -> u64 {
+        self.ledger_obligation
+    }
+
+    #[must_use]
+    pub const fn source_version(self) -> u64 {
+        self.source_version
+    }
+}
+
+/// Scope of a lifecycle barrier.  V2 schedules every scope conservatively as a
+/// global FIFO fence; retaining the scope prevents a later live implementation
+/// from guessing it after admission.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BarrierScope {
+    Global,
+    Key(StableEffectKey),
+}
+
+/// Exact fold authority that must precede a render claim.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TelemetryFence {
+    accumulator: AuthorityHandle,
+    through_version: u64,
+}
+
+impl TelemetryFence {
+    #[must_use]
+    pub const fn new(accumulator: AuthorityHandle, through_version: u64) -> Self {
+        Self {
+            accumulator,
+            through_version,
+        }
+    }
+
+    #[must_use]
+    pub const fn accumulator(self) -> AuthorityHandle {
+        self.accumulator
+    }
+
+    #[must_use]
+    pub const fn through_version(self) -> u64 {
+        self.through_version
+    }
+}
+
+/// Closed, exhaustive plan effect.  No variant stores an unbounded payload;
+/// externally sized data is represented by a journal or spool handle.
+///
+/// Each `retained_bytes` field is the additional authority-owned resident
+/// memory kept alive by that handle.  The coordinator independently adds the
+/// exact structural charge for its queue entry and effect allocation, so a
+/// zero additional charge can never make a stored plan free.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlannedEffect {
+    LifecycleBarrier {
+        scope: BarrierScope,
+        journal: AuthorityHandle,
+        retained_bytes: usize,
+    },
+    StateAuthority {
+        key: StableEffectKey,
+        authority: AuthorityHandle,
+        retained_bytes: usize,
+    },
+    StateResync {
+        authority: ResyncAuthority,
+        retained_bytes: usize,
+    },
+    RenderAuthority {
+        key: StableEffectKey,
+        claim: ExternalRenderAuthority,
+        telemetry_through: Option<TelemetryFence>,
+        retained_bytes: usize,
+    },
+    RenderResync {
+        authority: ExternalRenderAuthority,
+        retained_bytes: usize,
+    },
+    TopologyResync {
+        authority: ResyncAuthority,
+        retained_bytes: usize,
+    },
+    AuxiliaryResync {
+        authority: ResyncAuthority,
+        retained_bytes: usize,
+    },
+    EventJournal {
+        journal: AuthorityHandle,
+        retained_bytes: usize,
+    },
+    TelemetryFold {
+        key: StableEffectKey,
+        accumulator: AuthorityHandle,
+        through_version: u64,
+        retained_bytes: usize,
+    },
+    Spool {
+        spool: AuthorityHandle,
+        payload_bytes: u64,
+        retained_bytes: usize,
+    },
+}
+
+impl PlannedEffect {
+    #[must_use]
+    pub const fn lane(&self) -> AuthorityLane {
+        match self {
+            Self::LifecycleBarrier { .. } => AuthorityLane::Lifecycle,
+            Self::StateAuthority { .. } | Self::StateResync { .. } => AuthorityLane::State,
+            Self::RenderAuthority { .. } | Self::RenderResync { .. } => AuthorityLane::Render,
+            Self::TopologyResync { .. } => AuthorityLane::Topology,
+            Self::AuxiliaryResync { .. } => AuthorityLane::Auxiliary,
+            Self::EventJournal { .. } => AuthorityLane::Event,
+            Self::TelemetryFold { .. } => AuthorityLane::Telemetry,
+            Self::Spool { .. } => AuthorityLane::Spool,
+        }
+    }
+
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        let bytes = match self {
+            Self::LifecycleBarrier { retained_bytes, .. }
+            | Self::StateAuthority { retained_bytes, .. }
+            | Self::StateResync { retained_bytes, .. }
+            | Self::RenderAuthority { retained_bytes, .. }
+            | Self::RenderResync { retained_bytes, .. }
+            | Self::TopologyResync { retained_bytes, .. }
+            | Self::AuxiliaryResync { retained_bytes, .. }
+            | Self::EventJournal { retained_bytes, .. }
+            | Self::TelemetryFold { retained_bytes, .. }
+            | Self::Spool { retained_bytes, .. } => *retained_bytes,
+        };
+        bytes
+    }
+
+    const fn generation(&self) -> SchedulerGeneration {
+        match self {
+            Self::LifecycleBarrier { journal, .. }
+            | Self::StateAuthority {
+                authority: journal, ..
+            }
+            | Self::EventJournal { journal, .. }
+            | Self::TelemetryFold {
+                accumulator: journal,
+                ..
+            }
+            | Self::Spool { spool: journal, .. } => journal.generation(),
+            Self::StateResync { authority, .. }
+            | Self::TopologyResync { authority, .. }
+            | Self::AuxiliaryResync { authority, .. } => authority.handle().generation(),
+            Self::RenderAuthority { claim, .. } => claim.scheduler_generation(),
+            Self::RenderResync { authority, .. } => authority.scheduler_generation(),
+        }
+    }
+
+    const fn is_barrier(&self) -> bool {
+        matches!(self, Self::LifecycleBarrier { .. })
+    }
+}
+
+/// Atomic, ordered group of scheduler-owned authority handles.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryPlan {
+    effects: Arc<[PlannedEffect]>,
+}
+
+const SHARED_PLAN_ALLOCATION_HEADER_BYTES: usize = 2 * std::mem::size_of::<usize>();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanBuildError {
+    Empty,
+    FootprintOverflow,
+}
+
+impl DeliveryPlan {
+    pub fn new(effects: Vec<PlannedEffect>) -> Result<Self, PlanBuildError> {
+        if effects.is_empty() {
+            return Err(PlanBuildError::Empty);
+        }
+        let plan = Self {
+            effects: Arc::from(effects.into_boxed_slice()),
+        };
+        plan.footprint().ok_or(PlanBuildError::FootprintOverflow)?;
+        Ok(plan)
+    }
+
+    #[must_use]
+    pub fn effects(&self) -> &[PlannedEffect] {
+        self.effects.as_ref()
+    }
+
+    fn footprint(&self) -> Option<PlanFootprint> {
+        let mut lane_slots = [0usize; HARDENED_DELIVERY_LANE_COUNT];
+        let effect_storage =
+            std::mem::size_of::<PlannedEffect>().checked_mul(self.effects.len())?;
+        let mut resident_bytes = std::mem::size_of::<CoordinatorEntry>()
+            .checked_add(SHARED_PLAN_ALLOCATION_HEADER_BYTES)?
+            .checked_add(effect_storage)?;
+        let mut barrier_count = 0usize;
+        for effect in self.effects.as_ref() {
+            let lane = &mut lane_slots[effect.lane().index()];
+            *lane = lane.checked_add(1)?;
+            resident_bytes = resident_bytes.checked_add(effect.retained_bytes())?;
+            barrier_count = barrier_count.checked_add(usize::from(effect.is_barrier()))?;
+        }
+        Some(PlanFootprint {
+            lane_slots,
+            semantic_effects: self.effects.len(),
+            resident_bytes,
+            barrier_count,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlanFootprint {
+    lane_slots: [usize; HARDENED_DELIVERY_LANE_COUNT],
+    semantic_effects: usize,
+    resident_bytes: usize,
+    barrier_count: usize,
+}
+
+impl PlanFootprint {
+    fn total_slots(self) -> Option<usize> {
+        self.lane_slots
+            .into_iter()
+            .try_fold(0usize, usize::checked_add)
+    }
+}
+
+/// Checked slot and byte limits for v2 authority handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HardenedSchedulerLimits {
+    lane_slots: [usize; HARDENED_DELIVERY_LANE_COUNT],
+    total_slots: usize,
+    resident_bytes: usize,
+    max_effects_per_plan: usize,
+    max_effect_resident_bytes: usize,
+    pending_plans: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardenedConfigError {
+    CapacityOverflow,
+    ZeroPlanLimit,
+    ZeroEffectsPerPlan,
+}
+
+impl HardenedSchedulerLimits {
+    pub fn new(
+        lane_slots: [usize; HARDENED_DELIVERY_LANE_COUNT],
+        total_slots: usize,
+        resident_bytes: usize,
+        max_effects_per_plan: usize,
+        max_effect_resident_bytes: usize,
+        pending_plans: usize,
+    ) -> Result<Self, HardenedConfigError> {
+        let aggregate = lane_slots
+            .into_iter()
+            .try_fold(0usize, usize::checked_add)
+            .ok_or(HardenedConfigError::CapacityOverflow)?;
+        if total_slots > aggregate {
+            return Err(HardenedConfigError::CapacityOverflow);
+        }
+        if pending_plans == 0 {
+            return Err(HardenedConfigError::ZeroPlanLimit);
+        }
+        if max_effects_per_plan == 0 {
+            return Err(HardenedConfigError::ZeroEffectsPerPlan);
+        }
+        Ok(Self {
+            lane_slots,
+            total_slots,
+            resident_bytes,
+            max_effects_per_plan,
+            max_effect_resident_bytes,
+            pending_plans,
+        })
+    }
+
+    #[must_use]
+    pub const fn lane_limit(self, lane: AuthorityLane) -> usize {
+        self.lane_slots[lane.index()]
+    }
+
+    #[must_use]
+    pub const fn total_slots(self) -> usize {
+        self.total_slots
+    }
+
+    #[must_use]
+    pub const fn resident_bytes(self) -> usize {
+        self.resident_bytes
+    }
+}
+
+/// Exact usage partition.  Claiming moves a plan from ready to in-flight and
+/// does not release any slot or byte charge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HardenedCapacity {
+    pub lane_slots_used: [usize; HARDENED_DELIVERY_LANE_COUNT],
+    pub charged_slots: usize,
+    pub charged_resident_bytes: usize,
+    pub semantic_effects: usize,
+    pub reserved_plans: usize,
+    pub ready_plans: usize,
+    pub in_flight_plans: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HardenedCounters {
+    pub plans_admitted: u64,
+    pub plans_rejected: u64,
+    pub reservations_admitted: u64,
+    pub reservations_rejected: u64,
+    pub reservations_committed: u64,
+    pub reservations_cancelled: u64,
+    pub reservation_cancel_rejections: u64,
+    pub reservation_commit_rejections: u64,
+    pub stale_reservations: u64,
+    pub wrong_instance_reservations: u64,
+    pub claims: u64,
+    pub acknowledgements: u64,
+    pub retries: u64,
+    pub terminal_nacks: u64,
+    pub stale_settlements: u64,
+    pub wrong_instance_settlements: u64,
+    pub wake_registrations: u64,
+    pub wake_deliveries: u64,
+    pub closes: u64,
+    pub closed_semantic_effects: u64,
+    pub closed_charged_slots: u64,
+    pub closed_resident_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CoordinatorInstance(Arc<()>);
+
+impl CoordinatorInstance {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl PartialEq for CoordinatorInstance {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CoordinatorInstance {}
+
+/// Opaque, instance-bound reservation capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservationToken {
+    instance: CoordinatorInstance,
+    generation: SchedulerGeneration,
+    sequence: u64,
+}
+
+impl ReservationToken {
+    #[must_use]
+    pub const fn generation(&self) -> SchedulerGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// Opaque, instance-bound application-attempt capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorClaimToken {
+    instance: CoordinatorInstance,
+    generation: SchedulerGeneration,
+    obligation_sequence: u64,
+    attempt: u64,
+}
+
+impl CoordinatorClaimToken {
+    #[must_use]
+    pub const fn generation(&self) -> SchedulerGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn obligation_sequence(&self) -> u64 {
+        self.obligation_sequence
+    }
+
+    #[must_use]
+    pub const fn attempt(&self) -> u64 {
+        self.attempt
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorDeliveryClaim {
+    token: CoordinatorClaimToken,
+    epoch: u64,
+    plan: DeliveryPlan,
+}
+
+impl CoordinatorDeliveryClaim {
+    #[must_use]
+    pub const fn token(&self) -> &CoordinatorClaimToken {
+        &self.token
+    }
+
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.token.obligation_sequence
+    }
+
+    #[must_use]
+    pub fn plan(&self) -> &DeliveryPlan {
+        &self.plan
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanRejectReason {
+    Capacity,
+    ResidentBytes,
+    EffectTooLarge,
+    TooManyEffects,
+    MultipleBarriers,
+    BarrierMustBeIsolated,
+    WrongGeneration,
+    TelemetryDependencyOrder,
+    FootprintMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanAdmission {
+    Admitted {
+        sequence: u64,
+        epoch: u64,
+    },
+    Rejected {
+        reason: PlanRejectReason,
+        plan: DeliveryPlan,
+    },
+    Closed {
+        plan: DeliveryPlan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReservationAdmission {
+    Reserved(ReservationToken),
+    Rejected(PlanRejectReason),
+    Closed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReservationCommit {
+    Committed {
+        sequence: u64,
+        epoch: u64,
+    },
+    Rejected {
+        token: ReservationToken,
+        reason: PlanRejectReason,
+        plan: DeliveryPlan,
+    },
+    Stale {
+        plan: DeliveryPlan,
+    },
+    WrongInstance {
+        token: ReservationToken,
+        plan: DeliveryPlan,
+    },
+    Closed {
+        plan: DeliveryPlan,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReservationCancel {
+    Cancelled,
+    CausalDependents { token: ReservationToken },
+    Stale,
+    WrongInstance { token: ReservationToken },
+    GenerationClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatorSettleOutcome {
+    Acknowledged,
+    Retried,
+    FailedClosed,
+    StaleOrDuplicate,
+    WrongInstance,
+    GenerationClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatorClaimError {
+    TokenExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoordinatorCloseReport {
+    pub reserved_plans: usize,
+    pub ready_plans: usize,
+    pub in_flight_plans: usize,
+    pub semantic_effects: usize,
+    pub charged_slots: usize,
+    pub charged_resident_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatorCloseOutcome {
+    Closed(CoordinatorCloseReport),
+    AlreadyClosed,
+}
+
+#[derive(Clone, Debug)]
+enum CoordinatorEntryState {
+    Reserved {
+        token: ReservationToken,
+    },
+    Ready {
+        plan: DeliveryPlan,
+    },
+    InFlight {
+        plan: DeliveryPlan,
+        token: CoordinatorClaimToken,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct CoordinatorEntry {
+    sequence: u64,
+    epoch: u64,
+    footprint: PlanFootprint,
+    state: CoordinatorEntryState,
+}
+
+/// Hardened, non-wired authority coordinator.
+///
+/// V2 deliberately permits only one in-flight plan.  That conservative window
+/// makes the causal proof exact: admission sequence, application sequence, and
+/// acknowledgement sequence cannot diverge.  A later live implementation may
+/// widen the window only with an equivalent ordered-commit proof.
+pub struct DeliveryCoordinator {
+    instance: CoordinatorInstance,
+    generation: SchedulerGeneration,
+    limits: HardenedSchedulerLimits,
+    queue: VecDeque<CoordinatorEntry>,
+    next_sequence: Option<u64>,
+    next_attempt: Option<u64>,
+    current_epoch: u64,
+    closed: bool,
+    waiter: Option<Waker>,
+    counters: HardenedCounters,
+    last_close_report: Option<CoordinatorCloseReport>,
+}
+
+impl DeliveryCoordinator {
+    #[must_use]
+    pub fn new(generation: SchedulerGeneration, limits: HardenedSchedulerLimits) -> Self {
+        Self {
+            instance: CoordinatorInstance::new(),
+            generation,
+            limits,
+            queue: VecDeque::new(),
+            next_sequence: Some(1),
+            next_attempt: Some(1),
+            current_epoch: 0,
+            closed: false,
+            waiter: None,
+            counters: HardenedCounters::default(),
+            last_close_report: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> SchedulerGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> HardenedCounters {
+        self.counters
+    }
+
+    #[must_use]
+    pub const fn last_close_report(&self) -> Option<CoordinatorCloseReport> {
+        self.last_close_report
+    }
+
+    /// Return exact charged and semantic usage.
+    ///
+    /// Reserved plans charge slots and bytes but are not semantic effects.
+    /// Ready and in-flight plans remain identically charged until ACK.
+    #[must_use]
+    pub fn capacity(&self) -> HardenedCapacity {
+        let mut capacity = HardenedCapacity::default();
+        for entry in &self.queue {
+            for (used, entry_used) in capacity
+                .lane_slots_used
+                .iter_mut()
+                .zip(entry.footprint.lane_slots)
+            {
+                *used += entry_used;
+            }
+            capacity.charged_slots += entry
+                .footprint
+                .total_slots()
+                .expect("admitted footprint was checked");
+            capacity.charged_resident_bytes += entry.footprint.resident_bytes;
+            match &entry.state {
+                CoordinatorEntryState::Reserved { .. } => {
+                    capacity.reserved_plans += 1;
+                }
+                CoordinatorEntryState::Ready { .. } => {
+                    capacity.ready_plans += 1;
+                    capacity.semantic_effects += entry.footprint.semantic_effects;
+                }
+                CoordinatorEntryState::InFlight { .. } => {
+                    capacity.in_flight_plans += 1;
+                    capacity.semantic_effects += entry.footprint.semantic_effects;
+                }
+            }
+        }
+        capacity
+    }
+
+    /// Atomically admit an already-authoritative multi-effect plan.
+    ///
+    /// Every effect must be a fixed-size durable authority handle.  If any lane
+    /// or byte preflight fails, no queue, causal-clock, or capacity state is
+    /// mutated and ownership of the complete plan is returned.
+    pub fn admit_plan(&mut self, plan: DeliveryPlan) -> PlanAdmission {
+        if self.closed {
+            return PlanAdmission::Closed { plan };
+        }
+        let footprint = match self.validate_plan(&plan) {
+            Ok(footprint) => footprint,
+            Err(reason) => {
+                increment(&mut self.counters.plans_rejected);
+                return PlanAdmission::Rejected { reason, plan };
+            }
+        };
+        if let Err(reason) = self.preflight(footprint) {
+            increment(&mut self.counters.plans_rejected);
+            return PlanAdmission::Rejected { reason, plan };
+        }
+        if footprint.barrier_count == 1 && self.current_epoch == u64::MAX {
+            self.close_internal();
+            return PlanAdmission::Closed { plan };
+        }
+        let Some(sequence) = self.issue_sequence() else {
+            self.close_internal();
+            return PlanAdmission::Closed { plan };
+        };
+        let epoch = self.current_epoch;
+        self.queue.push_back(CoordinatorEntry {
+            sequence,
+            epoch,
+            footprint,
+            state: CoordinatorEntryState::Ready { plan },
+        });
+        if footprint.barrier_count == 1 {
+            self.current_epoch += 1;
+        }
+        increment(&mut self.counters.plans_admitted);
+        self.wake_waiter_if_claimable();
+        PlanAdmission::Admitted { sequence, epoch }
+    }
+
+    /// Reserve all slots and resident bytes before an authoritative mutation.
+    ///
+    /// The reservation occupies its ingress sequence and is invisible to the
+    /// consumer, but it is a causal fence: later plans cannot pass an
+    /// uncommitted pre-mutation publication.
+    pub fn reserve_plan(&mut self, plan: &DeliveryPlan) -> ReservationAdmission {
+        if self.closed {
+            return ReservationAdmission::Closed;
+        }
+        let footprint = match self.validate_plan(plan) {
+            Ok(footprint) => footprint,
+            Err(reason) => {
+                increment(&mut self.counters.reservations_rejected);
+                return ReservationAdmission::Rejected(reason);
+            }
+        };
+        if let Err(reason) = self.preflight(footprint) {
+            increment(&mut self.counters.reservations_rejected);
+            return ReservationAdmission::Rejected(reason);
+        }
+        if footprint.barrier_count == 1 && self.current_epoch == u64::MAX {
+            self.close_internal();
+            return ReservationAdmission::Closed;
+        }
+        let Some(sequence) = self.issue_sequence() else {
+            self.close_internal();
+            return ReservationAdmission::Closed;
+        };
+        let token = ReservationToken {
+            instance: self.instance.clone(),
+            generation: self.generation,
+            sequence,
+        };
+        let epoch = self.current_epoch;
+        self.queue.push_back(CoordinatorEntry {
+            sequence,
+            epoch,
+            footprint,
+            state: CoordinatorEntryState::Reserved {
+                token: token.clone(),
+            },
+        });
+        if footprint.barrier_count == 1 {
+            self.current_epoch += 1;
+        }
+        increment(&mut self.counters.reservations_admitted);
+        ReservationAdmission::Reserved(token)
+    }
+
+    /// Publish a plan into an existing invisible reservation.
+    ///
+    /// Commit is atomic and capacity-infallible only when the plan has the exact
+    /// reserved footprint.  A mismatch returns the complete plan and its
+    /// instance-bound token while retaining the invisible reservation for
+    /// explicit correction or cancellation.
+    pub fn commit_reservation(
+        &mut self,
+        token: ReservationToken,
+        plan: DeliveryPlan,
+    ) -> ReservationCommit {
+        if token.instance != self.instance {
+            increment(&mut self.counters.wrong_instance_reservations);
+            return ReservationCommit::WrongInstance { token, plan };
+        }
+        if self.closed {
+            return ReservationCommit::Closed { plan };
+        }
+        if token.generation != self.generation {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCommit::Stale { plan };
+        }
+        let Some(position) = self.queue.iter().position(|entry| {
+            matches!(
+                &entry.state,
+                CoordinatorEntryState::Reserved { token: queued } if queued == &token
+            )
+        }) else {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCommit::Stale { plan };
+        };
+        let footprint = match self.validate_plan(&plan) {
+            Ok(footprint) => footprint,
+            Err(reason) => {
+                increment(&mut self.counters.reservation_commit_rejections);
+                return ReservationCommit::Rejected {
+                    token,
+                    reason,
+                    plan,
+                };
+            }
+        };
+        if self.queue[position].footprint != footprint {
+            increment(&mut self.counters.reservation_commit_rejections);
+            return ReservationCommit::Rejected {
+                token,
+                reason: PlanRejectReason::FootprintMismatch,
+                plan,
+            };
+        }
+        let sequence = self.queue[position].sequence;
+        let epoch = self.queue[position].epoch;
+        self.queue[position].state = CoordinatorEntryState::Ready { plan };
+        increment(&mut self.counters.reservations_committed);
+        self.wake_waiter_if_claimable();
+        ReservationCommit::Committed { sequence, epoch }
+    }
+
+    /// Cancel an unpublished capacity reservation.
+    ///
+    /// A lifecycle reservation can roll its epoch back only while it is still
+    /// the causal tail.  Once later work has observed the successor epoch, the
+    /// reservation remains as a fail-closed fence until commit or generation
+    /// shutdown.
+    pub fn cancel_reservation(&mut self, token: ReservationToken) -> ReservationCancel {
+        if token.instance != self.instance {
+            increment(&mut self.counters.wrong_instance_reservations);
+            return ReservationCancel::WrongInstance { token };
+        }
+        if self.closed {
+            return ReservationCancel::GenerationClosed;
+        }
+        if token.generation != self.generation {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCancel::Stale;
+        }
+        let Some(position) = self.queue.iter().position(|entry| {
+            matches!(
+                &entry.state,
+                CoordinatorEntryState::Reserved { token: queued } if queued == &token
+            )
+        }) else {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCancel::Stale;
+        };
+        let reserved = &self.queue[position];
+        if reserved.footprint.barrier_count == 1 && position + 1 != self.queue.len() {
+            increment(&mut self.counters.reservation_cancel_rejections);
+            return ReservationCancel::CausalDependents { token };
+        }
+        let rolled_back_epoch = (reserved.footprint.barrier_count == 1).then_some(reserved.epoch);
+        let Some(_removed) = self.queue.remove(position) else {
+            unreachable!("located reservation remains present during exclusive cancellation")
+        };
+        if let Some(epoch) = rolled_back_epoch {
+            debug_assert_eq!(self.current_epoch, epoch + 1);
+            self.current_epoch = epoch;
+        }
+        increment(&mut self.counters.reservations_cancelled);
+        self.wake_waiter_if_claimable();
+        ReservationCancel::Cancelled
+    }
+
+    /// Claim the oldest causally eligible atomic plan.
+    ///
+    /// The plan remains charged and retained in-flight until ACK, retry, or
+    /// terminal NACK.  A reservation or earlier in-flight plan is an exact FIFO
+    /// fence and yields no claim.
+    pub fn claim_next(
+        &mut self,
+    ) -> Result<Option<CoordinatorDeliveryClaim>, CoordinatorClaimError> {
+        if self.closed {
+            return Ok(None);
+        }
+        let Some(front) = self.queue.front() else {
+            return Ok(None);
+        };
+        let CoordinatorEntryState::Ready { .. } = &front.state else {
+            return Ok(None);
+        };
+        let sequence = front.sequence;
+        let epoch = front.epoch;
+        let Some(attempt) = self.issue_attempt() else {
+            self.close_internal();
+            return Err(CoordinatorClaimError::TokenExhausted);
+        };
+        let token = CoordinatorClaimToken {
+            instance: self.instance.clone(),
+            generation: self.generation,
+            obligation_sequence: sequence,
+            attempt,
+        };
+        let front = self
+            .queue
+            .front_mut()
+            .expect("ready front remains present during token issuance");
+        let CoordinatorEntryState::Ready { plan } = &front.state else {
+            unreachable!("ready front cannot change during exclusive claim")
+        };
+        let retained_plan = plan.clone();
+        let prior_state = std::mem::replace(
+            &mut front.state,
+            CoordinatorEntryState::InFlight {
+                plan: retained_plan,
+                token: token.clone(),
+            },
+        );
+        let CoordinatorEntryState::Ready { plan: claimed_plan } = prior_state else {
+            unreachable!("exclusive claim replacement must recover the ready authority")
+        };
+        increment(&mut self.counters.claims);
+        Ok(Some(CoordinatorDeliveryClaim {
+            token,
+            epoch,
+            plan: claimed_plan,
+        }))
+    }
+
+    /// Poll without a check-then-park race.
+    ///
+    /// Admission, settlement, and this poll must use the same exclusive owner.
+    /// If no claim is eligible, registration occurs before that ownership can
+    /// be released; the next eligibility transition takes and wakes it.
+    pub fn poll_claim_next(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<CoordinatorDeliveryClaim>, CoordinatorClaimError>> {
+        match self.claim_next() {
+            Ok(None) if !self.closed => {
+                self.waiter = Some(cx.waker().clone());
+                increment(&mut self.counters.wake_registrations);
+                Poll::Pending
+            }
+            result => Poll::Ready(result),
+        }
+    }
+
+    pub fn acknowledge(&mut self, token: &CoordinatorClaimToken) -> CoordinatorSettleOutcome {
+        if token.instance != self.instance {
+            increment(&mut self.counters.wrong_instance_settlements);
+            return CoordinatorSettleOutcome::WrongInstance;
+        }
+        if self.closed {
+            return CoordinatorSettleOutcome::GenerationClosed;
+        }
+        if !self.front_claim_matches(token) {
+            increment(&mut self.counters.stale_settlements);
+            return CoordinatorSettleOutcome::StaleOrDuplicate;
+        }
+        let Some(_acknowledged) = self.queue.pop_front() else {
+            unreachable!("matching claim remains present during exclusive acknowledgement")
+        };
+        increment(&mut self.counters.acknowledgements);
+        self.wake_waiter_if_claimable();
+        CoordinatorSettleOutcome::Acknowledged
+    }
+
+    pub fn retry(&mut self, token: &CoordinatorClaimToken) -> CoordinatorSettleOutcome {
+        if token.instance != self.instance {
+            increment(&mut self.counters.wrong_instance_settlements);
+            return CoordinatorSettleOutcome::WrongInstance;
+        }
+        if self.closed {
+            return CoordinatorSettleOutcome::GenerationClosed;
+        }
+        if !self.front_claim_matches(token) {
+            increment(&mut self.counters.stale_settlements);
+            return CoordinatorSettleOutcome::StaleOrDuplicate;
+        }
+        let front = self
+            .queue
+            .front_mut()
+            .expect("matching claim requires a front entry");
+        let CoordinatorEntryState::InFlight { plan, .. } = &front.state else {
+            unreachable!("matching claim requires in-flight state")
+        };
+        let plan = plan.clone();
+        front.state = CoordinatorEntryState::Ready { plan };
+        increment(&mut self.counters.retries);
+        self.wake_waiter_if_claimable();
+        CoordinatorSettleOutcome::Retried
+    }
+
+    pub fn nack_terminal(&mut self, token: &CoordinatorClaimToken) -> CoordinatorSettleOutcome {
+        if token.instance != self.instance {
+            increment(&mut self.counters.wrong_instance_settlements);
+            return CoordinatorSettleOutcome::WrongInstance;
+        }
+        if self.closed {
+            return CoordinatorSettleOutcome::GenerationClosed;
+        }
+        if !self.front_claim_matches(token) {
+            increment(&mut self.counters.stale_settlements);
+            return CoordinatorSettleOutcome::StaleOrDuplicate;
+        }
+        increment(&mut self.counters.terminal_nacks);
+        self.close_internal();
+        CoordinatorSettleOutcome::FailedClosed
+    }
+
+    pub fn close(&mut self) -> CoordinatorCloseOutcome {
+        if self.closed {
+            return CoordinatorCloseOutcome::AlreadyClosed;
+        }
+        CoordinatorCloseOutcome::Closed(self.close_internal())
+    }
+
+    pub fn check_invariants(&self) -> Result<(), &'static str> {
+        let capacity = self.capacity();
+        if self.queue.len() > self.limits.pending_plans {
+            return Err("pending plan count exceeds configured limit");
+        }
+        if capacity.charged_slots > self.limits.total_slots {
+            return Err("charged slots exceed configured aggregate limit");
+        }
+        if capacity.charged_resident_bytes > self.limits.resident_bytes {
+            return Err("charged resident bytes exceed configured limit");
+        }
+        for lane in 0..HARDENED_DELIVERY_LANE_COUNT {
+            if capacity.lane_slots_used[lane] > self.limits.lane_slots[lane] {
+                return Err("authority lane exceeds configured slot limit");
+            }
+        }
+
+        let mut prior_sequence = None;
+        let mut prior_epoch = None;
+        let mut in_flight = 0usize;
+        for (position, entry) in self.queue.iter().enumerate() {
+            if prior_sequence.is_some_and(|prior| entry.sequence <= prior) {
+                return Err("ingress sequences are not strictly increasing");
+            }
+            if prior_epoch.is_some_and(|prior| entry.epoch < prior) {
+                return Err("causal epochs moved backwards");
+            }
+            prior_sequence = Some(entry.sequence);
+            prior_epoch = Some(entry.epoch);
+            match &entry.state {
+                CoordinatorEntryState::Reserved { token } => {
+                    if token.instance != self.instance
+                        || token.generation != self.generation
+                        || token.sequence != entry.sequence
+                    {
+                        return Err("reservation token does not identify its entry");
+                    }
+                }
+                CoordinatorEntryState::Ready { plan } => {
+                    if self.validate_plan(plan).ok() != Some(entry.footprint) {
+                        return Err("ready plan footprint or authority is invalid");
+                    }
+                }
+                CoordinatorEntryState::InFlight { plan, token } => {
+                    in_flight += 1;
+                    if position != 0 {
+                        return Err("only the causal head may be in flight");
+                    }
+                    if token.instance != self.instance
+                        || token.generation != self.generation
+                        || token.obligation_sequence != entry.sequence
+                    {
+                        return Err("claim token does not identify its entry");
+                    }
+                    if self.validate_plan(plan).ok() != Some(entry.footprint) {
+                        return Err("in-flight plan footprint or authority is invalid");
+                    }
+                }
+            }
+        }
+        if in_flight > 1 || in_flight != capacity.in_flight_plans {
+            return Err("in-flight accounting is inconsistent");
+        }
+        // The turbofish is load-bearing: under the GUI bundle build the
+        // feature-unified dep graph brings num_bigint/writeable Sum impls
+        // into candidacy and bare `.sum()` fails E0283 inference there,
+        // even though `cargo check -p` on this crate alone compiles.
+        if capacity.semantic_effects
+            != self
+                .queue
+                .iter()
+                .filter(|entry| !matches!(&entry.state, CoordinatorEntryState::Reserved { .. }))
+                .map(|entry| entry.footprint.semantic_effects)
+                .sum::<usize>()
+        {
+            return Err("semantic effect accounting is inconsistent");
+        }
+        if self.waiter.is_some()
+            && self
+                .queue
+                .front()
+                .is_some_and(|entry| matches!(&entry.state, CoordinatorEntryState::Ready { .. }))
+        {
+            return Err("registered waiter coexists with an eligible claim");
+        }
+        if self.closed && (!self.queue.is_empty() || self.waiter.is_some()) {
+            return Err("closed generation retains scheduler-owned authority");
+        }
+        Ok(())
+    }
+
+    fn validate_plan(&self, plan: &DeliveryPlan) -> Result<PlanFootprint, PlanRejectReason> {
+        if plan.effects.len() > self.limits.max_effects_per_plan {
+            return Err(PlanRejectReason::TooManyEffects);
+        }
+        let footprint = plan.footprint().ok_or(PlanRejectReason::ResidentBytes)?;
+        if footprint.barrier_count > 1 {
+            return Err(PlanRejectReason::MultipleBarriers);
+        }
+        if footprint.barrier_count == 1 && footprint.semantic_effects != 1 {
+            return Err(PlanRejectReason::BarrierMustBeIsolated);
+        }
+        for (index, effect) in plan.effects.iter().enumerate() {
+            if effect.generation() != self.generation {
+                return Err(PlanRejectReason::WrongGeneration);
+            }
+            if effect.retained_bytes() > self.limits.max_effect_resident_bytes {
+                return Err(PlanRejectReason::EffectTooLarge);
+            }
+            if let PlannedEffect::RenderAuthority {
+                key: render_key,
+                telemetry_through: Some(fence),
+                ..
+            } = effect
+            {
+                if fence.accumulator().generation() != self.generation {
+                    return Err(PlanRejectReason::WrongGeneration);
+                }
+                let matching_fold =
+                    plan.effects
+                        .iter()
+                        .enumerate()
+                        .find_map(|(fold_position, candidate)| match candidate {
+                            PlannedEffect::TelemetryFold {
+                                key,
+                                accumulator,
+                                through_version,
+                                ..
+                            } if *accumulator == fence.accumulator()
+                                && *through_version >= fence.through_version() =>
+                            {
+                                Some((fold_position, key))
+                            }
+                            _ => None,
+                        });
+                let dependency_is_ordered = matching_fold.map_or_else(
+                    || fence.accumulator().version() >= fence.through_version(),
+                    |(fold_position, fold_key)| fold_key == render_key && fold_position < index,
+                );
+                if !dependency_is_ordered {
+                    return Err(PlanRejectReason::TelemetryDependencyOrder);
+                }
+            }
+            if let PlannedEffect::TelemetryFold {
+                accumulator,
+                through_version,
+                ..
+            } = effect
+                && accumulator.version() < *through_version
+            {
+                return Err(PlanRejectReason::TelemetryDependencyOrder);
+            }
+        }
+        Ok(footprint)
+    }
+
+    fn preflight(&self, footprint: PlanFootprint) -> Result<(), PlanRejectReason> {
+        let capacity = self.capacity();
+        if self.queue.len() >= self.limits.pending_plans {
+            return Err(PlanRejectReason::Capacity);
+        }
+        let footprint_slots = footprint.total_slots().ok_or(PlanRejectReason::Capacity)?;
+        if capacity
+            .charged_slots
+            .checked_add(footprint_slots)
+            .is_none_or(|total| total > self.limits.total_slots)
+        {
+            return Err(PlanRejectReason::Capacity);
+        }
+        if capacity
+            .charged_resident_bytes
+            .checked_add(footprint.resident_bytes)
+            .is_none_or(|total| total > self.limits.resident_bytes)
+        {
+            return Err(PlanRejectReason::ResidentBytes);
+        }
+        for lane in 0..HARDENED_DELIVERY_LANE_COUNT {
+            if capacity.lane_slots_used[lane]
+                .checked_add(footprint.lane_slots[lane])
+                .is_none_or(|total| total > self.limits.lane_slots[lane])
+            {
+                return Err(PlanRejectReason::Capacity);
+            }
+        }
+        Ok(())
+    }
+
+    fn front_claim_matches(&self, token: &CoordinatorClaimToken) -> bool {
+        if token.generation != self.generation {
+            return false;
+        }
+        self.queue.front().is_some_and(|front| {
+            matches!(
+                &front.state,
+                CoordinatorEntryState::InFlight { token: current, .. } if current == token
+            )
+        })
+    }
+
+    fn issue_sequence(&mut self) -> Option<u64> {
+        let sequence = self.next_sequence?;
+        self.next_sequence = sequence.checked_add(1);
+        Some(sequence)
+    }
+
+    fn issue_attempt(&mut self) -> Option<u64> {
+        let attempt = self.next_attempt?;
+        self.next_attempt = attempt.checked_add(1);
+        Some(attempt)
+    }
+
+    fn close_internal(&mut self) -> CoordinatorCloseReport {
+        if self.closed {
+            return self.last_close_report.unwrap_or_default();
+        }
+        let capacity = self.capacity();
+        let waiter = self.waiter.take();
+        let report = CoordinatorCloseReport {
+            reserved_plans: capacity.reserved_plans,
+            ready_plans: capacity.ready_plans,
+            in_flight_plans: capacity.in_flight_plans,
+            semantic_effects: capacity.semantic_effects,
+            charged_slots: capacity.charged_slots,
+            charged_resident_bytes: capacity.charged_resident_bytes,
+        };
+        self.queue.clear();
+        self.closed = true;
+        self.last_close_report = Some(report);
+        increment(&mut self.counters.closes);
+        add_usize(
+            &mut self.counters.closed_semantic_effects,
+            report.semantic_effects,
+        );
+        add_usize(
+            &mut self.counters.closed_charged_slots,
+            report.charged_slots,
+        );
+        add_usize(
+            &mut self.counters.closed_resident_bytes,
+            report.charged_resident_bytes,
+        );
+        if let Some(waiter) = waiter {
+            increment(&mut self.counters.wake_deliveries);
+            waiter.wake();
+        }
+        report
+    }
+
+    fn wake_waiter(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            increment(&mut self.counters.wake_deliveries);
+            waiter.wake();
+        }
+    }
+
+    fn wake_waiter_if_claimable(&mut self) {
+        if self
+            .queue
+            .front()
+            .is_some_and(|entry| matches!(&entry.state, CoordinatorEntryState::Ready { .. }))
+        {
+            self.wake_waiter();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_next_attempt_for_test(&mut self, next: Option<u64>) {
+        self.next_attempt = next;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,6 +2659,1602 @@ mod tests {
                 prop_assert!(capacity.wake.used <= 1);
                 prop_assert_eq!(scheduler.check_invariants(), Ok(()));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod hardened_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Wake;
+
+    const GENERATION: SchedulerGeneration = SchedulerGeneration::new(41);
+
+    fn broad_limits() -> HardenedSchedulerLimits {
+        HardenedSchedulerLimits::new([16; HARDENED_DELIVERY_LANE_COUNT], 64, 4096, 8, 1024, 64)
+            .expect("broad test limits are representable")
+    }
+
+    fn coordinator() -> DeliveryCoordinator {
+        DeliveryCoordinator::new(GENERATION, broad_limits())
+    }
+
+    fn handle(id: u64, version: u64) -> AuthorityHandle {
+        AuthorityHandle::new(GENERATION, id, version)
+    }
+
+    fn plan_resident_bytes(effect_count: usize, additional_retained_bytes: usize) -> usize {
+        std::mem::size_of::<CoordinatorEntry>()
+            + 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<PlannedEffect>() * effect_count
+            + additional_retained_bytes
+    }
+
+    fn event_plan(id: u64, retained_bytes: usize) -> DeliveryPlan {
+        DeliveryPlan::new(vec![PlannedEffect::EventJournal {
+            journal: handle(id, 1),
+            retained_bytes,
+        }])
+        .expect("single event is a valid plan")
+    }
+
+    fn state_plan(id: u64) -> DeliveryPlan {
+        DeliveryPlan::new(vec![PlannedEffect::StateAuthority {
+            key: StableEffectKey::new(id, 1),
+            authority: handle(1000 + id, 1),
+            retained_bytes: 1,
+        }])
+        .expect("single state authority is a valid plan")
+    }
+
+    fn barrier_plan(id: u64) -> DeliveryPlan {
+        DeliveryPlan::new(vec![PlannedEffect::LifecycleBarrier {
+            scope: BarrierScope::Global,
+            journal: handle(2000 + id, 1),
+            retained_bytes: 1,
+        }])
+        .expect("single barrier is a valid plan")
+    }
+
+    fn plan_for_lane(lane: AuthorityLane, id: u64) -> DeliveryPlan {
+        match lane {
+            AuthorityLane::Event => event_plan(id, 1),
+            AuthorityLane::Lifecycle => barrier_plan(id),
+            _ => panic!("test oracle only models event and lifecycle lanes"),
+        }
+    }
+
+    fn wrong_generation_plan(lane: AuthorityLane, id: u64) -> DeliveryPlan {
+        let wrong_generation = SchedulerGeneration::new(GENERATION.get() + 1);
+        let effect = match lane {
+            AuthorityLane::Event => PlannedEffect::EventJournal {
+                journal: AuthorityHandle::new(wrong_generation, id, 1),
+                retained_bytes: 1,
+            },
+            AuthorityLane::Lifecycle => PlannedEffect::LifecycleBarrier {
+                scope: BarrierScope::Global,
+                journal: AuthorityHandle::new(wrong_generation, id, 1),
+                retained_bytes: 1,
+            },
+            _ => panic!("test oracle only models event and lifecycle lanes"),
+        };
+        DeliveryPlan::new(vec![effect]).expect("wrong generation does not invalidate plan shape")
+    }
+
+    fn render_plan(id: u64) -> DeliveryPlan {
+        DeliveryPlan::new(vec![PlannedEffect::RenderAuthority {
+            key: StableEffectKey::new(id, 1),
+            claim: ExternalRenderAuthority::new(GENERATION, 7, id, 1),
+            telemetry_through: None,
+            retained_bytes: 1,
+        }])
+        .expect("external render claim is a valid plan")
+    }
+
+    fn claim(coordinator: &mut DeliveryCoordinator) -> CoordinatorDeliveryClaim {
+        coordinator
+            .claim_next()
+            .expect("test token space is available")
+            .expect("expected an eligible plan")
+    }
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn claim_retains_authority_until_ack_and_retry_uses_a_new_attempt() {
+        let mut coordinator = coordinator();
+        assert!(matches!(
+            coordinator.admit_plan(event_plan(1, 4)),
+            PlanAdmission::Admitted {
+                sequence: 1,
+                epoch: 0
+            }
+        ));
+        let first = claim(&mut coordinator);
+        assert_eq!(
+            coordinator.capacity(),
+            HardenedCapacity {
+                lane_slots_used: [0, 0, 0, 0, 0, 1, 0, 0],
+                charged_slots: 1,
+                charged_resident_bytes: plan_resident_bytes(1, 4),
+                semantic_effects: 1,
+                in_flight_plans: 1,
+                ..HardenedCapacity::default()
+            }
+        );
+        assert_eq!(
+            coordinator.retry(first.token()),
+            CoordinatorSettleOutcome::Retried
+        );
+        let second = claim(&mut coordinator);
+        assert_ne!(first.token().attempt(), second.token().attempt());
+        assert_eq!(
+            coordinator.acknowledge(first.token()),
+            CoordinatorSettleOutcome::StaleOrDuplicate,
+            "late ACK from attempt one must not settle attempt two"
+        );
+        assert_eq!(coordinator.capacity().in_flight_plans, 1);
+        assert_eq!(
+            coordinator.acknowledge(second.token()),
+            CoordinatorSettleOutcome::Acknowledged
+        );
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+        assert_eq!(
+            coordinator.counters(),
+            HardenedCounters {
+                plans_admitted: 1,
+                claims: 2,
+                acknowledgements: 1,
+                retries: 1,
+                stale_settlements: 1,
+                ..HardenedCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_barrier_cannot_overtake_older_state_or_be_overtaken() {
+        let mut coordinator = coordinator();
+        assert!(matches!(
+            coordinator.admit_plan(state_plan(1)),
+            PlanAdmission::Admitted {
+                sequence: 1,
+                epoch: 0
+            }
+        ));
+        assert!(matches!(
+            coordinator.admit_plan(barrier_plan(2)),
+            PlanAdmission::Admitted {
+                sequence: 2,
+                epoch: 0
+            }
+        ));
+        assert!(matches!(
+            coordinator.admit_plan(state_plan(3)),
+            PlanAdmission::Admitted {
+                sequence: 3,
+                epoch: 1
+            }
+        ));
+
+        for (sequence, epoch) in [(1, 0), (2, 0), (3, 1)] {
+            let next = claim(&mut coordinator);
+            assert_eq!((next.sequence(), next.epoch()), (sequence, epoch));
+            assert_eq!(
+                coordinator.acknowledge(next.token()),
+                CoordinatorSettleOutcome::Acknowledged
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_barrier_must_be_an_epoch_isolated_plan() {
+        let mixed = DeliveryPlan::new(vec![
+            PlannedEffect::LifecycleBarrier {
+                scope: BarrierScope::Global,
+                journal: handle(1, 1),
+                retained_bytes: 1,
+            },
+            PlannedEffect::StateAuthority {
+                key: StableEffectKey::new(2, 1),
+                authority: handle(2, 1),
+                retained_bytes: 1,
+            },
+        ])
+        .expect("the plan builder checks shape overflow, not scheduler causality");
+        let mut coordinator = coordinator();
+        assert!(matches!(
+            coordinator.admit_plan(mixed),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::BarrierMustBeIsolated,
+                ..
+            }
+        ));
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+    }
+
+    #[test]
+    fn invisible_reservation_charges_capacity_and_fences_later_work() {
+        let mut coordinator = coordinator();
+        let barrier = barrier_plan(1);
+        let token = match coordinator.reserve_plan(&barrier) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        assert_eq!(coordinator.capacity().reserved_plans, 1);
+        assert_eq!(coordinator.capacity().semantic_effects, 0);
+        assert!(matches!(
+            coordinator.admit_plan(state_plan(2)),
+            PlanAdmission::Admitted {
+                sequence: 2,
+                epoch: 1
+            }
+        ));
+        assert_eq!(
+            coordinator.claim_next(),
+            Ok(None),
+            "later visible state must not pass an invisible reservation"
+        );
+        assert!(matches!(
+            coordinator.commit_reservation(token, barrier),
+            ReservationCommit::Committed {
+                sequence: 1,
+                epoch: 0
+            }
+        ));
+        let first = claim(&mut coordinator);
+        assert_eq!(first.sequence(), 1);
+        coordinator.acknowledge(first.token());
+        assert_eq!(claim(&mut coordinator).sequence(), 2);
+    }
+
+    #[test]
+    fn lifecycle_reservation_cancellation_preserves_epoch_truth() {
+        let mut coordinator_under_test = coordinator();
+        let barrier = barrier_plan(1);
+        let token = match coordinator_under_test.reserve_plan(&barrier) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        assert!(matches!(
+            coordinator_under_test.admit_plan(state_plan(2)),
+            PlanAdmission::Admitted {
+                sequence: 2,
+                epoch: 1
+            }
+        ));
+        let before = coordinator_under_test.capacity();
+        assert!(matches!(
+            coordinator_under_test.cancel_reservation(token),
+            ReservationCancel::CausalDependents { .. }
+        ));
+        assert_eq!(coordinator_under_test.capacity(), before);
+        assert_eq!(
+            coordinator_under_test
+                .counters()
+                .reservation_cancel_rejections,
+            1
+        );
+
+        let mut tail = coordinator();
+        let tail_barrier = barrier_plan(3);
+        let tail_token = match tail.reserve_plan(&tail_barrier) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected tail reservation, got {other:?}"),
+        };
+        assert_eq!(
+            tail.cancel_reservation(tail_token),
+            ReservationCancel::Cancelled
+        );
+        assert!(matches!(
+            tail.admit_plan(state_plan(4)),
+            PlanAdmission::Admitted {
+                sequence: 2,
+                epoch: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn reservation_rejection_and_mismatch_never_partially_publish() {
+        let limits = HardenedSchedulerLimits::new(
+            [1; HARDENED_DELIVERY_LANE_COUNT],
+            1,
+            plan_resident_bytes(1, 1),
+            2,
+            8,
+            1,
+        )
+        .expect("one-slot limits are valid");
+        let mut coordinator = DeliveryCoordinator::new(GENERATION, limits);
+        let first = barrier_plan(1);
+        let token = match coordinator.reserve_plan(&first) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected first reservation, got {other:?}"),
+        };
+        let before = coordinator.capacity();
+        assert_eq!(
+            coordinator.reserve_plan(&barrier_plan(2)),
+            ReservationAdmission::Rejected(PlanRejectReason::Capacity)
+        );
+        assert_eq!(coordinator.capacity(), before);
+
+        let mismatched = event_plan(10, 1);
+        let returned_token = match coordinator.commit_reservation(token, mismatched) {
+            ReservationCommit::Rejected {
+                token,
+                reason: PlanRejectReason::FootprintMismatch,
+                ..
+            } => token,
+            other => panic!("expected footprint rejection, got {other:?}"),
+        };
+        assert_eq!(coordinator.capacity(), before);
+        assert_eq!(
+            coordinator.cancel_reservation(returned_token),
+            ReservationCancel::Cancelled
+        );
+    }
+
+    #[test]
+    fn reservation_tokens_are_generation_bound_and_single_use() {
+        let mut coordinator = coordinator();
+        let shape = event_plan(1, 1);
+        let token = match coordinator.reserve_plan(&shape) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        assert!(matches!(
+            coordinator.commit_reservation(token.clone(), event_plan(2, 1)),
+            ReservationCommit::Committed {
+                sequence: 1,
+                epoch: 0
+            }
+        ));
+        assert!(matches!(
+            coordinator.commit_reservation(token.clone(), event_plan(3, 1)),
+            ReservationCommit::Stale { .. }
+        ));
+        let invalid_replay = DeliveryPlan::new(vec![PlannedEffect::EventJournal {
+            journal: AuthorityHandle::new(SchedulerGeneration::new(99), 9, 1),
+            retained_bytes: 1,
+        }])
+        .expect("generation validation belongs to the coordinator");
+        assert!(matches!(
+            coordinator.commit_reservation(token.clone(), invalid_replay),
+            ReservationCommit::Stale { .. }
+        ));
+        assert_eq!(
+            coordinator.cancel_reservation(token.clone()),
+            ReservationCancel::Stale
+        );
+
+        let mut next_instance = DeliveryCoordinator::new(GENERATION, broad_limits());
+        let replacement_token = match next_instance.reserve_plan(&event_plan(4, 1)) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected replacement reservation, got {other:?}"),
+        };
+        let live_origin_token = match coordinator.reserve_plan(&event_plan(40, 1)) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected live origin reservation, got {other:?}"),
+        };
+        let live_origin_token =
+            match next_instance.commit_reservation(live_origin_token, event_plan(41, 1)) {
+                ReservationCommit::WrongInstance { token, .. } => token,
+                other => panic!("expected recoverable wrong-instance routing, got {other:?}"),
+            };
+        assert!(matches!(
+            coordinator.commit_reservation(live_origin_token, event_plan(42, 1)),
+            ReservationCommit::Committed {
+                sequence: 2,
+                epoch: 0
+            }
+        ));
+        let returned = match next_instance.commit_reservation(token.clone(), event_plan(5, 1)) {
+            ReservationCommit::WrongInstance { token, .. } => token,
+            other => panic!("expected wrong-instance commit rejection, got {other:?}"),
+        };
+        assert_eq!(returned, token);
+        let returned = match next_instance.cancel_reservation(token.clone()) {
+            ReservationCancel::WrongInstance { token } => token,
+            other => panic!("expected wrong-instance cancellation rejection, got {other:?}"),
+        };
+        assert_eq!(returned, token);
+        assert!(matches!(
+            next_instance.commit_reservation(replacement_token, event_plan(6, 1)),
+            ReservationCommit::Committed {
+                sequence: 1,
+                epoch: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn multi_effect_plan_is_all_or_nothing_across_lane_capacity() {
+        let limits = HardenedSchedulerLimits::new(
+            [1, 1, 1, 1, 1, 0, 1, 1],
+            7,
+            plan_resident_bytes(2, 2),
+            4,
+            16,
+            8,
+        )
+        .expect("lane-specific limits are valid");
+        let mut coordinator = DeliveryCoordinator::new(GENERATION, limits);
+        let plan = DeliveryPlan::new(vec![
+            PlannedEffect::StateAuthority {
+                key: StableEffectKey::new(1, 1),
+                authority: handle(1, 1),
+                retained_bytes: 1,
+            },
+            PlannedEffect::EventJournal {
+                journal: handle(2, 1),
+                retained_bytes: 1,
+            },
+        ])
+        .expect("state plus event is structurally valid");
+        assert!(matches!(
+            coordinator.admit_plan(plan),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::Capacity,
+                ..
+            }
+        ));
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+    }
+
+    #[test]
+    fn telemetry_fold_must_precede_dependent_render_in_the_atomic_plan() {
+        let accumulator = handle(70, 5);
+        let render = PlannedEffect::RenderAuthority {
+            key: StableEffectKey::new(7, 1),
+            claim: ExternalRenderAuthority::new(GENERATION, 1, 7, 8),
+            telemetry_through: Some(TelemetryFence::new(accumulator, 5)),
+            retained_bytes: 1,
+        };
+        let fold = PlannedEffect::TelemetryFold {
+            key: StableEffectKey::new(7, 1),
+            accumulator,
+            through_version: 5,
+            retained_bytes: 1,
+        };
+        let mut coordinator = coordinator();
+        let reversed = DeliveryPlan::new(vec![render.clone(), fold.clone()])
+            .expect("reversed plan is structurally representable");
+        assert!(matches!(
+            coordinator.admit_plan(reversed),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::TelemetryDependencyOrder,
+                ..
+            }
+        ));
+        let wrong_scope = DeliveryPlan::new(vec![
+            PlannedEffect::TelemetryFold {
+                key: StableEffectKey::new(8, 1),
+                accumulator,
+                through_version: 5,
+                retained_bytes: 1,
+            },
+            render.clone(),
+        ])
+        .expect("cross-scope telemetry is structurally representable");
+        assert!(matches!(
+            coordinator.admit_plan(wrong_scope),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::TelemetryDependencyOrder,
+                ..
+            }
+        ));
+        let ordered =
+            DeliveryPlan::new(vec![fold, render]).expect("ordered telemetry plan is valid");
+        assert!(matches!(
+            coordinator.admit_plan(ordered),
+            PlanAdmission::Admitted { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_resident_byte_budget_bounds_large_external_commands() {
+        let resident_limit = plan_resident_bytes(1, 4);
+        assert!(
+            resident_limit > 4,
+            "the byte charge includes structural storage, not just caller metadata"
+        );
+        let limits = HardenedSchedulerLimits::new(
+            [2; HARDENED_DELIVERY_LANE_COUNT],
+            16,
+            resident_limit,
+            2,
+            4,
+            4,
+        )
+        .expect("byte test limits are valid");
+        let mut coordinator = DeliveryCoordinator::new(GENERATION, limits);
+        let spooled = DeliveryPlan::new(vec![PlannedEffect::Spool {
+            spool: handle(1, 1),
+            payload_bytes: u64::MAX,
+            retained_bytes: 4,
+        }])
+        .expect("external payload size does not enlarge the scheduler handle");
+        assert!(matches!(
+            coordinator.admit_plan(spooled),
+            PlanAdmission::Admitted { .. }
+        ));
+        assert_eq!(
+            coordinator.capacity().charged_resident_bytes,
+            resident_limit
+        );
+
+        let too_large = DeliveryPlan::new(vec![PlannedEffect::Spool {
+            spool: handle(2, 1),
+            payload_bytes: 1,
+            retained_bytes: 5,
+        }])
+        .expect("plan builder does not own scheduler-specific byte policy");
+        assert!(matches!(
+            coordinator.admit_plan(too_large),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::EffectTooLarge,
+                ..
+            }
+        ));
+        assert!(matches!(
+            coordinator.admit_plan(event_plan(3, 1)),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::ResidentBytes,
+                ..
+            }
+        ));
+        assert_eq!(
+            coordinator.capacity().charged_resident_bytes,
+            resident_limit
+        );
+    }
+
+    #[test]
+    fn render_claims_remain_distinct_external_ledger_authorities() {
+        let mut coordinator = coordinator();
+        coordinator.admit_plan(render_plan(1));
+        let successor = DeliveryPlan::new(vec![PlannedEffect::RenderAuthority {
+            key: StableEffectKey::new(1, 1),
+            claim: ExternalRenderAuthority::new(GENERATION, 7, 2, 2),
+            telemetry_through: None,
+            retained_bytes: 1,
+        }])
+        .expect("second external render claim is valid");
+        coordinator.admit_plan(successor);
+        assert_eq!(
+            coordinator.capacity().lane_slots_used[AuthorityLane::Render.index()],
+            2
+        );
+        let first = claim(&mut coordinator);
+        coordinator.acknowledge(first.token());
+        let second = claim(&mut coordinator);
+        assert_ne!(
+            first.plan().effects(),
+            second.plan().effects(),
+            "external ledger claims are never replaced by scheduler key coalescing"
+        );
+    }
+
+    #[test]
+    fn atomic_poll_registration_wakes_on_admission_and_terminal_close() {
+        let mut coordinator = coordinator();
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(coordinator.poll_claim_next(&mut context), Poll::Pending);
+        assert_eq!(
+            coordinator.claim_next(),
+            Ok(None),
+            "an empty direct probe must not erase a registered waiter"
+        );
+        coordinator.admit_plan(event_plan(1, 1));
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+        let in_flight = match coordinator.poll_claim_next(&mut context) {
+            Poll::Ready(Ok(Some(claim))) => claim,
+            other => panic!("expected ready claim, got {other:?}"),
+        };
+        assert_eq!(coordinator.poll_claim_next(&mut context), Poll::Pending);
+        assert_eq!(
+            coordinator.nack_terminal(in_flight.token()),
+            CoordinatorSettleOutcome::FailedClosed
+        );
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            2,
+            "terminal closure must wake a consumer parked behind in-flight work"
+        );
+    }
+
+    #[test]
+    fn waiter_wakes_only_when_the_causal_head_becomes_claimable() {
+        let mut coordinator = coordinator();
+        let reserved = event_plan(1, 1);
+        let token = match coordinator.reserve_plan(&reserved) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected head reservation, got {other:?}"),
+        };
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(coordinator.poll_claim_next(&mut context), Poll::Pending);
+        coordinator.admit_plan(event_plan(2, 1));
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "successor admission behind a reservation is not claimable"
+        );
+        assert!(matches!(
+            coordinator.commit_reservation(token, reserved),
+            ReservationCommit::Committed { .. }
+        ));
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+
+        let first = claim(&mut coordinator);
+        assert_eq!(coordinator.poll_claim_next(&mut context), Poll::Pending);
+        assert_eq!(
+            coordinator.acknowledge(first.token()),
+            CoordinatorSettleOutcome::Acknowledged
+        );
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 2);
+
+        let second = claim(&mut coordinator);
+        assert_eq!(coordinator.poll_claim_next(&mut context), Poll::Pending);
+        assert_eq!(
+            coordinator.acknowledge(second.token()),
+            CoordinatorSettleOutcome::Acknowledged
+        );
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            2,
+            "settlement to an empty queue preserves the waiter without a wake"
+        );
+        coordinator.admit_plan(event_plan(3, 1));
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            3,
+            "the preserved waiter observes the next claimable admission"
+        );
+    }
+
+    #[test]
+    fn close_report_separates_reserved_slots_from_semantic_effects() {
+        let mut coordinator = coordinator();
+        let reserved = event_plan(1, 3);
+        let _token = match coordinator.reserve_plan(&reserved) {
+            ReservationAdmission::Reserved(token) => token,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        let semantic = DeliveryPlan::new(vec![
+            PlannedEffect::StateAuthority {
+                key: StableEffectKey::new(2, 1),
+                authority: handle(2, 1),
+                retained_bytes: 5,
+            },
+            PlannedEffect::EventJournal {
+                journal: handle(3, 1),
+                retained_bytes: 7,
+            },
+        ])
+        .expect("two-effect plan is valid");
+        coordinator.admit_plan(semantic);
+        assert_eq!(
+            coordinator.close(),
+            CoordinatorCloseOutcome::Closed(CoordinatorCloseReport {
+                reserved_plans: 1,
+                ready_plans: 1,
+                in_flight_plans: 0,
+                semantic_effects: 2,
+                charged_slots: 3,
+                charged_resident_bytes: plan_resident_bytes(1, 3) + plan_resident_bytes(2, 12),
+            })
+        );
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+        assert_eq!(coordinator.counters().closed_semantic_effects, 2);
+        assert_eq!(coordinator.counters().closed_charged_slots, 3);
+    }
+
+    #[test]
+    fn wrong_generation_authority_and_stale_claim_fail_closed_or_reject() {
+        let mut coordinator = coordinator();
+        let wrong = DeliveryPlan::new(vec![PlannedEffect::EventJournal {
+            journal: AuthorityHandle::new(SchedulerGeneration::new(99), 1, 1),
+            retained_bytes: 1,
+        }])
+        .expect("wrong generation is scheduler validation, not plan shape");
+        assert!(matches!(
+            coordinator.admit_plan(wrong),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::WrongGeneration,
+                ..
+            }
+        ));
+
+        coordinator.admit_plan(event_plan(2, 1));
+        let old = claim(&mut coordinator);
+        let mut replacement = DeliveryCoordinator::new(GENERATION, broad_limits());
+        replacement.admit_plan(event_plan(3, 1));
+        let current = claim(&mut replacement);
+        assert_eq!(
+            replacement.acknowledge(old.token()),
+            CoordinatorSettleOutcome::WrongInstance
+        );
+        assert_eq!(
+            replacement.acknowledge(current.token()),
+            CoordinatorSettleOutcome::Acknowledged
+        );
+        assert!(!replacement.is_closed());
+    }
+
+    #[test]
+    fn attempt_token_exhaustion_closes_without_false_acknowledgement() {
+        let mut coordinator = coordinator();
+        coordinator.set_next_attempt_for_test(None);
+        coordinator.admit_plan(event_plan(1, 1));
+        assert_eq!(
+            coordinator.claim_next(),
+            Err(CoordinatorClaimError::TokenExhausted)
+        );
+        assert!(coordinator.is_closed());
+        assert_eq!(
+            coordinator.last_close_report(),
+            Some(CoordinatorCloseReport {
+                ready_plans: 1,
+                semantic_effects: 1,
+                charged_slots: 1,
+                charged_resident_bytes: plan_resident_bytes(1, 1),
+                ..CoordinatorCloseReport::default()
+            })
+        );
+    }
+
+    #[test]
+    fn closed_effect_enum_charges_every_authority_lane_exactly_once() {
+        let barrier = DeliveryPlan::new(vec![PlannedEffect::LifecycleBarrier {
+            scope: BarrierScope::Key(StableEffectKey::new(1, 1)),
+            journal: handle(1, 1),
+            retained_bytes: 1,
+        }])
+        .expect("isolated lifecycle authority is valid");
+        let remaining_lanes = DeliveryPlan::new(vec![
+            PlannedEffect::StateResync {
+                authority: ResyncAuthority::new(handle(2, 2), 20),
+                retained_bytes: 2,
+            },
+            PlannedEffect::RenderResync {
+                authority: ExternalRenderAuthority::new(GENERATION, 3, 30, 30),
+                retained_bytes: 3,
+            },
+            PlannedEffect::TopologyResync {
+                authority: ResyncAuthority::new(handle(4, 4), 40),
+                retained_bytes: 4,
+            },
+            PlannedEffect::AuxiliaryResync {
+                authority: ResyncAuthority::new(handle(5, 5), 50),
+                retained_bytes: 5,
+            },
+            PlannedEffect::EventJournal {
+                journal: handle(6, 6),
+                retained_bytes: 6,
+            },
+            PlannedEffect::TelemetryFold {
+                key: StableEffectKey::new(7, 1),
+                accumulator: handle(7, 7),
+                through_version: 7,
+                retained_bytes: 7,
+            },
+            PlannedEffect::Spool {
+                spool: handle(8, 8),
+                payload_bytes: 8_000_000,
+                retained_bytes: 8,
+            },
+        ])
+        .expect("one authority per non-lifecycle lane is a valid plan");
+        let mut coordinator = coordinator();
+        assert!(matches!(
+            coordinator.admit_plan(barrier),
+            PlanAdmission::Admitted { .. }
+        ));
+        assert!(matches!(
+            coordinator.admit_plan(remaining_lanes),
+            PlanAdmission::Admitted { .. }
+        ));
+        assert_eq!(
+            coordinator.capacity(),
+            HardenedCapacity {
+                lane_slots_used: [1; HARDENED_DELIVERY_LANE_COUNT],
+                charged_slots: HARDENED_DELIVERY_LANE_COUNT,
+                charged_resident_bytes: plan_resident_bytes(1, 1) + plan_resident_bytes(7, 35),
+                semantic_effects: HARDENED_DELIVERY_LANE_COUNT,
+                ready_plans: 2,
+                ..HardenedCapacity::default()
+            }
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReferenceState {
+        Reserved,
+        Ready,
+        InFlight { attempt: u64 },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReferenceCancel {
+        Cancelled,
+        CausalDependents,
+        Stale,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ReferenceEntry {
+        sequence: u64,
+        epoch: u64,
+        lane: AuthorityLane,
+        state: ReferenceState,
+    }
+
+    #[derive(Debug, Default)]
+    struct ReferenceCounters {
+        plans_admitted: u64,
+        plans_rejected: u64,
+        reservations_admitted: u64,
+        reservations_rejected: u64,
+        reservations_committed: u64,
+        reservations_cancelled: u64,
+        reservation_cancel_rejections: u64,
+        reservation_commit_rejections: u64,
+        stale_reservations: u64,
+        claims: u64,
+        acknowledgements: u64,
+        retries: u64,
+        terminal_nacks: u64,
+        stale_settlements: u64,
+        closes: u64,
+        closed_semantic_effects: u64,
+        closed_charged_slots: u64,
+        closed_resident_bytes: u64,
+    }
+
+    #[derive(Debug)]
+    struct ReferenceCoordinator {
+        queue: VecDeque<ReferenceEntry>,
+        next_sequence: u64,
+        next_attempt: u64,
+        epoch: u64,
+        closed: bool,
+        counters: ReferenceCounters,
+        event_limit: usize,
+        lifecycle_limit: usize,
+        total_limit: usize,
+        resident_bytes_per_plan: usize,
+    }
+
+    fn reference_increment(value: &mut u64) {
+        *value = value.saturating_add(1);
+    }
+
+    fn reference_add_usize(value: &mut u64, addend: usize) {
+        *value = value.saturating_add(u64::try_from(addend).unwrap_or(u64::MAX));
+    }
+
+    impl ReferenceCoordinator {
+        fn new(
+            event_limit: usize,
+            lifecycle_limit: usize,
+            total_limit: usize,
+            resident_bytes_per_plan: usize,
+        ) -> Self {
+            Self {
+                queue: VecDeque::new(),
+                next_sequence: 1,
+                next_attempt: 1,
+                epoch: 0,
+                closed: false,
+                counters: ReferenceCounters::default(),
+                event_limit,
+                lifecycle_limit,
+                total_limit,
+                resident_bytes_per_plan,
+            }
+        }
+
+        fn lane_count(&self, lane: AuthorityLane) -> usize {
+            self.queue.iter().filter(|entry| entry.lane == lane).count()
+        }
+
+        fn has_capacity(&self, lane: AuthorityLane) -> bool {
+            let lane_limit = match lane {
+                AuthorityLane::Lifecycle => self.lifecycle_limit,
+                AuthorityLane::Event => self.event_limit,
+                _ => 0,
+            };
+            self.queue.len() < self.total_limit && self.lane_count(lane) < lane_limit
+        }
+
+        fn admit(&mut self, lane: AuthorityLane) -> Option<(u64, u64)> {
+            if self.closed {
+                return None;
+            }
+            if !self.has_capacity(lane) {
+                reference_increment(&mut self.counters.plans_rejected);
+                return None;
+            }
+            let sequence = self.next_sequence;
+            self.next_sequence += 1;
+            let epoch = self.epoch;
+            self.queue.push_back(ReferenceEntry {
+                sequence,
+                epoch,
+                lane,
+                state: ReferenceState::Ready,
+            });
+            if lane == AuthorityLane::Lifecycle {
+                self.epoch += 1;
+            }
+            reference_increment(&mut self.counters.plans_admitted);
+            Some((sequence, epoch))
+        }
+
+        fn reserve(&mut self, lane: AuthorityLane) -> Option<(u64, u64)> {
+            if self.closed {
+                return None;
+            }
+            if !self.has_capacity(lane) {
+                reference_increment(&mut self.counters.reservations_rejected);
+                return None;
+            }
+            let sequence = self.next_sequence;
+            self.next_sequence += 1;
+            let epoch = self.epoch;
+            self.queue.push_back(ReferenceEntry {
+                sequence,
+                epoch,
+                lane,
+                state: ReferenceState::Reserved,
+            });
+            if lane == AuthorityLane::Lifecycle {
+                self.epoch += 1;
+            }
+            reference_increment(&mut self.counters.reservations_admitted);
+            Some((sequence, epoch))
+        }
+
+        fn commit(&mut self, sequence: u64) -> bool {
+            let Some(entry) = self
+                .queue
+                .iter_mut()
+                .find(|entry| entry.sequence == sequence)
+            else {
+                return false;
+            };
+            if entry.state != ReferenceState::Reserved {
+                return false;
+            }
+            entry.state = ReferenceState::Ready;
+            reference_increment(&mut self.counters.reservations_committed);
+            true
+        }
+
+        fn reject_commit(&mut self, sequence: u64) -> bool {
+            if self.closed
+                || !self.queue.iter().any(|entry| {
+                    entry.sequence == sequence && entry.state == ReferenceState::Reserved
+                })
+            {
+                return false;
+            }
+            reference_increment(&mut self.counters.reservation_commit_rejections);
+            true
+        }
+
+        fn reject_wrong_generation_admission(&mut self) -> bool {
+            if self.closed {
+                return false;
+            }
+            reference_increment(&mut self.counters.plans_rejected);
+            true
+        }
+
+        fn reject_wrong_generation_reservation(&mut self) -> bool {
+            if self.closed {
+                return false;
+            }
+            reference_increment(&mut self.counters.reservations_rejected);
+            true
+        }
+
+        fn reject_stale_reservation(&mut self) -> bool {
+            if self.closed {
+                return false;
+            }
+            reference_increment(&mut self.counters.stale_reservations);
+            true
+        }
+
+        fn cancel(&mut self, sequence: u64) -> ReferenceCancel {
+            let Some(position) = self.queue.iter().position(|entry| {
+                entry.sequence == sequence && entry.state == ReferenceState::Reserved
+            }) else {
+                return ReferenceCancel::Stale;
+            };
+            let entry = self.queue[position];
+            if entry.lane == AuthorityLane::Lifecycle && position + 1 != self.queue.len() {
+                reference_increment(&mut self.counters.reservation_cancel_rejections);
+                return ReferenceCancel::CausalDependents;
+            }
+            let Some(_removed) = self.queue.remove(position) else {
+                unreachable!("reference reservation remains present during cancellation")
+            };
+            if entry.lane == AuthorityLane::Lifecycle {
+                self.epoch = entry.epoch;
+            }
+            reference_increment(&mut self.counters.reservations_cancelled);
+            ReferenceCancel::Cancelled
+        }
+
+        fn claim(&mut self) -> Option<(u64, u64, u64)> {
+            let front = self.queue.front_mut()?;
+            if front.state != ReferenceState::Ready || self.closed {
+                return None;
+            }
+            let attempt = self.next_attempt;
+            self.next_attempt += 1;
+            front.state = ReferenceState::InFlight { attempt };
+            reference_increment(&mut self.counters.claims);
+            Some((front.sequence, front.epoch, attempt))
+        }
+
+        fn acknowledge(&mut self, sequence: u64, attempt: u64) -> bool {
+            let matches = self.queue.front().is_some_and(|entry| {
+                entry.sequence == sequence && entry.state == ReferenceState::InFlight { attempt }
+            });
+            if !matches {
+                reference_increment(&mut self.counters.stale_settlements);
+                return false;
+            }
+            let Some(_acknowledged) = self.queue.pop_front() else {
+                unreachable!("reference matching claim remains present during acknowledgement")
+            };
+            reference_increment(&mut self.counters.acknowledgements);
+            true
+        }
+
+        fn retry(&mut self, sequence: u64, attempt: u64) -> bool {
+            let Some(front) = self.queue.front_mut() else {
+                reference_increment(&mut self.counters.stale_settlements);
+                return false;
+            };
+            if front.sequence != sequence || front.state != (ReferenceState::InFlight { attempt }) {
+                reference_increment(&mut self.counters.stale_settlements);
+                return false;
+            }
+            front.state = ReferenceState::Ready;
+            reference_increment(&mut self.counters.retries);
+            true
+        }
+
+        fn reject_stale_settlement(&mut self) -> bool {
+            if self.closed {
+                return false;
+            }
+            reference_increment(&mut self.counters.stale_settlements);
+            true
+        }
+
+        fn nack_terminal(&mut self, sequence: u64, attempt: u64) -> bool {
+            if self.closed {
+                return false;
+            }
+            let matches = self.queue.front().is_some_and(|entry| {
+                entry.sequence == sequence && entry.state == ReferenceState::InFlight { attempt }
+            });
+            if !matches {
+                reference_increment(&mut self.counters.stale_settlements);
+                return false;
+            }
+            reference_increment(&mut self.counters.terminal_nacks);
+            self.close();
+            true
+        }
+
+        fn close(&mut self) {
+            if self.closed {
+                return;
+            }
+            let semantic = self
+                .queue
+                .iter()
+                .filter(|entry| entry.state != ReferenceState::Reserved)
+                .count();
+            let slots = self.queue.len();
+            self.queue.clear();
+            self.closed = true;
+            reference_increment(&mut self.counters.closes);
+            reference_add_usize(&mut self.counters.closed_semantic_effects, semantic);
+            reference_add_usize(&mut self.counters.closed_charged_slots, slots);
+            reference_add_usize(
+                &mut self.counters.closed_resident_bytes,
+                slots * self.resident_bytes_per_plan,
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn independent_reference_model_matches_order_capacity_and_counters(
+            event_limit in 0usize..=4,
+            lifecycle_limit in 0usize..=4,
+            total_limit in 1usize..=6,
+            actions in prop::collection::vec((0u8..=7, any::<u16>()), 0..160),
+        ) {
+            let lane_slots = [
+                lifecycle_limit,
+                0,
+                0,
+                0,
+                0,
+                event_limit,
+                0,
+                0,
+            ];
+            let aggregate = lifecycle_limit + event_limit;
+            let effective_total = total_limit.min(aggregate);
+            prop_assume!(effective_total > 0);
+            let resident_bytes_per_plan = plan_resident_bytes(1, 1);
+            let limits = HardenedSchedulerLimits::new(
+                lane_slots,
+                effective_total,
+                effective_total * resident_bytes_per_plan,
+                1,
+                1,
+                effective_total,
+            ).expect("generated limits are representable");
+            let mut production = DeliveryCoordinator::new(GENERATION, limits);
+            let mut reference = ReferenceCoordinator::new(
+                event_limit,
+                lifecycle_limit,
+                effective_total,
+                resident_bytes_per_plan,
+            );
+            let mut reservations: Vec<(ReservationToken, u64, AuthorityLane)> = Vec::new();
+            let mut active_claim: Option<(CoordinatorClaimToken, u64, u64)> = None;
+
+            for (action, value) in actions {
+                let id = u64::from(value) + 1;
+                match action {
+                    0 | 1 => {
+                        let lane = if action == 0 {
+                            AuthorityLane::Event
+                        } else {
+                            AuthorityLane::Lifecycle
+                        };
+                        let plan = if lane == AuthorityLane::Event {
+                            event_plan(id, 1)
+                        } else {
+                            barrier_plan(id)
+                        };
+                        let expected = reference.admit(lane);
+                        let actual = production.admit_plan(plan);
+                        match (expected, actual) {
+                            (Some((sequence, epoch)), PlanAdmission::Admitted {
+                                sequence: actual_sequence,
+                                epoch: actual_epoch,
+                            }) => {
+                                prop_assert_eq!((actual_sequence, actual_epoch), (sequence, epoch));
+                            }
+                            (None, PlanAdmission::Rejected { reason: PlanRejectReason::Capacity, .. })
+                            | (None, PlanAdmission::Closed { .. }) => {}
+                            pair => prop_assert!(false, "admission mismatch: {pair:?}"),
+                        }
+                    }
+                    2 => {
+                        let lane = if value % 2 == 0 {
+                            AuthorityLane::Event
+                        } else {
+                            AuthorityLane::Lifecycle
+                        };
+                        let plan = if lane == AuthorityLane::Event {
+                            event_plan(id, 1)
+                        } else {
+                            barrier_plan(id)
+                        };
+                        let expected = reference.reserve(lane);
+                        let actual = production.reserve_plan(&plan);
+                        match (expected, actual) {
+                            (Some((sequence, _)), ReservationAdmission::Reserved(token)) => {
+                                prop_assert_eq!(token.sequence(), sequence);
+                                reservations.push((token, sequence, lane));
+                            }
+                            (None, ReservationAdmission::Rejected(PlanRejectReason::Capacity))
+                            | (None, ReservationAdmission::Closed) => {}
+                            pair => prop_assert!(false, "reservation mismatch: {pair:?}"),
+                        }
+                    }
+                    3 => {
+                        if let Some((token, sequence, lane)) = reservations.pop() {
+                            let plan = if lane == AuthorityLane::Event {
+                                event_plan(id, 1)
+                            } else {
+                                barrier_plan(id)
+                            };
+                            let expected = reference.commit(sequence);
+                            let actual = production.commit_reservation(token, plan);
+                            prop_assert_eq!(
+                                matches!(actual, ReservationCommit::Committed { .. }),
+                                expected
+                            );
+                        }
+                    }
+                    4 => {
+                        if let Some((token, sequence, lane)) = reservations.pop() {
+                            let expected = reference.cancel(sequence);
+                            let actual = production.cancel_reservation(token);
+                            let actual = match actual {
+                                ReservationCancel::Cancelled => ReferenceCancel::Cancelled,
+                                ReservationCancel::CausalDependents { token } => {
+                                    reservations.push((token, sequence, lane));
+                                    ReferenceCancel::CausalDependents
+                                }
+                                ReservationCancel::Stale
+                                | ReservationCancel::WrongInstance { .. }
+                                | ReservationCancel::GenerationClosed => {
+                                    ReferenceCancel::Stale
+                                }
+                            };
+                            prop_assert_eq!(actual, expected);
+                        }
+                    }
+                    5 => {
+                        let expected = reference.claim();
+                        let actual = production.claim_next().expect("small trace cannot exhaust tokens");
+                        match (expected, actual) {
+                            (Some((sequence, epoch, attempt)), Some(claim)) => {
+                                prop_assert_eq!(
+                                    (claim.sequence(), claim.epoch(), claim.token().attempt()),
+                                    (sequence, epoch, attempt)
+                                );
+                                active_claim = Some((claim.token().clone(), sequence, attempt));
+                            }
+                            (None, None) => {}
+                            pair => prop_assert!(false, "claim mismatch: {pair:?}"),
+                        }
+                    }
+                    6 => {
+                        if let Some((token, sequence, attempt)) = active_claim.take() {
+                            let expected = reference.acknowledge(sequence, attempt);
+                            let actual = production.acknowledge(&token);
+                            prop_assert_eq!(
+                                actual == CoordinatorSettleOutcome::Acknowledged,
+                                expected
+                            );
+                        }
+                    }
+                    7 => {
+                        if let Some((token, sequence, attempt)) = active_claim.take() {
+                            let expected = reference.retry(sequence, attempt);
+                            let actual = production.retry(&token);
+                            prop_assert_eq!(actual == CoordinatorSettleOutcome::Retried, expected);
+                        } else {
+                            reference.close();
+                            let _ = production.close();
+                        }
+                    }
+                    _ => unreachable!("generated action is constrained to 0..=7"),
+                }
+
+                let capacity = production.capacity();
+                let reference_reserved = reference
+                    .queue
+                    .iter()
+                    .filter(|entry| entry.state == ReferenceState::Reserved)
+                    .count();
+                let reference_ready = reference
+                    .queue
+                    .iter()
+                    .filter(|entry| entry.state == ReferenceState::Ready)
+                    .count();
+                let reference_in_flight = reference
+                    .queue
+                    .iter()
+                    .filter(|entry| matches!(entry.state, ReferenceState::InFlight { .. }))
+                    .count();
+                prop_assert_eq!(capacity.charged_slots, reference.queue.len());
+                prop_assert_eq!(
+                    capacity.charged_resident_bytes,
+                    reference.queue.len() * resident_bytes_per_plan
+                );
+                prop_assert_eq!(capacity.reserved_plans, reference_reserved);
+                prop_assert_eq!(capacity.ready_plans, reference_ready);
+                prop_assert_eq!(capacity.in_flight_plans, reference_in_flight);
+                prop_assert_eq!(
+                    capacity.semantic_effects,
+                    reference_ready + reference_in_flight
+                );
+                let counters = production.counters();
+                prop_assert_eq!(counters.plans_admitted, reference.counters.plans_admitted);
+                prop_assert_eq!(counters.plans_rejected, reference.counters.plans_rejected);
+                prop_assert_eq!(
+                    counters.reservations_admitted,
+                    reference.counters.reservations_admitted
+                );
+                prop_assert_eq!(
+                    counters.reservations_rejected,
+                    reference.counters.reservations_rejected
+                );
+                prop_assert_eq!(
+                    counters.reservations_committed,
+                    reference.counters.reservations_committed
+                );
+                prop_assert_eq!(
+                    counters.reservations_cancelled,
+                    reference.counters.reservations_cancelled
+                );
+                prop_assert_eq!(
+                    counters.reservation_cancel_rejections,
+                    reference.counters.reservation_cancel_rejections
+                );
+                prop_assert_eq!(
+                    counters.reservation_commit_rejections,
+                    reference.counters.reservation_commit_rejections
+                );
+                prop_assert_eq!(
+                    counters.stale_reservations,
+                    reference.counters.stale_reservations
+                );
+                prop_assert_eq!(counters.claims, reference.counters.claims);
+                prop_assert_eq!(
+                    counters.acknowledgements,
+                    reference.counters.acknowledgements
+                );
+                prop_assert_eq!(counters.retries, reference.counters.retries);
+                prop_assert_eq!(
+                    counters.terminal_nacks,
+                    reference.counters.terminal_nacks
+                );
+                prop_assert_eq!(counters.closes, reference.counters.closes);
+                prop_assert_eq!(
+                    counters.closed_semantic_effects,
+                    reference.counters.closed_semantic_effects
+                );
+                prop_assert_eq!(
+                    counters.closed_charged_slots,
+                    reference.counters.closed_charged_slots
+                );
+                prop_assert_eq!(
+                    counters.closed_resident_bytes,
+                    reference.counters.closed_resident_bytes
+                );
+                prop_assert_eq!(
+                    counters.stale_settlements,
+                    reference.counters.stale_settlements
+                );
+                prop_assert_eq!(production.check_invariants(), Ok(()));
+            }
+        }
+
+        #[test]
+        fn generated_negative_trace_exercises_replay_rejection_and_terminal_nack(
+            use_event_lane in any::<bool>(),
+            seed in any::<u64>(),
+        ) {
+            let lane = if use_event_lane {
+                AuthorityLane::Event
+            } else {
+                AuthorityLane::Lifecycle
+            };
+            let opposite_lane = if use_event_lane {
+                AuthorityLane::Lifecycle
+            } else {
+                AuthorityLane::Event
+            };
+            let mut lane_slots = [0usize; HARDENED_DELIVERY_LANE_COUNT];
+            lane_slots[lane.index()] = 1;
+            let resident_bytes_per_plan = plan_resident_bytes(1, 1);
+            let limits = HardenedSchedulerLimits::new(
+                lane_slots,
+                1,
+                resident_bytes_per_plan,
+                1,
+                1,
+                1,
+            ).expect("single-lane negative-trace limits are valid");
+            let mut production = DeliveryCoordinator::new(GENERATION, limits);
+            let mut reference = ReferenceCoordinator::new(
+                usize::from(use_event_lane),
+                usize::from(!use_event_lane),
+                1,
+                resident_bytes_per_plan,
+            );
+            let id = |offset: u64| seed.wrapping_add(offset);
+
+            prop_assert!(reference.reject_wrong_generation_admission());
+            prop_assert!(matches!(
+                production.admit_plan(wrong_generation_plan(lane, id(1))),
+                PlanAdmission::Rejected {
+                    reason: PlanRejectReason::WrongGeneration,
+                    ..
+                }
+            ));
+            prop_assert!(reference.reject_wrong_generation_reservation());
+            prop_assert_eq!(
+                production.reserve_plan(&wrong_generation_plan(lane, id(2))),
+                ReservationAdmission::Rejected(PlanRejectReason::WrongGeneration)
+            );
+
+            let (sequence, epoch) = reference.reserve(lane).expect("lane has one slot");
+            let token = match production.reserve_plan(&plan_for_lane(lane, id(3))) {
+                ReservationAdmission::Reserved(token) => token,
+                other => panic!("expected valid reservation, got {other:?}"),
+            };
+            prop_assert_eq!((token.sequence(), epoch), (sequence, 0));
+            let stale_token = token.clone();
+
+            prop_assert!(reference.reject_commit(sequence));
+            let token = match production.commit_reservation(
+                token,
+                plan_for_lane(opposite_lane, id(4)),
+            ) {
+                ReservationCommit::Rejected {
+                    token,
+                    reason: PlanRejectReason::FootprintMismatch,
+                    ..
+                } => token,
+                other => panic!("expected footprint rejection, got {other:?}"),
+            };
+
+            prop_assert!(reference.reject_commit(sequence));
+            let token = match production.commit_reservation(
+                token,
+                wrong_generation_plan(lane, id(5)),
+            ) {
+                ReservationCommit::Rejected {
+                    token,
+                    reason: PlanRejectReason::WrongGeneration,
+                    ..
+                } => token,
+                other => panic!("expected generation rejection, got {other:?}"),
+            };
+
+            prop_assert!(reference.commit(sequence));
+            prop_assert!(matches!(
+                production.commit_reservation(token, plan_for_lane(lane, id(6))),
+                ReservationCommit::Committed {
+                    sequence: 1,
+                    epoch: 0
+                }
+            ));
+
+            prop_assert!(reference.reject_stale_reservation());
+            prop_assert!(matches!(
+                production.commit_reservation(stale_token, plan_for_lane(lane, id(7))),
+                ReservationCommit::Stale { .. }
+            ));
+
+            let (sequence, epoch, attempt) = reference.claim().expect("committed plan is ready");
+            let first = production
+                .claim_next()
+                .expect("attempt space is available")
+                .expect("committed plan is claimable");
+            prop_assert_eq!(
+                (first.sequence(), first.epoch(), first.token().attempt()),
+                (sequence, epoch, attempt)
+            );
+            let old_attempt = first.token().clone();
+            prop_assert!(reference.retry(sequence, attempt));
+            prop_assert_eq!(
+                production.retry(first.token()),
+                CoordinatorSettleOutcome::Retried
+            );
+            prop_assert!(reference.reject_stale_settlement());
+            prop_assert_eq!(
+                production.acknowledge(&old_attempt),
+                CoordinatorSettleOutcome::StaleOrDuplicate
+            );
+
+            let (sequence, epoch, attempt) =
+                reference.claim().expect("retried plan is ready");
+            let second = production
+                .claim_next()
+                .expect("attempt space is available")
+                .expect("retried plan is claimable");
+            prop_assert_eq!(
+                (second.sequence(), second.epoch(), second.token().attempt()),
+                (sequence, epoch, attempt)
+            );
+            let duplicate_attempt = second.token().clone();
+            prop_assert!(reference.acknowledge(sequence, attempt));
+            prop_assert_eq!(
+                production.acknowledge(second.token()),
+                CoordinatorSettleOutcome::Acknowledged
+            );
+            prop_assert!(reference.reject_stale_settlement());
+            prop_assert_eq!(
+                production.retry(&duplicate_attempt),
+                CoordinatorSettleOutcome::StaleOrDuplicate
+            );
+
+            let (sequence, epoch) = reference.admit(lane).expect("ACK released the slot");
+            prop_assert!(matches!(
+                production.admit_plan(plan_for_lane(lane, id(8))),
+                PlanAdmission::Admitted {
+                    sequence: actual_sequence,
+                    epoch: actual_epoch,
+                } if (actual_sequence, actual_epoch) == (sequence, epoch)
+            ));
+            let (sequence, epoch, attempt) =
+                reference.claim().expect("terminal-NACK plan is ready");
+            let terminal = production
+                .claim_next()
+                .expect("attempt space is available")
+                .expect("terminal-NACK plan is claimable");
+            prop_assert_eq!(
+                (terminal.sequence(), terminal.epoch(), terminal.token().attempt()),
+                (sequence, epoch, attempt)
+            );
+            prop_assert!(reference.nack_terminal(sequence, attempt));
+            prop_assert_eq!(
+                production.nack_terminal(terminal.token()),
+                CoordinatorSettleOutcome::FailedClosed
+            );
+
+            let counters = production.counters();
+            prop_assert_eq!(counters.plans_rejected, reference.counters.plans_rejected);
+            prop_assert_eq!(
+                counters.reservations_rejected,
+                reference.counters.reservations_rejected
+            );
+            prop_assert_eq!(
+                counters.reservation_commit_rejections,
+                reference.counters.reservation_commit_rejections
+            );
+            prop_assert_eq!(
+                counters.stale_reservations,
+                reference.counters.stale_reservations
+            );
+            prop_assert_eq!(
+                counters.stale_settlements,
+                reference.counters.stale_settlements
+            );
+            prop_assert_eq!(
+                counters.terminal_nacks,
+                reference.counters.terminal_nacks
+            );
+            prop_assert_eq!(counters.closes, reference.counters.closes);
+            prop_assert_eq!(counters.plans_rejected, 1);
+            prop_assert_eq!(counters.reservations_rejected, 1);
+            prop_assert_eq!(counters.reservation_commit_rejections, 2);
+            prop_assert_eq!(counters.stale_reservations, 1);
+            prop_assert_eq!(counters.stale_settlements, 2);
+            prop_assert_eq!(counters.claims, 3);
+            prop_assert_eq!(counters.acknowledgements, 1);
+            prop_assert_eq!(counters.retries, 1);
+            prop_assert_eq!(counters.terminal_nacks, 1);
+            prop_assert_eq!(counters.closes, 1);
+            prop_assert_eq!(counters.wrong_instance_reservations, 0);
+            prop_assert_eq!(counters.wrong_instance_settlements, 0);
+            prop_assert_eq!(counters.closed_semantic_effects, 1);
+            prop_assert_eq!(counters.closed_charged_slots, 1);
+            prop_assert_eq!(
+                counters.closed_resident_bytes,
+                u64::try_from(resident_bytes_per_plan).unwrap_or(u64::MAX)
+            );
+            prop_assert_eq!(production.capacity(), HardenedCapacity::default());
+            prop_assert_eq!(production.check_invariants(), Ok(()));
         }
     }
 }
