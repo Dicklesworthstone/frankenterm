@@ -367,7 +367,7 @@ impl ReviewAuthorityKind {
     }
 }
 
-/// Review outcome retained in catalog history.
+/// Review outcome declared in catalog metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDisposition {
@@ -795,13 +795,17 @@ pub struct ContradictionRecord {
     pub notes: String,
 }
 
-/// Catalog revision history entry.
+/// Declared catalog-revision metadata entry.
+///
+/// Schema v1 retains these rows in the current document, but it does not carry
+/// content-addressed predecessor snapshots or signatures. Consumers must not
+/// treat a row by itself as proof that the named prior revision was retained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeRecord {
     /// Stable change identifier.
     pub change_id: String,
-    /// Exact catalog content revision introduced by this append-only row.
+    /// Catalog content revision described by this row.
     pub catalog_revision: String,
     /// UTC timestamp as retained by the catalog artifact.
     pub changed_at_utc: String,
@@ -849,9 +853,9 @@ pub struct ProductJourneyCatalog {
     pub readme_mappings: Vec<ReadmeMapping>,
     /// Explicit documentation and product contradictions.
     pub contradictions: Vec<ContradictionRecord>,
-    /// Retained review history.
+    /// Declared review metadata.
     pub review_history: Vec<ReviewRecord>,
-    /// Retained revision history.
+    /// Declared revision-lineage metadata.
     pub change_history: Vec<ChangeRecord>,
 }
 
@@ -891,6 +895,8 @@ pub enum CatalogValidationCode {
     ContractOnlySupportedClaim,
     /// Schema version 1 attempted to use unsupported claim authority.
     UnsupportedClaimAuthority,
+    /// Schema version 1 attempted to mint positive run-evidence authority.
+    UnsupportedEvidenceAuthority,
     /// Producer coverage disagrees with exact or partial binding fields.
     InvalidProducerCoverage,
     /// A native target qualification is malformed or self-contradictory.
@@ -924,6 +930,7 @@ impl CatalogValidationCode {
             Self::ContradictoryClaim => "PJC-CLAIM-001",
             Self::ContractOnlySupportedClaim => "PJC-CLAIM-002",
             Self::UnsupportedClaimAuthority => "PJC-AUTHORITY-001",
+            Self::UnsupportedEvidenceAuthority => "PJC-AUTHORITY-002",
             Self::InvalidProducerCoverage => "PJC-PRODUCER-001",
             Self::InvalidTargetQualification => "PJC-TARGET-001",
             Self::InvalidReviewAuthority => "PJC-REVIEW-001",
@@ -2515,8 +2522,7 @@ fn validate_target_qualifications(
         }
         let uses_transitional_m5_pro_max = controller
             .is_some_and(|definition| definition.mode == TargetMode::M5ProMaxNative)
-            || session_host
-                .is_some_and(|definition| definition.mode == TargetMode::M5ProMaxNative);
+            || session_host.is_some_and(|definition| definition.mode == TargetMode::M5ProMaxNative);
         if uses_transitional_m5_pro_max
             && (qualification.availability != TargetAvailability::Unknown
                 || qualification.evidence_state != EvidenceState::Missing
@@ -2557,6 +2563,28 @@ fn validate_qualification_evidence(
     path: &str,
     validator: &mut ValidatorState,
 ) {
+    if qualification.evidence_state == EvidenceState::Proven {
+        validator.error(
+            CatalogValidationCode::UnsupportedEvidenceAuthority,
+            format!("{path}.evidence_state"),
+            "schema version 1 has no signed evidence-receipt verifier and cannot mint `proven` evidence",
+        );
+    }
+    if qualification.run_verdict == RunVerdict::Pass {
+        validator.error(
+            CatalogValidationCode::UnsupportedEvidenceAuthority,
+            format!("{path}.run_verdict"),
+            "schema version 1 has no signed run-receipt verifier and cannot mint a `pass` verdict",
+        );
+    }
+    if qualification.freshness_state == FreshnessState::Current {
+        validator.error(
+            CatalogValidationCode::UnsupportedEvidenceAuthority,
+            format!("{path}.freshness_state"),
+            "schema version 1 has no signed candidate-and-route freshness verifier and cannot mint `current` evidence",
+        );
+    }
+
     let executed_run = matches!(
         qualification.run_verdict,
         RunVerdict::Pass | RunVerdict::Fail | RunVerdict::Degraded
@@ -3111,7 +3139,7 @@ fn validate_mappings_and_history(
                 CatalogValidationCode::InvalidReviewAuthority,
                 format!("{path}.reviewed_catalog_revision"),
                 format!(
-                    "reviewed revision `{}` has no retained append-only change-history row",
+                    "reviewed revision `{}` has no declared change-history row in this catalog",
                     record.reviewed_catalog_revision
                 ),
             );
@@ -3146,6 +3174,13 @@ fn validate_mappings_and_history(
                 CatalogValidationCode::InvalidReviewAuthority,
                 format!("{path}.authority_receipt_ref"),
                 "authority receipt reference and SHA-256 must either both be present or both be absent",
+            );
+        }
+        if record.authority_kind != ReviewAuthorityKind::AutomatedInformational {
+            validator.error(
+                CatalogValidationCode::InvalidReviewAuthority,
+                format!("{path}.authority_kind"),
+                "schema version 1 accepts only automated_informational review metadata; human authority requires a later signed-receipt contract",
             );
         }
         match record.disposition {
@@ -3195,13 +3230,14 @@ fn validate_mappings_and_history(
         }
         if record.authority_kind == ReviewAuthorityKind::AutomatedInformational
             && (record.disposition != ReviewDisposition::Informational
+                || record.reviewed_commit.is_some()
                 || record.authority_receipt_ref.is_some()
                 || record.authority_receipt_sha256.is_some())
         {
             validator.error(
                 CatalogValidationCode::InvalidReviewAuthority,
                 format!("{path}.authority_kind"),
-                "automated_informational review must be informational and cannot carry an authority receipt",
+                "automated_informational review must be informational and cannot carry a reviewed commit or authority receipt",
             );
         }
         validator.require_text(&format!("{path}.notes"), &record.notes);
@@ -3290,7 +3326,7 @@ fn validate_mappings_and_history(
                 CatalogValidationCode::DuplicateId,
                 format!("{path}.catalog_revision"),
                 format!(
-                    "duplicate catalog revision `{}` in append-only history",
+                    "duplicate catalog revision `{}` in declared history",
                     record.catalog_revision
                 ),
             );
@@ -3333,7 +3369,7 @@ fn validate_mappings_and_history(
                 validator.error(
                     CatalogValidationCode::InvalidDefinition,
                     path.clone(),
-                    "the immutable initial change-history row must equal the canonical schema-v1 record",
+                    "the canonical initial draft-metadata row must equal the schema-v1 record",
                 );
             }
         }
@@ -3349,7 +3385,7 @@ fn validate_mappings_and_history(
         validator.error(
             CatalogValidationCode::InvalidDefinition,
             "change_history",
-            format!("schema-v1 history must retain immutable `{INITIAL_CHANGE_ID}`"),
+            format!("schema-v1 declared lineage must retain canonical `{INITIAL_CHANGE_ID}`"),
         );
     }
     if !change_revisions.contains(&catalog.catalog_revision) {
@@ -3357,7 +3393,7 @@ fn validate_mappings_and_history(
             CatalogValidationCode::InvalidDefinition,
             "change_history",
             format!(
-                "current catalog revision `{}` has no append-only change-history row",
+                "current catalog revision `{}` has no declared change-history row",
                 catalog.catalog_revision
             ),
         );
@@ -3370,7 +3406,7 @@ fn validate_mappings_and_history(
         validator.error(
             CatalogValidationCode::InvalidDefinition,
             "change_history",
-            "the final append-only change-history row must introduce the current catalog revision",
+            "the final declared change-history row must describe the current catalog revision",
         );
     }
 }

@@ -165,36 +165,46 @@ There is deliberately no aggregate `evidence_state`, `run_verdict`, or
 `evidence_refs` on a journey variant. Combining three target results into one
 field would hide unavailable targets, stale evidence, and mixed verdicts.
 
-The target-specific evidence values mean:
+The Rust DTO retains the complete qualification vocabulary so negative tests
+and untrusted inputs can fail with precise diagnostics. Schema v1, however,
+has no signed run-evidence receipt verifier. It therefore rejects the positive
+values `proven`, `pass`, and `current`; none of those strings can mint
+authority merely by pointing at existing repository files. They are reserved
+for a later authority-bearing contract.
 
-| Catalog value | Meaning |
+The target-specific evidence vocabulary means:
+
+| Vocabulary value | Meaning |
 |---|---|
-| `proven` | Retained evidence directly satisfies the declared evidence contract for the exact variant and target. |
+| `proven` | Reserved for a later signed-receipt contract: retained evidence directly satisfies the declared evidence contract for the exact variant and target. Invalid in schema v1. |
 | `proxy_only` | Evidence exercises a proxy rather than the complete native journey boundary. |
 | `fixture_only` | Evidence establishes deterministic fixture or contract behavior only. |
 | `skipped_not_proven` | A required predicate was deliberately absent; no support claim follows. |
 | `blocked` | The evidence lane could not reach an admissible verdict. |
 | `missing` | Required evidence has not been retained or linked. |
 
-Evidence state is independent of support and run outcome. For example, one
-target qualification may return `pass` for a reduced fixture while remaining
-`fixture_only`; the variant remains conditional.
+Evidence state is independent of support and run outcome. In a later
+authority-bearing contract, for example, one target qualification could return
+`pass` for a reduced fixture while remaining `fixture_only`; the variant would
+remain conditional. Schema v1 can retain negative `fail` or `degraded`
+outcomes for proxy or fixture evidence, but cannot encode that positive
+example.
 
-The target-specific run values mean:
+The target-specific run vocabulary means:
 
-| Catalog value | Meaning |
+| Vocabulary value | Meaning |
 |---|---|
-| `pass` | The exact declared run completed and every assertion in that run passed. Promotion may still require stronger evidence, review, freshness, and additional targets. |
+| `pass` | Reserved for a later signed-receipt contract: the exact declared run completed and every assertion passed. Invalid in schema v1. |
 | `fail` | The source or product behavior violated a required assertion. |
 | `degraded` | The run completed with an admitted degraded state; the receipt must identify what remained unproved. |
 | `not_run` | No qualifying run has been retained for the exact declared cell and target. |
 | `target_unavailable` | The requested target could not be exercised. This says nothing by itself about product support. |
 
-The target-specific freshness values are:
+The target-specific freshness vocabulary is:
 
-| Catalog value | Meaning |
+| Vocabulary value | Meaning |
 |---|---|
-| `current` | Candidate, route, configuration, renderer, hardware, and other declared qualification identities still match the receipt's freshness policy. |
+| `current` | Reserved for a later signed-receipt contract: candidate, route, configuration, renderer, hardware, and other qualification identities match the receipt's freshness policy. Invalid in schema v1. |
 | `stale` | A relevant identity or expiry boundary changed after the retained run. |
 | `unknown` | The catalog has no admissible freshness receipt for this target pair. |
 
@@ -477,11 +487,16 @@ separate target-qualification facts.
 ## Required Journey Lifecycle
 
 Every journey instance must define and retain the following phases.
-To preserve the v1 wire shape, the machine catalog maps conceptual phases 1
-and 2 into one ordered `setup` array: `setup[0]` is always the pre-mutation
-identity/preflight boundary, and `setup[1..]` contains clean setup. Semantic
-validation requires both portions; consumers must not treat the whole array as
-undifferentiated setup.
+To preserve the v1 wire shape, the prose convention maps conceptual phases 1
+and 2 into one ordered `setup` array: authors intend `setup[0]` to describe the
+pre-mutation identity/preflight boundary and `setup[1..]` to describe clean
+setup. Schema v1 proves only that the array contains at least two nonempty
+strings. It cannot type either role or detect swapped, collapsed, or
+post-mutation text, so consumers must not treat this convention as machine
+authority. A later schema must materialize the six roles as explicit typed
+fields.
+
+`7xqz4.1.1.3` owns that breaking typed-lifecycle contract and migration.
 
 ### 1. Identity and preflight
 
@@ -644,8 +659,8 @@ external immutable receipt:
   syntax and with no whitespace or newline normalization.
 
 Thus a digest stored inside the catalog never claims to hash the catalog bytes
-that contain it. The current informational review has null receipt fields and
-a null reviewed commit. If a future contract needs a digest of catalog content
+that contain it. Every schema-v1 informational review has null receipt fields
+and a null reviewed commit. If a future contract needs a digest of catalog content
 it must define a versioned detached canonical projection (excluding at least
 `review_history` and `change_history`) in a new authority contract; v1 does not
 silently invent such a projection.
@@ -668,7 +683,7 @@ privacy-safe schema, diagnosis, or cross-machine replay has qualified.
 
 | Contract facet | Required owners or evidence |
 |---|---|
-| Catalog and status authority | `7xqz4.1.1`; SLO catalog `.1.2`; degradation taxonomy `.1.3`; evidence schema `.1.4`; README mapping `.1.5`; privacy `.1.6`; maturity ladder `.1.7`. |
+| Catalog and status authority | `7xqz4.1.1`; content-addressed lineage `.1.1.2`; typed lifecycle `.1.1.3`; SLO catalog `.1.2`; degradation taxonomy `.1.3`; evidence schema `.1.4` and signed receipts `.1.4.1`; README mapping `.1.5`; privacy `.1.6`; maturity ladder `.1.7`. |
 | Exact installed identity | `7xqz4.2.1`–`.2.3`, `.2.9`; `4tenz.9.1`; existing mismatch-resolution work such as `ft-1itzl`. |
 | Native human interaction | `4tenz.2.1`–`.2.8`; product interaction `.4.2`–`.4.6`; product quality `.9.1`–`.9.9`. |
 | Resize, zoom, and appearance | `4tenz.3.1`–`.3.8`, `.7`, `.8`; product `.9.1`–`.9.9`; `docs/resize-baseline-scenarios.md` only as a deterministic substrate. |
@@ -756,6 +771,10 @@ must not upgrade it to `approved`.
 V1 deliberately rejects every `approved` or `changes_requested` record,
 including a perfectly shaped record pointing at real repository bytes. A path,
 hash, reviewer string, and claimed authority kind are not a root of trust.
+It also rejects every human authority kind even when paired with the
+`informational` disposition, and rejects a `reviewed_commit` on an automated
+informational row. Those shapes cannot be used as side doors around the
+authority boundary.
 Later human decisions require a new schema/contract version with a trusted
 signer registry and a verified detached signature binding exact catalog
 revision, commit, scope, disposition, reviewer identity, and receipt bytes.
@@ -773,14 +792,38 @@ pending.
 
 | Contract version | Date | Change | Authority |
 |---|---|---|---|
-| `ft.product_journey_catalog.v1` / companion revision 1 | 2026-07-27 | Initial four-persona, two-topology, q002/q020/q050/q200 contract; 32 conditional cells; 14-journey crosswalk; fail-closed target posture and promotion rules. | `7xqz4.1.1`; human approval pending. |
-| `ft.product_journey_catalog.v1` / companion revision 2 | 2026-07-28 | Retained revision 1 unchanged; added revision-bound review/change history, fail-closed human-authority rejection, candidate/route identity requirements, a frozen transitional combined M5 Pro/Max lane, and an enforced `setup[0]` identity/preflight boundary. | Automated adversarial review only; human approval pending. |
+| `ft.product_journey_catalog.v1` / companion revision 1 | 2026-07-27 | Unretained, uncommitted draft metadata. No revision-1 catalog bytes, Git object, or content digest were retained; its content identity is `NO-DATA`. | Automated informational draft only; human approval pending. |
+| `ft.product_journey_catalog.v1` / companion revision 2 | 2026-07-28 | First retained catalog artifact: initial four-persona/two-topology/q002–q200 contract plus authority-shape, identity, and transitional M5 hardening. Its two-slot setup convention was structural only, not typed lifecycle proof. | Automated adversarial review only; human approval pending. |
+| `ft.product_journey_catalog.v1` / companion revision 3 | 2026-07-28 | Negative-evidence correction: rejected all positive evidence and human-review authority in v1, aligned automated commit rules, enabled date-time assertion, corrected local interactive q050 projection, and disclosed the lineage and lifecycle limits. | Automated adversarial provenance review only; human approval pending. |
 
-History is append-only. Corrections add a new row and catalog revision; they do
-not rewrite the fact that an earlier revision existed. Every review names a
-retained change-history revision, and the current revision has its own review;
-historical reviews are never rewritten to the ambient current revision.
-Breaking field or semantic changes require a new schema/contract version.
+The current file retains ordered revision and review metadata, but schema v1
+does not prove append-only history. It has no predecessor content hash,
+detached signature, immutable snapshot reference, or verifier. Its validator
+can reject deletion or rewriting of the canonical draft row inside the current
+document; it cannot prove that the revision-1 bytes ever existed. A later
+content-addressed lineage contract must provide that authority.
+
+`7xqz4.1.1.2` owns the canonical digest, retained snapshot, predecessor, and
+signature contract.
+
+Revision 2 is the genesis retained artifact. Its exact source-control identity
+is:
+
+| Identity field | Exact value |
+|---|---|
+| Git commit | `32d72991856a9b00d55086ca07384dc082b8a3fc` |
+| Authored timestamp | `2026-07-27T21:43:49-04:00` |
+| Git tree | `9e02a16588e6a3e63f2655bc1fa6f6a5bce70b01` |
+| Parent commit | `524d1e76e44167bd39440ab56e8d0d3556f451e3` |
+| Catalog blob | `0605d08fed53cb3c0f45b277bb7d71021ffcf6f3` |
+| Raw catalog SHA-256 | `ee8c6b9c64d3530c428a6230a5661e21682b49ee1d1599f29043d43871241262` |
+| Commit signature | None (`git log --show-signature` reports no signature) |
+
+These values prove only that Git retained the revision-2 bytes. They do not
+constitute a product-owner review, a signed predecessor receipt, or permission
+to manufacture revision-1 identities. Revision 3 is a working correction until
+a later content-addressed lineage record binds its committed bytes. Breaking
+field or semantic changes still require a new schema/contract version.
 
 ## Promotion and Update Procedure
 
@@ -800,29 +843,33 @@ Each cell promotes independently:
    required target pair. Local Cargo output, a source scan, or a neighboring
    cell cannot replace the required run.
 5. Retain bounded structured artifacts with hashes, privacy classification,
-   sampling/overhead state, and offline replay instructions. Set each target
-   qualification's evidence state independently to `proven`, `proxy_only`,
-   `fixture_only`, `skipped_not_proven`, `blocked`, or `missing`.
+   sampling/overhead state, and offline replay instructions. Schema v1 may
+   record `proxy_only`, `fixture_only`, `skipped_not_proven`, `blocked`, or
+   `missing`; a `proven` result remains external pending a signed-receipt
+   contract and verifier.
 6. Apply the frozen SLO, correctness, recovery, resource, appearance,
-   accessibility, and intervention gates. Record each target-specific
-   `pass`, `fail`, `degraded`, `not_run`, or `target_unavailable` verdict
-   without translating it into support.
+   accessibility, and intervention gates. Schema v1 may record `fail`,
+   `degraded`, `not_run`, or `target_unavailable` without translating any
+   result into support. A passing receipt remains external and cannot be
+   serialized as `pass` in v1.
 7. Verify target-specific freshness against candidate, config, protocol,
    renderer, display, hardware, route, topology, and real-agent versions.
-   Record `current`, `stale`, or `unknown`; never hide mixed states in an
-   aggregate variant field.
+   Schema v1 may record `stale` or `unknown`; a verified `current` result
+   remains external until the later receipt verifier can bind every identity.
+   Never hide mixed states in an aggregate variant field.
 8. Obtain every required machine and human review. Visual, accessibility,
    privacy, and product-owner authority remains human where the contract
    requires it. Each review binds revision, commit, scope, authority kind, and
-   authority receipt.
+   authority receipt outside v1; schema v1 accepts automated informational
+   metadata only.
 9. Resolve or explicitly scope every open structured contradiction and run the
    schema, completeness, unique-ID, cross-reference, target-pair,
    contradiction, digest, and unsupported-case validators.
-10. Ask `.1.4` and `.12.1` to construct the signed promotion input only after
-    exact producer binding and every required current, proven, passing
-    target-pair qualification exist. `.12.9` remains the authority that
-    verifies the exact-candidate receipt and decides whether release/maturity
-    policy permits the claim.
+10. Ask `.1.4.1` and `.12.1` to construct the signed promotion input only after
+    exact producer binding and every required externally verified current,
+    proven, passing target-pair qualification exists. `.12.9` remains the
+    authority that verifies the exact-candidate receipt and decides whether
+    release/maturity policy permits the claim.
 11. If authority promotes the cell, retain the signed receipt externally and
     move the claim into a later authority-bearing schema/version. That contract
     may serialize the reserved `supported` shape only with
@@ -830,9 +877,10 @@ Each cell promotes independently:
     conditional and `catalog_claim_state = contract_only`; it is an input and
     historical contract record, not the promotion output.
 12. Update derived README, GUI guide, playbook, attestation, and release-note
-    wording only from the later receipt-authorized claim; append v1 review and
-    change history with exact commit and artifact identities. Derived prose
-    must never lead authority-bearing catalog data.
+    wording only from the later receipt-authorized claim. V1 may append
+    informational review/change metadata, but exact commit and artifact lineage
+    belongs in the later content-addressed contract. Derived prose must never
+    lead authority-bearing catalog data.
 
 Any candidate, config, protocol, renderer, display, hardware, route, topology,
 privacy policy, SLO, or supported-agent-version change that can affect a

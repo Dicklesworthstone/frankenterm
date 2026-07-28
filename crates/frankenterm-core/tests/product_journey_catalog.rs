@@ -48,6 +48,7 @@ fn load_schema_validator(root: &Path) -> Validator {
     let schema = read_json(&path);
     Validator::options()
         .with_draft(Draft::Draft202012)
+        .should_validate_formats(true)
         .build(&schema)
         .unwrap_or_else(|error| panic!("schema {} failed to compile: {error}", path.display()))
 }
@@ -331,7 +332,7 @@ fn assert_detached_sha256(root: &Path, reference: &str, expected: &str) {
     let path = root.join(reference_path(reference));
     let bytes = fs::read(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = hex::encode(Sha256::digest(bytes));
     assert_eq!(
         actual,
         expected,
@@ -510,13 +511,10 @@ fn schema_rejects_unknown_fields_versions_and_ambiguous_support_shapes() {
         "schema v1 is all-required and must reject reserved future scope values"
     );
 
-    let catalog_sha256 = format!(
-        "{:x}",
-        Sha256::digest(
-            fs::read(root.join(CATALOG_RELATIVE_PATH))
-                .expect("catalog bytes should be readable for forged-receipt mutation")
-        )
-    );
+    let catalog_sha256 = hex::encode(Sha256::digest(
+        fs::read(root.join(CATALOG_RELATIVE_PATH))
+            .expect("catalog bytes should be readable for forged-receipt mutation"),
+    ));
     let mut forged_human_authority = load_catalog_value(&root);
     let mut forged_review = forged_human_authority["review_history"][1].clone();
     forged_review["review_id"] = json!("ft.product-journey-review.forged-human");
@@ -536,26 +534,40 @@ fn schema_rejects_unknown_fields_versions_and_ambiguous_support_shapes() {
         "schema v1 must reject even a fully shaped content-bound claimed human approval without a trusted signature verifier"
     );
 
-    let mut unbound_current_evidence = load_catalog_value(&root);
-    let qualification = &mut unbound_current_evidence["variants"][0]["target_qualifications"][0];
+    let mut forged_human_information = load_catalog_value(&root);
+    forged_human_information["review_history"][1]["authority_kind"] = json!("human_product_owner");
+    assert!(
+        !schema_errors(&validator, &forged_human_information).is_empty(),
+        "schema v1 must reject claimed human authority even with an informational disposition"
+    );
+
+    let mut automated_with_commit = load_catalog_value(&root);
+    automated_with_commit["review_history"][1]["reviewed_commit"] = json!("0".repeat(40));
+    assert!(
+        !schema_errors(&validator, &automated_with_commit).is_empty(),
+        "automated informational metadata cannot claim a reviewed commit"
+    );
+
+    let mut unbound_retained_evidence = load_catalog_value(&root);
+    let qualification = &mut unbound_retained_evidence["variants"][0]["target_qualifications"][0];
     qualification["availability"] = json!("available");
-    qualification["evidence_state"] = json!("proven");
-    qualification["run_verdict"] = json!("pass");
-    qualification["freshness_state"] = json!("current");
+    qualification["evidence_state"] = json!("fixture_only");
+    qualification["run_verdict"] = json!("fail");
+    qualification["freshness_state"] = json!("stale");
     qualification["evidence_refs"] = json!([CATALOG_RELATIVE_PATH]);
     qualification["route_identity_ref"] = Value::Null;
     qualification["candidate_identity_ref"] = Value::Null;
     assert!(
-        !schema_errors(&validator, &unbound_current_evidence).is_empty(),
-        "current or executed evidence must bind both candidate and route identity"
+        !schema_errors(&validator, &unbound_retained_evidence).is_empty(),
+        "retained, executed, or stale evidence must bind both candidate and route identity"
     );
 
     let mut promoted_combined_m5 = load_catalog_value(&root);
     let qualification = &mut promoted_combined_m5["variants"][0]["target_qualifications"][2];
     qualification["availability"] = json!("available");
-    qualification["evidence_state"] = json!("proven");
-    qualification["run_verdict"] = json!("pass");
-    qualification["freshness_state"] = json!("current");
+    qualification["evidence_state"] = json!("fixture_only");
+    qualification["run_verdict"] = json!("fail");
+    qualification["freshness_state"] = json!("stale");
     qualification["route_identity_ref"] = json!(CATALOG_RELATIVE_PATH);
     qualification["candidate_identity_ref"] = json!(CATALOG_RELATIVE_PATH);
     qualification["evidence_refs"] = json!([CATALOG_RELATIVE_PATH]);
@@ -564,14 +576,36 @@ fn schema_rejects_unknown_fields_versions_and_ambiguous_support_shapes() {
         "transitional combined M5 Pro/Max lanes must remain unqualifiable in schema v1"
     );
 
-    let mut missing_identity_preflight = load_catalog_value(&root);
-    missing_identity_preflight["journey_definitions"][0]["setup"]
+    for (field, forbidden_value) in [
+        ("evidence_state", "proven"),
+        ("run_verdict", "pass"),
+        ("freshness_state", "current"),
+    ] {
+        let mut forged_positive_authority = load_catalog_value(&root);
+        let qualification =
+            &mut forged_positive_authority["variants"][0]["target_qualifications"][0];
+        qualification["availability"] = json!("available");
+        qualification["evidence_state"] = json!("fixture_only");
+        qualification["run_verdict"] = json!("fail");
+        qualification["freshness_state"] = json!("stale");
+        qualification["route_identity_ref"] = json!(CATALOG_RELATIVE_PATH);
+        qualification["candidate_identity_ref"] = json!(CATALOG_RELATIVE_PATH);
+        qualification["evidence_refs"] = json!([CATALOG_RELATIVE_PATH]);
+        qualification[field] = json!(forbidden_value);
+        assert!(
+            !schema_errors(&validator, &forged_positive_authority).is_empty(),
+            "schema v1 must reject unsupported positive authority `{field}={forbidden_value}`"
+        );
+    }
+
+    let mut missing_required_setup_slot = load_catalog_value(&root);
+    missing_required_setup_slot["journey_definitions"][0]["setup"]
         .as_array_mut()
         .expect("setup is an array")
         .remove(0);
     assert!(
-        !schema_errors(&validator, &missing_identity_preflight).is_empty(),
-        "setup must retain a separate index-zero identity/preflight boundary"
+        !schema_errors(&validator, &missing_required_setup_slot).is_empty(),
+        "schema v1 structurally requires two nonempty setup slots but cannot type their semantic roles"
     );
 }
 
@@ -823,8 +857,7 @@ fn target_qualifications_are_exact_per_pair_and_fail_closed() {
 
     for clear_route in [true, false] {
         let mut unbound_evidence = load_catalog(&root);
-        let qualification =
-            &mut first_variant(&mut unbound_evidence).target_qualifications[0];
+        let qualification = &mut first_variant(&mut unbound_evidence).target_qualifications[0];
         qualification.availability = TargetAvailability::Available;
         qualification.evidence_state = EvidenceState::Proven;
         qualification.run_verdict = RunVerdict::Pass;
@@ -859,6 +892,53 @@ fn target_qualifications_are_exact_per_pair_and_fail_closed() {
 }
 
 #[test]
+fn schema_v1_rejects_each_positive_evidence_authority_axis_independently() {
+    let root = repository_root();
+
+    let mut forged_proven = load_catalog(&root);
+    let qualification = &mut first_variant(&mut forged_proven).target_qualifications[0];
+    qualification.availability = TargetAvailability::Available;
+    qualification.evidence_state = EvidenceState::Proven;
+    qualification.run_verdict = RunVerdict::Fail;
+    qualification.freshness_state = FreshnessState::Stale;
+    qualification.route_identity_ref = Some(CATALOG_RELATIVE_PATH.to_string());
+    qualification.candidate_identity_ref = Some(CATALOG_RELATIVE_PATH.to_string());
+    qualification.evidence_refs = vec![CATALOG_RELATIVE_PATH.to_string()];
+    assert_has_code(
+        &forged_proven,
+        CatalogValidationCode::UnsupportedEvidenceAuthority,
+    );
+
+    let mut forged_pass = load_catalog(&root);
+    let qualification = &mut first_variant(&mut forged_pass).target_qualifications[0];
+    qualification.availability = TargetAvailability::Available;
+    qualification.evidence_state = EvidenceState::FixtureOnly;
+    qualification.run_verdict = RunVerdict::Pass;
+    qualification.freshness_state = FreshnessState::Stale;
+    qualification.route_identity_ref = Some(CATALOG_RELATIVE_PATH.to_string());
+    qualification.candidate_identity_ref = Some(CATALOG_RELATIVE_PATH.to_string());
+    qualification.evidence_refs = vec![CATALOG_RELATIVE_PATH.to_string()];
+    assert_has_code(
+        &forged_pass,
+        CatalogValidationCode::UnsupportedEvidenceAuthority,
+    );
+
+    let mut forged_current = load_catalog(&root);
+    let qualification = &mut first_variant(&mut forged_current).target_qualifications[0];
+    qualification.availability = TargetAvailability::Available;
+    qualification.evidence_state = EvidenceState::FixtureOnly;
+    qualification.run_verdict = RunVerdict::Fail;
+    qualification.freshness_state = FreshnessState::Current;
+    qualification.route_identity_ref = Some(CATALOG_RELATIVE_PATH.to_string());
+    qualification.candidate_identity_ref = Some(CATALOG_RELATIVE_PATH.to_string());
+    qualification.evidence_refs = vec![CATALOG_RELATIVE_PATH.to_string()];
+    assert_has_code(
+        &forged_current,
+        CatalogValidationCode::UnsupportedEvidenceAuthority,
+    );
+}
+
+#[test]
 fn contract_only_v1_cannot_mint_supported_or_evidence_bound_claims() {
     let root = repository_root();
     let mut catalog = load_catalog(&root);
@@ -888,6 +968,10 @@ fn contract_only_v1_cannot_mint_supported_or_evidence_bound_claims() {
     }
     assert_has_code(&catalog, CatalogValidationCode::ContractOnlySupportedClaim);
     assert_has_code(&catalog, CatalogValidationCode::UnsupportedClaimAuthority);
+    assert_has_code(
+        &catalog,
+        CatalogValidationCode::UnsupportedEvidenceAuthority,
+    );
 
     catalog.catalog_claim_state = CatalogClaimState::EvidenceBound;
     assert_has_code(&catalog, CatalogValidationCode::UnsupportedClaimAuthority);
@@ -1014,7 +1098,7 @@ fn readme_claim_text_and_fingerprints_match_exact_bytes() {
             mapping.mapping_id,
             mapping.readme_ref
         );
-        let actual = format!("{:x}", Sha256::digest(mapping.claim_text.as_bytes()));
+        let actual = hex::encode(Sha256::digest(mapping.claim_text.as_bytes()));
         assert_eq!(
             mapping.claim_sha256, actual,
             "{} README claim fingerprint drifted",
@@ -1039,8 +1123,9 @@ fn automated_review_cannot_approve_or_mint_authority() {
     let catalog = load_catalog(&root);
     let current = catalog
         .review_history
-        .first()
-        .expect("checked-in catalog retains an informational review");
+        .iter()
+        .find(|review| review.reviewed_catalog_revision == catalog.catalog_revision)
+        .expect("checked-in current catalog revision retains an informational review");
     assert_eq!(
         current.authority_kind,
         ReviewAuthorityKind::AutomatedInformational
@@ -1061,6 +1146,21 @@ fn automated_review_cannot_approve_or_mint_authority() {
     review.authority_receipt_sha256 = Some("0".repeat(64));
     assert_has_code(
         &automated_approval,
+        CatalogValidationCode::InvalidReviewAuthority,
+    );
+
+    let mut automated_with_commit = catalog.clone();
+    automated_with_commit.review_history[1].reviewed_commit = Some("0".repeat(40));
+    assert_has_code(
+        &automated_with_commit,
+        CatalogValidationCode::InvalidReviewAuthority,
+    );
+
+    let mut forged_human_information = catalog.clone();
+    forged_human_information.review_history[1].authority_kind =
+        ReviewAuthorityKind::HumanProductOwner;
+    assert_has_code(
+        &forged_human_information,
         CatalogValidationCode::InvalidReviewAuthority,
     );
 
@@ -1085,13 +1185,10 @@ fn automated_review_cannot_approve_or_mint_authority() {
     forged.scope = vec!["catalog_contract".to_string()];
     forged.reviewed_commit = Some("0".repeat(40));
     forged.authority_receipt_ref = Some(CATALOG_RELATIVE_PATH.to_string());
-    forged.authority_receipt_sha256 = Some(format!(
-        "{:x}",
-        Sha256::digest(
-            fs::read(root.join(CATALOG_RELATIVE_PATH))
-                .expect("catalog bytes should be readable for forged approval")
-        )
-    ));
+    forged.authority_receipt_sha256 = Some(hex::encode(Sha256::digest(
+        fs::read(root.join(CATALOG_RELATIVE_PATH))
+            .expect("catalog bytes should be readable for forged approval"),
+    )));
     forged_human_approval.review_history.push(forged);
     assert_has_code(
         &forged_human_approval,
@@ -1237,6 +1334,56 @@ fn canonical_journey_gate_and_mapping_assignments_cannot_be_swapped() {
 }
 
 #[test]
+fn declared_review_and_change_metadata_are_revision_bound() {
+    let root = repository_root();
+    let catalog = load_catalog(&root);
+    assert_eq!(catalog.catalog_revision, "2026-07-27.3");
+    assert_eq!(
+        catalog
+            .change_history
+            .iter()
+            .map(|record| record.catalog_revision.as_str())
+            .collect::<Vec<_>>(),
+        ["2026-07-27.1", "2026-07-27.2", "2026-07-27.3"]
+    );
+    assert_eq!(
+        catalog
+            .review_history
+            .iter()
+            .map(|record| record.reviewed_catalog_revision.as_str())
+            .collect::<Vec<_>>(),
+        ["2026-07-27.1", "2026-07-27.2", "2026-07-27.3"],
+        "each declared revision must retain its own informational review metadata"
+    );
+
+    let mut rewritten_initial_review = catalog.clone();
+    rewritten_initial_review.review_history[0].reviewed_catalog_revision =
+        "2026-07-27.2".to_string();
+    assert_has_code(
+        &rewritten_initial_review,
+        CatalogValidationCode::InvalidReviewAuthority,
+    );
+
+    let mut removed_initial_change = catalog.clone();
+    removed_initial_change.change_history.remove(0);
+    assert_has_code(
+        &removed_initial_change,
+        CatalogValidationCode::InvalidDefinition,
+    );
+
+    let mut ambient_unreviewed_revision = catalog.clone();
+    ambient_unreviewed_revision.catalog_revision = "2026-07-27.4".to_string();
+    assert_has_code(
+        &ambient_unreviewed_revision,
+        CatalogValidationCode::InvalidReviewAuthority,
+    );
+    assert_has_code(
+        &ambient_unreviewed_revision,
+        CatalogValidationCode::InvalidDefinition,
+    );
+}
+
+#[test]
 fn timestamps_and_initial_review_provenance_are_canonical() {
     let root = repository_root();
 
@@ -1260,6 +1407,23 @@ fn timestamps_and_initial_review_provenance_are_canonical() {
     assert_has_code(
         &narrowed_review_sources,
         CatalogValidationCode::InvalidReviewAuthority,
+    );
+
+    let mut rewritten_initial_reviewer = load_catalog(&root);
+    rewritten_initial_reviewer.review_history[0].reviewer =
+        "Claimed human product owner".to_string();
+    assert_has_code(
+        &rewritten_initial_reviewer,
+        CatalogValidationCode::InvalidReviewAuthority,
+    );
+
+    let mut missing_required_setup_slot = load_catalog(&root);
+    missing_required_setup_slot.journey_definitions[0]
+        .setup
+        .remove(0);
+    assert_has_code(
+        &missing_required_setup_slot,
+        CatalogValidationCode::EmptyLifecyclePhase,
     );
 }
 

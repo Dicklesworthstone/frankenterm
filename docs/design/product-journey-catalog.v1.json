@@ -1,7 +1,7 @@
 {
   "contract_id": "ft.product_journey_catalog.v1",
   "schema_version": 1,
-  "catalog_revision": "2026-07-27.2",
+  "catalog_revision": "2026-07-27.3",
   "source_bead_id": "ft-interactive-swarm-product-convergence-7xqz4.1.1",
   "catalog_claim_state": "contract_only",
   "personas": [
@@ -1674,7 +1674,6 @@
       "journey_ids": [
         "journey.attention_and_verified_submit",
         "journey.concurrent_maintenance",
-        "journey.component_crash_recovery",
         "journey.accessible_operator_day",
         "journey.version_pinned_agent_dogfood"
       ],
@@ -3920,6 +3919,29 @@
         "docs/design/product-journey-contract.md",
         "docs/json-schema/ft-product-journey-catalog.json"
       ]
+    },
+    {
+      "review_id": "ft.product-journey-review.2026-07-28.negative-evidence-hardening",
+      "reviewed_at_utc": "2026-07-28T02:18:16Z",
+      "reviewed_catalog_revision": "2026-07-27.3",
+      "reviewed_commit": null,
+      "reviewer": "Codex adversarial provenance review",
+      "authority_kind": "automated_informational",
+      "disposition": "informational",
+      "scope": [
+        "Negative evidence for catalog provenance, positive evidence authority, review authority, lifecycle limits, and exact journey projection."
+      ],
+      "authority_receipt_ref": null,
+      "authority_receipt_sha256": null,
+      "notes": "Automated informational correction only. Revision 1 was an unretained uncommitted draft represented only by current metadata; revision 2 was the first retained catalog artifact. Schema v1 cannot prove predecessor retention and now rejects proven evidence, pass verdicts, current freshness, human authority, and automated reviewed-commit claims until later signed-receipt contracts exist. The local-only interactive q050 projection was corrected to its canonical journey set. Human product-owner and specialist approvals remain pending; no cell is supported.",
+      "source_refs": [
+        ".beads/issues.jsonl",
+        "crates/frankenterm-core-audit-types/src/product_journey_catalog.rs",
+        "crates/frankenterm-core/tests/product_journey_catalog.rs",
+        "docs/design/product-journey-catalog.v1.json",
+        "docs/design/product-journey-contract.md",
+        "docs/json-schema/ft-product-journey-catalog.json"
+      ]
     }
   ],
   "change_history": [
@@ -3938,6 +3960,19 @@
       "catalog_revision": "2026-07-27.2",
       "changed_at_utc": "2026-07-28T01:00:19Z",
       "summary": "Fail-closed authority hardening: retained append-only review and change revisions, rejected unsigned human dispositions in schema v1, required candidate and route identity for evidence, froze the transitional combined M5 Pro/Max lane, and enforced setup index zero as the pre-mutation identity/preflight boundary.",
+      "source_refs": [
+        ".beads/issues.jsonl",
+        "crates/frankenterm-core-audit-types/src/product_journey_catalog.rs",
+        "crates/frankenterm-core/tests/product_journey_catalog.rs",
+        "docs/design/product-journey-contract.md",
+        "docs/json-schema/ft-product-journey-catalog.json"
+      ]
+    },
+    {
+      "change_id": "change.2026_07_27.3",
+      "catalog_revision": "2026-07-27.3",
+      "changed_at_utc": "2026-07-28T02:18:16Z",
+      "summary": "Negative-evidence correction: recorded revision 1 as an unretained draft and revision 2 as the first retained artifact, rejected all positive evidence and human-review authority in schema v1, aligned automated reviewed-commit rules, enabled designated date-time assertion, and corrected the local interactive q050 journey projection.",
       "source_refs": [
         ".beads/issues.jsonl",
         "crates/frankenterm-core-audit-types/src/product_journey_catalog.rs",

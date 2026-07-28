@@ -256,23 +256,23 @@
     "evidence_state": {
       "type": "string",
       "enum": [
-        "proven",
         "proxy_only",
         "fixture_only",
         "skipped_not_proven",
         "blocked",
         "missing"
-      ]
+      ],
+      "description": "Schema v1 cannot mint proven evidence; positive evidence authority requires a later signed-receipt contract."
     },
     "run_verdict": {
       "type": "string",
       "enum": [
-        "pass",
         "fail",
         "degraded",
         "not_run",
         "target_unavailable"
-      ]
+      ],
+      "description": "Schema v1 cannot mint a passing run verdict; positive run authority requires a later signed-receipt contract."
     },
     "producer_coverage": {
       "type": "string",
@@ -315,28 +315,20 @@
     "freshness_state": {
       "type": "string",
       "enum": [
-        "current",
         "stale",
         "unknown"
-      ]
+      ],
+      "description": "Schema v1 cannot mint current freshness; positive candidate-and-route freshness authority requires a later signed-receipt contract."
     },
     "review_authority_kind": {
       "type": "string",
-      "enum": [
-        "automated_informational",
-        "human_product_owner",
-        "human_visual",
-        "human_accessibility",
-        "human_privacy"
-      ]
+      "const": "automated_informational",
+      "description": "Schema v1 retains automated informational review metadata only; human authority requires a later signed-receipt contract."
     },
     "review_disposition": {
       "type": "string",
-      "enum": [
-        "approved",
-        "changes_requested",
-        "informational"
-      ]
+      "const": "informational",
+      "description": "Schema v1 cannot encode an approval or changes-requested authority decision."
     },
     "contradiction_status": {
       "type": "string",
@@ -981,7 +973,6 @@
                 "properties": {
                   "freshness_state": {
                     "enum": [
-                      "current",
                       "stale"
                     ]
                   }
@@ -994,7 +985,6 @@
                 "properties": {
                   "evidence_state": {
                     "enum": [
-                      "proven",
                       "proxy_only",
                       "fixture_only"
                     ]
@@ -1008,7 +998,6 @@
                 "properties": {
                   "run_verdict": {
                     "enum": [
-                      "pass",
                       "fail",
                       "degraded"
                     ]
