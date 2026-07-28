@@ -434,8 +434,7 @@ const PANE_REGISTRATION_DEFERRED_RETIREMENT: usize = 1usize << (usize::BITS - 2)
 const PANE_REGISTRATION_OPERATION_MASK: usize = PANE_REGISTRATION_DEFERRED_RETIREMENT - 1;
 
 fn pane_registration_is_quiescent(state: usize) -> bool {
-    state & PANE_REGISTRATION_RETIRED != 0
-        && state & PANE_REGISTRATION_OPERATION_MASK == 0
+    state & PANE_REGISTRATION_RETIRED != 0 && state & PANE_REGISTRATION_OPERATION_MASK == 0
 }
 
 impl PaneRegistrationGeneration {
@@ -746,10 +745,13 @@ impl PaneReaderStartGate {
             .is_some_and(|owner| std::ptr::eq::<Mux>(owner.as_ref(), mux));
         let is_registered = owns_generation && {
             let _registration = mux.pane_registration.lock();
-            mux.panes.read().get(&self.pane_id).is_some_and(|registered| {
-                Weak::ptr_eq(&Arc::downgrade(&registered.pane), &self.pane)
-                    && Arc::ptr_eq(&registered.generation, &self.generation)
-            })
+            mux.panes
+                .read()
+                .get(&self.pane_id)
+                .is_some_and(|registered| {
+                    Weak::ptr_eq(&Arc::downgrade(&registered.pane), &self.pane)
+                        && Arc::ptr_eq(&registered.generation, &self.generation)
+                })
         };
         if !is_registered {
             return;
@@ -926,11 +928,7 @@ impl PaneLifecycleTicketDispatch {
         Self::finish(&self.owner, ticket, scheduled);
     }
 
-    fn finish(
-        owner: &Weak<Mux>,
-        ticket: PaneLifecycleNotificationTicket,
-        scheduled: bool,
-    ) {
+    fn finish(owner: &Weak<Mux>, ticket: PaneLifecycleNotificationTicket, scheduled: bool) {
         if let Some(mux) = owner.upgrade() {
             if scheduled && !mux.is_main_thread() {
                 log::error!(
@@ -1014,12 +1012,10 @@ impl PaneOutputBatch {
             if next > PANE_OUTPUT_BATCH_PRODUCER_MASK {
                 return false;
             }
-            match self.state.compare_exchange_weak(
-                state,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return true,
                 Err(actual) => state = actual,
             }
@@ -1094,11 +1090,7 @@ impl PaneRetirementDispatch {
         Self::finish(&self.owner, completion, scheduled);
     }
 
-    fn finish(
-        owner: &Weak<Mux>,
-        completion: PaneRetirementCompletion,
-        scheduled: bool,
-    ) {
+    fn finish(owner: &Weak<Mux>, completion: PaneRetirementCompletion, scheduled: bool) {
         if let Some(mux) = owner.upgrade() {
             if scheduled && !mux.is_main_thread() {
                 log::error!(
@@ -1152,7 +1144,8 @@ impl PaneRetirementCompletion {
     fn complete(self, mux: Option<&Mux>) {
         if self.kill {
             log::debug!("killing pane {}", self.pane_id);
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pane.kill())).is_err() {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pane.kill())).is_err()
+            {
                 log::error!(
                     "pane {} panicked while being killed; completing removal lifecycle",
                     self.pane_id
@@ -1410,8 +1403,7 @@ fn resolve_pane_reader_mux(
         .read()
         .get(&pane.pane_id())
         .is_some_and(|registered| {
-            Arc::ptr_eq(&registered.pane, pane)
-                && Arc::ptr_eq(&registered.generation, generation)
+            Arc::ptr_eq(&registered.pane, pane) && Arc::ptr_eq(&registered.generation, generation)
         });
     is_registered.then_some(mux)
 }
@@ -1447,11 +1439,8 @@ fn send_actions_to_mux_with_scheduler_state(
         dead.store(true, Ordering::Release);
         return;
     };
-    let Some(output) = mux.reserve_pane_output_for_reader(
-        &pane,
-        generation,
-        scheduler_configured,
-    ) else {
+    let Some(output) = mux.reserve_pane_output_for_reader(&pane, generation, scheduler_configured)
+    else {
         dead.store(true, Ordering::Release);
         return;
     };
@@ -1539,12 +1528,7 @@ fn parse_buffered_data(
                     }
                     if !was_holding && hold.is_holding() && !actions.is_empty() {
                         // Flush prior actions before entering BSU hold.
-                        send_actions_to_mux(
-                            &pane,
-                            &generation,
-                            dead,
-                            std::mem::take(&mut actions),
-                        );
+                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
                         action_size = 0;
                     }
                     if !effect.handled {
@@ -1552,12 +1536,7 @@ fn parse_buffered_data(
                     }
 
                     if effect.flush && !actions.is_empty() {
-                        send_actions_to_mux(
-                            &pane,
-                            &generation,
-                            dead,
-                            std::mem::take(&mut actions),
-                        );
+                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
                         action_size = 0;
                     }
                 });
@@ -1591,12 +1570,7 @@ fn parse_buffered_data(
                         },
                     );
                     if !actions.is_empty() {
-                        send_actions_to_mux(
-                            &pane,
-                            &generation,
-                            dead,
-                            std::mem::take(&mut actions),
-                        );
+                        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
                     }
                     deadline = None;
                     action_size = 0;
@@ -1638,12 +1612,7 @@ fn parse_buffered_data(
                         }
                     }
 
-                    send_actions_to_mux(
-                        &pane,
-                        &generation,
-                        dead,
-                        std::mem::take(&mut actions),
-                    );
+                    send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
                     deadline = None;
                     action_size = 0;
                 }
@@ -1660,12 +1629,7 @@ fn parse_buffered_data(
     // for very short lived commands so that we don't forget to
     // display what they displayed.
     if !actions.is_empty() {
-        send_actions_to_mux(
-            &pane,
-            &generation,
-            dead,
-            std::mem::take(&mut actions),
-        );
+        send_actions_to_mux(&pane, &generation, dead, std::mem::take(&mut actions));
     }
 }
 
@@ -1786,21 +1750,11 @@ fn read_from_pane_pty(
     let exit_behavior = exit_behavior.unwrap_or_else(|| configuration().exit_behavior);
     if promise::spawn::is_scheduler_configured() {
         promise::spawn::spawn_into_main_thread(async move {
-            finish_pane_reader_eof(
-                &pane_for_lifecycle,
-                &generation,
-                pane_id,
-                exit_behavior,
-            );
+            finish_pane_reader_eof(&pane_for_lifecycle, &generation, pane_id, exit_behavior);
         })
         .detach();
     } else {
-        finish_pane_reader_eof(
-            &pane_for_lifecycle,
-            &generation,
-            pane_id,
-            exit_behavior,
-        );
+        finish_pane_reader_eof(&pane_for_lifecycle, &generation, pane_id, exit_behavior);
     }
 
     dead.store(true, Ordering::Release);
@@ -2413,9 +2367,7 @@ impl Mux {
                         .by_pane
                         .get(&pane_id)
                         .and_then(|notifications| notifications.front())
-                        .is_some_and(|notification| {
-                            notification.ready.load(Ordering::Acquire)
-                        });
+                        .is_some_and(|notification| notification.ready.load(Ordering::Acquire));
                     if notification_ready {
                         let notification = pending
                             .by_pane
@@ -2571,14 +2523,10 @@ impl Mux {
         let pane_id = pane.pane_id();
         let (batch, operation, should_schedule, owner) = {
             let _registration = self.pane_registration.lock();
-            let is_registered = self
-                .panes
-                .read()
-                .get(&pane_id)
-                .is_some_and(|registered| {
-                    Arc::ptr_eq(&registered.pane, pane)
-                        && Arc::ptr_eq(&registered.generation, generation)
-                });
+            let is_registered = self.panes.read().get(&pane_id).is_some_and(|registered| {
+                Arc::ptr_eq(&registered.pane, pane)
+                    && Arc::ptr_eq(&registered.generation, generation)
+            });
             if !is_registered {
                 return None;
             }
@@ -2595,11 +2543,10 @@ impl Mux {
                 }
                 Some(_) => return None,
                 None => {
-                    let lifecycle_notification = self
-                        .enqueue_pane_lifecycle_notification_locked(
-                            PaneLifecycleNotification::Output(pane_id),
-                            None,
-                        );
+                    let lifecycle_notification = self.enqueue_pane_lifecycle_notification_locked(
+                        PaneLifecycleNotification::Output(pane_id),
+                        None,
+                    );
                     let batch = PaneOutputBatch::new(
                         pane_id,
                         Arc::clone(generation),
@@ -2722,8 +2669,7 @@ impl Mux {
                 batches
             };
 
-            histogram!("mux.notifications.pane_output.batch_size")
-                .record(batches.len() as f64);
+            histogram!("mux.notifications.pane_output.batch_size").record(batches.len() as f64);
             for batch in batches {
                 batch.seal();
             }
@@ -2964,16 +2910,11 @@ impl Mux {
     ) -> Result<Option<PanePreparationClaim<'_>>, Error> {
         let pane_id = pane.pane_id();
         let weak_pane = Arc::downgrade(pane);
-        let generation = PaneRegistrationGeneration::new(
-            pane_id,
-            &self.pane_retirements,
-            Arc::downgrade(self),
-        );
+        let generation =
+            PaneRegistrationGeneration::new(pane_id, &self.pane_retirements, Arc::downgrade(self));
         let _registration = self.pane_registration.lock();
         if self.retiring_pane_ids.lock().contains(&pane_id)
-            || self
-                .pane_retirements
-                .has_in_flight_retirement(pane_id)
+            || self.pane_retirements.has_in_flight_retirement(pane_id)
         {
             return Err(PaneIdCollision { pane_id }.into());
         }
@@ -3021,8 +2962,7 @@ impl Mux {
         let Some(preparing) = claims.get_mut(&pane_id) else {
             return false;
         };
-        if !expected
-            .is_none_or(|expected| Weak::ptr_eq(&preparing.pane, &Arc::downgrade(expected)))
+        if !expected.is_none_or(|expected| Weak::ptr_eq(&preparing.pane, &Arc::downgrade(expected)))
         {
             return false;
         }
@@ -3063,9 +3003,7 @@ impl Mux {
         generation: &Arc<PaneRegistrationGeneration>,
     ) -> Result<(), Error> {
         if self.retiring_pane_ids.lock().contains(&pane_id)
-            || self
-                .pane_retirements
-                .has_in_flight_retirement(pane_id)
+            || self.pane_retirements.has_in_flight_retirement(pane_id)
         {
             return Err(PaneIdCollision { pane_id }.into());
         }
@@ -3194,12 +3132,11 @@ impl Mux {
                         }
                     })
             };
-            let parser_thread = parser_spawn_result
-                .map_err(|err| {
-                    dead.store(true, Ordering::Release);
-                    let _ = coordinator.cancel();
-                    anyhow!("failed to spawn pane parser thread for pane {pane_id}: {err}")
-                })?;
+            let parser_thread = parser_spawn_result.map_err(|err| {
+                dead.store(true, Ordering::Release);
+                let _ = coordinator.cancel();
+                anyhow!("failed to spawn pane parser thread for pane {pane_id}: {err}")
+            })?;
 
             let reader_coordinator = Arc::clone(&coordinator);
             let reader_ready = ready_tx.clone();
@@ -3328,11 +3265,7 @@ impl Mux {
         let publication_result = {
             let _registration = self.pane_registration.lock();
             let result = if preparation_claim.is_authoritative_locked() {
-                self.insert_pane_registration_locked(
-                    pane_id,
-                    pane,
-                    &preparation_claim.generation,
-                )
+                self.insert_pane_registration_locked(pane_id, pane, &preparation_claim.generation)
                     .map(|()| {
                         self.enqueue_pane_lifecycle_notification_locked(
                             PaneLifecycleNotification::Added(pane_id),
@@ -3403,11 +3336,7 @@ impl Mux {
                         if !claim.is_authoritative_locked() {
                             return Err(PanePreparationCancelled { pane_id }.into());
                         }
-                        self.insert_pane_registration_locked(
-                            pane_id,
-                            &pane,
-                            &claim.generation,
-                        )?;
+                        self.insert_pane_registration_locked(pane_id, &pane, &claim.generation)?;
                         let tab_was_inserted = match self.insert_tab_registration_locked(tab) {
                             Ok(tab_was_inserted) => tab_was_inserted,
                             Err(err) => {
@@ -3488,16 +3417,15 @@ impl Mux {
             let output_batch = registration.as_ref().and_then(|(_, generation)| {
                 self.take_pending_pane_output_batch_locked(pane_id, generation)
             });
-            let removed =
-                registration.map(|(pane, generation)| RemovedPaneRegistration {
-                    pane_id,
-                    pane,
-                    generation,
-                    lifecycle_notification: self.enqueue_pane_lifecycle_notification_locked(
-                        PaneLifecycleNotification::Removed(pane_id),
-                        None,
-                    ),
-                });
+            let removed = registration.map(|(pane, generation)| RemovedPaneRegistration {
+                pane_id,
+                pane,
+                generation,
+                lifecycle_notification: self.enqueue_pane_lifecycle_notification_locked(
+                    PaneLifecycleNotification::Removed(pane_id),
+                    None,
+                ),
+            });
             (
                 removed,
                 needs_cleanup,
@@ -3559,8 +3487,7 @@ impl Mux {
         generation: &Arc<PaneRegistrationGeneration>,
     ) {
         log::debug!("removing exact pane registration generation {}", pane_id);
-        if let Some(removed) =
-            self.take_pane_for_removal(pane_id, Some(expected), Some(generation))
+        if let Some(removed) = self.take_pane_for_removal(pane_id, Some(expected), Some(generation))
         {
             self.finish_pane_removal(removed, true);
             self.recompute_pane_count();
@@ -4416,13 +4343,7 @@ struct PaneRegistrationCallbackTarget {
 }
 
 impl PaneRegistrationCallbackTarget {
-    fn resolve(
-        &self,
-    ) -> Option<(
-        PaneRegistrationOperationLease,
-        Arc<dyn Pane>,
-        Arc<Mux>,
-    )> {
+    fn resolve(&self) -> Option<(PaneRegistrationOperationLease, Arc<dyn Pane>, Arc<Mux>)> {
         let generation = self.generation.upgrade()?;
         let operation = generation.try_acquire()?;
         let pane = self.pane.upgrade()?;
@@ -4896,12 +4817,7 @@ mod tests {
                 .generation,
         );
 
-        send_actions_to_mux(
-            &Arc::downgrade(&pane),
-            &generation,
-            &dead,
-            Vec::new(),
-        );
+        send_actions_to_mux(&Arc::downgrade(&pane), &generation, &dead, Vec::new());
 
         assert!(
             !dead.load(Ordering::Acquire),
@@ -4983,11 +4899,7 @@ mod tests {
         assert_eq!(download_events.load(Ordering::SeqCst), 1);
         assert_eq!(replacement_events.load(Ordering::SeqCst), 0);
 
-        originating_mux.remove_pane_if_same_generation(
-            105,
-            &originating_pane,
-            &generation,
-        );
+        originating_mux.remove_pane_if_same_generation(105, &originating_pane, &generation);
         assert!(
             clipboard
                 .set_contents(ClipboardSelection::Clipboard, Some("stale".to_string()))
@@ -5089,9 +5001,12 @@ mod tests {
                 .expect("initial generation should be live")
                 .generation,
         );
-        let admitted = generation
+        let admitted_first = generation
             .try_acquire()
-            .expect("live generation should admit an operation");
+            .expect("live generation should admit the first operation");
+        let admitted_last = generation
+            .try_acquire()
+            .expect("live generation should admit the second operation");
 
         mux.remove_pane_if_same_generation(104, &pane, &generation);
 
@@ -5111,7 +5026,15 @@ mod tests {
             "same-ID reuse must remain fenced while cleanup is pending",
         );
 
-        drop(admitted);
+        drop(admitted_first);
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "cleanup must wait for every admitted operation",
+        );
+        assert_eq!(removed.load(Ordering::SeqCst), 0);
+
+        drop(admitted_last);
 
         assert_eq!(kills.load(Ordering::SeqCst), 1);
         assert_eq!(removed.load(Ordering::SeqCst), 1);
@@ -5223,6 +5146,49 @@ mod tests {
     }
 
     #[test]
+    fn discarded_retirement_dispatch_cannot_strand_claimed_cleanup() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(106, test_size());
+        let removed = Arc::new(AtomicUsize::new(0));
+        let removed_for_subscriber = Arc::clone(&removed);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::PaneRemoved(106)) {
+                removed_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        let lifecycle_notification = {
+            let _registration = mux.pane_registration.lock();
+            assert!(mux.retiring_pane_ids.lock().insert(106));
+            mux.enqueue_pane_lifecycle_notification_locked(
+                PaneLifecycleNotification::Removed(106),
+                None,
+            )
+        };
+        let dispatch = PaneRetirementDispatch::new(
+            Arc::downgrade(&mux),
+            PaneRetirementCompletion {
+                pane_id: 106,
+                pane: Arc::clone(&pane),
+                kill: true,
+                lifecycle_notification,
+            },
+        );
+        drop(dispatch);
+
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            1,
+            "dispatch guard must recover cleanup when the runnable is dropped",
+        );
+        assert_eq!(removed.load(Ordering::SeqCst), 1);
+        mux.add_pane(&pane)
+            .expect("fallback cleanup must release the same-ID fence");
+    }
+
+    #[test]
     fn quiescent_removal_does_not_block_unrelated_pane_lifecycle() {
         let mux = Arc::new(Mux::new(None));
         let (pane_a, _) = KillCountingPane::new(106, test_size());
@@ -5266,9 +5232,7 @@ mod tests {
             .expect("pane B registration must not block behind pane A cleanup");
         mux.add_pane(&pane_c)
             .expect("pane C registration must not block behind pane A cleanup");
-        assert!(
-            mux.enqueue_pane_output_notification_for_pane_with_scheduler_state(&pane_c, false)
-        );
+        assert!(mux.enqueue_pane_output_notification_for_pane_with_scheduler_state(&pane_c, false));
 
         assert_eq!(
             &*events.lock(),
@@ -5341,8 +5305,7 @@ mod tests {
     fn generation_acquire_retire_race_never_admits_post_retirement_work() {
         for pane_id in 200..300 {
             let tracker = Arc::new(PaneRetirementTracker::default());
-            let generation =
-                PaneRegistrationGeneration::new(pane_id, &tracker, Weak::new());
+            let generation = PaneRegistrationGeneration::new(pane_id, &tracker, Weak::new());
             let barrier = Arc::new(std::sync::Barrier::new(3));
 
             let generation_for_acquire = Arc::clone(&generation);
@@ -5362,20 +5325,30 @@ mod tests {
             let admitted = acquire_thread
                 .join()
                 .expect("acquire racer should not panic");
-            retire_thread
-                .join()
-                .expect("retire racer should not panic");
+            retire_thread.join().expect("retire racer should not panic");
             assert!(
                 generation.try_acquire().is_none(),
                 "no operation may be admitted after retirement",
             );
+            let retired_state = generation.operation_state.load(Ordering::Acquire);
 
             if let Some(admitted) = admitted {
+                assert_ne!(
+                    retired_state & PANE_REGISTRATION_DEFERRED_RETIREMENT,
+                    0,
+                    "retirement must remember that admitted work existed at linearization",
+                );
                 assert!(
                     tracker.has_in_flight_retirement(pane_id),
                     "a pre-retirement operation must fence same-ID reuse",
                 );
                 drop(admitted);
+            } else {
+                assert_eq!(
+                    retired_state & PANE_REGISTRATION_DEFERRED_RETIREMENT,
+                    0,
+                    "retirement that wins admission must retain inline cleanup policy",
+                );
             }
             assert!(!tracker.has_in_flight_retirement(pane_id));
         }
@@ -5385,10 +5358,9 @@ mod tests {
     fn generation_operation_count_exhaustion_fails_closed_without_wrap() {
         let tracker = Arc::new(PaneRetirementTracker::default());
         let generation = PaneRegistrationGeneration::new(300, &tracker, Weak::new());
-        generation.operation_state.store(
-            PANE_REGISTRATION_OPERATION_MASK,
-            Ordering::Release,
-        );
+        generation
+            .operation_state
+            .store(PANE_REGISTRATION_OPERATION_MASK, Ordering::Release);
 
         assert!(generation.try_acquire().is_none());
         assert_eq!(
@@ -5551,8 +5523,7 @@ mod tests {
             assert!(!mux.pane_preparations.lock().contains_key(&pane_id));
             let pending_lifecycle = mux.pending_pane_lifecycle.lock();
             assert!(
-                pending_lifecycle.by_pane.is_empty()
-                    && pending_lifecycle.retirements.is_empty(),
+                pending_lifecycle.by_pane.is_empty() && pending_lifecycle.retirements.is_empty(),
                 "failed preparation must not enqueue PaneAdded",
             );
             drop(pending_lifecycle);
@@ -5717,12 +5688,8 @@ mod tests {
         Mux::set_mux(&originating_mux);
 
         let reader = std::io::Cursor::new(b"o".to_vec());
-        let (originating_pane, _) = KillCountingPane::new_with_reader(
-            123,
-            test_size(),
-            Some(Box::new(reader)),
-            false,
-        );
+        let (originating_pane, _) =
+            KillCountingPane::new_with_reader(123, test_size(), Some(Box::new(reader)), false);
         let replacement_pane = Arc::clone(&originating_pane);
 
         let (added_entered_tx, added_entered_rx) = std::sync::mpsc::channel();
@@ -6521,11 +6488,7 @@ mod tests {
             91,
             LivePaneRegistration {
                 pane: Arc::clone(&replacement),
-                generation: PaneRegistrationGeneration::new(
-                    91,
-                    &mux.pane_retirements,
-                    Weak::new(),
-                ),
+                generation: PaneRegistrationGeneration::new(91, &mux.pane_retirements, Weak::new()),
             },
         );
 
