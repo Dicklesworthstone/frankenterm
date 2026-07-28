@@ -1422,6 +1422,22 @@ fn send_actions_to_mux(
     dead: &Arc<AtomicBool>,
     actions: Vec<Action>,
 ) {
+    send_actions_to_mux_with_scheduler_state(
+        pane,
+        generation,
+        dead,
+        actions,
+        promise::spawn::is_scheduler_configured(),
+    );
+}
+
+fn send_actions_to_mux_with_scheduler_state(
+    pane: &Weak<dyn Pane>,
+    generation: &Arc<PaneRegistrationGeneration>,
+    dead: &Arc<AtomicBool>,
+    actions: Vec<Action>,
+    scheduler_configured: bool,
+) {
     let start = Instant::now();
     let Some(pane) = pane.upgrade() else {
         dead.store(true, Ordering::Release);
@@ -1434,7 +1450,7 @@ fn send_actions_to_mux(
     let Some(output) = mux.reserve_pane_output_for_reader(
         &pane,
         generation,
-        promise::spawn::is_scheduler_configured(),
+        scheduler_configured,
     ) else {
         dead.store(true, Ordering::Release);
         return;
@@ -3436,7 +3452,7 @@ impl Mux {
         expected: Option<&Arc<dyn Pane>>,
         expected_generation: Option<&Arc<PaneRegistrationGeneration>>,
     ) -> Option<RemovedPaneRegistration> {
-        let (removed, needs_cleanup, cleanup_only_fence_owned) = {
+        let (removed, needs_cleanup, cleanup_only_fence_owned, output_batch) = {
             let _registration = self.pane_registration.lock();
             let preparation_cancelled = if expected_generation.is_none() {
                 self.cancel_pane_preparation_locked(pane_id, expected)
@@ -3469,6 +3485,9 @@ impl Mux {
                 expected.is_none() || preparation_cancelled || registration.is_some();
             let fence_inserted = needs_cleanup && self.retiring_pane_ids.lock().insert(pane_id);
             let cleanup_only_fence_owned = fence_inserted && registration.is_none();
+            let output_batch = registration.as_ref().and_then(|(_, generation)| {
+                self.take_pending_pane_output_batch_locked(pane_id, generation)
+            });
             let removed =
                 registration.map(|(pane, generation)| RemovedPaneRegistration {
                     pane_id,
@@ -3479,9 +3498,18 @@ impl Mux {
                         None,
                     ),
                 });
-            (removed, needs_cleanup, cleanup_only_fence_owned)
+            (
+                removed,
+                needs_cleanup,
+                cleanup_only_fence_owned,
+                output_batch,
+            )
         };
 
+        if let Some(output_batch) = output_batch {
+            histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
+            output_batch.seal();
+        }
         if needs_cleanup {
             self.discard_removed_pane_states(&[pane_id]);
         }
@@ -4461,6 +4489,33 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
     }
 
+    struct BoundedTestExecutor {
+        receiver: std::sync::mpsc::Receiver<promise::spawn::Runnable>,
+    }
+
+    impl BoundedTestExecutor {
+        fn new() -> Self {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let low_priority_sender = sender.clone();
+            promise::spawn::set_schedulers(
+                Box::new(move |runnable| {
+                    let _ = sender.send(runnable);
+                }),
+                Box::new(move |runnable| {
+                    let _ = low_priority_sender.send(runnable);
+                }),
+            );
+            Self { receiver }
+        }
+
+        fn run_one(&self) {
+            self.receiver
+                .recv_timeout(Duration::from_secs(30))
+                .expect("a bounded test scheduler task should arrive")
+                .run();
+        }
+    }
+
     struct KillCountingPane {
         id: PaneId,
         size: Mutex<TerminalSize>,
@@ -4469,6 +4524,7 @@ mod tests {
         writes: Mutex<Vec<u8>>,
         reader: Mutex<Option<Box<dyn std::io::Read + Send>>>,
         on_reader: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        on_actions: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         on_kill: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         fail_reader: bool,
     }
@@ -4493,6 +4549,7 @@ mod tests {
                 writes: Mutex::new(Vec::new()),
                 reader: Mutex::new(reader),
                 on_reader: Mutex::new(None),
+                on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
                 fail_reader,
             });
@@ -4513,6 +4570,7 @@ mod tests {
                 writes: Mutex::new(Vec::new()),
                 reader: Mutex::new(None),
                 on_reader: Mutex::new(Some(Box::new(on_reader))),
+                on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
                 fail_reader: false,
             });
@@ -4533,7 +4591,29 @@ mod tests {
                 writes: Mutex::new(Vec::new()),
                 reader: Mutex::new(None),
                 on_reader: Mutex::new(None),
+                on_actions: Mutex::new(None),
                 on_kill: Mutex::new(Some(Box::new(on_kill))),
+                fail_reader: false,
+            });
+            (pane, kills)
+        }
+
+        fn new_with_actions_callback(
+            id: PaneId,
+            size: TerminalSize,
+            on_actions: impl FnOnce() + Send + 'static,
+        ) -> (Arc<dyn Pane>, Arc<AtomicUsize>) {
+            let kills = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn Pane> = Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                kills: Arc::clone(&kills),
+                actions: Arc::new(AtomicUsize::new(0)),
+                writes: Mutex::new(Vec::new()),
+                reader: Mutex::new(None),
+                on_reader: Mutex::new(None),
+                on_actions: Mutex::new(Some(Box::new(on_actions))),
+                on_kill: Mutex::new(None),
                 fail_reader: false,
             });
             (pane, kills)
@@ -4641,6 +4721,9 @@ mod tests {
         }
 
         fn perform_actions(&self, actions: Vec<Action>) {
+            if let Some(on_actions) = self.on_actions.lock().take() {
+                on_actions();
+            }
             self.actions.fetch_add(actions.len(), Ordering::SeqCst);
         }
 
@@ -5037,6 +5120,109 @@ mod tests {
     }
 
     #[test]
+    fn admitted_mutation_delivers_output_before_deferred_kill_and_removed() {
+        let _guard = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let (actions_entered_tx, actions_entered_rx) = std::sync::mpsc::channel();
+        let (release_actions_tx, release_actions_rx) = std::sync::mpsc::channel();
+        let (pane, kills) =
+            KillCountingPane::new_with_actions_callback(105, test_size(), move || {
+                actions_entered_tx
+                    .send(())
+                    .expect("perform_actions should report admission");
+                release_actions_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("test should release blocked perform_actions");
+            });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_subscriber = Arc::clone(&events);
+        let kills_for_subscriber = Arc::clone(&kills);
+        let mux_main_thread = std::thread::current().id();
+        mux.subscribe(move |notification| {
+            match notification {
+                MuxNotification::PaneOutput(105) => {
+                    assert_eq!(
+                        kills_for_subscriber.load(Ordering::SeqCst),
+                        0,
+                        "PaneOutput must precede kill",
+                    );
+                    events_for_subscriber.lock().push("output");
+                }
+                MuxNotification::PaneRemoved(105) => {
+                    assert_eq!(
+                        std::thread::current().id(),
+                        mux_main_thread,
+                        "deferred cleanup must return to the mux main thread",
+                    );
+                    assert_eq!(
+                        kills_for_subscriber.load(Ordering::SeqCst),
+                        1,
+                        "Pane::kill must precede PaneRemoved",
+                    );
+                    events_for_subscriber.lock().push("removed");
+                }
+                _ => {}
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+        mux.add_pane(&pane).expect("test pane should register");
+        let generation = Arc::clone(
+            &mux.panes
+                .read()
+                .get(&105)
+                .expect("test generation should be live")
+                .generation,
+        );
+        let dead = Arc::new(AtomicBool::new(false));
+        let pane_for_actions = Arc::downgrade(&pane);
+        let generation_for_actions = Arc::clone(&generation);
+        let dead_for_actions = Arc::clone(&dead);
+        let actions_thread = std::thread::spawn(move || {
+            send_actions_to_mux_with_scheduler_state(
+                &pane_for_actions,
+                &generation_for_actions,
+                &dead_for_actions,
+                vec![Action::Print('x')],
+                false,
+            );
+        });
+
+        actions_entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("perform_actions should block after exact output reservation");
+        assert!(
+            mux.pane_registration.try_lock().is_some(),
+            "external pane mutation must run without the topology lock",
+        );
+        mux.remove_pane_if_same_generation(105, &pane, &generation);
+        assert!(mux.get_pane(105).is_none());
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert!(events.lock().is_empty());
+        assert!(
+            mux.add_pane(&pane).is_err(),
+            "same-ID reuse must remain fenced through accepted output",
+        );
+
+        release_actions_tx
+            .send(())
+            .expect("release blocked perform_actions");
+        actions_thread
+            .join()
+            .expect("perform_actions thread should not panic");
+        assert!(!dead.load(Ordering::Acquire));
+        assert_eq!(&*events.lock(), &["output"]);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+
+        executor.run_one();
+        assert_eq!(&*events.lock(), &["output", "removed"]);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        mux.add_pane(&pane)
+            .expect("same-ID reuse may proceed after output and removal dispatch");
+    }
+
+    #[test]
     fn quiescent_removal_does_not_block_unrelated_pane_lifecycle() {
         let mux = Arc::new(Mux::new(None));
         let (pane_a, _) = KillCountingPane::new(106, test_size());
@@ -5246,10 +5432,23 @@ mod tests {
                 .expect("initial generation should be live")
                 .generation,
         );
-        let stale_notification = PendingPaneOutputNotification {
-            pane_id: 103,
-            pane: Arc::downgrade(&pane),
-            generation: Arc::downgrade(&old_generation),
+        let stale_batch = {
+            let _registration = mux.pane_registration.lock();
+            let lifecycle_notification = mux.enqueue_pane_lifecycle_notification_locked(
+                PaneLifecycleNotification::Output(103),
+                None,
+            );
+            let batch = PaneOutputBatch::new(
+                103,
+                Arc::clone(&old_generation),
+                lifecycle_notification,
+                0,
+                false,
+            );
+            let mut pending = mux.pending_pane_output.lock();
+            pending.queued.insert(103, Arc::clone(&batch));
+            pending.notifications.push(Arc::clone(&batch));
+            batch
         };
 
         mux.remove_pane_if_same_generation(103, &pane, &old_generation);
@@ -5272,34 +5471,40 @@ mod tests {
         })
         .expect("test mux subscription should allocate an identifier");
 
-        {
+        let new_batch = {
+            let _registration = mux.pane_registration.lock();
+            let lifecycle_notification = mux.enqueue_pane_lifecycle_notification_locked(
+                PaneLifecycleNotification::Output(103),
+                None,
+            );
+            let batch = PaneOutputBatch::new(
+                103,
+                Arc::clone(&new_generation),
+                lifecycle_notification,
+                0,
+                false,
+            );
             let mut pending = mux.pending_pane_output.lock();
-            pending.queued.insert(103, Arc::downgrade(&new_generation));
-            pending.notifications.push(PendingPaneOutputNotification {
-                pane_id: 103,
-                pane: Arc::downgrade(&pane),
-                generation: Arc::downgrade(&new_generation),
-            });
-        }
-
-        assert!(
-            mux.linearize_pane_output_notification(stale_notification)
-                .is_none(),
-            "old flush-local work must be rejected",
-        );
+            pending.queued.insert(103, Arc::clone(&batch));
+            pending.notifications.push(Arc::clone(&batch));
+            batch
+        };
         assert!(
             mux.pending_pane_output
                 .lock()
                 .queued
                 .get(&103)
-                .is_some_and(|queued| {
-                    Weak::ptr_eq(queued, &Arc::downgrade(&new_generation))
-                }),
-            "rejecting old work must preserve the new generation's queued marker",
+                .is_some_and(|queued| Arc::ptr_eq(queued, &new_batch)),
+            "replacement work must own the queued marker before delayed flush",
         );
 
         mux.flush_pending_pane_output_notifications();
         assert_eq!(&*outputs.lock(), &[103]);
+        assert!(
+            stale_batch.state.load(Ordering::Acquire) & PANE_OUTPUT_BATCH_SEALED != 0,
+            "the delayed old batch remains harmlessly sealed",
+        );
+        assert!(mux.pending_pane_output.lock().queued.is_empty());
     }
 
     #[test]
@@ -7109,7 +7314,7 @@ mod tests {
     }
 
     #[test]
-    fn discarded_pane_output_notification_is_not_flushed() {
+    fn removal_force_seals_accepted_output_without_erasing_other_batches() {
         let _guard = global_test_lock();
         Mux::shutdown();
         let executor = promise::spawn::SimpleExecutor::new();
@@ -7129,7 +7334,7 @@ mod tests {
 
         mux.enqueue_pane_output_notification(7);
         mux.enqueue_pane_output_notification(8);
-        mux.discard_pending_pane_output_notification(7);
+        mux.remove_pane(7);
 
         {
             let pending = mux.pending_pane_output.lock();
@@ -7139,18 +7344,23 @@ mod tests {
                     .iter()
                     .map(|notification| notification.pane_id)
                     .collect::<Vec<_>>(),
-                vec![8]
+                vec![7, 8]
             );
             assert!(!pending.queued.contains_key(&7));
             assert!(pending.queued.contains_key(&8));
         }
+        assert_eq!(
+            &*pane_outputs.lock(),
+            &[7],
+            "removal must publish output accepted before its lifecycle transition",
+        );
 
         mux.flush_pending_pane_output_notifications();
 
         assert_eq!(
             &*pane_outputs.lock(),
-            &[8],
-            "discarded pane-output notifications must not flush after pane removal",
+            &[7, 8],
+            "the unrelated open batch must remain independently drainable",
         );
 
         executor
@@ -7160,7 +7370,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_pane_discards_pending_output_for_removed_pane() {
+    fn remove_pane_preserves_already_accepted_output_before_removed() {
         let _guard = global_test_lock();
         Mux::shutdown();
         let executor = promise::spawn::SimpleExecutor::new();
@@ -7183,22 +7393,24 @@ mod tests {
         {
             let pending = mux.pending_pane_output.lock();
             assert!(
-                pending.notifications.is_empty(),
-                "remove_pane must clear queued output for the removed pane",
+                !pending.notifications.is_empty(),
+                "the scheduled vector may retain an already sealed exact batch",
             );
             assert!(
                 pending.queued.is_empty(),
-                "remove_pane must clear queued pane ids even when the pane is already absent",
+                "removal must close the exact generation's open batch",
             );
         }
+        assert_eq!(&*pane_outputs.lock(), &[7]);
 
         mux.flush_pending_pane_output_notifications();
         executor
             .tick()
             .expect("scheduled pane-output drain should run");
-        assert!(
-            pane_outputs.lock().is_empty(),
-            "stale pending output for an absent pane must not be dispatched",
+        assert_eq!(
+            pane_outputs.lock().as_slice(),
+            [7],
+            "an accepted output batch must publish exactly once before PaneRemoved",
         );
         Mux::shutdown();
     }
@@ -7290,7 +7502,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_during_output_batch_cancels_later_exact_output() {
+    fn removal_during_output_batch_preserves_already_accepted_output() {
         let _guard = global_test_lock();
         Mux::shutdown();
         let executor = promise::spawn::SimpleExecutor::new();
@@ -7318,8 +7530,8 @@ mod tests {
 
         assert_eq!(
             &*pane_outputs.lock(),
-            &[7],
-            "PaneRemoved(8) must not be followed by stale PaneOutput(8)",
+            &[7, 8],
+            "an output accepted before removal must precede PaneRemoved for that pane",
         );
         assert!(mux.get_pane(8).is_none());
         executor
