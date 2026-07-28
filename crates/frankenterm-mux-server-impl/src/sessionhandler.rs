@@ -233,7 +233,7 @@ fn maybe_push_pane_changes(
             per_pane.notifications.push(Alert::PaletteChanged);
             per_pane.sent_initial_palette = true;
         }
-        per_pane.notifications.drain(..).collect::<Vec<_>>()
+        std::mem::take(&mut per_pane.notifications)
     };
 
     for alert in notifications {
@@ -291,27 +291,21 @@ fn session_mux() -> anyhow::Result<Arc<Mux>> {
 }
 
 fn unregister_owned_client(mux: &Mux, client_id: &Arc<ClientId>) {
-    let owns_current_registration = mux
-        .iter_clients()
-        .into_iter()
-        .any(|info| *info.client_id == **client_id && Arc::ptr_eq(&info.client_id, client_id));
-
-    if owns_current_registration {
-        mux.unregister_client(client_id);
-    }
+    let _ = mux.unregister_client_if_same(client_id);
 }
 
 pub struct SessionHandler {
     to_write_tx: PduSender,
     per_pane: HashMap<PaneId, Arc<Mutex<PerPane>>>,
     client_id: Option<Arc<ClientId>>,
+    client_mux: Option<Arc<Mux>>,
     proxy_client_id: Option<ClientId>,
 }
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
         if let Some(client_id) = self.client_id.take() {
-            if let Some(mux) = Mux::try_get() {
+            if let Some(mux) = self.client_mux.take() {
                 unregister_owned_client(&mux, &client_id);
             }
         }
@@ -324,6 +318,7 @@ impl SessionHandler {
             to_write_tx,
             per_pane: HashMap::new(),
             client_id: None,
+            client_mux: None,
             proxy_client_id: None,
         }
     }
@@ -526,19 +521,26 @@ impl SessionHandler {
                     }
 
                     let client_id = Arc::new(client_id);
-                    if self.client_id.as_ref() != Some(&client_id) {
-                        let mux = match session_mux() {
-                            Ok(mux) => mux,
-                            Err(err) => {
-                                send_response(Err(err));
-                                return;
-                            }
-                        };
-                        let prior_client_id = self.client_id.replace(client_id.clone());
-                        if let Some(prior_client_id) = prior_client_id {
-                            unregister_owned_client(&mux, &prior_client_id);
+                    let mux = match session_mux() {
+                        Ok(mux) => mux,
+                        Err(err) => {
+                            send_response(Err(err));
+                            return;
                         }
-                        mux.register_client(client_id);
+                    };
+                    let registration_is_current = self.client_id.as_ref() == Some(&client_id)
+                        && self
+                            .client_mux
+                            .as_ref()
+                            .is_some_and(|owner| Arc::ptr_eq(owner, &mux));
+                    if !registration_is_current {
+                        let prior_registration = self.client_id.take().zip(self.client_mux.take());
+                        if let Some((prior_client_id, prior_mux)) = prior_registration {
+                            unregister_owned_client(&prior_mux, &prior_client_id);
+                        }
+                        mux.register_client(Arc::clone(&client_id));
+                        self.client_id = Some(client_id);
+                        self.client_mux = Some(mux);
                     }
                 }
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
@@ -1343,7 +1345,7 @@ impl SessionHandler {
                                 let pane = mux
                                     .get_pane(pane_id)
                                     .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                                tab.add_floating_pane(pane, rect);
+                                tab.add_floating_pane(pane, rect)?;
                                 Ok(Pdu::UnitResponse(UnitResponse {}))
                             },
                             send_response,
@@ -2167,9 +2169,24 @@ mod tests {
         tab.split_and_insert(0, second_request, Arc::clone(&pane3))
             .unwrap();
         tab.set_layout_cycle(mux::layout::default_cycle());
-        tab.swap_to_layout_index(2).unwrap();
-        let (_mux, _guard) =
-            install_tab_with_window(&tab, &[Arc::clone(&pane2), Arc::clone(&pane3)]);
+        assert_eq!(tab.swap_to_layout_index(2).as_deref(), Some("stacked"));
+        let slot_index = tab
+            .first_nontrivial_stack_slot_index()
+            .expect("three panes in the stacked layout must form a non-trivial stack");
+        let stacked_pane_ids = tab.all_stacked_pane_ids();
+        assert_eq!(
+            stacked_pane_ids.len(),
+            3,
+            "layout redistribution must preserve every pane in the stack"
+        );
+        let pane_index = stacked_pane_ids
+            .iter()
+            .position(|pane_id| *pane_id == pane2.pane_id())
+            .expect("the requested pane must remain addressable in the stack");
+        let (_mux, _guard) = install_tab_with_window(
+            &tab,
+            &[Arc::clone(&pane1), Arc::clone(&pane2), Arc::clone(&pane3)],
+        );
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
 
@@ -2177,8 +2194,8 @@ mod tests {
             serial: 100,
             pdu: Pdu::SelectStackPane(SelectStackPane {
                 tab_id: tab.tab_id(),
-                slot_index: 0,
-                pane_index: 2,
+                slot_index,
+                pane_index,
             }),
         });
         tick_until_response(&executor, &captured, 1);
@@ -2188,7 +2205,12 @@ mod tests {
         assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
         let visible = tab.iter_panes_ignoring_zoom();
         assert_eq!(visible.len(), 1);
-        assert_ne!(visible[0].pane.pane_id(), 1);
+        assert_eq!(visible[0].pane.pane_id(), pane2.pane_id());
+        assert_eq!(
+            tab.all_stacked_pane_ids().len(),
+            3,
+            "queued dead-window pruning must retain every registered stack member"
+        );
     }
 
     #[test]
@@ -4022,6 +4044,81 @@ mod tests {
             !clients_after_drop
                 .iter()
                 .any(|info| *info.client_id == second)
+        );
+    }
+
+    #[test]
+    fn handler_drop_unregisters_from_owning_mux_after_global_replacement() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let client = test_client_id("exact-mux-owner", 41_006);
+        let originating_mux = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&originating_mux);
+        let (sender, _captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 14,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client.clone(),
+                is_proxy: false,
+            }),
+        });
+        let replacement_client = Arc::new(client.clone());
+        replacement_mux.register_client(Arc::clone(&replacement_client));
+        Mux::set_mux(&replacement_mux);
+
+        drop(handler);
+
+        assert!(
+            originating_mux.iter_clients().is_empty(),
+            "handler cleanup must unregister from the mux that owns its registration",
+        );
+        assert!(
+            replacement_mux
+                .iter_clients()
+                .iter()
+                .any(|info| Arc::ptr_eq(&info.client_id, &replacement_client)),
+            "cleanup from an old mux must not remove an equal-valued replacement registration",
+        );
+    }
+
+    #[test]
+    fn repeated_client_identity_rebinds_registration_after_mux_replacement() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let client = test_client_id("mux-rebind", 41_007);
+        let originating_mux = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&originating_mux);
+        let (sender, _captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        for serial in [15, 16] {
+            if serial == 16 {
+                Mux::set_mux(&replacement_mux);
+            }
+            handler.process_one(DecodedPdu {
+                serial,
+                pdu: Pdu::SetClientId(SetClientId {
+                    client_id: client.clone(),
+                    is_proxy: false,
+                }),
+            });
+        }
+
+        assert!(
+            originating_mux.iter_clients().is_empty(),
+            "rebinding must remove the old mux registration",
+        );
+        assert_eq!(replacement_mux.iter_clients().len(), 1);
+        drop(handler);
+        assert!(
+            replacement_mux.iter_clients().is_empty(),
+            "drop must clean up the rebound registration",
         );
     }
 

@@ -9,7 +9,7 @@ use crate::{Domain, Mux, MuxNotification};
 use anyhow::Error;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use config::{ExitBehavior, ExitBehaviorMessaging, configuration};
+use config::{configuration, ExitBehavior, ExitBehaviorMessaging};
 use fancy_regex::Regex;
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
@@ -26,11 +26,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use termwiz::escape::csi::{CSI, Sgr};
+use termwiz::escape::csi::{Sgr, CSI};
 use termwiz::escape::{Action, DeviceControlMode};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
@@ -1215,7 +1215,13 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                         log::warn!("ignoring tmux control mode request without mux singleton");
                         return;
                     };
-                    mux.add_domain(&domain);
+                    if let Err(err) = mux.add_domain(&domain) {
+                        log::error!(
+                            "cannot register tmux control-mode domain for pane {}: {err}",
+                            self.pane_id
+                        );
+                        return;
+                    }
 
                     if let Some(pane) = mux.get_pane(self.pane_id) {
                         if let Some(pane) = pane.downcast_ref::<LocalPane>() {
@@ -1245,10 +1251,11 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
             }
             DeviceControlMode::Exit => {
                 if let Some(tmux) = self.tmux_domain.take() {
+                    tmux.transition_to_clean_exit();
                     if let Some(mux) = Mux::try_get() {
                         if let Some(pane) = mux.get_pane(self.pane_id) {
                             if let Some(pane) = pane.downcast_ref::<LocalPane>() {
-                                pane.tmux_domain.lock().take();
+                                let _ = pane.tmux_domain.lock().take();
                             } else {
                                 log::warn!(
                                     "tmux control mode pane {} is not a LocalPane",
@@ -1256,11 +1263,7 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                                 );
                             }
                         }
-                        mux.domain_was_detached(tmux.domain_id);
                     }
-                    // Ensure the tmux control-mode callback is removed immediately
-                    // rather than waiting for a future mux notify cycle.
-                    tmux.unsubscribe_notification();
                 }
             }
             DeviceControlMode::Data(c) => {
@@ -1376,6 +1379,45 @@ fn split_child(
 }
 
 impl LocalPane {
+    pub(crate) fn send_tmux_detach_if_same(
+        &self,
+        expected: &TmuxDomainState,
+    ) -> Result<bool, Error> {
+        // DCS parsing already holds the terminal lock before it installs or
+        // clears a tmux binding. Preserve that lock order here so terminal
+        // cleanup cannot deadlock parser-side terminal -> binding activity.
+        let mut terminal = self.locked_terminal();
+        let mut tmux_domain = self.tmux_domain.lock();
+        if !tmux_domain
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), expected))
+        {
+            return Ok(false);
+        }
+
+        // Claim the exact binding while the terminal lock prevents a new DCS
+        // control-mode binding from being installed. The write no longer
+        // relies on key routing, so the binding can be cleared before we
+        // release its mutex without opening a replacement-instance window.
+        let _ = tmux_domain.take();
+        drop(tmux_domain);
+        terminal.send_paste("detach\n")?;
+        Ok(true)
+    }
+
+    pub(crate) fn clear_tmux_domain_if(&self, expected: &TmuxDomainState) -> bool {
+        let mut tmux_domain = self.tmux_domain.lock();
+        if tmux_domain
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), expected))
+        {
+            let _ = tmux_domain.take();
+            true
+        } else {
+            false
+        }
+    }
+
     // ── ft-87qfi: lock-free SPSC disruptor staging for the pane->render path ──
     //
     // Every terminal access in this file goes through `locked_terminal()` rather
@@ -2053,13 +2095,11 @@ impl LocalPane {
 
 impl Drop for LocalPane {
     fn drop(&mut self) {
-        if let Some(tmux) = self.tmux_domain.lock().take() {
+        let tmux_domain = self.tmux_domain.lock().take();
+        if let Some(tmux) = tmux_domain {
             // Eagerly tear down tmux-domain state if this pane is being dropped
             // without a clean control-mode exit sequence.
-            tmux.unsubscribe_notification();
-            if let Some(mux) = Mux::try_get() {
-                mux.domain_was_detached(tmux.domain_id);
-            }
+            tmux.transition_to_exit_and_schedule_detach();
         }
 
         // Avoid lingering zombies if we can, but don't block forever.
@@ -2900,8 +2940,8 @@ mod tests {
 mod disruptor_ring_keep_gate {
     use super::*;
     use crossbeam::queue::ArrayQueue;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::thread;
 
     /// A batch is the little-endian bytes of its sequence index plus a sentinel

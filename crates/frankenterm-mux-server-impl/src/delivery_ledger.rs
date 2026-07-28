@@ -8,10 +8,12 @@
 //! [`DeliveryState::Dirty`] obligation remains present. The single delivery
 //! consumer waits through [`DeliveryLedger::poll_claim_next`], which registers
 //! its task waker while holding the same exclusive ledger access used by
-//! producers. A producer that publishes after the consumer's empty check takes
-//! and wakes that registration. This atomic check/register/publish relation is
-//! what prevents a check-then-park lost wake; a best-effort queue edge alone is
-//! not sufficient.
+//! producers. A producer that publishes after the consumer's empty check moves
+//! that registration into a pending wake. The owner extracts the wake before
+//! releasing exclusive access, then invokes it after releasing the guard. This
+//! atomic check/register/publish relation is what prevents a check-then-park
+//! lost wake without invoking arbitrary executor code under the owner lock; a
+//! best-effort queue edge alone is not sufficient.
 //!
 //! This module freezes the state and saturation contract.  It does not yet
 //! replace the existing dispatch queue, make `PerPane` snapshots transactional,
@@ -47,6 +49,8 @@
 //! | `InFlight { true, token }` | matching commit | `Dirty` at queue tail |
 //! | `InFlight { _, token }` | matching retry | `Dirty` at queue tail |
 //! | any pane state | pane close | `Closed` |
+//! | `Closed` | repeated pane close before ACK | `Closed` and return the same close capability |
+//! | `Closed` | exact lifecycle application ACK | tombstone reclaimed; allocator identity remains non-reusable |
 //! | any generation state | shutdown/terminal failure | `Closed` |
 //! | `Closed` | any later input | `Closed` |
 //!
@@ -55,6 +59,17 @@
 //! `Clean` supersedes queued pane dirties; older pane claims must settle before
 //! it can be claimed.  A dirty observed while the resync is in flight sets its
 //! `redirtied` bit, requiring a fresh resync after commit.
+//!
+//! Reclaiming a pane tombstone requires the exact [`PaneCloseAckToken`] minted
+//! by that close. After application acknowledgement, the ledger may forget the
+//! tombstone because [`mux::pane::alloc_pane_id`] is the process-lifetime
+//! identity authority: it allocates monotonically, never reuses an ID, and
+//! fails before exhaustion. The ledger deliberately does not infer liveness or
+//! retirement from numeric order. A lower ID may be a still-live pane first
+//! observed after a higher pane closed; treating it as retired would create a
+//! false generation failure. Authoritative bootstrap and live integration must
+//! admit only allocator-issued IDs and reconcile them against the mux
+//! inventory.
 //!
 //! | Notification effect | Ordering/coalescing | Saturation recovery |
 //! |---|---|---|
@@ -77,6 +92,7 @@ use mux::pane::PaneId;
 use mux::tab::TabId;
 use mux::window::WindowId;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::task::{Context, Poll, Waker};
 
 /// Stable identifier cited by all render-delivery implementation children.
@@ -85,6 +101,87 @@ pub const DELIVERY_LEDGER_CONTRACT_VERSION: &str = "ft.render-delivery-ledger.v1
 /// durable priority band is ready.  Intra-class ordering still follows the
 /// class-specific fairness contract.
 pub const DELIVERY_PRIORITY_BURST_LIMIT: usize = 8;
+
+static NEXT_DELIVERY_LEDGER_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// A consumer wake extracted from a delivery owner for deferred execution.
+///
+/// Ledger and coordinator mutation is normally serialized by an external
+/// mutex. Arbitrary [`Waker`] implementations may synchronously re-enter the
+/// consumer, so calling `wake` while that mutex is held can deadlock. Callers
+/// must extract this value through the owner's `take_pending_wake` method while
+/// holding exclusive ownership, release the external guard, and only then call
+/// [`Self::wake`].
+#[must_use = "release the delivery owner guard, then call PendingDeliveryWake::wake"]
+#[derive(Debug)]
+pub struct PendingDeliveryWake(Waker);
+
+impl PendingDeliveryWake {
+    pub(crate) fn new(waker: Waker) -> Self {
+        Self(waker)
+    }
+
+    /// Wake the registered consumer after releasing the delivery owner guard.
+    pub fn wake(self) {
+        self.0.wake();
+    }
+}
+
+/// Process-local, never-reused identity for one concrete ledger instance.
+///
+/// A caller-controlled [`DeliveryGeneration`] can legitimately recur after a
+/// teardown/reconnect bug or replay. Capabilities therefore bind both the
+/// semantic generation and this constructor-minted incarnation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DeliveryLedgerInstance(u64);
+
+impl DeliveryLedgerInstance {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryLedgerInstanceExhausted;
+
+impl std::fmt::Display for DeliveryLedgerInstanceExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "delivery-ledger instance identity space is exhausted; refusing to wrap or reuse",
+        )
+    }
+}
+
+impl std::error::Error for DeliveryLedgerInstanceExhausted {}
+
+fn allocate_delivery_ledger_instance(
+    counter: &AtomicU64,
+) -> Result<DeliveryLedgerInstance, DeliveryLedgerInstanceExhausted> {
+    let mut current = counter.load(AtomicOrdering::Relaxed);
+    loop {
+        if current == 0 {
+            return Err(DeliveryLedgerInstanceExhausted);
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or(DeliveryLedgerInstanceExhausted)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => return Ok(DeliveryLedgerInstance(current)),
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Connection-local generation identity.
 ///
@@ -109,11 +206,17 @@ impl DeliveryGeneration {
 /// Monotonic, never-reused token for one claimed delivery obligation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DeliveryToken {
+    instance: DeliveryLedgerInstance,
     generation: DeliveryGeneration,
     sequence: u64,
 }
 
 impl DeliveryToken {
+    #[must_use]
+    pub const fn instance(self) -> DeliveryLedgerInstance {
+        self.instance
+    }
+
     #[must_use]
     pub const fn generation(self) -> DeliveryGeneration {
         self.generation
@@ -171,6 +274,43 @@ impl DeliveryClaim {
     }
 }
 
+/// Exact capability that may reclaim one closed-pane tombstone.
+///
+/// The lifecycle producer sends this opaque token with the close barrier, and
+/// the consumer returns it only after applying that barrier. Possession is not
+/// queue-admission or socket-write authority: callers must invoke
+/// [`DeliveryLedger::acknowledge_pane_close`] only from the application-ACK
+/// path.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PaneCloseAckToken {
+    instance: DeliveryLedgerInstance,
+    generation: DeliveryGeneration,
+    pane_id: PaneId,
+    sequence: u64,
+}
+
+impl PaneCloseAckToken {
+    #[must_use]
+    pub const fn instance(self) -> DeliveryLedgerInstance {
+        self.instance
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> DeliveryGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn pane_id(self) -> PaneId {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirtyOutcome {
     BecameDirty,
@@ -190,6 +330,7 @@ pub enum ResyncOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "delivery settlement outcomes must be checked to preserve durable obligation state"]
 pub enum SettleOutcome {
     CommittedClean,
     LocallySettledNoChange,
@@ -202,19 +343,35 @@ pub enum SettleOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "pane close returns the exact application-ACK capability required to reclaim its tombstone"]
 pub enum ClosePaneOutcome {
-    ClosedClean,
-    ClosedDirty,
-    ClosedInFlight { token: DeliveryToken },
-    AlreadyClosed,
+    ClosedClean {
+        close_ack: PaneCloseAckToken,
+    },
+    ClosedDirty {
+        close_ack: PaneCloseAckToken,
+    },
+    ClosedInFlight {
+        delivery_token: DeliveryToken,
+        close_ack: PaneCloseAckToken,
+    },
+    AlreadyClosed {
+        close_ack: PaneCloseAckToken,
+    },
     Untracked,
+    GenerationClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "pane reclamation outcomes must be checked so tombstones are not stranded"]
 pub enum ReclaimPaneOutcome {
     Reclaimed,
     AwaitingClose,
-    Untracked,
+    WrongInstance,
+    WrongGeneration,
+    WrongPane,
+    StaleOrDuplicate,
+    GenerationClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,8 +406,23 @@ pub struct DeliveryCounters {
     pub terminal_failures: u64,
     /// Consumer wakers registered at an atomic empty-check boundary.
     pub wake_registrations: u64,
-    /// Registered consumers woken by a later transition.
+    /// Registered-consumer wakes extracted for delivery by the owner.
     pub wake_deliveries: u64,
+    /// Registered-consumer wakes deliberately suppressed because a valid
+    /// publication or settlement did not change work from unclaimable to
+    /// claimable. The waiter remains installed for the fence-clearing event.
+    pub suppressed_wakes: u64,
+    /// Exact close acknowledgements that reclaimed a bounded tombstone.
+    pub close_acknowledgements: u64,
+    /// Early, wrong-generation, wrong-pane, stale, duplicate, untracked, or
+    /// generation-closed close acknowledgement attempts.
+    pub rejected_close_acknowledgements: u64,
+    /// Settlement attempts carrying a capability minted by another concrete
+    /// ledger instance, even when the caller-controlled generation is equal.
+    pub rejected_cross_instance_settlements: u64,
+    /// Close acknowledgements carrying a capability minted by another
+    /// concrete ledger instance.
+    pub rejected_cross_instance_close_acknowledgements: u64,
 }
 
 impl DeliveryCounters {
@@ -272,6 +444,7 @@ pub struct DeliveryCapacity {
 struct PaneEntry {
     state: DeliveryState,
     queued: bool,
+    close_ack: Option<PaneCloseAckToken>,
 }
 
 /// Bounded render-delivery state for one connection-local generation.
@@ -281,20 +454,28 @@ struct PaneEntry {
 /// pane limit is valid and routes every render dirty to `resync_all`.
 #[derive(Debug)]
 pub struct DeliveryLedger {
+    instance: DeliveryLedgerInstance,
     generation: DeliveryGeneration,
     pane_limit: usize,
     panes: HashMap<PaneId, PaneEntry>,
     ready: VecDeque<PaneId>,
+    inflight_panes: usize,
     resync_all: DeliveryState,
     next_token_sequence: Option<u64>,
+    next_close_ack_sequence: Option<u64>,
     counters: DeliveryCounters,
     waiter: Option<Waker>,
+    pending_wake: Option<Waker>,
 }
 
 impl DeliveryLedger {
-    #[must_use]
-    pub fn new(generation: DeliveryGeneration, pane_limit: usize) -> Self {
-        Self {
+    pub fn new(
+        generation: DeliveryGeneration,
+        pane_limit: usize,
+    ) -> Result<Self, DeliveryLedgerInstanceExhausted> {
+        let instance = allocate_delivery_ledger_instance(&NEXT_DELIVERY_LEDGER_INSTANCE)?;
+        Ok(Self {
+            instance,
             generation,
             pane_limit,
             // Do not trust a configuration-sized capacity as an eager
@@ -302,11 +483,19 @@ impl DeliveryLedger {
             // are observed and remain bounded by `pane_limit`.
             panes: HashMap::new(),
             ready: VecDeque::new(),
+            inflight_panes: 0,
             resync_all: DeliveryState::Clean,
             next_token_sequence: Some(1),
+            next_close_ack_sequence: Some(1),
             counters: DeliveryCounters::default(),
             waiter: None,
-        }
+            pending_wake: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn instance(&self) -> DeliveryLedgerInstance {
+        self.instance
     }
 
     #[must_use]
@@ -351,11 +540,19 @@ impl DeliveryLedger {
     /// [`Self::poll_claim_next`]. A failed queue enqueue must not modify or
     /// roll back this transition.
     pub fn mark_dirty(&mut self, pane_id: PaneId) -> DirtyOutcome {
+        let was_claimable = self.has_claimable_work();
         let outcome = self.mark_dirty_inner(pane_id);
-        if outcome == DirtyOutcome::IgnoredClosed {
-            DeliveryCounters::increment(&mut self.counters.ignored_dirties);
-        } else {
-            self.wake_waiter();
+        match outcome {
+            DirtyOutcome::IgnoredClosed => {
+                DeliveryCounters::increment(&mut self.counters.ignored_dirties);
+            }
+            DirtyOutcome::BecameDirty
+            | DirtyOutcome::MarkedInFlightRedirty
+            | DirtyOutcome::Coalesced
+            | DirtyOutcome::CoveredByResyncAll
+            | DirtyOutcome::EscalatedToResyncAll => {
+                self.wake_if_newly_claimable(was_claimable);
+            }
         }
         outcome
     }
@@ -363,6 +560,9 @@ impl DeliveryLedger {
     fn mark_dirty_inner(&mut self, pane_id: PaneId) -> DirtyOutcome {
         DeliveryCounters::increment(&mut self.counters.dirties);
 
+        if self.is_closed() {
+            return DirtyOutcome::IgnoredClosed;
+        }
         if self
             .panes
             .get(&pane_id)
@@ -370,7 +570,6 @@ impl DeliveryLedger {
         {
             return DirtyOutcome::IgnoredClosed;
         }
-
         match self.resync_all {
             DeliveryState::Closed => return DirtyOutcome::IgnoredClosed,
             DeliveryState::Dirty => {
@@ -430,7 +629,7 @@ impl DeliveryLedger {
 
         if self.panes.len() >= self.pane_limit {
             DeliveryCounters::increment(&mut self.counters.overflows);
-            let _ = self.request_resync_all();
+            let _ = self.request_resync_all_inner();
             return DirtyOutcome::EscalatedToResyncAll;
         }
 
@@ -439,6 +638,7 @@ impl DeliveryLedger {
             PaneEntry {
                 state: DeliveryState::Dirty,
                 queued: true,
+                close_ack: None,
             },
         );
         self.ready.push_back(pane_id);
@@ -452,9 +652,10 @@ impl DeliveryLedger {
     /// pane claims retain their tokens so the eventual resync cannot overtake
     /// them on a FIFO wire/application lane.
     pub fn request_resync_all(&mut self) -> ResyncOutcome {
+        let was_claimable = self.has_claimable_work();
         let outcome = self.request_resync_all_inner();
         if outcome != ResyncOutcome::IgnoredClosed {
-            self.wake_waiter();
+            self.wake_if_newly_claimable(was_claimable);
         }
         outcome
     }
@@ -513,23 +714,20 @@ impl DeliveryLedger {
     /// in-flight pane claims.  Otherwise pane claims are FIFO round-robin:
     /// work redirtied while in flight is appended at the tail when settled.
     pub fn claim_next(&mut self) -> Result<Option<DeliveryClaim>, ClaimError> {
-        // There is one logical consumer. Any direct claim attempt supersedes
-        // its prior wait registration; `poll_claim_next` installs a fresh one
-        // only after observing that no claim is currently available.
-        self.waiter = None;
         if self.is_closed() {
             return Ok(None);
         }
 
         if matches!(self.resync_all, DeliveryState::Dirty) {
-            if self
-                .panes
-                .values()
-                .any(|entry| matches!(entry.state, DeliveryState::InFlight { .. }))
-            {
+            if self.inflight_panes != 0 {
                 return Ok(None);
             }
             let token = self.issue_token()?;
+            // There is one logical consumer. Only an actual successful claim
+            // supersedes its prior wait registration or not-yet-delivered
+            // pending wake. An empty direct probe must preserve the waiter.
+            self.waiter = None;
+            self.pending_wake = None;
             self.resync_all = DeliveryState::InFlight {
                 redirtied: false,
                 token,
@@ -556,6 +754,8 @@ impl DeliveryLedger {
                 continue;
             }
             let token = self.issue_token()?;
+            self.waiter = None;
+            self.pending_wake = None;
             let Some(entry) = self.panes.get_mut(&pane_id) else {
                 // The ledger is single-owner and token issuance cannot mutate
                 // the pane map. Keep this defensive branch non-panicking if a
@@ -568,6 +768,7 @@ impl DeliveryLedger {
                 redirtied: false,
                 token,
             };
+            self.inflight_panes += 1;
             return Ok(Some(DeliveryClaim {
                 scope: DeliveryScope::Pane(pane_id),
                 token,
@@ -582,8 +783,8 @@ impl DeliveryLedger {
     /// The ledger must be mutated through the same exclusive owner (normally a
     /// mutex guard) for both producer transitions and this poll. If no claim is
     /// ready, the waker is installed before that exclusive access is released.
-    /// A later state transition takes and wakes it even when every bounded
-    /// best-effort wake queue has capacity zero.
+    /// A later state transition defers it for [`Self::take_pending_wake`] even
+    /// when every bounded best-effort wake queue has capacity zero.
     pub fn poll_claim_next(
         &mut self,
         cx: &mut Context<'_>,
@@ -598,8 +799,27 @@ impl DeliveryLedger {
         }
     }
 
+    /// Extract a registered consumer wake while retaining exclusive ownership.
+    ///
+    /// Every caller that performs a mutation which can make work claimable or
+    /// close the generation must call this before releasing its external owner
+    /// guard. This includes claim/error paths that can close on token
+    /// exhaustion. The returned wake must not be fired until after that guard
+    /// is released. Extraction transfers the single pending wake obligation
+    /// and accounts it as a delivery; dropping the returned value without
+    /// waking violates the owner contract.
+    pub fn take_pending_wake(&mut self) -> Option<PendingDeliveryWake> {
+        let waiter = self.pending_wake.take()?;
+        DeliveryCounters::increment(&mut self.counters.wake_deliveries);
+        Some(PendingDeliveryWake::new(waiter))
+    }
+
     /// Commit an application-acknowledged claim.
     pub fn commit(&mut self, claim: DeliveryClaim) -> SettleOutcome {
+        if claim.token.instance != self.instance {
+            DeliveryCounters::increment(&mut self.counters.rejected_cross_instance_settlements);
+            return SettleOutcome::StaleOrDuplicate;
+        }
         if self.is_closed() {
             return SettleOutcome::GenerationClosed;
         }
@@ -607,6 +827,7 @@ impl DeliveryLedger {
             return SettleOutcome::StaleOrDuplicate;
         }
 
+        let was_claimable = self.has_claimable_work();
         let outcome = match claim.scope {
             DeliveryScope::ResyncAll => self.commit_resync_all(claim.token),
             DeliveryScope::Pane(pane_id) => self.commit_pane(pane_id, claim.token),
@@ -617,7 +838,7 @@ impl DeliveryLedger {
                 | SettleOutcome::ScopeClosed
                 | SettleOutcome::GenerationClosed
         ) {
-            self.wake_waiter();
+            self.wake_if_newly_claimable(was_claimable);
         }
         outcome
     }
@@ -630,6 +851,10 @@ impl DeliveryLedger {
     /// alerts, palette transitions, or any other effect that would require an
     /// application acknowledgement.
     pub fn settle_no_change(&mut self, claim: DeliveryClaim) -> SettleOutcome {
+        if claim.token.instance != self.instance {
+            DeliveryCounters::increment(&mut self.counters.rejected_cross_instance_settlements);
+            return SettleOutcome::StaleOrDuplicate;
+        }
         if self.is_closed() {
             return SettleOutcome::GenerationClosed;
         }
@@ -639,6 +864,7 @@ impl DeliveryLedger {
         let DeliveryScope::Pane(pane_id) = claim.scope else {
             return SettleOutcome::StaleOrDuplicate;
         };
+        let was_claimable = self.has_claimable_work();
         let Some(entry) = self.panes.get_mut(&pane_id) else {
             return SettleOutcome::StaleOrDuplicate;
         };
@@ -654,6 +880,7 @@ impl DeliveryLedger {
         }
 
         DeliveryCounters::increment(&mut self.counters.no_change_settlements);
+        self.inflight_panes -= 1;
         let outcome = if self.resync_all != DeliveryState::Clean {
             entry.state = DeliveryState::Clean;
             entry.queued = false;
@@ -668,12 +895,13 @@ impl DeliveryLedger {
             entry.queued = false;
             SettleOutcome::LocallySettledNoChange
         };
-        self.wake_waiter();
+        self.wake_if_newly_claimable(was_claimable);
         outcome
     }
 
     /// Return a transiently failed claim to durable dirty state.
     pub fn retry(&mut self, claim: DeliveryClaim) -> SettleOutcome {
+        let was_claimable = self.has_claimable_work();
         let outcome = self.retry_inner(claim);
         if !matches!(
             outcome,
@@ -681,12 +909,16 @@ impl DeliveryLedger {
                 | SettleOutcome::ScopeClosed
                 | SettleOutcome::GenerationClosed
         ) {
-            self.wake_waiter();
+            self.wake_if_newly_claimable(was_claimable);
         }
         outcome
     }
 
     fn retry_inner(&mut self, claim: DeliveryClaim) -> SettleOutcome {
+        if claim.token.instance != self.instance {
+            DeliveryCounters::increment(&mut self.counters.rejected_cross_instance_settlements);
+            return SettleOutcome::StaleOrDuplicate;
+        }
         if self.is_closed() {
             return SettleOutcome::GenerationClosed;
         }
@@ -721,6 +953,7 @@ impl DeliveryLedger {
                     return SettleOutcome::StaleOrDuplicate;
                 }
                 DeliveryCounters::increment(&mut self.counters.retries);
+                self.inflight_panes -= 1;
                 if self.resync_all == DeliveryState::Clean {
                     entry.state = DeliveryState::Dirty;
                     entry.queued = true;
@@ -743,6 +976,10 @@ impl DeliveryLedger {
     /// close a newly established ledger. Reconnect and authoritative bootstrap
     /// are responsible for creating a new ledger.
     pub fn fail_terminal(&mut self, claim: DeliveryClaim) -> SettleOutcome {
+        if claim.token.instance != self.instance {
+            DeliveryCounters::increment(&mut self.counters.rejected_cross_instance_settlements);
+            return SettleOutcome::StaleOrDuplicate;
+        }
         if self.is_closed() {
             return SettleOutcome::GenerationClosed;
         }
@@ -754,38 +991,78 @@ impl DeliveryLedger {
         SettleOutcome::FailedClosed
     }
 
-    /// Close a pane and invalidate any outstanding pane claim.
+    /// Close a pane, invalidate any outstanding render claim, and mint the
+    /// exact capability required to reclaim its tombstone after application
+    /// acknowledgement.
     pub fn close_pane(&mut self, pane_id: PaneId) -> ClosePaneOutcome {
         if self.is_closed() {
-            return ClosePaneOutcome::AlreadyClosed;
+            return ClosePaneOutcome::GenerationClosed;
         }
 
-        let Some(entry) = self.panes.get_mut(&pane_id) else {
+        let Some(prior_state) = self.panes.get(&pane_id).map(|entry| entry.state) else {
             // An all-pane snapshot inventories panes that never occupied a
             // bounded per-pane slot. Closing one of those panes can invalidate
             // an already-produced resync snapshot, so preserve the close as a
             // fresh resync obligation even though the pane itself is untracked.
-            self.redirty_inflight_resync();
-            self.wake_waiter();
+            let was_claimable = self.has_claimable_work();
+            if self.redirty_inflight_resync() {
+                self.wake_if_newly_claimable(was_claimable);
+            }
             return ClosePaneOutcome::Untracked;
         };
-        let outcome = match entry.state {
-            DeliveryState::Clean => ClosePaneOutcome::ClosedClean,
-            DeliveryState::Dirty => ClosePaneOutcome::ClosedDirty,
-            DeliveryState::InFlight { token, .. } => ClosePaneOutcome::ClosedInFlight { token },
-            DeliveryState::Closed => return ClosePaneOutcome::AlreadyClosed,
+        if prior_state == DeliveryState::Closed {
+            let Some(close_ack) = self.panes.get(&pane_id).and_then(|entry| entry.close_ack) else {
+                // Live-generation invariants require a capability on every
+                // tracked closed pane. If that invariant is ever broken,
+                // losing the only reclaim authority must fail closed.
+                DeliveryCounters::increment(&mut self.counters.terminal_failures);
+                self.close_generation();
+                return ClosePaneOutcome::GenerationClosed;
+            };
+            return ClosePaneOutcome::AlreadyClosed { close_ack };
+        }
+
+        let Some(close_ack) = self.issue_pane_close_ack(pane_id) else {
+            return ClosePaneOutcome::GenerationClosed;
+        };
+        let was_claimable = self.has_claimable_work();
+        let outcome = match prior_state {
+            DeliveryState::Clean => ClosePaneOutcome::ClosedClean { close_ack },
+            DeliveryState::Dirty => ClosePaneOutcome::ClosedDirty { close_ack },
+            DeliveryState::InFlight { token, .. } => {
+                self.inflight_panes -= 1;
+                ClosePaneOutcome::ClosedInFlight {
+                    delivery_token: token,
+                    close_ack,
+                }
+            }
+            DeliveryState::Closed => {
+                DeliveryCounters::increment(&mut self.counters.terminal_failures);
+                self.close_generation();
+                return ClosePaneOutcome::GenerationClosed;
+            }
+        };
+        let Some(entry) = self.panes.get_mut(&pane_id) else {
+            // The ledger is single-owner and close-token issuance cannot
+            // mutate the pane map. Preserve fail-closed behavior if a future
+            // implementation invalidates that assumption.
+            DeliveryCounters::increment(&mut self.counters.terminal_failures);
+            self.close_generation();
+            return ClosePaneOutcome::GenerationClosed;
         };
         entry.state = DeliveryState::Closed;
         entry.queued = false;
+        entry.close_ack = Some(close_ack);
         self.ready.retain(|queued| *queued != pane_id);
 
         // If an all-pane snapshot is already in flight, its inventory may
         // predate this close. Force a second authoritative pass.
         self.redirty_inflight_resync();
-        // Closing an in-flight pane may remove the last ordering barrier in
-        // front of an already-dirty resync.  Wake the consumer even though
-        // close itself did not enqueue a pane entry.
-        self.wake_waiter();
+        // Closing an in-flight pane wakes only when it removes the last
+        // ordering fence in front of a dirty resync. Redirtying an in-flight
+        // resync remains fenced by its older claim and deliberately retains
+        // the registered waiter without waking it.
+        self.wake_if_newly_claimable(was_claimable);
         outcome
     }
 
@@ -793,31 +1070,64 @@ impl DeliveryLedger {
     /// has been application-acknowledged.
     ///
     /// The caller must not invoke this at queue admission or socket-write
-    /// time. The acknowledgement is the causal fence proving that older render
-    /// work for this pane can no longer arrive. Pane IDs are never reused
-    /// within a generation; reuse requires a new generation/bootstrap.
-    pub fn acknowledge_pane_close(&mut self, pane_id: PaneId) -> ReclaimPaneOutcome {
-        match self.panes.get(&pane_id).map(|entry| entry.state) {
-            Some(DeliveryState::Closed) => {
-                self.panes.remove(&pane_id);
-                ReclaimPaneOutcome::Reclaimed
+    /// time. The exact generation-, pane-, and close-bound token is the causal
+    /// fence proving that older render work for this pane can no longer arrive.
+    /// Successful reclamation releases only the bounded ledger tombstone.
+    /// Process-lifetime non-reuse is guaranteed by the mux PaneId allocator,
+    /// not by retaining an unbounded history or comparing numeric ID order.
+    pub fn acknowledge_pane_close(
+        &mut self,
+        pane_id: PaneId,
+        close_ack: PaneCloseAckToken,
+    ) -> ReclaimPaneOutcome {
+        let outcome = if close_ack.instance != self.instance {
+            DeliveryCounters::increment(
+                &mut self.counters.rejected_cross_instance_close_acknowledgements,
+            );
+            ReclaimPaneOutcome::WrongInstance
+        } else if self.is_closed() {
+            ReclaimPaneOutcome::GenerationClosed
+        } else if close_ack.generation != self.generation {
+            ReclaimPaneOutcome::WrongGeneration
+        } else if close_ack.pane_id != pane_id {
+            ReclaimPaneOutcome::WrongPane
+        } else {
+            match self.panes.get(&pane_id) {
+                Some(PaneEntry {
+                    state: DeliveryState::Closed,
+                    close_ack: Some(expected),
+                    ..
+                }) if *expected == close_ack => {
+                    self.panes.remove(&pane_id);
+                    DeliveryCounters::increment(&mut self.counters.close_acknowledgements);
+                    return ReclaimPaneOutcome::Reclaimed;
+                }
+                Some(PaneEntry {
+                    state: DeliveryState::Closed,
+                    ..
+                }) => ReclaimPaneOutcome::StaleOrDuplicate,
+                Some(PaneEntry {
+                    state:
+                        DeliveryState::Clean | DeliveryState::Dirty | DeliveryState::InFlight { .. },
+                    ..
+                }) => ReclaimPaneOutcome::AwaitingClose,
+                None => ReclaimPaneOutcome::StaleOrDuplicate,
             }
-            Some(DeliveryState::Clean | DeliveryState::Dirty | DeliveryState::InFlight { .. }) => {
-                ReclaimPaneOutcome::AwaitingClose
-            }
-            None => ReclaimPaneOutcome::Untracked,
-        }
+        };
+        DeliveryCounters::increment(&mut self.counters.rejected_close_acknowledgements);
+        outcome
     }
 
     /// Terminally close this connection-local generation.
     pub fn close_generation(&mut self) {
         self.resync_all = DeliveryState::Closed;
         self.ready.clear();
+        self.inflight_panes = 0;
         for entry in self.panes.values_mut() {
             entry.state = DeliveryState::Closed;
             entry.queued = false;
         }
-        self.wake_waiter();
+        self.defer_waiter_wake();
     }
 
     /// Validate capacity, queue, token, and shutdown invariants.
@@ -844,6 +1154,8 @@ impl DeliveryLedger {
 
         let global_is_clean = self.resync_all == DeliveryState::Clean;
         let mut tokens = HashSet::new();
+        let mut close_ack_sequences = HashSet::new();
+        let mut observed_inflight_panes = 0usize;
         for (pane_id, entry) in &self.panes {
             if entry.queued != queued.contains(pane_id) {
                 return Err("pane queued bit disagrees with ready queue");
@@ -854,8 +1166,36 @@ impl DeliveryLedger {
             if !global_is_clean && entry.state == DeliveryState::Dirty {
                 return Err("resync-all must supersede queued pane dirties");
             }
+            match (entry.state, entry.close_ack) {
+                (DeliveryState::Closed, Some(close_ack)) => {
+                    if close_ack.instance != self.instance
+                        || close_ack.generation != self.generation
+                        || close_ack.pane_id != *pane_id
+                    {
+                        return Err("pane close acknowledgement token has wrong scope");
+                    }
+                    if !close_ack_sequences.insert(close_ack.sequence) {
+                        return Err("pane close acknowledgement sequence is reused");
+                    }
+                }
+                (DeliveryState::Closed, None) if !self.is_closed() => {
+                    return Err("live generation closed pane lacks close acknowledgement token");
+                }
+                (DeliveryState::Closed, None) => {}
+                (
+                    DeliveryState::Clean | DeliveryState::Dirty | DeliveryState::InFlight { .. },
+                    Some(_),
+                ) => {
+                    return Err("non-closed pane retains close acknowledgement token");
+                }
+                (
+                    DeliveryState::Clean | DeliveryState::Dirty | DeliveryState::InFlight { .. },
+                    None,
+                ) => {}
+            }
             if let DeliveryState::InFlight { token, .. } = entry.state {
-                if token.generation != self.generation {
+                observed_inflight_panes += 1;
+                if token.instance != self.instance || token.generation != self.generation {
                     return Err("pane token belongs to another generation");
                 }
                 if !tokens.insert(token) {
@@ -863,29 +1203,32 @@ impl DeliveryLedger {
                 }
             }
         }
+        if observed_inflight_panes != self.inflight_panes {
+            return Err("in-flight pane count disagrees with pane states");
+        }
 
         if let DeliveryState::InFlight { token, .. } = self.resync_all {
-            if token.generation != self.generation {
+            if token.instance != self.instance || token.generation != self.generation {
                 return Err("resync token belongs to another generation");
             }
             if !tokens.insert(token) {
                 return Err("delivery token is reused");
             }
-            if self
-                .panes
-                .values()
-                .any(|entry| matches!(entry.state, DeliveryState::InFlight { .. }))
-            {
+            if self.inflight_panes != 0 {
                 return Err("resync-all must not overtake an in-flight pane");
             }
         }
 
+        if self.waiter.is_some() && self.pending_wake.is_some() {
+            return Err("registered waiter coexists with an undelivered pending wake");
+        }
         if self.is_closed()
             && (self
                 .panes
                 .values()
                 .any(|entry| entry.state != DeliveryState::Closed)
                 || !self.ready.is_empty()
+                || self.inflight_panes != 0
                 || self.waiter.is_some())
         {
             return Err("closed generation retains deliverable work");
@@ -902,7 +1245,23 @@ impl DeliveryLedger {
         };
         self.next_token_sequence = sequence.checked_add(1);
         Ok(DeliveryToken {
+            instance: self.instance,
             generation: self.generation,
+            sequence,
+        })
+    }
+
+    fn issue_pane_close_ack(&mut self, pane_id: PaneId) -> Option<PaneCloseAckToken> {
+        let Some(sequence) = self.next_close_ack_sequence else {
+            DeliveryCounters::increment(&mut self.counters.terminal_failures);
+            self.close_generation();
+            return None;
+        };
+        self.next_close_ack_sequence = sequence.checked_add(1);
+        Some(PaneCloseAckToken {
+            instance: self.instance,
+            generation: self.generation,
+            pane_id,
             sequence,
         })
     }
@@ -940,6 +1299,7 @@ impl DeliveryLedger {
         }
 
         DeliveryCounters::increment(&mut self.counters.commits);
+        self.inflight_panes -= 1;
         if self.resync_all != DeliveryState::Clean {
             entry.state = DeliveryState::Clean;
             entry.queued = false;
@@ -957,7 +1317,7 @@ impl DeliveryLedger {
         }
     }
 
-    fn redirty_inflight_resync(&mut self) {
+    fn redirty_inflight_resync(&mut self) -> bool {
         if let DeliveryState::InFlight {
             redirtied: false,
             token,
@@ -967,19 +1327,46 @@ impl DeliveryLedger {
                 redirtied: true,
                 token,
             };
+            true
+        } else {
+            false
         }
     }
 
-    fn wake_waiter(&mut self) {
+    fn has_claimable_work(&self) -> bool {
+        match self.resync_all {
+            DeliveryState::Clean => !self.ready.is_empty(),
+            DeliveryState::Dirty => self.inflight_panes == 0,
+            DeliveryState::InFlight { .. } | DeliveryState::Closed => false,
+        }
+    }
+
+    fn wake_if_newly_claimable(&mut self, was_claimable: bool) {
+        if !was_claimable && self.has_claimable_work() {
+            self.defer_waiter_wake();
+        } else if self.waiter.is_some() {
+            DeliveryCounters::increment(&mut self.counters.suppressed_wakes);
+        }
+    }
+
+    fn defer_waiter_wake(&mut self) {
         if let Some(waiter) = self.waiter.take() {
-            DeliveryCounters::increment(&mut self.counters.wake_deliveries);
-            waiter.wake();
+            debug_assert!(
+                self.pending_wake.is_none(),
+                "the owner must extract each pending wake before another mutation"
+            );
+            self.pending_wake = Some(waiter);
         }
     }
 
     #[cfg(test)]
     fn set_next_token_sequence_for_test(&mut self, sequence: Option<u64>) {
         self.next_token_sequence = sequence;
+    }
+
+    #[cfg(test)]
+    fn set_next_close_ack_sequence_for_test(&mut self, sequence: Option<u64>) {
+        self.next_close_ack_sequence = sequence;
     }
 }
 
@@ -1624,6 +2011,15 @@ mod tests {
         DeliveryGeneration::new(17)
     }
 
+    fn ledger_for(generation: DeliveryGeneration, pane_limit: usize) -> DeliveryLedger {
+        DeliveryLedger::new(generation, pane_limit)
+            .expect("test delivery-ledger instance allocation should succeed")
+    }
+
+    fn ledger(pane_limit: usize) -> DeliveryLedger {
+        ledger_for(generation(), pane_limit)
+    }
+
     fn claim(ledger: &mut DeliveryLedger) -> DeliveryClaim {
         ledger
             .claim_next()
@@ -1631,9 +2027,52 @@ mod tests {
             .expect("expected a delivery claim")
     }
 
+    fn mutate_ledger_under_owner<T>(
+        ledger: &mut DeliveryLedger,
+        mutation: impl FnOnce(&mut DeliveryLedger) -> T,
+    ) -> (T, Option<PendingDeliveryWake>) {
+        // This exclusive borrow models the live external mutex guard. Returning
+        // the pending wake ends that guard boundary; tests must wake afterward.
+        let outcome = mutation(ledger);
+        let pending_wake = ledger.take_pending_wake();
+        (outcome, pending_wake)
+    }
+
+    fn close_ack(outcome: ClosePaneOutcome) -> PaneCloseAckToken {
+        match outcome {
+            ClosePaneOutcome::ClosedClean { close_ack }
+            | ClosePaneOutcome::ClosedDirty { close_ack }
+            | ClosePaneOutcome::ClosedInFlight { close_ack, .. }
+            | ClosePaneOutcome::AlreadyClosed { close_ack } => close_ack,
+            ClosePaneOutcome::Untracked | ClosePaneOutcome::GenerationClosed => {
+                panic!("expected a tracked pane close with acknowledgement token")
+            }
+        }
+    }
+
+    #[test]
+    fn ledger_instance_allocator_reserves_zero_and_terminal_value() {
+        let zero = AtomicU64::new(0);
+        assert_eq!(
+            allocate_delivery_ledger_instance(&zero),
+            Err(DeliveryLedgerInstanceExhausted)
+        );
+
+        let terminal_boundary = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_delivery_ledger_instance(&terminal_boundary),
+            Ok(DeliveryLedgerInstance(u64::MAX - 1))
+        );
+        assert_eq!(terminal_boundary.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            allocate_delivery_ledger_instance(&terminal_boundary),
+            Err(DeliveryLedgerInstanceExhausted)
+        );
+    }
+
     #[test]
     fn dirty_redirty_commit_cycle_is_level_triggered() {
-        let mut ledger = DeliveryLedger::new(generation(), 4);
+        let mut ledger = ledger(4);
         assert_eq!(ledger.mark_dirty(7), DirtyOutcome::BecameDirty);
         assert_eq!(ledger.mark_dirty(7), DirtyOutcome::Coalesced);
 
@@ -1660,7 +2099,7 @@ mod tests {
 
     #[test]
     fn only_wake_full_then_producer_quiesces_but_obligation_survives() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+        let mut ledger = ledger(1);
         let mut bounded_wakes = VecDeque::from(["older-dispatch-item"]);
         let wake_capacity = 1;
 
@@ -1686,7 +2125,7 @@ mod tests {
 
     #[test]
     fn atomic_wait_registration_closes_the_check_then_park_race() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+        let mut ledger = ledger(1);
         let wake_counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&wake_counter));
         let mut context = Context::from_waker(&waker);
@@ -1694,10 +2133,25 @@ mod tests {
         // The consumer performs its empty check and atomically registers the
         // task that would otherwise be about to park.
         assert_eq!(ledger.poll_claim_next(&mut context), Poll::Pending);
+        assert_eq!(
+            ledger.claim_next(),
+            Ok(None),
+            "an empty direct probe must not erase a registered waiter"
+        );
 
         // The producer runs strictly after that check, has no queue capacity,
         // publishes the only dirty, and then permanently quiesces.
-        assert_eq!(ledger.mark_dirty(3), DirtyOutcome::BecameDirty);
+        let (outcome, pending_wake) =
+            mutate_ledger_under_owner(&mut ledger, |owned| owned.mark_dirty(3));
+        assert_eq!(outcome, DirtyOutcome::BecameDirty);
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "owner mutation must not invoke an arbitrary waker under its guard"
+        );
+        pending_wake
+            .expect("claimable publication must defer the registered wake")
+            .wake();
         assert_eq!(
             wake_counter.0.load(Ordering::Relaxed),
             1,
@@ -1714,7 +2168,7 @@ mod tests {
 
         // The opposite ordering is also safe: preexisting work is returned
         // synchronously and no waiter is installed.
-        let mut producer_first = DeliveryLedger::new(generation(), 1);
+        let mut producer_first = self::ledger(1);
         producer_first.mark_dirty(4);
         assert!(matches!(
             producer_first.poll_claim_next(&mut context),
@@ -1731,8 +2185,124 @@ mod tests {
     }
 
     #[test]
+    fn terminal_close_defers_waiter_until_after_owner_release() {
+        let mut ledger = ledger(1);
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(ledger.poll_claim_next(&mut context), Poll::Pending);
+
+        let ((), pending_wake) =
+            mutate_ledger_under_owner(&mut ledger, DeliveryLedger::close_generation);
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "terminal close must not invoke the waker under owner ownership"
+        );
+        assert_eq!(ledger.check_invariants(), Ok(()));
+        pending_wake
+            .expect("terminal close must extract the registered waiter")
+            .wake();
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+        assert_eq!(ledger.counters().wake_deliveries, 1);
+    }
+
+    #[test]
+    fn in_flight_redirty_wake_storm_is_suppressed_until_settlement() {
+        let mut ledger = ledger(1);
+        assert_eq!(ledger.mark_dirty(3), DirtyOutcome::BecameDirty);
+        let in_flight = claim(&mut ledger);
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(ledger.poll_claim_next(&mut context), Poll::Pending);
+
+        assert_eq!(ledger.mark_dirty(3), DirtyOutcome::MarkedInFlightRedirty);
+        for _ in 1..64 {
+            assert_eq!(ledger.mark_dirty(3), DirtyOutcome::Coalesced);
+        }
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "redirties fenced by the older claim must retain, not wake, the waiter"
+        );
+        assert_eq!(ledger.counters().suppressed_wakes, 64);
+        assert_eq!(ledger.counters().wake_deliveries, 0);
+
+        let (outcome, pending_wake) =
+            mutate_ledger_under_owner(&mut ledger, |owned| owned.commit(in_flight));
+        assert_eq!(outcome, SettleOutcome::RequeuedDirty);
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "settlement must only extract the wake while the owner is held"
+        );
+        pending_wake
+            .expect("claimable settlement must defer the registered wake")
+            .wake();
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            1,
+            "settlement that exposes the redirtied obligation must wake exactly once"
+        );
+        assert_eq!(ledger.counters().wake_deliveries, 1);
+        assert!(matches!(
+            ledger.poll_claim_next(&mut context),
+            Poll::Ready(Ok(Some(DeliveryClaim {
+                scope: DeliveryScope::Pane(3),
+                ..
+            })))
+        ));
+    }
+
+    #[test]
+    fn clean_settlement_retains_waiter_until_new_work_becomes_claimable() {
+        let mut ledger = ledger(2);
+        assert_eq!(ledger.mark_dirty(1), DirtyOutcome::BecameDirty);
+        let in_flight = claim(&mut ledger);
+
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wake_counter));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(ledger.poll_claim_next(&mut context), Poll::Pending);
+
+        let (outcome, pending_wake) =
+            mutate_ledger_under_owner(&mut ledger, |owned| owned.commit(in_flight));
+        assert_eq!(outcome, SettleOutcome::CommittedClean);
+        assert!(
+            pending_wake.is_none(),
+            "a clean settlement must retain rather than extract its waiter"
+        );
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "a clean settlement exposes no work and must not spuriously wake"
+        );
+        assert_eq!(ledger.counters().suppressed_wakes, 1);
+
+        let (outcome, pending_wake) =
+            mutate_ledger_under_owner(&mut ledger, |owned| owned.mark_dirty(2));
+        assert_eq!(outcome, DirtyOutcome::BecameDirty);
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "claimable publication must not wake until the owner guard is gone"
+        );
+        pending_wake
+            .expect("later claimable dirty must defer the retained waiter")
+            .wake();
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            1,
+            "the retained waiter must wake when a later dirty becomes claimable"
+        );
+        assert_eq!(ledger.counters().wake_deliveries, 1);
+    }
+
+    #[test]
     fn close_wakes_resync_blocked_only_by_inflight_pane() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+        let mut ledger = ledger(1);
         assert_eq!(ledger.mark_dirty(1), DirtyOutcome::BecameDirty);
         let pane_claim = claim(&mut ledger);
         assert_eq!(ledger.mark_dirty(2), DirtyOutcome::EscalatedToResyncAll);
@@ -1746,12 +2316,36 @@ mod tests {
             "older in-flight pane must fence the ready resync"
         );
 
+        assert_eq!(ledger.mark_dirty(3), DirtyOutcome::CoveredByResyncAll);
         assert_eq!(
-            ledger.close_pane(1),
-            ClosePaneOutcome::ClosedInFlight {
-                token: pane_claim.token()
-            }
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "a dirty already covered by the fenced resync must not wake"
         );
+        assert_eq!(ledger.counters().suppressed_wakes, 1);
+
+        let (outcome, pending_wake) =
+            mutate_ledger_under_owner(&mut ledger, |owned| owned.close_pane(1));
+        assert!(matches!(
+            outcome,
+            ClosePaneOutcome::ClosedInFlight {
+                delivery_token,
+                ..
+            } if delivery_token == pane_claim.token()
+        ));
+        assert_eq!(
+            ledger.counters().suppressed_wakes,
+            1,
+            "the fence-clearing close must deliver rather than suppress its wake"
+        );
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "fence-clearing close must defer the wake under owner ownership"
+        );
+        pending_wake
+            .expect("fence-clearing close must extract the registered waiter")
+            .wake();
         assert_eq!(
             wake_counter.0.load(Ordering::Relaxed),
             1,
@@ -1768,7 +2362,7 @@ mod tests {
 
     #[test]
     fn zero_and_one_pane_capacity_use_bounded_resync_escape_hatch() {
-        let mut zero = DeliveryLedger::new(generation(), 0);
+        let mut zero = ledger(0);
         assert_eq!(zero.mark_dirty(1), DirtyOutcome::EscalatedToResyncAll);
         assert_eq!(
             zero.capacity(),
@@ -1783,7 +2377,7 @@ mod tests {
         assert_eq!(zero_claim.scope(), DeliveryScope::ResyncAll);
         assert_eq!(zero.commit(zero_claim), SettleOutcome::CommittedClean);
 
-        let mut one = DeliveryLedger::new(generation(), 1);
+        let mut one = ledger(1);
         assert_eq!(one.mark_dirty(1), DirtyOutcome::BecameDirty);
         assert_eq!(one.mark_dirty(2), DirtyOutcome::EscalatedToResyncAll);
         assert_eq!(one.pane_state(1), Some(DeliveryState::Clean));
@@ -1797,7 +2391,7 @@ mod tests {
 
     #[test]
     fn resync_waits_for_older_inflight_and_absorbs_its_redirty() {
-        let mut ledger = DeliveryLedger::new(generation(), 2);
+        let mut ledger = ledger(2);
         ledger.mark_dirty(1);
         let pane_claim = claim(&mut ledger);
         ledger.mark_dirty(1);
@@ -1817,7 +2411,7 @@ mod tests {
 
     #[test]
     fn redirty_during_resync_requires_a_fresh_resync_token() {
-        let mut ledger = DeliveryLedger::new(generation(), 0);
+        let mut ledger = ledger(0);
         ledger.mark_dirty(1);
         let first = claim(&mut ledger);
         assert_eq!(ledger.mark_dirty(2), DirtyOutcome::MarkedInFlightRedirty);
@@ -1832,7 +2426,7 @@ mod tests {
 
     #[test]
     fn round_robin_fairness_appends_redirtied_work_at_tail() {
-        let mut ledger = DeliveryLedger::new(generation(), 3);
+        let mut ledger = ledger(3);
         for pane_id in 1..=3 {
             ledger.mark_dirty(pane_id);
         }
@@ -1853,58 +2447,340 @@ mod tests {
 
     #[test]
     fn close_while_dirty_or_inflight_is_terminal_for_that_pane() {
-        let mut dirty = DeliveryLedger::new(generation(), 1);
+        let mut dirty = ledger(1);
         dirty.mark_dirty(4);
-        assert_eq!(dirty.close_pane(4), ClosePaneOutcome::ClosedDirty);
+        assert!(matches!(
+            dirty.close_pane(4),
+            ClosePaneOutcome::ClosedDirty { .. }
+        ));
         assert_eq!(dirty.claim_next(), Ok(None));
         assert_eq!(dirty.mark_dirty(4), DirtyOutcome::IgnoredClosed);
 
-        let mut inflight = DeliveryLedger::new(generation(), 1);
+        let mut inflight = ledger(1);
         inflight.mark_dirty(4);
         let old = claim(&mut inflight);
-        assert_eq!(
+        assert!(matches!(
             inflight.close_pane(4),
-            ClosePaneOutcome::ClosedInFlight { token: old.token() }
-        );
+            ClosePaneOutcome::ClosedInFlight {
+                delivery_token,
+                ..
+            } if delivery_token == old.token()
+        ));
         assert_eq!(inflight.commit(old), SettleOutcome::ScopeClosed);
         assert_eq!(inflight.retry(old), SettleOutcome::ScopeClosed);
         assert_eq!(inflight.check_invariants(), Ok(()));
     }
 
     #[test]
-    fn acknowledged_close_reclaims_capacity_without_id_reuse() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+    fn acknowledged_close_reclaims_capacity_for_later_allocator_ids() {
+        let mut ledger = ledger(1);
         ledger.mark_dirty(1);
-        assert_eq!(ledger.close_pane(1), ClosePaneOutcome::ClosedDirty);
+        assert!(matches!(
+            ledger.close_pane(1),
+            ClosePaneOutcome::ClosedDirty { .. }
+        ));
         assert_eq!(
             ledger.mark_dirty(2),
             DirtyOutcome::EscalatedToResyncAll,
             "unacknowledged close barrier must retain its bounded tombstone"
         );
 
-        let mut reclaimed = DeliveryLedger::new(generation(), 1);
+        let mut reclaimed = self::ledger(2);
         reclaimed.mark_dirty(1);
-        assert_eq!(reclaimed.close_pane(1), ClosePaneOutcome::ClosedDirty);
+        reclaimed.mark_dirty(2);
+        let close_ack = close_ack(reclaimed.close_pane(1));
         assert_eq!(
-            reclaimed.acknowledge_pane_close(1),
+            reclaimed.acknowledge_pane_close(1, close_ack),
             ReclaimPaneOutcome::Reclaimed
         );
-        assert_eq!(reclaimed.mark_dirty(2), DirtyOutcome::BecameDirty);
-        assert_eq!(reclaimed.capacity().tracked_panes, 1);
         assert_eq!(
-            reclaimed.acknowledge_pane_close(2),
-            ReclaimPaneOutcome::AwaitingClose
+            reclaimed.mark_dirty(3),
+            DirtyOutcome::BecameDirty,
+            "a higher monotonic PaneId must reuse the reclaimed capacity"
         );
-        assert_eq!(
-            reclaimed.acknowledge_pane_close(99),
-            ReclaimPaneOutcome::Untracked
-        );
+        assert_eq!(reclaimed.capacity().tracked_panes, 2);
+        assert_eq!(reclaimed.counters().close_acknowledgements, 1);
         assert_eq!(reclaimed.check_invariants(), Ok(()));
     }
 
     #[test]
+    fn repeated_close_returns_same_pending_ack_and_can_reclaim() {
+        let mut ledger = ledger(1);
+        ledger.mark_dirty(7);
+        let first_ack = close_ack(ledger.close_pane(7));
+        let repeated_ack = match ledger.close_pane(7) {
+            ClosePaneOutcome::AlreadyClosed { close_ack } => close_ack,
+            other => panic!("expected recoverable repeated close, got {other:?}"),
+        };
+        assert_eq!(
+            repeated_ack, first_ack,
+            "a retry before application ACK must recover the exact pending capability"
+        );
+        assert_eq!(
+            ledger.acknowledge_pane_close(7, repeated_ack),
+            ReclaimPaneOutcome::Reclaimed
+        );
+        assert_eq!(ledger.mark_dirty(8), DirtyOutcome::BecameDirty);
+        assert_eq!(ledger.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn higher_reclaimed_id_does_not_retire_a_lower_live_pane_first_observed_late() {
+        let mut ledger = ledger(2);
+        ledger.mark_dirty(100);
+        let close_ack = close_ack(ledger.close_pane(100));
+        assert_eq!(
+            ledger.acknowledge_pane_close(100, close_ack),
+            ReclaimPaneOutcome::Reclaimed
+        );
+
+        assert_eq!(
+            ledger.mark_dirty(1),
+            DirtyOutcome::BecameDirty,
+            "numeric order is not liveness evidence; pane 1 may have remained live throughout"
+        );
+        assert!(!ledger.is_closed());
+        assert_eq!(claim(&mut ledger).scope(), DeliveryScope::Pane(1));
+        assert_eq!(ledger.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn closing_lower_untracked_live_pane_redirties_resync_after_higher_reclaim() {
+        let mut ledger = ledger(1);
+        ledger.mark_dirty(100);
+        let close_ack = close_ack(ledger.close_pane(100));
+        assert_eq!(
+            ledger.acknowledge_pane_close(100, close_ack),
+            ReclaimPaneOutcome::Reclaimed
+        );
+        assert_eq!(ledger.request_resync_all(), ResyncOutcome::Requested);
+        let resync = claim(&mut ledger);
+
+        assert_eq!(ledger.close_pane(1), ClosePaneOutcome::Untracked);
+        assert!(matches!(
+            ledger.resync_all_state(),
+            DeliveryState::InFlight {
+                redirtied: true,
+                ..
+            }
+        ));
+        assert_eq!(ledger.commit(resync), SettleOutcome::RequeuedDirty);
+        assert!(!ledger.is_closed());
+        assert_eq!(ledger.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn close_ack_rejects_early_wrong_generation_wrong_pane_stale_and_duplicate() {
+        let mut ledger = ledger(2);
+        ledger.mark_dirty(10);
+        ledger.mark_dirty(11);
+
+        let early = PaneCloseAckToken {
+            instance: ledger.instance(),
+            generation: generation(),
+            pane_id: 10,
+            sequence: 1,
+        };
+        assert_eq!(
+            ledger.acknowledge_pane_close(10, early),
+            ReclaimPaneOutcome::AwaitingClose,
+            "even a guessed future token cannot acknowledge a pane before it closes"
+        );
+        let exact = close_ack(ledger.close_pane(10));
+        assert_eq!(exact, early);
+
+        let wrong_generation = PaneCloseAckToken {
+            generation: DeliveryGeneration::new(generation().get() + 1),
+            ..exact
+        };
+        assert_eq!(
+            ledger.acknowledge_pane_close(10, wrong_generation),
+            ReclaimPaneOutcome::WrongGeneration
+        );
+        assert_eq!(
+            ledger.acknowledge_pane_close(11, exact),
+            ReclaimPaneOutcome::WrongPane
+        );
+        let stale = PaneCloseAckToken {
+            sequence: exact.sequence() - 1,
+            ..exact
+        };
+        assert_eq!(
+            ledger.acknowledge_pane_close(10, stale),
+            ReclaimPaneOutcome::StaleOrDuplicate
+        );
+        assert_eq!(
+            ledger.acknowledge_pane_close(10, exact),
+            ReclaimPaneOutcome::Reclaimed
+        );
+        assert_eq!(
+            ledger.acknowledge_pane_close(10, exact),
+            ReclaimPaneOutcome::StaleOrDuplicate
+        );
+
+        assert_eq!(ledger.counters().close_acknowledgements, 1);
+        assert_eq!(ledger.counters().rejected_close_acknowledgements, 5);
+        assert_eq!(ledger.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn same_generation_cross_instance_claim_cannot_commit() {
+        let mut original = ledger(1);
+        original.mark_dirty(7);
+        let stale = claim(&mut original);
+
+        let mut replacement = ledger(1);
+        replacement.mark_dirty(7);
+        let current = claim(&mut replacement);
+        assert_ne!(stale.token().instance(), current.token().instance());
+
+        assert_eq!(replacement.commit(stale), SettleOutcome::StaleOrDuplicate);
+        assert!(matches!(
+            replacement.pane_state(7),
+            Some(DeliveryState::InFlight { token, .. }) if token == current.token()
+        ));
+        assert_eq!(
+            replacement.counters().rejected_cross_instance_settlements,
+            1
+        );
+        assert_eq!(replacement.commit(current), SettleOutcome::CommittedClean);
+    }
+
+    #[test]
+    fn same_generation_cross_instance_claim_cannot_retry_or_settle_no_change() {
+        let mut original = ledger(1);
+        original.mark_dirty(8);
+        let stale = claim(&mut original);
+
+        let mut replacement = ledger(1);
+        replacement.mark_dirty(8);
+        let current = claim(&mut replacement);
+
+        assert_eq!(replacement.retry(stale), SettleOutcome::StaleOrDuplicate);
+        assert_eq!(
+            replacement.settle_no_change(stale),
+            SettleOutcome::StaleOrDuplicate
+        );
+        assert!(matches!(
+            replacement.pane_state(8),
+            Some(DeliveryState::InFlight { token, .. }) if token == current.token()
+        ));
+        assert_eq!(
+            replacement.counters().rejected_cross_instance_settlements,
+            2
+        );
+        assert_eq!(
+            replacement.settle_no_change(current),
+            SettleOutcome::LocallySettledNoChange
+        );
+    }
+
+    #[test]
+    fn same_generation_cross_instance_terminal_failure_cannot_close_replacement() {
+        let mut original = ledger(1);
+        original.mark_dirty(9);
+        let stale = claim(&mut original);
+
+        let mut replacement = ledger(1);
+        replacement.mark_dirty(9);
+        let current = claim(&mut replacement);
+
+        assert_eq!(
+            replacement.fail_terminal(stale),
+            SettleOutcome::StaleOrDuplicate
+        );
+        assert!(!replacement.is_closed());
+        assert!(matches!(
+            replacement.pane_state(9),
+            Some(DeliveryState::InFlight { token, .. }) if token == current.token()
+        ));
+        assert_eq!(
+            replacement.counters().rejected_cross_instance_settlements,
+            1
+        );
+    }
+
+    #[test]
+    fn same_generation_cross_instance_close_ack_cannot_reclaim_replacement() {
+        let mut original = ledger(1);
+        original.mark_dirty(10);
+        let stale = close_ack(original.close_pane(10));
+
+        let mut replacement = ledger(1);
+        replacement.mark_dirty(10);
+        let current = close_ack(replacement.close_pane(10));
+        assert_ne!(stale.instance(), current.instance());
+
+        assert_eq!(
+            replacement.acknowledge_pane_close(10, stale),
+            ReclaimPaneOutcome::WrongInstance
+        );
+        assert_eq!(replacement.pane_state(10), Some(DeliveryState::Closed));
+        assert_eq!(
+            replacement
+                .counters()
+                .rejected_cross_instance_close_acknowledgements,
+            1
+        );
+        assert_eq!(replacement.counters().rejected_close_acknowledgements, 1);
+        assert_eq!(
+            replacement.acknowledge_pane_close(10, current),
+            ReclaimPaneOutcome::Reclaimed
+        );
+    }
+
+    #[test]
+    fn closed_replacement_still_classifies_cross_instance_settlements() {
+        let mut original = ledger(1);
+        original.mark_dirty(11);
+        let stale = claim(&mut original);
+
+        let mut replacement = ledger(1);
+        replacement.close_generation();
+
+        assert_eq!(replacement.commit(stale), SettleOutcome::StaleOrDuplicate);
+        assert_eq!(
+            replacement.settle_no_change(stale),
+            SettleOutcome::StaleOrDuplicate
+        );
+        assert_eq!(replacement.retry(stale), SettleOutcome::StaleOrDuplicate);
+        assert_eq!(
+            replacement.fail_terminal(stale),
+            SettleOutcome::StaleOrDuplicate
+        );
+        assert_eq!(
+            replacement.counters().rejected_cross_instance_settlements,
+            4
+        );
+        assert!(replacement.is_closed());
+    }
+
+    #[test]
+    fn closed_replacement_still_classifies_cross_instance_close_ack() {
+        let mut original = ledger(1);
+        original.mark_dirty(12);
+        let stale = close_ack(original.close_pane(12));
+
+        let mut replacement = ledger(1);
+        replacement.close_generation();
+
+        assert_eq!(
+            replacement.acknowledge_pane_close(12, stale),
+            ReclaimPaneOutcome::WrongInstance
+        );
+        assert_eq!(
+            replacement
+                .counters()
+                .rejected_cross_instance_close_acknowledgements,
+            1
+        );
+        assert_eq!(replacement.counters().rejected_close_acknowledgements, 1);
+        assert!(replacement.is_closed());
+    }
+
+    #[test]
     fn stale_and_duplicate_commits_cannot_clean_newer_work() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+        let mut ledger = ledger(1);
         ledger.mark_dirty(7);
         let first = claim(&mut ledger);
         assert_eq!(ledger.commit(first), SettleOutcome::CommittedClean);
@@ -1922,7 +2798,7 @@ mod tests {
 
     #[test]
     fn no_change_settlement_is_local_pane_only_and_preserves_redirty() {
-        let mut clean = DeliveryLedger::new(generation(), 1);
+        let mut clean = ledger(1);
         clean.mark_dirty(7);
         let no_change_claim = claim(&mut clean);
         assert_eq!(
@@ -1933,7 +2809,7 @@ mod tests {
         assert_eq!(clean.counters().commits, 0);
         assert_eq!(clean.counters().no_change_settlements, 1);
 
-        let mut redirtied = DeliveryLedger::new(generation(), 1);
+        let mut redirtied = ledger(1);
         redirtied.mark_dirty(8);
         let redirtied_claim = claim(&mut redirtied);
         redirtied.mark_dirty(8);
@@ -1943,7 +2819,7 @@ mod tests {
         );
         assert_eq!(claim(&mut redirtied).scope(), DeliveryScope::Pane(8));
 
-        let mut resync = DeliveryLedger::new(generation(), 0);
+        let mut resync = ledger(0);
         resync.request_resync_all();
         let resync_claim = claim(&mut resync);
         assert_eq!(
@@ -1959,7 +2835,7 @@ mod tests {
 
     #[test]
     fn shutdown_closes_dirty_and_inflight_work_without_false_clean() {
-        let mut ledger = DeliveryLedger::new(generation(), 2);
+        let mut ledger = ledger(2);
         ledger.mark_dirty(1);
         ledger.mark_dirty(2);
         let old = claim(&mut ledger);
@@ -1976,14 +2852,14 @@ mod tests {
 
     #[test]
     fn shutdown_closes_dirty_and_inflight_resync_without_settlement() {
-        let mut dirty_resync = DeliveryLedger::new(generation(), 0);
+        let mut dirty_resync = ledger(0);
         dirty_resync.mark_dirty(1);
         assert_eq!(dirty_resync.resync_all_state(), DeliveryState::Dirty);
         dirty_resync.close_generation();
         assert_eq!(dirty_resync.resync_all_state(), DeliveryState::Closed);
         assert_eq!(dirty_resync.claim_next(), Ok(None));
 
-        let mut inflight_resync = DeliveryLedger::new(generation(), 0);
+        let mut inflight_resync = ledger(0);
         inflight_resync.mark_dirty(1);
         let old = claim(&mut inflight_resync);
         assert_eq!(old.scope(), DeliveryScope::ResyncAll);
@@ -1995,9 +2871,12 @@ mod tests {
 
     #[test]
     fn dirty_for_closed_pane_does_not_redirty_inflight_resync() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+        let mut ledger = ledger(1);
         ledger.mark_dirty(1);
-        assert_eq!(ledger.close_pane(1), ClosePaneOutcome::ClosedDirty);
+        assert!(matches!(
+            ledger.close_pane(1),
+            ClosePaneOutcome::ClosedDirty { .. }
+        ));
         assert_eq!(ledger.request_resync_all(), ResyncOutcome::Requested);
         let resync = claim(&mut ledger);
         assert_eq!(resync.scope(), DeliveryScope::ResyncAll);
@@ -2015,7 +2894,7 @@ mod tests {
 
     #[test]
     fn untracked_close_redirties_an_inflight_all_pane_inventory() {
-        let mut ledger = DeliveryLedger::new(generation(), 0);
+        let mut ledger = ledger(0);
         assert_eq!(ledger.request_resync_all(), ResyncOutcome::Requested);
         let resync = claim(&mut ledger);
         assert_eq!(resync.scope(), DeliveryScope::ResyncAll);
@@ -2035,7 +2914,7 @@ mod tests {
 
     #[test]
     fn token_exhaustion_fails_closed_without_wrap_or_reuse() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+        let mut ledger = ledger(1);
         ledger.set_next_token_sequence_for_test(Some(u64::MAX));
         ledger.mark_dirty(1);
         let final_token = claim(&mut ledger);
@@ -2050,8 +2929,27 @@ mod tests {
     }
 
     #[test]
+    fn close_ack_token_exhaustion_fails_generation_closed_without_reuse() {
+        let mut ledger = ledger(2);
+        ledger.set_next_close_ack_sequence_for_test(Some(u64::MAX));
+        ledger.mark_dirty(1);
+        ledger.mark_dirty(2);
+
+        let final_ack = close_ack(ledger.close_pane(1));
+        assert_eq!(final_ack.sequence(), u64::MAX);
+        assert_eq!(
+            ledger.close_pane(2),
+            ClosePaneOutcome::GenerationClosed,
+            "exhausted close-ACK space must close rather than reuse a capability"
+        );
+        assert!(ledger.is_closed());
+        assert_eq!(ledger.counters().terminal_failures, 1);
+        assert_eq!(ledger.check_invariants(), Ok(()));
+    }
+
+    #[test]
     fn terminal_failure_fails_closed_and_transient_failure_retries() {
-        let mut transient = DeliveryLedger::new(generation(), 1);
+        let mut transient = ledger(1);
         transient.mark_dirty(1);
         let transient_claim = claim(&mut transient);
         assert_eq!(
@@ -2072,7 +2970,7 @@ mod tests {
 
     #[test]
     fn same_generation_transport_death_closes_even_after_scope_race() {
-        let mut ledger = DeliveryLedger::new(generation(), 1);
+        let mut ledger = ledger(1);
         ledger.mark_dirty(1);
         let transport_claim = claim(&mut ledger);
         assert!(matches!(
@@ -2085,7 +2983,7 @@ mod tests {
         );
         assert!(ledger.is_closed());
 
-        let mut new_generation = DeliveryLedger::new(DeliveryGeneration::new(18), 1);
+        let mut new_generation = ledger_for(DeliveryGeneration::new(18), 1);
         new_generation.mark_dirty(1);
         assert_eq!(
             new_generation.fail_terminal(transport_claim),
@@ -2295,11 +3193,51 @@ mod tests {
 
     proptest! {
         #[test]
+        fn reclaiming_one_id_never_changes_a_distinct_live_id(
+            reclaimed_id in 0usize..=4096,
+            live_id in 0usize..=4096,
+        ) {
+            prop_assume!(reclaimed_id != live_id);
+            let mut ledger = ledger(1);
+            prop_assert_eq!(
+                ledger.mark_dirty(reclaimed_id),
+                DirtyOutcome::BecameDirty
+            );
+            let close_ack = close_ack(ledger.close_pane(reclaimed_id));
+            prop_assert_eq!(
+                ledger.acknowledge_pane_close(reclaimed_id, close_ack),
+                ReclaimPaneOutcome::Reclaimed
+            );
+
+            prop_assert_eq!(
+                ledger.mark_dirty(live_id),
+                DirtyOutcome::BecameDirty,
+                "reclaiming {} changed distinct live pane {}",
+                reclaimed_id,
+                live_id
+            );
+            prop_assert!(!ledger.is_closed());
+            let instance = ledger.instance();
+            prop_assert_eq!(
+                ledger.claim_next(),
+                Ok(Some(DeliveryClaim {
+                    scope: DeliveryScope::Pane(live_id),
+                    token: DeliveryToken {
+                        instance,
+                        generation: generation(),
+                        sequence: 1,
+                    },
+                }))
+            );
+            prop_assert_eq!(ledger.check_invariants(), Ok(()));
+        }
+
+        #[test]
         fn generated_transition_sequences_preserve_all_structural_invariants(
             pane_limit in 0usize..=8,
             actions in prop::collection::vec((0u8..=6, 0usize..=12), 0..256),
         ) {
-            let mut ledger = DeliveryLedger::new(generation(), pane_limit);
+            let mut ledger = ledger(pane_limit);
             let mut claims = Vec::new();
 
             for (action, pane_id) in actions {

@@ -26,14 +26,21 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-use std::task::{Context as TaskContext, Poll, Waker};
+use std::task::{Context as TaskContext, Waker};
 use wezterm_uds::UnixStream;
 
 pub const DISPATCH_ITEM_QUEUE_CAPACITY: usize = 4096;
 const TRANSIENT_WRITE_RETRY_LIMIT: usize = 8;
 const TMUX_CONTROL_MAX_LINE_BYTES: usize = 16 * 1024;
+/// Bound one outbound turn so an already-readable keypress cannot sit behind
+/// an arbitrarily long run of render/notification frames.
+const OUTBOUND_WRITE_QUANTUM_FRAMES: usize = 32;
+const OUTBOUND_WRITE_QUANTUM_BYTES: usize = 64 * 1024;
+static DROPPED_NOTIFICATION_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchIoBackend {
@@ -123,6 +130,20 @@ pub enum DispatchStreamKind {
     Unix,
     Tls,
     Generic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchReadinessHint {
+    Ready,
+    NotReady,
+    Unsupported,
+}
+
+/// The side whose readiness completed a combined dispatch wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DispatchReadySide {
+    Readable,
+    Writable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -330,6 +351,49 @@ pub trait DispatchStream: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug {
     fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
     fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>>;
 
+    /// Wait for and classify readable input or writable output.
+    ///
+    /// Socket wrappers with a single reactor registration slot must override
+    /// this, arm a combined interest, and classify the wake without installing
+    /// competing registrations. The default remains available for independent
+    /// test and generic stream implementations.
+    fn wait_for_readable_or_writable(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<DispatchReadySide>> + Send + '_>> {
+        let wait_for_read = self.wait_for_readable();
+        let wait_for_write = self.wait_for_writable();
+        Box::pin(async move {
+            pin_mut!(wait_for_read);
+            pin_mut!(wait_for_write);
+            match select(wait_for_read, wait_for_write).await {
+                Either::Left((result, _)) => result.map(|()| DispatchReadySide::Readable),
+                Either::Right((result, _)) => result.map(|()| DispatchReadySide::Writable),
+            }
+        })
+    }
+
+    /// Synchronously probe inbound readiness without consuming bytes.
+    ///
+    /// Production socket wrappers override this so a continuously ready
+    /// internal queue cannot win by repeatedly causing a pending-first
+    /// readiness future to be created and dropped.
+    fn try_readable_without_consuming(&self) -> io::Result<DispatchReadinessHint> {
+        Ok(DispatchReadinessHint::Unsupported)
+    }
+
+    /// A pending outbound poll may carry a transport-level retry obligation
+    /// that forbids application reads until the identical operation is
+    /// retried (notably OpenSSL `WANT_READ`/`WANT_WRITE`).
+    fn pending_outbound_requires_retry(&self) -> bool {
+        false
+    }
+
+    fn wait_for_pending_outbound_retry(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        self.wait_for_writable()
+    }
+
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     fn io_uring_fd(&self) -> Option<RawFd> {
         None
@@ -349,6 +413,54 @@ impl DispatchStream for UnixStream {
         Box::pin(UnixStream::wait_for_writable(self))
     }
 
+    fn wait_for_readable_or_writable(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<DispatchReadySide>> + Send + '_>> {
+        #[cfg(unix)]
+        {
+            Box::pin(async move {
+                UnixStream::wait_for_readable_or_writable(self).await?;
+                UnixStream::try_readable_without_consuming(self).map(|ready| {
+                    if ready {
+                        DispatchReadySide::Readable
+                    } else {
+                        DispatchReadySide::Writable
+                    }
+                })
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let wait_for_read = self.wait_for_readable();
+            let wait_for_write = self.wait_for_writable();
+            Box::pin(async move {
+                pin_mut!(wait_for_read);
+                pin_mut!(wait_for_write);
+                match select(wait_for_read, wait_for_write).await {
+                    Either::Left((result, _)) => result.map(|()| DispatchReadySide::Readable),
+                    Either::Right((result, _)) => result.map(|()| DispatchReadySide::Writable),
+                }
+            })
+        }
+    }
+
+    fn try_readable_without_consuming(&self) -> io::Result<DispatchReadinessHint> {
+        #[cfg(unix)]
+        {
+            UnixStream::try_readable_without_consuming(self).map(|ready| {
+                if ready {
+                    DispatchReadinessHint::Ready
+                } else {
+                    DispatchReadinessHint::NotReady
+                }
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(DispatchReadinessHint::Unsupported)
+        }
+    }
+
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     fn io_uring_fd(&self) -> Option<RawFd> {
         Some(self.as_raw_fd())
@@ -366,6 +478,41 @@ impl DispatchStream for AsyncSslStream {
 
     fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
         Box::pin(AsyncSslStream::wait_for_writable(self))
+    }
+
+    fn wait_for_readable_or_writable(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<DispatchReadySide>> + Send + '_>> {
+        Box::pin(async move {
+            AsyncSslStream::wait_for_readable_or_writable(self).await?;
+            AsyncSslStream::try_readable_without_consuming(self).map(|ready| {
+                if ready {
+                    DispatchReadySide::Readable
+                } else {
+                    DispatchReadySide::Writable
+                }
+            })
+        })
+    }
+
+    fn try_readable_without_consuming(&self) -> io::Result<DispatchReadinessHint> {
+        AsyncSslStream::try_readable_without_consuming(self).map(|ready| {
+            if ready {
+                DispatchReadinessHint::Ready
+            } else {
+                DispatchReadinessHint::NotReady
+            }
+        })
+    }
+
+    fn pending_outbound_requires_retry(&self) -> bool {
+        AsyncSslStream::pending_outbound_requires_retry(self)
+    }
+
+    fn wait_for_pending_outbound_retry(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        Box::pin(AsyncSslStream::wait_for_pending_outbound_retry(self))
     }
 }
 
@@ -407,9 +554,20 @@ fn queue_notification(item_tx: &Sender<Item>, notification: MuxNotification) -> 
     match item_tx.try_send(Item::Notif(notification)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
-            log::warn!(
-                "dropped mux notification because dispatch item queue is full (capacity {DISPATCH_ITEM_QUEUE_CAPACITY})"
-            );
+            let dropped = DROPPED_NOTIFICATION_COUNT
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            metrics::counter!("mux.dispatch.notification_queue.full").increment(1);
+            // Saturation must not amplify into one synchronous formatting/I/O
+            // operation per dropped event. Powers-of-two sampling retains a
+            // useful escalation signal with logarithmic log volume.
+            if dropped.is_power_of_two() {
+                log::warn!(
+                    "mux dispatch notification queue is full (capacity \
+                     {DISPATCH_ITEM_QUEUE_CAPACITY}); dropped {dropped} notification(s) since \
+                     process start"
+                );
+            }
             true
         }
         Err(TrySendError::Closed(_)) => false,
@@ -669,6 +827,7 @@ where
     stream.wait_for_readable().await
 }
 
+#[cfg(test)]
 async fn wait_for_dispatch_writable<T>(
     stream: &T,
     _io_uring_runtime: Option<&DispatchIoUringRuntime>,
@@ -684,6 +843,238 @@ where
     stream.wait_for_writable().await
 }
 
+async fn wait_for_dispatch_readable_or_writable<T>(
+    stream: &T,
+    _io_uring_runtime: Option<&DispatchIoUringRuntime>,
+) -> std::io::Result<DispatchReadySide>
+where
+    T: DispatchStream,
+{
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    if let (Some(runtime), Some(raw_fd)) = (_io_uring_runtime, stream.io_uring_fd()) {
+        runtime
+            .wait_for_fd(raw_fd, Interest::READABLE | Interest::WRITABLE)
+            .await?;
+        return match stream.try_readable_without_consuming()? {
+            DispatchReadinessHint::Ready => Ok(DispatchReadySide::Readable),
+            DispatchReadinessHint::NotReady => Ok(DispatchReadySide::Writable),
+            DispatchReadinessHint::Unsupported => stream.wait_for_readable_or_writable().await,
+        };
+    }
+
+    stream.wait_for_readable_or_writable().await
+}
+
+#[derive(Debug)]
+struct PendingOutboundBatch {
+    bytes: Vec<u8>,
+    offset: usize,
+    transient_retries: usize,
+    phase: PendingOutboundPhase,
+    prefer_read: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingOutboundPhase {
+    Writing,
+    Flushing,
+}
+
+impl PendingOutboundBatch {
+    fn remaining(&self) -> &[u8] {
+        &self.bytes[self.offset..]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutboundService {
+    Readable,
+    Progress,
+    Complete,
+}
+
+fn prepare_pending_outbound_batch(
+    first: Box<DecodedPdu>,
+    item_rx: &Receiver<Item>,
+    deferred_item: &mut Option<Item>,
+    compression_mode: codec::CompressionMode,
+) -> anyhow::Result<PendingOutboundBatch> {
+    debug_assert!(deferred_item.is_none());
+    let mut bytes = Vec::new();
+    let mut current = Some(first);
+    let mut frames = 0_usize;
+
+    loop {
+        let Some(decoded) = current.take() else {
+            break;
+        };
+        let mut frame = Vec::new();
+        decoded
+            .pdu
+            .encode_with_mode(&mut frame, decoded.serial, compression_mode)
+            .context("encoding PDU frame")?;
+
+        if frames > 0
+            && bytes
+                .len()
+                .checked_add(frame.len())
+                .is_none_or(|next_len| next_len > OUTBOUND_WRITE_QUANTUM_BYTES)
+        {
+            *deferred_item = Some(Item::WritePdu(decoded));
+            break;
+        }
+
+        bytes.extend_from_slice(&frame);
+        frames = frames.saturating_add(1);
+        if frames >= OUTBOUND_WRITE_QUANTUM_FRAMES || bytes.len() >= OUTBOUND_WRITE_QUANTUM_BYTES {
+            break;
+        }
+
+        match item_rx.try_recv() {
+            Ok(Item::WritePdu(next)) => current = Some(next),
+            Ok(other) => {
+                *deferred_item = Some(other);
+                break;
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+        }
+    }
+
+    metrics::histogram!("mux.dispatch.outbound_batch.frames").record(frames as f64);
+    metrics::histogram!("mux.dispatch.outbound_batch.bytes").record(bytes.len() as f64);
+    if bytes.len() > OUTBOUND_WRITE_QUANTUM_BYTES {
+        metrics::histogram!("mux.dispatch.outbound_batch.overshoot_bytes")
+            .record(bytes.len().saturating_sub(OUTBOUND_WRITE_QUANTUM_BYTES) as f64);
+    }
+
+    Ok(PendingOutboundBatch {
+        bytes,
+        offset: 0,
+        transient_retries: 0,
+        phase: PendingOutboundPhase::Writing,
+        prefer_read: true,
+    })
+}
+
+async fn poll_dispatch_write_once<T>(stream: &mut T, bytes: &[u8]) -> io::Result<Option<usize>>
+where
+    T: DispatchStream,
+{
+    std::future::poll_fn(|cx| {
+        Poll::Ready(match Pin::new(&mut *stream).poll_write(cx, bytes) {
+            Poll::Ready(result) => result.map(Some),
+            Poll::Pending => Ok(None),
+        })
+    })
+    .await
+}
+
+async fn poll_dispatch_flush_once<T>(stream: &mut T) -> io::Result<Option<()>>
+where
+    T: DispatchStream,
+{
+    std::future::poll_fn(|cx| {
+        Poll::Ready(match Pin::new(&mut *stream).poll_flush(cx) {
+            Poll::Ready(result) => result.map(Some),
+            Poll::Pending => Ok(None),
+        })
+    })
+    .await
+}
+
+async fn service_pending_outbound<T>(
+    stream: &mut T,
+    pending: &mut PendingOutboundBatch,
+    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+) -> anyhow::Result<OutboundService>
+where
+    T: DispatchStream,
+{
+    if pending.prefer_read
+        && stream
+            .try_readable_without_consuming()
+            .context("probing mux stream readability during an outbound frame")?
+            == DispatchReadinessHint::Ready
+    {
+        // Alternate when both directions remain continuously ready.
+        pending.prefer_read = false;
+        return Ok(OutboundService::Readable);
+    }
+
+    let mut operation_polled_pending = false;
+    match pending.phase {
+        PendingOutboundPhase::Writing => {
+            let turn_len = pending.remaining().len().min(OUTBOUND_WRITE_QUANTUM_BYTES);
+            let turn_end = pending.offset.saturating_add(turn_len);
+            match poll_dispatch_write_once(stream, &pending.bytes[pending.offset..turn_end]).await {
+                Ok(Some(0)) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WriteZero,
+                        "failed to write mux PDU frame chunk",
+                    )
+                    .into());
+                }
+                Ok(Some(written)) => {
+                    pending.offset = pending.offset.saturating_add(written);
+                    pending.transient_retries = 0;
+                    pending.prefer_read = true;
+                    metrics::histogram!("mux.dispatch.outbound_chunk.bytes").record(written as f64);
+                    if pending.offset == pending.bytes.len() {
+                        pending.phase = PendingOutboundPhase::Flushing;
+                    }
+                    return Ok(OutboundService::Progress);
+                }
+                Ok(None) => operation_polled_pending = true,
+                Err(err)
+                    if is_transient_write_error(&err)
+                        && pending.transient_retries < TRANSIENT_WRITE_RETRY_LIMIT =>
+                {
+                    pending.transient_retries = pending.transient_retries.saturating_add(1);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        PendingOutboundPhase::Flushing => match poll_dispatch_flush_once(stream).await {
+            Ok(Some(())) => return Ok(OutboundService::Complete),
+            Ok(None) => operation_polled_pending = true,
+            Err(err)
+                if is_transient_write_error(&err)
+                    && pending.transient_retries < TRANSIENT_WRITE_RETRY_LIMIT =>
+            {
+                pending.transient_retries = pending.transient_retries.saturating_add(1);
+            }
+            Err(err) => return Err(err.into()),
+        },
+    }
+
+    if operation_polled_pending && stream.pending_outbound_requires_retry() {
+        // OpenSSL requires the exact SSL_write/flush operation to be retried
+        // with identical arguments before any SSL_read. Preserve the
+        // operation-specific interest armed by that poll.
+        stream
+            .wait_for_pending_outbound_retry()
+            .await
+            .context("waiting to retry a transport-bound outbound operation")?;
+        pending.prefer_read = false;
+        return Ok(OutboundService::Progress);
+    }
+
+    // The one-shot write/flush poll registered its precise transport
+    // interest but did not suspend this task. Replace it with one combined
+    // interest so newly readable input can preempt a blocked outbound window.
+    let ready_side = wait_for_dispatch_readable_or_writable(stream, io_uring_runtime)
+        .await
+        .context("waiting after a pending mux stream write or flush")?;
+    if ready_side == DispatchReadySide::Readable {
+        // Keep write preference false so the next service turn attempts
+        // outbound progress before accepting another continuously-ready read.
+        pending.prefer_read = false;
+        return Ok(OutboundService::Readable);
+    }
+    Ok(OutboundService::Progress)
+}
+
+#[cfg(test)]
 async fn write_pending_pdus<T>(
     stream: &mut T,
     first: Box<DecodedPdu>,
@@ -705,6 +1096,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn write_pending_pdus_with_compression_mode<T>(
     stream: &mut T,
     first: Box<DecodedPdu>,
@@ -721,10 +1113,7 @@ where
         .context("waiting for mux stream to become writable")?;
 
     let mut current = Some(first);
-    loop {
-        let Some(decoded) = current.take() else {
-            break;
-        };
+    while let Some(decoded) = current.take() {
         let mut frame = Vec::new();
         decoded
             .pdu
@@ -733,6 +1122,7 @@ where
         write_frame_with_transient_retries(stream, &frame, io_uring_runtime)
             .await
             .context("encoding PDU to client")?;
+
         match item_rx.try_recv() {
             Ok(Item::WritePdu(next)) => current = Some(next),
             Ok(other) => {
@@ -742,14 +1132,79 @@ where
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
-
     stream.flush().await.context("flushing PDU to client")
+}
+
+/// Choose between inbound socket work and the internal outbound/notification
+/// queue without allowing either ready source to starve the other.
+///
+/// When both sides remain ready, `prefer_read` alternates turns. The outbound
+/// turn itself is bounded by `OUTBOUND_WRITE_QUANTUM_*`, so continuous pane
+/// output has a finite service bound before the next inbound readiness probe.
+async fn next_dispatch_item<T>(
+    stream: &T,
+    item_rx: &Receiver<Item>,
+    deferred_item: &mut Option<Item>,
+    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+    prefer_read: &mut bool,
+) -> anyhow::Result<Item>
+where
+    T: DispatchStream,
+{
+    if *prefer_read {
+        match stream
+            .try_readable_without_consuming()
+            .context("probing mux stream readability")?
+        {
+            DispatchReadinessHint::Ready => {
+                *prefer_read = false;
+                return Ok(Item::Readable);
+            }
+            DispatchReadinessHint::NotReady | DispatchReadinessHint::Unsupported => {}
+        }
+    }
+
+    if let Some(item) = deferred_item.take() {
+        *prefer_read = !matches!(item, Item::Readable);
+        return Ok(item);
+    }
+    match item_rx.try_recv() {
+        Ok(item) => {
+            *prefer_read = !matches!(item, Item::Readable);
+            return Ok(item);
+        }
+        Err(TryRecvError::Closed) => {
+            return Err(anyhow::anyhow!("mux dispatch item queue closed"));
+        }
+        Err(TryRecvError::Empty) => {}
+    }
+
+    let rx_msg = item_rx
+        .recv()
+        .map(|result| result.map_err(|err| anyhow::anyhow!("{err:?}")));
+    let wait_for_read = wait_for_dispatch_readable(stream, io_uring_runtime)
+        .map(|result| result.map(|()| Item::Readable).map_err(anyhow::Error::from));
+    pin_mut!(rx_msg);
+    pin_mut!(wait_for_read);
+
+    let item = if *prefer_read {
+        match select(wait_for_read, rx_msg).await {
+            Either::Left((result, _)) | Either::Right((result, _)) => result?,
+        }
+    } else {
+        match select(rx_msg, wait_for_read).await {
+            Either::Left((result, _)) | Either::Right((result, _)) => result?,
+        }
+    };
+    *prefer_read = !matches!(item, Item::Readable);
+    Ok(item)
 }
 
 fn is_transient_write_error(err: &std::io::Error) -> bool {
     matches!(err.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock)
 }
 
+#[cfg(test)]
 async fn write_frame_with_transient_retries<T>(
     stream: &mut T,
     frame: &[u8],
@@ -881,6 +1336,34 @@ where
 
     fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
         self.inner.wait_for_writable()
+    }
+
+    fn wait_for_readable_or_writable(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = io::Result<DispatchReadySide>> + Send + '_>> {
+        if self.pending.is_empty() {
+            self.inner.wait_for_readable_or_writable()
+        } else {
+            Box::pin(async { Ok(DispatchReadySide::Readable) })
+        }
+    }
+
+    fn try_readable_without_consuming(&self) -> io::Result<DispatchReadinessHint> {
+        if self.pending.is_empty() {
+            self.inner.try_readable_without_consuming()
+        } else {
+            Ok(DispatchReadinessHint::Ready)
+        }
+    }
+
+    fn pending_outbound_requires_retry(&self) -> bool {
+        self.inner.pending_outbound_requires_retry()
+    }
+
+    fn wait_for_pending_outbound_retry(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        self.inner.wait_for_pending_outbound_retry()
     }
 
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -1376,6 +1859,8 @@ where
 
     let (item_tx, item_rx) = bounded::<Item>(DISPATCH_ITEM_QUEUE_CAPACITY);
     let mut deferred_item = None;
+    let mut pending_outbound = None;
+    let mut prefer_read = true;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     let io_uring_runtime = DispatchIoUringRuntime::maybe_new(reactor, stream.io_uring_fd());
     #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
@@ -1390,35 +1875,33 @@ where
     {
         let mux = Mux::try_get().context("mux singleton is not available")?;
         let tx = item_tx.clone();
-        let sub_id = mux.subscribe(move |n| queue_notification(&tx, n));
+        let sub_id = mux
+            .subscribe(move |n| queue_notification(&tx, n))
+            .context("allocate mux dispatch subscription")?;
         let _subscription_guard = MuxSubscriptionGuard::new(mux, sub_id);
 
         loop {
-            let next_item = if let Some(item) = deferred_item.take() {
-                Ok(item)
-            } else {
-                match item_rx.try_recv() {
-                    Ok(item) => Ok(item),
-                    Err(TryRecvError::Closed) => {
-                        Err(anyhow::anyhow!("mux dispatch item queue closed"))
+            let next_item = if let Some(pending) = pending_outbound.as_mut() {
+                match service_pending_outbound(&mut stream, pending, io_uring_runtime.as_ref())
+                    .await
+                {
+                    Ok(OutboundService::Readable) => Ok(Item::Readable),
+                    Ok(OutboundService::Progress) => continue,
+                    Ok(OutboundService::Complete) => {
+                        pending_outbound = None;
+                        continue;
                     }
-                    Err(TryRecvError::Empty) => {
-                        let rx_msg = item_rx
-                            .recv()
-                            .map(|result| result.map_err(|err| anyhow::anyhow!("{err:?}")));
-                        let wait_for_read = wait_for_dispatch_readable(
-                            &stream,
-                            io_uring_runtime.as_ref(),
-                        )
-                        .map(|result| result.map(|()| Item::Readable).map_err(anyhow::Error::from));
-
-                        pin_mut!(rx_msg);
-                        pin_mut!(wait_for_read);
-                        match select(rx_msg, wait_for_read).await {
-                            Either::Left((result, _)) | Either::Right((result, _)) => result,
-                        }
-                    }
+                    Err(err) => Err(err),
                 }
+            } else {
+                next_dispatch_item(
+                    &stream,
+                    &item_rx,
+                    &mut deferred_item,
+                    io_uring_runtime.as_ref(),
+                    &mut prefer_read,
+                )
+                .await
             };
 
             match next_item {
@@ -1436,19 +1919,16 @@ where
                     handler.process_one(decoded);
                 }
                 Ok(Item::WritePdu(decoded)) => {
-                    if let Err(err) = write_pending_pdus(
-                        &mut stream,
+                    match prepare_pending_outbound_batch(
                         decoded,
                         &item_rx,
                         &mut deferred_item,
-                        io_uring_runtime.as_ref(),
-                    )
-                    .await
-                    {
-                        if is_clean_disconnect(&err) {
-                            return Ok(());
+                        codec::CompressionMode::Auto,
+                    ) {
+                        Ok(pending) => {
+                            pending_outbound = Some(pending);
                         }
-                        return Err(err);
+                        Err(err) => return Err(err),
                     }
                 }
                 Ok(Item::Notif(MuxNotification::PaneOutput(pane_id))) => {
@@ -1596,14 +2076,12 @@ mod tests {
     use std::ops::Range;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use termwiz::surface::{Line, SequenceNo};
     use wezterm_term::color::ColorPalette;
     use wezterm_term::terminal::{Alert, ClipboardSelection};
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
-
-    static TMUX_CONTROL_MUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,
@@ -1612,7 +2090,9 @@ mod tests {
 
     impl ScopedMux {
         fn install(mux: &Arc<Mux>) -> Self {
-            let lock = TMUX_CONTROL_MUX_TEST_LOCK.lock().unwrap();
+            let lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
             let prior = Mux::try_get();
             Mux::set_mux(mux);
             Self { prior, _lock: lock }
@@ -2082,10 +2562,12 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let observed = Arc::new(AtomicUsize::new(0));
         let notifications = Arc::clone(&observed);
-        let sub_id = mux.subscribe(move |_| {
-            notifications.fetch_add(1, Ordering::Relaxed);
-            true
-        });
+        let sub_id = mux
+            .subscribe(move |_| {
+                notifications.fetch_add(1, Ordering::Relaxed);
+                true
+            })
+            .expect("test mux subscription should allocate an identifier");
 
         {
             let _guard = MuxSubscriptionGuard::new(Arc::clone(&mux), sub_id);
@@ -2103,9 +2585,6 @@ mod tests {
 
     #[test]
     fn process_async_treats_unexpected_eof_as_clean_disconnect() {
-        let _lock = crate::GLOBAL_STATE_TEST_LOCK
-            .lock()
-            .expect("global test lock");
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(EofDispatchStream));
@@ -2160,9 +2639,6 @@ mod tests {
 
     #[test]
     fn process_async_treats_read_side_connection_reset_as_clean_disconnect() {
-        let _lock = crate::GLOBAL_STATE_TEST_LOCK
-            .lock()
-            .expect("global test lock");
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(ReadErrorDispatchStream {
@@ -2221,9 +2697,6 @@ mod tests {
 
     #[test]
     fn process_async_propagates_readable_wait_failures() {
-        let _lock = crate::GLOBAL_STATE_TEST_LOCK
-            .lock()
-            .expect("global test lock");
         let mux = Arc::new(Mux::new(None));
         let _scoped_mux = ScopedMux::install(&mux);
         let result = promise::spawn::block_on(process_async(FailingReadableDispatchStream));
@@ -2294,12 +2767,16 @@ mod tests {
 
     impl DispatchStream for RecordingDispatchStream {
         fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(std::future::pending())
         }
 
         fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
             self.writable_waits.fetch_add(1, Ordering::Relaxed);
             Box::pin(async { Ok(()) })
+        }
+
+        fn try_readable_without_consuming(&self) -> io::Result<DispatchReadinessHint> {
+            Ok(DispatchReadinessHint::Ready)
         }
     }
 
@@ -2327,6 +2804,176 @@ mod tests {
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             this.flush_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ChunkedDispatchStream {
+        readable: AtomicBool,
+        bytes: Vec<u8>,
+        write_sizes: Vec<usize>,
+    }
+
+    impl DispatchStream for ChunkedDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            if self.readable.load(Ordering::Acquire) {
+                Box::pin(async { Ok(()) })
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn try_readable_without_consuming(&self) -> io::Result<DispatchReadinessHint> {
+            Ok(if self.readable.load(Ordering::Acquire) {
+                DispatchReadinessHint::Ready
+            } else {
+                DispatchReadinessHint::NotReady
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PendingWriteThenReadableDispatchStream {
+        readable: AtomicBool,
+        combined_waits: AtomicUsize,
+        write_polls: AtomicUsize,
+    }
+
+    impl DispatchStream for PendingWriteThenReadableDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn wait_for_readable_or_writable(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = io::Result<DispatchReadySide>> + Send + '_>> {
+            Box::pin(async move {
+                self.combined_waits.fetch_add(1, Ordering::Relaxed);
+                self.readable.store(true, Ordering::Release);
+                Ok(DispatchReadySide::Readable)
+            })
+        }
+
+        fn try_readable_without_consuming(&self) -> io::Result<DispatchReadinessHint> {
+            Ok(if self.readable.load(Ordering::Acquire) {
+                DispatchReadinessHint::Ready
+            } else {
+                DispatchReadinessHint::NotReady
+            })
+        }
+    }
+
+    impl AsyncRead for PendingWriteThenReadableDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for PendingWriteThenReadableDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.write_polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct UnsupportedReadinessPendingWriteStream {
+        readable_waits: AtomicUsize,
+        write_polls: AtomicUsize,
+    }
+
+    impl DispatchStream for UnsupportedReadinessPendingWriteStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.readable_waits.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl AsyncRead for UnsupportedReadinessPendingWriteStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for UnsupportedReadinessPendingWriteStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.write_polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for ChunkedDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ChunkedDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.bytes.extend_from_slice(buf);
+            this.write_sizes.push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
 
@@ -3173,9 +3820,6 @@ mod tests {
             let cut = 1 + (cut_seed % (encoded.len() - 1));
             let frame_prefix = encoded[..cut].to_vec();
 
-            let _lock = crate::GLOBAL_STATE_TEST_LOCK
-                .lock()
-                .expect("global test lock");
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
             let result = promise::spawn::block_on(process_async(PartialFrameDisconnectStream::new(
@@ -3220,9 +3864,6 @@ mod tests {
                 malformed_len
             );
 
-            let _lock = crate::GLOBAL_STATE_TEST_LOCK
-                .lock()
-                .expect("global test lock");
             let mux = Arc::new(Mux::new(None));
             let _scoped_mux = ScopedMux::install(&mux);
             let result = promise::spawn::block_on(process_async(PartialFrameDisconnectStream::new(
@@ -3278,7 +3919,8 @@ mod tests {
             mux.subscribe(move |notification| {
                 full_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
                 queue_notification(&full_tx, notification)
-            });
+            })
+            .expect("test mux subscription should allocate an identifier");
             mux.notify(notification.clone());
             mux.notify(notification.clone());
             prop_assert_eq!(
@@ -3300,7 +3942,8 @@ mod tests {
             mux.subscribe(move |notification| {
                 closed_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
                 queue_notification(&closed_tx, notification)
-            });
+            })
+            .expect("test mux subscription should allocate an identifier");
             mux.notify(notification.clone());
             mux.notify(notification);
             prop_assert_eq!(
@@ -3719,6 +4362,218 @@ mod tests {
         assert!(
             matches!(item_rx.try_recv(), Err(TryRecvError::Empty)),
             "write batch should drain only queued write items"
+        );
+    }
+
+    #[test]
+    fn dispatch_chooser_services_readable_input_before_a_continuous_internal_queue() {
+        let (item_tx, item_rx) = unbounded();
+        item_tx
+            .try_send(Item::Notif(MuxNotification::Empty))
+            .expect("queue outbound notification");
+        let stream = RecordingDispatchStream::default();
+        let mut deferred_item = None;
+        let mut prefer_read = true;
+
+        let first = promise::spawn::block_on(next_dispatch_item(
+            &stream,
+            &item_rx,
+            &mut deferred_item,
+            None,
+            &mut prefer_read,
+        ))
+        .expect("ready input should be selected");
+        assert!(
+            matches!(first, Item::Readable),
+            "an already-readable keypress must not wait for the internal queue to become empty",
+        );
+        assert!(!prefer_read);
+
+        let second = promise::spawn::block_on(next_dispatch_item(
+            &stream,
+            &item_rx,
+            &mut deferred_item,
+            None,
+            &mut prefer_read,
+        ))
+        .expect("outbound turn should remain live");
+        assert!(matches!(second, Item::Notif(MuxNotification::Empty)));
+        assert!(
+            prefer_read,
+            "the next turn must force another inbound readiness probe",
+        );
+    }
+
+    #[test]
+    fn oversized_outbound_frame_yields_between_bounded_chunks_for_inbound_work() {
+        let (item_tx, item_rx) = unbounded();
+        let first = Box::new(DecodedPdu {
+            pdu: Pdu::WriteToPane(WriteToPane {
+                pane_id: 7,
+                data: vec![0x5a; OUTBOUND_WRITE_QUANTUM_BYTES * 3],
+            }),
+            serial: 1,
+        });
+        let mut deferred_item = None;
+        let mut pending = prepare_pending_outbound_batch(
+            first,
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+        )
+        .expect("large frame should encode");
+        drop(item_tx);
+
+        assert!(
+            pending.bytes.len() > OUTBOUND_WRITE_QUANTUM_BYTES,
+            "test frame must exceed one outbound service quantum",
+        );
+        let mut stream = ChunkedDispatchStream::default();
+        let first_turn =
+            promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
+                .expect("first write chunk should succeed");
+        assert_eq!(first_turn, OutboundService::Progress);
+        assert_eq!(pending.offset, OUTBOUND_WRITE_QUANTUM_BYTES);
+        assert_eq!(stream.write_sizes, vec![OUTBOUND_WRITE_QUANTUM_BYTES]);
+
+        stream.readable.store(true, Ordering::Release);
+        let offset_before_read = pending.offset;
+        let inbound_turn =
+            promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
+                .expect("readable input should preempt the next frame chunk");
+        assert_eq!(inbound_turn, OutboundService::Readable);
+        assert_eq!(
+            pending.offset, offset_before_read,
+            "inbound service must not advance the outbound frame",
+        );
+
+        stream.readable.store(false, Ordering::Release);
+        loop {
+            let outcome =
+                promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
+                    .expect("remaining chunks should succeed");
+            assert!(matches!(
+                outcome,
+                OutboundService::Progress | OutboundService::Complete
+            ));
+            if outcome == OutboundService::Complete {
+                break;
+            }
+        }
+        assert!(
+            stream
+                .write_sizes
+                .iter()
+                .all(|written| *written <= OUTBOUND_WRITE_QUANTUM_BYTES),
+            "no write turn may exceed the configured byte quantum",
+        );
+        assert_eq!(stream.bytes, pending.bytes);
+    }
+
+    #[test]
+    fn pending_write_rearms_combined_interest_and_yields_to_new_input() {
+        let (_item_tx, item_rx) = unbounded();
+        let first = Box::new(DecodedPdu {
+            pdu: Pdu::Ping(Ping {}),
+            serial: 1,
+        });
+        let mut deferred_item = None;
+        let mut pending = prepare_pending_outbound_batch(
+            first,
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+        )
+        .expect("ping frame should encode");
+        let mut stream = PendingWriteThenReadableDispatchStream::default();
+
+        let outcome =
+            promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
+                .expect("newly readable input should preempt a pending write");
+
+        assert_eq!(outcome, OutboundService::Readable);
+        assert_eq!(pending.offset, 0, "a Pending write must not consume bytes");
+        assert_eq!(stream.write_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.combined_waits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unsupported_readiness_probe_classifies_combined_read_wake_without_spinning() {
+        let (_item_tx, item_rx) = unbounded();
+        let mut deferred_item = None;
+        let mut pending = prepare_pending_outbound_batch(
+            queued_ping(1),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+        )
+        .expect("ping frame should encode");
+        let mut stream = UnsupportedReadinessPendingWriteStream::default();
+
+        for expected_polls in 1..=2 {
+            let outcome =
+                promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
+                    .expect("classified read wake should return to the dispatch loop");
+
+            assert_eq!(outcome, OutboundService::Readable);
+            assert_eq!(
+                pending.offset, 0,
+                "a Pending write must not consume outbound bytes",
+            );
+            assert_eq!(
+                stream.write_polls.load(Ordering::Relaxed),
+                expected_polls,
+                "each reciprocal turn must poll outbound once before yielding to input",
+            );
+            assert_eq!(
+                stream.readable_waits.load(Ordering::Relaxed),
+                expected_polls,
+                "one classified combined wait should resolve each service turn",
+            );
+        }
+    }
+
+    #[test]
+    fn prefetched_bytes_are_reported_readable_before_the_inner_socket() {
+        let stream = PrefetchedDispatchStream::new(CountingDispatchStream::default(), vec![0x42]);
+        assert_eq!(
+            stream
+                .try_readable_without_consuming()
+                .expect("prefetched readiness probe should succeed"),
+            DispatchReadinessHint::Ready,
+        );
+    }
+
+    #[test]
+    fn outbound_write_batch_yields_at_the_frame_quantum() {
+        let (item_tx, item_rx) = unbounded();
+        let total_frames = OUTBOUND_WRITE_QUANTUM_FRAMES + 5;
+        for serial in 2..=u64::try_from(total_frames).expect("test frame count fits u64") {
+            item_tx
+                .try_send(Item::WritePdu(queued_ping(serial)))
+                .expect("queue outbound ping");
+        }
+        let mut deferred_item = None;
+        let pending = prepare_pending_outbound_batch(
+            queued_ping(1),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Auto,
+        )
+        .expect("bounded outbound batch should prepare");
+
+        let mut decoded_frames = 0;
+        let mut cursor = Cursor::new(pending.bytes.as_slice());
+        while (cursor.position() as usize) < pending.bytes.len() {
+            Pdu::decode(&mut cursor).expect("decode recorded outbound frame");
+            decoded_frames += 1;
+        }
+        assert_eq!(decoded_frames, OUTBOUND_WRITE_QUANTUM_FRAMES);
+        assert!(deferred_item.is_none());
+        assert_eq!(
+            item_rx.len(),
+            total_frames - OUTBOUND_WRITE_QUANTUM_FRAMES,
+            "the next turn must retain the ordered outbound suffix",
         );
     }
 

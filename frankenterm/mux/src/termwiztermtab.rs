@@ -5,19 +5,19 @@
 
 use std::convert::TryFrom;
 
-use crate::Mux;
-use crate::domain::{Domain, DomainId, DomainState, alloc_domain_id};
+use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use crate::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, WithPaneLines,
-    alloc_pane_id,
+    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
+    WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tab::Tab;
 use crate::window::WindowId;
-use anyhow::{Context, bail};
+use crate::Mux;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use crossbeam::channel::{Receiver, Sender, unbounded as channel};
+use crossbeam::channel::{unbounded as channel, Receiver, Sender};
 use filedescriptor::{FileDescriptor, Pipe};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
@@ -116,8 +116,8 @@ impl TermWizTerminalPane {
         input_tx: Sender<InputEvent>,
         render_rx: FileDescriptor,
         term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
-    ) -> Self {
-        let pane_id = alloc_pane_id();
+    ) -> Result<Self, crate::IdAllocationError> {
+        let pane_id = alloc_pane_id()?;
 
         let terminal = Mutex::new(frankenterm_term::Terminal::new(
             size,
@@ -127,7 +127,7 @@ impl TermWizTerminalPane {
             Box::new(Vec::new()), // Sink writer; TermWiz applets use render_rx for output
         ));
 
-        Self {
+        Ok(Self {
             pane_id,
             domain_id,
             terminal,
@@ -135,7 +135,7 @@ impl TermWizTerminalPane {
             render_rx,
             input_tx,
             dead: Mutex::new(false),
-        }
+        })
     }
 }
 
@@ -391,7 +391,7 @@ impl TermWizTerminal {
 
 impl termwiz::terminal::Terminal for TermWizTerminal {
     fn set_raw_mode(&mut self) -> termwiz::Result<()> {
-        use termwiz::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode};
+        use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
 
         macro_rules! decset {
             ($variant:ident) => {
@@ -512,14 +512,14 @@ pub fn allocate(
         input_tx,
         render_pipe.read,
         Some(config),
-    );
+    )?;
 
     // Add the tab to the mux so that the output is processed
     let pane: Arc<dyn Pane> = Arc::new(pane);
 
     let mux = Mux::try_get()
         .ok_or_else(|| anyhow::anyhow!("cannot allocate TermWiz pane: no mux configured"))?;
-    mux.add_domain(&domain);
+    mux.add_domain(&domain)?;
     mux.add_pane(&pane)
         .context("failed to add TermWiz pane to mux — pane ID collision?")?;
 
@@ -582,8 +582,11 @@ pub async fn run<
             .ok_or_else(|| anyhow::anyhow!("cannot register TermWiz tab: no mux configured"))?;
 
         let domain = termwiz_terminal_domain();
-        mux.add_domain(&domain);
+        let pane =
+            TermWizTerminalPane::new(domain.domain_id(), size, input_tx, render_rx, term_config)?;
+        let pane: Arc<dyn Pane> = Arc::new(pane);
 
+        mux.add_domain(&domain)?;
         let window_builder;
         let window_id = match window_id {
             Some(id) => id,
@@ -592,10 +595,6 @@ pub async fn run<
                 *window_builder
             }
         };
-
-        let pane =
-            TermWizTerminalPane::new(domain.domain_id(), size, input_tx, render_rx, term_config);
-        let pane: Arc<dyn Pane> = Arc::new(pane);
 
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
@@ -644,8 +643,8 @@ pub async fn run<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Mux;
     use crate::domain::LocalDomain;
+    use crate::Mux;
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,

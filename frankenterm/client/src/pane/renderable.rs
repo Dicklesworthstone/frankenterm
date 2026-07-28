@@ -353,8 +353,7 @@ impl RenderableInner {
                     // threshold, so secret characters in an echo-off prompt never
                     // render plain even if the pane was confident a moment ago. [F2]
                     self.prediction_score = (self.prediction_score - 2)
-                        .min(PREDICT_CONFIDENT_SCORE - 1)
-                        .max(PREDICT_SCORE_MIN);
+                        .clamp(PREDICT_SCORE_MIN, PREDICT_CONFIDENT_SCORE - 1);
                     self.last_prediction_miss = now;
                 }
                 None => {}
@@ -1132,8 +1131,9 @@ impl RenderableState {
         // case the feature is for), while on fast links a short TTL keeps the
         // stale-overpaint window (a unilateral redraw under a stale prediction)
         // small. [review F3/F4]
-        let predict_ttl = Duration::from_millis(250)
-            .max(Duration::from_millis(inner.last_input_rtt.saturating_mul(4)));
+        let predict_ttl = Duration::from_millis(250).max(Duration::from_millis(
+            inner.last_input_rtt.saturating_mul(4),
+        ));
         inner.predictions.retain(|p| p.born.elapsed() < predict_ttl);
         if !inner.predictions.is_empty() {
             let (start, end) = (lines.start, lines.end);
@@ -1167,13 +1167,14 @@ impl RenderableState {
         let span = (lines.end - lines.start).max(1);
         let lo = lines.start.saturating_sub(span);
         let hi = lines.end.saturating_add(span);
-        let needs_prefetch = (lo..lines.start).chain(lines.end..hi).any(|idx| {
-            match inner.lines.peek(&idx) {
-                None | Some(LineEntry::Stale(_)) => true,
-                Some(LineEntry::Line(line)) => line.changed_since(inner.seqno),
-                Some(LineEntry::Fetching(_)) | Some(LineEntry::LineAndFetching(..)) => false,
-            }
-        });
+        let needs_prefetch =
+            (lo..lines.start)
+                .chain(lines.end..hi)
+                .any(|idx| match inner.lines.peek(&idx) {
+                    None | Some(LineEntry::Stale(_)) => true,
+                    Some(LineEntry::Line(line)) => line.changed_since(inner.seqno),
+                    Some(LineEntry::Fetching(_)) | Some(LineEntry::LineAndFetching(..)) => false,
+                });
         if needs_prefetch && inner.fetch_limiter.non_blocking_admittance_check(1) {
             for idx in (lo..lines.start).chain(lines.end..hi) {
                 match inner.lines.pop(&idx) {

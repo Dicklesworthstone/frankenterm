@@ -39,6 +39,7 @@ use config::{
     GuiPosition, TermConfig, WindowCloseConfirmation, configuration,
 };
 use flume::{Sender, TrySendError};
+use frankenterm_client::pane::ClientPane;
 use frankenterm_core::accessibility_preferences::MotionPreference;
 use frankenterm_core::atlas_tier_doctor::TierSwapDoctorReport;
 use frankenterm_core::floating_panes::{
@@ -49,10 +50,14 @@ use frankenterm_core::session_pane_state::TerminalState;
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::accessibility_preferences::config_with_accessibility_palette;
 use frankenterm_gui::floating_panes::{
-    GuiFloatingPaneController, emit_floating_pane_a11y_messages,
+    GuiFloatingPaneController, emit_floating_pane_a11y_messages, floating_pane_id_to_mux_pane_id,
+    mux_pane_id_to_floating_pane_id,
 };
 use frankenterm_gui::triple_buffer_gui::{
     TerminalStateTripleBufferRegistry, poll_terminal_state_buffer_health_snapshots,
+};
+use frankenterm_gui::{
+    terminal_pane_id_to_u64, terminal_u16_from_stable_delta, terminal_u16_from_usize,
 };
 use frankenterm_toast_notification::persistent_toast_notification;
 use lfucache::*;
@@ -66,8 +71,8 @@ use mux::tab::{
     PositionedPane, PositionedSplit, SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab,
     TabId,
 };
-use mux::window::WindowId as MuxWindowId;
 use mux::unify::{MergePlan, TabIdentity, TabSnapshot, WindowSnapshot, plan_unify_domain};
+use mux::window::WindowId as MuxWindowId;
 use mux::{
     Mux, MuxNotification, SynchronizedOutputAdmissionDecision, SynchronizedOutputDepthOutcome,
     SynchronizedOutputDrainCause, SynchronizedOutputEvent,
@@ -78,7 +83,7 @@ use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeSet, HashMap, LinkedList};
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use termwiz::hyperlink::Hyperlink;
@@ -87,7 +92,6 @@ use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
-use frankenterm_client::pane::ClientPane;
 
 pub mod background;
 pub mod box_model;
@@ -1206,21 +1210,6 @@ pub(crate) fn mark_cursor_rows_dirty(
     current: StableCursorPosition,
 ) {
     mark_stable_rows_dirty(bitmap, viewport, [previous.y, current.y]);
-}
-
-#[must_use]
-pub(crate) fn terminal_u16_from_usize(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
-}
-
-#[must_use]
-pub(crate) fn terminal_u16_from_stable_delta(value: StableRowIndex) -> u16 {
-    u16::try_from(value).unwrap_or(if value < 0 { 0 } else { u16::MAX })
-}
-
-#[must_use]
-pub(crate) fn terminal_pane_id_to_u64(pane_id: PaneId) -> u64 {
-    u64::try_from(pane_id).unwrap_or(u64::MAX)
 }
 
 #[must_use]
@@ -2515,8 +2504,10 @@ impl TermWindow {
                 myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
             }
             myself.load_os_parameters();
+            myself
+                .subscribe_to_pane_updates()
+                .context("subscribing new GUI window to mux pane updates")?;
             window.show();
-            myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
         }
@@ -3321,36 +3312,72 @@ impl TermWindow {
         true
     }
 
-    fn subscribe_to_pane_updates(&self) {
-        let Some(window) = self.window.clone() else {
-            log::warn!("cannot subscribe to pane updates without a GUI window");
-            return;
-        };
+    fn subscribe_to_pane_updates(&self) -> anyhow::Result<()> {
+        let window = self
+            .window
+            .clone()
+            .ok_or_else(|| anyhow!("cannot subscribe to pane updates without a GUI window"))?;
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
-        let Some(mux) = Mux::try_get() else {
-            log::warn!("cannot subscribe to pane updates without an active mux");
-            return;
-        };
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow!("cannot subscribe to pane updates without an active mux"))?;
         let dead = Arc::new(AtomicBool::new(false));
-        mux.subscribe(move |n| {
-            if dead.load(Ordering::Relaxed) {
-                return false;
-            }
-            let mux_window_id = match mux_window_id.lock() {
-                Ok(mux_window_id) => *mux_window_id,
-                Err(poisoned) => {
-                    log::warn!("recovering poisoned mux-window subscription lock");
-                    *poisoned.into_inner()
+        let subscription_id = Arc::new(AtomicUsize::new(usize::MAX));
+        let unsubscribe_requested = Arc::new(AtomicBool::new(false));
+        let callback_subscription_id = Arc::clone(&subscription_id);
+        let callback_unsubscribe_requested = Arc::clone(&unsubscribe_requested);
+        let callback_mux = Arc::downgrade(&mux);
+        let allocated_subscription_id = mux
+            .subscribe(move |n| {
+                if dead.load(Ordering::Relaxed) {
+                    return false;
                 }
-            };
-            let window = window.clone();
-            let dead = dead.clone();
-            promise::spawn::spawn_into_main_thread(async move {
-                Self::mux_pane_output_event_callback(n, &window, mux_window_id, &dead)
+                let mux_window_id = match mux_window_id.lock() {
+                    Ok(mux_window_id) => *mux_window_id,
+                    Err(poisoned) => {
+                        log::warn!("recovering poisoned mux-window subscription lock");
+                        *poisoned.into_inner()
+                    }
+                };
+                if matches!(
+                    &n,
+                    MuxNotification::WindowRemoved(window_id) if *window_id == mux_window_id
+                ) {
+                    // This notification is sufficient to retire the subscriber
+                    // synchronously.  Do not enqueue a GUI-thread callback and
+                    // wait for some later notification to observe `dead`.
+                    dead.store(true, Ordering::Release);
+                    callback_unsubscribe_requested.store(true, Ordering::Release);
+                    return false;
+                }
+                let window = window.clone();
+                let dead = dead.clone();
+                let subscription_id = Arc::clone(&callback_subscription_id);
+                let unsubscribe_requested = Arc::clone(&callback_unsubscribe_requested);
+                let mux = callback_mux.clone();
+                promise::spawn::spawn_into_main_thread(async move {
+                    if !Self::mux_pane_output_event_callback(n, &window, mux_window_id, &dead) {
+                        dead.store(true, Ordering::Release);
+                        unsubscribe_requested.store(true, Ordering::Release);
+                        let sub_id = subscription_id.swap(usize::MAX, Ordering::AcqRel);
+                        if sub_id != usize::MAX {
+                            if let Some(mux) = mux.upgrade() {
+                                let _ = mux.unsubscribe(sub_id);
+                            }
+                        }
+                    }
+                })
+                .detach();
+                true
             })
-            .detach();
-            true
-        });
+            .context("allocating mux pane-update subscription")?;
+        subscription_id.store(allocated_subscription_id, Ordering::Release);
+        if unsubscribe_requested.load(Ordering::Acquire) {
+            let sub_id = subscription_id.swap(usize::MAX, Ordering::AcqRel);
+            if sub_id != usize::MAX {
+                let _ = mux.unsubscribe(sub_id);
+            }
+        }
+        Ok(())
     }
 
     fn emit_status_event(&mut self) {
@@ -4284,11 +4311,7 @@ impl TermWindow {
             .into_iter()
             .map(|pane| pane.pane)
             .collect();
-        panes.extend(
-            tab.iter_floating_panes()
-                .into_iter()
-                .map(|pane| pane.pane),
-        );
+        panes.extend(tab.iter_floating_panes().into_iter().map(|pane| pane.pane));
 
         if panes.is_empty() {
             return None;
@@ -4299,7 +4322,10 @@ impl TermWindow {
         for pane in panes {
             let client_pane = pane.downcast_ref::<ClientPane>()?;
             let pane_domain = pane.domain_id();
-            if domain_id.replace(pane_domain).is_some_and(|id| id != pane_domain) {
+            if domain_id
+                .replace(pane_domain)
+                .is_some_and(|id| id != pane_domain)
+            {
                 return None;
             }
             remote_pane_ids.push(client_pane.remote_pane_id());
@@ -4835,7 +4861,11 @@ impl TermWindow {
         let mut controller = GuiFloatingPaneController::new();
         let panes = tab.iter_floating_panes();
         for floating in panes.iter().filter(|pane| pane.visible) {
-            let Some(pane_id) = u32::try_from(floating.pane_id).ok() else {
+            let Some(pane_id) = mux_pane_id_to_floating_pane_id(floating.pane_id) else {
+                log::error!(
+                    "mux floating pane id {} exceeds the controller's supported range",
+                    floating.pane_id
+                );
                 continue;
             };
             let Some(rect) = FloatingRect::try_new(
@@ -4846,14 +4876,23 @@ impl TermWindow {
             ) else {
                 continue;
             };
-            controller.set_floating(pane_id, rect);
+            controller.restore_floating(pane_id, rect);
         }
-        if let Some(focused) = panes.iter().find(|pane| pane.is_focused) {
-            if let Ok(pane_id) = u32::try_from(focused.pane_id) {
-                controller.focus(pane_id);
+        if let Some(focused) = panes.iter().find(|pane| pane.visible && pane.is_focused) {
+            if let Some(pane_id) = mux_pane_id_to_floating_pane_id(focused.pane_id) {
+                if !controller.restore_focus(Some(pane_id)) {
+                    log::error!(
+                        "focused mux floating pane {} was absent from the visible controller snapshot",
+                        focused.pane_id
+                    );
+                }
+            } else {
+                log::error!(
+                    "focused mux floating pane id {} exceeds the controller's supported range",
+                    focused.pane_id
+                );
             }
         }
-        let _ = controller.drain_a11y_messages();
         controller
     }
 
@@ -4868,7 +4907,14 @@ impl TermWindow {
 
     fn sync_floating_z_order(tab: &Tab, controller: &GuiFloatingPaneController) {
         for entry in controller.snapshot_layout() {
-            tab.set_floating_pane_z_order(entry.pane_id as usize, entry.z_order);
+            let Some(pane_id) = floating_pane_id_to_mux_pane_id(entry.pane_id) else {
+                log::error!(
+                    "floating pane id {} exceeds the mux's supported range",
+                    entry.pane_id
+                );
+                continue;
+            };
+            tab.set_floating_pane_z_order(pane_id, entry.z_order);
         }
     }
 
@@ -4881,6 +4927,9 @@ impl TermWindow {
         let Some(focused) = controller.focused() else {
             return false;
         };
+        let prior_rect = controller
+            .pane(focused)
+            .and_then(|pane| pane.position.rect());
 
         if command == FloatingKeyboardCommand::CycleOverlapping {
             let x = self.last_mouse_coords.0.min(u16::MAX as usize) as u16;
@@ -4888,7 +4937,11 @@ impl TermWindow {
             let Some(next) = controller.cycle_overlapping_at(x, y) else {
                 return false;
             };
-            let changed = tab.set_floating_pane_focus(next as usize);
+            let Some(next_pane_id) = floating_pane_id_to_mux_pane_id(next) else {
+                log::error!("floating pane id {next} exceeds the mux's supported range");
+                return false;
+            };
+            let changed = tab.set_floating_pane_focus(next_pane_id);
             let messages = controller.drain_a11y_messages();
             emit_floating_pane_a11y_messages(&messages);
             if changed {
@@ -4907,13 +4960,58 @@ impl TermWindow {
         ) else {
             return false;
         };
+        let Some(focused_pane_id) = floating_pane_id_to_mux_pane_id(focused) else {
+            log::error!("floating pane id {focused} exceeds the mux's supported range");
+            return false;
+        };
 
+        let geometry_command = matches!(
+            command,
+            FloatingKeyboardCommand::MoveLeft
+                | FloatingKeyboardCommand::MoveRight
+                | FloatingKeyboardCommand::MoveUp
+                | FloatingKeyboardCommand::MoveDown
+                | FloatingKeyboardCommand::GrowHorizontal
+                | FloatingKeyboardCommand::ShrinkHorizontal
+                | FloatingKeyboardCommand::GrowVertical
+                | FloatingKeyboardCommand::ShrinkVertical
+                | FloatingKeyboardCommand::SnapTop
+                | FloatingKeyboardCommand::SnapBottom
+                | FloatingKeyboardCommand::SnapLeft
+                | FloatingKeyboardCommand::SnapRight
+        );
         let changed = match position {
-            PanePosition::Floating(rect) => tab
-                .set_floating_pane_rect(focused as usize, Self::mux_floating_rect(rect))
-                .is_some(),
+            PanePosition::Floating(rect) if geometry_command => {
+                // The controller computes a speculative rectangle, while the
+                // mux applies authoritative tab/minimum-size clamping. Drop
+                // the speculative announcement and rebuild it from the exact
+                // committed geometry.
+                let _ = controller.drain_a11y_messages();
+                let Some(committed) =
+                    tab.set_floating_pane_rect(focused_pane_id, Self::mux_floating_rect(rect))
+                else {
+                    return false;
+                };
+                let Some(committed_rect) = FloatingRect::try_new(
+                    u16::try_from(committed.left).unwrap_or(u16::MAX),
+                    u16::try_from(committed.top).unwrap_or(u16::MAX),
+                    u16::try_from(committed.width).unwrap_or(u16::MAX),
+                    u16::try_from(committed.height).unwrap_or(u16::MAX),
+                ) else {
+                    return false;
+                };
+                if !controller.reconcile_committed_rect(focused, committed_rect) {
+                    return false;
+                }
+                let changed = prior_rect != Some(committed_rect);
+                if changed {
+                    controller.announce_rect_changed(focused);
+                }
+                changed
+            }
+            PanePosition::Floating(_) => true,
             PanePosition::Tiled if command == FloatingKeyboardCommand::TogglePin => {
-                tab.remove_floating_pane(focused as usize).is_some()
+                tab.remove_floating_pane(focused_pane_id).is_some()
             }
             PanePosition::Tiled => true,
         };
@@ -5587,12 +5685,16 @@ impl TermWindow {
                 if let Some(fp) = focused_floating {
                     let pane_id = fp.pane_id;
                     let mut controller = Self::controller_for_tab_floating_panes(&tab);
-                    if let Ok(core_pane_id) = u32::try_from(pane_id) {
+                    if let Some(core_pane_id) = mux_pane_id_to_floating_pane_id(pane_id) {
                         controller.focus(core_pane_id);
                         controller.apply_keyboard_command(
                             FloatingKeyboardCommand::TogglePin,
                             tab.get_size().cols.min(u16::MAX as usize) as u16,
                             tab.get_size().rows.min(u16::MAX as usize) as u16,
+                        );
+                    } else {
+                        log::error!(
+                            "mux floating pane id {pane_id} exceeds the controller's supported range"
                         );
                     }
                     tab.remove_floating_pane(pane_id);
@@ -6360,8 +6462,7 @@ mod tests {
         record_frame_budget_execution_outstanding, record_sync_output_mux_event,
         reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
         should_force_paint_for_frame_budget, should_run_frame_budget_decision,
-        should_skip_clean_line, terminal_pane_id_to_u64, terminal_u16_from_stable_delta,
-        terminal_u16_from_usize, webgpu,
+        should_skip_clean_line, webgpu,
     };
 
     #[test]
@@ -6519,16 +6620,6 @@ mod tests {
         assert!(bm.contains(10));
         assert_eq!(bm.count(), 2);
         assert_eq!(bm.dirty_marks_total(), 2);
-    }
-
-    #[test]
-    fn terminal_state_numeric_fields_saturate_for_gui_publish() {
-        assert_eq!(terminal_u16_from_usize(24), 24);
-        assert_eq!(terminal_u16_from_usize(usize::MAX), u16::MAX);
-        assert_eq!(terminal_u16_from_stable_delta(10), 10);
-        assert_eq!(terminal_u16_from_stable_delta(-1), 0);
-        assert_eq!(terminal_u16_from_stable_delta(isize::MAX), u16::MAX);
-        assert_eq!(terminal_pane_id_to_u64(7), 7);
     }
 
     /// ft-i6k6u: the substrate's MarksBySource record method

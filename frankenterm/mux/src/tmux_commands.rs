@@ -1,26 +1,55 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{PaneId, alloc_pane_id};
+use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
-use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
+use crate::tmux::{
+    AttachState, TmuxBacklogDrain, TmuxBacklogLimits, TmuxDomain, TmuxDomainState,
+    TmuxPaneOutputState, TmuxRemotePane, TmuxTab,
+};
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{CSI, Cursor};
-use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
+
+/// Maximum payload retained in a single `SendKeys` command after queue merging.
+const SEND_KEYS_MERGE_MAX_BYTES: usize = 16 * 1024;
 
 pub(crate) trait TmuxCommand: Send + Debug {
     fn get_command(&self, domain_id: DomainId) -> String;
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
+
+    /// Number of tmux guarded responses emitted by `get_command`.
+    ///
+    /// Most mailbox items issue one tmux command. Multi-command items must
+    /// override this so a later response cannot be misattributed to the next
+    /// mailbox item.
+    fn expected_responses(&self) -> usize {
+        1
+    }
+
+    fn mailbox_payload_bytes(&self) -> usize {
+        0
+    }
+
+    fn try_merge_newer(&mut self, _newer: &dyn TmuxCommand) -> bool {
+        false
+    }
+
+    fn as_send_keys(&self) -> Option<(TmuxPaneId, &[u8])> {
+        None
+    }
+
+    fn as_resize(&self) -> Option<(TmuxPaneId, PtySize)> {
+        None
+    }
 }
 
 fn tmux_mux() -> anyhow::Result<Arc<Mux>> {
@@ -31,6 +60,7 @@ fn u64_to_usize_saturating(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+#[cfg(test)]
 fn usize_to_u32_saturating(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -68,6 +98,26 @@ struct WindowItem {
 }
 
 impl TmuxDomainState {
+    fn fail_local_mirror_publication(&self, err: anyhow::Error) -> anyhow::Error {
+        // A LocalPane drop normally asks its child signaller to kill the
+        // corresponding remote pane.  Publication failures are local mirror
+        // failures, not authority to mutate the live tmux session, so fence
+        // every child before any partially built pane or tab can be dropped.
+        // The absorbing terminal transition then removes all partial local
+        // topology once the currently admitted operation returns.
+        let remote_panes: Vec<_> = self.remote_panes.lock().values().cloned().collect();
+        for remote_pane in remote_panes {
+            remote_pane
+                .lock()
+                .child_state
+                .mark_exited(ExitStatus::with_signal(
+                    "tmux local mirror publication failed",
+                ));
+        }
+        self.transition_to_exit_and_schedule_detach();
+        err
+    }
+
     /// check if a PaneItem received from ListAllPanes has been attached
     pub fn check_pane_attached(&self, window_id: TmuxWindowId, pane_id: TmuxPaneId) -> bool {
         let gui_tabs = self.gui_tabs.lock();
@@ -125,23 +175,55 @@ impl TmuxDomainState {
         Ok(())
     }
 
-    fn remove_tmux_pane_state_entries(
-        remote_panes: &mut HashMap<TmuxPaneId, Arc<Mutex<TmuxRemotePane>>>,
-        backlog: &mut HashMap<TmuxPaneId, Vec<u8>>,
+    fn retire_tmux_pane_state_entries(
+        &self,
         pane_ids: &[TmuxPaneId],
-    ) -> Vec<PaneId> {
-        let mut local_pane_ids = Vec::with_capacity(pane_ids.len());
-        for pane_id in pane_ids {
-            if let Some(remote) = remote_panes.remove(pane_id) {
-                let remote = remote.lock();
-                remote
-                    .child_state
-                    .mark_exited(ExitStatus::with_exit_code(0));
-                local_pane_ids.push(remote.local_pane_id);
-            }
-            let _ = backlog.remove(pane_id);
+    ) -> anyhow::Result<Vec<PaneId>> {
+        let _retirement = self.pane_retirement.lock();
+        let removed_panes = {
+            let mut remote_panes = self.remote_panes.lock();
+            let mut retired_panes = self.retired_panes.lock();
+            let new_tombstones = pane_ids
+                .iter()
+                .filter(|pane_id| !retired_panes.contains(pane_id))
+                .count();
+            let Some(next_tombstone_count) = retired_panes.len().checked_add(new_tombstones) else {
+                anyhow::bail!("tmux retired-pane tombstone accounting overflow");
+            };
+            anyhow::ensure!(
+                next_tombstone_count <= super::tmux::RETIRED_PANE_TOMBSTONE_LIMIT,
+                "tmux retired-pane tombstone cap {} exceeded",
+                super::tmux::RETIRED_PANE_TOMBSTONE_LIMIT
+            );
+
+            pane_ids
+                .iter()
+                .filter_map(|pane_id| {
+                    retired_panes.insert(*pane_id);
+                    remote_panes
+                        .remove(pane_id)
+                        .map(|remote| (*pane_id, remote))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut local_pane_ids = Vec::with_capacity(removed_panes.len());
+        for (_pane_id, remote) in removed_panes {
+            // Tombstone publication is the admission cutoff. A producer that
+            // passed its per-pane tombstone check first linearizes before
+            // retirement; this lock waits for it, then publishes Retired.
+            let mut remote = remote.lock();
+            remote.output_state = TmuxPaneOutputState::Retired;
+            remote
+                .child_state
+                .mark_exited(ExitStatus::with_exit_code(0));
+            local_pane_ids.push(remote.local_pane_id);
         }
-        local_pane_ids
+
+        // Every producer admitted before the tombstone has completed, and all
+        // later output is rejected, before backlog cleanup.
+        self.backlog.lock().remove_many(pane_ids);
+        Ok(local_pane_ids)
     }
 
     fn remove_detached_pane(
@@ -170,11 +252,7 @@ impl TmuxDomainState {
             (tab_id, to_remove, tab_empty)
         };
 
-        let local_pane_ids = {
-            let mut pane_map = self.remote_panes.lock();
-            let mut backlog = self.backlog.lock();
-            Self::remove_tmux_pane_state_entries(&mut pane_map, &mut backlog, &to_remove)
-        };
+        let local_pane_ids = self.retire_tmux_pane_state_entries(&to_remove)?;
 
         let mux = tmux_mux()?;
         for pane_id in local_pane_ids {
@@ -192,16 +270,12 @@ impl TmuxDomainState {
             let mut gui_tabs = self.gui_tabs.lock();
             match gui_tabs.remove(&window_id) {
                 Some(tab) => tab,
-                None => anyhow::bail!("Cannot find the window {window_id}"),
+                None => return Ok(()),
             }
         };
 
         let detached_panes: Vec<_> = tab.panes.iter().copied().collect();
-        let local_pane_ids = {
-            let mut pane_map = self.remote_panes.lock();
-            let mut backlog = self.backlog.lock();
-            Self::remove_tmux_pane_state_entries(&mut pane_map, &mut backlog, &detached_panes)
-        };
+        let local_pane_ids = self.retire_tmux_pane_state_entries(&detached_panes)?;
 
         let mux = tmux_mux()?;
         for pane_id in local_pane_ids {
@@ -212,17 +286,27 @@ impl TmuxDomainState {
         Ok(())
     }
 
-    fn set_pane_cursor_position(&self, pane: &Arc<dyn Pane>, x: usize, y: usize) {
-        pane.perform_actions(vec![Action::CSI(CSI::Cursor(
-            Cursor::CharacterAndLinePosition {
-                col: OneBased::from_zero_based(usize_to_u32_saturating(x)),
-                line: OneBased::from_zero_based(usize_to_u32_saturating(y)),
-            },
-        ))]);
+    fn prepare_pane_capture(&self, pane_id: TmuxPaneId) -> anyhow::Result<bool> {
+        let pane_map = self.remote_panes.lock();
+        let pane = pane_map
+            .get(&pane_id)
+            .with_context(|| format!("cannot prepare capture for missing tmux pane {pane_id}"))?;
+        let mut pane = pane.lock();
+        match pane.output_state {
+            TmuxPaneOutputState::Fresh => {
+                pane.output_state = TmuxPaneOutputState::AwaitingCapture;
+                Ok(true)
+            }
+            TmuxPaneOutputState::AwaitingCapture | TmuxPaneOutputState::Captured => Ok(false),
+            TmuxPaneOutputState::Ready => Ok(false),
+            TmuxPaneOutputState::Retired => {
+                anyhow::bail!("cannot prepare capture for retired tmux pane {pane_id}")
+            }
+        }
     }
 
     fn create_pane(&self, pane: &PaneItem) -> anyhow::Result<Arc<dyn Pane>> {
-        let local_pane_id = alloc_pane_id();
+        let local_pane_id = alloc_pane_id()?;
         let child_state = Arc::new(TmuxChildState::new());
         let (output_read, output_write) = filedescriptor::socketpair()?;
         let ref_pane = Arc::new(Mutex::new(TmuxRemotePane {
@@ -238,18 +322,14 @@ impl TmuxDomainState {
             pane_height: pane.pane_height,
             pane_left: pane.pane_left,
             pane_top: pane.pane_top,
+            output_state: TmuxPaneOutputState::Fresh,
         }));
-
-        {
-            let mut pane_map = self.remote_panes.lock();
-            pane_map.insert(pane.pane_id, ref_pane.clone());
-        }
 
         let pane_pty = TmuxPty {
             domain_id: self.domain_id,
             reader: output_read,
-            cmd_queue: self.cmd_queue.clone(),
-            master_pane: ref_pane,
+            cmd_queue: Arc::clone(&self.cmd_queue),
+            master_pane: Arc::clone(&ref_pane),
         };
 
         let writer = WriterWrapper::new(pane_pty.take_writer()?);
@@ -266,7 +346,8 @@ impl TmuxDomainState {
             self.domain_id,
             pane.pane_id,
             self.cmd_queue.clone(),
-            child_state,
+            Arc::clone(&child_state),
+            self.registered_owner_weak()?,
         );
 
         let command_description = "tmux pane".to_string();
@@ -283,7 +364,7 @@ impl TmuxDomainState {
             Box::new(writer.clone()),
         );
 
-        Ok(Arc::new(LocalPane::new(
+        let local_pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
             local_pane_id,
             terminal,
             Box::new(child),
@@ -291,7 +372,74 @@ impl TmuxDomainState {
             Box::new(writer),
             self.domain_id,
             command_description,
-        )))
+        ));
+
+        let mut pane_map = self.remote_panes.lock();
+        if self.retired_panes.lock().contains(&pane.pane_id) {
+            child_state.mark_exited(ExitStatus::with_signal(
+                "retired tmux remote pane identity reuse",
+            ));
+            anyhow::bail!(
+                "tmux attempted to reuse retired remote pane id {}",
+                pane.pane_id
+            );
+        }
+        if pane_map.contains_key(&pane.pane_id) {
+            child_state.mark_exited(ExitStatus::with_signal(
+                "duplicate tmux remote pane identity",
+            ));
+            anyhow::bail!(
+                "tmux remote pane {} is already mapped to a local pane",
+                pane.pane_id
+            );
+        }
+        pane_map.insert(pane.pane_id, ref_pane);
+        drop(pane_map);
+
+        Ok(local_pane)
+    }
+
+    fn finish_fresh_split(&self, pane_id: TmuxPaneId) -> anyhow::Result<()> {
+        let remote_pane = {
+            let pane_map = self.remote_panes.lock();
+            pane_map
+                .get(&pane_id)
+                .cloned()
+                .with_context(|| format!("cannot finish missing split tmux pane {pane_id}"))?
+        };
+        let mut remote_pane = remote_pane.lock();
+        anyhow::ensure!(
+            remote_pane.output_state == TmuxPaneOutputState::Fresh,
+            "split tmux pane {pane_id} reached {:?} before initial stream commit",
+            remote_pane.output_state
+        );
+
+        let limits = TmuxBacklogLimits::current();
+        let backlog_drain = {
+            let mut backlog = self.backlog.lock();
+            backlog.refresh_limits(limits);
+            anyhow::ensure!(
+                !backlog.requires_global_resync(),
+                "tmux split pane {pane_id} cannot recover from a global output gap"
+            );
+            backlog.take(pane_id)
+        };
+        match backlog_drain {
+            Some(TmuxBacklogDrain::ResyncRequired) => {
+                anyhow::bail!("tmux split pane {pane_id} initial output is gapped")
+            }
+            Some(TmuxBacklogDrain::Bytes(bytes)) => {
+                let (first, second) = bytes.as_slices();
+                remote_pane
+                    .output_write
+                    .write_all(first)
+                    .and_then(|()| remote_pane.output_write.write_all(second))
+                    .context("writing complete pre-publication split-pane stream")?;
+            }
+            None => {}
+        }
+        remote_pane.output_state = TmuxPaneOutputState::Ready;
+        Ok(())
     }
 
     pub fn split_pane(
@@ -340,14 +488,35 @@ impl TmuxDomainState {
             pane_active: false,
         };
 
-        let pane = self.create_pane(&p).context("failed to create pane")?;
-        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))?;
+        let pane = self.create_pane(&p).map_err(|err| {
+            self.fail_local_mirror_publication(err.context("failed to create pane"))
+        })?;
+        tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))
+            .map_err(|err| {
+                self.fail_local_mirror_publication(
+                    err.context("failed to insert tmux pane into local tab"),
+                )
+            })?;
 
-        self.add_attached_pane(window_id, remote_id)?;
+        self.add_attached_pane(window_id, remote_id)
+            .map_err(|err| {
+                self.fail_local_mirror_publication(
+                    err.context("failed to attach tmux pane to local window state"),
+                )
+            })?;
 
-        let _ = mux.add_pane(&pane);
+        mux.add_pane(&pane).map_err(|err| {
+            self.fail_local_mirror_publication(
+                err.context("failed to publish tmux pane in local mux"),
+            )
+        })?;
+        self.finish_fresh_split(remote_id).map_err(|err| {
+            self.fail_local_mirror_publication(
+                err.context("failed to commit split tmux pane initial output"),
+            )
+        })?;
 
-        return Ok(pane);
+        Ok(pane)
     }
 
     fn sync_pane_state(&self, panes: &[PaneItem]) -> anyhow::Result<()> {
@@ -355,6 +524,11 @@ impl TmuxDomainState {
             return Ok(());
         };
         let mux = tmux_mux()?;
+        if self.backlog.lock().requires_global_resync() {
+            anyhow::bail!(
+                "tmux output backlog lost pane identity; refusing partial per-window recovery"
+            );
+        }
 
         for pane in panes.iter() {
             if pane.session_id != current_session
@@ -363,53 +537,103 @@ impl TmuxDomainState {
                 continue;
             }
 
-            // We now have the cursor information, fix the cursor position
-            let pane_map = self.remote_panes.lock();
-            let local_pane = match pane_map.get(&pane.pane_id) {
-                Some(p) => {
-                    let local_pane_id = p.lock().local_pane_id;
-                    mux.get_pane(local_pane_id)
-                }
-                None => None,
+            let remote_pane = {
+                let pane_map = self.remote_panes.lock();
+                pane_map.get(&pane.pane_id).cloned().with_context(|| {
+                    format!(
+                        "tmux pane {} is attached but has no local remote-pane gate",
+                        pane.pane_id
+                    )
+                })?
             };
+            let mut remote_pane = remote_pane.lock();
+            let local_pane = mux.get_pane(remote_pane.local_pane_id).with_context(|| {
+                format!(
+                    "tmux pane {} maps to missing local pane {}",
+                    pane.pane_id, remote_pane.local_pane_id
+                )
+            })?;
 
-            if let Some(local_pane) = local_pane {
-                let c = local_pane.get_cursor_position();
-                // no capture, output case
-                if c.x == 0 && c.y == 0 {
-                    if let Some(text) = self.backlog.lock().remove(&pane.pane_id) {
-                        if let Some(ref_pane) = pane_map.get(&pane.pane_id) {
-                            let mut ref_pane = ref_pane.lock();
-                            if let Err(err) = ref_pane.output_write.write_all(&text) {
-                                log::error!("Failed to write tmux data to output: {:#}", err);
-                            }
-                        }
-                    }
-                } else {
-                    // we have capture, so remove the backlog
-                    let _ = self.backlog.lock().remove(&pane.pane_id);
-                    if pane.cursor_x != 0 || pane.cursor_y != 0 {
-                        self.set_pane_cursor_position(
-                            &local_pane,
-                            u64_to_usize_saturating(pane.cursor_x),
-                            u64_to_usize_saturating(pane.cursor_y),
-                        );
-                    }
+            let backlog_drain = self.backlog.lock().take(pane.pane_id);
+            let mut apply_snapshot_cursor = true;
+            match (remote_pane.output_state, backlog_drain) {
+                (_, Some(TmuxBacklogDrain::ResyncRequired)) => {
+                    anyhow::bail!(
+                        "tmux pane {} output backlog is gapped; refusing unsafe textual replay",
+                        pane.pane_id
+                    );
                 }
-                if pane.pane_active {
-                    let gui_tabs = self.gui_tabs.lock();
+                (TmuxPaneOutputState::Fresh, Some(TmuxBacklogDrain::Bytes(text))) => {
+                    apply_snapshot_cursor = text.is_empty();
+                    let (first, second) = text.as_slices();
+                    remote_pane
+                        .output_write
+                        .write_all(first)
+                        .and_then(|()| remote_pane.output_write.write_all(second))
+                        .context("writing complete pre-attach tmux stream to local pane")?;
+                }
+                (TmuxPaneOutputState::Fresh, None) | (TmuxPaneOutputState::Captured, None) => {}
+                (TmuxPaneOutputState::Captured, Some(TmuxBacklogDrain::Bytes(text)))
+                    if !text.is_empty() =>
+                {
+                    anyhow::bail!(
+                        "tmux pane {} produced {} bytes while capture publication was pending; \
+                         refusing cursor-ambiguous textual replay",
+                        pane.pane_id,
+                        text.len()
+                    );
+                }
+                (TmuxPaneOutputState::Captured, Some(TmuxBacklogDrain::Bytes(_))) => {}
+                (TmuxPaneOutputState::AwaitingCapture, _) => {
+                    anyhow::bail!(
+                        "tmux pane {} list state overtook its required capture callback",
+                        pane.pane_id
+                    );
+                }
+                (TmuxPaneOutputState::Ready, Some(_)) => {
+                    anyhow::bail!(
+                        "ready tmux pane {} retained an impossible preparation backlog",
+                        pane.pane_id
+                    );
+                }
+                (TmuxPaneOutputState::Ready, None) => {}
+                (TmuxPaneOutputState::Retired, _) => {
+                    anyhow::bail!(
+                        "tmux pane {} was retired during state synchronization",
+                        pane.pane_id
+                    );
+                }
+            }
 
-                    let Some(local_tab) = gui_tabs.get(&pane.window_id) else {
-                        anyhow::bail!("invalid tmux window id {}", pane.window_id);
-                    };
+            if remote_pane.output_state != TmuxPaneOutputState::Ready {
+                if apply_snapshot_cursor {
+                    let row = pane.cursor_y.saturating_add(1);
+                    let col = pane.cursor_x.saturating_add(1);
+                    write!(&mut remote_pane.output_write, "\u{1b}[{row};{col}H")
+                        .context("serializing tmux cursor after initial pane stream")?;
+                }
+                remote_pane.output_state = TmuxPaneOutputState::Ready;
+            }
+            remote_pane.session_id = pane.session_id;
+            remote_pane.window_id = pane.window_id;
+            remote_pane.cursor_x = pane.cursor_x;
+            remote_pane.cursor_y = pane.cursor_y;
+            remote_pane.pane_width = pane.pane_width;
+            remote_pane.pane_height = pane.pane_height;
+            remote_pane.pane_left = pane.pane_left;
+            remote_pane.pane_top = pane.pane_top;
+            drop(remote_pane);
 
-                    match mux.get_tab(local_tab.tab_id) {
-                        Some(tab) => {
-                            tab.set_active_pane(&local_pane);
-                            mux.notify(MuxNotification::PaneFocused(local_pane.pane_id()));
-                        }
-                        None => {}
-                    }
+            if pane.pane_active {
+                let gui_tabs = self.gui_tabs.lock();
+
+                let Some(local_tab) = gui_tabs.get(&pane.window_id) else {
+                    anyhow::bail!("invalid tmux window id {}", pane.window_id);
+                };
+
+                if let Some(tab) = mux.get_tab(local_tab.tab_id) {
+                    tab.set_active_pane(&local_pane);
+                    mux.notify(MuxNotification::PaneFocused(local_pane.pane_id()));
                 }
             }
 
@@ -424,6 +648,7 @@ impl TmuxDomainState {
             return Ok(());
         };
         let mux = tmux_mux()?;
+        let mut required_commands: Vec<Box<dyn TmuxCommand>> = Vec::new();
 
         if !new_window {
             let active_window_ids: HashSet<TmuxWindowId> = windows
@@ -441,7 +666,7 @@ impl TmuxDomainState {
             };
 
             for stale_window_id in stale_window_ids {
-                let _ = self.remove_detached_window(stale_window_id);
+                self.remove_detached_window(stale_window_id)?;
             }
         }
 
@@ -469,9 +694,18 @@ impl TmuxDomainState {
 
             let tab = Arc::new(Tab::new(&size));
             tab.set_title(&format!("{}", window.window_name));
-            mux.add_tab_no_panes(&tab);
+            mux.add_tab_no_panes(&tab).map_err(|err| {
+                self.fail_local_mirror_publication(
+                    err.context("failed to register tmux tab in local mux state"),
+                )
+            })?;
 
-            let _ = self.add_attached_window(window, &tab.tab_id())?;
+            self.add_attached_window(window, &tab.tab_id())
+                .map_err(|err| {
+                    self.fail_local_mirror_publication(
+                        err.context("failed to attach tmux window to local tab state"),
+                    )
+                })?;
 
             let mut split_stack;
             let mut split_direction;
@@ -493,10 +727,23 @@ impl TmuxDomainState {
                             pane_left: x.pane_left,
                             pane_top: x.pane_top,
                         };
-                        let local_pane = self.create_pane(&p).context("failed to create pane")?;
+                        let local_pane = self.create_pane(&p).map_err(|err| {
+                            self.fail_local_mirror_publication(
+                                err.context("failed to create tmux pane"),
+                            )
+                        })?;
                         tab.assign_pane(&local_pane);
-                        self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
+                        self.add_attached_pane(p.window_id, p.pane_id)
+                            .map_err(|err| {
+                                self.fail_local_mirror_publication(
+                                    err.context("failed to attach tmux pane to local window state"),
+                                )
+                            })?;
+                        mux.add_pane(&local_pane).map_err(|err| {
+                            self.fail_local_mirror_publication(
+                                err.context("failed to publish tmux pane in local mux"),
+                            )
+                        })?;
                         break;
                     }
 
@@ -527,31 +774,51 @@ impl TmuxDomainState {
                     };
                     let local_pane;
                     if !self.check_pane_attached(p.window_id, p.pane_id) {
-                        local_pane = self.create_pane(&p).context("failed to create pane")?;
-                        self.add_attached_pane(p.window_id, p.pane_id)?;
-                        let _ = mux.add_pane(&local_pane);
+                        local_pane = self.create_pane(&p).map_err(|err| {
+                            self.fail_local_mirror_publication(
+                                err.context("failed to create tmux pane"),
+                            )
+                        })?;
+                        self.add_attached_pane(p.window_id, p.pane_id)
+                            .map_err(|err| {
+                                self.fail_local_mirror_publication(
+                                    err.context("failed to attach tmux pane to local window state"),
+                                )
+                            })?;
+                        mux.add_pane(&local_pane).map_err(|err| {
+                            self.fail_local_mirror_publication(
+                                err.context("failed to publish tmux pane in local mux"),
+                            )
+                        })?;
                         if let None = tab.get_active_pane() {
                             tab.assign_pane(&local_pane);
                             split_pane_index = tab.get_active_idx();
                             continue;
                         }
 
-                        split_pane_index = next_split_pane_index(tab.split_and_insert(
-                            split_pane_index,
-                            SplitRequest {
-                                direction: split_direction,
-                                target_is_second: false,
-                                top_level: false,
-                                size: SplitSize::Cells(
-                                    if split_direction == SplitDirection::Horizontal {
-                                        u64_to_usize_saturating(p.pane_width)
-                                    } else {
-                                        u64_to_usize_saturating(p.pane_height)
-                                    },
-                                ),
-                            },
-                            local_pane.clone(),
-                        )?);
+                        split_pane_index = next_split_pane_index(
+                            tab.split_and_insert(
+                                split_pane_index,
+                                SplitRequest {
+                                    direction: split_direction,
+                                    target_is_second: false,
+                                    top_level: false,
+                                    size: SplitSize::Cells(
+                                        if split_direction == SplitDirection::Horizontal {
+                                            u64_to_usize_saturating(p.pane_width)
+                                        } else {
+                                            u64_to_usize_saturating(p.pane_height)
+                                        },
+                                    ),
+                                },
+                                local_pane.clone(),
+                            )
+                            .map_err(|err| {
+                                self.fail_local_mirror_publication(
+                                    err.context("failed to insert tmux pane into local tab"),
+                                )
+                            })?,
+                        );
                     } else {
                         let pane_map = self.remote_panes.lock();
                         let local_pane_id = match pane_map.get(&p.pane_id) {
@@ -575,7 +842,12 @@ impl TmuxDomainState {
                 }
             }
 
-            mux.add_tab_to_window(&tab, **gui_window_id)?;
+            mux.add_tab_to_window(&tab, **gui_window_id)
+                .map_err(|err| {
+                    self.fail_local_mirror_publication(
+                        err.context("failed to publish tmux tab in local mux window"),
+                    )
+                })?;
             gui_window_id.notify();
 
             let gui_tabs = self.gui_tabs.lock();
@@ -593,16 +865,18 @@ impl TmuxDomainState {
             // For new window, we wait for nature ouput instead of capturing
             if !new_window {
                 for p in local_tab.panes.iter() {
-                    self.cmd_queue.lock().push_back(Box::new(CapturePane {
-                        pane_id: *p,
-                        history_limit: window.history_limit,
-                    }));
+                    if self.prepare_pane_capture(*p)? {
+                        required_commands.push(Box::new(CapturePane {
+                            pane_id: *p,
+                            history_limit: window.history_limit,
+                        }));
+                    }
                 }
             }
 
             // To keep the active window last one to make it active after set the focus pane
             if !window.window_active {
-                self.cmd_queue.lock().push_back(Box::new(ListAllPanes {
+                required_commands.push(Box::new(ListAllPanes {
                     window_id: window.window_id,
                     prune: false,
                     layout_csum: window.layout_csum.clone(),
@@ -613,7 +887,7 @@ impl TmuxDomainState {
         // To keep the active window last one to make it active after set the focus pane
         match windows.iter().find(|w| w.window_active) {
             Some(window) => {
-                self.cmd_queue.lock().push_back(Box::new(ListAllPanes {
+                required_commands.push(Box::new(ListAllPanes {
                     window_id: window.window_id,
                     prune: false,
                     layout_csum: window.layout_csum.clone(),
@@ -623,24 +897,19 @@ impl TmuxDomainState {
         }
 
         if *self.attach_state.lock() == AttachState::Init {
-            self.cmd_queue.lock().push_back(Box::new(AttachDone));
+            required_commands.push(Box::new(AttachDone));
         }
 
-        TmuxDomainState::schedule_send_next_command(self.domain_id);
-
-        Ok(())
+        self.enqueue_required_batch(required_commands, "window-state synchronization")
     }
 
-    pub fn subscribe_notification(&self) {
-        let mut notification_sub_id = self.notification_sub_id.lock();
-        if notification_sub_id.is_some() {
-            return;
+    pub fn subscribe_notification(&self) -> anyhow::Result<()> {
+        if self.notification_sub_id.lock().is_some() {
+            return Ok(());
         }
 
-        let Some(mux) = Mux::try_get() else {
-            log::warn!("cannot subscribe tmux notifications without active mux");
-            return;
-        };
+        let mux =
+            Mux::try_get().context("cannot subscribe tmux notifications without active mux")?;
         let domain_id = self.domain_id;
         let sub_id = mux.subscribe(move |n| {
             // Domain lifetimes can outlive tmux sessions and a stale callback
@@ -651,7 +920,10 @@ impl TmuxDomainState {
             let Some(domain) = mux.get_domain(domain_id) else {
                 return false;
             };
-            if domain.downcast_ref::<TmuxDomain>().is_none() {
+            let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+                return false;
+            };
+            if tmux_domain.inner.is_terminal() {
                 return false;
             }
 
@@ -670,64 +942,82 @@ impl TmuxDomainState {
                     return;
                 };
 
-                if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
-                    return;
-                }
-
-                match n {
-                    MuxNotification::PaneFocused(pane_id) => {
-                        let tmux_pane_id = match tmux_domain
-                            .inner
-                            .remote_panes
-                            .lock()
-                            .iter()
-                            .find(|(_, p)| p.lock().local_pane_id == pane_id)
-                        {
-                            Some((_, p)) => Some(p.lock().pane_id),
-                            None => None,
-                        };
-
-                        if let Some(pane_id) = tmux_pane_id {
-                            tmux_domain
-                                .inner
-                                .cmd_queue
-                                .lock()
-                                .push_back(Box::new(SelectPane { pane_id: pane_id }));
-                            TmuxDomainState::schedule_send_next_command(domain_id);
-                        }
+                let _ = tmux_domain.inner.with_active_lifecycle(|| {
+                    if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
+                        return;
                     }
-                    MuxNotification::WindowInvalidated(window_id) => {
-                        if let Some(window) = mux.get_window(window_id) {
-                            let Some(tab) = window.get_active() else {
-                                return;
-                            };
-                            let tmux_window_id = match tmux_domain
+
+                    match n {
+                        MuxNotification::PaneFocused(pane_id) => {
+                            let tmux_pane_id = match tmux_domain
                                 .inner
-                                .gui_tabs
+                                .remote_panes
                                 .lock()
                                 .iter()
-                                .find(|(_, t)| t.tab_id == tab.tab_id())
+                                .find(|(_, p)| p.lock().local_pane_id == pane_id)
                             {
-                                Some((_, t)) => Some(t.tmux_window_id),
+                                Some((_, p)) => Some(p.lock().pane_id),
                                 None => None,
                             };
-                            if let Some(window_id) = tmux_window_id {
-                                tmux_domain.inner.cmd_queue.lock().push_back(Box::new(
-                                    SelectWindow {
-                                        window_id: window_id,
-                                    },
-                                ));
-                                TmuxDomainState::schedule_send_next_command(domain_id);
+
+                            if let Some(pane_id) = tmux_pane_id {
+                                let accepted = {
+                                    let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
+                                    cmd_queue
+                                        .push_back(Box::new(SelectPane { pane_id }))
+                                        .is_ok()
+                                };
+                                if accepted {
+                                    TmuxDomainState::schedule_send_next_command(domain_id);
+                                }
                             }
                         }
+                        MuxNotification::WindowInvalidated(window_id) => {
+                            if let Some(window) = mux.get_window(window_id) {
+                                let Some(tab) = window.get_active() else {
+                                    return;
+                                };
+                                let tmux_window_id = match tmux_domain
+                                    .inner
+                                    .gui_tabs
+                                    .lock()
+                                    .iter()
+                                    .find(|(_, t)| t.tab_id == tab.tab_id())
+                                {
+                                    Some((_, t)) => Some(t.tmux_window_id),
+                                    None => None,
+                                };
+                                if let Some(window_id) = tmux_window_id {
+                                    let accepted = {
+                                        let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
+                                        cmd_queue
+                                            .push_back(Box::new(SelectWindow { window_id }))
+                                            .is_ok()
+                                    };
+                                    if accepted {
+                                        TmuxDomainState::schedule_send_next_command(domain_id);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
+                });
             })
             .detach();
             true
-        });
-        *notification_sub_id = Some(sub_id);
+        })?;
+        match self.publish_notification_subscription(sub_id) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let _ = mux.unsubscribe(sub_id);
+                Ok(())
+            }
+            Err(err) => {
+                let _ = mux.unsubscribe(sub_id);
+                Err(err)
+            }
+        }
     }
 
     pub fn unsubscribe_notification(&self) {
@@ -755,6 +1045,30 @@ fn parse_sigil_number(text: &str) -> anyhow::Result<u64> {
         .parse()?;
 
     Ok(num)
+}
+
+fn parse_split_pane_identity(output: &str) -> anyhow::Result<u64> {
+    let mut identities = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let identity = identities
+        .next()
+        .ok_or_else(|| anyhow!("split-window returned no pane id"))?;
+    anyhow::ensure!(
+        identities.next().is_none(),
+        "split-window returned more than one pane identity"
+    );
+    let digits = identity
+        .strip_prefix('%')
+        .ok_or_else(|| anyhow!("split-window pane identity must begin with '%'"))?;
+    anyhow::ensure!(
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        "split-window pane identity must be exactly '%' followed by decimal digits"
+    );
+    digits
+        .parse()
+        .context("split-window pane identity is outside the supported range")
 }
 
 fn parse_list_pane_item(line: &str) -> anyhow::Result<Option<PaneItem>> {
@@ -1048,7 +1362,7 @@ impl TmuxCommand for Resize {
 
         let pane_map = tmux_domain.inner.remote_panes.lock();
         {
-            let mut pane = match pane_map.get(&self.pane_id) {
+            let pane = match pane_map.get(&self.pane_id) {
                 Some(x) => x.lock(),
                 None => return "".to_string(),
             };
@@ -1056,9 +1370,6 @@ impl TmuxCommand for Resize {
             if pane.pane_width == self.size.cols as u64 && pane.pane_height == self.size.rows as u64
             {
                 return "".to_string();
-            } else {
-                pane.pane_width = self.size.cols as u64;
-                pane.pane_height = self.size.rows as u64;
             }
         }
 
@@ -1109,7 +1420,40 @@ impl TmuxCommand for Resize {
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
+
+        let mux = tmux_mux()?;
+        let domain = mux
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
+        let tmux_domain = domain
+            .downcast_ref::<TmuxDomain>()
+            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
+        if let Some(pane) = tmux_domain.inner.remote_panes.lock().get(&self.pane_id) {
+            let mut pane = pane.lock();
+            pane.pane_width = self.size.cols as u64;
+            pane.pane_height = self.size.rows as u64;
+        }
         Ok(())
+    }
+
+    fn expected_responses(&self) -> usize {
+        2
+    }
+
+    fn try_merge_newer(&mut self, newer: &dyn TmuxCommand) -> bool {
+        let Some((pane_id, size)) = newer.as_resize() else {
+            return false;
+        };
+        if pane_id != self.pane_id {
+            return false;
+        }
+
+        self.size = size;
+        true
+    }
+
+    fn as_resize(&self) -> Option<(TmuxPaneId, PtySize)> {
+        Some((self.pane_id, self.size))
     }
 }
 
@@ -1149,16 +1493,21 @@ impl TmuxCommand for CapturePane {
         let unescaped = normalize_capture_pane_output(&unescaped);
 
         let pane_map = tmux_domain.inner.remote_panes.lock();
-        if let Some(pane) = pane_map.get(&self.pane_id) {
-            let mut pane = pane.lock();
-            if let Some(p) = mux.get_pane(pane.local_pane_id) {
-                tmux_domain.inner.set_pane_cursor_position(&p, 0, 0);
-            }
-
-            pane.output_write
-                .write_all(unescaped.as_bytes())
-                .context("writing capture pane result to output")?;
+        let pane = pane_map.get(&self.pane_id).with_context(|| {
+            format!("capture result targeted missing tmux pane {}", self.pane_id)
+        })?;
+        let mut pane = pane.lock();
+        if pane.output_state != TmuxPaneOutputState::AwaitingCapture {
+            anyhow::bail!(
+                "capture result for tmux pane {} arrived in {:?} state",
+                self.pane_id,
+                pane.output_state
+            );
         }
+        pane.output_write
+            .write_all(unescaped.as_bytes())
+            .context("writing capture pane result to output")?;
+        pane.output_state = TmuxPaneOutputState::Captured;
 
         Ok(())
     }
@@ -1185,6 +1534,33 @@ impl TmuxCommand for SendKeys {
             anyhow::bail!("{error}");
         }
         Ok(())
+    }
+
+    fn mailbox_payload_bytes(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn try_merge_newer(&mut self, newer: &dyn TmuxCommand) -> bool {
+        let Some((pane, keys)) = newer.as_send_keys() else {
+            return false;
+        };
+        if pane != self.pane {
+            return false;
+        }
+
+        let Some(combined_len) = self.keys.len().checked_add(keys.len()) else {
+            return false;
+        };
+        if combined_len > SEND_KEYS_MERGE_MAX_BYTES {
+            return false;
+        }
+
+        self.keys.extend_from_slice(keys);
+        true
+    }
+
+    fn as_send_keys(&self) -> Option<(TmuxPaneId, &[u8])> {
+        Some((self.pane, &self.keys))
     }
 }
 
@@ -1219,17 +1595,20 @@ impl TmuxCommand for ListCommands {
             };
             support_commands.insert(command_name.to_string(), line.to_string());
         }
+        drop(support_commands);
 
-        let mut cmd_queue = tmux_domain.inner.cmd_queue.as_ref().lock();
-        if let Some(session) = *tmux_domain.inner.tmux_session.lock() {
-            cmd_queue.push_back(Box::new(ListAllWindows {
+        let session = tmux_domain
+            .inner
+            .tmux_session
+            .lock()
+            .ok_or_else(|| anyhow!("tmux session disappeared during command discovery"))?;
+        tmux_domain.inner.enqueue_required(
+            Box::new(ListAllWindows {
                 session_id: session,
                 window_id: None,
-            }));
-            TmuxDomainState::schedule_send_next_command(domain_id);
-        }
-
-        Ok(())
+            }),
+            "post-list-commands window discovery",
+        )
     }
 }
 
@@ -1237,14 +1616,21 @@ impl TmuxCommand for ListCommands {
 pub(crate) struct SplitPane {
     pub pane_id: TmuxPaneId,
     pub direction: SplitDirection,
+    pub request_id: u64,
 }
 
 impl TmuxCommand for SplitPane {
     fn get_command(&self, _domain_id: DomainId) -> String {
         if self.direction == SplitDirection::Horizontal {
-            format!("split-window -h -t %{}\n", self.pane_id)
+            format!(
+                "split-window -P -F '#{{pane_id}}' -h -t %{}\n",
+                self.pane_id
+            )
         } else {
-            format!("split-window -v -t %{}\n", self.pane_id)
+            format!(
+                "split-window -P -F '#{{pane_id}}' -v -t %{}\n",
+                self.pane_id
+            )
         }
     }
 
@@ -1256,14 +1642,45 @@ impl TmuxCommand for SplitPane {
                     if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
                         let _ = tmux_domain
                             .inner
-                            .fail_oldest_pending_split(anyhow!(error.clone()));
+                            .fail_pending_split(self.request_id, anyhow!(error.clone()));
                     }
                 }
             }
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
-        Ok(())
+
+        let pane_id = parse_split_pane_identity(&result.output);
+
+        let mux = tmux_mux()?;
+        let domain = mux
+            .get_domain(domain_id)
+            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
+        let tmux_domain = domain
+            .downcast_ref::<TmuxDomain>()
+            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
+
+        match pane_id {
+            Ok(pane_id) => {
+                anyhow::ensure!(
+                    tmux_domain
+                        .inner
+                        .resolve_pending_split(self.request_id, pane_id),
+                    "missing pending tmux split request {}",
+                    self.request_id
+                );
+                Ok(())
+            }
+            Err(err) => {
+                let message = format!(
+                    "split-window in domain={domain_id} returned invalid pane identity: {err}"
+                );
+                let _ = tmux_domain
+                    .inner
+                    .fail_pending_split(self.request_id, anyhow!(message.clone()));
+                anyhow::bail!("{message}");
+            }
+        }
     }
 }
 
@@ -1404,19 +1821,20 @@ mod tests {
 
         let tmux_domain = Arc::new(TmuxDomain::new(0));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
-        mux.add_domain(&domain);
+        mux.add_domain(&domain)
+            .expect("test tmux domain should register");
 
         (guard, tmux_domain)
     }
 
     #[test]
     fn remove_tmux_pane_state_entries_removes_requested_ids_only() {
-        let mut remote_panes: HashMap<TmuxPaneId, Arc<Mutex<TmuxRemotePane>>> = HashMap::new();
+        let (_guard, tmux_domain) = install_tmux_domain();
         let removed_child_state = Arc::new(TmuxChildState::new());
         let retained_child_state = Arc::new(TmuxChildState::new());
         let (_read_removed, write_removed) = filedescriptor::socketpair().expect("socketpair");
         let (_read_retained, write_retained) = filedescriptor::socketpair().expect("socketpair");
-        remote_panes.insert(
+        tmux_domain.inner.remote_panes.lock().insert(
             11,
             Arc::new(Mutex::new(TmuxRemotePane {
                 local_pane_id: 101,
@@ -1431,9 +1849,18 @@ mod tests {
                 pane_height: 24,
                 pane_left: 0,
                 pane_top: 0,
+                output_state: TmuxPaneOutputState::Ready,
             })),
         );
-        remote_panes.insert(
+        let removed_gate = Arc::clone(
+            tmux_domain
+                .inner
+                .remote_panes
+                .lock()
+                .get(&11)
+                .expect("removed pane gate"),
+        );
+        tmux_domain.inner.remote_panes.lock().insert(
             22,
             Arc::new(Mutex::new(TmuxRemotePane {
                 local_pane_id: 202,
@@ -1448,26 +1875,51 @@ mod tests {
                 pane_height: 24,
                 pane_left: 0,
                 pane_top: 0,
+                output_state: TmuxPaneOutputState::Ready,
             })),
         );
 
-        let mut backlog: HashMap<TmuxPaneId, Vec<u8>> = HashMap::new();
-        backlog.insert(11, b"pane-11".to_vec());
-        backlog.insert(22, b"pane-22".to_vec());
-        backlog.insert(33, b"pane-33".to_vec());
+        let limits = crate::tmux::TmuxBacklogLimits::new(32, 128, 8);
+        {
+            let mut backlog = tmux_domain.inner.backlog.lock();
+            backlog.append_with_limits(11, b"pane-11", limits);
+            backlog.append_with_limits(22, b"pane-22", limits);
+            backlog.append_with_limits(33, b"pane-33", limits);
+        }
 
-        let removed_local_ids = TmuxDomainState::remove_tmux_pane_state_entries(
-            &mut remote_panes,
-            &mut backlog,
-            &[11, 33],
-        );
+        let removed_local_ids = tmux_domain
+            .inner
+            .retire_tmux_pane_state_entries(&[11, 33])
+            .expect("retire requested panes");
 
         assert_eq!(removed_local_ids, vec![101]);
+        let remote_panes = tmux_domain.inner.remote_panes.lock();
         assert!(!remote_panes.contains_key(&11));
         assert!(remote_panes.contains_key(&22));
-        assert!(!backlog.contains_key(&11));
-        assert!(backlog.contains_key(&22));
-        assert!(!backlog.contains_key(&33));
+        drop(remote_panes);
+        let backlog = tmux_domain.inner.backlog.lock();
+        assert!(!backlog.contains(11));
+        assert!(backlog.contains(22));
+        assert!(!backlog.contains(33));
+        drop(backlog);
+        let retired_panes = tmux_domain.inner.retired_panes.lock();
+        assert!(retired_panes.contains(&11));
+        assert!(retired_panes.contains(&33));
+        assert!(!retired_panes.contains(&22));
+        drop(retired_panes);
+        assert_eq!(
+            removed_gate.lock().output_state,
+            TmuxPaneOutputState::Retired,
+            "a producer that cloned the pane gate before removal must observe retirement"
+        );
+        tmux_domain.inner.advance(Box::new(vec![Event::Output {
+            pane: 11,
+            text: b"late".to_vec(),
+        }]));
+        assert!(
+            !tmux_domain.inner.backlog.lock().contains(11),
+            "late output for a tombstoned pane must not resurrect its backlog"
+        );
         assert_eq!(
             removed_child_state
                 .try_wait()
@@ -1475,6 +1927,148 @@ mod tests {
             Some(0)
         );
         assert!(retained_child_state.try_wait().is_none());
+    }
+
+    #[test]
+    fn fresh_split_commit_preserves_prepublication_then_live_order() {
+        use std::io::Read as _;
+
+        let (_guard, tmux_domain) = install_tmux_domain();
+        let (mut output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
+        tmux_domain.inner.remote_panes.lock().insert(
+            31,
+            Arc::new(Mutex::new(TmuxRemotePane {
+                local_pane_id: 131,
+                output_write,
+                child_state: Arc::new(TmuxChildState::new()),
+                session_id: 1,
+                window_id: 2,
+                pane_id: 31,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+                output_state: TmuxPaneOutputState::Fresh,
+            })),
+        );
+        {
+            let mut backlog = tmux_domain.inner.backlog.lock();
+            let limits = crate::tmux::TmuxBacklogLimits::new(32, 128, 8);
+            backlog.append_with_limits(31, b"A", limits);
+            backlog.append_with_limits(31, b"B", limits);
+        }
+
+        tmux_domain
+            .inner
+            .finish_fresh_split(31)
+            .expect("commit complete split stream");
+        tmux_domain.inner.advance(Box::new(vec![Event::Output {
+            pane: 31,
+            text: b"C".to_vec(),
+        }]));
+
+        let mut observed = [0_u8; 3];
+        output_read
+            .read_exact(&mut observed)
+            .expect("read committed and live output");
+        assert_eq!(&observed, b"ABC");
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_panes
+                .lock()
+                .get(&31)
+                .expect("split pane")
+                .lock()
+                .output_state,
+            TmuxPaneOutputState::Ready
+        );
+        assert!(!tmux_domain.inner.backlog.lock().contains(31));
+    }
+
+    #[test]
+    fn gapped_fresh_split_never_becomes_ready() {
+        let (_guard, tmux_domain) = install_tmux_domain();
+        let (_output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
+        tmux_domain.inner.remote_panes.lock().insert(
+            32,
+            Arc::new(Mutex::new(TmuxRemotePane {
+                local_pane_id: 132,
+                output_write,
+                child_state: Arc::new(TmuxChildState::new()),
+                session_id: 1,
+                window_id: 2,
+                pane_id: 32,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+                output_state: TmuxPaneOutputState::Fresh,
+            })),
+        );
+        tmux_domain.inner.backlog.lock().append_with_limits(
+            32,
+            b"AB",
+            crate::tmux::TmuxBacklogLimits::new(1, 8, 8),
+        );
+
+        assert!(tmux_domain.inner.finish_fresh_split(32).is_err());
+        assert_eq!(
+            tmux_domain
+                .inner
+                .remote_panes
+                .lock()
+                .get(&32)
+                .expect("split pane")
+                .lock()
+                .output_state,
+            TmuxPaneOutputState::Fresh,
+            "a gapped stream must never be published Ready"
+        );
+    }
+
+    #[test]
+    fn local_mirror_publication_failure_fences_remote_children_and_terminalizes() {
+        let (_guard, tmux_domain) = install_tmux_domain();
+        let child_state = Arc::new(TmuxChildState::new());
+        let (_output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
+        tmux_domain.inner.remote_panes.lock().insert(
+            41,
+            Arc::new(Mutex::new(TmuxRemotePane {
+                local_pane_id: 141,
+                output_write,
+                child_state: Arc::clone(&child_state),
+                session_id: 1,
+                window_id: 2,
+                pane_id: 41,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+                output_state: TmuxPaneOutputState::Ready,
+            })),
+        );
+
+        let err = tmux_domain
+            .inner
+            .fail_local_mirror_publication(anyhow!("duplicate local PaneId"));
+
+        assert_eq!(err.to_string(), "duplicate local PaneId");
+        assert!(tmux_domain.inner.is_terminal());
+        assert!(
+            child_state.try_wait().is_some(),
+            "local rollback must prevent LocalPane::drop from sending kill-pane"
+        );
+        assert!(
+            tmux_domain.inner.remote_panes.lock().is_empty(),
+            "terminal cleanup must remove the partial remote-pane mirror"
+        );
     }
 
     #[test]
@@ -1515,6 +2109,28 @@ mod tests {
     #[test]
     fn parse_sigil_number_rejects_unknown_prefix() {
         assert!(parse_sigil_number("x42").is_err());
+    }
+
+    #[test]
+    fn split_pane_identity_requires_one_exact_percent_id() {
+        assert_eq!(parse_split_pane_identity("\n  %42  \n").unwrap(), 42);
+        for malformed in [
+            "",
+            "$42",
+            "@42",
+            "%",
+            "%+42",
+            "%-1",
+            "%42 suffix",
+            "%42\n%43",
+            "%18446744073709551616",
+        ] {
+            assert!(
+                parse_split_pane_identity(malformed).is_err(),
+                "malformed split identity {:?} must fail closed",
+                malformed
+            );
+        }
     }
 
     #[test]
@@ -1590,6 +2206,113 @@ mod tests {
     }
 
     #[test]
+    fn send_keys_merge_appends_same_pane_bytes_in_order() {
+        let mut older = SendKeys {
+            keys: vec![0x01, 0x02],
+            pane: 7,
+        };
+        let newer = SendKeys {
+            keys: vec![0x03, 0x04],
+            pane: 7,
+        };
+
+        assert!(older.try_merge_newer(&newer));
+        assert_eq!(older.keys, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn send_keys_merge_rejects_pane_and_command_type_mismatches() {
+        let mut older = SendKeys {
+            keys: vec![0x01, 0x02],
+            pane: 7,
+        };
+        let different_pane = SendKeys {
+            keys: vec![0x03, 0x04],
+            pane: 8,
+        };
+
+        assert!(!older.try_merge_newer(&different_pane));
+        assert!(!older.try_merge_newer(&ListCommands));
+        assert_eq!(older.keys, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn send_keys_merge_accepts_exact_limit_and_rejects_overflow() {
+        let mut older = SendKeys {
+            keys: vec![0x01; SEND_KEYS_MERGE_MAX_BYTES - 1],
+            pane: 7,
+        };
+        let at_limit = SendKeys {
+            keys: vec![0x02],
+            pane: 7,
+        };
+        let over_limit = SendKeys {
+            keys: vec![0x03],
+            pane: 7,
+        };
+
+        assert!(older.try_merge_newer(&at_limit));
+        assert_eq!(older.keys.len(), SEND_KEYS_MERGE_MAX_BYTES);
+        assert!(!older.try_merge_newer(&over_limit));
+        assert_eq!(older.keys.len(), SEND_KEYS_MERGE_MAX_BYTES);
+        assert_eq!(older.keys.last(), Some(&0x02));
+    }
+
+    #[test]
+    fn resize_merge_uses_latest_same_pane_size() {
+        let original = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 8,
+            pixel_height: 16,
+        };
+        let latest = PtySize {
+            rows: 60,
+            cols: 180,
+            pixel_width: 10,
+            pixel_height: 20,
+        };
+        let mut older = Resize {
+            pane_id: 7,
+            size: original,
+        };
+        let newer = Resize {
+            pane_id: 7,
+            size: latest,
+        };
+
+        assert!(older.try_merge_newer(&newer));
+        assert_eq!(older.size, latest);
+    }
+
+    #[test]
+    fn resize_merge_rejects_pane_and_command_type_mismatches() {
+        let original = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 8,
+            pixel_height: 16,
+        };
+        let mut older = Resize {
+            pane_id: 7,
+            size: original,
+        };
+        let different_pane = Resize {
+            pane_id: 8,
+            size: PtySize {
+                rows: 60,
+                cols: 180,
+                pixel_width: 10,
+                pixel_height: 20,
+            },
+        };
+
+        assert!(!older.try_merge_newer(&different_pane));
+        assert!(!older.try_merge_newer(&ListCommands));
+        assert_eq!(older.size, original);
+    }
+
+    #[test]
     fn capture_pane_get_command_includes_pane_id_and_history() {
         let cmd = CapturePane {
             pane_id: 12,
@@ -1658,8 +2381,12 @@ mod tests {
         let cmd = SplitPane {
             pane_id: 5,
             direction: SplitDirection::Horizontal,
+            request_id: 1,
         };
-        assert_eq!(cmd.get_command(0), "split-window -h -t %5\n");
+        assert_eq!(
+            cmd.get_command(0),
+            "split-window -P -F '#{pane_id}' -h -t %5\n"
+        );
     }
 
     #[test]
@@ -1667,8 +2394,12 @@ mod tests {
         let cmd = SplitPane {
             pane_id: 9,
             direction: SplitDirection::Vertical,
+            request_id: 2,
         };
-        assert_eq!(cmd.get_command(0), "split-window -v -t %9\n");
+        assert_eq!(
+            cmd.get_command(0),
+            "split-window -P -F '#{pane_id}' -v -t %9\n"
+        );
     }
 
     #[test]

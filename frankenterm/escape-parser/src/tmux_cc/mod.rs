@@ -959,12 +959,27 @@ impl Parser {
                     .begun
                     .as_mut()
                     .ok_or_else(|| format_err!("missing begun"))?;
-                if begun.output.len() + line.len() + 1 > MAX_GUARDED_OUTPUT_LEN {
+                if begun.error {
+                    // A prior overflow converted this guarded response into a
+                    // bounded terminal error. Discard its remaining payload
+                    // until the matching %end/%error closes the command.
+                } else if begun
+                    .output
+                    .len()
+                    .checked_add(line.len())
+                    .and_then(|len| len.checked_add(1))
+                    .is_none_or(|len| len > MAX_GUARDED_OUTPUT_LEN)
+                {
                     log::warn!(
-                        "tmux CC guarded output exceeded {} byte cap, discarding block",
+                        "tmux CC guarded output exceeded {} byte cap; retaining a bounded error \
+                         until the closing guard",
                         MAX_GUARDED_OUTPUT_LEN
                     );
-                    self.begun.take();
+                    begun.error = true;
+                    begun.output.clear();
+                    begun.output.push_str(
+                        "tmux control response exceeded the bounded guarded-output limit",
+                    );
                 } else {
                     begun.output.push_str(line);
                     begun.output.push('\n');
@@ -1310,6 +1325,32 @@ here
                 Event::SubscriptionChanged,
             ],
             events
+        );
+    }
+
+    #[test]
+    fn oversized_guarded_response_completes_as_bounded_error() {
+        let chunk = "x".repeat(MAX_GUARDED_OUTPUT_LEN / 2);
+        let input =
+            format!("%begin 1604279270 310 0\n{chunk}\n{chunk}\n{chunk}\n%end 1604279270 310 0\n");
+
+        let mut parser = Parser::new();
+        let events = parser
+            .advance_bytes(input.as_bytes())
+            .expect("oversized guarded response should remain parseable");
+
+        assert_eq!(events.len(), 1);
+        let Event::Guarded(guarded) = &events[0] else {
+            panic!("expected one bounded guarded error, got {:?}", events[0]);
+        };
+        assert!(guarded.error);
+        assert!(
+            guarded.output.contains("exceeded"),
+            "the synthetic response should explain the bounded failure",
+        );
+        assert!(
+            guarded.output.len() < 128,
+            "overflow error must not retain the oversized response",
         );
     }
 

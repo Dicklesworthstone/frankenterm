@@ -6,6 +6,10 @@
 
 use base64::Engine as _;
 use frankenterm_core::native_events::{WireEvent, WirePaneState};
+use frankenterm_gui::{
+    terminal_pane_id_to_u64, terminal_u16_from_usize, terminal_u32_from_stable_delta,
+    terminal_u32_from_usize,
+};
 use mux::pane::{CachePolicy, PaneId};
 use mux::{Mux, MuxNotification};
 use std::io::Write;
@@ -32,7 +36,9 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// A mux-to-wire event that's ready to serialize.
@@ -164,18 +170,37 @@ impl NativeEventBridge {
             log::warn!(
                 "Native event bridge: mux singleton unavailable, running without native events"
             );
+            shutdown.store(true, Ordering::Release);
+            drop(tx);
+            if sender_thread.join().is_err() {
+                log::warn!("Native event bridge: sender thread panicked during shutdown");
+            }
             return None;
         };
         let subscription_id = {
             let tx_clone = tx.clone();
             let shutdown_for_subscription = shutdown.clone();
-            mux.subscribe(move |notification| {
+            match mux.subscribe(move |notification| {
                 if shutdown_for_subscription.load(Ordering::Acquire) {
                     return false;
                 }
                 handle_mux_notification(&notification, &tx_clone);
                 true // keep listening
-            })
+            }) {
+                Ok(subscription_id) => subscription_id,
+                Err(err) => {
+                    log::warn!(
+                        "Native event bridge: failed to allocate mux subscription ({err}), \
+                         running without native events"
+                    );
+                    shutdown.store(true, Ordering::Release);
+                    drop(tx);
+                    if sender_thread.join().is_err() {
+                        log::warn!("Native event bridge: sender thread panicked during shutdown");
+                    }
+                    return None;
+                }
+            }
         };
 
         Some(Self {
@@ -341,14 +366,14 @@ fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSe
                 ("unknown".to_string(), None)
             };
             Some(BridgeEvent::PaneCreated {
-                pane_id: *pane_id as u64,
+                pane_id: terminal_pane_id_to_u64(*pane_id),
                 domain,
                 cwd,
             })
         }
 
         MuxNotification::PaneRemoved(pane_id) => Some(BridgeEvent::PaneDestroyed {
-            pane_id: *pane_id as u64,
+            pane_id: terminal_pane_id_to_u64(*pane_id),
         }),
 
         MuxNotification::TabTitleChanged { tab_id, .. } => {
@@ -373,7 +398,7 @@ fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSe
             pane_id,
             alert: wezterm_term::Alert::SetUserVar { name, value },
         } => Some(BridgeEvent::UserVar {
-            pane_id: *pane_id as u64,
+            pane_id: terminal_pane_id_to_u64(*pane_id),
             name: name.clone(),
             value: value.clone(),
         }),
@@ -395,14 +420,14 @@ fn build_state_change_event(pane_id: PaneId) -> Option<BridgeEvent> {
     let cursor = pane.get_cursor_position();
 
     Some(BridgeEvent::StateChange {
-        pane_id: pane_id as u64,
+        pane_id: terminal_pane_id_to_u64(pane_id),
         state: WirePaneState {
             title: pane.get_title(),
-            rows: dims.viewport_rows as u16,
-            cols: dims.cols as u16,
+            rows: terminal_u16_from_usize(dims.viewport_rows),
+            cols: terminal_u16_from_usize(dims.cols),
             is_alt_screen: pane.is_alt_screen_active(),
-            cursor_row: cursor.y as u32,
-            cursor_col: cursor.x as u32,
+            cursor_row: terminal_u32_from_stable_delta(cursor.y),
+            cursor_col: terminal_u32_from_usize(cursor.x),
         },
     })
 }
@@ -489,7 +514,9 @@ mod tests {
             exited_flag.store(true, Ordering::Release);
         });
 
-        let subscription_id = mux.subscribe(|_| true);
+        let subscription_id = mux
+            .subscribe(|_| true)
+            .expect("test mux subscription should allocate an identifier");
         let bridge = NativeEventBridge {
             shutdown,
             sender_thread: Some(sender_thread),
@@ -515,7 +542,9 @@ mod tests {
         let _mux_guard = TestMuxGuard::install(original_mux.clone());
         let replacement_mux = Arc::new(Mux::new(None));
 
-        let subscription_id = original_mux.subscribe(|_| true);
+        let subscription_id = original_mux
+            .subscribe(|_| true)
+            .expect("test mux subscription should allocate an identifier");
         let bridge = NativeEventBridge {
             shutdown: Arc::new(AtomicBool::new(false)),
             sender_thread: None,

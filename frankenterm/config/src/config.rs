@@ -565,6 +565,16 @@ pub struct Config {
     #[dynamic(default = "default_mux_tmux_max_backlog_bytes_per_pane")]
     pub mux_tmux_max_backlog_bytes_per_pane: usize,
 
+    /// Maximum aggregate payload retained for tmux panes whose local mirrors
+    /// have not materialized yet. Default: 32MB (33554432).
+    #[dynamic(default = "default_mux_tmux_max_backlog_bytes")]
+    pub mux_tmux_max_backlog_bytes: usize,
+
+    /// Maximum number of not-yet-materialized tmux pane identities with
+    /// retained output. Default: 1024.
+    #[dynamic(default = "default_mux_tmux_max_backlog_entries")]
+    pub mux_tmux_max_backlog_entries: usize,
+
     /// Number of panes in a tab above which resize operations are
     /// parallelized. Default: 8.
     #[dynamic(default = "default_resize_fanout_parallel_threshold")]
@@ -2057,6 +2067,14 @@ fn default_mux_max_synchronized_output_bytes() -> usize {
 
 fn default_mux_tmux_max_backlog_bytes_per_pane() -> usize {
     1_048_576
+}
+
+fn default_mux_tmux_max_backlog_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_mux_tmux_max_backlog_entries() -> usize {
+    1024
 }
 
 fn default_ssh_initial_poll_delay_ms() -> u64 {

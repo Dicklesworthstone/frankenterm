@@ -193,7 +193,8 @@ pub async fn spawn_command_internal(
 
             // Move the pane to floating position on the active tab
             if let Some(tab) = mux.get_active_tab_for_window(src_window_id) {
-                tab.add_floating_pane(Arc::clone(&pane), rect);
+                tab.add_floating_pane(Arc::clone(&pane), rect)
+                    .context("add_floating_pane")?;
                 log::info!(
                     "Created floating pane {} at ({}, {})",
                     pane.pane_id(),

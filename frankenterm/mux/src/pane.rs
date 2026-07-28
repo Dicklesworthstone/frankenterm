@@ -1,9 +1,9 @@
-use crate::ExitBehavior;
 use crate::domain::DomainId;
 use crate::renderable::*;
+use crate::ExitBehavior;
 use async_trait::async_trait;
 use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
-use downcast_rs::{Downcast, impl_downcast};
+use downcast_rs::{impl_downcast, Downcast};
 use frankenterm_dynamic::Value;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
@@ -25,8 +25,12 @@ use url::Url;
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type PaneId = usize;
 
-pub fn alloc_pane_id() -> PaneId {
-    crate::next_saturating_usize_id(&PANE_ID)
+pub fn reserve_pane_ids(count: usize) -> Result<std::ops::Range<PaneId>, crate::IdAllocationError> {
+    crate::try_reserve_usize_ids(&PANE_ID, count, "pane")
+}
+
+pub fn alloc_pane_id() -> Result<PaneId, crate::IdAllocationError> {
+    reserve_pane_ids(1).map(|reserved| reserved.start)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -992,10 +996,9 @@ mod test {
         assert!(pane.get_changed_since(0..10, SEQ_ZERO).is_empty());
         assert_eq!(pane.get_title(), "fake-pane");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(
-            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-                .is_ok()
-        );
+        assert!(pane
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_ok());
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());

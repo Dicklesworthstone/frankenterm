@@ -1,5 +1,5 @@
 use crate::domain::DomainId;
-use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
+use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{Mux, MuxNotification, WindowId};
@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::sync::Arc;
 use url::Url;
 
@@ -637,21 +638,21 @@ fn build_from_pane_tree<F>(
     active: &mut Option<Arc<dyn Pane>>,
     zoomed: &mut Option<Arc<dyn Pane>>,
     make_pane: &mut F,
-) -> Tree
+) -> anyhow::Result<Tree>
 where
-    F: FnMut(PaneEntry) -> Arc<dyn Pane>,
+    F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
 {
-    match tree {
+    Ok(match tree {
         bintree::Tree::Empty => Tree::Empty,
         bintree::Tree::Node { left, right, data } => Tree::Node {
-            left: Box::new(build_from_pane_tree(*left, active, zoomed, make_pane)),
-            right: Box::new(build_from_pane_tree(*right, active, zoomed, make_pane)),
+            left: Box::new(build_from_pane_tree(*left, active, zoomed, make_pane)?),
+            right: Box::new(build_from_pane_tree(*right, active, zoomed, make_pane)?),
             data,
         },
         bintree::Tree::Leaf(entry) => {
             let is_zoomed_pane = entry.is_zoomed_pane;
             let is_active_pane = entry.is_active_pane;
-            let pane = make_pane(entry);
+            let pane = make_pane(entry)?;
             if is_zoomed_pane {
                 zoomed.replace(Arc::clone(&pane));
             }
@@ -660,7 +661,7 @@ where
             }
             Tree::Leaf(pane)
         }
-    }
+    })
 }
 
 /// Computes the minimum (x, y) size based on the panes in this portion
@@ -1598,9 +1599,14 @@ impl Tab {
     /// PaneEntry, or to create a new Pane from that entry.
     /// make_pane is expected to add the pane to the mux if it creates
     /// a new pane, otherwise the pane won't poll/update in the GUI.
-    pub fn sync_with_pane_tree<F>(&self, size: TerminalSize, root: PaneNode, make_pane: F)
+    pub fn sync_with_pane_tree<F>(
+        &self,
+        size: TerminalSize,
+        root: PaneNode,
+        make_pane: F,
+    ) -> anyhow::Result<()>
     where
-        F: FnMut(PaneEntry) -> Arc<dyn Pane>,
+        F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
     {
         self.inner.lock().sync_with_pane_tree(size, root, make_pane)
     }
@@ -1635,11 +1641,17 @@ impl Tab {
         self.inner.lock().iter_panes_ignoring_zoom()
     }
 
+    /// Returns every logical pane owned by this tab exactly once, including
+    /// hidden stack members and floating panes.
+    pub fn iter_all_panes(&self) -> Vec<Arc<dyn Pane>> {
+        self.inner.lock().all_logical_panes()
+    }
+
     pub fn add_floating_pane(
         &self,
         pane: Arc<dyn Pane>,
         rect: FloatingPaneRect,
-    ) -> PositionedFloatingPane {
+    ) -> anyhow::Result<PositionedFloatingPane> {
         self.inner.lock().add_floating_pane(pane, rect)
     }
 
@@ -1680,26 +1692,11 @@ impl Tab {
     }
 
     pub fn has_panes_in_domain(&self, domain_id: DomainId) -> bool {
-        self.iter_panes_ignoring_zoom()
-            .iter()
-            .any(|pane| pane.pane.domain_id() == domain_id)
-            || self
-                .iter_floating_panes()
-                .iter()
-                .any(|pane| pane.pane.domain_id() == domain_id)
+        self.inner.lock().has_panes_in_domain(domain_id)
     }
 
     pub fn domain_id_for_pane(&self, pane_id: PaneId) -> Option<DomainId> {
-        self.iter_panes_ignoring_zoom()
-            .iter()
-            .find(|pane| pane.pane.pane_id() == pane_id)
-            .map(|pane| pane.pane.domain_id())
-            .or_else(|| {
-                self.iter_floating_panes()
-                    .iter()
-                    .find(|pane| pane.pane.pane_id() == pane_id)
-                    .map(|pane| pane.pane.domain_id())
-            })
+        self.inner.lock().domain_id_for_pane(pane_id)
     }
 
     pub fn has_floating_pane(&self, pane_id: PaneId) -> bool {
@@ -1993,16 +1990,21 @@ impl TabInner {
         }
     }
 
-    fn sync_with_pane_tree<F>(&mut self, size: TerminalSize, root: PaneNode, mut make_pane: F)
+    fn sync_with_pane_tree<F>(
+        &mut self,
+        size: TerminalSize,
+        root: PaneNode,
+        mut make_pane: F,
+    ) -> anyhow::Result<()>
     where
-        F: FnMut(PaneEntry) -> Arc<dyn Pane>,
+        F: FnMut(PaneEntry) -> anyhow::Result<Arc<dyn Pane>>,
     {
         let mut active = None;
         let mut zoomed = None;
 
         log::debug!("sync_with_pane_tree with size {:?}", size);
 
-        let t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane);
+        let t = build_from_pane_tree(root.into_tree(), &mut active, &mut zoomed, &mut make_pane)?;
         let mut cursor = t.cursor();
 
         self.active = 0;
@@ -2032,6 +2034,7 @@ impl TabInner {
         self.pane.replace(cursor.tree());
         self.floating_panes.clear();
         self.floating_focus = None;
+        self.pane_stacks.clear();
         self.zoomed = zoomed;
         self.size = size;
 
@@ -2044,6 +2047,7 @@ impl TabInner {
             self.iter_panes()
         );
         assert!(self.pane.is_some());
+        Ok(())
     }
 
     fn codec_pane_tree(&mut self) -> PaneNode {
@@ -2092,18 +2096,25 @@ impl TabInner {
     /// Returns a count of how many panes are in this tab
     fn count_panes(&mut self) -> usize {
         let floating_count = self.count_floating_panes();
-        let mut count = 0;
+        let hidden_stack_count = self
+            .pane_stacks
+            .values()
+            .map(|stack| stack.len().saturating_sub(1))
+            .fold(0usize, usize::saturating_add);
+        let mut count: usize = 0;
         let mut cursor = self.pane.take().unwrap().cursor();
 
         loop {
             if cursor.is_leaf() {
-                count += 1;
+                count = count.saturating_add(1);
             }
             match cursor.preorder_next() {
                 Ok(c) => cursor = c,
                 Err(c) => {
                     self.pane.replace(c.tree());
-                    return count + floating_count;
+                    return count
+                        .saturating_add(hidden_stack_count)
+                        .saturating_add(floating_count);
                 }
             }
         }
@@ -2156,10 +2167,71 @@ impl TabInner {
             None => false,
         };
         in_tree
+            || self.pane_stacks.values().any(|stack| {
+                stack
+                    .panes()
+                    .iter()
+                    .any(|stacked| stacked.pane_id() == pane)
+            })
             || self
                 .floating_panes
                 .iter()
                 .any(|floating| floating.pane.pane_id() == pane)
+    }
+
+    fn has_panes_in_domain(&self, domain_id: DomainId) -> bool {
+        fn tree_has_domain(tree: &Tree, domain_id: DomainId) -> bool {
+            match tree {
+                Tree::Empty => false,
+                Tree::Node { left, right, .. } => {
+                    tree_has_domain(left, domain_id) || tree_has_domain(right, domain_id)
+                }
+                Tree::Leaf(pane) => pane.domain_id() == domain_id,
+            }
+        }
+
+        self.pane
+            .as_ref()
+            .is_some_and(|tree| tree_has_domain(tree, domain_id))
+            || self.pane_stacks.values().any(|stack| {
+                stack
+                    .panes()
+                    .iter()
+                    .any(|pane| pane.domain_id() == domain_id)
+            })
+            || self
+                .floating_panes
+                .iter()
+                .any(|floating| floating.pane.domain_id() == domain_id)
+    }
+
+    fn domain_id_for_pane(&self, pane_id: PaneId) -> Option<DomainId> {
+        fn find_in_tree(tree: &Tree, pane_id: PaneId) -> Option<DomainId> {
+            match tree {
+                Tree::Empty => None,
+                Tree::Node { left, right, .. } => {
+                    find_in_tree(left, pane_id).or_else(|| find_in_tree(right, pane_id))
+                }
+                Tree::Leaf(pane) => (pane.pane_id() == pane_id).then(|| pane.domain_id()),
+            }
+        }
+
+        self.floating_panes
+            .iter()
+            .find(|floating| floating.pane.pane_id() == pane_id)
+            .map(|floating| floating.pane.domain_id())
+            .or_else(|| {
+                self.pane_stacks
+                    .values()
+                    .flat_map(|stack| stack.panes())
+                    .find(|pane| pane.pane_id() == pane_id)
+                    .map(|pane| pane.domain_id())
+            })
+            .or_else(|| {
+                self.pane
+                    .as_ref()
+                    .and_then(|tree| find_in_tree(tree, pane_id))
+            })
     }
 
     fn clamp_floating_rect(&self, rect: FloatingPaneRect) -> FloatingPaneRect {
@@ -2198,13 +2270,27 @@ impl TabInner {
             .position(|floating| floating.pane.pane_id() == pane_id)
     }
 
-    fn next_floating_z_order(&self) -> u32 {
-        self.floating_panes
+    fn next_floating_z_order(&mut self) -> u32 {
+        let max = self
+            .floating_panes
             .iter()
             .map(|floating| floating.z_order)
             .max()
-            .unwrap_or(0)
-            .saturating_add(1)
+            .unwrap_or(0);
+        if max != u32::MAX {
+            return max + 1;
+        }
+
+        // Long-lived sessions can raise panes often enough to exhaust the
+        // semantic lane counter even with only a handful of live panes.
+        // Preserve the current total order while compacting it back to a
+        // dense range, then allocate the next unique top lane.
+        let mut order: Vec<usize> = (0..self.floating_panes.len()).collect();
+        order.sort_by_key(|index| (self.floating_panes[*index].z_order, *index));
+        for (lane, index) in order.into_iter().enumerate() {
+            self.floating_panes[index].z_order = u32::try_from(lane).unwrap_or(u32::MAX);
+        }
+        u32::try_from(self.floating_panes.len()).unwrap_or(u32::MAX)
     }
 
     fn positioned_floating_pane(&self, floating: &FloatingPane) -> PositionedFloatingPane {
@@ -2227,16 +2313,23 @@ impl TabInner {
         &mut self,
         pane: Arc<dyn Pane>,
         rect: FloatingPaneRect,
-    ) -> PositionedFloatingPane {
+    ) -> anyhow::Result<PositionedFloatingPane> {
         let prior = self.get_active_pane();
         let rect = self.clamp_floating_rect(rect);
         let pane_id = pane.pane_id();
+        if self.contains_pane(pane_id) {
+            return Err(anyhow::anyhow!(
+                "pane {pane_id} is already present in tab {}; floating panes require a detached pane",
+                self.id
+            ));
+        }
         pane.resize(self.floating_pane_size(rect)).ok();
+        let z_order = self.next_floating_z_order();
 
         let floating = FloatingPane {
             pane: Arc::clone(&pane),
             rect,
-            z_order: self.next_floating_z_order(),
+            z_order,
             visible: true,
             pinned: false,
             opacity: 1.0,
@@ -2245,7 +2338,7 @@ impl TabInner {
         self.floating_focus = Some(pane_id);
 
         self.advise_focus_change(prior);
-        self.positioned_floating_pane(self.floating_panes.last().expect("floating pane added"))
+        Ok(self.positioned_floating_pane(self.floating_panes.last().expect("floating pane added")))
     }
 
     fn set_floating_pane_rect(
@@ -2415,6 +2508,106 @@ impl TabInner {
         removed
     }
 
+    /// Remove the visible member of a stack while preserving the invariant
+    /// that the stack's active pane is represented by the corresponding tree
+    /// leaf.
+    ///
+    /// `None` means that the slot is not a stack whose active pane matches
+    /// `pane_id`. `Some(None)` means that the removed pane was the stack's last
+    /// member and the caller must remove the tree leaf. `Some(Some(pane))`
+    /// supplies the survivor that must replace the removed tree leaf.
+    fn remove_visible_stacked_pane(
+        &mut self,
+        slot_index: usize,
+        pane_id: PaneId,
+    ) -> Option<Option<Arc<dyn Pane>>> {
+        let stack = self.pane_stacks.get_mut(&slot_index)?;
+        if stack.active_pane().pane_id() != pane_id {
+            return None;
+        }
+
+        stack.remove(pane_id)?;
+        if stack.is_empty() {
+            self.pane_stacks.remove(&slot_index);
+            Some(None)
+        } else {
+            Some(Some(Arc::clone(stack.active_pane())))
+        }
+    }
+
+    /// Re-key stacks after a tree mutation or rotation. Stack slot indices are
+    /// topological leaf indices, so the authoritative association is the
+    /// active pane that is also present in the tree.
+    fn reindex_pane_stacks_from_tree(&mut self) {
+        fn collect_leaf_indices(
+            tree: &Tree,
+            next_index: &mut usize,
+            indices: &mut HashMap<PaneId, usize>,
+        ) {
+            match tree {
+                Tree::Empty => {}
+                Tree::Node { left, right, .. } => {
+                    collect_leaf_indices(left, next_index, indices);
+                    collect_leaf_indices(right, next_index, indices);
+                }
+                Tree::Leaf(pane) => {
+                    indices.insert(pane.pane_id(), *next_index);
+                    *next_index = next_index.saturating_add(1);
+                }
+            }
+        }
+
+        if self.pane_stacks.is_empty() {
+            return;
+        }
+        let Some(tree) = self.pane.as_ref() else {
+            log::error!(
+                "tab {} has {} pane stacks but no pane tree",
+                self.id,
+                self.pane_stacks.len()
+            );
+            return;
+        };
+
+        let mut next_index = 0usize;
+        let mut leaf_indices = HashMap::new();
+        collect_leaf_indices(tree, &mut next_index, &mut leaf_indices);
+
+        let mut targets = Vec::with_capacity(self.pane_stacks.len());
+        let mut occupied = HashSet::with_capacity(self.pane_stacks.len());
+        for (old_index, stack) in &self.pane_stacks {
+            let active_id = stack.active_pane().pane_id();
+            let Some(new_index) = leaf_indices.get(&active_id).copied() else {
+                log::error!(
+                    "tab {} stack slot {} has active pane {} without a representative tree leaf",
+                    self.id,
+                    old_index,
+                    active_id
+                );
+                return;
+            };
+            if !occupied.insert(new_index) {
+                log::error!(
+                    "tab {} has multiple pane stacks mapped to tree slot {}",
+                    self.id,
+                    new_index
+                );
+                return;
+            }
+            targets.push((*old_index, new_index));
+        }
+
+        let mut stacks = std::mem::take(&mut self.pane_stacks);
+        let mut remapped = HashMap::with_capacity(stacks.len());
+        for (old_index, new_index) in targets {
+            let stack = stacks
+                .remove(&old_index)
+                .expect("pane stack disappeared while reindexing");
+            remapped.insert(new_index, stack);
+        }
+        self.pane_stacks = remapped;
+    }
+
     fn remove_stacked_panes_if<F>(&mut self, predicate: F) -> Vec<Arc<dyn Pane>>
     where
         F: Fn(&Arc<dyn Pane>) -> bool,
@@ -2422,10 +2615,13 @@ impl TabInner {
         let mut removed = Vec::new();
         let mut empty_slots = Vec::new();
         for (slot_index, stack) in &mut self.pane_stacks {
+            let active_id = stack.active_pane().pane_id();
             let pane_ids = stack
                 .panes()
                 .iter()
-                .filter(|pane| predicate(pane))
+                // The visible member is removed by `remove_pane_if`, which can
+                // promote the surviving active member into the same tree leaf.
+                .filter(|pane| pane.pane_id() != active_id && predicate(pane))
                 .map(|pane| pane.pane_id())
                 .collect::<Vec<_>>();
             for pane_id in pane_ids {
@@ -2735,11 +2931,45 @@ impl TabInner {
                 .get(idx)
                 .map(|floating| Arc::clone(&floating.pane));
         }
+        if let Some(pane) = self
+            .pane_stacks
+            .values()
+            .flat_map(|stack| stack.panes())
+            .find(|pane| pane.pane_id() == pane_id)
+        {
+            return Some(Arc::clone(pane));
+        }
 
         self.iter_panes_ignoring_zoom()
             .into_iter()
             .find(|positioned| positioned.pane.pane_id() == pane_id)
             .map(|positioned| positioned.pane)
+    }
+
+    fn all_logical_panes(&mut self) -> Vec<Arc<dyn Pane>> {
+        let mut seen = HashSet::new();
+        let mut panes = Vec::new();
+
+        for positioned in self.iter_panes_ignoring_zoom() {
+            let pane_id = positioned.pane.pane_id();
+            if seen.insert(pane_id) {
+                panes.push(positioned.pane);
+            }
+        }
+        for stack in self.pane_stacks.values() {
+            for pane in stack.panes() {
+                if seen.insert(pane.pane_id()) {
+                    panes.push(Arc::clone(pane));
+                }
+            }
+        }
+        for floating in &self.floating_panes {
+            if seen.insert(floating.pane.pane_id()) {
+                panes.push(Arc::clone(&floating.pane));
+            }
+        }
+
+        panes
     }
 
     fn effective_pane_constraints_for(&mut self, pane_id: PaneId) -> Option<PaneConstraints> {
@@ -2834,6 +3064,7 @@ impl TabInner {
                 }
             }
         }
+        self.reindex_pane_stacks_from_tree();
     }
 
     fn rotate_clockwise(&mut self) {
@@ -2865,6 +3096,7 @@ impl TabInner {
                 }
             }
         }
+        self.reindex_pane_stacks_from_tree();
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
 
@@ -3544,7 +3776,10 @@ impl TabInner {
         let should_prune = |pane: &Arc<dyn Pane>| {
             let in_mux = mux
                 .as_ref()
-                .map(|mux| mux.get_pane(pane.pane_id()).is_some())
+                .map(|mux| {
+                    mux.get_pane(pane.pane_id())
+                        .is_some_and(|registered| Arc::ptr_eq(&registered, pane))
+                })
                 .unwrap_or(true);
             let dead = pane.is_dead();
             dead || !in_mux
@@ -3570,7 +3805,10 @@ impl TabInner {
                     // <https://github.com/wezterm/wezterm/issues/4030>
                     let in_mux = mux
                         .as_ref()
-                        .map(|mux| mux.get_pane(pane.pane_id()).is_some())
+                        .map(|mux| {
+                            mux.get_pane(pane.pane_id())
+                                .is_some_and(|registered| Arc::ptr_eq(&registered, pane))
+                        })
                         .unwrap_or(true);
                     let dead = pane.is_dead();
                     log::trace!(
@@ -3589,42 +3827,66 @@ impl TabInner {
 
     fn kill_pane(&mut self, pane_id: PaneId) -> bool {
         if self.has_floating_pane(pane_id) {
-            if self.remove_floating_pane(pane_id).is_some() {
+            if let Some(pane) = self.remove_floating_pane(pane_id) {
                 if promise::spawn::is_scheduler_configured() {
-                    promise::spawn::spawn_into_main_thread(async move {
-                        if let Some(mux) = Mux::try_get() {
-                            mux.remove_pane(pane_id);
-                        }
-                    })
-                    .detach();
+                    if let Some(mux) = Mux::try_get() {
+                        let mux = Arc::downgrade(&mux);
+                        promise::spawn::spawn_into_main_thread(async move {
+                            if let Some(mux) = mux.upgrade() {
+                                mux.remove_pane_if_same(pane_id, &pane);
+                            }
+                        })
+                        .detach();
+                    }
                 }
                 return true;
             }
             return false;
         }
-        !self
+        if !self
             .remove_pane_if(|_, pane| pane.pane_id() == pane_id, true)
             .is_empty()
+        {
+            return true;
+        }
+        if let Some(pane) = self.remove_stacked_pane(pane_id) {
+            if promise::spawn::is_scheduler_configured() {
+                if let Some(mux) = Mux::try_get() {
+                    let mux = Arc::downgrade(&mux);
+                    promise::spawn::spawn_into_main_thread(async move {
+                        if let Some(mux) = mux.upgrade() {
+                            mux.remove_pane_if_same(pane_id, &pane);
+                        }
+                    })
+                    .detach();
+                }
+            }
+            return true;
+        }
+        false
     }
 
     fn kill_panes_in_domain(&mut self, domain: DomainId) -> bool {
         let removed_floating = self.remove_floating_panes_in_domain(domain);
         let removed_stacked = self.remove_stacked_panes_if(|pane| pane.domain_id() == domain);
         if !removed_floating.is_empty() || !removed_stacked.is_empty() {
-            let ids: Vec<PaneId> = removed_floating
+            let removed: Vec<Arc<dyn Pane>> = removed_floating
                 .iter()
                 .chain(removed_stacked.iter())
-                .map(|pane| pane.pane_id())
+                .cloned()
                 .collect();
             if promise::spawn::is_scheduler_configured() {
-                promise::spawn::spawn_into_main_thread(async move {
-                    if let Some(mux) = Mux::try_get() {
-                        for pane_id in ids {
-                            mux.remove_pane(pane_id);
+                if let Some(mux) = Mux::try_get() {
+                    let mux = Arc::downgrade(&mux);
+                    promise::spawn::spawn_into_main_thread(async move {
+                        if let Some(mux) = mux.upgrade() {
+                            for pane in removed {
+                                mux.remove_pane_if_same(pane.pane_id(), &pane);
+                            }
                         }
-                    }
-                })
-                .detach();
+                    })
+                    .detach();
+                }
             }
         }
         let removed_tree = self.remove_pane_if(|_, pane| pane.domain_id() == domain, true);
@@ -3672,54 +3934,66 @@ impl TabInner {
                 if cursor.is_leaf() {
                     let pane = Arc::clone(cursor.leaf_mut().unwrap());
                     if f(pane_index, &pane) {
-                        removed_indices.push(pane_index);
                         if Some(pane.pane_id()) == zoomed_pane {
                             // If we removed the zoomed pane, un-zoom our state!
                             self.zoomed.take();
                         }
-                        let size;
-                        match cursor.unsplit_leaf() {
-                            Ok((c, dead, p)) => {
-                                dead_panes.push(dead);
-                                size = if let Some(parent) = p {
-                                    TerminalSize {
-                                        rows: parent.height(),
-                                        cols: parent.width(),
-                                        pixel_width: pixel_span(
-                                            cell_dims.pixel_width,
-                                            parent.width(),
-                                        ),
-                                        pixel_height: pixel_span(
-                                            cell_dims.pixel_height,
-                                            parent.height(),
-                                        ),
-                                        dpi: cell_dims.dpi,
+                        match self.remove_visible_stacked_pane(pane_index, pane.pane_id()) {
+                            Some(Some(replacement)) => {
+                                dead_panes.push(pane);
+                                replacement.resize(pane_size).ok();
+                                *cursor
+                                    .leaf_mut()
+                                    .expect("visible stacked pane must remain a tree leaf") =
+                                    replacement;
+                            }
+                            Some(None) | None => {
+                                removed_indices.push(pane_index);
+                                let size;
+                                match cursor.unsplit_leaf() {
+                                    Ok((c, dead, p)) => {
+                                        dead_panes.push(dead);
+                                        size = if let Some(parent) = p {
+                                            TerminalSize {
+                                                rows: parent.height(),
+                                                cols: parent.width(),
+                                                pixel_width: pixel_span(
+                                                    cell_dims.pixel_width,
+                                                    parent.width(),
+                                                ),
+                                                pixel_height: pixel_span(
+                                                    cell_dims.pixel_height,
+                                                    parent.height(),
+                                                ),
+                                                dpi: cell_dims.dpi,
+                                            }
+                                        } else {
+                                            log::warn!(
+                                                "removed pane {} from split without size metadata",
+                                                pane.pane_id()
+                                            );
+                                            pane_size
+                                        };
+                                        cursor = c;
                                     }
-                                } else {
-                                    log::warn!(
-                                        "removed pane {} from split without size metadata",
-                                        pane.pane_id()
-                                    );
-                                    pane_size
+                                    Err(c) => {
+                                        // We might be the root, for example
+                                        if c.is_top() && c.is_leaf() {
+                                            self.pane.replace(Tree::Empty);
+                                            dead_panes.push(pane);
+                                        } else {
+                                            self.pane.replace(c.tree());
+                                        }
+                                        break;
+                                    }
                                 };
-                                cursor = c;
-                            }
-                            Err(c) => {
-                                // We might be the root, for example
-                                if c.is_top() && c.is_leaf() {
-                                    self.pane.replace(Tree::Empty);
-                                    dead_panes.push(pane);
-                                } else {
-                                    self.pane.replace(c.tree());
-                                }
-                                break;
-                            }
-                        };
 
-                        if let Some(unsplit) = cursor.leaf_mut() {
-                            unsplit.resize(size).ok();
-                        } else {
-                            self.apply_pane_size(size, &mut cursor);
+                                if let Some(unsplit) = cursor.leaf_mut() {
+                                    unsplit.resize(size).ok();
+                                } else {
+                                    self.apply_pane_size(size, &mut cursor);
+                                }
+                            }
                         }
                     } else if !dead_panes.is_empty() {
                         // Apply our revised size to the tty
@@ -3746,18 +4020,22 @@ impl TabInner {
             removed_indices.retain(|&idx| idx <= active_idx);
             self.active = active_idx.saturating_sub(removed_indices.len());
         }
+        self.reindex_pane_stacks_from_tree();
 
         if !dead_panes.is_empty() && kill {
-            let to_kill: Vec<_> = dead_panes.iter().map(|p| p.pane_id()).collect();
+            let to_kill = dead_panes.clone();
             if promise::spawn::is_scheduler_configured() {
-                promise::spawn::spawn_into_main_thread(async move {
-                    if let Some(mux) = Mux::try_get() {
-                        for pane_id in to_kill.into_iter() {
-                            mux.remove_pane(pane_id);
+                if let Some(mux) = Mux::try_get() {
+                    let mux = Arc::downgrade(&mux);
+                    promise::spawn::spawn_into_main_thread(async move {
+                        if let Some(mux) = mux.upgrade() {
+                            for pane in to_kill {
+                                mux.remove_pane_if_same(pane.pane_id(), &pane);
+                            }
                         }
-                    }
-                })
-                .detach();
+                    })
+                    .detach();
+                }
             }
         }
         for pane in &dead_panes {
@@ -3769,9 +4047,8 @@ impl TabInner {
     }
 
     fn can_close_without_prompting(&mut self, reason: CloseReason) -> bool {
-        let panes = self.iter_panes_ignoring_zoom();
-        for pos in &panes {
-            if !pos.pane.can_close_without_prompting(reason) {
+        for pane in self.all_logical_panes() {
+            if !pane.can_close_without_prompting(reason) {
                 return false;
             }
         }
@@ -3781,14 +4058,9 @@ impl TabInner {
     fn is_dead(&mut self) -> bool {
         // Make sure we account for all panes, so that we don't
         // kill the whole tab if the zoomed pane is dead!
-        let panes = self.iter_panes_ignoring_zoom();
-        let mut dead_count = 0;
-        for pos in &panes {
-            if pos.pane.is_dead() {
-                dead_count += 1;
-            }
-        }
-        dead_count == panes.len()
+        self.all_logical_panes()
+            .into_iter()
+            .all(|pane| pane.is_dead())
     }
 
     fn get_active_pane(&mut self) -> Option<Arc<dyn Pane>> {
@@ -3935,6 +4207,7 @@ impl TabInner {
             let size = self.size;
             apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
         }
+        self.reindex_pane_stacks_from_tree();
 
         // And update focus
         if keep_focus {
@@ -4246,6 +4519,7 @@ impl TabInner {
 
                         self.active = pane_index;
                         self.recency.tag(pane_index);
+                        self.reindex_pane_stacks_from_tree();
                         return Ok(pane_index);
                     }
                     Err(cursor) => cursor,
@@ -4318,6 +4592,7 @@ impl TabInner {
             }
         }
 
+        self.reindex_pane_stacks_from_tree();
         log::debug!("split info after split: {:#?}", self.iter_splits());
         log::debug!("pane info after split: {:#?}", self.iter_panes());
 
@@ -4444,7 +4719,7 @@ mod test {
     use rangeset::RangeSet;
     use std::convert::TryFrom;
     use std::ops::Range;
-    use termwiz::surface::{SEQ_ZERO, SequenceNo};
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use url::Url;
 
     /// Ensure the global Mux singleton is initialized for tests that trigger
@@ -4843,10 +5118,9 @@ mod test {
         assert!(pane.get_logical_lines(0..10).is_empty());
         assert_eq!(pane.get_title(), "fake-pane-42");
         assert!(pane.send_paste("discarded").is_ok());
-        assert!(
-            pane.key_down(KeyCode::Char('x'), KeyModifiers::NONE)
-                .is_ok()
-        );
+        assert!(pane
+            .key_down(KeyCode::Char('x'), KeyModifiers::NONE)
+            .is_ok());
         assert!(pane.key_up(KeyCode::Char('x'), KeyModifiers::NONE).is_ok());
         assert!(pane.reader().unwrap().is_none());
         assert!(!pane.is_dead());
@@ -4896,16 +5170,15 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(
-            tab.compute_split_size(
+        assert!(tab
+            .compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none()
-        );
+            .is_none());
 
         let horz_size = tab
             .compute_split_size(
@@ -5089,15 +5362,17 @@ mod test {
         let tab = Tab::new(&size);
         tab.assign_pane(&FakePane::new(1, size));
 
-        let floating = tab.add_floating_pane(
-            FakePane::new(99, size),
-            FloatingPaneRect {
-                left: 78,
-                top: 23,
-                width: 1,
-                height: 1,
-            },
-        );
+        let floating = tab
+            .add_floating_pane(
+                FakePane::new(99, size),
+                FloatingPaneRect {
+                    left: 78,
+                    top: 23,
+                    width: 1,
+                    height: 1,
+                },
+            )
+            .expect("floating pane should be detached");
 
         assert_eq!(99, floating.pane_id);
         assert!(floating.is_focused);
@@ -5129,7 +5404,8 @@ mod test {
                 width: 20,
                 height: 10,
             },
-        );
+        )
+        .expect("floating pane should be detached");
 
         assert!(tab.has_panes_in_domain(1));
         assert!(tab.has_panes_in_domain(2));
@@ -5156,7 +5432,8 @@ mod test {
                 width: 20,
                 height: 10,
             },
-        );
+        )
+        .expect("floating pane should be detached");
 
         assert_eq!(tab.domain_id_for_pane(1), Some(1));
         assert_eq!(tab.domain_id_for_pane(2), Some(2));
@@ -5184,7 +5461,8 @@ mod test {
                 width: 20,
                 height: 10,
             },
-        );
+        )
+        .expect("floating pane should be detached");
         tab.add_floating_pane(
             FakePane::new(3, size),
             FloatingPaneRect {
@@ -5193,7 +5471,8 @@ mod test {
                 width: 25,
                 height: 12,
             },
-        );
+        )
+        .expect("floating pane should be detached");
 
         let panes = tab.iter_floating_panes();
         assert_eq!(2, panes.len());
@@ -5246,7 +5525,8 @@ mod test {
                 width: 30,
                 height: 8,
             },
-        );
+        )
+        .expect("floating pane should be detached");
 
         assert!(tab.contains_pane(42));
         let removed = tab
@@ -5310,6 +5590,9 @@ mod test {
 
     #[test]
     fn set_active_idx_without_mux_singleton_does_not_panic() {
+        let _mux_guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         Mux::shutdown();
         let size = TerminalSize {
             rows: 24,
@@ -5385,7 +5668,8 @@ mod test {
                     width: 20,
                     height: 10,
                 },
-            );
+            )
+            .expect("floating pane should be detached");
         }
 
         // Bring pane 10 to front (z_order only, not focus)
@@ -5411,6 +5695,44 @@ mod test {
     }
 
     #[test]
+    fn floating_pane_z_order_compacts_before_counter_exhaustion() {
+        ensure_mux_initialized();
+        let size = TerminalSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 1000,
+            pixel_height: 750,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        for id in 10..13 {
+            tab.add_floating_pane(
+                FakePane::new(id, size),
+                FloatingPaneRect {
+                    left: id,
+                    top: id,
+                    width: 20,
+                    height: 10,
+                },
+            )
+            .expect("floating pane should be detached");
+        }
+        assert!(tab.set_floating_pane_z_order(12, u32::MAX));
+
+        assert!(tab.bring_floating_pane_to_front(10));
+
+        let panes = tab.iter_floating_panes();
+        let z_orders: Vec<u32> = panes.iter().map(|pane| pane.z_order).collect();
+        let mut unique = z_orders.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), panes.len());
+        assert_eq!(panes.last().map(|pane| pane.pane_id), Some(10));
+        assert!(z_orders.iter().all(|z_order| *z_order < u32::MAX));
+    }
+
+    #[test]
     fn floating_pane_reposition_updates_geometry() {
         ensure_mux_initialized();
         let size = TerminalSize {
@@ -5431,7 +5753,8 @@ mod test {
                 width: 30,
                 height: 15,
             },
-        );
+        )
+        .expect("floating pane should be detached");
 
         let new_rect = FloatingPaneRect {
             left: 10,
@@ -5471,7 +5794,8 @@ mod test {
                 width: 30,
                 height: 15,
             },
-        );
+        )
+        .expect("floating pane should be detached");
 
         let small = TerminalSize {
             rows: 10,
@@ -6275,7 +6599,8 @@ mod test {
                         width: 20,
                         height: 10,
                     },
-                );
+                )
+                .expect("floating pane should be detached");
             }
 
             // Bring a random one to front
@@ -7316,6 +7641,157 @@ mod test {
             tab.stack_count() > 0,
             "Should have at least one stack for overflow panes"
         );
+        assert_eq!(
+            tab.count_panes(),
+            Some(3),
+            "pane accounting must include hidden stack members"
+        );
+    }
+
+    #[test]
+    fn removing_visible_stack_member_promotes_survivor_and_preserves_count() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+        tab.set_layout_cycle(default_cycle());
+        assert_eq!(tab.swap_to_layout_index(2).as_deref(), Some("stacked"));
+
+        let removed_id = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        let removed = tab
+            .remove_pane(removed_id)
+            .expect("visible stack member should be removable");
+        assert_eq!(removed.pane_id(), removed_id);
+        assert_eq!(tab.count_panes(), Some(2));
+
+        let visible_after = tab.iter_panes_ignoring_zoom();
+        assert_eq!(visible_after.len(), 1);
+        assert_ne!(visible_after[0].pane.pane_id(), removed_id);
+        assert!(!tab.contains_pane(removed_id));
+
+        let slot = tab
+            .first_nontrivial_stack_slot_index()
+            .expect("two survivors should remain stacked");
+        let cycled_id = tab.cycle_stack(slot).expect("survivor stack should cycle");
+        assert_eq!(
+            tab.iter_panes_ignoring_zoom()[slot].pane.pane_id(),
+            cycled_id
+        );
+        assert_eq!(tab.count_panes(), Some(2));
+    }
+
+    #[test]
+    fn removing_earlier_leaf_reindexes_later_stack_slot() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(4);
+        tab.set_layout_cycle(default_cycle());
+        assert_eq!(tab.swap_to_next_layout().as_deref(), Some("main-side"));
+        assert_eq!(tab.first_nontrivial_stack_slot_index(), Some(2));
+
+        let first_id = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        tab.remove_pane(first_id)
+            .expect("unstacked leading pane should be removable");
+
+        assert_eq!(tab.count_panes(), Some(3));
+        assert_eq!(tab.first_nontrivial_stack_slot_index(), Some(1));
+        let cycled_id = tab.cycle_stack(1).expect("reindexed stack should cycle");
+        assert_eq!(tab.iter_panes_ignoring_zoom()[1].pane.pane_id(), cycled_id);
+    }
+
+    #[test]
+    fn hidden_stack_members_are_members_and_cannot_be_added_as_floating() {
+        use crate::layout::default_cycle;
+
+        let (tab, size) = make_tab_with_n_panes(3);
+        tab.set_layout_cycle(default_cycle());
+        assert_eq!(tab.swap_to_layout_index(2).as_deref(), Some("stacked"));
+
+        let visible_id = tab.iter_panes_ignoring_zoom()[0].pane.pane_id();
+        let hidden_id = tab
+            .all_stacked_pane_ids()
+            .into_iter()
+            .find(|pane_id| *pane_id != visible_id)
+            .expect("stack should contain a hidden pane");
+        assert!(tab.contains_pane(hidden_id));
+        assert_eq!(tab.domain_id_for_pane(hidden_id), Some(1));
+
+        let hidden = tab
+            .inner
+            .lock()
+            .find_pane_by_id(hidden_id)
+            .expect("hidden pane should be discoverable");
+        let result = tab.add_floating_pane(
+            hidden,
+            FloatingPaneRect {
+                left: 2,
+                top: 2,
+                width: 20,
+                height: 10,
+            },
+        );
+        assert!(result.is_err());
+        assert!(tab.iter_floating_panes().is_empty());
+        assert_eq!(tab.count_panes(), Some(3));
+        assert_eq!(tab.inner.lock().size, size);
+    }
+
+    #[test]
+    fn duplicate_floating_pane_identity_is_rejected() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        let floating = FakePane::new(2, size);
+        let rect = FloatingPaneRect {
+            left: 2,
+            top: 2,
+            width: 20,
+            height: 10,
+        };
+
+        tab.add_floating_pane(Arc::clone(&floating), rect)
+            .expect("first detached insertion should succeed");
+        assert!(tab.add_floating_pane(floating, rect).is_err());
+        assert_eq!(tab.iter_floating_panes().len(), 1);
+        assert_eq!(tab.count_panes(), Some(2));
+    }
+
+    #[test]
+    fn rotating_layout_reindexes_stack_to_its_visible_member() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(4);
+        tab.set_layout_cycle(default_cycle());
+        assert_eq!(tab.swap_to_next_layout().as_deref(), Some("main-side"));
+
+        tab.rotate_clockwise();
+        let slot = tab
+            .first_nontrivial_stack_slot_index()
+            .expect("rotated layout should retain its pane stack");
+        let active_stack_id = {
+            let inner = tab.inner.lock();
+            inner
+                .pane_stacks
+                .get(&slot)
+                .expect("stack should be keyed by its rotated slot")
+                .active_pane()
+                .pane_id()
+        };
+        assert_eq!(
+            tab.iter_panes_ignoring_zoom()[slot].pane.pane_id(),
+            active_stack_id
+        );
+        let cycled_id = tab.cycle_stack(slot).expect("rotated stack should cycle");
+        assert_eq!(
+            tab.iter_panes_ignoring_zoom()[slot].pane.pane_id(),
+            cycled_id
+        );
+        assert_eq!(tab.count_panes(), Some(4));
     }
 
     #[test]
@@ -7687,7 +8163,8 @@ mod test {
                 width: 40,
                 height: 10,
             },
-        );
+        )
+        .expect("floating pane should be detached");
 
         // Verify initial state: 3 tiled + 1 floating.
         let tiled = tab.iter_panes_ignoring_zoom();
@@ -7969,7 +8446,8 @@ mod test {
                     width: 20,
                     height: 10,
                 },
-            );
+            )
+            .expect("floating pane should be detached");
         }
 
         // Last added (30) should be focused.

@@ -8,6 +8,8 @@ use std::net::TcpStream;
 #[cfg(feature = "async-asupersync")]
 use std::pin::Pin;
 #[cfg(feature = "async-asupersync")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "async-asupersync")]
 use std::sync::{Mutex, MutexGuard};
 #[cfg(feature = "async-asupersync")]
 use std::task::{Context, Poll};
@@ -41,6 +43,8 @@ pub struct AsyncSslStream {
     s: SslStream<TcpStream>,
     #[cfg(feature = "async-asupersync")]
     registration: Mutex<Option<IoRegistration>>,
+    #[cfg(feature = "async-asupersync")]
+    pending_outbound_retry: AtomicBool,
 }
 
 #[cfg(feature = "async-io")]
@@ -55,19 +59,108 @@ impl AsyncSslStream {
             s,
             #[cfg(feature = "async-asupersync")]
             registration: Mutex::new(None),
+            #[cfg(feature = "async-asupersync")]
+            pending_outbound_retry: AtomicBool::new(false),
+        }
+    }
+
+    /// Probe for decrypted TLS bytes, encrypted socket bytes, or EOF without
+    /// consuming input. This is intentionally synchronous and nonblocking so
+    /// a dispatcher can check inbound work before servicing a hot internal
+    /// queue without repeatedly allocating and discarding readiness futures.
+    pub fn try_readable_without_consuming(&self) -> std::io::Result<bool> {
+        // Callers can enter dispatch through the direct TLS path without the
+        // protocol-detection prelude that normally makes the socket
+        // nonblocking. Never let a readiness probe block an executor thread.
+        self.s.get_ref().set_nonblocking(true)?;
+        if self.s.ssl().pending() > 0 {
+            return Ok(true);
+        }
+
+        let mut probe = [0_u8; 1];
+        match self.s.get_ref().peek(&mut probe) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+            Err(err) => Err(err),
         }
     }
 
     #[cfg(feature = "async-asupersync")]
     pub async fn wait_for_readable(&self) -> std::io::Result<()> {
-        let mut armed = false;
         poll_fn(|cx| {
-            if armed {
-                return Poll::Ready(Ok(()));
+            match self.try_readable_without_consuming() {
+                Ok(true) => return Poll::Ready(Ok(())),
+                Ok(false) => {}
+                Err(err) => return Poll::Ready(Err(err)),
             }
             self.register_interest_for_read(cx)?;
+
+            // Close the probe/register race: bytes can arrive between the
+            // first peek and arming the reactor interest.
+            match self.try_readable_without_consuming() {
+                Ok(true) => Poll::Ready(Ok(())),
+                Ok(false) => Poll::Pending,
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        })
+        .await
+    }
+
+    /// Wait until either inbound data or outbound capacity may be available.
+    ///
+    /// A single combined registration is required because this wrapper owns
+    /// one reactor registration slot. Racing separate read/write waiters would
+    /// let the second waiter overwrite the first waiter's interest.
+    #[cfg(feature = "async-asupersync")]
+    pub async fn wait_for_readable_or_writable(&self) -> std::io::Result<()> {
+        let mut armed = false;
+        poll_fn(|cx| {
+            match self.try_readable_without_consuming() {
+                Ok(true) => return Poll::Ready(Ok(())),
+                Ok(false) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            if armed {
+                // The combined registration woke this task. The caller
+                // re-probes readability before treating the wake as writable,
+                // so a spurious wake cannot manufacture inbound work.
+                return Poll::Ready(Ok(()));
+            }
+
+            self.register_interest_for_read_write(cx)?;
             armed = true;
-            Poll::Pending
+
+            // Close the probe/register race for the read side.
+            match self.try_readable_without_consuming() {
+                Ok(true) => Poll::Ready(Ok(())),
+                Ok(false) => Poll::Pending,
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        })
+        .await
+    }
+
+    /// Whether the last TLS write/flush poll returned `WANT_READ` or
+    /// `WANT_WRITE` and therefore must be retried before any other SSL I/O.
+    #[cfg(feature = "async-asupersync")]
+    pub fn pending_outbound_requires_retry(&self) -> bool {
+        self.pending_outbound_retry.load(Ordering::Acquire)
+    }
+
+    /// Suspend on the exact reactor interest armed by the preceding SSL
+    /// write/flush poll without overwriting it with a combined interest.
+    #[cfg(feature = "async-asupersync")]
+    pub async fn wait_for_pending_outbound_retry(&self) -> std::io::Result<()> {
+        let mut suspended = false;
+        poll_fn(|_| {
+            if suspended {
+                Poll::Ready(Ok(()))
+            } else {
+                suspended = true;
+                Poll::Pending
+            }
         })
         .await
     }
@@ -179,6 +272,10 @@ impl AsyncSslStream {
 
     fn register_interest_for_write(&self, cx: &Context<'_>) -> std::io::Result<()> {
         self.register_interest(cx, Interest::WRITABLE)
+    }
+
+    fn register_interest_for_read_write(&self, cx: &Context<'_>) -> std::io::Result<()> {
+        self.register_interest(cx, Interest::READABLE | Interest::WRITABLE)
     }
 
     fn register_interest(&self, cx: &Context<'_>, interest: Interest) -> std::io::Result<()> {
@@ -314,23 +411,37 @@ impl AsyncWrite for AsyncSslStream {
             return Poll::Ready(Err(err));
         }
         match this.s.ssl_write(buf) {
-            Ok(written) => Poll::Ready(Ok(written)),
+            Ok(written) => {
+                this.pending_outbound_retry.store(false, Ordering::Release);
+                Poll::Ready(Ok(written))
+            }
             Err(err) if err.code() == ErrorCode::WANT_WRITE => {
+                this.pending_outbound_retry.store(true, Ordering::Release);
                 if let Err(register_err) = this.register_interest_for_write(cx) {
+                    this.pending_outbound_retry.store(false, Ordering::Release);
                     return Poll::Ready(Err(register_err));
                 }
                 Poll::Pending
             }
             Err(err) if err.code() == ErrorCode::WANT_READ => {
+                this.pending_outbound_retry.store(true, Ordering::Release);
                 if let Err(register_err) = this.register_interest_for_read(cx) {
+                    this.pending_outbound_retry.store(false, Ordering::Release);
                     return Poll::Ready(Err(register_err));
                 }
                 Poll::Pending
             }
-            Err(err) if err.code() == ErrorCode::ZERO_RETURN => Poll::Ready(Err(
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "TLS session closed"),
-            )),
-            Err(err) => Poll::Ready(Err(ssl_error_to_io(err))),
+            Err(err) if err.code() == ErrorCode::ZERO_RETURN => {
+                this.pending_outbound_retry.store(false, Ordering::Release);
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "TLS session closed",
+                )))
+            }
+            Err(err) => {
+                this.pending_outbound_retry.store(false, Ordering::Release);
+                Poll::Ready(Err(ssl_error_to_io(err)))
+            }
         }
     }
 
@@ -356,14 +467,22 @@ impl AsyncWrite for AsyncSslStream {
             return Poll::Ready(Err(err));
         }
         match this.s.flush() {
-            Ok(()) => Poll::Ready(Ok(())),
+            Ok(()) => {
+                this.pending_outbound_retry.store(false, Ordering::Release);
+                Poll::Ready(Ok(()))
+            }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                this.pending_outbound_retry.store(true, Ordering::Release);
                 if let Err(register_err) = this.register_interest_for_write(cx) {
+                    this.pending_outbound_retry.store(false, Ordering::Release);
                     return Poll::Ready(Err(register_err));
                 }
                 Poll::Pending
             }
-            Err(err) => Poll::Ready(Err(err)),
+            Err(err) => {
+                this.pending_outbound_retry.store(false, Ordering::Release);
+                Poll::Ready(Err(err))
+            }
         }
     }
 

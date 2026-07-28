@@ -139,7 +139,7 @@ impl UnixStream {
     pub async fn wait_for_readable(&self) -> std::io::Result<()> {
         std::future::poll_fn(|cx| {
             self.inner.set_nonblocking(true)?;
-            match self.poll_readable_without_consuming() {
+            match self.try_readable_without_consuming() {
                 Ok(true) => Poll::Ready(Ok(())),
                 Ok(false) => {
                     self.register_interest_for_read(cx)?;
@@ -155,15 +155,66 @@ impl UnixStream {
         .await
     }
 
+    /// Wait until either inbound data or outbound capacity may be available.
+    ///
+    /// This uses one combined reactor registration because `UnixStream` owns
+    /// one registration slot; racing independent read/write waiters would
+    /// overwrite one another's interest.
     #[cfg(all(feature = "async-asupersync", unix))]
-    fn poll_readable_without_consuming(&self) -> std::io::Result<bool> {
+    pub async fn wait_for_readable_or_writable(&self) -> std::io::Result<()> {
+        let mut armed = false;
+        std::future::poll_fn(|cx| {
+            self.inner.set_nonblocking(true)?;
+            match self.try_readable_without_consuming() {
+                Ok(true) => return Poll::Ready(Ok(())),
+                Ok(false) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    fallback_rewake(cx);
+                    return Poll::Pending;
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+
+            if armed {
+                // The caller re-probes readability after this combined wake
+                // before treating it as writable.
+                return Poll::Ready(Ok(()));
+            }
+
+            self.register_interest_for_read_write(cx)?;
+            armed = true;
+
+            // Close the probe/register race for inbound data.
+            match self.try_readable_without_consuming() {
+                Ok(true) => Poll::Ready(Ok(())),
+                Ok(false) => Poll::Pending,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    fallback_rewake(cx);
+                    Poll::Pending
+                }
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        })
+        .await
+    }
+
+    #[cfg(all(feature = "async-asupersync", unix))]
+    /// Probe socket readability without consuming any bytes.
+    ///
+    /// Dispatchers use this before servicing an already-ready internal queue;
+    /// an EOF is reported as readable so the normal read path can terminate.
+    #[cfg(unix)]
+    pub fn try_readable_without_consuming(&self) -> std::io::Result<bool> {
+        // The public direct-dispatch path does not necessarily pass through
+        // protocol detection first, so establish nonblocking mode here too.
+        self.inner.set_nonblocking(true)?;
         let mut probe = [0u8; 1];
         let result = unsafe {
             libc::recv(
                 self.inner.as_raw_fd(),
                 probe.as_mut_ptr().cast(),
                 probe.len(),
-                libc::MSG_PEEK,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
             )
         };
         if result >= 0 {
@@ -171,7 +222,10 @@ impl UnixStream {
         }
 
         let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
             Ok(false)
         } else {
             Err(err)
@@ -293,6 +347,11 @@ impl UnixStream {
     #[cfg(feature = "async-asupersync")]
     fn register_interest_for_write(&self, cx: &Context<'_>) -> std::io::Result<()> {
         self.register_interest(cx, Interest::WRITABLE)
+    }
+
+    #[cfg(feature = "async-asupersync")]
+    fn register_interest_for_read_write(&self, cx: &Context<'_>) -> std::io::Result<()> {
+        self.register_interest(cx, Interest::READABLE | Interest::WRITABLE)
     }
 
     #[cfg(feature = "async-asupersync")]
@@ -1807,8 +1866,9 @@ mod tests {
         });
         let (mut server, _) = listener.accept().unwrap();
         let mut c = client.join().unwrap();
-        drop(listener); // drop listener
-                        // Communication should still work
+        // Dropping the listener must not tear down an accepted stream.
+        drop(listener);
+        // Communication should still work
         server.write_all(b"after drop").unwrap();
         server.flush().unwrap();
         let mut buf = [0u8; 64];
@@ -1850,8 +1910,9 @@ mod tests {
         });
         let (mut server, _) = listener.accept().unwrap();
         let c = client.join().unwrap();
-        drop(c); // close client end
-                 // Give OS time to propagate the close
+        // Close the client end before probing the server-side failure path.
+        drop(c);
+        // Give OS time to propagate the close
         std::thread::sleep(std::time::Duration::from_millis(50));
         // First write may succeed (buffered), but repeated writes should eventually fail
         let mut failed = false;

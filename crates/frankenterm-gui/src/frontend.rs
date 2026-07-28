@@ -246,7 +246,8 @@ impl GuiFrontEnd {
                 }
             }
             true
-        });
+        })
+        .context("allocate GUI frontend mux subscription")?;
         // Re-evaluate the config so that folks that are using
         // `wezterm.gui.get_appearance()` can have that take effect
         // before any windows are created

@@ -42,6 +42,7 @@ hostname.workspace = true
 lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
+lru.workspace = true
 luahelper = { workspace=true, optional = true }
 metrics.workspace = true
 mlua = { workspace=true, optional = true }

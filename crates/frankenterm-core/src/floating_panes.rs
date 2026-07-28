@@ -125,15 +125,17 @@ impl FloatingRect {
     /// non-overlap (boundary-shared rects are visually disjoint).
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        let h_overlap = self.x < other.x + other.width && other.x < self.x + self.width;
-        let v_overlap = self.y < other.y + other.height && other.y < self.y + self.height;
+        let h_overlap = u32::from(self.x) < other.right() && u32::from(other.x) < self.right();
+        let v_overlap = u32::from(self.y) < other.bottom() && u32::from(other.y) < self.bottom();
         h_overlap && v_overlap
     }
 
     /// Whether the rect contains a grid coordinate.
     #[must_use]
     pub fn contains(&self, x: u16, y: u16) -> bool {
-        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+        let x = u32::from(x);
+        let y = u32::from(y);
+        x >= u32::from(self.x) && x < self.right() && y >= u32::from(self.y) && y < self.bottom()
     }
 }
 
@@ -141,9 +143,10 @@ impl FloatingRect {
 // Z-order
 // ============================================================================
 
-/// Pane identifier. Opaque to this module — the integration layer's
-/// per-pane id (likely `u32` in the gui).
-pub type PaneId = u32;
+/// Pane identifier. Opaque to this module. The fixed-width `u64`
+/// representation preserves the mux's full pane-id range on supported
+/// 64-bit targets without coupling serialized layouts to pointer width.
+pub type PaneId = u64;
 
 /// Z-order lane. Higher = drawn later (on top). Stable monotonic so
 /// `raise(p)` increments past the current top without renumbering
@@ -189,8 +192,7 @@ impl FloatingZStack {
         if let Some(idx) = self.find_index(id) {
             self.entries.remove(idx);
         }
-        let z = ZOrder(self.next_lane);
-        self.next_lane = self.next_lane.saturating_add(1);
+        let z = self.allocate_top_lane();
         self.entries.push((id, z));
         z
     }
@@ -204,12 +206,12 @@ impl FloatingZStack {
     }
 
     /// Raise a pane one step. If it's already on top, no-op.
-    pub fn raise(&mut self, id: PaneId) {
+    pub fn raise(&mut self, id: PaneId) -> bool {
         let Some(idx) = self.find_index(id) else {
-            return;
+            return false;
         };
         if idx + 1 >= self.entries.len() {
-            return;
+            return false;
         }
         // Swap with the next-higher entry.
         self.entries.swap(idx, idx + 1);
@@ -223,15 +225,16 @@ impl FloatingZStack {
             self.entries[idx] = (lower_id, higher_z);
             self.entries[idx + 1] = (higher_id, lower_z);
         }
+        true
     }
 
     /// Lower a pane one step. If it's already on bottom, no-op.
-    pub fn lower(&mut self, id: PaneId) {
+    pub fn lower(&mut self, id: PaneId) -> bool {
         let Some(idx) = self.find_index(id) else {
-            return;
+            return false;
         };
         if idx == 0 {
-            return;
+            return false;
         }
         self.entries.swap(idx, idx - 1);
         let (lower_id, lower_z) = self.entries[idx - 1];
@@ -240,30 +243,31 @@ impl FloatingZStack {
             self.entries[idx - 1] = (lower_id, higher_z);
             self.entries[idx] = (higher_id, lower_z);
         }
+        true
     }
 
     /// Raise a pane to the top of the stack.
-    pub fn raise_to_top(&mut self, id: PaneId) {
+    pub fn raise_to_top(&mut self, id: PaneId) -> bool {
         let Some(idx) = self.find_index(id) else {
-            return;
+            return false;
         };
         if idx + 1 == self.entries.len() {
-            return;
+            return false;
         }
         let entry = self.entries.remove(idx);
-        let new_z = ZOrder(self.next_lane);
-        self.next_lane = self.next_lane.saturating_add(1);
+        let new_z = self.allocate_top_lane();
         self.entries.push((entry.0, new_z));
+        true
     }
 
     /// Lower a pane to the bottom of the stack. Reuses the lowest
     /// unused lane below the current minimum.
-    pub fn lower_to_bottom(&mut self, id: PaneId) {
+    pub fn lower_to_bottom(&mut self, id: PaneId) -> bool {
         let Some(idx) = self.find_index(id) else {
-            return;
+            return false;
         };
         if idx == 0 {
-            return;
+            return false;
         }
         let entry = self.entries.remove(idx);
         let min_z = self.entries.first().map_or(ZOrder(0), |(_, z)| *z);
@@ -271,8 +275,20 @@ impl FloatingZStack {
             // Compact upward: shift every existing entry up by 1 and
             // reuse 0 for the new bottom. Rare path (only when min
             // is exactly 0).
+            if self.next_lane == u32::MAX
+                || self
+                    .entries
+                    .iter()
+                    .any(|(_, z_order)| z_order.0 == u32::MAX)
+            {
+                self.compact_lanes();
+            }
             for e in &mut self.entries {
-                e.1 = ZOrder(e.1.0.saturating_add(1));
+                e.1 = ZOrder(
+                    e.1.0
+                        .checked_add(1)
+                        .expect("compacted floating z-order must have an upper lane"),
+                );
             }
             self.next_lane = self.next_lane.saturating_add(1);
             ZOrder(0)
@@ -280,6 +296,7 @@ impl FloatingZStack {
             ZOrder(min_z.0 - 1)
         };
         self.entries.insert(0, (entry.0, new_z));
+        true
     }
 
     /// Cycle focus among overlapping floating panes at a given
@@ -328,6 +345,22 @@ impl FloatingZStack {
 
     fn find_index(&self, id: PaneId) -> Option<usize> {
         self.entries.iter().position(|(pid, _)| *pid == id)
+    }
+
+    fn allocate_top_lane(&mut self) -> ZOrder {
+        if self.next_lane == u32::MAX {
+            self.compact_lanes();
+        }
+        let z = ZOrder(self.next_lane);
+        self.next_lane = self.next_lane.saturating_add(1);
+        z
+    }
+
+    fn compact_lanes(&mut self) {
+        for (lane, (_, z_order)) in self.entries.iter_mut().enumerate() {
+            z_order.0 = u32::try_from(lane).unwrap_or(u32::MAX);
+        }
+        self.next_lane = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
     }
 }
 
@@ -495,9 +528,9 @@ pub fn snap_target(
     snap_distance: u16,
 ) -> Option<SnapEdge> {
     let near_left = rect.x <= snap_distance;
-    let near_right = (rect.x + rect.width) >= screen_width.saturating_sub(snap_distance);
+    let near_right = rect.right() >= u32::from(screen_width.saturating_sub(snap_distance));
     let near_top = rect.y <= snap_distance;
-    let near_bottom = (rect.y + rect.height) >= screen_height.saturating_sub(snap_distance);
+    let near_bottom = rect.bottom() >= u32::from(screen_height.saturating_sub(snap_distance));
 
     match (near_top, near_bottom, near_left, near_right) {
         (true, _, true, _) => Some(SnapEdge::TopLeft),
@@ -516,11 +549,17 @@ pub fn snap_target(
 /// layer renders the snap-preview overlay separately.
 #[must_use]
 pub fn apply_snap(
-    _rect: FloatingRect,
+    rect: FloatingRect,
     edge: SnapEdge,
     screen_width: u16,
     screen_height: u16,
 ) -> FloatingRect {
+    // A heavily padded or transiently minimized GUI can expose a zero-cell
+    // viewport. FloatingRect deliberately forbids zero-sized rectangles, so
+    // preserve the last valid geometry until a non-empty grid is available.
+    if screen_width == 0 || screen_height == 0 {
+        return rect;
+    }
     let half_w = screen_width / 2;
     let half_h = screen_height / 2;
     match edge {
@@ -706,6 +745,21 @@ mod tests {
         assert_eq!(r0.bottom(), u32::from(u16::MAX - 1) + 5);
     }
 
+    #[test]
+    fn floating_rect_queries_use_widened_endpoints() {
+        let overflowing = FloatingRect::new(u16::MAX - 1, u16::MAX - 1, 5, 5);
+        let corner = FloatingRect::new(u16::MAX, u16::MAX, 1, 1);
+
+        assert!(overflowing.overlaps(&corner));
+        assert!(corner.overlaps(&overflowing));
+        assert!(overflowing.contains(u16::MAX, u16::MAX));
+        assert!(!overflowing.contains(u16::MAX - 2, u16::MAX));
+        assert_eq!(
+            snap_target(overflowing, u16::MAX, u16::MAX, DEFAULT_SNAP_DISTANCE,),
+            Some(SnapEdge::BottomRight)
+        );
+    }
+
     // ----------------------------------------------------------------
     // FloatingZStack
     // ----------------------------------------------------------------
@@ -726,6 +780,38 @@ mod tests {
         assert!(z1 < z2);
         assert!(z2 < z3);
         assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn z_stack_compacts_before_lane_counter_exhaustion() {
+        let mut s = FloatingZStack::new();
+        s.insert_top(1);
+        s.insert_top(2);
+        s.next_lane = u32::MAX;
+
+        let z3 = s.insert_top(3);
+        let entries = s.iter_back_to_front().collect::<Vec<_>>();
+
+        assert_eq!(
+            entries,
+            vec![(1, ZOrder(0)), (2, ZOrder(1)), (3, ZOrder(2))]
+        );
+        assert_eq!(z3, ZOrder(2));
+        assert_eq!(s.next_lane, 3);
+    }
+
+    #[test]
+    fn z_stack_preserves_pane_id_above_u32_max() {
+        let mut s = FloatingZStack::new();
+        let pane_id = u64::from(u32::MAX) + 1;
+
+        s.insert_top(pane_id);
+
+        assert_eq!(s.z_of(pane_id), Some(ZOrder(0)));
+        assert_eq!(
+            s.iter_back_to_front().collect::<Vec<_>>(),
+            vec![(pane_id, ZOrder(0))]
+        );
     }
 
     #[test]
@@ -765,7 +851,7 @@ mod tests {
         s.insert_top(10);
         s.insert_top(20);
         s.insert_top(30);
-        s.raise(20);
+        assert!(s.raise(20));
         let order: Vec<PaneId> = s.iter_back_to_front().map(|(id, _)| id).collect();
         assert_eq!(order, vec![10, 30, 20]);
     }
@@ -775,7 +861,7 @@ mod tests {
         let mut s = FloatingZStack::new();
         s.insert_top(10);
         s.insert_top(20);
-        s.raise(20); // already on top
+        assert!(!s.raise(20)); // already on top
         let order: Vec<PaneId> = s.iter_back_to_front().map(|(id, _)| id).collect();
         assert_eq!(order, vec![10, 20]);
     }
@@ -786,7 +872,7 @@ mod tests {
         s.insert_top(10);
         s.insert_top(20);
         s.insert_top(30);
-        s.lower(30);
+        assert!(s.lower(30));
         let order: Vec<PaneId> = s.iter_back_to_front().map(|(id, _)| id).collect();
         assert_eq!(order, vec![10, 30, 20]);
     }
@@ -796,7 +882,7 @@ mod tests {
         let mut s = FloatingZStack::new();
         s.insert_top(10);
         s.insert_top(20);
-        s.lower(10);
+        assert!(!s.lower(10));
         let order: Vec<PaneId> = s.iter_back_to_front().map(|(id, _)| id).collect();
         assert_eq!(order, vec![10, 20]);
     }
@@ -807,7 +893,7 @@ mod tests {
         s.insert_top(10);
         s.insert_top(20);
         s.insert_top(30);
-        s.raise_to_top(10);
+        assert!(s.raise_to_top(10));
         let order: Vec<PaneId> = s.iter_back_to_front().map(|(id, _)| id).collect();
         assert_eq!(order, vec![20, 30, 10]);
     }
@@ -818,7 +904,7 @@ mod tests {
         s.insert_top(10);
         s.insert_top(20);
         s.insert_top(30);
-        s.lower_to_bottom(30);
+        assert!(s.lower_to_bottom(30));
         let order: Vec<PaneId> = s.iter_back_to_front().map(|(id, _)| id).collect();
         assert_eq!(order, vec![30, 10, 20]);
     }
@@ -1009,6 +1095,25 @@ mod tests {
         let rect = r(0, 0, 10, 10);
         let snapped = apply_snap(rect, SnapEdge::BottomRight, 100, 60);
         assert_eq!(snapped, r(50, 30, 50, 30));
+    }
+
+    #[test]
+    fn apply_snap_preserves_valid_rect_for_zero_extent_screen() {
+        let rect = r(3, 4, 10, 8);
+        for edge in [
+            SnapEdge::Top,
+            SnapEdge::Bottom,
+            SnapEdge::Left,
+            SnapEdge::Right,
+            SnapEdge::TopLeft,
+            SnapEdge::TopRight,
+            SnapEdge::BottomLeft,
+            SnapEdge::BottomRight,
+        ] {
+            assert_eq!(apply_snap(rect, edge, 0, 60), rect);
+            assert_eq!(apply_snap(rect, edge, 100, 0), rect);
+            assert_eq!(apply_snap(rect, edge, 0, 0), rect);
+        }
     }
 
     // ----------------------------------------------------------------

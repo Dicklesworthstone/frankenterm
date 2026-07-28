@@ -513,6 +513,8 @@ mod tests {
         assert_eq!(handle.mux_socket_buffer_size, 1024 * 1024);
         assert_eq!(handle.mux_max_synchronized_output_bytes, 8 * 1024 * 1024);
         assert_eq!(handle.mux_tmux_max_backlog_bytes_per_pane, 1_048_576);
+        assert_eq!(handle.mux_tmux_max_backlog_bytes, 32 * 1024 * 1024);
+        assert_eq!(handle.mux_tmux_max_backlog_entries, 1024);
     }
 
     #[test]

@@ -30,6 +30,7 @@ io-uring = { version = "0.7.12", optional = true }
 lazy_static.workspace = true
 libc.workspace = true
 log.workspace = true
+metrics.workspace = true
 mux.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 parking_lot.workspace = true

@@ -373,8 +373,8 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
             continue;
         }
 
-        let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(client_config));
-        mux.add_domain(&domain);
+        let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(client_config)?);
+        mux.add_domain(&domain)?;
     }
 
     for ssh_dom in config.ssh_domains() {
@@ -387,7 +387,7 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
         }
 
         let domain: Arc<dyn Domain> = Arc::new(RemoteSshDomain::with_ssh_domain(&ssh_dom)?);
-        mux.add_domain(&domain);
+        mux.add_domain(&domain)?;
     }
 
     for wsl_dom in config.wsl_domains() {
@@ -396,7 +396,7 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
         }
 
         let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_wsl(wsl_dom.clone())?);
-        mux.add_domain(&domain);
+        mux.add_domain(&domain)?;
     }
 
     for exec_dom in &config.exec_domains {
@@ -405,7 +405,7 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
         }
 
         let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_exec_domain(exec_dom.clone())?);
-        mux.add_domain(&domain);
+        mux.add_domain(&domain)?;
     }
 
     for serial in &config.serial_ports {
@@ -414,7 +414,7 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
         }
 
         let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_serial_domain(serial.clone())?);
-        mux.add_domain(&domain);
+        mux.add_domain(&domain)?;
     }
 
     if is_standalone_mux {
@@ -423,12 +423,12 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
                 if dom.is::<ClientDomain>() {
                     anyhow::bail!("default_mux_server_domain cannot be set to a client domain!");
                 }
-                mux.set_default_domain(&dom);
+                mux.set_default_domain(&dom)?;
             }
         }
     } else if let Some(name) = &config.default_domain {
         if let Some(dom) = mux.get_domain_by_name(name) {
-            mux.set_default_domain(&dom);
+            mux.set_default_domain(&dom)?;
         }
     }
 
@@ -442,14 +442,33 @@ pub static PKI: std::sync::LazyLock<pki::Pki> =
 mod tests {
     use super::*;
     use config::{Config, SshDomain};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard};
     use termwiz::cell::CellAttributes;
     use wezterm_term::Line;
     use wezterm_term::config::ScrollbackSpillSink;
 
     fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &GLOBAL_STATE_TEST_LOCK
+    }
+
+    struct ScopedTestState {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ScopedTestState {
+        fn acquire() -> Self {
+            let lock = test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reset_test_state();
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for ScopedTestState {
+        fn drop(&mut self) {
+            reset_test_state();
+        }
     }
 
     fn make_test_handle(ssh_domains: Vec<SshDomain>) -> ConfigHandle {
@@ -463,6 +482,7 @@ mod tests {
 
     fn reset_test_state() {
         config::use_test_configuration();
+        config::set_scrollback_spill_sink_factory(None);
         Mux::shutdown();
     }
 
@@ -678,7 +698,7 @@ mod tests {
 
     #[test]
     fn client_domains_include_only_wezterm_ssh_domains() {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
 
         let raw_ssh = SshDomain {
             name: "raw-ssh".to_string(),
@@ -705,13 +725,11 @@ mod tests {
             ClientDomainConfig::Ssh(ssh) => assert_eq!(ssh.name, "mux-ssh"),
             other => panic!("expected SSH client domain, got {other:?}"),
         }
-
-        reset_test_state();
     }
 
     #[test]
     fn update_mux_domains_registers_muxed_and_raw_ssh_domains() -> anyhow::Result<()> {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
 
         let raw_ssh = SshDomain {
             name: "raw-ssh".to_string(),
@@ -749,22 +767,20 @@ mod tests {
             "non-multiplexed SSH domain should use RemoteSshDomain"
         );
 
-        reset_test_state();
         Ok(())
     }
 
     #[test]
     fn client_domains_empty_config_returns_empty() {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
         let handle = make_test_handle(vec![]);
         let domains = client_domains(&handle);
         assert!(domains.is_empty(), "no ssh domains means no client domains");
-        reset_test_state();
     }
 
     #[test]
     fn update_mux_domains_with_no_ssh_registers_only_local() -> anyhow::Result<()> {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
         let handle = make_test_handle(vec![]);
 
         let local_domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
@@ -779,13 +795,12 @@ mod tests {
             "local domain should still be present"
         );
 
-        reset_test_state();
         Ok(())
     }
 
     #[test]
     fn update_mux_domains_idempotent_on_second_call() -> anyhow::Result<()> {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
 
         let mux_ssh = SshDomain {
             name: "mux-ssh".to_string(),
@@ -817,13 +832,12 @@ mod tests {
             "second call should not create a new domain"
         );
 
-        reset_test_state();
         Ok(())
     }
 
     #[test]
     fn client_domains_with_only_raw_ssh_returns_empty() {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
 
         let raw_ssh = SshDomain {
             name: "raw-only".to_string(),
@@ -838,13 +852,11 @@ mod tests {
             domains.is_empty(),
             "raw SSH domains should not appear in client_domains"
         );
-
-        reset_test_state();
     }
 
     #[test]
     fn update_mux_domains_for_server_respects_mux_server_domain() -> anyhow::Result<()> {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
 
         let raw_ssh = SshDomain {
             name: "raw-ssh".to_string(),
@@ -870,13 +882,12 @@ mod tests {
             "should use RemoteSshDomain for non-multiplexed SSH"
         );
 
-        reset_test_state();
         Ok(())
     }
 
     #[test]
     fn client_domains_multiple_mux_ssh() {
-        let _guard = test_lock().lock().expect("lock");
+        let _state = ScopedTestState::acquire();
 
         let mux1 = SshDomain {
             name: "mux-1".to_string(),
@@ -909,7 +920,5 @@ mod tests {
         let names: Vec<&str> = domains.iter().map(|d| d.name()).collect();
         assert!(names.contains(&"mux-1"));
         assert!(names.contains(&"mux-2"));
-
-        reset_test_state();
     }
 }

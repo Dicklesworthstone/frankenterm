@@ -119,6 +119,40 @@ impl GuiFloatingPaneController {
         z_order
     }
 
+    /// Restore a pane from authoritative mux state without inventing focus or
+    /// emitting a user-action announcement.
+    pub fn restore_floating(&mut self, pane_id: PaneId, rect: FloatingRect) -> ZOrder {
+        let z_order = self.zstack.insert_top(pane_id);
+        self.panes
+            .insert(pane_id, GuiFloatingPane::floating(pane_id, rect, z_order));
+        z_order
+    }
+
+    /// Restore authoritative focus without announcing a new focus action.
+    ///
+    /// `None` is meaningful: a tab may have visible floating panes while its
+    /// tiled pane owns focus.
+    pub fn restore_focus(&mut self, pane_id: Option<PaneId>) -> bool {
+        if pane_id.is_some_and(|pane_id| self.rect_for(pane_id).is_none()) {
+            return false;
+        }
+        self.focused = pane_id;
+        true
+    }
+
+    /// Reconcile a speculative controller rect with the geometry actually
+    /// committed by the mux. This is intentionally silent; the integration
+    /// layer decides whether the authoritative before/after state warrants an
+    /// accessibility announcement.
+    pub fn reconcile_committed_rect(&mut self, pane_id: PaneId, rect: FloatingRect) -> bool {
+        self.set_rect(pane_id, rect).is_some()
+    }
+
+    /// Announce the controller's current authoritative rectangle.
+    pub fn announce_rect_changed(&mut self, pane_id: PaneId) {
+        self.push_a11y(pane_id, FloatingPaneA11yKind::RectChanged);
+    }
+
     pub fn pin_to_tiled(&mut self, pane_id: PaneId) -> bool {
         let Some(rect) = self.rect_for(pane_id) else {
             return false;
@@ -175,6 +209,9 @@ impl GuiFloatingPaneController {
         if self.rect_for(pane_id).is_none() {
             return false;
         }
+        if self.focused == Some(pane_id) {
+            return false;
+        }
         self.focused = Some(pane_id);
         self.push_a11y(pane_id, FloatingPaneA11yKind::FocusGained);
         true
@@ -217,7 +254,9 @@ impl GuiFloatingPaneController {
         let next = self
             .zstack
             .cycle_among_overlapping(self.focused, x, y, |pane_id| self.rect_for(pane_id))?;
-        self.focus(next);
+        if self.focused == Some(next) || !self.focus(next) {
+            return None;
+        }
         Some(next)
     }
 
@@ -228,10 +267,7 @@ impl GuiFloatingPaneController {
         screen_height: u16,
     ) -> Option<PanePosition> {
         if command == KeyboardCommand::CancelOperation {
-            return self
-                .cancel_drag_or_resize()
-                .map(PanePosition::Floating)
-                .or(Some(PanePosition::Tiled));
+            return self.cancel_drag_or_resize().map(PanePosition::Floating);
         }
 
         let pane_id = self.focused?;
@@ -262,30 +298,35 @@ impl GuiFloatingPaneController {
                 };
                 self.commit_rect(pane_id, apply_snap(rect, edge, screen_width, screen_height))
             }
-            KeyboardCommand::TogglePin => {
-                self.pin_to_tiled(pane_id);
-                Some(PanePosition::Tiled)
-            }
+            KeyboardCommand::TogglePin => self.pin_to_tiled(pane_id).then_some(PanePosition::Tiled),
             KeyboardCommand::RaiseOne => {
-                self.zstack.raise(pane_id);
+                if !self.zstack.raise(pane_id) {
+                    return None;
+                }
                 self.refresh_z_order(pane_id);
                 self.push_a11y(pane_id, FloatingPaneA11yKind::ZOrderChanged);
                 self.pane(pane_id).map(|pane| pane.position)
             }
             KeyboardCommand::LowerOne => {
-                self.zstack.lower(pane_id);
+                if !self.zstack.lower(pane_id) {
+                    return None;
+                }
                 self.refresh_z_order(pane_id);
                 self.push_a11y(pane_id, FloatingPaneA11yKind::ZOrderChanged);
                 self.pane(pane_id).map(|pane| pane.position)
             }
             KeyboardCommand::RaiseToTop => {
-                self.zstack.raise_to_top(pane_id);
+                if !self.zstack.raise_to_top(pane_id) {
+                    return None;
+                }
                 self.refresh_z_order(pane_id);
                 self.push_a11y(pane_id, FloatingPaneA11yKind::ZOrderChanged);
                 self.pane(pane_id).map(|pane| pane.position)
             }
             KeyboardCommand::LowerToBottom => {
-                self.zstack.lower_to_bottom(pane_id);
+                if !self.zstack.lower_to_bottom(pane_id) {
+                    return None;
+                }
                 self.refresh_z_order(pane_id);
                 self.push_a11y(pane_id, FloatingPaneA11yKind::ZOrderChanged);
                 self.pane(pane_id).map(|pane| pane.position)
@@ -334,7 +375,7 @@ impl GuiFloatingPaneController {
         entries.sort_by_key(|entry| entry.z_order);
         for entry in entries {
             if let Some(rect) = entry.rect() {
-                self.set_floating(entry.pane_id, rect);
+                self.restore_floating(entry.pane_id, rect);
             }
         }
     }
@@ -364,6 +405,9 @@ impl GuiFloatingPaneController {
     }
 
     fn commit_rect(&mut self, pane_id: PaneId, rect: FloatingRect) -> Option<PanePosition> {
+        if self.rect_for(pane_id) == Some(rect) {
+            return None;
+        }
         self.set_rect(pane_id, rect)?;
         self.push_a11y(pane_id, FloatingPaneA11yKind::RectChanged);
         Some(PanePosition::Floating(rect))
@@ -403,6 +447,16 @@ pub fn classify_hit_region(rect: FloatingRect, x: u16, y: u16) -> FloatingPaneHi
         (false, false, false, true) => FloatingPaneHitRegion::Resize(ResizeHandle::Right),
         _ => FloatingPaneHitRegion::Body,
     }
+}
+
+#[must_use]
+pub fn mux_pane_id_to_floating_pane_id(pane_id: mux::pane::PaneId) -> Option<PaneId> {
+    PaneId::try_from(pane_id).ok()
+}
+
+#[must_use]
+pub fn floating_pane_id_to_mux_pane_id(pane_id: PaneId) -> Option<mux::pane::PaneId> {
+    mux::pane::PaneId::try_from(pane_id).ok()
 }
 
 #[must_use]
@@ -477,13 +531,146 @@ pub fn emit_floating_pane_a11y_messages(messages: &[FloatingPaneA11yMessage]) {
 }
 
 fn move_rect(rect: FloatingRect, dx: i16, dy: i16) -> FloatingRect {
-    let x = i32::from(rect.x).saturating_add(i32::from(dx)).max(0) as u16;
-    let y = i32::from(rect.y).saturating_add(i32::from(dy)).max(0) as u16;
+    let x = i32::from(rect.x)
+        .saturating_add(i32::from(dx))
+        .clamp(0, i32::from(u16::MAX));
+    let y = i32::from(rect.y)
+        .saturating_add(i32::from(dy))
+        .clamp(0, i32::from(u16::MAX));
+    let x = u16::try_from(x).expect("clamped floating-pane x coordinate must fit in u16");
+    let y = u16::try_from(y).expect("clamped floating-pane y coordinate must fit in u16");
     FloatingRect::new(x, y, rect.width, rect.height)
 }
 
 fn resize_rect(rect: FloatingRect, dw: i16, dh: i16) -> FloatingRect {
-    let width = i32::from(rect.width).saturating_add(i32::from(dw)).max(1) as u16;
-    let height = i32::from(rect.height).saturating_add(i32::from(dh)).max(1) as u16;
+    let width = i32::from(rect.width)
+        .saturating_add(i32::from(dw))
+        .clamp(1, i32::from(u16::MAX));
+    let height = i32::from(rect.height)
+        .saturating_add(i32::from(dh))
+        .clamp(1, i32::from(u16::MAX));
+    let width = u16::try_from(width).expect("clamped floating-pane width must fit in u16");
+    let height = u16::try_from(height).expect("clamped floating-pane height must fit in u16");
     FloatingRect::new(rect.x, rect.y, width, height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_rect_saturates_at_coordinate_bounds() {
+        let rect = FloatingRect::new(u16::MAX, u16::MAX, 1, 1);
+
+        assert_eq!(move_rect(rect, 1, 1), rect);
+        assert_eq!(
+            move_rect(FloatingRect::new(0, 0, 1, 1), -1, -1),
+            FloatingRect::new(0, 0, 1, 1)
+        );
+    }
+
+    #[test]
+    fn resize_rect_saturates_at_nonzero_dimension_bounds() {
+        let maximum = FloatingRect::new(0, 0, u16::MAX, u16::MAX);
+        assert_eq!(resize_rect(maximum, 1, 1), maximum);
+
+        let minimum = FloatingRect::new(0, 0, 1, 1);
+        assert_eq!(resize_rect(minimum, -1, -1), minimum);
+    }
+
+    #[test]
+    fn keyboard_growth_at_maximum_dimensions_is_a_silent_noop() {
+        let mut controller = GuiFloatingPaneController::new();
+        let pane_id = 7;
+        let maximum = FloatingRect::new(0, 0, u16::MAX, u16::MAX);
+        controller.restore_floating(pane_id, maximum);
+        assert!(controller.restore_focus(Some(pane_id)));
+
+        assert_eq!(
+            controller.apply_keyboard_command(KeyboardCommand::GrowHorizontal, u16::MAX, u16::MAX,),
+            None
+        );
+        assert_eq!(
+            controller.apply_keyboard_command(KeyboardCommand::GrowVertical, u16::MAX, u16::MAX,),
+            None
+        );
+        assert!(controller.drain_a11y_messages().is_empty());
+    }
+
+    #[test]
+    fn single_pane_focus_z_order_cycle_and_idle_cancel_are_silent_noops() {
+        let mut controller = GuiFloatingPaneController::new();
+        let pane_id = 11;
+        controller.restore_floating(pane_id, FloatingRect::new(0, 0, 10, 10));
+        assert!(controller.restore_focus(Some(pane_id)));
+
+        assert!(!controller.focus(pane_id));
+        assert_eq!(controller.cycle_overlapping_at(5, 5), None);
+        assert_eq!(
+            controller.apply_keyboard_command(KeyboardCommand::RaiseOne, 80, 24),
+            None
+        );
+        assert_eq!(
+            controller.apply_keyboard_command(KeyboardCommand::LowerOne, 80, 24),
+            None
+        );
+        assert_eq!(
+            controller.apply_keyboard_command(KeyboardCommand::RaiseToTop, 80, 24),
+            None
+        );
+        assert_eq!(
+            controller.apply_keyboard_command(KeyboardCommand::LowerToBottom, 80, 24),
+            None
+        );
+        assert_eq!(
+            controller.apply_keyboard_command(KeyboardCommand::CancelOperation, 80, 24),
+            None
+        );
+        assert!(controller.drain_a11y_messages().is_empty());
+    }
+
+    #[test]
+    fn authoritative_restore_does_not_invent_focus_or_announcements() {
+        let mut controller = GuiFloatingPaneController::new();
+        controller.restore_floating(1, FloatingRect::new(0, 0, 10, 10));
+        controller.restore_floating(2, FloatingRect::new(10, 0, 10, 10));
+
+        assert_eq!(controller.focused(), None);
+        assert!(controller.drain_a11y_messages().is_empty());
+        assert!(controller.restore_focus(Some(1)));
+        assert_eq!(controller.focused(), Some(1));
+        assert!(controller.restore_focus(None));
+        assert_eq!(controller.focused(), None);
+        assert!(!controller.restore_focus(Some(99)));
+        assert_eq!(controller.focused(), None);
+    }
+
+    #[test]
+    fn committed_rect_reconciliation_is_silent_until_explicit_announcement() {
+        let mut controller = GuiFloatingPaneController::new();
+        controller.restore_floating(1, FloatingRect::new(0, 0, 10, 10));
+        let committed = FloatingRect::new(2, 3, 5, 4);
+
+        assert!(controller.reconcile_committed_rect(1, committed));
+        assert_eq!(
+            controller.pane(1).and_then(|pane| pane.position.rect()),
+            Some(committed)
+        );
+        assert!(controller.drain_a11y_messages().is_empty());
+
+        controller.announce_rect_changed(1);
+        let messages = controller.drain_a11y_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].position, committed);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn pane_id_above_u32_max_round_trips_through_gui_bridge() {
+        let pane_id = u64::from(u32::MAX) + 1;
+        let mux_pane_id = usize::try_from(pane_id).expect("64-bit mux pane id");
+
+        assert_eq!(mux_pane_id_to_floating_pane_id(mux_pane_id), Some(pane_id));
+        assert_eq!(floating_pane_id_to_mux_pane_id(pane_id), Some(mux_pane_id));
+    }
 }

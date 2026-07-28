@@ -360,8 +360,8 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
 
     let domain: Arc<dyn Domain> = Arc::new(mux::ssh::RemoteSshDomain::with_ssh_domain(&dom)?);
     let mux = Mux::try_get().context("mux singleton is not available")?;
-    mux.add_domain(&domain);
-    mux.set_default_domain(&domain);
+    mux.add_domain(&domain)?;
+    mux.set_default_domain(&domain)?;
 
     let should_publish = false;
     async_run_terminal_gui(cmd, start_command, should_publish).await
@@ -413,7 +413,7 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
 
     let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_serial_domain(serial_domain)?);
     let mux = Mux::try_get().context("mux singleton is not available")?;
-    mux.add_domain(&domain);
+    mux.add_domain(&domain)?;
 
     let should_publish = false;
     async_run_terminal_gui(cmd, start_command, should_publish).await
@@ -932,7 +932,7 @@ fn setup_mux(
             default_name
         )
     })?;
-    mux.set_default_domain(&domain);
+    mux.set_default_domain(&domain)?;
 
     Ok(mux)
 }

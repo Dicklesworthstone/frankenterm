@@ -44,6 +44,50 @@ pub fn checked_stable_row_range_from_top(
     Some(top..end)
 }
 
+#[must_use]
+pub fn terminal_u16_from_usize(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+#[must_use]
+pub fn terminal_u16_from_stable_delta(value: wezterm_term::StableRowIndex) -> u16 {
+    u16::try_from(value).unwrap_or(if value < 0 { 0 } else { u16::MAX })
+}
+
+#[must_use]
+pub fn terminal_u32_from_usize(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[must_use]
+pub fn terminal_u32_from_stable_delta(value: wezterm_term::StableRowIndex) -> u32 {
+    u32::try_from(value).unwrap_or(if value < 0 { 0 } else { u32::MAX })
+}
+
+#[must_use]
+pub fn terminal_pane_id_to_u64(pane_id: mux::pane::PaneId) -> u64 {
+    u64::try_from(pane_id).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod numeric_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_numeric_fields_saturate_for_gui_and_wire_publish() {
+        assert_eq!(terminal_u16_from_usize(24), 24);
+        assert_eq!(terminal_u16_from_usize(usize::MAX), u16::MAX);
+        assert_eq!(terminal_u16_from_stable_delta(10), 10);
+        assert_eq!(terminal_u16_from_stable_delta(-1), 0);
+        assert_eq!(terminal_u16_from_stable_delta(isize::MAX), u16::MAX);
+        assert_eq!(terminal_u32_from_usize(80), 80);
+        assert_eq!(terminal_u32_from_usize(usize::MAX), u32::MAX);
+        assert_eq!(terminal_u32_from_stable_delta(-1), 0);
+        assert_eq!(terminal_u32_from_stable_delta(isize::MAX), u32::MAX);
+        assert_eq!(terminal_pane_id_to_u64(7), 7);
+    }
+}
+
 pub mod glyph_quad_staging {
     use std::sync::LazyLock;
 

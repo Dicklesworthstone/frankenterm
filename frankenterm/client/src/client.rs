@@ -1,23 +1,23 @@
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
-use anyhow::{Context, anyhow, bail};
-use asupersync::Cx;
+use anyhow::{anyhow, bail, Context};
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
-use async_channel::{Receiver, Sender, bounded, unbounded};
+use asupersync::Cx;
+use async_channel::{bounded, unbounded, Receiver, Sender};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
-use config::{SshDomain, TlsDomainClient, UnixDomain, UnixTarget, configuration};
+use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
-use futures::future::{Either, ready, select};
+use futures::future::{ready, select, Either};
 use futures::pin_mut;
-use mux::Mux;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
 use mux::pane::PaneId;
 use mux::ssh::ssh_connect_with_ui;
+use mux::Mux;
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
@@ -661,10 +661,7 @@ fn unix_stream_connect_with_timeout(
             let _ = tx.send(UnixStream::connect(path));
         })
         .map_err(|err| {
-            std::io::Error::new(
-                ErrorKind::Other,
-                format!("spawn unix socket connect timeout thread: {err}"),
-            )
+            std::io::Error::other(format!("spawn unix socket connect timeout thread: {err}"))
         })?;
 
     match rx.recv_timeout(timeout) {
@@ -2142,6 +2139,7 @@ mod tests {
         let socket_path = unique_handshake_socket_path();
         let listener = UnixListener::bind(&socket_path).expect("bind local UDS handshake server");
         let (set_client_id_tx, set_client_id_rx) = mpsc::channel::<SetClientId>();
+        let (server_release_tx, server_release_rx) = mpsc::channel::<()>();
         let server = std::thread::Builder::new()
             .name("ft-kuxho-handshake-server".to_string())
             .spawn(move || -> anyhow::Result<()> {
@@ -2175,6 +2173,14 @@ mod tests {
                     stream.flush().context("server flush response PDU")?;
 
                     if matches!(response, Pdu::UnitResponse(_)) {
+                        // Keep the transport alive until the test has consumed
+                        // the response. Closing here races the handshake future
+                        // against the reader's terminal EOF result and makes
+                        // the harness nondeterministic even when the response
+                        // was decoded and delivered correctly.
+                        server_release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .context("wait for completed client handshake")?;
                         break;
                     }
                 }
@@ -2243,6 +2249,9 @@ mod tests {
             logs
         );
 
+        server_release_tx
+            .send(())
+            .expect("server must remain alive through handshake assertions");
         drop(client);
         server
             .join()

@@ -188,7 +188,8 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
         lua.create_function(|_, domain: UserDataRef<MuxDomain>| {
             let mux = get_mux()?;
             let domain = domain.resolve(&mux)?;
-            mux.set_default_domain(&domain);
+            mux.set_default_domain(&domain)
+                .map_err(mlua::Error::external)?;
             Ok(())
         })?,
     )?;

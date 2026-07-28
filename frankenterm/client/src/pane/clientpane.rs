@@ -1,6 +1,6 @@
-use crate::domain::{ClientInner, lock_or_recover};
+use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{RenderableInner, RenderableState, hydrate_lines};
+use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -9,7 +9,7 @@ use config::keyassignment::ScrollbackEraseMode;
 use mux::domain::DomainId;
 use mux::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
-    SearchResult, WithPaneLines, alloc_pane_id,
+    SearchResult, WithPaneLines,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -53,15 +53,15 @@ pub struct ClientPane {
 }
 
 impl ClientPane {
-    pub fn new(
+    pub(crate) fn new(
         client: &Arc<ClientInner>,
+        local_pane_id: PaneId,
         remote_tab_id: TabId,
         remote_pane_id: PaneId,
         size: TerminalSize,
         title: &str,
         alt_screen_active: bool,
     ) -> Self {
-        let local_pane_id = alloc_pane_id();
         let writer = PaneWriter {
             client: Arc::clone(client),
             remote_pane_id,
@@ -720,12 +720,10 @@ mod tests {
     use crate::client::Client;
     use crate::domain::ClientDomainConfig;
     use config::UnixDomain;
-    use mux::Mux;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
+    use mux::Mux;
     use promise::spawn::SimpleExecutor;
     use std::sync::{Mutex as StdMutex, Once};
-
-    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn ensure_test_scheduler() {
         static TEST_SCHEDULER: Once = Once::new();
@@ -770,13 +768,14 @@ mod tests {
 
     #[test]
     fn render_delta_updates_authoritative_alt_screen_state() {
-        let _lock = TEST_LOCK.lock().unwrap();
+        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
         ensure_test_scheduler();
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(&mux);
         let inner = test_client_inner(17);
         let pane = ClientPane::new(
             &inner,
+            31,
             23,
             29,
             TerminalSize {
@@ -827,22 +826,24 @@ mod tests {
 
     #[test]
     fn unilateral_state_alert_is_forwarded_exactly_once() {
-        let _lock = TEST_LOCK.lock().unwrap();
+        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
         ensure_test_scheduler();
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(&mux);
         let observed = Arc::new(StdMutex::new(Vec::new()));
         let observed_for_subscriber = Arc::clone(&observed);
         mux.subscribe(move |notification| {
-            if let MuxNotification::Alert { pane_id: 23, alert } = notification {
+            if let MuxNotification::Alert { pane_id: 32, alert } = notification {
                 observed_for_subscriber.lock().unwrap().push(alert);
             }
             true
-        });
+        })
+        .expect("test mux subscription should allocate an identifier");
 
         let inner = test_client_inner(17);
         let pane = ClientPane::new(
             &inner,
+            32,
             23,
             29,
             TerminalSize {
