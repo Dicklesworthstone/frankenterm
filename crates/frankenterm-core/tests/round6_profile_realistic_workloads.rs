@@ -154,7 +154,9 @@ fn spread_offsets(lo: usize, hi: usize, n: usize) -> Vec<usize> {
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     (0..n)
         .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             lo + ((state >> 33) % span) as usize
         })
         .collect()
@@ -277,12 +279,22 @@ fn run_profile() -> (Vec<Frame>, f64, f64) {
     // detection stress — ANSI-saturated and trigger-saturated (informational only)
     let ansi = String::from_utf8_lossy(&ansi_saturated_frame()).into_owned();
     let mut actx = DetectionContext::new();
-    let (_, ansi_ns) =
-        measure(|| { black_box(engine.detect_with_context(black_box(&ansi), &mut actx)); }, WARMUP, ITERS);
+    let (_, ansi_ns) = measure(
+        || {
+            black_box(engine.detect_with_context(black_box(&ansi), &mut actx));
+        },
+        WARMUP,
+        ITERS,
+    );
     let triggers = String::from_utf8_lossy(&trigger_saturated_frame()).into_owned();
     let mut tctx = DetectionContext::new();
-    let (_, trig_ns) =
-        measure(|| { black_box(engine.detect_with_context(black_box(&triggers), &mut tctx)); }, WARMUP, ITERS);
+    let (_, trig_ns) = measure(
+        || {
+            black_box(engine.detect_with_context(black_box(&triggers), &mut tctx));
+        },
+        WARMUP,
+        ITERS,
+    );
     let ansi_mean = ansi_ns as f64 / ITERS as f64;
     let trig_mean = trig_ns as f64 / ITERS as f64;
 
@@ -407,7 +419,11 @@ fn profile_realistic_workloads_and_emit_scored_targets() {
     );
     for f in &frames {
         let share = f.realistic_self_ns() / total_realistic_ns;
-        let gate = if share >= GATE_SHARE { "PASS — eligible" } else { "below — no bead" };
+        let gate = if share >= GATE_SHARE {
+            "PASS — eligible"
+        } else {
+            "below — no bead"
+        };
         println!(
             "{:<28} {:<26} {:>10.1} {:>10} {:>8.3}% {:>9.0}  {}",
             f.name,
@@ -425,7 +441,8 @@ fn profile_realistic_workloads_and_emit_scored_targets() {
     );
 
     // ── Machine-readable JSON (one line, easy to lift into the artifact) ──
-    let mut json = String::from("ROUND6_B0_JSON {\"schema\":\"round6.b0.profile.v1\",\"gate_share\":");
+    let mut json =
+        String::from("ROUND6_B0_JSON {\"schema\":\"round6.b0.profile.v1\",\"gate_share\":");
     json.push_str(&format!("{GATE_SHARE},\"frames\":["));
     for (i, f) in frames.iter().enumerate() {
         let share = f.realistic_self_ns() / total_realistic_ns;
@@ -485,5 +502,8 @@ fn profile_realistic_workloads_and_emit_scored_targets() {
         .iter()
         .map(|f| f.realistic_self_ns() / total_realistic_ns)
         .sum();
-    assert!((sum_share - 1.0).abs() < 1e-6, "shares must sum to 1, got {sum_share}");
+    assert!(
+        (sum_share - 1.0).abs() < 1e-6,
+        "shares must sum to 1, got {sum_share}"
+    );
 }

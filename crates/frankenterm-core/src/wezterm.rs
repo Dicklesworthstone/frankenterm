@@ -6237,7 +6237,8 @@ mod tests {
         // trips it Open). with_circuit_breaker_config constructs a
         // PRIVATE breaker, which is what "default is closed" actually
         // pins: a default-config breaker starts Closed.
-        let client = WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::default());
+        let client =
+            WeztermClient::new().with_circuit_breaker_config(CircuitBreakerConfig::default());
         let status = client.circuit_status();
         assert_eq!(status.state, CircuitStateKind::Closed);
     }

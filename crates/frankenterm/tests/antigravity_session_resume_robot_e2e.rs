@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const BEAD_ID: &str = "ft-agy-provider-q8o4y-685af.5";
 const ANTIGRAVITY_MODEL: &str = "Gemini 3.1 Pro (High)";
@@ -429,9 +429,13 @@ fn run_robot_json(run: RobotRun<'_>) -> Value {
         }),
     );
     assert_eq!(
-        status, "pass",
+        status,
+        "pass",
         "{scenario_id}:{} expected ok={} with zero exit; stdout artifact {}; stderr artifact {}; payload={payload}",
-        run.step, run.expect_ok, stdout_path.display(), stderr_path.display()
+        run.step,
+        run.expect_ok,
+        stdout_path.display(),
+        stderr_path.display()
     );
     payload
 }

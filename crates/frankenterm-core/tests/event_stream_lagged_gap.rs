@@ -233,8 +233,8 @@ fn wait_with_cx_surfaces_lagged_not_timeout_when_awaited_event_dropped() {
             // Yield first so the waiter (polled first by `join!`) has
             // definitely subscribed and parked on its receive before we
             // publish — robust even if poll order were reversed.
-            let _ = frankenterm_core::runtime_async::sleep_with_cx(&cx, Duration::from_millis(5))
-                .await;
+            let _ =
+                frankenterm_core::runtime_async::sleep_with_cx(&cx, Duration::from_millis(5)).await;
 
             // The awaited event, published FIRST so it lands in the window the
             // buffer will evict.
@@ -264,7 +264,10 @@ fn wait_with_cx_surfaces_lagged_not_timeout_when_awaited_event_dropped() {
             !result.is_timeout(),
             "a dropped-window lag must NOT masquerade as a timeout"
         );
-        assert!(!result.is_matched(), "the awaited event was dropped, not matched");
+        assert!(
+            !result.is_matched(),
+            "the awaited event was dropped, not matched"
+        );
         if let WaitResult::Lagged { missed_count, .. } = result {
             assert!(
                 missed_count > 0,

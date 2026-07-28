@@ -26,7 +26,12 @@ use frankenterm_core_replay::replay_artifact_registry::{
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const RETENTION_DAYS: u64 = 1;
 
-fn entry(path: &str, label: &str, status: ArtifactStatus, retired_at_ms: Option<u64>) -> ArtifactEntry {
+fn entry(
+    path: &str,
+    label: &str,
+    status: ArtifactStatus,
+    retired_at_ms: Option<u64>,
+) -> ArtifactEntry {
     ArtifactEntry {
         path: path.to_string(),
         label: label.to_string(),
@@ -80,9 +85,19 @@ fn diverse_manifest(now_ms: u64) -> Vec<ArtifactEntry> {
     vec![
         entry("a.ftreplay", "a-active", ArtifactStatus::Active, None),
         // shares path with a-active; retired + aged => prunable
-        entry("a.ftreplay", "a-retired-aged", ArtifactStatus::Retired, Some(1000)),
+        entry(
+            "a.ftreplay",
+            "a-retired-aged",
+            ArtifactStatus::Retired,
+            Some(1000),
+        ),
         // unique path; retired + aged => prunable
-        entry("b.ftreplay", "b-retired-aged", ArtifactStatus::Retired, Some(0)),
+        entry(
+            "b.ftreplay",
+            "b-retired-aged",
+            ArtifactStatus::Retired,
+            Some(0),
+        ),
         entry("c.ftreplay", "c-active", ArtifactStatus::Active, None),
         // shares path with c-active; retired but RECENT => not prunable
         entry(
@@ -181,7 +196,10 @@ fn prune_is_idempotent() {
     let after_first = reg.manifest().artifacts.clone();
 
     let second = reg.prune(&prune_opts(now, false));
-    assert_eq!(second.pruned_count, 0, "a second prune removes nothing (idempotent)");
+    assert_eq!(
+        second.pruned_count, 0,
+        "a second prune removes nothing (idempotent)"
+    );
     assert_eq!(
         reg.manifest().artifacts,
         after_first,
@@ -197,7 +215,10 @@ fn prune_dry_run_leaves_manifest_unchanged() {
 
     let result = reg.prune(&prune_opts(now, true));
     assert!(result.dry_run);
-    assert!(result.pruned_count > 0, "dry-run still REPORTS the prunable count");
+    assert!(
+        result.pruned_count > 0,
+        "dry-run still REPORTS the prunable count"
+    );
     assert_eq!(
         reg.manifest().artifacts,
         before,
@@ -215,11 +236,19 @@ fn golden_active_survives_pruned_retired_duplicate_path() {
     let now = 1000 + 2 * DAY_MS;
     let mut reg = registry(vec![
         entry("dup.ftreplay", "active", ArtifactStatus::Active, None),
-        entry("dup.ftreplay", "retired", ArtifactStatus::Retired, Some(1000)),
+        entry(
+            "dup.ftreplay",
+            "retired",
+            ArtifactStatus::Retired,
+            Some(1000),
+        ),
     ]);
 
     let result = reg.prune(&prune_opts(now, false));
-    assert_eq!(result.pruned_count, 1, "only the retired+aged duplicate is pruned");
+    assert_eq!(
+        result.pruned_count, 1,
+        "only the retired+aged duplicate is pruned"
+    );
 
     let at_path: Vec<&ArtifactEntry> = reg
         .manifest()

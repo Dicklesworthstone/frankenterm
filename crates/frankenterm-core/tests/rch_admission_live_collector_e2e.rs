@@ -16,9 +16,9 @@
 use std::path::{Path, PathBuf};
 
 use frankenterm_core::rch_admission::{
-    build_rch_admission_report, collect_live_rch_admission_input, RchAdmissionCommandDiagnostic,
-    RchAdmissionCollectorInput, RchAdmissionLocalDiskDiagnostic, RchAdmissionProbeDiagnostic,
-    RchAdmissionProbeStatus,
+    RchAdmissionCollectorInput, RchAdmissionCommandDiagnostic, RchAdmissionLocalDiskDiagnostic,
+    RchAdmissionProbeDiagnostic, RchAdmissionProbeStatus, build_rch_admission_report,
+    collect_live_rch_admission_input,
 };
 use frankenterm_core::rch_admission_surface::{RchAdmissionSurface, RchAdmissionSurfaceKind};
 
@@ -97,7 +97,10 @@ fn doctor_surface_reflects_live_input_with_advisory_banner() {
 
     // The advisory not-proof banner is ALWAYS the first line — the surface must
     // never let an operator mistake admission advice for a green build proof.
-    assert!(surface.advisory_only, "doctor surface must be advisory-only");
+    assert!(
+        surface.advisory_only,
+        "doctor surface must be advisory-only"
+    );
     assert_eq!(
         lines.first().map(String::as_str),
         Some(surface.not_proof_banner.as_str()),
@@ -175,7 +178,9 @@ fn doctor_surface_is_data_driven_not_canned() {
     // the disk-space condition rather than generic boilerplate.
     let enospc_text = enospc_lines.join("\n").to_lowercase();
     assert!(
-        enospc_text.contains("space") || enospc_text.contains("enospc") || enospc_text.contains("disk"),
+        enospc_text.contains("space")
+            || enospc_text.contains("enospc")
+            || enospc_text.contains("disk"),
         "ENOSPC doctor output must name the disk-space condition; got:\n{enospc_text}"
     );
 

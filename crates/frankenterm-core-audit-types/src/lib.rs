@@ -82,10 +82,10 @@ pub mod migration_rehearsal;
 // Both are leaf-clean (zero `crate::*` deps in their source).
 pub mod mdl_extraction;
 pub mod policy_decision_log_engine;
+pub mod product_journey_catalog;
 pub mod proof_doctor;
 pub mod proof_handoff;
 pub mod proof_lane;
-pub mod product_journey_catalog;
 pub mod recorder_audit_engine;
 // [ft-xcsm0 / ft-8nqx0 Phase 4] Recorder + session retention POLICY DTOs.
 // Engines (`RetentionManager`, `cleanup_sessions`) stay in

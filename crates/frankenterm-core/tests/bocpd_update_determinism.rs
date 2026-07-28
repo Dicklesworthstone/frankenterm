@@ -48,10 +48,7 @@ fn change_points_match(a: &Option<ChangePoint>, b: &Option<ChangePoint>) -> bool
 }
 
 fn posteriors_match(a: &[f64], b: &[f64]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| x.to_bits() == y.to_bits())
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 #[test]
@@ -69,9 +66,21 @@ fn two_fresh_models_on_identical_sequence_are_bit_identical() {
         );
 
         // Every derived getter must agree, bit-for-bit, at every step.
-        assert_eq!(a.observation_count(), b.observation_count(), "obs count @ {step}");
-        assert_eq!(a.change_point_count(), b.change_point_count(), "cp count @ {step}");
-        assert_eq!(a.map_run_length(), b.map_run_length(), "map run length @ {step}");
+        assert_eq!(
+            a.observation_count(),
+            b.observation_count(),
+            "obs count @ {step}"
+        );
+        assert_eq!(
+            a.change_point_count(),
+            b.change_point_count(),
+            "cp count @ {step}"
+        );
+        assert_eq!(
+            a.map_run_length(),
+            b.map_run_length(),
+            "map run length @ {step}"
+        );
         assert_eq!(a.in_warmup(), b.in_warmup(), "warmup @ {step}");
         assert_eq!(
             a.change_point_probability().to_bits(),

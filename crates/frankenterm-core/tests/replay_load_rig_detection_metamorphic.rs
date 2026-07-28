@@ -37,11 +37,10 @@ fn detection_probe_is_independent_of_capture_tuning() {
     // egress frames by the production PatternEngine, so it MUST be identical no
     // matter how the CAPTURE-mode knobs are tuned. A synthetic-over-config
     // detector would move with these knobs; the real one cannot.
-    let baseline = ChaosScaleHarness::run_replay_corpus_load_rig(
-        ReplayCorpusLoadRigConfig::target_200_pane(),
-    )
-    .expect("rig runs")
-    .detection_probe;
+    let baseline =
+        ChaosScaleHarness::run_replay_corpus_load_rig(ReplayCorpusLoadRigConfig::target_200_pane())
+            .expect("rig runs")
+            .detection_probe;
 
     let mut tuned = ReplayCorpusLoadRigConfig::target_200_pane();
     tuned.poll_interval_ms = 1234;
@@ -58,8 +57,14 @@ fn detection_probe_is_independent_of_capture_tuning() {
         "detection probe must be capture-tuning-independent — it scans the real corpus \
          egress frames via the production PatternEngine, not a synthetic function of config"
     );
-    assert!(baseline.frames_scanned > 0, "the production engine scanned real frames");
-    assert!(baseline.bytes_scanned > 0, "real bytes were read from the corpus");
+    assert!(
+        baseline.frames_scanned > 0,
+        "the production engine scanned real frames"
+    );
+    assert!(
+        baseline.bytes_scanned > 0,
+        "real bytes were read from the corpus"
+    );
     assert!(baseline.detections >= baseline.panes_with_detections);
 }
 
@@ -69,7 +74,10 @@ fn detection_probe_is_deterministic() {
     // byte-identical probe (golden-style determinism).
     let a = detection_probe_for(200);
     let b = detection_probe_for(200);
-    assert_eq!(a, b, "detection over the deterministic corpus must be reproducible");
+    assert_eq!(
+        a, b,
+        "detection over the deterministic corpus must be reproducible"
+    );
 }
 
 #[test]
@@ -100,10 +108,9 @@ fn detection_probe_scales_with_pane_count() {
 
 #[test]
 fn capture_metrics_are_not_the_old_synthetic_formulas() {
-    let report = ChaosScaleHarness::run_replay_corpus_load_rig(
-        ReplayCorpusLoadRigConfig::target_200_pane(),
-    )
-    .expect("rig runs");
+    let report =
+        ChaosScaleHarness::run_replay_corpus_load_rig(ReplayCorpusLoadRigConfig::target_200_pane())
+            .expect("rig runs");
     let poll = report
         .mode_result(CaptureMode::Poll)
         .expect("poll mode recorded");

@@ -15,9 +15,9 @@
 //! state mapping + reason-code precedence, and asserts JSON serde stability.
 
 use frankenterm_core::degraded_mode::{
-    contract_for_source_snapshot, contract_for_surface, DegradedModeAction, DegradedModeContract,
-    DegradedModeRestoreCondition, DegradedModeState, DegradedModeSurface, DEGRADED_MODE_CONTRACT_ID,
-    DEGRADED_MODE_SCHEMA_VERSION,
+    DEGRADED_MODE_CONTRACT_ID, DEGRADED_MODE_SCHEMA_VERSION, DegradedModeAction,
+    DegradedModeContract, DegradedModeRestoreCondition, DegradedModeState, DegradedModeSurface,
+    contract_for_source_snapshot, contract_for_surface,
 };
 use frankenterm_core::operating_envelope::{
     OperatingEnvelopeSourceKind, OperatingEnvelopeSourceSnapshot,
@@ -159,8 +159,11 @@ fn admits_treats_forbidden_as_overriding_and_unlisted_as_neither() {
 
     // An action listed in neither set is neither admitted nor forbidden: the
     // contract is an explicit allow/deny list, not an exhaustive verdict.
-    let storage =
-        contract_for_surface(DegradedModeSurface::Storage, DegradedModeState::Degraded, "x");
+    let storage = contract_for_surface(
+        DegradedModeSurface::Storage,
+        DegradedModeState::Degraded,
+        "x",
+    );
     assert!(!storage.admits(DegradedModeAction::RunRemoteProof));
     assert!(!storage.forbids(DegradedModeAction::RunRemoteProof));
 }
@@ -174,7 +177,11 @@ fn admits_treats_forbidden_as_overriding_and_unlisted_as_neither() {
 fn security_critical_action_sets_match_the_doctrine_per_surface() {
     // RCH down: defer proof, keep local hygiene — but NEVER pass off local cargo
     // as proof, restart the service, drain workers, or claim a remote proof ran.
-    let rch = contract_for_surface(DegradedModeSurface::Rch, DegradedModeState::Unavailable, "x");
+    let rch = contract_for_surface(
+        DegradedModeSurface::Rch,
+        DegradedModeState::Unavailable,
+        "x",
+    );
     for admitted in [
         DegradedModeAction::LocalHygieneCheck,
         DegradedModeAction::RecordDeferredProof,
@@ -193,8 +200,11 @@ fn security_critical_action_sets_match_the_doctrine_per_surface() {
 
     // Agent Mail down: Beads-only coordination — never repair/restart the shared
     // service (the AGENTS.md DO-NOT-TOUCH doctrine).
-    let mail =
-        contract_for_surface(DegradedModeSurface::AgentMail, DegradedModeState::Unavailable, "x");
+    let mail = contract_for_surface(
+        DegradedModeSurface::AgentMail,
+        DegradedModeState::Unavailable,
+        "x",
+    );
     assert!(mail.admits(DegradedModeAction::ClaimReadyBead));
     assert!(mail.admits(DegradedModeAction::NonAuthoritativeCoordinationIntent));
     assert!(mail.forbids(DegradedModeAction::RepairAgentMail));
@@ -202,7 +212,11 @@ fn security_critical_action_sets_match_the_doctrine_per_surface() {
 
     // MCP off: robot-CLI equivalents + typed unsupported-resource receipts; no
     // service mutation, no semantic claims.
-    let mcp = contract_for_surface(DegradedModeSurface::Mcp, DegradedModeState::Unavailable, "x");
+    let mcp = contract_for_surface(
+        DegradedModeSurface::Mcp,
+        DegradedModeState::Unavailable,
+        "x",
+    );
     assert!(mcp.admits(DegradedModeAction::RobotCliEquivalent));
     assert!(mcp.admits(DegradedModeAction::EmitUnsupportedResourceReceipt));
     assert!(mcp.forbids(DegradedModeAction::ServiceMutation));
@@ -211,8 +225,11 @@ fn security_critical_action_sets_match_the_doctrine_per_surface() {
 
     // Storage degraded: read-only redacted tail only; no mutation, no search
     // claims, no derived-store rebuild.
-    let storage =
-        contract_for_surface(DegradedModeSurface::Storage, DegradedModeState::Degraded, "x");
+    let storage = contract_for_surface(
+        DegradedModeSurface::Storage,
+        DegradedModeState::Degraded,
+        "x",
+    );
     assert!(storage.admits(DegradedModeAction::RawRedactedGetText));
     assert!(storage.forbids(DegradedModeAction::StorageMutation));
     assert!(storage.forbids(DegradedModeAction::SearchClaims));
@@ -220,8 +237,11 @@ fn security_critical_action_sets_match_the_doctrine_per_surface() {
 
     // Semantic pane unavailable: raw redacted text (confidence-downgraded); no
     // semantic-zone claim, no strict verified-submit.
-    let semantic =
-        contract_for_surface(DegradedModeSurface::SemanticPane, DegradedModeState::Unavailable, "x");
+    let semantic = contract_for_surface(
+        DegradedModeSurface::SemanticPane,
+        DegradedModeState::Unavailable,
+        "x",
+    );
     assert!(semantic.admits(DegradedModeAction::RawRedactedGetText));
     assert!(semantic.forbids(DegradedModeAction::SemanticZoneClaim));
     assert!(semantic.forbids(DegradedModeAction::StrictVerifiedSubmit));
@@ -235,8 +255,7 @@ fn security_critical_action_sets_match_the_doctrine_per_surface() {
 
     // Beads degraded: comment/file blockers, but never claim ready work against a
     // stale graph or edit overlapping dirty paths.
-    let beads =
-        contract_for_surface(DegradedModeSurface::Beads, DegradedModeState::Stale, "x");
+    let beads = contract_for_surface(DegradedModeSurface::Beads, DegradedModeState::Stale, "x");
     assert!(beads.admits(DegradedModeAction::AddBeadsComment));
     assert!(beads.admits(DegradedModeAction::CreateBlockerBead));
     assert!(beads.forbids(DegradedModeAction::ClaimReadyBead));
@@ -300,10 +319,19 @@ fn snapshot_maps_each_non_available_state_to_a_contract() {
 fn snapshot_surface_mapping_and_unmapped_kinds() {
     // The four dependency kinds with a degraded-mode doctrine map to a surface.
     let mapped = [
-        (OperatingEnvelopeSourceKind::AgentMail, DegradedModeSurface::AgentMail),
+        (
+            OperatingEnvelopeSourceKind::AgentMail,
+            DegradedModeSurface::AgentMail,
+        ),
         (OperatingEnvelopeSourceKind::Rch, DegradedModeSurface::Rch),
-        (OperatingEnvelopeSourceKind::Beads, DegradedModeSurface::Beads),
-        (OperatingEnvelopeSourceKind::RobotInventory, DegradedModeSurface::SemanticPane),
+        (
+            OperatingEnvelopeSourceKind::Beads,
+            DegradedModeSurface::Beads,
+        ),
+        (
+            OperatingEnvelopeSourceKind::RobotInventory,
+            DegradedModeSurface::SemanticPane,
+        ),
     ];
     for (kind, expected_surface) in mapped {
         let snapshot = OperatingEnvelopeSourceSnapshot::new("src", kind).unavailable("down");
@@ -336,7 +364,9 @@ fn snapshot_reason_code_follows_documented_precedence() {
     let unavailable = OperatingEnvelopeSourceSnapshot::new("rch", OperatingEnvelopeSourceKind::Rch)
         .unavailable("rch.unavailable_reason");
     assert_eq!(
-        contract_for_source_snapshot(&unavailable).unwrap().reason_code,
+        contract_for_source_snapshot(&unavailable)
+            .unwrap()
+            .reason_code,
         "rch.unavailable_reason"
     );
 
@@ -371,8 +401,16 @@ fn snapshot_reason_code_follows_documented_precedence() {
 
 #[test]
 fn contract_is_deterministic_and_json_round_trips() {
-    let a = contract_for_surface(DegradedModeSurface::Rch, DegradedModeState::Unavailable, "rch.x");
-    let b = contract_for_surface(DegradedModeSurface::Rch, DegradedModeState::Unavailable, "rch.x");
+    let a = contract_for_surface(
+        DegradedModeSurface::Rch,
+        DegradedModeState::Unavailable,
+        "rch.x",
+    );
+    let b = contract_for_surface(
+        DegradedModeSurface::Rch,
+        DegradedModeState::Unavailable,
+        "rch.x",
+    );
     assert_eq!(a, b, "contract construction must be deterministic");
 
     let json_a = serde_json::to_string(&a).expect("serialize contract");

@@ -27,11 +27,10 @@
 //! W6.5 `wa://swarm/scent` TTL resource, W6.6 notification mutes + dedup.
 
 use frankenterm_core::attention_router::{
-    build_attention_router_next_view, build_attention_router_snapshot,
-    build_attention_router_surface_payload, AttentionRouterSeverity,
-    AttentionRouterSourceAdapterInput, AttentionRouterSourceFact, AttentionRouterSourceFactKind,
-    AttentionRouterSourceHealth, AttentionRouterSourceKind, AttentionRouterSourceObservation,
-    AttentionRouterSurface,
+    AttentionRouterSeverity, AttentionRouterSourceAdapterInput, AttentionRouterSourceFact,
+    AttentionRouterSourceFactKind, AttentionRouterSourceHealth, AttentionRouterSourceKind,
+    AttentionRouterSourceObservation, AttentionRouterSurface, build_attention_router_next_view,
+    build_attention_router_snapshot, build_attention_router_surface_payload,
 };
 use frankenterm_core::intervention_console::{
     ApprovalStatus, EmergencyScope, InterventionAction, InterventionConsole, PaneControlState,
@@ -255,7 +254,10 @@ fn w6_2_next_view_is_severity_dominant_and_explainable() {
     let snapshot = build_attention_router_snapshot(&cockpit_input());
     let view = build_attention_router_next_view(&snapshot, None);
 
-    assert!(view.advisory, "`next` is advisory, never an exclusive gateway");
+    assert!(
+        view.advisory,
+        "`next` is advisory, never an exclusive gateway"
+    );
     assert_eq!(view.total_items, 5);
     assert_eq!(view.returned_items, 5);
     assert!(view.cursor.is_none(), "no budget => no continuation cursor");
@@ -371,7 +373,10 @@ fn w6_2_next_view_budget_elides_with_continuation_cursor() {
 
     // A zero budget still emits the top entry — `next` is never empty.
     let minimal = build_attention_router_next_view(&snapshot, Some(0));
-    assert_eq!(minimal.returned_items, 1, "next is never empty when items exist");
+    assert_eq!(
+        minimal.returned_items, 1,
+        "next is never empty when items exist"
+    );
     assert!(minimal.cursor.is_some());
 
     // A generous budget returns everything with no cursor, identical to no budget.
@@ -390,7 +395,11 @@ fn w6_3_emergency_stop_blocks_resume_and_audits_the_denial() {
     let mut console = InterventionConsole::new();
     console.register_pane(1);
 
-    assert!(console.execute("op", InterventionAction::PausePane { pane_id: 1 }).success);
+    assert!(
+        console
+            .execute("op", InterventionAction::PausePane { pane_id: 1 })
+            .success
+    );
     assert_eq!(console.pane_state(1), PaneControlState::Paused);
 
     // Trip the global kill switch.
@@ -441,7 +450,10 @@ fn w6_3_emergency_stop_blocks_resume_and_audits_the_denial() {
             .success
     );
     let resume2 = console.execute("op", InterventionAction::ResumePane { pane_id: 1 });
-    assert!(resume2.success, "resume must succeed once the stop is released");
+    assert!(
+        resume2.success,
+        "resume must succeed once the stop is released"
+    );
     assert_eq!(console.pane_state(1), PaneControlState::Active);
 }
 
@@ -494,7 +506,10 @@ fn w6_3_approval_is_a_one_shot_token() {
 
     // The token is one-shot: re-approving fails and does not re-increment.
     let replay = console.execute("op", InterventionAction::ApproveRequest { request_id });
-    assert!(!replay.success, "an already-consumed token cannot be re-approved");
+    assert!(
+        !replay.success,
+        "an already-consumed token cannot be re-approved"
+    );
     assert!(replay.message.contains("not Pending"));
     assert_eq!(
         console.snapshot().total_approvals_processed,
@@ -532,9 +547,18 @@ fn w6_3_pending_approval_ttl_boundary_is_exact() {
         ttl_ms: 500,
         status: ApprovalStatus::Pending,
     };
-    assert!(!approval.is_expired(1_000), "not expired at creation instant");
-    assert!(!approval.is_expired(1_499), "not expired one ms before deadline");
-    assert!(approval.is_expired(1_500), "expired exactly at created + ttl");
+    assert!(
+        !approval.is_expired(1_000),
+        "not expired at creation instant"
+    );
+    assert!(
+        !approval.is_expired(1_499),
+        "not expired one ms before deadline"
+    );
+    assert!(
+        approval.is_expired(1_500),
+        "expired exactly at created + ttl"
+    );
     assert!(approval.is_expired(5_000), "expired well past the deadline");
 
     let no_ttl = PendingApproval {
@@ -556,7 +580,10 @@ fn w6_3_stale_approvals_expire_and_cannot_be_approved() {
     std::thread::sleep(std::time::Duration::from_millis(25));
 
     let expired = console.expire_stale_approvals();
-    assert_eq!(expired, 1, "the lone stale approval must be swept exactly once");
+    assert_eq!(
+        expired, 1,
+        "the lone stale approval must be swept exactly once"
+    );
     assert!(
         console.pending_approvals().is_empty(),
         "expired approvals must drop out of the pending queue"
@@ -564,5 +591,8 @@ fn w6_3_stale_approvals_expire_and_cannot_be_approved() {
 
     // An expired token can no longer be approved.
     let late = console.execute("op", InterventionAction::ApproveRequest { request_id });
-    assert!(!late.success, "an expired approval token cannot be approved");
+    assert!(
+        !late.success,
+        "an expired approval token cannot be approved"
+    );
 }

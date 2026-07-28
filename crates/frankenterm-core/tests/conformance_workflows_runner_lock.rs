@@ -21,8 +21,7 @@ use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
 use frankenterm_core::workflows::{
     BoxFuture, CxPolicyInjector, ManualWorkflowRunOutcome, PaneWorkflowLockManager, StepResult,
     WaitCondition, Workflow, WorkflowContext, WorkflowEngine, WorkflowExecutionResult,
-    WorkflowRunner, WorkflowRunnerConfig, WorkflowStartResult, WorkflowStep,
-    WorkflowTriggerPolicy,
+    WorkflowRunner, WorkflowRunnerConfig, WorkflowStartResult, WorkflowStep, WorkflowTriggerPolicy,
 };
 
 const PANE_ID: u64 = 7204;

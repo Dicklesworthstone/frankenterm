@@ -52,13 +52,19 @@ fn cdc_round_trip_byte_identical_over_capture_corpus() {
         let lines = [
             format!("{prompt}run task {}", i % 7),
             "=== redraw banner: status OK ===".to_string(),
-            format!("output {i}: unicode ✓ café ★ 日本語 — padded to a realistic terminal width here"),
+            format!(
+                "output {i}: unicode ✓ café ★ 日本語 — padded to a realistic terminal width here"
+            ),
             if i % 5 == 0 {
                 "multi\nline\nembedded\r\ncontent".to_string()
             } else {
                 format!("line {i}")
             },
-            if i % 11 == 0 { String::new() } else { "tail".to_string() },
+            if i % 11 == 0 {
+                String::new()
+            } else {
+                "tail".to_string()
+            },
         ];
         for l in lines {
             cdc.push_line(l.clone());
@@ -111,7 +117,11 @@ fn cdc_dedup_saves_bytes_on_repeated_content() {
         }
     }
 
-    assert_eq!(warm_dump(&cdc), warm_dump(&legacy), "dedup must stay byte-identical");
+    assert_eq!(
+        warm_dump(&cdc),
+        warm_dump(&legacy),
+        "dedup must stay byte-identical"
+    );
     assert!(
         cdc.warm_total_bytes() < legacy.warm_total_bytes(),
         "dedup must shrink warm bytes on repeats: cdc={} legacy={}",
@@ -138,7 +148,11 @@ fn cdc_eviction_preserves_resident_pages_and_accounting() {
 
     let mut pushed = Vec::new();
     for i in 0..600usize {
-        let l = format!("evt {} :: {}", i % 9, if i % 3 == 0 { "REPEATED-PAYLOAD" } else { "x" });
+        let l = format!(
+            "evt {} :: {}",
+            i % 9,
+            if i % 3 == 0 { "REPEATED-PAYLOAD" } else { "x" }
+        );
         cdc.push_line(l.clone());
         pushed.push(l);
     }

@@ -295,7 +295,10 @@ fn reaches_forbidden(
     // first. The witness then begins with the rendered root type.
     for ident in &g.root_type_idents {
         if is_forbidden(ident) {
-            return Some((ident.clone(), vec![g.root_type_rendered.clone(), ident.clone()]));
+            return Some((
+                ident.clone(),
+                vec![g.root_type_rendered.clone(), ident.clone()],
+            ));
         }
     }
 
@@ -460,9 +463,7 @@ impl<'a> FileVisitor<'a> {
 
 /// Parse a `thread_local!`-style token stream into `(ident, line, type)`
 /// tuples. Each entry is `[#attrs] [pub] static IDENT : TYPE = EXPR ;`.
-fn parse_static_items(
-    tokens: &proc_macro2::TokenStream,
-) -> Vec<(String, usize, Type)> {
+fn parse_static_items(tokens: &proc_macro2::TokenStream) -> Vec<(String, usize, Type)> {
     use syn::parse::{Parse, ParseStream};
     use syn::{Token, Visibility};
 
@@ -509,9 +510,7 @@ fn parse_static_items(
 
 /// Parse a `lazy_static!`-style token stream into `(ident, line, type)`
 /// tuples. Each entry is `[#attrs] [pub] static ref IDENT : TYPE = EXPR ;`.
-fn parse_static_ref_items(
-    tokens: &proc_macro2::TokenStream,
-) -> Vec<(String, usize, Type)> {
+fn parse_static_ref_items(tokens: &proc_macro2::TokenStream) -> Vec<(String, usize, Type)> {
     use syn::parse::{Parse, ParseStream};
     use syn::{Token, Visibility};
 
@@ -727,21 +726,16 @@ fn cfg_is_test_only(meta: &syn::Meta) -> bool {
 /// skip test functions whose bodies declare `thread_local!`/`static` globals
 /// (those are not production caches and must not be flagged).
 fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path()
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "test")
-    })
+    attrs
+        .iter()
+        .any(|a| a.path().segments.last().is_some_and(|s| s.ident == "test"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn build_graph_and_globals(
-        src: &str,
-    ) -> (BTreeMap<String, BTreeSet<String>>, Vec<GlobalSite>) {
+    fn build_graph_and_globals(src: &str) -> (BTreeMap<String, BTreeSet<String>>, Vec<GlobalSite>) {
         let parsed = syn::parse_file(src).unwrap();
         let mut type_graph = BTreeMap::new();
         let mut globals = Vec::new();
@@ -807,7 +801,10 @@ mod tests {
             struct Run { positions: Vec<Pos> }
             struct Pos { x: f32, y: f32, idx: u32 }
         "#;
-        assert!(first_finding(src).is_none(), "POD-only global must be clean");
+        assert!(
+            first_finding(src).is_none(),
+            "POD-only global must be clean"
+        );
     }
 
     #[test]
@@ -963,7 +960,11 @@ mod tests {
             }
         "#;
         let (_g, globals) = build_graph_and_globals(src);
-        assert_eq!(globals.len(), 1, "#[cfg(not(test))] is production — must scan");
+        assert_eq!(
+            globals.len(),
+            1,
+            "#[cfg(not(test))] is production — must scan"
+        );
         let f = first_finding(src).expect("production global reaching Sprite must flag");
         assert_eq!(f.forbidden_leaf, "Sprite");
     }
@@ -1059,7 +1060,10 @@ mod tests {
             }
         "#;
         let (_g, globals) = build_graph_and_globals(src);
-        assert!(globals.is_empty(), "#[cfg(test)] fn-local global must be skipped");
+        assert!(
+            globals.is_empty(),
+            "#[cfg(test)] fn-local global must be skipped"
+        );
     }
 
     #[test]
@@ -1074,6 +1078,9 @@ mod tests {
             }
         "#;
         let (_g, globals) = build_graph_and_globals(src);
-        assert!(globals.is_empty(), "#[test] fn-local global must be skipped");
+        assert!(
+            globals.is_empty(),
+            "#[test] fn-local global must be skipped"
+        );
     }
 }

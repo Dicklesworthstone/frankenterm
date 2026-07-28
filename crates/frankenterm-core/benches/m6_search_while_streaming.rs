@@ -518,8 +518,7 @@ fn emit_evidence(rows: &[EvidenceRow]) {
             } else {
                 f64::INFINITY
             };
-            let above_noise =
-                ratio >= ABOVE_NOISE_RATIO && cont_wait_p95 >= ABOVE_NOISE_ABS_NS;
+            let above_noise = ratio >= ABOVE_NOISE_RATIO && cont_wait_p95 >= ABOVE_NOISE_ABS_NS;
 
             let verdict = VerdictRow {
                 test_type: "m6-lock-wait-verdict",

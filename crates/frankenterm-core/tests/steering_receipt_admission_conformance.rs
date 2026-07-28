@@ -14,11 +14,15 @@
 //!   4. tampering a bound field without re-sealing `receipt_id` is rejected
 //!      (no forgery).
 
-use frankenterm_core::steer_run::{receipt_admits_action, steer_run_gate, SteerRunGate};
+use frankenterm_core::steer_run::{SteerRunGate, receipt_admits_action, steer_run_gate};
 use frankenterm_core::steering::SteeringReceipt;
 
 /// A valid, sealed `envelope.admit` receipt bound to `tx_hash`.
-fn admit_receipt(tx_hash: Option<&str>, created_at_ms: i64, ttl_ms: Option<i64>) -> SteeringReceipt {
+fn admit_receipt(
+    tx_hash: Option<&str>,
+    created_at_ms: i64,
+    ttl_ms: Option<i64>,
+) -> SteeringReceipt {
     SteeringReceipt::new(
         "objective",
         "ws",
@@ -57,7 +61,10 @@ fn receipt_admits_only_the_exact_bound_plan_hash() {
         "",               // empty
     ] {
         let g = receipt_admits_action(&r, other, 5_000);
-        assert!(!g.is_valid(), "must not admit a non-exact plan hash: {other:?}");
+        assert!(
+            !g.is_valid(),
+            "must not admit a non-exact plan hash: {other:?}"
+        );
         assert!(
             matches!(g, SteerRunGate::HashMismatch { contract: "tx" }),
             "non-exact plan hash {other:?} must be a typed tx HashMismatch, got {g:?}"
@@ -83,7 +90,10 @@ fn steer_run_gate_fails_closed_on_unverifiable_tx_binding() {
     // Captured a tx binding, but the caller supplied no live tx hash to confirm it.
     let g = steer_run_gate(&r, None, None, 5_000);
     assert!(!g.is_valid());
-    assert!(matches!(g, SteerRunGate::UnverifiableBinding { contract: "tx" }));
+    assert!(matches!(
+        g,
+        SteerRunGate::UnverifiableBinding { contract: "tx" }
+    ));
 }
 
 #[test]
@@ -97,7 +107,12 @@ fn steer_run_gate_fails_closed_on_unverifiable_mission_binding() {
     // the mission path.)
     let g = steer_run_gate(&r, None, Some("tx-A"), 5_000);
     assert!(!g.is_valid());
-    assert!(matches!(g, SteerRunGate::UnverifiableBinding { contract: "mission" }));
+    assert!(matches!(
+        g,
+        SteerRunGate::UnverifiableBinding {
+            contract: "mission"
+        }
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +128,10 @@ fn expired_receipt_does_not_admit_no_replay_past_ttl() {
         "must admit before expiry"
     );
     let g = receipt_admits_action(&r, "plan-A", 5_000);
-    assert!(!g.is_valid(), "must not admit after expiry (no replay past TTL)");
+    assert!(
+        !g.is_valid(),
+        "must not admit after expiry (no replay past TTL)"
+    );
     assert!(matches!(g, SteerRunGate::Expired));
 }
 
@@ -275,7 +293,10 @@ fn moving_a_receipt_across_workspaces_without_resealing_is_rejected() {
 
     r.workspace_id = "other-workspace".to_string();
     let g = receipt_admits_action(&r, "plan-A", 5_000);
-    assert!(!g.is_valid(), "a cross-workspace-repurposed receipt must not admit");
+    assert!(
+        !g.is_valid(),
+        "a cross-workspace-repurposed receipt must not admit"
+    );
     assert!(
         matches!(g, SteerRunGate::Invalid(_)),
         "workspace tamper must surface as Invalid (receipt_id mismatch), got {g:?}"

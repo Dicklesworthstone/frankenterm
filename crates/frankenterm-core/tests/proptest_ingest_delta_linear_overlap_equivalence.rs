@@ -46,7 +46,11 @@ fn canon(r: &DeltaResult) -> (u8, String, String) {
 }
 
 /// Assert the linear (KMP) and quadratic (legacy memchr) arms agree exactly.
-fn assert_arms_agree(previous: &str, current: &str, overlap_size: usize) -> Result<(), TestCaseError> {
+fn assert_arms_agree(
+    previous: &str,
+    current: &str,
+    overlap_size: usize,
+) -> Result<(), TestCaseError> {
     let quadratic = extract_delta_with_overlap_mode(previous, current, overlap_size, false);
     let linear = extract_delta_with_overlap_mode(previous, current, overlap_size, true);
     prop_assert_eq!(
@@ -182,19 +186,9 @@ fn pinned_overlap_cases_agree_and_match_expectation() {
             DeltaResult::Content(" peace".to_string()),
         ),
         // Box-drawing (3-byte) overlap boundary: shared "│─" tail/head.
-        (
-            "ab│─",
-            "│─cd",
-            64,
-            DeltaResult::Content("cd".to_string()),
-        ),
+        ("ab│─", "│─cd", 64, DeltaResult::Content("cd".to_string())),
         // Emoji (4-byte) overlap boundary: shared "🚀" tail/head.
-        (
-            "x🚀",
-            "🚀y",
-            64,
-            DeltaResult::Content("y".to_string()),
-        ),
+        ("x🚀", "🚀y", 64, DeltaResult::Content("y".to_string())),
         // Full overlap (current is wholly a suffix of previous) → the delta is
         // empty, so the algorithm reports content_changed_without_append.
         (

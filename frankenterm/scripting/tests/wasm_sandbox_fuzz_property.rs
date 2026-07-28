@@ -44,7 +44,10 @@ fn push_uleb_u32(out: &mut Vec<u8>, mut value: u32) {
 /// Append a WASM section: `id` + ULEB(len) + payload.
 fn push_section(module: &mut Vec<u8>, section_id: u8, payload: &[u8]) {
     module.push(section_id);
-    push_uleb_u32(module, u32::try_from(payload.len()).expect("section length fits in u32"));
+    push_uleb_u32(
+        module,
+        u32::try_from(payload.len()).expect("section length fits in u32"),
+    );
     module.extend_from_slice(payload);
 }
 
@@ -110,12 +113,12 @@ fn wasm_loader_rejects_malformed_inputs_without_panic_fuzz() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     let mut inputs: Vec<Vec<u8>> = vec![
-        Vec::new(),                                // empty
-        b"\0asm".to_vec(),                         // magic only, truncated version
-        b"\0asm\x01\0\0\0".to_vec(),               // valid header, no config export
-        b"AAAA\x01\0\0\0".to_vec(),                // wrong magic
-        b"\0asm\xff\xff\xff\xff".to_vec(),         // bad version
-        vec![0x05, 0xff, 0xff, 0xff, 0xff, 0x0f],  // section id 5 + huge ULEB len, no body
+        Vec::new(),                               // empty
+        b"\0asm".to_vec(),                        // magic only, truncated version
+        b"\0asm\x01\0\0\0".to_vec(),              // valid header, no config export
+        b"AAAA\x01\0\0\0".to_vec(),               // wrong magic
+        b"\0asm\xff\xff\xff\xff".to_vec(),        // bad version
+        vec![0x05, 0xff, 0xff, 0xff, 0xff, 0x0f], // section id 5 + huge ULEB len, no body
         {
             // valid header + memory section claiming a payload that isn't present
             let mut m = b"\0asm\x01\0\0\0".to_vec();
@@ -163,11 +166,8 @@ fn wasm_engine_has_no_host_inheritance_leak_vectors_ft_0dki4() {
     // This test lives in a separate file from the engine, so the needles below
     // cannot match their own assertion text. `.inherit_stderr()` (diagnostics
     // only, not a secret-bearing channel) is intentionally NOT in the deny list.
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/wasm_engine.rs"
-    ))
-    .expect("read wasm_engine.rs source");
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wasm_engine.rs"))
+        .expect("read wasm_engine.rs source");
 
     for needle in [
         ".inherit_env(",     // host env -> guest environ (the ft-0dki4 leak)

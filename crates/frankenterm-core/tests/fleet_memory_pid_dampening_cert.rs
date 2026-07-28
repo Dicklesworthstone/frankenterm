@@ -227,8 +227,14 @@ fn golden_hysteresis_mode_matches_legacy_fractions() {
     //   Emergency retain 0/1 → target 0,    evict 3000 → pane2: 20, pane1: 10
     let expected: [(FleetPressureTier, (u8, usize, usize, Vec<(u64, usize)>)); 3] = [
         (FleetPressureTier::Elevated, (1, 3000, 2250, vec![(2, 8)])),
-        (FleetPressureTier::Critical, (2, 3000, 750, vec![(2, 20), (1, 3)])),
-        (FleetPressureTier::Emergency, (3, 3000, 0, vec![(2, 20), (1, 10)])),
+        (
+            FleetPressureTier::Critical,
+            (2, 3000, 750, vec![(2, 20), (1, 3)]),
+        ),
+        (
+            FleetPressureTier::Emergency,
+            (3, 3000, 0, vec![(2, 20), (1, 10)]),
+        ),
     ];
 
     for (tier, want) in expected {

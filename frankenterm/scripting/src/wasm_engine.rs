@@ -811,11 +811,9 @@ mod tests {
         // environment (it copied host secrets into the guest environ), and the
         // store must install a memory limiter. Source-level so it holds without
         // a WAT toolchain dependency.
-        let src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/wasm_engine.rs"
-        ))
-        .expect("read wasm_engine.rs source");
+        let src =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/wasm_engine.rs"))
+                .expect("read wasm_engine.rs source");
         // Needles are assembled from fragments so this guard does not match its
         // own assertion text — only genuine production callsites count.
         let inherit_env_call = concat!(".inherit", "_env(");

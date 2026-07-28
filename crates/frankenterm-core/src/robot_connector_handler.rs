@@ -375,10 +375,7 @@ pub fn handle_connector_action(
     }
 
     let operation = action.op_name().to_string();
-    let connector_id = action
-        .target_connector_id()
-        .unwrap_or_default()
-        .to_string();
+    let connector_id = action.target_connector_id().unwrap_or_default().to_string();
 
     // ── dry-run: side-effect-free plan receipt ───────────────────────────
     if action.dry_run() {

@@ -26,14 +26,14 @@
 //! scope for this classifier slice.
 
 use frankenterm_core::deferred_proof_replay::{
-    DeferredProofReplayAttemptOutcome as Outcome, DeferredProofReplayAttemptRecord,
     DEFERRED_PROOF_REPLAY_ATTEMPT_CONTRACT_ID, DEFERRED_PROOF_REPLAY_SCHEMA_VERSION,
+    DeferredProofReplayAttemptOutcome as Outcome, DeferredProofReplayAttemptRecord,
 };
 use frankenterm_core::proof_intent::{ProofIntent, ProofKind, ProofRedactionPolicy, ProofScope};
 use frankenterm_core::proof_quality::{
-    classify_proof_quality, ProofArtifactObservation, ProofExecutionVenue, ProofQualityInput,
+    PROOF_QUALITY_CONTRACT_ID, ProofArtifactObservation, ProofExecutionVenue, ProofQualityInput,
     ProofQualityReceipt, ProofQualityScope, ProofReleaseImpact, ProofSourceState,
-    ProofTerminalClass, PROOF_QUALITY_CONTRACT_ID,
+    ProofTerminalClass, classify_proof_quality,
 };
 
 const SRC: &str = "sha256:current-tree";
@@ -119,7 +119,10 @@ fn only_confirmed_remote_pass_validates_every_other_outcome_fails_closed() {
     let intent = pkg_intent(); // no expected artifact -> artifact NotExpected
     for outcome in ALL_OUTCOMES {
         let is_pass = outcome == Outcome::RemoteProofPassed;
-        let remote_reached = matches!(outcome, Outcome::RemoteProofPassed | Outcome::RemoteProofFailed);
+        let remote_reached = matches!(
+            outcome,
+            Outcome::RemoteProofPassed | Outcome::RemoteProofFailed
+        );
         let local_fallback = outcome == Outcome::BlockedLocalFallback;
         let exit = Some(if is_pass { 0 } else { 1 });
         let attempt = attempt(outcome, remote_reached, local_fallback, exit);
@@ -139,7 +142,10 @@ fn only_confirmed_remote_pass_validates_every_other_outcome_fails_closed() {
         if is_pass {
             assert_eq!(receipt.terminal_class, ProofTerminalClass::ValidRemoteProof);
             assert_eq!(receipt.execution_venue, ProofExecutionVenue::RemoteWorker);
-            assert!(receipt.blockers.is_empty(), "valid proof carries no blockers");
+            assert!(
+                receipt.blockers.is_empty(),
+                "valid proof carries no blockers"
+            );
         } else {
             assert_ne!(
                 receipt.terminal_class,
@@ -227,7 +233,10 @@ fn release_impact_and_scope_axes_classify_from_intent() {
         artifact_observation: ProofArtifactObservation::PresentValid,
         release_impact: None,
     });
-    assert_eq!(supplemental.release_impact, ProofReleaseImpact::Supplemental);
+    assert_eq!(
+        supplemental.release_impact,
+        ProofReleaseImpact::Supplemental
+    );
     assert_eq!(
         supplemental.proof_scope,
         ProofQualityScope::Package {

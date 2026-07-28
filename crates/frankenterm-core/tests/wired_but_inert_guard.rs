@@ -158,10 +158,16 @@ fn prod_three() {}
     let prod = production_only(sample);
     assert!(prod.contains("fn prod_one"), "kept production fn one");
     assert!(prod.contains("fn prod_two"), "kept production fn two");
-    assert!(prod.contains("fn prod_three"), "kept production fn after braceless cfg(test) use");
+    assert!(
+        prod.contains("fn prod_three"),
+        "kept production fn after braceless cfg(test) use"
+    );
     assert!(!prod.contains("fn helper"), "stripped test-module body");
     assert!(!prod.contains("secret"), "stripped test-module body");
-    assert!(!prod.contains("HashMap"), "stripped braceless cfg(test) item");
+    assert!(
+        !prod.contains("HashMap"),
+        "stripped braceless cfg(test) item"
+    );
 
     // A production needle that ALSO appears only inside a test block must be
     // removed by stripping (this is what stops a stale test copy from masking

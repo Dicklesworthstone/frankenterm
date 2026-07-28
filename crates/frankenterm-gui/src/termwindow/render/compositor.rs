@@ -342,7 +342,11 @@ impl LayerStack {
         // `dirty_rect()` twice.
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
-        scratch.extend(self.layers.iter().map(|l| (l.dirty_rect(), l.opaque(), false)));
+        scratch.extend(
+            self.layers
+                .iter()
+                .map(|l| (l.dirty_rect(), l.opaque(), false)),
+        );
 
         // For each layer i (sorted ascending z), mark it covered if any layer
         // j > i is opaque AND contains layer i's dirty rect. Reads of

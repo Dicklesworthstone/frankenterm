@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_escape_parser::Action;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use frankenterm_escape_parser::parser::Parser;
+use frankenterm_escape_parser::Action;
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use serde_json::json;

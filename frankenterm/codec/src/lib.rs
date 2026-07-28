@@ -16,7 +16,7 @@
 // smol Async streams into codec async APIs, mixed graphs must continue to use
 // the smol path until those callers migrate.
 
-use anyhow::{Context as _, Error, bail};
+use anyhow::{bail, Context as _, Error};
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Alert, ClipboardSelection, SemanticZone, StableRowIndex, TerminalSize};
@@ -89,7 +89,7 @@ pub use bounded_varbincode::deserialize as bounded_varbincode_deserialize;
 /// range-checked, the chunk cache is capped, and reconstructed output is capped
 /// at [`MAX_PDU_SIZE`].
 pub mod cdc_dedup {
-    use anyhow::{Result, bail};
+    use anyhow::{bail, Result};
     use std::collections::HashMap;
     use std::convert::TryFrom;
 

@@ -116,7 +116,11 @@ struct Scorecard {
 impl Scorecard {
     fn rel_delta(&self) -> f64 {
         if self.baseline_value == 0.0 {
-            if self.candidate_value == 0.0 { 0.0 } else { f64::INFINITY }
+            if self.candidate_value == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            }
         } else {
             (self.candidate_value - self.baseline_value) / self.baseline_value
         }
@@ -248,7 +252,11 @@ pub fn harness_config() -> ScrollbackConfig {
 
 /// Run one pane: feed the whole trace, then read its resident footprint and CDC
 /// engagement. Deterministic and env-free.
-fn run_pane(trace: &[String], arm: CdcArm, config: &ScrollbackConfig) -> (usize, bool, Option<usize>) {
+fn run_pane(
+    trace: &[String],
+    arm: CdcArm,
+    config: &ScrollbackConfig,
+) -> (usize, bool, Option<usize>) {
     let mut sb = arm.construct(config);
     for line in trace {
         sb.push_line(line.clone());
@@ -394,7 +402,9 @@ fn adaptive_m4_rss_win_on_redundant_redraw_adjudicated() {
         },
     ];
 
-    println!("\n=== ROUND-7 RSS scorecard: adaptive-M4 on redundant terminal-redraw (deterministic) ===");
+    println!(
+        "\n=== ROUND-7 RSS scorecard: adaptive-M4 on redundant terminal-redraw (deterministic) ==="
+    );
     println!(
         "fleet_panes={FLEET_PANES} lines/pane={LINES_PER_PANE} frame_lines={FRAME_LINES} \
          redraw_frames={REDRAW_FRAMES} status_period={STATUS_PERIOD} \
@@ -420,8 +430,15 @@ fn adaptive_m4_rss_win_on_redundant_redraw_adjudicated() {
     }
 
     // Fail-closed harness invariants (NOT the verdict — that is the emitted data).
-    assert!(off.total_bytes > 0, "off arm stored no resident bytes — trace did not flush warm pages");
-    assert_eq!(off.per_pane_bytes * off.panes, off.total_bytes, "fleet sum must be panes * per-pane");
+    assert!(
+        off.total_bytes > 0,
+        "off arm stored no resident bytes — trace did not flush warm pages"
+    );
+    assert_eq!(
+        off.per_pane_bytes * off.panes,
+        off.total_bytes,
+        "fleet sum must be panes * per-pane"
+    );
     assert!(
         adaptive.adaptive_engaged_panes == FLEET_PANES,
         "adaptive probe failed to engage on a maximally-redundant trace ({}/{} panes) — \
@@ -465,7 +482,9 @@ fn adaptive_m4_no_regression_on_low_redundancy_adjudicated() {
         },
     ];
 
-    println!("\n=== ROUND-7 RSS scorecard: adaptive-M4 on low-redundancy trace (deterministic) ===");
+    println!(
+        "\n=== ROUND-7 RSS scorecard: adaptive-M4 on low-redundancy trace (deterministic) ==="
+    );
     println!(
         "fleet_panes={FLEET_PANES} lines/pane={LINES_PER_PANE} (all unique) \
          | adaptive engaged {}/{} panes (expect 0: probe declines)",
@@ -481,7 +500,10 @@ fn adaptive_m4_no_regression_on_low_redundancy_adjudicated() {
     }
 
     // Fail-closed harness invariants.
-    assert!(off.total_bytes > 0, "off arm stored no resident bytes on low-redundancy trace");
+    assert!(
+        off.total_bytes > 0,
+        "off arm stored no resident bytes on low-redundancy trace"
+    );
     assert_eq!(
         adaptive.adaptive_engaged_panes, 0,
         "adaptive probe engaged CDC on a low-redundancy trace — it must decline to avoid the \

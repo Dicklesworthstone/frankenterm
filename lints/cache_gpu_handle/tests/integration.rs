@@ -29,12 +29,7 @@ fn audit_fixture(name: &str) -> Vec<cache_gpu_handle_lint::Finding> {
     report
         .findings
         .into_iter()
-        .filter(|f| {
-            f.rel_path
-                .file_name()
-                .map(|n| n == name)
-                .unwrap_or(false)
-        })
+        .filter(|f| f.rel_path.file_name().map(|n| n == name).unwrap_or(false))
         .collect()
 }
 
@@ -84,7 +79,10 @@ fn fixtures_dir_produces_exactly_one_finding() {
         "exactly one finding (bad fixture) expected, got {:#?}",
         report.findings
     );
-    assert!(report.total_globals >= 3, "fixtures declare multiple globals");
+    assert!(
+        report.total_globals >= 3,
+        "fixtures declare multiple globals"
+    );
 }
 
 #[test]
@@ -137,11 +135,7 @@ fn real_shapecache_dir_is_clean() {
     let shapecache_findings: Vec<_> = report
         .findings
         .iter()
-        .filter(|f| {
-            f.rel_path
-                .to_string_lossy()
-                .contains("shapecache.rs")
-        })
+        .filter(|f| f.rel_path.to_string_lossy().contains("shapecache.rs"))
         .collect();
     assert!(
         shapecache_findings.is_empty(),

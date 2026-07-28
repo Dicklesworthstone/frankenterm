@@ -156,7 +156,11 @@ fn softstop_pauses_exactly_new_workflow_launches() {
         killswitch_denied(SoftStop, ActionKind::WorkflowRun, None),
         "SoftStop must pause a pane-less WorkflowRun (the ft-l59nq repro)"
     );
-    assert!(killswitch_denied(SoftStop, ActionKind::ConnectorTriggerWorkflow, None));
+    assert!(killswitch_denied(
+        SoftStop,
+        ActionKind::ConnectorTriggerWorkflow,
+        None
+    ));
 
     // Everything that is NOT a new workflow launch must drain (incl. mutating,
     // connector, exec, file, and read actions).

@@ -2372,9 +2372,8 @@ fn mphf_bucket_index(anchor: &str, seed: u64, bucket_count: usize) -> usize {
 
 #[cfg(feature = "patterns-mphf-dispatch")]
 fn mphf_slot_index(anchor: &str, seed: u64, displacement: usize, slot_count: usize) -> usize {
-    let slot_seed = seed
-        ^ 0x9fb2_1c65_1e98_df25
-        ^ (displacement as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let slot_seed =
+        seed ^ 0x9fb2_1c65_1e98_df25 ^ (displacement as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     (mphf_hash(anchor, slot_seed) as usize) % slot_count
 }
 
@@ -5689,18 +5688,43 @@ mod tests {
             "detection COUNT differs for agent {agent:?} on input {text:?}\n  oracle={oracle:#?}\n  sharded={sharded:#?}"
         );
         for (o, s) in oracle.iter().zip(sharded.iter()) {
-            assert_eq!(o.rule_id, s.rule_id, "rule_id/order differs (agent {agent:?}, input {text:?})");
-            assert_eq!(o.agent_type, s.agent_type, "agent_type differs for {}", o.rule_id);
-            assert_eq!(o.event_type, s.event_type, "event_type differs for {}", o.rule_id);
+            assert_eq!(
+                o.rule_id, s.rule_id,
+                "rule_id/order differs (agent {agent:?}, input {text:?})"
+            );
+            assert_eq!(
+                o.agent_type, s.agent_type,
+                "agent_type differs for {}",
+                o.rule_id
+            );
+            assert_eq!(
+                o.event_type, s.event_type,
+                "event_type differs for {}",
+                o.rule_id
+            );
             assert_eq!(o.severity, s.severity, "severity differs for {}", o.rule_id);
             assert!(
                 (o.confidence - s.confidence).abs() < f64::EPSILON,
                 "confidence differs for {}: {} vs {}",
-                o.rule_id, o.confidence, s.confidence
+                o.rule_id,
+                o.confidence,
+                s.confidence
             );
-            assert_eq!(o.extracted, s.extracted, "extracted captures differ for {} (input {text:?})", o.rule_id);
-            assert_eq!(o.matched_text, s.matched_text, "matched_text differs for {} (input {text:?})", o.rule_id);
-            assert_eq!(o.span, s.span, "span differs for {} (input {text:?})", o.rule_id);
+            assert_eq!(
+                o.extracted, s.extracted,
+                "extracted captures differ for {} (input {text:?})",
+                o.rule_id
+            );
+            assert_eq!(
+                o.matched_text, s.matched_text,
+                "matched_text differs for {} (input {text:?})",
+                o.rule_id
+            );
+            assert_eq!(
+                o.span, s.span,
+                "span differs for {} (input {text:?})",
+                o.rule_id
+            );
         }
     }
 
@@ -9840,7 +9864,9 @@ description = "Project lint warning"
 
         let detections = engine.detect_with_context("LIMIT_REACHED\n", &mut ctx);
         assert!(
-            detections.iter().any(|d| d.rule_id == "codex.usage.reached"),
+            detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
             "a genuinely new occurrence must fire even though an earlier hit \
              sits inside the overlap window"
         );
@@ -9861,7 +9887,9 @@ description = "Project lint warning"
 
         let detections = engine.detect_with_context("nothing interesting here\n", &mut ctx);
         assert!(
-            !detections.iter().any(|d| d.rule_id == "codex.usage.reached"),
+            !detections
+                .iter()
+                .any(|d| d.rule_id == "codex.usage.reached"),
             "an occurrence carried only by the overlap must not re-fire"
         );
     }

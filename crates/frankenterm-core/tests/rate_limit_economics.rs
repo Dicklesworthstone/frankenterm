@@ -64,10 +64,22 @@ fn limit_window(
 #[test]
 fn reset_text_parses_across_agent_cli_fixture_formats() {
     // Plain seconds, compact (s/m/h), and "N unit" forms all parse.
-    assert_eq!(parse_retry_after_duration("30"), Some(Duration::from_secs(30)));
-    assert_eq!(parse_retry_after_duration("30s"), Some(Duration::from_secs(30)));
-    assert_eq!(parse_retry_after_duration("5m"), Some(Duration::from_secs(300)));
-    assert_eq!(parse_retry_after_duration("2h"), Some(Duration::from_secs(7200)));
+    assert_eq!(
+        parse_retry_after_duration("30"),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        parse_retry_after_duration("30s"),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        parse_retry_after_duration("5m"),
+        Some(Duration::from_secs(300))
+    );
+    assert_eq!(
+        parse_retry_after_duration("2h"),
+        Some(Duration::from_secs(7200))
+    );
     assert_eq!(
         parse_retry_after_duration("30 seconds"),
         Some(Duration::from_secs(30))
@@ -81,7 +93,10 @@ fn reset_text_parses_across_agent_cli_fixture_formats() {
         Some(Duration::from_secs(7200))
     );
     // Surrounding whitespace is tolerated.
-    assert_eq!(parse_retry_after_duration("  45  "), Some(Duration::from_secs(45)));
+    assert_eq!(
+        parse_retry_after_duration("  45  "),
+        Some(Duration::from_secs(45))
+    );
 }
 
 #[test]
@@ -89,7 +104,14 @@ fn unparseable_reset_text_returns_none_so_caller_uses_conservative_ttl() {
     // Unparseable reset must NOT yield a (wrong) duration — that would silently
     // mis-schedule recovery. It returns None so the ledger applies its
     // conservative TTL fallback instead.
-    for junk in ["", "soon", "later today", "30 lightyears", "abc", "tomorrow"] {
+    for junk in [
+        "",
+        "soon",
+        "later today",
+        "30 lightyears",
+        "abc",
+        "tomorrow",
+    ] {
         assert_eq!(
             parse_retry_after_duration(junk),
             None,
@@ -127,7 +149,10 @@ fn missing_reset_degrades_to_conservative_ttl_and_stays_limited() {
         "must stay limited under the conservative fallback — never silently usable"
     );
     assert!(rec.is_active(60_999));
-    assert!(!rec.is_active(61_000), "usable once the conservative deadline passes");
+    assert!(
+        !rec.is_active(61_000),
+        "usable once the conservative deadline passes"
+    );
 }
 
 // ── build_limits_forecast: determinism + capacity invariant ──────────────────
@@ -169,7 +194,10 @@ fn forecast_counts_conservative_ttl_window_as_limited() {
     let windows = vec![limit_window(7, "x", None, "unknown_ttl", now, 60_000)];
     let f = build_limits_forecast(now, 3, &windows);
 
-    assert_eq!(f.limited_now, 1, "a pane under a conservative-TTL window is limited");
+    assert_eq!(
+        f.limited_now, 1,
+        "a pane under a conservative-TTL window is limited"
+    );
     assert_eq!(f.usable_now, 2);
     assert_eq!(f.active.len(), 1);
     assert!(
@@ -190,7 +218,10 @@ fn forecast_pane_recovers_only_when_its_last_window_clears() {
     ];
     let f = build_limits_forecast(now, 2, &windows);
 
-    assert_eq!(f.limited_now, 1, "one distinct pane is limited (across 2 accounts)");
+    assert_eq!(
+        f.limited_now, 1,
+        "one distinct pane is limited (across 2 accounts)"
+    );
     assert_eq!(f.usable_now, 1);
 
     let recovery = f

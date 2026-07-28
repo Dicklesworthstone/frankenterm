@@ -84,7 +84,10 @@ fn listener_decodes_wire_events_and_ignores_hello() {
             r#"{"type":"state_change","pane_id":8,"state":{"title":"zsh","rows":24,"cols":80,"is_alt_screen":false,"cursor_row":1,"cursor_col":2},"ts":43}"#,
         ];
         for line in lines {
-            stream.write_all(line.as_bytes()).await.expect("write event");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write event");
             stream.write_all(b"\n").await.expect("write newline");
         }
         stream.flush().await.expect("flush native event payload");
@@ -249,8 +252,15 @@ fn listener_accepts_reconnect_and_rapid_events() {
             .expect("connect second stream");
         let event_count = 256u64;
         for i in 0..event_count {
-            let line = format!(r#"{{"type":"pane_destroyed","pane_id":{},"ts":{}}}"#, i, i * 10);
-            stream.write_all(line.as_bytes()).await.expect("write event");
+            let line = format!(
+                r#"{{"type":"pane_destroyed","pane_id":{},"ts":{}}}"#,
+                i,
+                i * 10
+            );
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write event");
             stream.write_all(b"\n").await.expect("write newline");
         }
         stream.flush().await.expect("flush native event payload");

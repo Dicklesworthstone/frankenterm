@@ -34,10 +34,8 @@ where
 }
 
 fn temp_db_path(slug: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "ft_storage_pipe_{slug}_{}.db",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("ft_storage_pipe_{slug}_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     path.to_string_lossy().to_string()
 }
@@ -135,7 +133,10 @@ fn write_embed_search_pipeline_e2e() {
             ids.len(),
             "exactly one embedding per appended segment"
         );
-        assert_eq!(group.dimension, 128, "embedding dimension matches the query embedder");
+        assert_eq!(
+            group.dimension, 128,
+            "embedding dimension matches the query embedder"
+        );
         assert!(
             storage
                 .get_embedding(ids[0], QUERY_EMBEDDER_ID)

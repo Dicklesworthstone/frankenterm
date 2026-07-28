@@ -28,12 +28,12 @@ use std::process::Command;
 use std::time::Duration;
 
 use frankenterm_core::storage::{
-    check_and_recover_wal_inner, estimate_wal_frames, skip_startup_wal_checkpoint_enabled_for_test,
-    WalFrameEstimate, WalRecoveryAction,
+    WalFrameEstimate, WalRecoveryAction, check_and_recover_wal_inner, estimate_wal_frames,
+    skip_startup_wal_checkpoint_enabled_for_test,
 };
 use frankenterm_core::storage_backend_trait::RusqliteBackend;
 use frankenterm_core::{Error, StorageError};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 // `WAL_RECOVERY_THRESHOLD` is `pub(crate)` in storage.rs; the integration-test
@@ -131,9 +131,7 @@ fn read_all_rows(path: &Path) -> Vec<(i64, String)> {
         .prepare("SELECT id, body FROM sample ORDER BY id")
         .expect("prepare select");
     let rows = stmt
-        .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
         .expect("query rows")
         .map(|r| r.expect("row"))
         .collect();
@@ -156,7 +154,13 @@ fn recover(path: &Path, skip_enabled: bool) -> frankenterm_core::error::Result<W
 
 /// Write a fabricated `-wal`-style file: `len` bytes, optional big-endian magic at
 /// offset 0, optional big-endian page_size field at offset 8, zero-padded.
-fn write_fake_wal(dir: &TempDir, name: &str, len: usize, magic: Option<u32>, page: Option<u32>) -> PathBuf {
+fn write_fake_wal(
+    dir: &TempDir,
+    name: &str,
+    len: usize,
+    magic: Option<u32>,
+    page: Option<u32>,
+) -> PathBuf {
     let mut buf = vec![0u8; len];
     if let Some(m) = magic {
         if len >= 4 {
@@ -242,31 +246,64 @@ fn t3_estimate_rejects_malformed_headers_and_computes_valid_ones() {
 
     // (a) shorter than the 32-byte header
     let short = write_fake_wal(&dir, "short.wal", 10, Some(0x377f_0682), Some(4096));
-    assert_eq!(estimate_wal_frames(&short.to_string_lossy()), WalFrameEstimate::Unreadable);
+    assert_eq!(
+        estimate_wal_frames(&short.to_string_lossy()),
+        WalFrameEstimate::Unreadable
+    );
 
     // (b) bad magic
     let bad_magic = write_fake_wal(&dir, "badmagic.wal", 64, Some(0x0000_0000), Some(4096));
-    assert_eq!(estimate_wal_frames(&bad_magic.to_string_lossy()), WalFrameEstimate::Unreadable);
+    assert_eq!(
+        estimate_wal_frames(&bad_magic.to_string_lossy()),
+        WalFrameEstimate::Unreadable
+    );
 
     // (c) valid magic, non-power-of-two page size
     let bad_page = write_fake_wal(&dir, "badpage.wal", 64, Some(0x377f_0683), Some(1000));
-    assert_eq!(estimate_wal_frames(&bad_page.to_string_lossy()), WalFrameEstimate::Unreadable);
+    assert_eq!(
+        estimate_wal_frames(&bad_page.to_string_lossy()),
+        WalFrameEstimate::Unreadable
+    );
 
     // (d) valid magic, page size 0
     let zero_page = write_fake_wal(&dir, "zeropage.wal", 64, Some(0x377f_0682), Some(0));
-    assert_eq!(estimate_wal_frames(&zero_page.to_string_lossy()), WalFrameEstimate::Unreadable);
+    assert_eq!(
+        estimate_wal_frames(&zero_page.to_string_lossy()),
+        WalFrameEstimate::Unreadable
+    );
 
     // (e) missing file
     let missing = dir.path().join("does-not-exist.wal");
-    assert_eq!(estimate_wal_frames(&missing.to_string_lossy()), WalFrameEstimate::Unreadable);
+    assert_eq!(
+        estimate_wal_frames(&missing.to_string_lossy()),
+        WalFrameEstimate::Unreadable
+    );
 
     // (f) positive control: page_size 4096, 5 frames -> 32 + 5*(4096+24) = 20632
-    let valid = write_fake_wal(&dir, "valid.wal", 32 + 5 * (4096 + 24), Some(0x377f_0682), Some(4096));
-    assert_eq!(estimate_wal_frames(&valid.to_string_lossy()), WalFrameEstimate::Frames(5));
+    let valid = write_fake_wal(
+        &dir,
+        "valid.wal",
+        32 + 5 * (4096 + 24),
+        Some(0x377f_0682),
+        Some(4096),
+    );
+    assert_eq!(
+        estimate_wal_frames(&valid.to_string_lossy()),
+        WalFrameEstimate::Frames(5)
+    );
 
     // (g) page_size field 1 normalizes to 65536: 32 + 2*(65536+24) = 131152 -> 2 frames
-    let big_page = write_fake_wal(&dir, "bigpage.wal", 32 + 2 * (65536 + 24), Some(0x377f_0683), Some(1));
-    assert_eq!(estimate_wal_frames(&big_page.to_string_lossy()), WalFrameEstimate::Frames(2));
+    let big_page = write_fake_wal(
+        &dir,
+        "bigpage.wal",
+        32 + 2 * (65536 + 24),
+        Some(0x377f_0683),
+        Some(1),
+    );
+    assert_eq!(
+        estimate_wal_frames(&big_page.to_string_lossy()),
+        WalFrameEstimate::Frames(2)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +398,10 @@ fn run_child(gate_env: Option<&str>) -> (bool, String) {
     let stdout = String::from_utf8(output.stdout).expect("child stdout utf8");
     let line = stdout
         .lines()
-        .find_map(|l| l.find(CHILD_LINE_PREFIX).map(|p| &l[p + CHILD_LINE_PREFIX.len()..]))
+        .find_map(|l| {
+            l.find(CHILD_LINE_PREFIX)
+                .map(|p| &l[p + CHILD_LINE_PREFIX.len()..])
+        })
         .unwrap_or_else(|| panic!("missing child line in stdout:\n{stdout}"));
     let (gate, action) = line.split_once(';').expect("malformed child line");
     (gate.trim() == "true", action.trim().to_string())
@@ -372,18 +412,30 @@ fn t5_child_public_path_default_on_and_opt_out() {
     // ft-yjihu.1 round-9 promotion: the gate is now default-ON (opt-out). Default
     // (no gate env): the public path must SKIP a small healthy WAL.
     let (gate_default, action_default) = run_child(None);
-    assert!(gate_default, "unset {SKIP_GATE_ENV} must default the gate ON (round-9 promotion)");
-    assert_eq!(action_default, "skipped", "default-on must skip a small healthy WAL");
+    assert!(
+        gate_default,
+        "unset {SKIP_GATE_ENV} must default the gate ON (round-9 promotion)"
+    );
+    assert_eq!(
+        action_default, "skipped",
+        "default-on must skip a small healthy WAL"
+    );
 
     // Gate explicitly on (=1): the real env -> gate -> decision wiring must skip.
     let (gate_on, action_on) = run_child(Some("1"));
     assert!(gate_on, "{SKIP_GATE_ENV}=1 must enable the gate");
-    assert_eq!(action_on, "skipped", "gate on must skip a small healthy WAL end-to-end");
+    assert_eq!(
+        action_on, "skipped",
+        "gate on must skip a small healthy WAL end-to-end"
+    );
 
     // Falsey value is the opt-OUT: restores the legacy always-checkpoint path.
     let (gate_off, action_off) = run_child(Some("0"));
     assert!(!gate_off, "{SKIP_GATE_ENV}=0 must opt OUT (gate OFF)");
-    assert_eq!(action_off, "checkpointed", "opt-out value must take the checkpoint path");
+    assert_eq!(
+        action_off, "checkpointed",
+        "opt-out value must take the checkpoint path"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -429,15 +481,14 @@ fn corrupt_db(dir: &TempDir, name: &str) -> PathBuf {
 fn assert_fails_closed(path: &Path, skip_enabled: bool) {
     let result = recover(path, skip_enabled);
     match result {
-        Ok(action) => panic!(
-            "corrupt DB must fail closed (skip_enabled={skip_enabled}), got Ok({action:?})"
-        ),
+        Ok(action) => {
+            panic!("corrupt DB must fail closed (skip_enabled={skip_enabled}), got Ok({action:?})")
+        }
         Err(err) => {
             // Preferred surface is StorageError::Corruption; some SQLite builds may
             // surface the corrupt page as an integrity-check Database error instead.
             // Either way the contract is: an error, never a silent skip.
-            let is_corruption =
-                matches!(err, Error::Storage(StorageError::Corruption { .. }));
+            let is_corruption = matches!(err, Error::Storage(StorageError::Corruption { .. }));
             let is_db_err = matches!(err, Error::Storage(StorageError::Database(_)));
             assert!(
                 is_corruption || is_db_err,

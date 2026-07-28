@@ -1754,7 +1754,10 @@ fn gc_golden_preserves_active_drops_old_closed_and_stays_consistent() {
         count("SELECT COUNT(*) FROM mux_sessions WHERE shutdown_clean = 0"),
         2
     );
-    assert_eq!(count("SELECT COUNT(*) FROM mux_pane_state WHERE pane_id = 1"), 1);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM mux_pane_state WHERE pane_id = 1"),
+        1
+    );
     // Old closed dropped by age; recent closed kept.
     assert_eq!(
         count("SELECT COUNT(*) FROM mux_sessions WHERE session_id = 'closed-old-1'"),

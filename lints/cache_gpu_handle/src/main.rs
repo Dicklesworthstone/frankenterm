@@ -73,7 +73,9 @@ fn main() -> ExitCode {
 }
 
 fn print_help() {
-    println!("cache-gpu-handle-lint — forbid process-global caches from owning a GPU-resource handle");
+    println!(
+        "cache-gpu-handle-lint — forbid process-global caches from owning a GPU-resource handle"
+    );
     println!();
     println!("usage: cache-gpu-handle-lint [--json] [SRC_ROOT ...]");
     println!();

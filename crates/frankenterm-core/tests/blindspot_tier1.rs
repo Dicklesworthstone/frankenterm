@@ -24,7 +24,7 @@
 
 use frankenterm_core::command_guard::compiled_agents_doctrine_policy;
 use frankenterm_core::degraded_mode::{
-    contract_for_surface, DegradedModeAction, DegradedModeState, DegradedModeSurface,
+    DegradedModeAction, DegradedModeState, DegradedModeSurface, contract_for_surface,
 };
 
 // ── Degraded-Mode Contracts (W10.5, closed) ──────────────────────────────────
@@ -82,10 +82,16 @@ fn degraded_mode_admitted_and_forbidden_disjoint_and_consistent_for_all_scenario
                     !c.forbidden_actions.contains(action),
                     "{surface:?}/{state:?}: {action:?} is both admitted and forbidden"
                 );
-                assert!(c.admits(*action), "{surface:?}/{state:?}: admitted action must admit()");
+                assert!(
+                    c.admits(*action),
+                    "{surface:?}/{state:?}: admitted action must admit()"
+                );
             }
             for action in &c.forbidden_actions {
-                assert!(c.forbids(*action), "{surface:?}/{state:?}: forbidden action must forbid()");
+                assert!(
+                    c.forbids(*action),
+                    "{surface:?}/{state:?}: forbidden action must forbid()"
+                );
                 assert!(
                     !c.admits(*action),
                     "{surface:?}/{state:?}: a forbidden action must never admit()"

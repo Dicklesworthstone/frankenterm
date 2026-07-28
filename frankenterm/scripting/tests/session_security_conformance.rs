@@ -36,8 +36,8 @@ fn ft_a58cq_extension_name_rejects_filesystem_escapes() {
         "",
         " leading",
         "trailing ",
-        "C:evil",   // Windows drive prefix
-        "a:b",      // colon (and drive-like)
+        "C:evil", // Windows drive prefix
+        "a:b",    // colon (and drive-like)
         "semi;colon",
         "with space",
     ];

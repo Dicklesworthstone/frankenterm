@@ -69,8 +69,14 @@ fn fresh_db_initializes_to_head_with_ms_embedded_at_default_and_no_orphans() {
     initialize_schema(&conn).expect("fresh init");
 
     // (1) fresh DB lands exactly at HEAD.
-    assert_eq!(get_user_version(&conn).expect("user_version"), SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 32, "this e2e is pinned to the v32 default repair");
+    assert_eq!(
+        get_user_version(&conn).expect("user_version"),
+        SCHEMA_VERSION
+    );
+    assert_eq!(
+        SCHEMA_VERSION, 32,
+        "this e2e is pinned to the v32 default repair"
+    );
 
     // (2) segment_embeddings default is epoch ms (the v32 contract).
     let dflt = embedded_at_default(&conn).expect("embedded_at has a default");
@@ -176,7 +182,10 @@ fn upgrade_from_seconds_default_at_v31_repairs_to_ms_preserving_rows() {
     // Re-init applies exactly v32.
     initialize_schema(&conn).expect("upgrade 31 -> 32");
 
-    assert_eq!(get_user_version(&conn).expect("user_version"), SCHEMA_VERSION);
+    assert_eq!(
+        get_user_version(&conn).expect("user_version"),
+        SCHEMA_VERSION
+    );
     assert!(
         embedded_at_default(&conn).unwrap().contains("1000"),
         "v32 must repair the default to epoch ms"

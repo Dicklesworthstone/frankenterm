@@ -34,7 +34,11 @@ fn catalog() -> Vec<(&'static str, String, &'static str)> {
         ("anthropic_key", format!("sk-ant-{S}{}", z(40)), S),
         ("openai_key", format!("sk-proj-{S}{}", z(16)), S),
         ("github_token", format!("ghp_{S}{}", z(36)), S),
-        ("github_fine_grained_pat", format!("github_pat_{S}{}", z(50)), S),
+        (
+            "github_fine_grained_pat",
+            format!("github_pat_{S}{}", z(50)),
+            S,
+        ),
         ("gitlab_token", format!("glpat-{S}{}", z(20)), S),
         ("xai_key", format!("xai-{S}{}", z(40)), S),
         ("groq_key", format!("gsk_{S}{}", z(40)), S),
@@ -44,30 +48,50 @@ fn catalog() -> Vec<(&'static str, String, &'static str)> {
         ("replicate_token", format!("r8_{S}{}", z(30)), S),
         ("anyscale_key", format!("esecret_{S}{}", z(30)), S),
         ("perplexity_key", format!("pplx-{S}{}", z(40)), S),
-        ("ai_provider_keyed_value", format!("cohere_api_key={S}{}", z(16)), S),
+        (
+            "ai_provider_keyed_value",
+            format!("cohere_api_key={S}{}", z(16)),
+            S,
+        ),
         // AKIA charset is uppercase+digits; `S` is all-uppercase, `z()` digits.
         ("aws_access_key_id", format!("AKIA{S}{}", z(16)), S),
-        ("aws_secret_key", format!("aws_secret_access_key={S}{}", z(40)), S),
+        (
+            "aws_secret_key",
+            format!("aws_secret_access_key={S}{}", z(40)),
+            S,
+        ),
         ("bearer_token", format!("Bearer {S}{}", z(20)), S),
         ("slack_token", format!("xoxb-{S}{}", z(10)), S),
         ("stripe_key", format!("sk_live_{S}{}", z(20)), S),
         ("twilio_account_sid", format!("AC{HX}{}", z(32)), HX),
         ("sendgrid_key", format!("SG.{S}{}.{}{}", z(20), S, z(40)), S),
         ("datadog_api_key", format!("DD_API_KEY={HX}{}", z(32)), HX),
-        ("database_url", format!("postgres://user:{S}pw@dbhost:5432/app"), S),
+        (
+            "database_url",
+            format!("postgres://user:{S}pw@dbhost:5432/app"),
+            S,
+        ),
         (
             "ssh_private_key",
-            format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{S}bodyline\n-----END OPENSSH PRIVATE KEY-----"),
+            format!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n{S}bodyline\n-----END OPENSSH PRIVATE KEY-----"
+            ),
             S,
         ),
         (
             "pgp_block",
-            format!("-----BEGIN PGP PRIVATE KEY BLOCK-----\n{S}bodyline\n-----END PGP PRIVATE KEY BLOCK-----"),
+            format!(
+                "-----BEGIN PGP PRIVATE KEY BLOCK-----\n{S}bodyline\n-----END PGP PRIVATE KEY BLOCK-----"
+            ),
             S,
         ),
         ("jwt_token", format!("eyJ{S}aa.eyJ0{S}bb.sig{S}cc"), S),
         ("device_code", format!("device_code={S}"), S),
-        ("oauth_url", format!("https://app.example/cb#access_token={S}tok"), S),
+        (
+            "oauth_url",
+            format!("https://app.example/cb#access_token={S}tok"),
+            S,
+        ),
         ("generic_api_key", format!("api_key={S}{}", z(16)), S),
         ("generic_token", format!(" token={S}{}", z(16)), S),
         ("generic_password", format!("password={S}pw"), S),
@@ -77,7 +101,11 @@ fn catalog() -> Vec<(&'static str, String, &'static str)> {
 
 #[test]
 fn catalog_has_all_32_patterns() {
-    assert_eq!(catalog().len(), 32, "catalog table must cover all 32 patterns");
+    assert_eq!(
+        catalog().len(),
+        32,
+        "catalog table must cover all 32 patterns"
+    );
 }
 
 /// Batch redaction: every sample is detected as a secret and its value is

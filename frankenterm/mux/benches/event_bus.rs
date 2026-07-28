@@ -4,7 +4,7 @@
 //! required by wa-3dfxb.13.
 
 use anyhow::Error;
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 use mux::domain::DomainId;

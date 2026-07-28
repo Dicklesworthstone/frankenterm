@@ -46,13 +46,11 @@ use std::time::{Duration, Instant};
 
 use frankenterm_core::bocpd::{BocpdConfig, BocpdManager};
 use frankenterm_core::events::{Event, EventBus};
-use frankenterm_core::patterns::{
-    AgentType, Detection, DetectionContext, PatternEngine, Severity,
-};
+use frankenterm_core::patterns::{AgentType, Detection, DetectionContext, PatternEngine, Severity};
 use frankenterm_core::redactor::Redactor;
 use frankenterm_core::storage::check_and_recover_wal;
 use frankenterm_core::storage_backend_trait::RusqliteBackend;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 // ── fleet-minute call model (identical to round-6/7 so shares stay comparable) ──
 const CAPTURE_DELTAS_PER_SEC: u64 = 192;
@@ -530,7 +528,10 @@ fn profile_round9_detect_with_context_corrected() {
 
     let (mut frames, avg_dirty_wal_bytes) = run_profile(ab.on_median_ns);
     let total_realistic_ns: f64 = frames.iter().map(Frame::realistic_self_ns).sum();
-    assert!(total_realistic_ns > 0.0, "no self-time recorded; harness is dead");
+    assert!(
+        total_realistic_ns > 0.0,
+        "no self-time recorded; harness is dead"
+    );
 
     frames.sort_by(|a, b| {
         b.realistic_self_ns()
@@ -577,7 +578,9 @@ fn profile_round9_detect_with_context_corrected() {
     let quick_reject_realistic_share = detect_share * quick_reject_share_of_detect;
     let cv_ok = ab.on_cv <= 0.05 && ab.off_cv <= 0.05;
 
-    println!("\n=== ROUND-9 quick_reject A/B (ft-ui1xn) — production detect_with_context entry ===");
+    println!(
+        "\n=== ROUND-9 quick_reject A/B (ft-ui1xn) — production detect_with_context entry ==="
+    );
     println!(
         "corpus: {} deltas ({} match-present), count-weighted realistic size distribution",
         ab.corpus_len, ab.match_segments
@@ -601,7 +604,11 @@ fn profile_round9_detect_with_context_corrected() {
         "detect_with_context realistic share: {:.3}%  (gate {:.1}%: {})",
         detect_share * 100.0,
         GATE_SHARE * 100.0,
-        if detect_share >= GATE_SHARE { "PASS" } else { "below" }
+        if detect_share >= GATE_SHARE {
+            "PASS"
+        } else {
+            "below"
+        }
     );
     println!(
         "quick_reject prefilter realistic share (= detect_share x speedup): {:.3}%",
@@ -662,15 +669,24 @@ fn profile_round9_detect_with_context_corrected() {
 
     // Sanity (not a perf assertion): every frame measured non-zero, shares sum to 1.
     for frame in &frames {
-        assert!(frame.mean_nanos() > 0.0, "frame {} measured zero mean ns", frame.name);
+        assert!(
+            frame.mean_nanos() > 0.0,
+            "frame {} measured zero mean ns",
+            frame.name
+        );
     }
     let share_sum: f64 = frames
         .iter()
         .map(|frame| frame.realistic_self_ns() / total_realistic_ns)
         .sum();
-    assert!((share_sum - 1.0).abs() < 1e-6, "shares must sum to 1, got {share_sum}");
     assert!(
-        frames.iter().any(|f| f.name == "patterns.detect_with_context"),
+        (share_sum - 1.0).abs() < 1e-6,
+        "shares must sum to 1, got {share_sum}"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.name == "patterns.detect_with_context"),
         "corrected per-delta frame missing"
     );
     assert!(

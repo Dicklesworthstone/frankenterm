@@ -686,10 +686,7 @@ fn assert_search_success_data(envelope: &Value) {
     // embeddings and the hybrid search finds real semantic candidates instead of
     // degrading to lexical. `data.mode` == `metrics.effective_mode` (both report
     // the mode that actually ran); `requested_mode` stays "hybrid".
-    assert_eq!(
-        data.get("mode"),
-        Some(&Value::String("hybrid".to_string()))
-    );
+    assert_eq!(data.get("mode"), Some(&Value::String("hybrid".to_string())));
     let metrics = data
         .get("metrics")
         .and_then(Value::as_object)

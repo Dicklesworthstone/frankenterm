@@ -18,7 +18,7 @@
 //! slow-vs-stuck, e2e mission drive) ride .6.4/.6.5/.6.6 (blocked/deferred as
 //! security-sensitive) and are out of scope for this plan-side file.
 
-use frankenterm_core::steer_plan::{steer_plan, SteerPlanScenario};
+use frankenterm_core::steer_plan::{SteerPlanScenario, steer_plan};
 use frankenterm_core::steer_run::receipt_admits_action;
 use frankenterm_core::steering::SteeringReceipt;
 
@@ -31,8 +31,22 @@ const CREATED_MS: i64 = 1_700_000_000_000;
 #[test]
 fn steer_plan_is_deterministic_per_input() {
     for scenario in SteerPlanScenario::ALL {
-        let a = steer_plan(scenario, "ship the W5 family", "ws-det", GEN_MS, CREATED_MS, None);
-        let b = steer_plan(scenario, "ship the W5 family", "ws-det", GEN_MS, CREATED_MS, None);
+        let a = steer_plan(
+            scenario,
+            "ship the W5 family",
+            "ws-det",
+            GEN_MS,
+            CREATED_MS,
+            None,
+        );
+        let b = steer_plan(
+            scenario,
+            "ship the W5 family",
+            "ws-det",
+            GEN_MS,
+            CREATED_MS,
+            None,
+        );
 
         assert_eq!(
             a.receipt.receipt_id,

@@ -61,13 +61,29 @@ fn complete_snapshot() -> MuxSemanticSnapshot {
 
 #[test]
 fn resolve_dom_command_index_selects_last_and_bounds() {
-    assert_eq!(resolve_dom_command_index(0, -1), None, "no commands => None");
+    assert_eq!(
+        resolve_dom_command_index(0, -1),
+        None,
+        "no commands => None"
+    );
     assert_eq!(resolve_dom_command_index(0, 0), None);
-    assert_eq!(resolve_dom_command_index(3, -1), Some(2), "-1 selects most recent");
+    assert_eq!(
+        resolve_dom_command_index(3, -1),
+        Some(2),
+        "-1 selects most recent"
+    );
     assert_eq!(resolve_dom_command_index(3, 0), Some(0));
     assert_eq!(resolve_dom_command_index(3, 2), Some(2));
-    assert_eq!(resolve_dom_command_index(3, 3), None, "out of range => None");
-    assert_eq!(resolve_dom_command_index(3, -2), None, "only -1 is special; other negatives => None");
+    assert_eq!(
+        resolve_dom_command_index(3, 3),
+        None,
+        "out of range => None"
+    );
+    assert_eq!(
+        resolve_dom_command_index(3, -2),
+        None,
+        "only -1 is special; other negatives => None"
+    );
 }
 
 #[test]
@@ -92,14 +108,24 @@ fn dom_zone_from_mux_maps_kinds_boundaries_and_redacts() {
         // Boundaries pass through unchanged.
         assert_eq!((dz.start_y, dz.start_x, dz.end_y, dz.end_x), (3, 1, 4, 9));
         // Zone text is redacted (the secret never leaves the builder).
-        assert!(!dz.text.contains(SECRET), "zone text must be redacted: {}", dz.text);
+        assert!(
+            !dz.text.contains(SECRET),
+            "zone text must be redacted: {}",
+            dz.text
+        );
     }
 }
 
 #[test]
 fn build_dom_data_zones_happy_path_is_osc133() {
     let redactor = Redactor::new();
-    let data = build_dom_data(1, DomQueryKind::Zones, None, &complete_snapshot(), &redactor);
+    let data = build_dom_data(
+        1,
+        DomQueryKind::Zones,
+        None,
+        &complete_snapshot(),
+        &redactor,
+    );
     assert_eq!(data.source, "osc133");
     assert!(!data.semantic_data_unavailable);
     assert!((data.confidence - 1.0).abs() < f64::EPSILON);
@@ -119,11 +145,17 @@ fn build_dom_data_last_command_and_exit_code_populate() {
     let last = build_dom_data(1, DomQueryKind::LastCommand, None, &snap, &redactor);
     assert_eq!(last.source, "osc133");
     assert!(!last.semantic_data_unavailable);
-    assert!(last.command.is_some(), "LastCommand must populate the command field");
+    assert!(
+        last.command.is_some(),
+        "LastCommand must populate the command field"
+    );
 
     let exit = build_dom_data(1, DomQueryKind::ExitCode, None, &snap, &redactor);
     assert!(!exit.semantic_data_unavailable);
-    assert!(exit.exit_code.is_some(), "ExitCode must populate from snapshot.last_exit_code");
+    assert!(
+        exit.exit_code.is_some(),
+        "ExitCode must populate from snapshot.last_exit_code"
+    );
 }
 
 #[test]
@@ -132,7 +164,10 @@ fn build_dom_data_missing_exit_code_is_honestly_unavailable() {
     let mut snap = complete_snapshot();
     snap.last_exit_code = None; // command ran but no OSC 133;D exit code captured.
     let data = build_dom_data(1, DomQueryKind::ExitCode, None, &snap, &redactor);
-    assert!(data.semantic_data_unavailable, "missing exit code must be typed-unavailable, not a guess");
+    assert!(
+        data.semantic_data_unavailable,
+        "missing exit code must be typed-unavailable, not a guess"
+    );
     assert!(data.exit_code.is_none());
 }
 
@@ -141,10 +176,17 @@ fn build_dom_data_without_osc133_markers_never_guesses() {
     let redactor = Redactor::new();
     // A pane with only output (no prompt/input markers) — e.g. a raw stream.
     let output_only = MuxSemanticSnapshot {
-        zones: vec![zone(MuxSemanticZoneKind::Output, 0, "raw output with no shell integration")],
+        zones: vec![zone(
+            MuxSemanticZoneKind::Output,
+            0,
+            "raw output with no shell integration",
+        )],
         last_exit_code: None,
     };
-    let empty = MuxSemanticSnapshot { zones: vec![], last_exit_code: None };
+    let empty = MuxSemanticSnapshot {
+        zones: vec![],
+        last_exit_code: None,
+    };
 
     for (label, snap) in [("output-only", &output_only), ("empty", &empty)] {
         for query in [
@@ -169,14 +211,24 @@ fn unavailable_envelopes_are_honest_and_redacted() {
     let redactor = Redactor::new();
     let reason = format!("pane gone; last token {SECRET}");
 
-    let u = dom_unavailable(5, DomQueryKind::Zones, None, Vec::new(), reason.clone(), &redactor);
+    let u = dom_unavailable(
+        5,
+        DomQueryKind::Zones,
+        None,
+        Vec::new(),
+        reason.clone(),
+        &redactor,
+    );
     assert!(u.semantic_data_unavailable);
     assert_eq!(u.source, "unavailable");
     assert!((u.confidence - 0.0).abs() < f64::EPSILON);
     assert!(u.command.is_none() && u.output.is_none() && u.exit_code.is_none());
     // The unavailable reason is redacted (no secret leaks through the error path).
     let reason_text = u.unavailable_reason.clone().unwrap_or_default();
-    assert!(!reason_text.contains(SECRET), "unavailable reason must be redacted: {reason_text}");
+    assert!(
+        !reason_text.contains(SECRET),
+        "unavailable reason must be redacted: {reason_text}"
+    );
 
     let alt = dom_alt_screen_unavailable(5, DomQueryKind::LastCommand, Some(-1), &redactor);
     assert!(alt.semantic_data_unavailable);
@@ -186,7 +238,13 @@ fn unavailable_envelopes_are_honest_and_redacted() {
 #[test]
 fn dom_data_serde_round_trips() {
     let redactor = Redactor::new();
-    let data = build_dom_data(1, DomQueryKind::Zones, None, &complete_snapshot(), &redactor);
+    let data = build_dom_data(
+        1,
+        DomQueryKind::Zones,
+        None,
+        &complete_snapshot(),
+        &redactor,
+    );
     let first = serde_json::to_value(&data).expect("serialize DomData");
     let back: frankenterm_core::robot_types::DomData =
         serde_json::from_value(first.clone()).expect("deserialize DomData");

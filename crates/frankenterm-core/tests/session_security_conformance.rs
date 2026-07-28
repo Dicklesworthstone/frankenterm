@@ -26,7 +26,7 @@ use std::path::Path;
 
 use frankenterm_core::policy::{ActionKind, ActorKind, PolicyEngine, PolicyInput};
 use frankenterm_core::policy_quarantine::KillSwitchLevel;
-use frankenterm_core::redactor::{Redactor, REDACTED_MARKER};
+use frankenterm_core::redactor::{REDACTED_MARKER, Redactor};
 use frankenterm_core::replay_capture::{CaptureRedactionMode, CaptureRedactionPolicy};
 
 // ---------------------------------------------------------------------------
@@ -212,10 +212,7 @@ fn ft_cdxrr_classifier_consulted_on_outbound_dispatch() {
 #[test]
 fn ft_ps9fu_swarm_scent_routed_through_policy_and_redactor() {
     let src = production_only(&read_core_src("mcp_resources.rs"));
-    for needle in [
-        "authorize_swarm_scent_panes(",
-        "redact_swarm_scent_report(",
-    ] {
+    for needle in ["authorize_swarm_scent_panes(", "redact_swarm_scent_report("] {
         assert!(
             src.contains(needle),
             "ft-ps9fu regression: wa://swarm/scent read must route through `{needle}` \

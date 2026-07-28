@@ -5,14 +5,14 @@ use super::*;
 use crate::color::{ColorPalette, RgbColor};
 use crate::config::{BidiMode, NewlineCanon};
 use frankenterm_bidi::ParagraphDirectionHint;
-use frankenterm_cell::UnicodeVersion;
 use frankenterm_cell::image::ImageData;
+use frankenterm_cell::UnicodeVersion;
 use frankenterm_escape_parser::csi::{
     Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
     EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
     XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
 };
-use frankenterm_escape_parser::{CSI, OneBased, OperatingSystemCommand};
+use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 use log::debug;
 use num_traits::ToPrimitive;
@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
 use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
@@ -2197,7 +2197,11 @@ impl TerminalState {
         // on xterm, so, to prevent a lot of noise in esctest, treat them as spaces, at least when
         // asking for the checksum of a single cell (which is what esctest does).
         // See: https://github.com/wezterm/wezterm/pull/4565
-        if checksum == 0 { 32u16 } else { checksum }
+        if checksum == 0 {
+            32u16
+        } else {
+            checksum
+        }
     }
 
     fn perform_csi_window(&mut self, window: Window) {

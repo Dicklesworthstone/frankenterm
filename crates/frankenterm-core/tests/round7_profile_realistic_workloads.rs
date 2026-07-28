@@ -29,7 +29,7 @@ use frankenterm_core::patterns::{DetectionContext, PatternEngine};
 use frankenterm_core::redactor::Redactor;
 use frankenterm_core::storage::check_and_recover_wal;
 use frankenterm_core::storage_backend_trait::RusqliteBackend;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 const CAPTURE_DELTAS_PER_SEC: u64 = 192;
 const REDACT_READS_PER_SEC: u64 = 64;

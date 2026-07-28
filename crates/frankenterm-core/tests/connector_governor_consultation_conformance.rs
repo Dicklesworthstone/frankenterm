@@ -154,7 +154,11 @@ fn arb_reason() -> impl Strategy<Value = GovernorReason> {
 }
 
 /// Build a `GovernorDecision` from arbitrary parts via the public constructors.
-fn decision_for(verdict: GovernorVerdict, reason: GovernorReason, delay_ms: u64) -> GovernorDecision {
+fn decision_for(
+    verdict: GovernorVerdict,
+    reason: GovernorReason,
+    delay_ms: u64,
+) -> GovernorDecision {
     match verdict {
         GovernorVerdict::Allow => GovernorDecision::allow("c", "k", 1),
         GovernorVerdict::Throttle => GovernorDecision::throttle("c", "k", reason, delay_ms, 1),

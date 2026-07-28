@@ -4,9 +4,7 @@
 //! - Quick reject no-match: **< 1µs** for typical non-matching text
 //! - Pattern detection (typical corpus): **p50 < 1ms**, **p99 < 5ms**
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::patterns::{DetectionContext, PatternEngine};
 use std::fmt::Write as _;
 

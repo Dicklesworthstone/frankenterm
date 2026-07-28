@@ -26,10 +26,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use frankenterm_core::storage::{
-    check_and_recover_wal_inner, estimate_wal_frames, WalFrameEstimate, WalRecoveryAction,
+    WalFrameEstimate, WalRecoveryAction, check_and_recover_wal_inner, estimate_wal_frames,
 };
 use frankenterm_core::storage_backend_trait::RusqliteBackend;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 // `WAL_RECOVERY_THRESHOLD` is `pub(crate)` (storage.rs:287); mirror it here
@@ -46,7 +46,8 @@ const BLOCKS: usize = 25;
 fn small_dirty_wal(dir: &TempDir, name: &str) -> (Connection, PathBuf) {
     let path = dir.path().join(name);
     let mut conn = Connection::open(&path).expect("open dirty WAL db");
-    conn.pragma_update(None, "journal_mode", "WAL").expect("enable WAL");
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .expect("enable WAL");
     conn.pragma_update(None, "wal_autocheckpoint", 0)
         .expect("disable autocheckpoint");
     conn.execute_batch("CREATE TABLE sample(id INTEGER PRIMARY KEY, body TEXT NOT NULL);")
@@ -70,8 +71,10 @@ fn small_dirty_wal(dir: &TempDir, name: &str) -> (Connection, PathBuf) {
 fn large_dirty_wal(dir: &TempDir, name: &str) -> (Connection, PathBuf) {
     let path = dir.path().join(name);
     let mut conn = Connection::open(&path).expect("open large WAL db");
-    conn.pragma_update(None, "page_size", 512).expect("set 512-byte pages");
-    conn.pragma_update(None, "journal_mode", "WAL").expect("enable WAL");
+    conn.pragma_update(None, "page_size", 512)
+        .expect("set 512-byte pages");
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .expect("enable WAL");
     conn.pragma_update(None, "wal_autocheckpoint", 0)
         .expect("disable autocheckpoint");
     conn.execute_batch("CREATE TABLE sample(id INTEGER PRIMARY KEY, body TEXT NOT NULL);")
@@ -183,7 +186,11 @@ fn wal_skip_startup_time_ab_and_no_regression() {
     let on_med = median(on_ns.clone());
     let off_cv = cv(&off_ns);
     let on_cv = cv(&on_ns);
-    let speedup = if off_med == 0.0 { 0.0 } else { (off_med - on_med) / off_med };
+    let speedup = if off_med == 0.0 {
+        0.0
+    } else {
+        (off_med - on_med) / off_med
+    };
 
     // ── No regression on clean + large paths (branch equivalence) ──
     let clean_dir = tempfile::tempdir().expect("tempdir");

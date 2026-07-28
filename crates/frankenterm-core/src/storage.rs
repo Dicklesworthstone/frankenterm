@@ -294,8 +294,7 @@ pub(crate) const WAL_RECOVERY_THRESHOLD: i64 = 10_000;
 /// journal exists, skipping the startup `wal_checkpoint(PASSIVE)` removes the
 /// dominant startup-recovery cost (round-7 B0': 3.528% self-time on a 4.7 MB
 /// dirty WAL). Any ambiguity falls back to the existing checkpoint behavior.
-const FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT_ENV: &str =
-    "FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT";
+const FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT_ENV: &str = "FT_MOONSHOT_SKIP_STARTUP_WAL_CHECKPOINT";
 
 /// Default-ON gate for [`check_and_recover_wal`]'s startup-checkpoint skip.
 ///

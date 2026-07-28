@@ -53,9 +53,16 @@ fn distinct_correlation_ids_are_all_accepted() {
     let mut journal = MissionJournal::new(MissionId("m-distinct".into()));
     for i in 0..10_i64 {
         let appended = journal.append(marker(), format!("cid-{i}"), "op", "test", None, 1_000 + i);
-        assert!(appended.is_ok(), "distinct cid-{i} must be accepted: {appended:?}");
+        assert!(
+            appended.is_ok(),
+            "distinct cid-{i} must be accepted: {appended:?}"
+        );
     }
-    assert_eq!(journal.len(), 10, "ten distinct correlation_ids → ten entries");
+    assert_eq!(
+        journal.len(),
+        10,
+        "ten distinct correlation_ids → ten entries"
+    );
 }
 
 #[test]
@@ -154,8 +161,7 @@ fn correlation_index_cap_refuses_new_ids_fail_closed_ft_anpt8() {
     // the index: at the cap, NEW correlation IDs are refused with a typed
     // fail-closed error, while duplicates of already-accepted IDs keep
     // deduplicating exactly (the double-apply window never reopens).
-    let mut journal =
-        MissionJournal::new(MissionId("m-cap".into())).with_correlation_index_cap(3);
+    let mut journal = MissionJournal::new(MissionId("m-cap".into())).with_correlation_index_cap(3);
 
     for i in 0..3_i64 {
         journal
@@ -191,7 +197,10 @@ fn correlation_index_cap_refuses_new_ids_fail_closed_ft_anpt8() {
     assert!(journal.has_correlation("cid-0"));
     let still_full = journal.append(marker(), "cid-after-compact", "op", "test", None, 4_000);
     assert!(
-        matches!(still_full, Err(MissionJournalError::CorrelationIndexFull(3))),
+        matches!(
+            still_full,
+            Err(MissionJournalError::CorrelationIndexFull(3))
+        ),
         "compaction must not reopen index headroom, got {still_full:?}"
     );
 }

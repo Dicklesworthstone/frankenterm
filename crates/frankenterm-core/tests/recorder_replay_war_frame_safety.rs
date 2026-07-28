@@ -27,8 +27,13 @@ use frankenterm_core::replay::Recording;
 /// corrupts every existing `.war` recording.
 #[test]
 fn war_frame_encode_byte_layout_golden() {
-    let frame = RecordingFrame::new(0x0102_0304_0506_0708, FrameType::Event, 0xAB, b"xy".to_vec())
-        .expect("small payload builds a valid frame");
+    let frame = RecordingFrame::new(
+        0x0102_0304_0506_0708,
+        FrameType::Event,
+        0xAB,
+        b"xy".to_vec(),
+    )
+    .expect("small payload builds a valid frame");
     let bytes = frame.encode();
     let expected: Vec<u8> = vec![
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // timestamp_ms (u64 LE)

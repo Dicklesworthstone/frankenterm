@@ -830,7 +830,10 @@ static RM_RF_ROOT: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 static RM_RF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(r"(?i){RM_COMMAND_POSITION}rm\s+-[a-z]*(?:r|f)[a-z]*\b")).unwrap()
+    Regex::new(&format!(
+        r"(?i){RM_COMMAND_POSITION}rm\s+-[a-z]*(?:r|f)[a-z]*\b"
+    ))
+    .unwrap()
 });
 static RM_RF_SAFE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\brm\s+(-[a-z]*r[a-z]*f?[a-z]*\s+)(node_modules|target|__pycache__|\.cache|dist|build|\.next|\.turbo|tmp)\s*(?:;|$|&&|\|\||\||\n)").unwrap()

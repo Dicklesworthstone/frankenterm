@@ -63,7 +63,11 @@ struct Scorecard {
 impl Scorecard {
     fn rel_delta(&self) -> f64 {
         if self.baseline_value == 0.0 {
-            if self.candidate_value == 0.0 { 0.0 } else { f64::INFINITY }
+            if self.candidate_value == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            }
         } else {
             (self.candidate_value - self.baseline_value) / self.baseline_value
         }
@@ -134,7 +138,11 @@ struct HitRate {
 impl HitRate {
     fn rate(self) -> f64 {
         let total = self.hits + self.misses;
-        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
     }
 }
 
@@ -183,14 +191,18 @@ fn run_cache(policy: CacheEvictionPolicy, trace: &[u64]) -> HitRate {
         &config,
         policy,
     );
-    let mut hr = HitRate { hits: 0, misses: 0, evictions: 0 };
+    let mut hr = HitRate {
+        hits: 0,
+        misses: 0,
+        evictions: 0,
+    };
     for &key in trace {
         if cache.get(&key).is_some() {
             hr.hits += 1;
         } else {
             hr.misses += 1;
-            hr.evictions += u64::try_from(cache.put_capturing_evictions(key, key).len())
-                .unwrap_or(u64::MAX);
+            hr.evictions +=
+                u64::try_from(cache.put_capturing_evictions(key, key).len()).unwrap_or(u64::MAX);
         }
     }
     hr
@@ -213,7 +225,10 @@ fn pressure_replay() -> Vec<(FleetPressureTier, Option<f64>)> {
             cycles.push((FleetPressureTier::Elevated, Some(headroom)));
         }
         // critical spike
-        cycles.push((FleetPressureTier::Critical, Some(0.05 + f64::from(cycle) * 0.01)));
+        cycles.push((
+            FleetPressureTier::Critical,
+            Some(0.05 + f64::from(cycle) * 0.01),
+        ));
         // falling headroom (pressure building) — the flip side of the sawtooth
         for step in (0..6).rev() {
             let headroom = 0.06 + f64::from(step) * 0.04;
@@ -272,14 +287,18 @@ fn run_replay(dampening: MemoryDampening) -> ReplayMetric {
     let mut panes = build_panes();
     let mut orchestrator = FleetScrollbackOrchestrator::new();
     let mut pid = PidReclaimController::new();
-    let cfg = PidDampeningConfig { dampening, ..PidDampeningConfig::default() };
+    let cfg = PidDampeningConfig {
+        dampening,
+        ..PidDampeningConfig::default()
+    };
     let mut total_evicted_bytes = 0usize;
     let mut previous_target: Option<usize> = None;
     let mut previous_direction = 0isize;
     let mut direction_changes = 0usize;
 
     for (tier, headroom) in pressure_replay() {
-        if let Some(plan) = orchestrator.plan_eviction_damped(tier, &panes, headroom, &mut pid, &cfg)
+        if let Some(plan) =
+            orchestrator.plan_eviction_damped(tier, &panes, headroom, &mut pid, &cfg)
         {
             if let Some(prev) = previous_target {
                 let direction = match plan.fleet_warm_bytes_target.cmp(&prev) {
@@ -300,7 +319,10 @@ fn run_replay(dampening: MemoryDampening) -> ReplayMetric {
         }
     }
 
-    ReplayMetric { total_evicted_bytes, direction_changes }
+    ReplayMetric {
+        total_evicted_bytes,
+        direction_changes,
+    }
 }
 
 // ── Tests (fail-closed harness proofs) + scorecard emission ─────────────────
@@ -344,7 +366,12 @@ fn s3fifo_scan_heavy_hit_rate_adjudicated() {
     }
     println!(
         "  scan: lfu {}h/{}m/{}ev  s3fifo {}h/{}m/{}ev",
-        scan_lfu.hits, scan_lfu.misses, scan_lfu.evictions, scan_s3.hits, scan_s3.misses, scan_s3.evictions
+        scan_lfu.hits,
+        scan_lfu.misses,
+        scan_lfu.evictions,
+        scan_s3.hits,
+        scan_s3.misses,
+        scan_s3.evictions
     );
 
     // Fail-closed harness invariants (NOT the verdict — that is the emitted data).
@@ -355,9 +382,18 @@ fn s3fifo_scan_heavy_hit_rate_adjudicated() {
             c.metric
         );
     }
-    assert!(scan_lfu.hits + scan_lfu.misses > 0, "scan trace did not run");
-    assert!(scan_s3.evictions > 0, "scan trace evicted nothing — capacity too large");
-    assert!(phase_lfu.hits + phase_lfu.misses > 0, "phase trace did not run");
+    assert!(
+        scan_lfu.hits + scan_lfu.misses > 0,
+        "scan trace did not run"
+    );
+    assert!(
+        scan_s3.evictions > 0,
+        "scan trace evicted nothing — capacity too large"
+    );
+    assert!(
+        phase_lfu.hits + phase_lfu.misses > 0,
+        "phase trace did not run"
+    );
 }
 
 #[test]
@@ -387,7 +423,10 @@ fn m9_pid_dampening_evicted_bytes_and_oscillation_adjudicated() {
     ];
 
     println!("\n=== ROUND-6 A5 quality scorecard: M9 PID dampening (deterministic) ===");
-    println!("panes={PANE_COUNT} replay_cycles={}", pressure_replay().len());
+    println!(
+        "panes={PANE_COUNT} replay_cycles={}",
+        pressure_replay().len()
+    );
     for c in &cards {
         c.print();
         println!("ROUND6_A5_JSON {}", c.to_json());

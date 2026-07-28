@@ -69,20 +69,37 @@ fn every_submit_state_serializes_to_its_stable_wire_string() {
     // carrying it serializes `state` to exactly that string (JSON golden per state).
     let expected = [
         (SubmitReceiptState::Submitted, "submitted"),
-        (SubmitReceiptState::QueuedBehindOperation, "queued_behind_operation"),
+        (
+            SubmitReceiptState::QueuedBehindOperation,
+            "queued_behind_operation",
+        ),
         (SubmitReceiptState::StuckInComposer, "stuck_in_composer"),
-        (SubmitReceiptState::PaneCrashedToShell, "pane_crashed_to_shell"),
-        (SubmitReceiptState::VerificationUnavailable, "verification_unavailable"),
+        (
+            SubmitReceiptState::PaneCrashedToShell,
+            "pane_crashed_to_shell",
+        ),
+        (
+            SubmitReceiptState::VerificationUnavailable,
+            "verification_unavailable",
+        ),
         (SubmitReceiptState::PolicyDenied, "policy_denied"),
         (SubmitReceiptState::RequiresApproval, "requires_approval"),
         (SubmitReceiptState::SendFailed, "send_failed"),
     ];
-    assert_eq!(expected.len(), ALL_STATES.len(), "a state was added without a wire-string lock");
+    assert_eq!(
+        expected.len(),
+        ALL_STATES.len(),
+        "a state was added without a wire-string lock"
+    );
     for (state, wire) in expected {
         assert_eq!(state.as_str(), wire, "as_str drifted for {state:?}");
         let receipt = receipt_with_state(state);
         let json = serde_json::to_value(&receipt).expect("serialize receipt");
-        assert_eq!(json["state"], serde_json::json!(wire), "JSON state wire drift for {state:?}");
+        assert_eq!(
+            json["state"],
+            serde_json::json!(wire),
+            "JSON state wire drift for {state:?}"
+        );
     }
 }
 
@@ -123,8 +140,14 @@ fn submit_guarantee_level_silent_success_and_fail_open_guards() {
 
     // SECURITY: a stuck composer is NOT a `submitted`/`working` success — the
     // headline silent-success regression guard.
-    assert!(!Submitted.is_met_by(St::StuckInComposer, none), "stuck must not meet submitted");
-    assert!(!Working.is_met_by(St::StuckInComposer, none), "stuck must not meet working");
+    assert!(
+        !Submitted.is_met_by(St::StuckInComposer, none),
+        "stuck must not meet submitted"
+    );
+    assert!(
+        !Working.is_met_by(St::StuckInComposer, none),
+        "stuck must not meet working"
+    );
     // ...but `write` only proves the call happened, which a stuck send still did.
     assert!(Write.is_met_by(St::StuckInComposer, none));
     assert!(Composer.is_met_by(St::StuckInComposer, none));
@@ -139,7 +162,10 @@ fn submit_guarantee_level_silent_success_and_fail_open_guards() {
         St::RequiresApproval,
     ] {
         for level in [Write, Composer, Submitted, Working] {
-            assert!(!level.is_met_by(state, none), "{level:?} must not be met by {state:?}");
+            assert!(
+                !level.is_met_by(state, none),
+                "{level:?} must not be met by {state:?}"
+            );
         }
     }
 
@@ -149,7 +175,10 @@ fn submit_guarantee_level_silent_success_and_fail_open_guards() {
     assert!(Submitted.is_met_by(St::QueuedBehindOperation, none));
 
     // `working` requires the `submitted` state AND a working-evidence rule id.
-    assert!(!Working.is_met_by(St::Submitted, none), "working needs evidence");
+    assert!(
+        !Working.is_met_by(St::Submitted, none),
+        "working needs evidence"
+    );
     let working_evidence = vec!["claude_code:working_state:busy".to_string()];
     assert!(Working.is_met_by(St::Submitted, &working_evidence));
     // ...and even with the evidence, a queued (not-yet-working) state is not `working`.
@@ -158,7 +187,10 @@ fn submit_guarantee_level_silent_success_and_fail_open_guards() {
     // Profile requirement: only `write` is profile-free.
     assert!(!Write.requires_submit_profile());
     for level in [Composer, Submitted, Working] {
-        assert!(level.requires_submit_profile(), "{level:?} must require a submit profile");
+        assert!(
+            level.requires_submit_profile(),
+            "{level:?} must require a submit profile"
+        );
     }
 }
 
@@ -166,7 +198,10 @@ fn submit_guarantee_level_silent_success_and_fail_open_guards() {
 fn submit_receipt_state_is_fail_open_for_allowed_sends() {
     // Status-quo: an allowed send with NO verification report is `submitted`
     // (verification never makes a send worse than today's behavior).
-    assert_eq!(submit_receipt_state(&allowed("send.allow"), None), SubmitReceiptState::Submitted);
+    assert_eq!(
+        submit_receipt_state(&allowed("send.allow"), None),
+        SubmitReceiptState::Submitted
+    );
 
     // A verification report state passes through honestly — including
     // `verification_unavailable` (the explicit fail-open signal) and the
@@ -194,7 +229,10 @@ fn submit_receipt_state_is_fail_open_for_allowed_sends() {
         action: ActionKind::SendText,
         audit_action_id: None,
     };
-    assert_eq!(submit_receipt_state(&deny, None), SubmitReceiptState::PolicyDenied);
+    assert_eq!(
+        submit_receipt_state(&deny, None),
+        SubmitReceiptState::PolicyDenied
+    );
 
     let approve = InjectionResult::RequiresApproval {
         decision: PolicyDecision::require_approval("needs sign-off"),
@@ -203,7 +241,10 @@ fn submit_receipt_state_is_fail_open_for_allowed_sends() {
         action: ActionKind::SendText,
         audit_action_id: None,
     };
-    assert_eq!(submit_receipt_state(&approve, None), SubmitReceiptState::RequiresApproval);
+    assert_eq!(
+        submit_receipt_state(&approve, None),
+        SubmitReceiptState::RequiresApproval
+    );
 
     let err = InjectionResult::Error {
         decision: PolicyDecision::allow_with_rule("send.allow"),
@@ -212,7 +253,10 @@ fn submit_receipt_state_is_fail_open_for_allowed_sends() {
         action: ActionKind::SendText,
         audit_action_id: None,
     };
-    assert_eq!(submit_receipt_state(&err, None), SubmitReceiptState::SendFailed);
+    assert_eq!(
+        submit_receipt_state(&err, None),
+        SubmitReceiptState::SendFailed
+    );
 }
 
 #[test]
@@ -224,7 +268,10 @@ fn submit_receipt_evidence_rule_ids_merge_sorted_and_deduped() {
     let merged = submit_receipt_evidence_rule_ids(&allowed("send.allow"), Some(&report));
     // The decision rule id and the report rule ids are merged, sorted, deduped
     // (send.allow appears in both but only once).
-    assert_eq!(merged, vec!["send.allow".to_string(), "zzz:later".to_string()]);
+    assert_eq!(
+        merged,
+        vec!["send.allow".to_string(), "zzz:later".to_string()]
+    );
 }
 
 #[test]
@@ -240,16 +287,28 @@ fn idempotency_replay_returns_the_original_receipt() {
     assert_eq!(lookup(&ft_dir, key).expect("lookup"), None);
 
     // Record a submitted receipt, then replay -> the original is returned verbatim.
-    let original = report_with_state(SubmitReceiptState::Submitted, vec!["send.allow".to_string()]);
+    let original = report_with_state(
+        SubmitReceiptState::Submitted,
+        vec!["send.allow".to_string()],
+    );
     record(&ft_dir, key, &original).expect("record");
-    assert_eq!(lookup(&ft_dir, key).expect("lookup").as_ref(), Some(&original));
+    assert_eq!(
+        lookup(&ft_dir, key).expect("lookup").as_ref(),
+        Some(&original)
+    );
 
     // A queued-behind-operation receipt under a distinct key is independent.
     let queued_key = "idem:9:aabbccddeeff0011";
     let queued = report_with_state(SubmitReceiptState::QueuedBehindOperation, vec![]);
     record(&ft_dir, queued_key, &queued).expect("record queued");
-    assert_eq!(lookup(&ft_dir, queued_key).expect("lookup queued").as_ref(), Some(&queued));
-    assert_eq!(lookup(&ft_dir, key).expect("lookup").as_ref(), Some(&original));
+    assert_eq!(
+        lookup(&ft_dir, queued_key).expect("lookup queued").as_ref(),
+        Some(&queued)
+    );
+    assert_eq!(
+        lookup(&ft_dir, key).expect("lookup").as_ref(),
+        Some(&original)
+    );
 
     let _ = std::fs::remove_dir_all(&ft_dir);
 }
@@ -257,7 +316,9 @@ fn idempotency_replay_returns_the_original_receipt() {
 #[test]
 fn submit_idempotency_key_guard_rejects_traversal_and_malformed() {
     assert!(is_valid_submit_key("idem:0:0123456789abcdef"));
-    assert!(is_valid_submit_key("idem:18446744073709551615:deadbeefdeadbeef"));
+    assert!(is_valid_submit_key(
+        "idem:18446744073709551615:deadbeefdeadbeef"
+    ));
     // Path traversal / separators / absolute.
     assert!(!is_valid_submit_key("idem:7:../etc/passwd"));
     assert!(!is_valid_submit_key("../escape"));

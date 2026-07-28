@@ -10,7 +10,7 @@
 use std::hint::black_box;
 
 use codec::cdc_dedup::{CdcDedupDecoder, CdcDedupEncoder};
-use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 
 const FRAME_COUNT: usize = 96;
 

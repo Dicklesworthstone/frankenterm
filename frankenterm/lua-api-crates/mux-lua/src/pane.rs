@@ -375,8 +375,9 @@ impl UserData for MuxPane {
                 // ids inside the spawned future so only `Send` values cross the
                 // `Task` boundary -- not `Arc<Tab>`.
                 let (tab_id, window) = promise::spawn::spawn(async move {
-                    let (tab, window) =
-                        mux.move_pane_to_new_tab(pane_id, Some(window_id), None).await?;
+                    let (tab, window) = mux
+                        .move_pane_to_new_tab(pane_id, Some(window_id), None)
+                        .await?;
                     Ok::<_, anyhow::Error>((tab.tab_id(), window))
                 })
                 .await
