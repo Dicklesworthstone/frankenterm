@@ -1,6 +1,6 @@
-use crate::domain::{lock_or_recover, ClientInner};
+use crate::domain::{ClientInner, lock_or_recover};
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
+use crate::pane::renderable::{RenderableInner, RenderableState, hydrate_lines};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -8,8 +8,8 @@ use config::configuration;
 use config::keyassignment::ScrollbackEraseMode;
 use mux::domain::DomainId;
 use mux::pane::{
-    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
-    Pattern, SearchResult, WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
+    SearchResult, WithPaneLines, alloc_pane_id,
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
@@ -202,21 +202,9 @@ impl ClientPane {
                     }
                     Alert::OutputSinceFocusLost => {
                         *self.unseen_output.lock() = true;
-                        if let Some(mux) = Mux::try_get() {
-                            mux.notify(MuxNotification::Alert {
-                                pane_id: self.local_pane_id,
-                                alert: Alert::OutputSinceFocusLost,
-                            });
-                        }
                     }
                     Alert::Progress(progress) => {
                         *self.progress.lock() = progress.clone();
-                        if let Some(mux) = Mux::try_get() {
-                            mux.notify(MuxNotification::Alert {
-                                pane_id: self.local_pane_id,
-                                alert: Alert::Progress(progress.clone()),
-                            });
-                        }
                     }
                     _ => {}
                 }
@@ -732,8 +720,8 @@ mod tests {
     use crate::client::Client;
     use crate::domain::ClientDomainConfig;
     use config::UnixDomain;
-    use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::Mux;
+    use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use promise::spawn::SimpleExecutor;
     use std::sync::{Mutex as StdMutex, Once};
 
@@ -835,5 +823,62 @@ mod tests {
         .expect("render delta should apply");
 
         assert!(pane.is_alt_screen_active());
+    }
+
+    #[test]
+    fn unilateral_state_alert_is_forwarded_exactly_once() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        ensure_test_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::Alert { pane_id: 23, alert } = notification {
+                observed_for_subscriber.lock().unwrap().push(alert);
+            }
+            true
+        });
+
+        let inner = test_client_inner(17);
+        let pane = ClientPane::new(
+            &inner,
+            23,
+            29,
+            TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 800,
+                pixel_height: 480,
+                dpi: 96,
+            },
+            "shell",
+            false,
+        );
+
+        promise::spawn::block_on(async {
+            pane.process_unilateral(Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 29,
+                alert: Alert::OutputSinceFocusLost,
+            }))
+            .await?;
+            pane.process_unilateral(Pdu::NotifyAlert(NotifyAlert {
+                pane_id: 29,
+                alert: Alert::Progress(Progress::Percentage(64)),
+            }))
+            .await
+        })
+        .expect("unilateral alerts should apply");
+
+        assert!(*pane.unseen_output.lock());
+        assert_eq!(*pane.progress.lock(), Progress::Percentage(64));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                Alert::OutputSinceFocusLost,
+                Alert::Progress(Progress::Percentage(64)),
+            ],
+            "state mutation and notification forwarding must not emit duplicate alerts"
+        );
     }
 }

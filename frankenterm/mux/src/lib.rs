@@ -63,14 +63,14 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -91,7 +91,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -230,14 +230,16 @@ struct PendingPaneOutputNotifications {
 
 /// Discriminant key for the high-rate Alert variants we dedupe per pane.
 ///
-/// `Progress` (OSC 9;4) and `CurrentWorkingDirectoryChanged` (OSC 7) re-emit
-/// on every shell prompt under active agent output; `OutputSinceFocusLost`
-/// re-emits on every seqno bump to an unfocused pane. Across N attached muxes
-/// these saturate the notify path with thousands of clones+box allocations
-/// per second. See ft-18xgy.
+/// `CurrentWorkingDirectoryChanged` (OSC 7) re-emits on every shell prompt
+/// under active agent output; `OutputSinceFocusLost` re-emits on every seqno
+/// bump to an unfocused pane. Across N attached muxes these can saturate the
+/// notify path with thousands of clones+box allocations per second. Progress
+/// is deliberately excluded: Percentage(42) followed by Percentage(64) is a
+/// state transition, not a duplicate, and timer-dropping the newer value can
+/// leave a remote client stale indefinitely. See ft-18xgy and
+/// ft-interactive-systems-performance-4tenz.5.5.1.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum HighRateAlertKind {
-    Progress,
     CurrentWorkingDirectoryChanged,
     OutputSinceFocusLost,
 }
@@ -1096,7 +1098,6 @@ impl Mux {
         // See ft-18xgy.
         if let MuxNotification::Alert { pane_id, alert } = &notification {
             let kind = match alert {
-                frankenterm_term::Alert::Progress(_) => Some(HighRateAlertKind::Progress),
                 frankenterm_term::Alert::CurrentWorkingDirectoryChanged => {
                     Some(HighRateAlertKind::CurrentWorkingDirectoryChanged)
                 }
@@ -1704,9 +1705,9 @@ impl Mux {
             .get(&tab_id)
             .map(Arc::clone)
             .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} not found in mux"))?;
-        let src_window = self
-            .window_containing_tab(tab_id)
-            .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} is not in any window"))?;
+        let src_window = self.window_containing_tab(tab_id).ok_or_else(|| {
+            anyhow!("move_tab_between_windows: tab {tab_id} is not in any window")
+        })?;
 
         {
             let mut windows = self.windows.write();
@@ -2231,8 +2232,8 @@ mod tests {
     use proptest::prelude::*;
     use rangeset::RangeSet;
     use std::ops::Range;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::MutexGuard as StdMutexGuard;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use termwiz::surface::{Line, SequenceNo};
 
     fn global_test_lock() -> StdMutexGuard<'static, ()> {
@@ -2747,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn high_rate_alert_notifications_dedupe_per_pane_and_kind() {
+    fn high_rate_alert_dedupe_preserves_value_bearing_progress_updates() {
         let mux = Mux::new(None);
         let notifications = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&notifications);
@@ -2758,40 +2759,54 @@ mod tests {
             true
         });
 
-        let progress = MuxNotification::Alert {
+        let cwd = MuxNotification::Alert {
             pane_id: 7,
-            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(42)),
+            alert: frankenterm_term::Alert::CurrentWorkingDirectoryChanged,
         };
-        mux.notify(progress.clone());
-        mux.notify(progress.clone());
+        mux.notify(cwd.clone());
+        mux.notify(cwd.clone());
         assert_eq!(
             notifications.load(Ordering::Relaxed),
             1,
-            "same-pane same-kind high-rate alerts should dedupe inside the frame window",
+            "idempotent same-pane alerts should dedupe inside the frame window",
         );
 
         mux.notify(MuxNotification::Alert {
             pane_id: 7,
-            alert: frankenterm_term::Alert::CurrentWorkingDirectoryChanged,
+            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(42)),
+        });
+        mux.notify(MuxNotification::Alert {
+            pane_id: 7,
+            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(64)),
         });
         assert_eq!(
             notifications.load(Ordering::Relaxed),
-            2,
-            "different high-rate alert kinds should not dedupe each other",
+            3,
+            "newer value-bearing progress state must never be timer-dropped",
+        );
+
+        mux.notify(MuxNotification::Alert {
+            pane_id: 7,
+            alert: frankenterm_term::Alert::OutputSinceFocusLost,
+        });
+        assert_eq!(
+            notifications.load(Ordering::Relaxed),
+            4,
+            "different idempotent alert kinds should not dedupe each other",
         );
 
         {
             let mut last = mux.last_high_rate_alert.lock();
             *last
-                .get_mut(&(7, HighRateAlertKind::Progress))
-                .expect("first progress alert should populate the dedupe map") = Instant::now()
+                .get_mut(&(7, HighRateAlertKind::CurrentWorkingDirectoryChanged))
+                .expect("first cwd alert should populate the dedupe map") = Instant::now()
                 .checked_sub(HIGH_RATE_ALERT_DEDUPE_WINDOW + Duration::from_millis(1))
                 .expect("test duration is small enough to subtract from now");
         }
-        mux.notify(progress);
+        mux.notify(cwd);
         assert_eq!(
             notifications.load(Ordering::Relaxed),
-            3,
+            5,
             "same-pane same-kind alert should dispatch again after the dedupe window",
         );
     }
@@ -2801,7 +2816,7 @@ mod tests {
         let mux = Mux::new(None);
         mux.notify(MuxNotification::Alert {
             pane_id: 7,
-            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(42)),
+            alert: frankenterm_term::Alert::OutputSinceFocusLost,
         });
         mux.notify(MuxNotification::Alert {
             pane_id: 7,
@@ -2809,14 +2824,14 @@ mod tests {
         });
         mux.notify(MuxNotification::Alert {
             pane_id: 8,
-            alert: frankenterm_term::Alert::Progress(frankenterm_term::Progress::Percentage(64)),
+            alert: frankenterm_term::Alert::OutputSinceFocusLost,
         });
 
         {
             let last = mux.last_high_rate_alert.lock();
-            assert!(last.contains_key(&(7, HighRateAlertKind::Progress)));
+            assert!(last.contains_key(&(7, HighRateAlertKind::OutputSinceFocusLost)));
             assert!(last.contains_key(&(7, HighRateAlertKind::CurrentWorkingDirectoryChanged)));
-            assert!(last.contains_key(&(8, HighRateAlertKind::Progress)));
+            assert!(last.contains_key(&(8, HighRateAlertKind::OutputSinceFocusLost)));
         }
 
         mux.remove_pane(7);
@@ -2827,7 +2842,7 @@ mod tests {
             "remove_pane must not leave high-rate alert dedupe entries for a dead pane",
         );
         assert!(
-            last.contains_key(&(8, HighRateAlertKind::Progress)),
+            last.contains_key(&(8, HighRateAlertKind::OutputSinceFocusLost)),
             "tearing down one pane must not clear dedupe state for unrelated live panes",
         );
     }

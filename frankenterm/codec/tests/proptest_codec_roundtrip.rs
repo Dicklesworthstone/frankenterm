@@ -19,7 +19,7 @@ use codec::{
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
-    Alert, ClipboardSelection, MouseButton, MouseEvent as TermMouseEvent, MouseEventKind,
+    Alert, ClipboardSelection, MouseButton, MouseEvent as TermMouseEvent, MouseEventKind, Progress,
     TerminalSize,
 };
 use mux::client::{ClientId, ClientInfo};
@@ -38,6 +38,27 @@ fn arb_small_string() -> impl Strategy<Value = String> {
 
 fn arb_small_bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..128)
+}
+
+fn arb_sanitized_alt_text() -> impl Strategy<Value = String> {
+    let word = proptest::collection::vec(
+        any::<char>().prop_filter("printable non-whitespace character", |ch| {
+            !ch.is_control() && !ch.is_whitespace()
+        }),
+        1..=8,
+    )
+    .prop_map(|chars| chars.into_iter().collect::<String>());
+
+    proptest::collection::vec(word, 1..=8).prop_map(|words| words.join(" "))
+}
+
+fn arb_progress() -> impl Strategy<Value = Progress> {
+    prop_oneof![
+        Just(Progress::None),
+        any::<u8>().prop_map(Progress::Percentage),
+        any::<u8>().prop_map(Progress::Error),
+        Just(Progress::Indeterminate),
+    ]
 }
 
 fn arb_terminal_size() -> impl Strategy<Value = TerminalSize> {
@@ -378,6 +399,8 @@ fn arb_alert() -> impl Strategy<Value = Alert> {
         Just(Alert::CurrentWorkingDirectoryChanged),
         Just(Alert::PaletteChanged),
         Just(Alert::OutputSinceFocusLost),
+        arb_progress().prop_map(Alert::Progress),
+        prop::option::of(arb_small_string()).prop_map(Alert::IconTitleChanged),
         arb_small_string().prop_map(Alert::WindowTitleChanged),
         prop::option::of(arb_small_string()).prop_map(Alert::TabTitleChanged),
         (
@@ -392,6 +415,10 @@ fn arb_alert() -> impl Strategy<Value = Alert> {
             }),
         (arb_small_string(), arb_small_string())
             .prop_map(|(name, value)| Alert::SetUserVar { name, value }),
+        arb_small_string().prop_map(|name| Alert::SetProfileRequested { name }),
+        arb_small_string().prop_map(|shape| Alert::MouseShapeRequested { shape }),
+        (any::<u32>(), arb_sanitized_alt_text())
+            .prop_map(|(image_id, text)| Alert::ImageAltText { image_id, text }),
     ]
 }
 
@@ -604,8 +631,8 @@ fn arb_get_pane_renderable_dimensions() -> impl Strategy<Value = GetPaneRenderab
     arb_id().prop_map(|pane_id| GetPaneRenderableDimensions { pane_id })
 }
 
-fn arb_get_pane_renderable_dimensions_response(
-) -> impl Strategy<Value = GetPaneRenderableDimensionsResponse> {
+fn arb_get_pane_renderable_dimensions_response()
+-> impl Strategy<Value = GetPaneRenderableDimensionsResponse> {
     (
         arb_id(),
         any::<bool>(),
