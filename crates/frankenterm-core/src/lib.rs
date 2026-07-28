@@ -44,6 +44,13 @@
 
 #![forbid(unsafe_code)]
 #![feature(stmt_expr_attributes)]
+// windows_by_handle: volume_serial_number()/file_index() power the
+// tx-contract-store filesystem-identity checks on Windows
+// (tx_execution::std_object_identity). Still unstable on the pinned
+// nightly; the workspace is nightly-only so the gate is safe, and the
+// stable alternative (GetFileInformationByHandle) needs unsafe, which
+// this crate forbids.
+#![cfg_attr(windows, feature(windows_by_handle))]
 
 pub mod a11y_tree;
 pub mod accessibility_preferences;
