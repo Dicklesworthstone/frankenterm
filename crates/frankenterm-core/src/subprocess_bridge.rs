@@ -101,7 +101,29 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         crate::runtime_async::process::configure_process_group(&mut cmd)
             .map_err(|err| BridgeError::ExitCode(-1, err.to_string()))?;
 
-        let mut child = cmd.spawn().map_err(|err| self.map_spawn_error(err))?;
+        // ETXTBSY (os error 26) on exec is always transient: either the
+        // bridge binary is briefly open for writing (mid-self-update), or
+        // another thread's fork captured a writable fd for it that its
+        // child has not yet CLOEXEC-closed — the classic multithreaded
+        // write-then-exec race (ft-e5jb0; same bounded-retry shape as
+        // robot_ntm_differential::run_ntm_subprocess).
+        let mut child = {
+            const ETXTBSY: i32 = 26;
+            const RETRY_DELAYS_MS: [u64; 2] = [10, 50];
+            let mut delays = RETRY_DELAYS_MS.iter();
+            loop {
+                match cmd.spawn() {
+                    Ok(child) => break child,
+                    Err(err) if err.raw_os_error() == Some(ETXTBSY) => match delays.next() {
+                        Some(delay_ms) => {
+                            std::thread::sleep(Duration::from_millis(*delay_ms));
+                        }
+                        None => return Err(self.map_spawn_error(err)),
+                    },
+                    Err(err) => return Err(self.map_spawn_error(err)),
+                }
+            }
+        };
         let started = Instant::now();
 
         let kill_process_group = |child_id: u32| {
