@@ -1,10 +1,9 @@
 use anyhow::{anyhow, Result};
 use async_executor::Executor;
-use flume::{bounded, unbounded, Receiver, TryRecvError};
+use flume::{bounded, unbounded, Receiver};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Poll, Waker};
 
 pub use async_task::{Runnable, Task};
 pub type SpawnFunc = Box<dyn FnOnce() + Send>;
@@ -156,63 +155,24 @@ where
 {
     let (tx, rx) = bounded(1);
 
-    // Holds the waker that may later observe
-    // during the Future::poll call.
-    struct WakerHolder {
-        waker: Mutex<Option<Waker>>,
-    }
-
-    let holder = Arc::new(WakerHolder {
-        waker: Mutex::new(None),
-    });
-
-    let thread_waker = Arc::clone(&holder);
     let thread_tx = tx.clone();
     if let Err(err) = std::thread::Builder::new()
         .name("promise-worker".to_string())
         .spawn(move || {
             let res = f();
-            if thread_tx.send(res).is_err() {
-                return;
-            }
-            // If someone polled the thread before we got here,
-            // they will have populated the waker; extract it
-            // and wake up the scheduler so that it will poll
-            // the result again. Wake outside the mutex guard so a
-            // custom waker cannot poison the holder lock.
-            let waker = lock_or_recover(&thread_waker.waker).take();
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            let _ = thread_tx.send(res);
         })
     {
         let _ = tx.send(Err(anyhow!("failed to spawn promise worker thread: {err}")));
     }
+    drop(tx);
 
-    struct PendingResult<T> {
-        rx: Receiver<Result<T>>,
-        holder: Arc<WakerHolder>,
-    }
-
-    impl<T> std::future::Future for PendingResult<T> {
-        type Output = Result<T>;
-
-        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
-            match self.rx.try_recv() {
-                Ok(res) => Poll::Ready(res),
-                Err(TryRecvError::Empty) => {
-                    let mut waker = lock_or_recover(&self.holder.waker);
-                    waker.replace(cx.waker().clone());
-                    Poll::Pending
-                }
-                Err(TryRecvError::Disconnected) => {
-                    Poll::Ready(Err(anyhow!("thread terminated without providing a result")))
-                }
-            }
+    spawn_into_main_thread(async move {
+        match rx.into_recv_async().await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("thread terminated without providing a result")),
         }
-    }
-
-    spawn_into_main_thread(PendingResult { rx, holder })
+    })
 }
 
 fn get_scoped() -> Option<Arc<Executor<'static>>> {

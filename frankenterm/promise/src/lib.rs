@@ -14,6 +14,8 @@ pub struct BrokenPromise {}
 struct Core<T> {
     result: Option<anyhow::Result<T>>,
     waker: Option<Waker>,
+    future_taken: bool,
+    producer_completed: bool,
 }
 
 fn lock_core<T>(core: &Mutex<Core<T>>) -> MutexGuard<'_, Core<T>> {
@@ -33,6 +35,7 @@ pub struct Promise<T> {
 #[derive(Debug)]
 pub struct Future<T> {
     core: Arc<Mutex<Core<T>>>,
+    completed: bool,
 }
 
 impl<T> Default for Promise<T> {
@@ -47,13 +50,23 @@ impl<T> Promise<T> {
             core: Arc::new(Mutex::new(Core {
                 result: None,
                 waker: None,
+                future_taken: false,
+                producer_completed: false,
             })),
         }
     }
 
     pub fn get_future(&mut self) -> Option<Future<T>> {
+        {
+            let mut core = lock_core(&self.core);
+            if core.future_taken {
+                return None;
+            }
+            core.future_taken = true;
+        }
         Some(Future {
             core: Arc::clone(&self.core),
+            completed: false,
         })
     }
 
@@ -68,7 +81,11 @@ impl<T> Promise<T> {
     pub fn result(&mut self, result: Result<T, Error>) -> bool {
         let waker = {
             let mut core = lock_core(&self.core);
-            core.result.replace(result);
+            if core.producer_completed {
+                return false;
+            }
+            core.producer_completed = true;
+            core.result = Some(result);
             core.waker.take()
         };
 
@@ -76,6 +93,26 @@ impl<T> Promise<T> {
             waker.wake();
         }
         true
+    }
+}
+
+impl<T> Drop for Promise<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut core = lock_core(&self.core);
+            if core.producer_completed {
+                return;
+            }
+            core.producer_completed = true;
+            core.result = Some(Err(BrokenPromise {}.into()));
+            core.waker.take()
+        };
+
+        if let Some(waker) = waker {
+            // Destructors must not propagate an executor-provided waker panic:
+            // a second panic during unwinding would abort the process.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()));
+        }
     }
 }
 
@@ -99,7 +136,10 @@ impl<T: Send + 'static> Future<T> {
             core: Arc::new(Mutex::new(Core {
                 result: Some(result),
                 waker: None,
+                future_taken: true,
+                producer_completed: true,
             })),
+            completed: false,
         }
     }
 }
@@ -108,10 +148,13 @@ impl<T: Send + 'static> std::future::Future for Future<T> {
     type Output = Result<T, Error>;
 
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        assert!(!this.completed, "promise future polled after completion");
         let waker = ctx.waker().clone();
 
-        let mut core = lock_core(&self.core);
+        let mut core = lock_core(&this.core);
         if let Some(result) = core.result.take() {
+            this.completed = true;
             Poll::Ready(result)
         } else {
             core.waker.replace(waker);
@@ -124,27 +167,26 @@ impl<T: Send + 'static> std::future::Future for Future<T> {
 mod tests {
     use super::*;
     use std::future::Future as StdFuture;
-    use std::task::{RawWaker, RawWakerVTable};
+    use std::task::Wake;
 
     fn noop_waker() -> Waker {
-        fn noop(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
+        Waker::noop().clone()
+    }
+
+    struct PanicWake;
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            panic!("waker panic");
         }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            panic!("waker panic");
+        }
     }
 
     fn panic_waker() -> Waker {
-        fn drop(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker {
-            RawWaker::new(p, &VTABLE)
-        }
-        fn wake(_: *const ()) {
-            panic!("waker panic");
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        Waker::from(Arc::new(PanicWake))
     }
 
     // ── BrokenPromise ──────────────────────────────────────────
@@ -181,10 +223,66 @@ mod tests {
     }
 
     #[test]
-    fn get_future_can_be_called_multiple_times() {
+    fn get_future_is_single_consumer() {
         let mut p: Promise<i32> = Promise::new();
-        let _f1 = p.get_future();
-        let _f2 = p.get_future();
+        assert!(p.get_future().is_some());
+        assert!(p.get_future().is_none());
+    }
+
+    #[test]
+    fn dropping_incomplete_promise_completes_future_with_broken_promise() {
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().expect("future");
+        drop(promise);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match StdFuture::poll(Pin::new(&mut future), &mut cx) {
+            Poll::Ready(Err(err)) => {
+                assert_eq!(err.to_string(), "Promise was dropped before completion")
+            }
+            other => panic!("expected broken-promise error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dropping_incomplete_promise_contains_panicking_waker() {
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().expect("future");
+        let waker = panic_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Pending
+        ));
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(promise))).is_ok());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Ready(Err(_))
+        ));
+    }
+
+    #[test]
+    fn dropping_resolved_promise_after_consumption_does_not_invent_broken_promise() {
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().expect("future");
+        assert!(promise.ok(42));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
+            Poll::Ready(Ok(42))
+        ));
+
+        let core = Arc::clone(&promise.core);
+        drop(promise);
+        let core = lock_core(&core);
+        assert!(core.producer_completed);
+        assert!(core.result.is_none());
     }
 
     // ── Promise::ok / err / result ─────────────────────────────
@@ -306,17 +404,18 @@ mod tests {
     }
 
     #[test]
-    fn poll_after_ready_returns_err_none() {
+    fn poll_after_ready_panics_instead_of_reentering_terminal_future() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut fut = Future::ok(42i32);
-        // First poll takes the result
-        let _ = StdFuture::poll(Pin::new(&mut fut), &mut cx);
-        // Second poll: result was taken, so it's Pending (no result left)
         assert!(matches!(
             StdFuture::poll(Pin::new(&mut fut), &mut cx),
-            Poll::Pending
+            Poll::Ready(Ok(42))
         ));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = StdFuture::poll(Pin::new(&mut fut), &mut cx);
+        }))
+        .is_err());
     }
 
     // ── Waker integration ──────────────────────────────────────
@@ -448,56 +547,51 @@ mod tests {
         ));
     }
 
-    // ── Multiple futures from same promise ─────────────────────
+    // ── Single-consumer future ownership ────────────────────────
 
     #[test]
-    fn multiple_futures_share_result() {
+    fn promise_rejects_a_second_future() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut p: Promise<i32> = Promise::new();
         let mut f1 = p.get_future().unwrap();
-        let mut f2 = p.get_future().unwrap();
+        assert!(p.get_future().is_none());
 
-        p.ok(42);
+        assert!(p.ok(42));
 
-        // First future gets the result
         match StdFuture::poll(Pin::new(&mut f1), &mut cx) {
             Poll::Ready(Ok(val)) => assert_eq!(val, 42),
-            Poll::Pending => { /* f2 might have consumed it */ }
             other => panic!("{}", format!("unexpected: {other:?}")),
         }
-        // Second future: result already taken by first
-        // It will be Pending since the result was consumed
-        let _ = StdFuture::poll(Pin::new(&mut f2), &mut cx);
     }
 
-    // ── Promise double-resolve ────────────────────────────────
+    // ── Promise resolution is single-assignment ───────────────
 
     #[test]
-    fn promise_ok_twice_overwrites() {
+    fn promise_ok_twice_preserves_first_result() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut p: Promise<i32> = Promise::new();
         let mut fut = p.get_future().unwrap();
-        p.ok(1);
-        p.ok(2); // overwrites
+        assert!(p.ok(1));
+        assert!(!p.ok(2));
         match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
-            Poll::Ready(Ok(val)) => assert_eq!(val, 2),
-            other => panic!("{}", format!("expected Ready(Ok(2)), got {other:?}")),
+            Poll::Ready(Ok(val)) => assert_eq!(val, 1),
+            other => panic!("{}", format!("expected Ready(Ok(1)), got {other:?}")),
         }
     }
 
     #[test]
-    fn promise_err_then_ok_overwrites() {
+    fn promise_err_then_ok_preserves_first_error() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut p: Promise<i32> = Promise::new();
         let mut fut = p.get_future().unwrap();
-        p.err(anyhow::anyhow!("first"));
-        p.ok(42); // overwrites the error
+        assert!(p.err(anyhow::anyhow!("first")));
+        assert!(!p.ok(42));
         match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
-            Poll::Ready(Ok(val)) => assert_eq!(val, 42),
-            other => panic!("{}", format!("expected Ready(Ok(42)), got {other:?}")),
+            Poll::Ready(Err(err)) => assert_eq!(err.to_string(), "first"),
+            other => panic!("{}", format!("expected Ready(Err), got {other:?}")),
         }
     }
 
@@ -513,19 +607,22 @@ mod tests {
     // ── Promise drop without resolve ──────────────────────────
 
     #[test]
-    fn promise_drop_without_resolve_leaves_future_pending() {
+    fn promise_drop_after_pending_poll_wakes_with_broken_promise() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut fut;
-        {
-            let mut p: Promise<i32> = Promise::new();
-            fut = p.get_future().unwrap();
-            // p drops here without resolve
-        }
+        let mut promise: Promise<i32> = Promise::new();
+        let mut future = promise.get_future().unwrap();
         assert!(matches!(
-            StdFuture::poll(Pin::new(&mut fut), &mut cx),
+            StdFuture::poll(Pin::new(&mut future), &mut cx),
             Poll::Pending
         ));
+        drop(promise);
+        match StdFuture::poll(Pin::new(&mut future), &mut cx) {
+            Poll::Ready(Err(err)) => {
+                assert_eq!(err.to_string(), "Promise was dropped before completion")
+            }
+            other => panic!("expected broken-promise error, got {:?}", other),
+        }
     }
 
     // ── Cross-thread with err ─────────────────────────────────
@@ -619,16 +716,16 @@ mod tests {
     }
 
     #[test]
-    fn promise_ok_then_err_overwrites_to_err() {
+    fn promise_ok_then_err_preserves_first_value() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut p: Promise<i32> = Promise::new();
         let mut fut = p.get_future().unwrap();
-        p.ok(42);
-        p.err(anyhow::anyhow!("overwritten")); // overwrites the Ok
+        assert!(p.ok(42));
+        assert!(!p.err(anyhow::anyhow!("ignored")));
         match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
-            Poll::Ready(Err(e)) => assert_eq!(e.to_string(), "overwritten"),
-            other => panic!("{}", format!("expected Ready(Err), got {other:?}")),
+            Poll::Ready(Ok(value)) => assert_eq!(value, 42),
+            other => panic!("{}", format!("expected Ready(Ok(42)), got {other:?}")),
         }
     }
 
@@ -693,20 +790,16 @@ mod tests {
     }
 
     #[test]
-    fn future_ok_consumed_then_pending() {
+    #[should_panic(expected = "promise future polled after completion")]
+    fn future_repoll_after_completion_panics() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut fut = Future::ok(42i32);
-        // First poll consumes the value
         assert!(matches!(
             StdFuture::poll(Pin::new(&mut fut), &mut cx),
             Poll::Ready(Ok(42))
         ));
-        // Second poll is pending because the value was consumed
-        assert!(matches!(
-            StdFuture::poll(Pin::new(&mut fut), &mut cx),
-            Poll::Pending
-        ));
+        let _ = StdFuture::poll(Pin::new(&mut fut), &mut cx);
     }
 
     #[test]
@@ -729,15 +822,15 @@ mod tests {
         }
     }
 
-    // ── Promise result always returns true ──────────────────
+    // ── Promise result reports duplicate resolution ─────────
 
     #[test]
-    fn promise_result_returns_true_even_after_prior_resolve() {
+    fn promise_result_returns_false_after_prior_resolve() {
         let mut p: Promise<i32> = Promise::new();
         assert!(p.ok(1));
-        assert!(p.ok(2));
-        assert!(p.err(anyhow::anyhow!("err")));
-        assert!(p.result(Ok(3)));
+        assert!(!p.ok(2));
+        assert!(!p.err(anyhow::anyhow!("err")));
+        assert!(!p.result(Ok(3)));
     }
 
     // ── Waker replacement on repeated polls ─────────────────
@@ -801,15 +894,17 @@ mod tests {
             // Try polling from this thread concurrently
             let waker = noop_waker();
             let mut cx = Context::from_waker(&waker);
-            let _ = StdFuture::poll(Pin::new(&mut fut), &mut cx);
+            let first_poll = StdFuture::poll(Pin::new(&mut fut), &mut cx);
 
             handle.join().unwrap();
 
-            // After thread completes, should be ready
-            match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
-                Poll::Ready(Ok(val)) => assert_eq!(val, 123),
-                Poll::Pending => { /* already consumed in concurrent poll */ }
-                other => panic!("{}", format!("unexpected: {other:?}")),
+            match first_poll {
+                Poll::Ready(Ok(value)) => assert_eq!(value, 123),
+                Poll::Pending => match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+                    Poll::Ready(Ok(value)) => assert_eq!(value, 123),
+                    other => panic!("expected resolved promise after join, got {:?}", other),
+                },
+                other => panic!("unexpected first poll: {:?}", other),
             }
         }
     }
@@ -955,27 +1050,27 @@ mod tests {
         }
     }
 
-    // ── Multiple resolve then single poll ───────────────────
+    // ── Multiple resolve attempts preserve first result ─────
 
     #[test]
-    fn triple_resolve_last_wins() {
+    fn triple_resolve_first_wins() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut p: Promise<i32> = Promise::new();
         let mut fut = p.get_future().unwrap();
-        p.ok(1);
-        p.ok(2);
-        p.ok(3);
+        assert!(p.ok(1));
+        assert!(!p.ok(2));
+        assert!(!p.ok(3));
         match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
-            Poll::Ready(Ok(val)) => assert_eq!(val, 3),
-            other => panic!("{}", format!("expected Ready(Ok(3)), got {other:?}")),
+            Poll::Ready(Ok(val)) => assert_eq!(val, 1),
+            other => panic!("{}", format!("expected Ready(Ok(1)), got {other:?}")),
         }
     }
 
     // ── Drop promise after poll pending ─────────────────────
 
     #[test]
-    fn drop_promise_after_pending_poll_no_panic() {
+    fn drop_promise_after_pending_poll_completes_without_panic() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut fut;
@@ -989,11 +1084,12 @@ mod tests {
             ));
             // p dropped here — no panic expected
         }
-        // Future is permanently pending
-        assert!(matches!(
-            StdFuture::poll(Pin::new(&mut fut), &mut cx),
-            Poll::Pending
-        ));
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Err(err)) => {
+                assert_eq!(err.to_string(), "Promise was dropped before completion")
+            }
+            other => panic!("expected broken-promise error, got {:?}", other),
+        }
     }
 
     // ── BrokenPromise into anyhow preserves message ─────────
@@ -1102,28 +1198,21 @@ mod tests {
         ));
     }
 
-    // ── Multiple futures: second gets nothing after first takes ──
+    // ── A second future is rejected before resolution ───────────
 
     #[test]
-    fn second_future_pending_after_first_takes_value() {
+    fn second_future_is_rejected_before_first_takes_value() {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut p: Promise<i32> = Promise::new();
         let mut f1 = p.get_future().unwrap();
-        let mut f2 = p.get_future().unwrap();
+        assert!(p.get_future().is_none());
 
-        p.ok(42);
+        assert!(p.ok(42));
 
-        // First future takes the value
         assert!(matches!(
             StdFuture::poll(Pin::new(&mut f1), &mut cx),
             Poll::Ready(Ok(42))
-        ));
-
-        // Second future finds nothing — result was consumed
-        assert!(matches!(
-            StdFuture::poll(Pin::new(&mut f2), &mut cx),
-            Poll::Pending
         ));
     }
 

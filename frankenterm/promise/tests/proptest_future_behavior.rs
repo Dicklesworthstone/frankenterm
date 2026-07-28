@@ -3,15 +3,10 @@ use promise::{Future, Promise};
 use proptest::prelude::*;
 use std::future::Future as StdFuture;
 use std::pin::Pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 
 fn noop_waker() -> Waker {
-    fn noop(_: *const ()) {}
-    fn clone(p: *const ()) -> RawWaker {
-        RawWaker::new(p, &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    Waker::noop().clone()
 }
 
 fn arb_small_string() -> impl Strategy<Value = String> {
@@ -34,7 +29,7 @@ proptest! {
     }
 
     #[test]
-    fn promise_last_write_wins_before_poll(
+    fn promise_first_write_wins_before_poll(
         first in arb_small_string(),
         second in arb_small_string(),
     ) {
@@ -43,12 +38,13 @@ proptest! {
         let mut promise = Promise::new();
         let mut fut = promise.get_future().expect("future");
 
+        let expected = first.clone();
         prop_assert!(promise.ok(first));
-        prop_assert!(promise.err(anyhow!(second.clone())));
+        prop_assert!(!promise.err(anyhow!(second)));
 
         match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
-            Poll::Ready(Err(err)) => prop_assert_eq!(err.to_string(), second),
-            other => prop_assert!(false, "expected Ready(Err(_)), got {other:?}"),
+            Poll::Ready(Ok(value)) => prop_assert_eq!(value, expected),
+            other => prop_assert!(false, "expected Ready(Ok(_)), got {other:?}"),
         }
     }
 }
