@@ -176,7 +176,12 @@ pub fn plan_unify_domain(
     if let Some(c) = candidates.iter().find(|w| w.window_id == canonical) {
         ordered.push(*c);
     }
-    ordered.extend(candidates.iter().copied().filter(|w| w.window_id != canonical));
+    ordered.extend(
+        candidates
+            .iter()
+            .copied()
+            .filter(|w| w.window_id != canonical),
+    );
 
     let mut moves: Vec<TabMove> = Vec::new();
     let mut drops: Vec<TabDrop> = Vec::new();
@@ -426,7 +431,10 @@ mod tests {
         let dropped: HashSet<TabId> = plan.drops.iter().map(|d| d.tab_id).collect();
         assert!(dropped.contains(&20), "duplicate mirror must be dropped");
         assert!(moved.contains(&21), "distinct tab must be moved");
-        assert!(moved.is_disjoint(&dropped), "no tab is both moved and dropped");
+        assert!(
+            moved.is_disjoint(&dropped),
+            "no tab is both moved and dropped"
+        );
     }
 
     #[test]
@@ -554,8 +562,7 @@ mod tests {
         );
         assert_eq!(plan.close_windows, vec![2]);
         assert!(
-            plan.moves.iter().all(|m| m.tab_id != 30)
-                && plan.drops.iter().all(|d| d.tab_id != 30),
+            plan.moves.iter().all(|m| m.tab_id != 30) && plan.drops.iter().all(|d| d.tab_id != 30),
             "same-identity tabs in other workspaces stay untouched",
         );
     }

@@ -1,11 +1,11 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{alloc_pane_id, PaneId};
+use crate::pane::{PaneId, alloc_pane_id};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
@@ -14,7 +14,7 @@ use std::convert::TryFrom;
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{Cursor, CSI};
+use termwiz::escape::csi::{CSI, Cursor};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 
