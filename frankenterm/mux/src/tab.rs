@@ -18,6 +18,31 @@ use url::Url;
 pub type Tree = bintree::Tree<Arc<dyn Pane>, SplitDirectionAndSize>;
 pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
 
+fn schedule_mux_pane_removals(panes: Vec<Arc<dyn Pane>>) {
+    if !promise::spawn::is_scheduler_configured() {
+        return;
+    }
+    let Some(mux) = Mux::try_get() else {
+        return;
+    };
+    let registrations = panes
+        .iter()
+        .filter_map(|pane| mux.capture_pane_registration(pane))
+        .collect::<Vec<_>>();
+    if registrations.is_empty() {
+        return;
+    }
+    let mux = Arc::downgrade(&mux);
+    promise::spawn::spawn_into_main_thread(async move {
+        if let Some(mux) = mux.upgrade() {
+            for registration in registrations {
+                mux.remove_pane_registration(registration);
+            }
+        }
+    })
+    .detach();
+}
+
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type TabId = usize;
 
@@ -3828,17 +3853,7 @@ impl TabInner {
     fn kill_pane(&mut self, pane_id: PaneId) -> bool {
         if self.has_floating_pane(pane_id) {
             if let Some(pane) = self.remove_floating_pane(pane_id) {
-                if promise::spawn::is_scheduler_configured() {
-                    if let Some(mux) = Mux::try_get() {
-                        let mux = Arc::downgrade(&mux);
-                        promise::spawn::spawn_into_main_thread(async move {
-                            if let Some(mux) = mux.upgrade() {
-                                mux.remove_pane_if_same(pane_id, &pane);
-                            }
-                        })
-                        .detach();
-                    }
-                }
+                schedule_mux_pane_removals(vec![pane]);
                 return true;
             }
             return false;
@@ -3850,17 +3865,7 @@ impl TabInner {
             return true;
         }
         if let Some(pane) = self.remove_stacked_pane(pane_id) {
-            if promise::spawn::is_scheduler_configured() {
-                if let Some(mux) = Mux::try_get() {
-                    let mux = Arc::downgrade(&mux);
-                    promise::spawn::spawn_into_main_thread(async move {
-                        if let Some(mux) = mux.upgrade() {
-                            mux.remove_pane_if_same(pane_id, &pane);
-                        }
-                    })
-                    .detach();
-                }
-            }
+            schedule_mux_pane_removals(vec![pane]);
             return true;
         }
         false
@@ -3875,19 +3880,7 @@ impl TabInner {
                 .chain(removed_stacked.iter())
                 .cloned()
                 .collect();
-            if promise::spawn::is_scheduler_configured() {
-                if let Some(mux) = Mux::try_get() {
-                    let mux = Arc::downgrade(&mux);
-                    promise::spawn::spawn_into_main_thread(async move {
-                        if let Some(mux) = mux.upgrade() {
-                            for pane in removed {
-                                mux.remove_pane_if_same(pane.pane_id(), &pane);
-                            }
-                        }
-                    })
-                    .detach();
-                }
-            }
+            schedule_mux_pane_removals(removed);
         }
         let removed_tree = self.remove_pane_if(|_, pane| pane.domain_id() == domain, true);
         !removed_floating.is_empty() || !removed_stacked.is_empty() || !removed_tree.is_empty()
@@ -4023,20 +4016,7 @@ impl TabInner {
         self.reindex_pane_stacks_from_tree();
 
         if !dead_panes.is_empty() && kill {
-            let to_kill = dead_panes.clone();
-            if promise::spawn::is_scheduler_configured() {
-                if let Some(mux) = Mux::try_get() {
-                    let mux = Arc::downgrade(&mux);
-                    promise::spawn::spawn_into_main_thread(async move {
-                        if let Some(mux) = mux.upgrade() {
-                            for pane in to_kill {
-                                mux.remove_pane_if_same(pane.pane_id(), &pane);
-                            }
-                        }
-                    })
-                    .detach();
-                }
-            }
+            schedule_mux_pane_removals(dead_panes.clone());
         }
         for pane in &dead_panes {
             let pid = pane.pane_id();
