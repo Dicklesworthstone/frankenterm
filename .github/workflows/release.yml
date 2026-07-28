@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@nightly
@@ -94,7 +94,7 @@ jobs:
           #   artifact: ft.exe
           #   asset: ft-windows-amd64.exe
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0  # Full history for version metadata
@@ -279,7 +279,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: actions/download-artifact@v8.0.1
@@ -311,7 +311,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate build provenance attestations
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           # Attest every file a downloader might trust: the binary archives AND the
           # checksum artifacts that key archive verification. Without attesting
@@ -444,7 +444,7 @@ jobs:
             "docs/attestations/SIGNING.md" \
             dist/
 
-      - uses: softprops/action-gh-release@v3.0.1
+      - uses: softprops/action-gh-release@v3.0.2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
