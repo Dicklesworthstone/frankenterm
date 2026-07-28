@@ -1,7 +1,7 @@
 # Interactive Systems Performance Negative-Evidence Ledger
 
-**Campaign:** `ft-interactive-systems-performance-4tenz`  
-**Contract:** `docs/perf/mux-long-session-performance-campaign.md`  
+**Campaign:** `ft-interactive-systems-performance-4tenz`
+**Contract:** `docs/perf/mux-long-session-performance-campaign.md`
 **Opened:** 2026-07-27
 
 This ledger prevents the mux/renderer/long-session campaign from repeating

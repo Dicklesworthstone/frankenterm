@@ -1,9 +1,10 @@
 # Real Mux Interaction, Resize, and Long-Session Performance Campaign
 
-**Status:** active investigation and optimization program  
-**Opened:** 2026-07-27  
-**Campaign epic:** `ft-interactive-systems-performance-4tenz`  
-**Truth-contract bead:** `ft-interactive-systems-performance-4tenz.1`  
+**Status:** active investigation and optimization program
+**Opened:** 2026-07-27
+**Campaign epic:** `ft-interactive-systems-performance-4tenz`
+**Product-convergence epic:** `ft-interactive-swarm-product-convergence-7xqz4`
+**Truth-contract bead:** `ft-interactive-systems-performance-4tenz.1`
 **Evidence ledger:** `docs/perf-ledger/interactive-systems-negative-results.md`
 
 This document is the operating contract for improving the latency and visual
@@ -508,62 +509,796 @@ Connection decode, mux mutation, and one terminal are inherently ordered.
 Parallelism belongs across independent panes or reflow chunks only when the
 chunks are large enough to amortize scheduling and cache costs.
 
-## 10. Campaign graph
+## 10. Target product promise
+
+The campaign is complete only when FrankenTerm behaves like an operator-grade
+interactive system, not merely when a benchmark becomes faster. The user
+promise is:
+
+> A focused remote pane feels local on a healthy LAN, remains responsive while
+> the rest of a large fleet is busy, resizes and zooms without ugly or
+> internally inconsistent frames, does not progressively rot during a
+> workday or multi-day run, explains the cause when it cannot meet that
+> promise, and recovers without losing the operator's final intent.
+
+That promise has seven inseparable parts:
+
+1. **Immediate interaction.** A key, paste, mouse action, or IME commit on the
+   focused pane has a protected bounded path from native input to a correct
+   presented response.
+2. **Continuous visual quality.** Resize, zoom, display migration, font-scale
+   changes, selection, cursor, images, Unicode, RTL, and IME remain coherent
+   at intermediate frames as well as at final convergence.
+3. **Fleet-scale fairness.** Background panes can make progress, but output,
+   search, capture, maintenance, resync, and a resize storm cannot silently
+   starve focused interaction.
+4. **Long-session stability.** Latency, memory, GPU residency, cache churn,
+   queue age, and thread count do not acquire positive slopes merely because a
+   session is old.
+5. **Truthful operation.** The installed GUI, CLI, mux server, config, and
+   evidence schema identify themselves atomically. A mismatch or unsupported
+   measurement is a typed degraded state, not an attractive false result.
+6. **Actionable diagnosis.** Operators can ask why the session is slow and get
+   a bounded, privacy-safe explanation with the dominant stage, confidence,
+   current envelope, and next safe action.
+7. **Safe adaptation.** Hardware-aware tuning is measured and reversible.
+   FrankenTerm never guesses a machine profile, silently changes correctness,
+   or turns one successful run into a universal default.
+
+### 10.1 User journeys that must work
+
+The following are product acceptance journeys, not optional demos:
+
+| Journey | Required observable outcome |
+|---|---|
+| First launch after installation | GUI, bundled CLI, mux protocol, source/build identity, config provenance, and renderer capability agree; mismatch is diagnosed before measurement |
+| One remote shell on the direct LAN | Typing, paste, cursor motion, and shell echo remain within the frozen interaction SLO without prediction hiding a slow real path |
+| Twenty-agent daily project | The focused agent stays responsive during compile output, searches, capture, and routine pane churn |
+| Fifty-pane burst | Aggregate 1 MB/s output cannot strand input or final output; degraded behavior is visible and converges exactly |
+| Two-hundred-pane mission | Continuous resize and tab/split changes preserve focused interaction, final geometry, and visual correctness |
+| Full workday | After four or more hours, interaction and render tails remain inside the admitted envelope with no harmful resource slope |
+| Multi-day control plane | At 24 and 72 hours, reconnects, maintenance, indexing, and cache aging do not cause leak-like growth or correctness drift |
+| Network interruption | Disconnect, reconnect, resync, and final-intent convergence are bounded, auditable, and do not duplicate or reorder input |
+| Display and text changes | 60/120 Hz, zoom, DPI/display move, Unicode, emoji, combining marks, RTL, IME, images, and accessibility geometry remain correct |
+| Performance incident | `ft` can collect a bounded incident bundle, identify likely dominant stages, state uncertainty, and recommend a reversible next step |
+
+### 10.2 Explicit non-goals
+
+- Do not promise zero network latency or disguise a slow remote application
+  with unsafe prediction.
+- Do not privilege focused input by dropping non-supersedable output or
+  violating terminal ordering.
+- Do not use every available core merely because it exists.
+- Do not ship architecture-specific SIMD before profiles show the relevant
+  kernel is material.
+- Do not make a synthetic, headless, submit-time, or loaded-host result stand
+  in for a target-class presentation claim.
+- Do not require users to understand internal queue names to diagnose ordinary
+  performance problems.
+
+## 11. Intended runtime architecture
+
+This section is a destination architecture. Each transition must be justified
+by the traces and one-lever A/B protocol in Section 7.
+
+### 11.1 Protected interactive fast path
+
+The connection and mux surfaces need explicit service classes:
+
+```text
+interactive input and acknowledgement
+  > correctness-critical control/resync
+  > visible-pane output and resize convergence
+  > non-visible output/capture/search/maintenance
+```
+
+The `>` notation expresses latency preference, not absolute starvation. Each
+class needs:
+
+- a bounded queue or bounded outstanding-work budget;
+- enqueue timestamp, oldest age, depth, admitted/coalesced/rejected counters;
+- a fairness quantum and maximum service gap;
+- cancellation and shutdown semantics through `Cx`;
+- an exact definition of which operations are supersedable;
+- a final-state convergence invariant; and
+- a saturation behavior that is visible to the operator.
+
+Key bytes, ordered terminal output, protocol barriers, and the last resize
+intent are never silently dropped. Intermediate resize intents, redundant
+paint requests, duplicate cursor deltas, and optional high-volume telemetry
+may be coalesced only under a proved equivalence contract.
+
+FrankenTerm already contains deterministic `latency_stages` types for lane
+scheduling, input rings, correlation, budget enforcement, formal invariants,
+and instrumentation. Current code search finds these primarily in their module
+and tests, not in the live AppKit/client/mux/render path. The campaign must
+extend or integrate that substrate where its semantics fit. It must not create
+a second unrelated scheduler model merely because the production wiring is
+missing.
+
+### 11.2 Coherent versioned terminal snapshots
+
+Rendering and remote delta production should consume a coherent versioned
+snapshot:
+
+```text
+terminal mutation under short lock
+  -> immutable visible-state snapshot + generation
+  -> lock release
+  -> shape/damage/quad/delta work outside the terminal lock
+  -> publish only if generation and pane identity are admissible
+```
+
+The snapshot contract includes visible lines, cursor, dimensions, palette,
+selection, semantic zones, images, hyperlink identity, alternate-screen state,
+input-method geometry, and a monotonic generation. It must define:
+
+- which data are owned, shared, or copy-on-write;
+- maximum lock hold and snapshot allocation budgets;
+- how a stale snapshot is detected and discarded;
+- whether an older complete frame may remain visible while newer work runs;
+- how prediction and server deltas reconcile against generations; and
+- how final state is proved byte/state equivalent to the reference path.
+
+Triple buffering is useful only when it is live: producer, renderer, and last
+known-good buffers must be wired to actual pane mutations and paint. DTOs and
+synthetic tests alone do not satisfy this architecture.
+
+### 11.3 Damage and frame production
+
+Invalidation must describe cause and scope:
+
+- cursor-only;
+- one or more dirty row ranges;
+- selection/IME/overlay only;
+- surface projection changed but terminal grid did not;
+- terminal grid/reflow changed;
+- font metrics/DPI changed;
+- atlas/glyph resource invalidation; or
+- full unknown damage as a fail-safe.
+
+The renderer should reuse line shaping and quads when the terminal content and
+metric generation are unchanged, even if the window projection changes. A
+same-grid resize should be able to reproject/reclip existing quads. A
+grid-changing resize must publish a coherent viewport before cancelable cold
+convergence.
+
+On current macOS Metal paths, the pacing experiment should use the applicable
+Metal display-link API and actual capability probe, with a fallback path for
+unsupported systems. The existing VRR/display-pipeline abstractions are
+inputs, not proof that the live window is display-link paced. Input-triggered
+work may request an earlier paint within the display-link contract, but may not
+busy-spin or defeat energy and thermal policy.
+
+### 11.4 Persistent topology-aware execution
+
+Resize/reflow work should use a persistent, bounded, `Cx`-aware execution
+resource. A scheduling decision is a function of useful work:
+
+```text
+workers = f(independent_chunks, bytes, line complexity, cache locality,
+            target latency, current pressure, QoS, thermal/power state)
+```
+
+not merely `available_parallelism()`.
+
+On Apple silicon:
+
+- communicate user-visible urgency using QoS;
+- ensure high-QoS consumers do not wait on work intentionally demoted to
+  utility/background;
+- sweep bounded worker counts and record actual P/E residency;
+- let the OS place work rather than hard-coding undocumented core IDs; and
+- test responsiveness, energy, and thermal sustainability together.
+
+On `trj`:
+
+- keep the serialized connection/parser/mux critical path compact;
+- sweep physical-core-only and SMT configurations;
+- measure CCD/LLC locality, migration, remote memory, IRQ/network placement,
+  cache misses, and context switches;
+- spread only sufficiently large independent pane/reflow work; and
+- reject fanout whose coordination and cache costs exceed useful work.
+
+### 11.5 Long-session ownership discipline
+
+Every long-lived cache, queue, subscription, worker, atlas, GPU resource,
+scrollback tier, reconnect state, and background task needs:
+
+- an owner and lifetime boundary;
+- a cap or an evidence-backed reason it is naturally bounded;
+- size/age/eviction/overflow counters;
+- a shutdown and cancellation path;
+- generation or connection identity where stale work is possible; and
+- an incident-bundle representation that does not leak pane contents.
+
+The soak lane must detect slopes and change points by subsystem. “RSS grew”
+is insufficient; the artifact should attribute retained objects, mapped
+regions, allocator classes, GPU residency, scrollback, caches, subscriptions,
+threads, and queue backlog as far as platform APIs allow.
+
+## 12. Operator performance control plane
+
+Performance work becomes genuinely useful when the same truth is accessible
+to a person and to an automation agent.
+
+### 12.1 `ft perf doctor`
+
+A side-effect-free preflight should report:
+
+- running GUI, bundled CLI, mux-server, protocol, and source identity;
+- target architecture, CPU topology, display mode, renderer/backend, power and
+  thermal state;
+- route/transport, endpoint, RTT/jitter/loss orientation;
+- queue/trace feature availability and instrumentation overhead mode;
+- session age, pane count, output rate, resource pressure, and current
+  operating-envelope classification;
+- whether each requested claim is measured, proxy-only, unavailable, skipped,
+  or invalid; and
+- typed remediation for mismatches or missing prerequisites.
+
+It must be fast, bounded, redacted, machine-readable in JSON/TOON, and useful
+in human CLI output. It must not restart the GUI, rewrite config, change
+affinity, or enable expensive tracing.
+
+### 12.2 `ft perf trace`, `status`, and `explain`
+
+The control plane needs three distinct operations:
+
+- `trace`: collect a bounded correlated sample around an operator action or
+  reproduction window;
+- `status`: show current rolling SLOs, queue pressure, dominant resources,
+  degraded state, and evidence freshness; and
+- `explain`: convert trace/rolling evidence into ranked causal candidates,
+  confidence, falsifiers, and the next safe measurement or tuning action.
+
+The existing `ft robot perf slo-status` is a starting surface. New commands
+must share schema and semantics across human CLI, Robot Mode, MCP, and incident
+bundles rather than each inventing a different truth model.
+
+Raw text, key contents, secrets, and pane payloads are excluded by default.
+Correlation IDs, durations, type names, counts, hashes, sizes, and redacted
+pane/session identities are normally sufficient. The overhead budget and
+sampling state must be reported in every artifact.
+
+### 12.3 GUI overlay
+
+An opt-in overlay may show:
+
+- current input-to-present estimate and whether it includes a physical display
+  boundary;
+- frame interval/jank;
+- focused-pane and connection queue age;
+- output and resize pressure;
+- session age and resource trend;
+- active degraded mode; and
+- a short reason such as `server_dispatch_wait` or `frame_phase`.
+
+The overlay is not enabled by default, must not create a self-reinforcing
+repaint loop, and must use the same measured schema as CLI/Robot Mode.
+
+### 12.4 Measured autotuning with receipts
+
+Autotuning has two steps:
+
+1. a side-effect-free planner proposes a hardware/workload profile, expected
+   benefit, evidence, risk, and rollback; then
+2. an explicitly authorized apply action changes only declared settings and
+   emits a receipt with previous values, new values, build/config identity,
+   expiry/revalidation rules, and rollback command.
+
+Candidate dimensions include worker bounds, service quanta, parser
+coalescing, frame-rate range, cache budgets, and background QoS. A target
+profile is promoted only after the named hardware matrix. Unknown M5 or AMD
+SKUs start from conservative portable defaults and measure rather than inherit
+an adjacent SKU's profile.
+
+No autotuner may:
+
+- weaken terminal semantics, secret safeguards, visual correctness, or release
+  proof;
+- change network routes, system-wide affinity, or power settings silently;
+- claim causal certainty from one noisy run; or
+- retain a profile after binary/config/hardware/display identity changes
+  without revalidation.
+
+## 13. Graceful overload, disconnect, and recovery
+
+Real users eventually exceed an operating envelope. The correct outcome is
+controlled degradation with exact recovery, not a hang or an invisible drop.
+
+### 13.1 State machine
+
+The runtime exposes a deterministic state machine:
+
+```text
+healthy
+  -> pressured
+  -> interaction_protected
+  -> degraded
+  -> recovering
+  -> healthy
+```
+
+Transitions have thresholds, hysteresis, minimum dwell, reason codes,
+timestamps, and receipts. Metrics include queue age, missed frame budget,
+output rate, memory/GPU pressure, cache overflow, reconnect backlog, and
+thermal state. The state is per relevant scope: pane, connection, window, and
+process.
+
+### 13.2 Permitted degradation order
+
+Subject to the formal correctness contract, the preferred sequence is:
+
+1. coalesce duplicate paint and superseded resize intents;
+2. reduce optional telemetry and overlay cadence;
+3. defer non-visible shaping, cold reflow, indexing, and maintenance;
+4. reduce background-pane presentation frequency while preserving state
+   ingestion and final convergence;
+5. cap optional caches and evict by a deterministic policy;
+6. surface a visible degraded state with reason and recovery progress; and
+7. reject new optional work with a typed response if capacity is exhausted.
+
+Input bytes, ordered output, approvals, protocol barriers, audit records, and
+the final pane/resize state remain correctness-critical.
+
+### 13.3 Reconnect and exact convergence
+
+Disconnect/reconnect testing must prove:
+
+- no input is ambiguously replayed;
+- acknowledged and unacknowledged operations are distinguishable;
+- connection generation prevents stale deltas and tasks from landing;
+- resync is bounded and cannot permanently monopolize the interactive lane;
+- notification-queue saturation cannot strand the final pane state;
+- visible progress and retry/backoff state are available to the operator; and
+- the post-recovery terminal state matches an authoritative reference.
+
+Existing reconnect-window, degraded-mode, operating-envelope, and render
+governor lanes should be integrated by dependency or relation. This campaign
+does not duplicate their contracts.
+
+### 13.4 Power and thermal sustainability
+
+Responsiveness that thermal-throttles after ten minutes is not a successful
+optimization. Target runs record energy impact, wakeups, idle GPU/CPU, and
+thermal transitions. Display-link pacing, QoS, worker counts, background
+refresh, and cache policy must have both latency and sustainability gates.
+Accessibility settings such as reduced motion or limited frame rate are part
+of the target contract, not configuration noise.
+
+## 14. Verification architecture
+
+The campaign uses a proof pyramid. Higher layers do not erase failures or
+substitute for lower layers.
+
+### 14.1 Deterministic unit and property proof
+
+Required properties include:
+
+- scheduler boundedness, fairness, maximum service gap, and final convergence;
+- no key loss, duplication, or reordering;
+- latest-intent resize coalescing;
+- generation-safe snapshot publication;
+- exact reference equivalence for damage-only deltas;
+- cancellation and shutdown at every await/resource boundary;
+- hysteresis and recovery of degraded states;
+- artifact schema round-trip, redaction, and version compatibility; and
+- deterministic autotune planning and rollback receipts.
+
+Model checking and Loom-style concurrency tests should cover the smallest
+scheduler, queue, generation, disconnect, and cancellation state spaces.
+Existing `latency_stages` formal invariants should be extended where they map
+to the production contract.
+
+### 14.2 Fuzz and differential proof
+
+Fuzz:
+
+- protocol ordering, partial frames, corrupt lengths, reconnect boundaries,
+  and queue saturation;
+- dirty-range/cursor deduplication against full viewport materialization;
+- resize/zoom/scrollback interleavings;
+- Unicode, combining, bidi, emoji, image, hyperlink, and alternate-screen
+  mutations;
+- snapshot generations and stale-work cancellation; and
+- performance artifact parsers and schema migration.
+
+The old/reference and candidate paths run from identical seeds where possible.
+Final terminal state, emitted bytes, cursor, dimensions, semantic zones,
+images, and visual corpus results must agree.
+
+### 14.3 Native visual and interaction proof
+
+The native rig must drive actual AppKit events and live resize/zoom gestures,
+exercise a production remote mux and PTY, and observe actual Metal
+presentation. It must retain:
+
+- event/trace records;
+- presented-frame timing and dropped/duplicated frame information;
+- synchronized screenshots or video at defined checkpoints;
+- image-diff and semantic visual-oracle results;
+- cursor, selection, IME, accessibility geometry, and focus state;
+- route/display/build/config identity; and
+- an explicit statement of whether photons were physically measured.
+
+No visual gate may be reduced to “the final screenshot looks plausible.”
+Intermediate-frame coherence is part of the resize promise.
+
+### 14.4 Soak and chaos proof
+
+The 4h/24h/72h runner uses deterministic seeds and resumable phase journals.
+It includes:
+
+- quiet and interactive periods;
+- sustained and burst output;
+- resize/zoom/display changes;
+- pane/tab/window churn;
+- search, capture, workflow, and maintenance overlap;
+- route interruption, mux restart/reconnect, and backpressure;
+- atlas-near-cap and glyph-diverse phases;
+- memory and GPU pressure; and
+- graceful shutdown and artifact finalization.
+
+A failed or interrupted soak is an artifact with a terminal reason, last
+successful checkpoint, partial time series, and retry recipe. It is never
+silently discarded.
+
+### 14.5 Statistical adjudication
+
+Before each target run, freeze:
+
+- sample size and warmup;
+- primary and guardrail metrics;
+- comparison method and confidence interval;
+- noise classification and retry limit;
+- slope/change-point method for soaks;
+- materiality threshold; and
+- keep/reject/indeterminate decision rule.
+
+The baseline database is append-only or content-addressed, binds every result
+to source/binary/config/hardware/workload identity, and preserves losing
+results. A regression alert names the affected stage and workload rather than
+only a global score.
+
+### 14.6 CI and target tiers
+
+| Tier | Cadence | Authority |
+|---|---|---|
+| Fast deterministic | each focused change/PR | unit, property, model, schema, redaction, small differential tests |
+| Workspace remote | each candidate before merge/close | strict remote check, Clippy, tests, formatting, and focused benchmarks |
+| Nightly integration | nightly | production mux/PTY scenarios, saturation, reconnect, visual corpus where target is available |
+| Weekly target | weekly or hardware reservation | M4/M5/Threadripper native live workload and 4h screen |
+| Release qualification | release candidate | selected 24h/72h, full user journeys, attestation and verifier replay |
+
+Strict remote RCH Cargo proof and native target execution are separate
+statuses. A remote Linux build cannot mint a macOS presentation artifact, and
+a local native runtime result cannot replace required remote Cargo proof.
+
+### 14.7 Canary and rollback
+
+Risky scheduling/render changes should support a short-lived feature gate for
+controlled A/B and rollback during the campaign. Before release promotion:
+
+- the candidate is the default in a canary cohort or shadow comparison;
+- rollback is exercised, not merely documented;
+- schema readers tolerate the transition according to the declared version
+  policy;
+- incident signals identify the candidate configuration; and
+- obsolete gates are removed only through a separately reviewed cleanup, never
+  hidden inside the performance change.
+
+The repository's no-backward-compatibility policy does not excuse ambiguous
+live rollback during an active performance experiment.
+
+## 15. Full Beads work breakdown
+
+The planning pass produced two linked umbrellas:
+
+1. `ft-interactive-systems-performance-4tenz` remains the causal performance
+   campaign. It has 90 descendants: 11 direct children and 79 implementation,
+   measurement, test, and certification leaves under `.2-.9`.
+2. `ft-interactive-swarm-product-convergence-7xqz4` is the product-convergence
+   umbrella. It has 118 descendants: 12 workstream epics and 106 leaves.
+
+Together they contain 210 issues: two roots, 20 child epics, and 188 granular
+leaves. Every new implementation leaf carries Background, Technical Approach,
+Success Criteria, Test Plan, Observability/Artifacts, and
+Considerations/Non-claims. The 14 field-journey leaves use the equivalent
+Background/User Value, SETUP/ACT, Success/ASSERT, Test Variants/TEARDOWN,
+Observability/Artifacts, and Considerations/Non-claims contract. Parent epics
+close only after every required child and artifact is terminal.
+
+### 15.1 Causal performance graph
 
 ```text
 ft-interactive-systems-performance-4tenz
 |
-+-- .1 truth/proof contract (materialized; release-artifact closure waits on .10/.11)
-|   +-- .10 burn down the 21-site Cx release-verifier regression
-|   +-- .11 reconcile four unresolved/unmirrored attestation producers
-|       (both block only .1 closure, not the .2/.3/.4 measurement lanes)
++-- .1  campaign truth and proof boundary
++-- .10 repair 21 Cx release-verifier sites
++-- .11 reconcile four attestation producers
 |
-+-- .2 real keypress trace
-|   +-- .5 client/server priority and resize-coalescing A/B
-|   +-- .6 short-lock terminal snapshot and damage-only delta A/B
++-- .2  real input-to-present trace (8 leaves)
+|   +-- trace identity/clock/privacy schema
+|   +-- bounded flight recorder and platform markers
+|   +-- AppKit/GUI/client instrumentation
+|   +-- server/mux/terminal/PTTY/parser instrumentation
+|   +-- client apply/render/presentation instrumentation
+|   +-- causal-echo/fault harness
+|   +-- isolated Mac-to-trj runner
+|   +-- frozen statistical baselines and attribution
 |
-+-- .3 live Metal resize/zoom rig
-|   +-- .7 topology-aware resize/reflow scheduling A/B
-|   +-- .8 damage-aware invalidation, pacing, and zoom A/B
++-- .3  native resize/zoom rig (8 leaves)
+|   +-- scenario contract and isolated bundle identity
+|   +-- native event driver and Metal presentation capture
+|   +-- transient/final semantic and visual comparators
+|   +-- headless adapter, verify-the-rig canaries, M4 baseline
 |
-+-- .4 real 4h/24h/72h aged-session rig
++-- .4  production aged-session rig (9 leaves)
+|   +-- existing-substrate audit and deterministic workload corpus
+|   +-- resource ownership/evidence schema
+|   +-- resumable Cx-aware runner and real fault/maintenance phases
+|   +-- slope/change-point analysis
+|   +-- separate 4h, 24h, and 72h artifacts
+|   +-- incident capture and minimization
 |
-+-- .9 M4/M5 and Threadripper target certification
-    (depends on .2, .3, and .4)
++-- .5  mux scheduling/backpressure (12 leaves)
+|   +-- PDU/service-class formal contract
+|   +-- bounded client scheduler and server dispatch fairness
+|   +-- buffering/flush and mux-main QoS experiments
+|   +-- P0 level-triggered PaneOutput final-convergence repair
+|   +-- resize coalescing and early GUI window routing
+|   +-- parser, prediction, and secure route A/Bs
+|   +-- saturation/fairness/final-state proof
+|
++-- .6  coherent snapshots and sparse damage (9 leaves)
+|   +-- live-source reconciliation and snapshot contract
+|   +-- short-lock renderer cutover and damage journal
+|   +-- sparse server delta, minimal key ack, sparse client apply
+|   +-- differential/model/fuzz/native proof and final A/B
+|
++-- .7  resize/reflow/topology (11 leaves)
+|   +-- measured cost model and persistent bounded executor
+|   +-- unified tab/pane transactions and active-first fairness
+|   +-- actual atomic viewport-first/cancelable cold convergence
+|   +-- profile-admitted clone/wrap work
+|   +-- separate Apple and trj topology sweeps
+|   +-- chaos proof and selected defaults
+|
++-- .8  render/pacing/zoom/cache (12 leaves)
+|   +-- mandatory live-call-graph reconciliation
+|   +-- invalidation taxonomy, duplicate removal, quad reprojection
+|   +-- real Metal display-link and input-wake behavior
+|   +-- deadline-aware zoom and aged glyph/atlas stability
+|   +-- profile-gated GPU experiments only
+|   +-- visual/a11y, power/thermal, and combined adjudication
+|
++-- .9  target certification (10 leaves)
+    +-- atomic preflight and candidate rollback
+    +-- separate M4, base M5, M5 Pro/Max, and trj qualification
+    +-- secure route and portable-correctness matrices
+    +-- real workflow dogfood and verified attestation bundle
 ```
 
-Related existing lanes are linked, not replaced:
+The `.5` and `.6` behavior changes depend on the `.2.8` real baseline.
+Resize/reflow/render behavior depends on `.3.8`. The final per-target artifacts
+depend on the 4h/24h/72h evidence and all individually admitted changes.
+Instrumentation, corpus, model, and correctness work may proceed in parallel
+where no retained baseline is required. To preserve that parallelism, the
+workstream-epic links are contextual `related` edges; blocking authority lives
+on the exact leaves that consume an upstream artifact. In particular,
+`4tenz.5.5` is immediately actionable and is not blocked by trace-baseline or
+QoS-contract work.
 
-- `ft-tf6g3.3`, `.3.8`, and `.3.9`: renderer SLO target evidence;
-- `ft-7h5da.10.3` and `.10.3.2`: deterministic/production load-rig truth gap;
+### 15.2 Product-convergence graph
+
+```text
+ft-interactive-swarm-product-convergence-7xqz4
+|
++-- .1  product promise, journeys, SLOs, privacy, evidence (7 leaves)
++-- .2  atomic install, first run, config, update, rollback (9 leaves)
++-- .3  real multi-host workload and fault laboratory (7 leaves)
++-- .4  complete human/automation interaction experience (8 leaves)
++-- .5  degradation, connectivity, overload, recovery (8 leaves)
++-- .6  hardware-aware explainable autotuning (8 leaves)
++-- .7  latency clinic, live SLOs, incidents, support (8 leaves)
++-- .8  session continuity and disaster recovery (9 leaves)
++-- .9  visual quality, input, native accessibility (9 leaves)
++-- .10 memory, storage, power, thermal, visibility (10 leaves)
++-- .11 exact real-world operator journeys (14 leaves)
++-- .12 release verdict, canary, rollback, docs, retraction (9 leaves)
+```
+
+The 14 field journeys cover:
+
+- clean-Mac first hour;
+- two-agent everyday project;
+- twenty-pane daily swarm;
+- fifty-pane M4-to-`trj` loaded fleet;
+- two-hundred-pane 4h/24h/72h target mission;
+- rate-limit, compaction, approval, Verified Submit, and Attention;
+- concurrent search/index/backup/GC/WAL/rules/incident maintenance;
+- remote host unavailable at launch;
+- LAN/Wi-Fi/tailnet roam and sleep/wake;
+- live update and rollback;
+- component crash and recovery;
+- keyboard-only, VoiceOver, reduced-motion, and low-vision use;
+- privacy-safe field lag diagnosis and replay; and
+- version-pinned Codex, Claude, Gemini, and supported-agent dogfood.
+
+The final authority is
+`ft-interactive-swarm-product-convergence-7xqz4.12.9`. It cannot close until
+the exact packaged candidate, every required journey, claimed hardware target,
+human-review boundary, attestation verifier, rollback, and retraction rehearsal
+pass.
+
+Two cross-workstream gates are intentional. The complete real visual corpus at
+`ft-interactive-swarm-product-convergence-7xqz4.9.1` blocks performance visual
+qualification at `ft-interactive-systems-performance-4tenz.8.10`, and release
+canary promotion at `ft-interactive-swarm-product-convergence-7xqz4.12.5`
+blocks on packaged install/update/rollback qualification at `.12.2`. Robot
+keyword suggestions are advisory only; all other suggestions from this pass
+were rejected as transitive, independent, or semantically reversed rather than
+used to over-serialize the campaign.
+
+### 15.3 Existing lanes to reuse or link
+
+The new graph does not erase existing work:
+
+- `ft-tf6g3.3`, `.3.8`, and `.3.9`: renderer SLO and target evidence;
+- `ft-tf6g3.30`, `.32`, `.33`, and `.40`: performance-gate,
+  evidence-stream, visual-corpus, and centralized-test-log substrate;
+- `ft-7h5da.10.3` and `.10.3.2`: deterministic versus production load-rig
+  truth;
+- `ft-7h5da.10.4.3` and `ft-tf6g3.14`: target-class resource-cockpit
+  measurement and current skipped-not-proven boundary;
 - `ft-35zzw`: true viewport-first background reflow;
-- `ft-uyt88`: persistent mux buffering with unresolved harness ambiguity;
-- `ft-uzj0s`: heavy-burst proxy bench; and
-- `ft-1itzl`: mismatched app-bundle CLI/GUI identity and robot-state hang.
+- `ft-uyt88`: persistent mux buffering and syscall reduction;
+- `ft-th8ag` plus `ft-gwzrm`, `ft-96uy6`, `ft-th8ag.1`, `ft-1g4mv`, and
+  `ft-1l5n2`: live renderer telemetry and unwired production sources;
+- `ft-3agml` and `ft-7h5da.7.8`: render/operating-envelope governor wiring;
+- `ft-c4rn6`: reconnect-window storm and real unreachable-host proof;
+- `ft-uzj0s`: heavy-burst proxy benchmark;
+- `ft-1itzl`: app-bundle CLI/GUI identity and robot-state hang; and
+- `ft-ujwwd`: observed GPU-firmware lockup investigation.
 
-## 11. First execution sequence
+Use blocking dependencies only where an artifact or implementation is truly a
+precondition. Use related edges for shared context and independently
+progressing lanes. Closed substrate remains evidence to reuse, not a reason to
+reimplement it.
 
-1. Use the reconciled truth contract and preserve all non-claims. Close `.1`
-   only after `.10` and `.11` clear the independent required-category
-   attestation verifier; `.2`, `.3`, and `.4` are intentionally free to start
-   meanwhile.
-2. Add the correlation schema and minimally invasive queue/lock/presentation
-   telemetry.
-3. Run quiet M4→`trj` direct-LAN and current-route baselines.
-4. Reproduce lag under 50-pane burst, 200-pane resize, and four-hour aged
-   conditions.
-5. Attribute p95/p99 tails to stages before selecting a code change.
-6. Run one-lever A/Bs in the dependency order above.
-7. Preserve every losing result and retry predicate.
-8. Promote only retained changes through focused proof, broad proof, 4h screen,
-   and target-class certification.
+## 16. Dependency and execution order
 
-The campaign is successful when the real interaction is fast and visually
-stable on the named machines, the result survives aged sessions, and the
-evidence is strong enough to fail closed—not when a proxy benchmark alone
-reports an attractive number.
+### Phase A — truth, immediate correctness, and atomic identity
 
-## 12. Primary external references
+1. Finish `4tenz.1`, `.10`, and `.11` for release-attestation truth.
+2. Complete product-truth `.1.1-.1.7` and distribution identity
+   `.2.1-.2.3`.
+3. Fix the P0 notification-saturation final-convergence defect at
+   `4tenz.5.5`; correctness work is not delayed for a performance baseline.
+4. Start the trace schema/recorder, native scenario/identity, and soak
+   reality-audit/schema work in parallel.
+5. Reconcile existing trace, scheduler, snapshot, damage, display-link,
+   evidence, logging, and visual substrate before creating new architecture.
+
+### Phase B — isolated lab, clean first use, and real baselines
+
+1. Complete the isolated multi-host lab and deterministic workload actors.
+2. Complete idempotent setup, effective-config truth, component lifecycle, and
+   the clean-Mac first-use tour.
+3. Complete input tracing through actual presentation and the native
+   resize/zoom visual rig.
+4. Run identity-clean quiet and loaded M4-to-`trj` baselines over each named
+   route.
+5. Run the four-hour screen and freeze stage budgets, slope thresholds,
+   workload seeds, and statistical keep rules.
+
+No runtime candidate is promoted from a microbenchmark before these baselines.
+
+### Phase C — remove serialized tail costs
+
+1. Address the largest traced input queue/lock/fanout/frame-phase stage through
+   `.5` and `.6`, one lever at a time.
+2. Preserve correctness, fairness, and final convergence under saturation.
+3. Run the four-hour screen after every candidate that changes queueing,
+   snapshot ownership, or cache lifetime.
+4. Keep losing experiments in the negative ledger.
+
+### Phase D — make resize and zoom continuously correct
+
+1. Integrate persistent bounded reflow execution.
+2. Publish coherent viewport state before cancelable cold convergence.
+3. Replace coarse damage and timer pacing only where native traces admit it.
+4. Exercise intermediate-frame visual, cursor, IME, image, and accessibility
+   oracles at 60 and 120 Hz.
+
+### Phase E — make performance operable under pressure
+
+1. Wire measured service classes, scoped degraded states, disconnected-input
+   semantics, overload shedding, and exact recovery.
+2. Deliver the canonical `ft perf doctor/trace/status/explain` and
+   incident/support workflow.
+3. Complete session continuity, storage/update recovery, and DR drills.
+4. Add measured, explicitly authorized, reversible tuning profiles.
+5. Complete native accessibility, international input, visual/motion safety,
+   and resource/power/thermal behavior.
+
+### Phase F — qualify targets and real workflows
+
+1. Make the clean first-hour and two-agent four-hour journeys impeccable.
+2. Advance through 20, 50, then 200 panes; a larger fleet never excuses a
+   regression in the smaller journey.
+3. Run M4, each available M5 class, `trj`, and the route matrix independently.
+4. Run portable correctness gates on supported non-macOS paths.
+5. Complete 24h/72h selected worst-case soaks, all 14 field journeys, and the
+   required human reviews.
+6. Qualify install/update/fault/canary/regression/retraction behavior against
+   the exact packaged candidate.
+7. Replay the offline verifier and close only the final go/no-go bead
+   `.12.9`.
+
+Unavailable physical M5 hardware produces an explicit unavailable/not-proven
+result; it does not block improving or truthfully releasing M4/Threadripper
+support, and it cannot be silently inferred from those machines.
+
+## 17. Logging and evidence requirements
+
+Every implementation and test bead must identify the logs it produces.
+Minimum live fields are:
+
+- schema version, trace/run ID, source/binary/config identity;
+- host, process, connection, window, tab, pane, generation, and correlation ID
+  in redacted/stable form;
+- monotonic timestamp and clock domain;
+- stage/event/reason code;
+- queue class, depth, oldest age, admitted/coalesced/rejected counts;
+- terminal-lock wait/hold, work units, rows/bytes/glyphs/quads;
+- presentation/display identity and measured boundary;
+- current pressure/degraded state and transition reason;
+- resource samples and ownership category;
+- instrumentation sampling/overhead state; and
+- terminal outcome, artifact hashes, and retry predicate.
+
+Logs are structured, bounded, rate-limited, and usable from JSON/TOON without
+scraping prose. Test output uses the existing centralized test-log substrate.
+Evidence bundles include a concise human summary but never make prose the sole
+source of a release claim.
+
+## 18. Definition of the promised land
+
+The umbrella epic closes only when all of the following are true:
+
+1. A real native event traverses the actual remote mux/PTY/application path
+   and reaches an actual presented frame under a correlated, bounded trace.
+2. The frozen input, burst, resize, reflow, visual, and long-session SLOs pass
+   on the named qualified targets, or a target is explicitly scoped
+   unavailable/not-proven.
+3. Focused interaction remains protected under 20-, 50-, and 200-pane load
+   without key/output loss, reordering, starvation, or stranded final state.
+4. Continuous resize, zoom, DPI/display move, and full text/image corpus show
+   no critical intermediate or final visual defects.
+5. Four-, 24-, and 72-hour artifacts show no disallowed positive resource or
+   latency slope and retain replayable incident evidence.
+6. Apple and Threadripper tuning is independently measured, conservative on
+   unknown SKUs, sustainable under thermal/power constraints, and reversible.
+7. Operators and agents can diagnose the current state, collect evidence,
+   understand degraded behavior, and apply or roll back an authorized tuning
+   profile without reading source code.
+8. Disconnect, overload, saturation, recovery, and rollback journeys converge
+   exactly and visibly.
+9. Fast, nightly, target, release, fuzz, visual, soak, and verifier gates are
+   wired to authoritative artifacts and fail closed.
+10. The negative ledger contains every rejected experiment with its numeric
+    evidence and one retry predicate.
+11. README/support claims match the generated attestation bundle.
+12. The operator pilot reports that FrankenTerm feels predictably responsive
+    and trustworthy in the real project workflows this system exists to run,
+    and the objective artifacts agree.
+
+The campaign is successful when these user-level properties are durable and
+explainable—not when a proxy benchmark alone reports an attractive number.
+
+## 19. Primary external references
 
 - Apple, [Tuning your code's performance for Apple silicon](https://developer.apple.com/documentation/apple-silicon/tuning-your-code-s-performance-for-apple-silicon/)
 - Apple, [Recording performance data with signposts](https://developer.apple.com/documentation/os/recording-performance-data)
