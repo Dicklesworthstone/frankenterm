@@ -560,8 +560,6 @@ enum CdcDedupMode {
 
 /// Number of flushed warm pages sampled before adaptive CDC makes its decision.
 const CDC_ADAPTIVE_PROBE_PAGES: usize = 8;
-/// Avoid enabling from a tiny one-page sample.
-const CDC_ADAPTIVE_MIN_PAGES: usize = 4;
 /// Enable CDC when sampled raw bytes are at least this many percent of unique
 /// chunk bytes. 150 means the probe observed roughly 1.5x or better redundancy.
 const CDC_ADAPTIVE_RATIO_THRESHOLD_X100: u64 = 150;
@@ -609,9 +607,7 @@ impl CdcAdaptiveProbe {
             }
         }
 
-        if self.sampled_pages >= CDC_ADAPTIVE_MIN_PAGES
-            && self.sampled_pages >= CDC_ADAPTIVE_PROBE_PAGES
-        {
+        if self.sampled_pages >= CDC_ADAPTIVE_PROBE_PAGES {
             self.decision_made = true;
             self.enabled = self.ratio_x100() >= CDC_ADAPTIVE_RATIO_THRESHOLD_X100;
             self.seen_chunks.clear();

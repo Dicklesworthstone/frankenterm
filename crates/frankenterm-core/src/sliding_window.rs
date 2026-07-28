@@ -150,9 +150,7 @@ impl SlidingWindow {
 
     /// Reset all buckets to zero.
     pub fn clear(&mut self) {
-        for b in &mut self.buckets {
-            *b = 0;
-        }
+        self.buckets.fill(0);
         self.head = 0;
         self.head_start_ms = 0;
         self.initialized = false;

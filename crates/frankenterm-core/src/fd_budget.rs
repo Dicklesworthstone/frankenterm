@@ -468,19 +468,35 @@ impl FdBudget {
     }
 
     fn add_allocated(&self, fds: u64) {
-        let _ = self
-            .total_allocated
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(current.saturating_add(fds))
-            });
+        let mut current = self.total_allocated.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_add(fds);
+            match self.total_allocated.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn subtract_allocated(&self, fds: u64) {
-        let _ = self
-            .total_allocated
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(current.saturating_sub(fds))
-            });
+        let mut current = self.total_allocated.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_sub(fds);
+            match self.total_allocated.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Get current FD budget snapshot.

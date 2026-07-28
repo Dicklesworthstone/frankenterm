@@ -73,9 +73,7 @@ impl CompactBitset {
     #[must_use]
     pub fn full(capacity: usize) -> Self {
         let mut bs = Self::new(capacity);
-        for w in &mut bs.words {
-            *w = u64::MAX;
-        }
+        bs.words.fill(u64::MAX);
         bs.mask_tail();
         bs
     }
@@ -245,16 +243,12 @@ impl CompactBitset {
 
     /// Clear all bits to zero.
     pub fn clear_all(&mut self) {
-        for w in &mut self.words {
-            *w = 0;
-        }
+        self.words.fill(0);
     }
 
     /// Set all bits within capacity to one.
     pub fn set_all(&mut self) {
-        for w in &mut self.words {
-            *w = u64::MAX;
-        }
+        self.words.fill(u64::MAX);
         self.mask_tail();
     }
 

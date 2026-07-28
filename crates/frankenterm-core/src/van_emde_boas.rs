@@ -379,9 +379,7 @@ impl VanEmdeBoas {
 
     /// Clears all elements.
     pub fn clear(&mut self) {
-        for word in &mut self.bits {
-            *word = 0;
-        }
+        self.bits.fill(0);
         self.min = None;
         self.max = None;
         self.count = 0;

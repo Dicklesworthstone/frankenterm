@@ -1364,9 +1364,9 @@ fn validate_topologies(
         let expected_controllers = canonical_mac_modes().into_iter().collect::<BTreeSet<_>>();
         let expected_session_hosts = match definition.topology {
             Topology::LocalOnly => expected_controllers.clone(),
-            Topology::MacLanRemote => [TargetMode::ThreadripperPro5995wxNative]
-                .into_iter()
-                .collect(),
+            Topology::MacLanRemote => {
+                std::iter::once(TargetMode::ThreadripperPro5995wxNative).collect()
+            }
         };
         if controller_modes != expected_controllers {
             validator.error(
@@ -1553,7 +1553,7 @@ fn validate_actor_modes(
             }
         }
         let expected_persona = canonical_persona_for_actor_mode(definition.actor_mode);
-        if allowed != [expected_persona].into_iter().collect() {
+        if allowed != std::iter::once(expected_persona).collect() {
             validator.error(
                 CatalogValidationCode::InvalidDefinition,
                 format!("{path}.personas"),
@@ -2363,7 +2363,7 @@ fn validate_exact_producer_target_sets(
         Topology::LocalOnly => ["mac16_11_m4_pro", "m5_native", "m5_pro_max_native"]
             .into_iter()
             .collect::<BTreeSet<_>>(),
-        Topology::MacLanRemote => ["trj_5995wx"].into_iter().collect::<BTreeSet<_>>(),
+        Topology::MacLanRemote => std::iter::once("trj_5995wx").collect::<BTreeSet<_>>(),
     };
     let controllers = binding
         .controller_target_class_ids

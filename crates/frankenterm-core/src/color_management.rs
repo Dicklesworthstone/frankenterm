@@ -274,8 +274,8 @@ pub fn delta_e_2000(a: Color, b: Color) -> f64 {
 
 #[must_use]
 fn delta_e_2000_lab(lab1: [f64; 3], lab2: [f64; 3]) -> f64 {
-    let (l1, a1, b1) = (lab1[0], lab1[1], lab1[2]);
-    let (l2, a2, b2) = (lab2[0], lab2[1], lab2[2]);
+    let [l1, a1, b1] = lab1;
+    let [l2, a2, b2] = lab2;
 
     let average_lightness = l1.midpoint(l2);
     let c1 = a1.hypot(b1);

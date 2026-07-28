@@ -1662,6 +1662,8 @@ struct WriteCommandSender {
     wakeup: Option<Arc<WriterWakeup>>,
 }
 
+type WriteCommandSendError = Box<mpsc::SendError<WriteCommand>>;
+
 impl WriteCommandSender {
     fn new(inner: mpsc::Sender<WriteCommand>, max_capacity: usize) -> Self {
         Self {
@@ -1672,18 +1674,24 @@ impl WriteCommandSender {
         }
     }
 
-    async fn send(
-        &self,
-        command: WriteCommand,
-    ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
+    async fn send(&self, command: WriteCommand) -> std::result::Result<(), WriteCommandSendError> {
         let cx = crate::cx::for_request();
         self.send_with_cx(&cx, command).await
     }
 
     fn mark_command_dequeued(counter: &AtomicUsize) {
-        let _ = counter.try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |depth| {
-            depth.checked_sub(1)
-        });
+        let mut depth = counter.load(AtomicOrdering::Acquire);
+        while let Some(next) = depth.checked_sub(1) {
+            match counter.compare_exchange_weak(
+                depth,
+                next,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => depth = observed,
+            }
+        }
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`WriteCommandSender::send`].
@@ -1706,14 +1714,18 @@ impl WriteCommandSender {
         &self,
         cx: &crate::cx::Cx,
         command: WriteCommand,
-    ) -> std::result::Result<(), mpsc::SendError<WriteCommand>> {
+    ) -> std::result::Result<(), WriteCommandSendError> {
         let permit = match self.inner.reserve(cx).await {
             Ok(permit) => permit,
             Err(mpsc::SendError::Disconnected(())) => {
-                return Err(mpsc::SendError::Disconnected(command));
+                return Err(Box::new(mpsc::SendError::Disconnected(command)));
             }
-            Err(mpsc::SendError::Full(())) => return Err(mpsc::SendError::Full(command)),
-            Err(mpsc::SendError::Cancelled(())) => return Err(mpsc::SendError::Cancelled(command)),
+            Err(mpsc::SendError::Full(())) => {
+                return Err(Box::new(mpsc::SendError::Full(command)));
+            }
+            Err(mpsc::SendError::Cancelled(())) => {
+                return Err(Box::new(mpsc::SendError::Cancelled(command)));
+            }
         };
 
         self.queued_depth.fetch_add(1, AtomicOrdering::AcqRel);
@@ -1729,7 +1741,7 @@ impl WriteCommandSender {
             }
             Err(err) => {
                 Self::mark_command_dequeued(&self.queued_depth);
-                Err(err)
+                Err(Box::new(err))
             }
         }
     }

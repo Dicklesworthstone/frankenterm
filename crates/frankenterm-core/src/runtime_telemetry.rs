@@ -151,12 +151,19 @@ fn runtime_telemetry_epoch_millis(now: SystemTime, context: &'static str) -> u64
 }
 
 fn record_runtime_telemetry_clock_anomaly(context: &'static str, skew: Duration) {
-    let anomaly_count = RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-            Some(count.saturating_add(1))
-        })
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
+    let mut count = RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed);
+    let anomaly_count = loop {
+        let next = count.saturating_add(1);
+        match RUNTIME_TELEMETRY_CLOCK_ANOMALY_COUNT.compare_exchange_weak(
+            count,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break next,
+            Err(observed) => count = observed,
+        }
+    };
     let clock_skew_ms = u64::try_from(skew.as_millis()).unwrap_or(u64::MAX);
 
     tracing::warn!(

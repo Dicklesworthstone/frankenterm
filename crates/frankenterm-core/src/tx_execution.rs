@@ -1524,7 +1524,7 @@ fn create_tx_contract_recovery_file(
         options.mode(0o600).nonblock(true);
         match guard.parent_dir.open_with(&name, &options) {
             Ok(file) => return Ok((name, file)),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => {
                 return Err(TxContractStoreError::new(
                     TxContractStoreErrorKind::Write,
@@ -3203,11 +3203,10 @@ fn reconcile_before_ambiguous_retirement(
             Some(StepOutcome::Success { .. }) => {
                 durable_success_step_ids.insert(step.step_id.0.clone());
             }
-            Some(other) => {
-                if first_conflict.is_none() {
-                    first_conflict = Some((step.step_id.0.clone(), format!("{other:?}")));
-                }
+            Some(other) if first_conflict.is_none() => {
+                first_conflict = Some((step.step_id.0.clone(), format!("{other:?}")));
             }
+            Some(_) => {}
             None => {}
         }
     }
@@ -3303,6 +3302,20 @@ impl CompensationDispatchPermit {
         self.step_ids.contains(step_id)
     }
 }
+
+type CompensationPhaseOutput = (
+    TxCompensationReport,
+    HashMap<String, IdempotencyKey>,
+    HashMap<String, StepOutcome>,
+    HashMap<String, StepOutcome>,
+);
+
+type CompensationInputsWithDedupOutput = (
+    Vec<TxCompensationStepInput>,
+    HashMap<String, IdempotencyKey>,
+    HashMap<String, StepOutcome>,
+    HashMap<String, StepOutcome>,
+);
 
 struct TxLedgerRecordingContext<'a> {
     execution_id: &'a str,
@@ -3950,7 +3963,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
             &execution_id,
             now_ms,
         );
-        archive_terminal_execution_ledger(&mut ledger, store.as_deref_mut(), &execution_id)?;
+        archive_terminal_execution_ledger(&mut ledger, store, &execution_id)?;
 
         Ok(TxExecutionResult {
             final_state,
@@ -4117,7 +4130,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         events: &mut Vec<TxObservabilityEvent>,
         decision_path: &mut String,
         kill_switch: MissionKillSwitchLevel,
-        mut store: Option<&mut IdempotencyStore>,
+        store: Option<&mut IdempotencyStore>,
         now_ms: i64,
     ) -> Result<(TxPrepareReport, HashSet<String>), TxExecutionError> {
         let logical_now_ms = checked_logical_now_ms(now_ms)?;
@@ -4133,8 +4146,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
 
         let (gate_inputs, has_unresolved_effects, durable_success_step_ids) = if let Some(
             durable_store,
-        ) =
-            store.as_deref_mut()
+        ) = store
         {
             let committed_receipt_step_ids = contract
                 .receipts
@@ -4402,15 +4414,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         prevalidated_original_commit_outcomes: Option<&HashMap<String, StepOutcome>>,
         preacquired_rollback_proof_leases: Option<&mut DurableKeyLeaseSet>,
         now_ms: i64,
-    ) -> Result<
-        (
-            TxCompensationReport,
-            HashMap<String, IdempotencyKey>,
-            HashMap<String, StepOutcome>,
-            HashMap<String, StepOutcome>,
-        ),
-        TxExecutionError,
-    > {
+    ) -> Result<CompensationPhaseOutput, TxExecutionError> {
         if dispatch_permit.execution_id != execution_id
             || dispatch_permit.plan_id != contract.plan.plan_id.0
             || dispatch_permit.contract_hash != contract.compute_hash()
@@ -5184,15 +5188,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         mut preacquired_rollback_proof_leases: Option<&mut DurableKeyLeaseSet>,
         dispatch_permit: &CompensationDispatchPermit,
         now_ms: i64,
-    ) -> Result<
-        (
-            Vec<TxCompensationStepInput>,
-            HashMap<String, IdempotencyKey>,
-            HashMap<String, StepOutcome>,
-            HashMap<String, StepOutcome>,
-        ),
-        TxExecutionError,
-    > {
+    ) -> Result<CompensationInputsWithDedupOutput, TxExecutionError> {
         let logical_now_ms = checked_logical_now_ms(now_ms)?;
         if store.is_some()
             && (prevalidated_original_commit_outcomes.is_none()

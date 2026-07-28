@@ -7537,15 +7537,18 @@ fn mark_mock_id_seen(counter: &AtomicU64, id: u64) {
 }
 
 fn allocate_mock_id(counter: &AtomicU64, label: &str) -> crate::Result<u64> {
-    counter
-        .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|current| {
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        let next = current.checked_add(1).ok_or_else(|| {
             crate::Error::Wezterm(WeztermError::CommandFailed(format!(
                 "mock {label} id space exhausted at {current}"
             )))
-        })
+        })?;
+        match counter.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(current),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl MockWezterm {

@@ -5463,8 +5463,7 @@ pub fn verify_incident_bundle(
     let source_payloads_have_provenance = match source_payload_files(bundle_path) {
         Ok(payloads) => payloads.into_iter().all(|path| {
             bundle_relative_display(bundle_path, &path)
-                .ok()
-                .is_some_and(|relative| source_files.contains_key(&relative))
+                .is_ok_and(|relative| source_files.contains_key(&relative))
         }),
         Err(error) => {
             warnings.push(error);
