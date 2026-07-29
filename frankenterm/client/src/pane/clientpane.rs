@@ -1,3 +1,4 @@
+use crate::client::RpcGenerationScope;
 use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
@@ -136,6 +137,7 @@ impl ClientPane {
     pub(crate) async fn process_unilateral(
         &self,
         registration: &mux::PaneRegistrationHandle,
+        rpc: &RpcGenerationScope,
         pdu: Pdu,
     ) -> anyhow::Result<()> {
         let registration_matches_self = registration
@@ -164,12 +166,7 @@ impl ClientPane {
                 }
 
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
-                let client = {
-                    let renderable = self.renderable.lock();
-                    let client = Arc::clone(&renderable.inner.borrow().client);
-                    client
-                };
-                let bonus_lines = hydrate_lines(client, delta.pane_id, bonus_lines).await;
+                let bonus_lines = hydrate_lines(rpc, delta.pane_id, bonus_lines).await;
 
                 let applied = registration
                     .try_with_current_output(|_| {
@@ -856,11 +853,13 @@ mod tests {
         let registration = mux
             .capture_pane_registration(&pane_for_mux)
             .expect("render-delta test pane should retain exact registration");
+        let rpc = inner.client.rpc_scope();
         assert!(!pane.is_alt_screen_active());
 
         promise::spawn::block_on(async {
             pane.process_unilateral(
                 &registration,
+                &rpc,
                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                     pane_id: 29,
                     mouse_grabbed: false,
@@ -985,10 +984,12 @@ mod tests {
         let registration = mux
             .capture_pane_registration(&pane_for_mux)
             .expect("unilateral-alert test pane should retain exact registration");
+        let rpc = inner.client.rpc_scope();
 
         promise::spawn::block_on(async {
             pane.process_unilateral(
                 &registration,
+                &rpc,
                 Pdu::NotifyAlert(NotifyAlert {
                     pane_id: 29,
                     alert: Alert::OutputSinceFocusLost,
@@ -997,6 +998,7 @@ mod tests {
             .await?;
             pane.process_unilateral(
                 &registration,
+                &rpc,
                 Pdu::NotifyAlert(NotifyAlert {
                     pane_id: 29,
                     alert: Alert::Progress(Progress::Percentage(64)),
@@ -1048,11 +1050,13 @@ mod tests {
         let pane_b_registration = mux
             .capture_pane_registration(&pane_b_for_mux)
             .expect("second pane should retain exact registration");
+        let rpc = inner.client.rpc_scope();
 
         promise::spawn::block_on(async {
             pane_a
                 .process_unilateral(
                     &pane_b_registration,
+                    &rpc,
                     Pdu::NotifyAlert(NotifyAlert {
                         pane_id: 29,
                         alert: Alert::OutputSinceFocusLost,
@@ -1083,6 +1087,7 @@ mod tests {
         let registration = mux
             .capture_pane_registration(&pane_for_mux)
             .expect("clipboard reentrancy test pane should retain exact registration");
+        let rpc = inner.client.rpc_scope();
 
         let callback_ran = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<dyn Clipboard> = Arc::new(ReentrantClipboard {
@@ -1094,6 +1099,7 @@ mod tests {
         promise::spawn::block_on(async {
             pane.process_unilateral(
                 &registration,
+                &rpc,
                 Pdu::SetClipboard(SetClipboard {
                     pane_id: 31,
                     clipboard: Some("copied text".to_string()),

@@ -204,6 +204,9 @@ struct RpcTransportState {
     phase: ParkingMutex<RpcTransportPhase>,
     /// Hot-path mirror. Zero means that external RPC admission is disabled.
     live_generation: AtomicU64,
+    /// Ambient user/workflow admission is enabled only after this physical
+    /// transport completes its exact-generation codec and identity handshake.
+    ready_generation: AtomicU64,
     next_attempt_id: AtomicU64,
     /// Wire serials are never reused during one Client incarnation. This makes
     /// a stale response from an old physical stream unmatched on its successor
@@ -218,6 +221,7 @@ impl RpcTransportState {
         Self {
             phase: ParkingMutex::new(RpcTransportPhase::Live(generation)),
             live_generation: AtomicU64::new(generation.get()),
+            ready_generation: AtomicU64::new(0),
             next_attempt_id: AtomicU64::new(1),
             next_wire_serial: AtomicU64::new(1),
         }
@@ -252,6 +256,10 @@ impl RpcTransportState {
 
     fn active_generation(&self) -> Option<NonZeroU64> {
         NonZeroU64::new(self.live_generation.load(AtomicOrdering::Acquire))
+    }
+
+    fn ready_generation(&self) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.ready_generation.load(AtomicOrdering::Acquire))
     }
 
     fn validate(
@@ -363,6 +371,7 @@ pub(crate) struct RpcGenerationScope {
     sender: Sender<ReaderMessage>,
     rpc_transport: Arc<RpcTransportState>,
     generation: Option<NonZeroU64>,
+    allow_unready: bool,
 }
 
 impl RpcGenerationScope {
@@ -372,7 +381,9 @@ impl RpcGenerationScope {
             match *phase {
                 RpcTransportPhase::Live(generation)
                     if rpc_transport.live_generation.load(AtomicOrdering::Acquire)
-                        == generation.get() =>
+                        == generation.get()
+                        && rpc_transport.ready_generation.load(AtomicOrdering::Acquire)
+                            == generation.get() =>
                 {
                     Some(generation)
                 }
@@ -383,6 +394,7 @@ impl RpcGenerationScope {
             sender,
             rpc_transport,
             generation,
+            allow_unready: false,
         }
     }
 
@@ -390,11 +402,13 @@ impl RpcGenerationScope {
         sender: Sender<ReaderMessage>,
         rpc_transport: Arc<RpcTransportState>,
         generation: NonZeroU64,
+        allow_unready: bool,
     ) -> Self {
         Self {
             sender,
             rpc_transport,
             generation: Some(generation),
+            allow_unready,
         }
     }
 
@@ -416,6 +430,7 @@ impl RpcGenerationScope {
         let rpc_transport = Arc::clone(&self.rpc_transport);
         let sender = self.sender.clone();
         let scoped_generation = self.generation;
+        let allow_unready = self.allow_unready;
         let attempt = rpc_transport.allocate_attempt(request);
         let binding = attempt.and_then(|attempt_id| {
             let Some(generation) = scoped_generation else {
@@ -442,6 +457,15 @@ impl RpcGenerationScope {
                     "exact-generation RPC scope is no longer live",
                 ));
             }
+            if !allow_unready
+                && rpc_transport.ready_generation.load(AtomicOrdering::Acquire) != generation.get()
+            {
+                return Err(RpcTransportState::unavailable_error(
+                    attempt_id,
+                    request,
+                    RpcRetirementStage::Admission,
+                ));
+            }
             Ok(RpcBinding {
                 generation,
                 attempt_id,
@@ -462,6 +486,9 @@ impl RpcGenerationScope {
                     RpcTransportPhase::Live(generation) if generation == binding.generation
                 ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire)
                     != binding.generation.get()
+                    || (!allow_unready
+                        && rpc_transport.ready_generation.load(AtomicOrdering::Acquire)
+                            != binding.generation.get())
                 {
                     return Err(anyhow::Error::new(rpc_transport.retirement_error(
                         binding,
@@ -1050,6 +1077,7 @@ async fn process_unilateral_inner_async(
         return Ok(());
     }
     let client_domain = dispatch.client_domain();
+    let rpc = dispatch.rpc_scope();
 
     let (pane, registration) = if let Some(admitted) = admitted {
         admitted
@@ -1068,7 +1096,11 @@ async fn process_unilateral_inner_async(
                     return Ok(());
                 }
                 let resync_result = client_domain
-                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner))
+                    .resync_if_current(
+                        Arc::clone(&dispatch.mux),
+                        Arc::clone(&dispatch.inner),
+                        &rpc,
+                    )
                     .await;
                 if !dispatch.is_current() {
                     return Ok(());
@@ -1093,7 +1125,11 @@ async fn process_unilateral_inner_async(
                     return Ok(());
                 }
                 let resync_result = client_domain
-                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner))
+                    .resync_if_current(
+                        Arc::clone(&dispatch.mux),
+                        Arc::clone(&dispatch.inner),
+                        &rpc,
+                    )
                     .await;
                 if !dispatch.is_current() {
                     return Ok(());
@@ -1149,7 +1185,7 @@ async fn process_unilateral_inner_async(
         return Ok(());
     }
     let result = client_pane
-        .process_unilateral(&registration, decoded.pdu)
+        .process_unilateral(&registration, &rpc, decoded.pdu)
         .await;
     if !dispatch.is_current() {
         return Ok(());
@@ -1318,13 +1354,18 @@ fn process_unilateral(
             if !dispatch.is_current() {
                 return Ok(());
             }
+            let rpc = dispatch.rpc_scope();
             promise::spawn::spawn_into_main_thread(async move {
                 if !dispatch.is_current() {
                     return Ok(());
                 }
                 let result = dispatch
                     .client_domain()
-                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner))
+                    .resync_if_current(
+                        Arc::clone(&dispatch.mux),
+                        Arc::clone(&dispatch.inner),
+                        &rpc,
+                    )
                     .await;
                 if !dispatch.is_current() {
                     return Ok(());
@@ -1722,6 +1763,21 @@ impl PendingReplies {
         }
     }
 
+    #[cfg(test)]
+    fn complete_or_fail_transport(
+        &mut self,
+        serial: NonZeroU64,
+        pdu: Pdu,
+    ) -> Result<ReplyDisposition, PendingRpcError> {
+        match self.complete(serial, pdu) {
+            Ok(disposition) => Ok(disposition),
+            Err(error) => {
+                self.fail_all(&error.to_string());
+                Err(error)
+            }
+        }
+    }
+
     fn fail_all(&mut self, reason: &str) {
         log::trace!("failing all pending RPCs: {reason}");
         for (serial, pending) in self.map.drain() {
@@ -1780,6 +1836,12 @@ impl PendingReplies {
 
     fn fail_after_transport_error(&mut self, error: &anyhow::Error) {
         self.fail_all(&format!("{error:#}"));
+    }
+
+    #[cfg(test)]
+    fn fail_after_decode_error(&mut self, error: &anyhow::Error) {
+        self.record_decode_protocol_error(error);
+        self.fail_all(&format!("Error while decoding response pdu: {error:#}"));
     }
 
     fn reject_admission(
@@ -3131,6 +3193,7 @@ impl Client {
                                     let reattach_ui = ui.clone();
                                     match reconnect_dispatch_authority.resolve_current() {
                                         Ok(Some(dispatch)) => {
+                                            let rpc = dispatch.rpc_scope();
                                             promise::spawn::spawn_into_main_thread(async move {
                                                 if !dispatch.is_current() {
                                                     return Ok(());
@@ -3139,6 +3202,7 @@ impl Client {
                                                     Arc::clone(&dispatch.mux),
                                                     Arc::clone(&dispatch.domain),
                                                     Arc::clone(&dispatch.inner),
+                                                    rpc,
                                                     reattach_ui,
                                                 )
                                                 .await;
@@ -4111,6 +4175,7 @@ mod tests {
     fn rpc_future_binds_synchronously_but_never_enqueues_before_first_poll() {
         let (client, receiver) = client_with_idle_rpc_queue();
         let authority = client.test_dispatch_authority(Weak::new());
+        let first_generation_scope = client.rpc_scope();
 
         let bound_on_first = client.send_pdu(Pdu::Ping(Ping {}));
         assert!(
@@ -4152,6 +4217,20 @@ mod tests {
         successor
             .activate_rpc_transport()
             .expect("publish the exact successor generation");
+        let stale_scoped_call = first_generation_scope.ping();
+        let error = asupersync_block_on(stale_scoped_call)
+            .expect_err("a reusable first-generation scope must never auto-upgrade");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                bound_generation,
+                active_generation: Some(active_generation),
+                stage: RpcRetirementStage::Admission,
+                certainty: RpcDeliveryCertainty::DefinitelyNotSent,
+                ..
+            }) if bound_generation.get() == INITIAL_CONNECTION_GENERATION
+                && active_generation.get() == successor.generation
+        ));
         let fresh_but_unpolled = client.send_pdu(Pdu::Ping(Ping {}));
         assert!(matches!(
             receiver.try_recv(),
@@ -4164,34 +4243,84 @@ mod tests {
     fn transport_retirement_drains_queued_generation_with_one_typed_outcome() {
         let (client, receiver) = client_with_idle_rpc_queue();
         let authority = client.test_dispatch_authority(Weak::new());
-        let (completion, result) = bounded(1);
-        asupersync_block_on(
-            client
-                .sender
-                .send(client.test_reader_message(Pdu::Ping(Ping {}), completion)),
-        )
-        .expect("queue an exact-generation request");
+        let requests = vec![
+            Pdu::WriteToPane(WriteToPane {
+                pane_id: 11,
+                data: b"keypress".to_vec(),
+            }),
+            Pdu::SpawnV2(SpawnV2 {
+                domain: config::keyassignment::SpawnTabDomain::default(),
+                window_id: None,
+                command: None,
+                command_dir: None,
+                size: wezterm_term::TerminalSize::default(),
+                workspace: "campaign".to_string(),
+            }),
+            Pdu::SplitPane(SplitPane {
+                pane_id: 12,
+                split_request: mux::tab::SplitRequest::default(),
+                command: None,
+                command_dir: None,
+                domain: config::keyassignment::SpawnTabDomain::default(),
+                move_pane_id: None,
+            }),
+            Pdu::MovePaneToNewTab(MovePaneToNewTab {
+                pane_id: 13,
+                window_id: None,
+                workspace_for_new_window: Some("campaign".to_string()),
+            }),
+            Pdu::KillPane(KillPane { pane_id: 14 }),
+            Pdu::SearchScrollbackRequest(SearchScrollbackRequest {
+                pane_id: 15,
+                pattern: mux::pane::Pattern::CaseSensitiveString("needle".to_string()),
+                range: 0..100,
+                limit: Some(8),
+            }),
+            Pdu::Resize(Resize {
+                containing_tab_id: 16,
+                pane_id: 17,
+                size: wezterm_term::TerminalSize::default(),
+            }),
+            Pdu::Ping(Ping {}),
+        ];
+        let mut results = Vec::with_capacity(requests.len());
+        asupersync_block_on(async {
+            for pdu in requests {
+                let request = pdu.pdu_name();
+                let (completion, result) = bounded(1);
+                client
+                    .sender
+                    .send(client.test_reader_message(pdu, completion))
+                    .await
+                    .expect("queue an exact-generation request");
+                results.push((request, result));
+            }
+        });
 
         authority
             .advance_generation(&receiver)
             .expect("retire and drain the queued generation");
-        let error = result
-            .try_recv()
-            .expect("retirement must complete the queued request")
-            .expect_err("queued work must not cross onto the successor");
-        assert!(matches!(
-            error.downcast_ref::<RpcTransportError>(),
-            Some(RpcTransportError::Retired {
-                stage: RpcRetirementStage::Queued,
-                certainty: RpcDeliveryCertainty::DefinitelyNotSent,
-                active_generation: None,
-                ..
-            })
-        ));
-        assert!(matches!(
-            result.try_recv(),
-            Err(async_channel::TryRecvError::Empty) | Err(async_channel::TryRecvError::Closed)
-        ));
+        for (request, result) in results {
+            let error = result
+                .try_recv()
+                .expect("retirement must complete the queued request")
+                .expect_err("queued work must not cross onto the successor");
+            assert!(matches!(
+                error.downcast_ref::<RpcTransportError>(),
+                Some(RpcTransportError::Retired {
+                    request: observed_request,
+                    stage: RpcRetirementStage::Queued,
+                    certainty: RpcDeliveryCertainty::DefinitelyNotSent,
+                    active_generation: None,
+                    ..
+                }) if *observed_request == request
+            ));
+            assert!(matches!(
+                result.try_recv(),
+                Err(async_channel::TryRecvError::Empty)
+                    | Err(async_channel::TryRecvError::Closed)
+            ));
+        }
         assert!(matches!(
             receiver.try_recv(),
             Err(async_channel::TryRecvError::Empty)

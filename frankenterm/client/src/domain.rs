@@ -809,6 +809,14 @@ impl ClientDomain {
             return Ok(());
         }
 
+        // Every physical server connection owns a fresh SessionHandler with no
+        // client identity. Re-establish codec compatibility and SetClientId on
+        // the exact successor generation before any topology or workspace RPC.
+        expected
+            .client
+            .verify_version_compat_with_scope(&ui, &rpc)
+            .await?;
+
         if !Self::sync_remote_topology(
             Arc::clone(&mux),
             client_domain,

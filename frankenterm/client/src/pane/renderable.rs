@@ -1,3 +1,4 @@
+use crate::client::RpcGenerationScope;
 use crate::domain::ClientInner;
 use codec::*;
 use config::{configuration, ConfigHandle};
@@ -812,20 +813,18 @@ impl RenderableInner {
 
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
+        let rpc = client.client.rpc_scope();
+        let request = rpc.get_lines(GetLines {
+            pane_id: remote_pane_id,
+            lines: to_fetch.clone().into(),
+        });
 
         promise::spawn::spawn(async move {
-            let result = client
-                .client
-                .get_lines(GetLines {
-                    pane_id: remote_pane_id,
-                    lines: to_fetch.clone().into(),
-                })
-                .await;
+            let result = request.await;
 
             let result = match result {
                 Ok(result) => {
-                    let lines =
-                        hydrate_lines(Arc::clone(&client), remote_pane_id, result.lines).await;
+                    let lines = hydrate_lines(&rpc, remote_pane_id, result.lines).await;
                     Ok(lines)
                 }
                 Err(err) => Err(err),
@@ -931,14 +930,13 @@ impl RenderableInner {
         let remote_pane_id = self.remote_pane_id;
         let local_pane_id = self.local_pane_id;
         let client = Arc::clone(&self.client);
+        let request = client
+            .client
+            .get_pane_render_changes(GetPaneRenderChanges {
+                pane_id: remote_pane_id,
+            });
         promise::spawn::spawn(async move {
-            let alive = match client
-                .client
-                .get_pane_render_changes(GetPaneRenderChanges {
-                    pane_id: remote_pane_id,
-                })
-                .await
-            {
+            let alive = match request.await {
                 Ok(resp) => resp.is_alive,
                 // if we got a timeout on a reconnectable, don't
                 // consider the tab to be dead; that helps to
@@ -1050,7 +1048,7 @@ fn lock_image_lru() -> MutexGuard<'static, ImageLru> {
 }
 
 pub(crate) async fn hydrate_lines(
-    client: Arc<ClientInner>,
+    rpc: &RpcGenerationScope,
     pane_id: PaneId,
     serialized_lines: SerializedLines,
 ) -> Vec<(StableRowIndex, Line)> {
@@ -1078,7 +1076,7 @@ pub(crate) async fn hydrate_lines(
     }
 
     for (_, request) in requests {
-        match client.client.get_image_cell(request).await {
+        match rpc.get_image_cell(request).await {
             Ok(GetImageCellResponse {
                 data: Some(data), ..
             }) => {
