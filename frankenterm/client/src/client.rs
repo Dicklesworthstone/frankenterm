@@ -258,10 +258,6 @@ impl RpcTransportState {
         NonZeroU64::new(self.live_generation.load(AtomicOrdering::Acquire))
     }
 
-    fn ready_generation(&self) -> Option<NonZeroU64> {
-        NonZeroU64::new(self.ready_generation.load(AtomicOrdering::Acquire))
-    }
-
     fn validate(
         &self,
         binding: RpcBinding,
@@ -3768,12 +3764,14 @@ impl Client {
         client_domain_config: ClientDomainConfig,
     ) -> Self {
         let (sender, _receiver) = unbounded();
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        rpc_transport.mark_current_generation_ready_for_test();
         Self {
             sender,
             local_domain_id,
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
-            rpc_transport: Arc::new(RpcTransportState::new()),
+            rpc_transport,
             client_id: ClientId {
                 hostname: "test-host".to_string(),
                 username: "tester".to_string(),
@@ -4057,13 +4055,15 @@ mod tests {
 
     fn client_with_idle_rpc_queue() -> (Client, Receiver<ReaderMessage>) {
         let (sender, receiver) = unbounded();
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        rpc_transport.mark_current_generation_ready_for_test();
         (
             Client {
                 sender,
                 local_domain_id: None,
                 incarnation: Arc::new(ClientIncarnation),
                 connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
-                rpc_transport: Arc::new(RpcTransportState::new()),
+                rpc_transport,
                 client_id: ClientId::new(),
                 client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
                 is_reconnectable: false,
@@ -4381,6 +4381,29 @@ mod tests {
             }) if bound_generation.get() == INITIAL_CONNECTION_GENERATION
                 && active_generation.get() == successor.generation
         ));
+        let before_successor_handshake = client.send_pdu(Pdu::WriteToPane(WriteToPane {
+            pane_id: 9,
+            data: b"must-not-overtake-handshake".to_vec(),
+        }));
+        let error = asupersync_block_on(before_successor_handshake)
+            .expect_err("ambient effectful RPC must not enter an unready successor");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Unavailable {
+                request: "WriteToPane",
+                stage: RpcRetirementStage::Admission,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+
+        let bootstrap = client.bootstrap_rpc_scope();
+        client
+            .publish_rpc_transport_ready(&bootstrap)
+            .expect("publish readiness only after the test handshake barrier");
         let fresh_but_unpolled = client.send_pdu(Pdu::Ping(Ping {}));
         assert!(matches!(
             receiver.try_recv(),
