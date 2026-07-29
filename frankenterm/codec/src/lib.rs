@@ -1237,6 +1237,46 @@ macro_rules! pdu {
                 }
             }
 
+            /// Serialize one complete framed PDU without touching a transport.
+            ///
+            /// Callers that need an authority check immediately before the
+            /// first socket write can build the frame here, validate that
+            /// authority, and then issue exactly one `write_all`. Unlike
+            /// encoding into a temporary `Vec` through `encode`, this returns
+            /// the codec's own frame allocation directly and avoids a second
+            /// full-frame copy.
+            pub fn encode_frame(&self, serial: u64) -> Result<Vec<u8>, Error> {
+                self.encode_frame_with_mode(serial, CompressionMode::Auto)
+            }
+
+            pub fn encode_frame_with_mode(
+                &self,
+                serial: u64,
+                compression_mode: CompressionMode,
+            ) -> Result<Vec<u8>, Error> {
+                match self {
+                    Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
+                    $(
+                        Pdu::$name(s) => {
+                            let (data, is_compressed) =
+                                serialize_with_mode(s, compression_mode)?;
+                            let frame =
+                                encode_raw_as_vec($vers, serial, &data, is_compressed)?;
+                            log::debug!(
+                                "encode_frame {} size={}",
+                                stringify!($name),
+                                frame.len()
+                            );
+                            metrics::histogram!("pdu.size", "pdu" => stringify!($name))
+                                .record(frame.len() as f64);
+                            metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name))
+                                .record(frame.len() as f64);
+                            Ok(frame)
+                        }
+                    ,)*
+                }
+            }
+
             pub async fn encode_async<W: Unpin + AsyncWriteExt>(&self, w: &mut W, serial: u64) -> Result<(), Error> {
                 self.encode_async_with_mode(w, serial, CompressionMode::Auto).await
             }
@@ -2575,6 +2615,26 @@ mod test {
         encode_raw(ident, serial, data, false, &mut write_result).unwrap();
 
         assert_eq!(vec_result, write_result);
+    }
+
+    #[test]
+    fn pdu_encode_frame_matches_existing_wire_encoding() {
+        let pdu = Pdu::WriteToPane(WriteToPane {
+            pane_id: 42,
+            data: b"generation-bound input".to_vec(),
+        });
+        let serial = 0x1_0000_0001;
+        let direct_frame = pdu
+            .encode_frame(serial)
+            .expect("encode directly into the owned frame");
+        let mut existing_encoding = Vec::new();
+        pdu.encode(&mut existing_encoding, serial)
+            .expect("encode through the existing writer API");
+
+        assert_eq!(direct_frame, existing_encoding);
+        let decoded = Pdu::decode(direct_frame.as_slice()).expect("decode direct frame");
+        assert_eq!(decoded.serial, serial);
+        assert_eq!(decoded.pdu, pdu);
     }
 
     // --- COMPRESSED_MASK tests ---
