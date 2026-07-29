@@ -1475,8 +1475,8 @@ impl TermWindow {
                 let mux_window_id = self.mux_window_id;
 
                 let can_close = mux
-                    .get_window(mux_window_id)
-                    .map_or(false, |w| w.can_close_without_prompting());
+                    .window_can_close_without_prompting(mux_window_id)
+                    .unwrap_or(false);
                 if can_close {
                     mux.kill_window(self.mux_window_id);
                     window.close();
@@ -5536,10 +5536,10 @@ impl TermWindow {
                 }
             }
             SwitchToWorkspace { name, spawn } => {
-                let activity = crate::Activity::new();
                 let Some(mux) = self.mux_or_log("switch workspace") else {
                     return Ok(PerformAssignmentResult::Handled);
                 };
+                let activity = crate::Activity::new_for_mux(&mux);
                 let name = name
                     .as_ref()
                     .map(|name| name.to_string())

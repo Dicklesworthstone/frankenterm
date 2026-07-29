@@ -2,7 +2,7 @@ use crate::domain::DomainId;
 use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
-use crate::{Mux, MuxNotification, WindowId};
+use crate::{Mux, MuxNotification, PaneRegistrationHandle, WindowId};
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
@@ -12,36 +12,12 @@ use rangeset::intersects_range;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use url::Url;
 
 pub type Tree = bintree::Tree<Arc<dyn Pane>, SplitDirectionAndSize>;
 pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
-
-fn schedule_mux_pane_removals(panes: Vec<Arc<dyn Pane>>) {
-    if !promise::spawn::is_scheduler_configured() {
-        return;
-    }
-    let Some(mux) = Mux::try_get() else {
-        return;
-    };
-    let registrations = panes
-        .iter()
-        .filter_map(|pane| mux.capture_pane_registration(pane))
-        .collect::<Vec<_>>();
-    if registrations.is_empty() {
-        return;
-    }
-    let mux = Arc::downgrade(&mux);
-    promise::spawn::spawn_into_main_thread(async move {
-        if let Some(mux) = mux.upgrade() {
-            for registration in registrations {
-                mux.remove_pane_registration(registration);
-            }
-        }
-    })
-    .detach();
-}
 
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type TabId = usize;
@@ -369,6 +345,225 @@ struct TabInner {
 pub struct Tab {
     inner: Mutex<TabInner>,
     tab_id: TabId,
+}
+
+type PaneIdentity = *const ();
+
+fn pane_identity(pane: &Arc<dyn Pane>) -> PaneIdentity {
+    Arc::as_ptr(pane).cast::<()>()
+}
+
+#[derive(Clone)]
+struct ObservedPane {
+    pane: Arc<dyn Pane>,
+    pane_id: Option<PaneId>,
+}
+
+#[derive(Clone)]
+struct ExactPaneRemovalCandidate {
+    pane: Arc<dyn Pane>,
+    pane_id: PaneId,
+    expected_registration: Option<PaneRegistrationHandle>,
+}
+
+#[derive(Default)]
+struct DeferredTabCallbacks {
+    changed: bool,
+    removed: HashSet<PaneIdentity>,
+    resize_work: Vec<(Arc<dyn Pane>, TerminalSize)>,
+    prior_focus: Option<Arc<dyn Pane>>,
+    current_focus: Option<Arc<dyn Pane>>,
+    current_focus_id: Option<PaneId>,
+}
+
+impl DeferredTabCallbacks {
+    fn execute(self, mux: Option<&Mux>) {
+        execute_pane_resize_work(self.resize_work);
+
+        let focus_changed = match (&self.prior_focus, &self.current_focus) {
+            (Some(prior), Some(current)) => !Arc::ptr_eq(prior, current),
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+        };
+        if !focus_changed {
+            return;
+        }
+
+        if let Some(prior) = self.prior_focus {
+            if catch_unwind(AssertUnwindSafe(|| prior.focus_changed(false))).is_err() {
+                log::error!(
+                    "pane focus-loss callback panicked for exact pane identity {:p}",
+                    Arc::as_ptr(&prior)
+                );
+            }
+        }
+        if let Some(current) = self.current_focus {
+            if catch_unwind(AssertUnwindSafe(|| current.focus_changed(true))).is_err() {
+                log::error!(
+                    "pane focus-gain callback panicked for exact pane identity {:p}",
+                    Arc::as_ptr(&current)
+                );
+            }
+            if let (Some(mux), Some(pane_id)) = (mux, self.current_focus_id) {
+                mux.notify(MuxNotification::PaneFocused(pane_id));
+            }
+        }
+    }
+}
+
+fn collect_raw_tree_panes(tree: &Tree, panes: &mut Vec<Arc<dyn Pane>>) {
+    match tree {
+        Tree::Empty => {}
+        Tree::Node { left, right, .. } => {
+            collect_raw_tree_panes(left, panes);
+            collect_raw_tree_panes(right, panes);
+        }
+        Tree::Leaf(pane) => panes.push(Arc::clone(pane)),
+    }
+}
+
+fn collect_raw_tree_leaves(tree: &Tree, panes: &mut Vec<Arc<dyn Pane>>) {
+    collect_raw_tree_panes(tree, panes);
+}
+
+fn split_dimension_preserving_ratio(
+    total_with_separator: usize,
+    old_first: usize,
+    old_second: usize,
+) -> (usize, usize) {
+    let available = total_with_separator.saturating_sub(1);
+    if available == 0 {
+        return (0, 0);
+    }
+    if old_first == 0 {
+        return (0, available);
+    }
+    if old_second == 0 {
+        return (available, 0);
+    }
+
+    let old_total = old_first.saturating_add(old_second);
+    let proportional = if old_total == 0 {
+        available / 2
+    } else {
+        let numerator = (available as u128).saturating_mul(old_first as u128);
+        usize::try_from(numerator / old_total as u128).unwrap_or(available)
+    };
+    if available >= 2 {
+        let first = proportional.clamp(1, available - 1);
+        (first, available - first)
+    } else {
+        (
+            proportional.min(available),
+            available.saturating_sub(proportional),
+        )
+    }
+}
+
+fn terminal_size_for_cells(parent: TerminalSize, rows: usize, cols: usize) -> TerminalSize {
+    let dims = cell_dimensions(&parent);
+    TerminalSize {
+        rows,
+        cols,
+        pixel_width: pixel_span(dims.pixel_width, cols),
+        pixel_height: pixel_span(dims.pixel_height, rows),
+        dpi: parent.dpi,
+    }
+}
+
+/// Reassign split geometry without invoking pane constraint or resize callbacks.
+///
+/// Dead-pane removal can collapse an interior node while `Tab::inner` is held.
+/// The surviving tree still needs coherent geometry, but consulting
+/// `Pane::pane_constraints` there would re-enter arbitrary pane code. Preserve
+/// each split's prior ratio instead and collect resize work for execution after
+/// the tab lock is released.
+fn normalize_tree_sizes_callback_free(
+    tree: &mut Tree,
+    size: TerminalSize,
+    work: &mut Vec<(Arc<dyn Pane>, TerminalSize)>,
+) {
+    match tree {
+        Tree::Empty => {}
+        Tree::Leaf(pane) => work.push((Arc::clone(pane), size)),
+        Tree::Node { left, right, data } => {
+            let Some(split) = data.as_mut() else {
+                normalize_tree_sizes_callback_free(left, size, work);
+                normalize_tree_sizes_callback_free(right, size, work);
+                return;
+            };
+            let (first, second) = match split.direction {
+                SplitDirection::Horizontal => {
+                    let (first_cols, second_cols) = split_dimension_preserving_ratio(
+                        size.cols,
+                        split.first.cols,
+                        split.second.cols,
+                    );
+                    (
+                        terminal_size_for_cells(size, size.rows, first_cols),
+                        terminal_size_for_cells(size, size.rows, second_cols),
+                    )
+                }
+                SplitDirection::Vertical => {
+                    let (first_rows, second_rows) = split_dimension_preserving_ratio(
+                        size.rows,
+                        split.first.rows,
+                        split.second.rows,
+                    );
+                    (
+                        terminal_size_for_cells(size, first_rows, size.cols),
+                        terminal_size_for_cells(size, second_rows, size.cols),
+                    )
+                }
+            };
+            split.first = first;
+            split.second = second;
+            normalize_tree_sizes_callback_free(left, first, work);
+            normalize_tree_sizes_callback_free(right, second, work);
+        }
+    }
+}
+
+fn remove_exact_panes_from_tree(
+    tree: Tree,
+    removals: &HashSet<PaneIdentity>,
+    replacements: &HashMap<PaneIdentity, Arc<dyn Pane>>,
+    removed: &mut HashSet<PaneIdentity>,
+) -> (Tree, bool) {
+    match tree {
+        Tree::Empty => (Tree::Empty, false),
+        Tree::Leaf(pane) => {
+            let identity = pane_identity(&pane);
+            if !removals.contains(&identity) {
+                return (Tree::Leaf(pane), false);
+            }
+            removed.insert(identity);
+            if let Some(replacement) = replacements.get(&identity) {
+                (Tree::Leaf(Arc::clone(replacement)), true)
+            } else {
+                (Tree::Empty, true)
+            }
+        }
+        Tree::Node { left, right, data } => {
+            let (left, left_changed) =
+                remove_exact_panes_from_tree(*left, removals, replacements, removed);
+            let (right, right_changed) =
+                remove_exact_panes_from_tree(*right, removals, replacements, removed);
+            let changed = left_changed || right_changed;
+            match (left, right) {
+                (Tree::Empty, Tree::Empty) => (Tree::Empty, changed),
+                (Tree::Empty, survivor) | (survivor, Tree::Empty) => (survivor, true),
+                (left, right) => (
+                    Tree::Node {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        data,
+                    },
+                    changed,
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1514,10 +1709,13 @@ fn resize_fanout_workers_for_host(work_len: usize) -> usize {
 fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
     let mut work = Vec::new();
     collect_pane_resize_work(tree, size, &mut work);
+    execute_pane_resize_work(work);
+}
 
+fn execute_pane_resize_work(work: Vec<(Arc<dyn Pane>, TerminalSize)>) {
     if work.len() <= 1 {
         for (pane, pane_size) in work {
-            pane.resize(pane_size).ok();
+            invoke_pane_resize(&pane, pane_size);
         }
         return;
     }
@@ -1527,7 +1725,7 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
 
     if worker_count <= 1 {
         for (pane, pane_size) in work {
-            pane.resize(pane_size).ok();
+            invoke_pane_resize(&pane, pane_size);
         }
         return;
     }
@@ -1561,11 +1759,20 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
         for bucket in buckets {
             scope.spawn(move |_| {
                 for (pane, pane_size) in bucket {
-                    pane.resize(pane_size).ok();
+                    invoke_pane_resize(&pane, pane_size);
                 }
             });
         }
     });
+}
+
+fn invoke_pane_resize(pane: &Arc<dyn Pane>, pane_size: TerminalSize) {
+    if catch_unwind(AssertUnwindSafe(|| pane.resize(pane_size))).is_err() {
+        log::error!(
+            "pane resize callback panicked for exact pane identity {:p}",
+            Arc::as_ptr(pane)
+        );
+    }
 }
 
 fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
@@ -1601,16 +1808,24 @@ impl Tab {
     }
 
     pub fn set_title(&self, title: &str) {
-        let mut inner = self.inner.lock();
-        if inner.title != title {
-            inner.title = title.to_string();
+        if self.set_title_without_notify(title) {
+            let tab_id = self.tab_id;
             Mux::try_get().map(|mux| {
                 mux.notify(MuxNotification::TabTitleChanged {
-                    tab_id: inner.id,
+                    tab_id,
                     title: title.to_string(),
                 })
             });
         }
+    }
+
+    pub(crate) fn set_title_without_notify(&self, title: &str) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.title == title {
+            return false;
+        }
+        inner.title = title.to_string();
+        true
     }
 
     /// Called by the multiplexer client when building a local tab to
@@ -1669,7 +1884,7 @@ impl Tab {
     /// Returns every logical pane owned by this tab exactly once, including
     /// hidden stack members and floating panes.
     pub fn iter_all_panes(&self) -> Vec<Arc<dyn Pane>> {
-        self.inner.lock().all_logical_panes()
+        self.snapshot_panes_callback_free()
     }
 
     pub fn add_floating_pane(
@@ -1904,16 +2119,261 @@ impl Tab {
         self.inner.lock().get_pane_direction(direction, ignore_zoom)
     }
 
-    pub fn prune_dead_panes(&self) -> bool {
-        self.inner.lock().prune_dead_panes()
+    fn snapshot_panes_callback_free(&self) -> Vec<Arc<dyn Pane>> {
+        self.inner.lock().snapshot_panes_callback_free()
     }
 
-    pub fn kill_pane(&self, pane_id: PaneId) -> bool {
-        self.inner.lock().kill_pane(pane_id)
+    /// Execute `f` only while this exact tab has no structural pane entries.
+    ///
+    /// The tab topology lock remains held throughout `f`, so the callback must
+    /// not invoke pane code or attempt to reacquire this tab. Callers that also
+    /// need mux registration authority must acquire it before entering here.
+    pub(crate) fn with_structurally_empty<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let inner = self.inner.lock();
+        if inner.snapshot_panes_callback_free().is_empty() {
+            Some(f())
+        } else {
+            None
+        }
     }
 
-    pub fn kill_panes_in_domain(&self, domain: DomainId) -> bool {
-        self.inner.lock().kill_panes_in_domain(domain)
+    fn observe_panes(panes: Vec<Arc<dyn Pane>>) -> Vec<ObservedPane> {
+        panes
+            .into_iter()
+            .map(|pane| {
+                let pane_id = match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
+                    Ok(pane_id) => Some(pane_id),
+                    Err(_) => {
+                        log::error!(
+                            "Pane::pane_id panicked for exact pane identity {:p}; \
+                             retaining it conservatively",
+                            Arc::as_ptr(&pane)
+                        );
+                        None
+                    }
+                };
+                ObservedPane { pane, pane_id }
+            })
+            .collect()
+    }
+
+    fn apply_exact_removal_plan(
+        &self,
+        mux: &Mux,
+        observed: &[ObservedPane],
+        candidates: &[ExactPaneRemovalCandidate],
+    ) -> (bool, Vec<PaneRegistrationHandle>) {
+        if candidates.is_empty() {
+            return (false, Vec::new());
+        }
+
+        let (callbacks, registrations) = {
+            // Registry publication/retirement is serialized before topology
+            // mutation. No pane trait method is invoked in this scope.
+            let _registration = mux.pane_registration.lock();
+            let registered = mux.panes.read();
+            let authorized = candidates
+                .iter()
+                .filter(|candidate| {
+                    let current = registered.get(&candidate.pane_id);
+                    match &candidate.expected_registration {
+                        Some(expected) => current.is_some_and(|current| {
+                            Arc::ptr_eq(&current.pane, &candidate.pane)
+                                && expected.same_registration(&PaneRegistrationHandle::new(
+                                    &current.pane,
+                                    &current.generation,
+                                ))
+                        }),
+                        None => current
+                            .is_none_or(|current| !Arc::ptr_eq(&current.pane, &candidate.pane)),
+                    }
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let callbacks = self
+                .inner
+                .lock()
+                .remove_exact_panes_callback_free(observed, &authorized);
+            let registrations = authorized
+                .iter()
+                .filter(|candidate| callbacks.removed.contains(&pane_identity(&candidate.pane)))
+                .filter_map(|candidate| candidate.expected_registration.clone())
+                .collect::<Vec<_>>();
+            (callbacks, registrations)
+        };
+
+        let changed = callbacks.changed;
+        callbacks.execute(Some(mux));
+        (changed, registrations)
+    }
+
+    #[cfg(test)]
+    fn prune_dead_panes_without_mux(&self) -> bool {
+        let panes = self.snapshot_panes_callback_free();
+        let observed = Self::observe_panes(panes);
+        let candidates = observed
+            .iter()
+            .filter_map(|observed| {
+                let pane_id = observed.pane_id?;
+                match catch_unwind(AssertUnwindSafe(|| observed.pane.is_dead())) {
+                    Ok(true) => Some(ExactPaneRemovalCandidate {
+                        pane: Arc::clone(&observed.pane),
+                        pane_id,
+                        expected_registration: None,
+                    }),
+                    Ok(false) => None,
+                    Err(_) => {
+                        log::error!(
+                            "Pane::is_dead panicked for pane {pane_id}; retaining it conservatively"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut inner = self.inner.lock();
+        let callbacks = inner.remove_exact_panes_callback_free(&observed, &candidates);
+        let changed = callbacks.changed;
+        drop(inner);
+        callbacks.execute(None);
+        changed
+    }
+
+    pub(crate) fn prune_dead_panes_deferred(
+        &self,
+        mux: &Mux,
+    ) -> (bool, Vec<PaneRegistrationHandle>) {
+        let panes = self.snapshot_panes_callback_free();
+        let observed = Self::observe_panes(panes);
+        let mut candidates = Vec::new();
+
+        for observed in &observed {
+            let Some(pane_id) = observed.pane_id else {
+                continue;
+            };
+            let registered = mux.get_pane(pane_id);
+            let registered_exact = registered
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &observed.pane));
+            let should_remove = if registered_exact {
+                match catch_unwind(AssertUnwindSafe(|| observed.pane.is_dead())) {
+                    Ok(dead) => {
+                        log::trace!("prune_dead_panes: pane_id={pane_id} dead={dead} in_mux=true");
+                        dead
+                    }
+                    Err(_) => {
+                        log::error!(
+                            "Pane::is_dead panicked for pane {pane_id}; retaining it conservatively"
+                        );
+                        false
+                    }
+                }
+            } else {
+                // A topology entry that is not the exact pane registered in
+                // the mux is stale regardless of its self-reported liveness.
+                // Final authorization below rechecks absence while holding the
+                // registration lock, so a concurrent exact re-registration is
+                // never removed.
+                log::trace!("prune_dead_panes: pane_id={pane_id} dead=not-queried in_mux=false");
+                true
+            };
+            if !should_remove {
+                continue;
+            }
+
+            let expected_registration = if registered_exact {
+                match catch_unwind(AssertUnwindSafe(|| {
+                    mux.capture_pane_registration(&observed.pane)
+                })) {
+                    Ok(registration) => registration,
+                    Err(_) => {
+                        log::error!(
+                            "pane registration capture panicked for pane {pane_id}; \
+                             retaining it conservatively"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            candidates.push(ExactPaneRemovalCandidate {
+                pane: Arc::clone(&observed.pane),
+                pane_id,
+                expected_registration,
+            });
+        }
+
+        self.apply_exact_removal_plan(mux, &observed, &candidates)
+    }
+
+    /// Structurally remove only the supplied exact pane objects.
+    ///
+    /// This is the domain-detach counterpart to dead-pane pruning. Numeric
+    /// pane IDs are observed outside `Tab::inner`, then the mux registration
+    /// and exact `Arc` identity are revalidated under the registration lock.
+    /// Pane resize/focus callbacks are deferred until every lock is released.
+    pub(crate) fn remove_exact_panes_deferred(
+        &self,
+        mux: &Mux,
+        panes: &[Arc<dyn Pane>],
+    ) -> (bool, Vec<PaneRegistrationHandle>) {
+        let requested = panes
+            .iter()
+            .map(pane_identity)
+            .collect::<HashSet<PaneIdentity>>();
+        let observed = Self::observe_panes(self.snapshot_panes_callback_free());
+        let mut candidates = Vec::new();
+        for observed in &observed {
+            if !requested.contains(&pane_identity(&observed.pane)) {
+                continue;
+            }
+            let Some(pane_id) = observed.pane_id else {
+                continue;
+            };
+            let expected_registration = match catch_unwind(AssertUnwindSafe(|| {
+                mux.capture_pane_registration(&observed.pane)
+            })) {
+                Ok(registration) => registration,
+                Err(_) => {
+                    log::error!(
+                        "pane registration capture panicked for exact pane {pane_id}; \
+                         retaining it conservatively"
+                    );
+                    continue;
+                }
+            };
+            candidates.push(ExactPaneRemovalCandidate {
+                pane: Arc::clone(&observed.pane),
+                pane_id,
+                expected_registration,
+            });
+        }
+        self.apply_exact_removal_plan(mux, &observed, &candidates)
+    }
+
+    pub fn kill_pane_registration(&self, registration: &PaneRegistrationHandle) -> bool {
+        let observed = Self::observe_panes(self.snapshot_panes_callback_free());
+        let candidate = observed.iter().find_map(|observed| {
+            let pane_id = observed.pane_id?;
+            registration
+                .try_with_current(|current| current.is_same_pane(&observed.pane))
+                .unwrap_or(false)
+                .then(|| ExactPaneRemovalCandidate {
+                    pane: Arc::clone(&observed.pane),
+                    pane_id,
+                    expected_registration: Some(registration.clone()),
+                })
+        });
+        let Some(candidate) = candidate else {
+            return false;
+        };
+        let Some(mux) = registration.owner() else {
+            return false;
+        };
+        let (changed, registrations) = self.apply_exact_removal_plan(&mux, &observed, &[candidate]);
+        changed && PaneRegistrationHandle::retire_batch_if_current(registrations) == 1
     }
 
     /// Remove pane from tab.
@@ -1924,15 +2384,82 @@ impl Tab {
     }
 
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
-        self.inner.lock().can_close_without_prompting(reason)
+        self.snapshot_panes_callback_free().into_iter().all(|pane| {
+            match catch_unwind(AssertUnwindSafe(|| {
+                pane.can_close_without_prompting(reason)
+            })) {
+                Ok(can_close) => can_close,
+                Err(_) => {
+                    log::error!(
+                        "Pane::can_close_without_prompting panicked for exact pane identity {:p}; \
+                         requiring a close prompt conservatively",
+                        Arc::as_ptr(&pane)
+                    );
+                    false
+                }
+            }
+        })
     }
 
     pub fn is_dead(&self) -> bool {
-        self.inner.lock().is_dead()
+        // Make sure we account for all panes, so that we don't kill the
+        // whole tab if the zoomed pane is dead. A panicking liveness callback
+        // is conservatively treated as live.
+        self.snapshot_panes_callback_free().into_iter().all(|pane| {
+            match catch_unwind(AssertUnwindSafe(|| pane.is_dead())) {
+                Ok(dead) => dead,
+                Err(_) => {
+                    log::error!(
+                        "Pane::is_dead panicked for exact pane identity {:p}; \
+                         retaining its tab conservatively",
+                        Arc::as_ptr(&pane)
+                    );
+                    false
+                }
+            }
+        })
     }
 
     pub fn get_active_pane(&self) -> Option<Arc<dyn Pane>> {
         self.inner.lock().get_active_pane()
+    }
+
+    /// Resolve the active pane without invoking a `Pane` method while the tab
+    /// topology lock is held.
+    pub(crate) fn get_active_pane_callback_free(&self) -> Option<Arc<dyn Pane>> {
+        let (zoomed, floating_focus, floating, tree_active) = {
+            let inner = self.inner.lock();
+            (
+                inner.zoomed.as_ref().map(Arc::clone),
+                inner.floating_focus,
+                inner
+                    .floating_panes
+                    .iter()
+                    .filter(|floating| floating.visible)
+                    .map(|floating| Arc::clone(&floating.pane))
+                    .collect::<Vec<_>>(),
+                inner.raw_tree_active_pane(),
+            )
+        };
+        if zoomed.is_some() {
+            return zoomed;
+        }
+        if let Some(focused_id) = floating_focus {
+            for pane in floating {
+                match catch_unwind(AssertUnwindSafe(|| pane.pane_id())) {
+                    Ok(pane_id) if pane_id == focused_id => return Some(pane),
+                    Ok(_) => {}
+                    Err(_) => {
+                        log::error!(
+                            "Pane::pane_id panicked while resolving active floating pane {:p}; \
+                             retaining callback safety",
+                            Arc::as_ptr(&pane)
+                        );
+                    }
+                }
+            }
+        }
+        tree_active
     }
 
     #[allow(unused)]
@@ -2480,33 +3007,6 @@ impl TabInner {
         self.floating_index_by_id(pane_id).is_some()
     }
 
-    fn remove_floating_panes_in_domain(&mut self, domain: DomainId) -> Vec<Arc<dyn Pane>> {
-        let mut removed = vec![];
-        let mut removed_ids = vec![];
-        self.floating_panes.retain(|floating| {
-            if floating.pane.domain_id() == domain {
-                removed_ids.push(floating.pane.pane_id());
-                removed.push(Arc::clone(&floating.pane));
-                false
-            } else {
-                true
-            }
-        });
-        for pane_id in removed_ids {
-            self.discard_removed_pane_state(pane_id);
-        }
-        if let Some(pane_id) = self.floating_focus {
-            if !self
-                .floating_panes
-                .iter()
-                .any(|floating| floating.pane.pane_id() == pane_id)
-            {
-                self.floating_focus = None;
-            }
-        }
-        removed
-    }
-
     fn discard_removed_pane_state(&mut self, pane_id: PaneId) {
         self.constraint_overrides.remove(&pane_id);
         self.collapsed_panes.remove(&pane_id);
@@ -2631,40 +3131,6 @@ impl TabInner {
             remapped.insert(new_index, stack);
         }
         self.pane_stacks = remapped;
-    }
-
-    fn remove_stacked_panes_if<F>(&mut self, predicate: F) -> Vec<Arc<dyn Pane>>
-    where
-        F: Fn(&Arc<dyn Pane>) -> bool,
-    {
-        let mut removed = Vec::new();
-        let mut empty_slots = Vec::new();
-        for (slot_index, stack) in &mut self.pane_stacks {
-            let active_id = stack.active_pane().pane_id();
-            let pane_ids = stack
-                .panes()
-                .iter()
-                // The visible member is removed by `remove_pane_if`, which can
-                // promote the surviving active member into the same tree leaf.
-                .filter(|pane| pane.pane_id() != active_id && predicate(pane))
-                .map(|pane| pane.pane_id())
-                .collect::<Vec<_>>();
-            for pane_id in pane_ids {
-                if let Some(pane) = stack.remove(pane_id) {
-                    removed.push(pane);
-                }
-            }
-            if stack.is_empty() {
-                empty_slots.push(*slot_index);
-            }
-        }
-        for slot_index in empty_slots {
-            self.pane_stacks.remove(&slot_index);
-        }
-        for pane in &removed {
-            self.discard_removed_pane_state(pane.pane_id());
-        }
-        removed
     }
 
     fn resize_floating_panes_to_fit(&mut self) {
@@ -2971,30 +3437,302 @@ impl TabInner {
             .map(|positioned| positioned.pane)
     }
 
-    fn all_logical_panes(&mut self) -> Vec<Arc<dyn Pane>> {
+    /// Clone pane identities without invoking any `Pane` trait method.
+    ///
+    /// Numeric pane IDs are reusable and trait methods are arbitrary external
+    /// code, so neither is suitable while `Tab::inner` is held. The erased data
+    /// pointer is stable for the lifetime of these retained `Arc`s and is used
+    /// only for process-local exact-identity deduplication.
+    fn snapshot_panes_callback_free(&self) -> Vec<Arc<dyn Pane>> {
         let mut seen = HashSet::new();
         let mut panes = Vec::new();
 
-        for positioned in self.iter_panes_ignoring_zoom() {
-            let pane_id = positioned.pane.pane_id();
-            if seen.insert(pane_id) {
-                panes.push(positioned.pane);
+        if let Some(tree) = &self.pane {
+            let mut tree_panes = Vec::new();
+            collect_raw_tree_panes(tree, &mut tree_panes);
+            for pane in tree_panes {
+                if seen.insert(pane_identity(&pane)) {
+                    panes.push(pane);
+                }
             }
         }
         for stack in self.pane_stacks.values() {
             for pane in stack.panes() {
-                if seen.insert(pane.pane_id()) {
+                if seen.insert(pane_identity(pane)) {
                     panes.push(Arc::clone(pane));
                 }
             }
         }
         for floating in &self.floating_panes {
-            if seen.insert(floating.pane.pane_id()) {
+            if seen.insert(pane_identity(&floating.pane)) {
                 panes.push(Arc::clone(&floating.pane));
+            }
+        }
+        if let Some(zoomed) = &self.zoomed {
+            if seen.insert(pane_identity(zoomed)) {
+                panes.push(Arc::clone(zoomed));
             }
         }
 
         panes
+    }
+
+    fn raw_tree_active_pane(&self) -> Option<Arc<dyn Pane>> {
+        let tree = self.pane.as_ref()?;
+        let mut leaves = Vec::new();
+        collect_raw_tree_leaves(tree, &mut leaves);
+        leaves.get(self.active).cloned()
+    }
+
+    fn raw_active_pane_callback_free(
+        &self,
+        pane_ids: &HashMap<PaneIdentity, PaneId>,
+    ) -> Option<Arc<dyn Pane>> {
+        if let Some(zoomed) = &self.zoomed {
+            return Some(Arc::clone(zoomed));
+        }
+        if let Some(focused_id) = self.floating_focus {
+            if let Some(focused) = self.floating_panes.iter().find(|floating| {
+                floating.visible
+                    && pane_ids.get(&pane_identity(&floating.pane)) == Some(&focused_id)
+            }) {
+                return Some(Arc::clone(&focused.pane));
+            }
+        }
+        self.raw_tree_active_pane()
+    }
+
+    fn reindex_pane_stacks_callback_free(&mut self) {
+        if self.pane_stacks.is_empty() {
+            return;
+        }
+        let Some(tree) = self.pane.as_ref() else {
+            log::error!(
+                "tab {} has {} pane stacks but no pane tree",
+                self.id,
+                self.pane_stacks.len()
+            );
+            return;
+        };
+
+        let mut leaves = Vec::new();
+        collect_raw_tree_leaves(tree, &mut leaves);
+        let leaf_indices = leaves
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| (pane_identity(pane), index))
+            .collect::<HashMap<_, _>>();
+        let mut targets = Vec::with_capacity(self.pane_stacks.len());
+        let mut occupied = HashSet::with_capacity(self.pane_stacks.len());
+        for (old_index, stack) in &self.pane_stacks {
+            let active_identity = pane_identity(stack.active_pane());
+            let Some(new_index) = leaf_indices.get(&active_identity).copied() else {
+                log::error!(
+                    "tab {} stack slot {} has an active pane without an exact representative \
+                     tree leaf",
+                    self.id,
+                    old_index
+                );
+                return;
+            };
+            if !occupied.insert(new_index) {
+                log::error!(
+                    "tab {} has multiple pane stacks mapped to tree slot {}",
+                    self.id,
+                    new_index
+                );
+                return;
+            }
+            targets.push((*old_index, new_index));
+        }
+
+        let mut stacks = std::mem::take(&mut self.pane_stacks);
+        let mut remapped = HashMap::with_capacity(stacks.len());
+        for (old_index, new_index) in targets {
+            let stack = stacks
+                .remove(&old_index)
+                .expect("pane stack disappeared while callback-free reindexing");
+            remapped.insert(new_index, stack);
+        }
+        self.pane_stacks = remapped;
+    }
+
+    /// Apply an already-authorized exact-identity removal plan.
+    ///
+    /// This method must remain callback-free: callers hold mux registration
+    /// authority while entering it. All values needed from pane trait methods
+    /// were observed before acquiring `Tab::inner`.
+    fn remove_exact_panes_callback_free(
+        &mut self,
+        observed: &[ObservedPane],
+        candidates: &[ExactPaneRemovalCandidate],
+    ) -> DeferredTabCallbacks {
+        if candidates.is_empty() {
+            return DeferredTabCallbacks::default();
+        }
+
+        let removals = candidates
+            .iter()
+            .map(|candidate| pane_identity(&candidate.pane))
+            .collect::<HashSet<_>>();
+        let pane_ids = observed
+            .iter()
+            .filter_map(|observed| {
+                observed
+                    .pane_id
+                    .map(|pane_id| (pane_identity(&observed.pane), pane_id))
+            })
+            .collect::<HashMap<_, _>>();
+        let prior_focus = self.raw_active_pane_callback_free(&pane_ids);
+        let prior_tree_active = self.raw_tree_active_pane();
+        let prior_focus_was_floating = prior_focus.as_ref().is_some_and(|prior| {
+            self.floating_panes
+                .iter()
+                .any(|floating| Arc::ptr_eq(&floating.pane, prior))
+        });
+
+        let mut callbacks = DeferredTabCallbacks {
+            prior_focus,
+            ..DeferredTabCallbacks::default()
+        };
+        let mut tree_replacements = HashMap::new();
+
+        // Rebuild stacks by exact Arc identity. PaneStack's ID-based removal
+        // helper deliberately isn't used here: PaneId is a reusable slot.
+        let old_stacks = std::mem::take(&mut self.pane_stacks);
+        for (slot_index, stack) in old_stacks {
+            let old_panes = stack.panes().to_vec();
+            let old_active_index = stack.active_index().min(old_panes.len().saturating_sub(1));
+            let old_active = old_panes.get(old_active_index).cloned();
+            let mut survivors = Vec::with_capacity(old_panes.len());
+            let mut survivors_before_active = 0usize;
+            for (index, pane) in old_panes.into_iter().enumerate() {
+                let identity = pane_identity(&pane);
+                if removals.contains(&identity) {
+                    callbacks.removed.insert(identity);
+                    continue;
+                }
+                if index < old_active_index {
+                    survivors_before_active = survivors_before_active.saturating_add(1);
+                }
+                survivors.push(pane);
+            }
+
+            if survivors.is_empty() {
+                continue;
+            }
+            let active_survived = old_active
+                .as_ref()
+                .is_some_and(|pane| !removals.contains(&pane_identity(pane)));
+            let new_active_index = if active_survived {
+                survivors_before_active
+            } else {
+                survivors_before_active.min(survivors.len() - 1)
+            };
+            let mut rebuilt = PaneStack::new(survivors);
+            let selected = rebuilt.select(new_active_index);
+            debug_assert!(selected, "computed stack active index must be valid");
+
+            if let Some(old_active) = old_active {
+                let old_active_identity = pane_identity(&old_active);
+                if removals.contains(&old_active_identity) {
+                    tree_replacements
+                        .insert(old_active_identity, Arc::clone(rebuilt.active_pane()));
+                }
+            }
+            self.pane_stacks.insert(slot_index, rebuilt);
+        }
+
+        let mut tree_changed = false;
+        if let Some(tree) = self.pane.take() {
+            let (tree, changed) = remove_exact_panes_from_tree(
+                tree,
+                &removals,
+                &tree_replacements,
+                &mut callbacks.removed,
+            );
+            self.pane = Some(tree);
+            tree_changed = changed;
+        }
+
+        let old_floating = std::mem::take(&mut self.floating_panes);
+        self.floating_panes.reserve(old_floating.len());
+        for floating in old_floating {
+            let identity = pane_identity(&floating.pane);
+            if removals.contains(&identity) {
+                callbacks.removed.insert(identity);
+            } else {
+                self.floating_panes.push(floating);
+            }
+        }
+
+        if self
+            .zoomed
+            .as_ref()
+            .is_some_and(|zoomed| removals.contains(&pane_identity(zoomed)))
+        {
+            if let Some(zoomed) = self.zoomed.take() {
+                callbacks.removed.insert(pane_identity(&zoomed));
+            }
+        }
+        if prior_focus_was_floating
+            && callbacks
+                .prior_focus
+                .as_ref()
+                .is_some_and(|prior| callbacks.removed.contains(&pane_identity(prior)))
+        {
+            // Do not transfer focus to an unrelated pane that reused the same
+            // numeric ID.
+            self.floating_focus = None;
+        }
+
+        if callbacks.removed.is_empty() {
+            return DeferredTabCallbacks::default();
+        }
+        callbacks.changed = true;
+
+        self.reindex_pane_stacks_callback_free();
+
+        let mut remaining_tree_panes = Vec::new();
+        if let Some(tree) = &self.pane {
+            collect_raw_tree_leaves(tree, &mut remaining_tree_panes);
+        }
+        if remaining_tree_panes.is_empty() {
+            self.active = 0;
+        } else if let Some(prior_tree_active) = &prior_tree_active {
+            self.active = remaining_tree_panes
+                .iter()
+                .position(|pane| Arc::ptr_eq(pane, prior_tree_active))
+                .unwrap_or_else(|| self.active.min(remaining_tree_panes.len() - 1));
+        } else {
+            self.active = self.active.min(remaining_tree_panes.len() - 1);
+        }
+
+        let remaining_ids = self
+            .snapshot_panes_callback_free()
+            .into_iter()
+            .filter_map(|pane| pane_ids.get(&pane_identity(&pane)).copied())
+            .collect::<HashSet<_>>();
+        for candidate in candidates {
+            if callbacks.removed.contains(&pane_identity(&candidate.pane))
+                && !remaining_ids.contains(&candidate.pane_id)
+            {
+                self.discard_removed_pane_state(candidate.pane_id);
+            }
+        }
+
+        if tree_changed {
+            if let Some(tree) = self.pane.as_mut() {
+                normalize_tree_sizes_callback_free(tree, self.size, &mut callbacks.resize_work);
+            }
+        }
+
+        callbacks.current_focus = self.raw_active_pane_callback_free(&pane_ids);
+        callbacks.current_focus_id = callbacks
+            .current_focus
+            .as_ref()
+            .and_then(|pane| pane_ids.get(&pane_identity(pane)).copied());
+        callbacks
     }
 
     fn effective_pane_constraints_for(&mut self, pane_id: PaneId) -> Option<PaneConstraints> {
@@ -3796,108 +4534,18 @@ impl TabInner {
         None
     }
 
-    fn prune_dead_panes(&mut self) -> bool {
-        let mux = Mux::try_get();
-        let should_prune = |pane: &Arc<dyn Pane>| {
-            let in_mux = mux
-                .as_ref()
-                .map(|mux| {
-                    mux.get_pane(pane.pane_id())
-                        .is_some_and(|registered| Arc::ptr_eq(&registered, pane))
-                })
-                .unwrap_or(true);
-            let dead = pane.is_dead();
-            dead || !in_mux
-        };
-        let dead_floating: Vec<PaneId> = self
-            .floating_panes
-            .iter()
-            .filter(|floating| should_prune(&floating.pane))
-            .map(|floating| floating.pane.pane_id())
-            .collect();
-
-        for pane_id in &dead_floating {
-            let _ = self.remove_floating_pane(*pane_id);
-        }
-
-        let removed_stacked = self.remove_stacked_panes_if(should_prune);
-        let removed_tree = !self
-            .remove_pane_if(
-                |_, pane| {
-                    // If the pane is no longer known to the mux, then its liveness
-                    // state isn't guaranteed to be monitored or updated, so let's
-                    // consider the pane effectively dead if it isn't in the mux.
-                    // <https://github.com/wezterm/wezterm/issues/4030>
-                    let in_mux = mux
-                        .as_ref()
-                        .map(|mux| {
-                            mux.get_pane(pane.pane_id())
-                                .is_some_and(|registered| Arc::ptr_eq(&registered, pane))
-                        })
-                        .unwrap_or(true);
-                    let dead = pane.is_dead();
-                    log::trace!(
-                        "prune_dead_panes: pane_id={} dead={} in_mux={}",
-                        pane.pane_id(),
-                        dead,
-                        in_mux
-                    );
-                    dead || !in_mux
-                },
-                true,
-            )
-            .is_empty();
-        !dead_floating.is_empty() || !removed_stacked.is_empty() || removed_tree
-    }
-
-    fn kill_pane(&mut self, pane_id: PaneId) -> bool {
-        if self.has_floating_pane(pane_id) {
-            if let Some(pane) = self.remove_floating_pane(pane_id) {
-                schedule_mux_pane_removals(vec![pane]);
-                return true;
-            }
-            return false;
-        }
-        if !self
-            .remove_pane_if(|_, pane| pane.pane_id() == pane_id, true)
-            .is_empty()
-        {
-            return true;
-        }
-        if let Some(pane) = self.remove_stacked_pane(pane_id) {
-            schedule_mux_pane_removals(vec![pane]);
-            return true;
-        }
-        false
-    }
-
-    fn kill_panes_in_domain(&mut self, domain: DomainId) -> bool {
-        let removed_floating = self.remove_floating_panes_in_domain(domain);
-        let removed_stacked = self.remove_stacked_panes_if(|pane| pane.domain_id() == domain);
-        if !removed_floating.is_empty() || !removed_stacked.is_empty() {
-            let removed: Vec<Arc<dyn Pane>> = removed_floating
-                .iter()
-                .chain(removed_stacked.iter())
-                .cloned()
-                .collect();
-            schedule_mux_pane_removals(removed);
-        }
-        let removed_tree = self.remove_pane_if(|_, pane| pane.domain_id() == domain, true);
-        !removed_floating.is_empty() || !removed_stacked.is_empty() || !removed_tree.is_empty()
-    }
-
     fn remove_pane(&mut self, pane_id: PaneId) -> Option<Arc<dyn Pane>> {
         if let Some(pane) = self.remove_floating_pane(pane_id) {
             return Some(pane);
         }
-        let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id, false);
+        let panes = self.remove_pane_if(|_, pane| pane.pane_id() == pane_id);
         panes
             .into_iter()
             .next()
             .or_else(|| self.remove_stacked_pane(pane_id))
     }
 
-    fn remove_pane_if<F>(&mut self, f: F, kill: bool) -> Vec<Arc<dyn Pane>>
+    fn remove_pane_if<F>(&mut self, f: F) -> Vec<Arc<dyn Pane>>
     where
         F: Fn(usize, &Arc<dyn Pane>) -> bool,
     {
@@ -4015,32 +4663,12 @@ impl TabInner {
         }
         self.reindex_pane_stacks_from_tree();
 
-        if !dead_panes.is_empty() && kill {
-            schedule_mux_pane_removals(dead_panes.clone());
-        }
         for pane in &dead_panes {
             let pid = pane.pane_id();
             self.discard_removed_pane_state(pid);
             self.remove_stacked_pane(pid);
         }
         dead_panes
-    }
-
-    fn can_close_without_prompting(&mut self, reason: CloseReason) -> bool {
-        for pane in self.all_logical_panes() {
-            if !pane.can_close_without_prompting(reason) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn is_dead(&mut self) -> bool {
-        // Make sure we account for all panes, so that we don't
-        // kill the whole tab if the zoomed pane is dead!
-        self.all_logical_panes()
-            .into_iter()
-            .all(|pane| pane.is_dead())
     }
 
     fn get_active_pane(&mut self) -> Option<Arc<dyn Pane>> {
@@ -4907,6 +5535,11 @@ mod test {
         constraints: PaneConstraints,
         priority: CollapsePriority,
         writes: Mutex<Vec<u8>>,
+        mux_registration: Arc<crate::PaneRegistrationSlot>,
+        dead: bool,
+        panic_in_is_dead: bool,
+        callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+        kills: std::sync::atomic::AtomicUsize,
     }
 
     impl FakePane {
@@ -4918,6 +5551,11 @@ mod test {
                 constraints: PaneConstraints::default(),
                 priority: CollapsePriority::default(),
                 writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                callback_probe: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -4929,6 +5567,11 @@ mod test {
                 constraints: PaneConstraints::default(),
                 priority: CollapsePriority::default(),
                 writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                callback_probe: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -4944,6 +5587,11 @@ mod test {
                 constraints,
                 priority: CollapsePriority::default(),
                 writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                callback_probe: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -4960,6 +5608,33 @@ mod test {
                 constraints,
                 priority,
                 writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead: false,
+                panic_in_is_dead: false,
+                callback_probe: None,
+                kills: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn new_with_callback_probe(
+            id: PaneId,
+            size: TerminalSize,
+            dead: bool,
+            panic_in_is_dead: bool,
+            callback_probe: Arc<dyn Fn() + Send + Sync>,
+        ) -> Arc<dyn Pane> {
+            Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                domain_id: 1,
+                constraints: PaneConstraints::default(),
+                priority: CollapsePriority::default(),
+                writes: Mutex::new(Vec::new()),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+                dead,
+                panic_in_is_dead,
+                callback_probe: Some(callback_probe),
+                kills: std::sync::atomic::AtomicUsize::new(0),
             })
         }
     }
@@ -4967,6 +5642,10 @@ mod test {
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
             self.id
+        }
+
+        fn mux_registration_slot(&self) -> &Arc<crate::PaneRegistrationSlot> {
+            &self.mux_registration
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
@@ -5046,8 +5725,17 @@ mod test {
             })
         }
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+            if let Some(probe) = &self.callback_probe {
+                probe();
+            }
             *self.size.lock() = size;
             Ok(())
+        }
+
+        fn focus_changed(&self, _focused: bool) {
+            if let Some(probe) = &self.callback_probe {
+                probe();
+            }
         }
 
         fn key_down(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
@@ -5060,7 +5748,17 @@ mod test {
             Ok(())
         }
         fn is_dead(&self) -> bool {
-            false
+            if let Some(probe) = &self.callback_probe {
+                probe();
+            }
+            assert!(
+                !self.panic_in_is_dead,
+                "intentional FakePane::is_dead panic"
+            );
+            self.dead
+        }
+        fn kill(&self) {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         fn palette(&self) -> ColorPalette {
             ColorPalette::default()
@@ -5621,8 +6319,193 @@ mod test {
 
         tab.activate_pane_direction(PaneDirection::Right);
         assert_eq!(tab.codec_pane_tree(), PaneNode::Empty);
-        assert!(!tab.prune_dead_panes());
+        assert!(!tab.prune_dead_panes_without_mux());
         assert_eq!(tab.count_panes(), Some(2));
+    }
+
+    #[test]
+    fn staged_prune_uses_exact_identity_and_runs_callbacks_after_unlock() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Arc::new(Tab::new(&size));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let weak_tab = Arc::downgrade(&tab);
+        let probe: Arc<dyn Fn() + Send + Sync> = {
+            let armed = Arc::clone(&armed);
+            let callback_count = Arc::clone(&callback_count);
+            Arc::new(move || {
+                if !armed.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let tab = weak_tab.upgrade().expect("tab retained by test");
+                assert!(
+                    tab.inner.try_lock().is_some(),
+                    "pane callback must not run while Tab::inner is held"
+                );
+                callback_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            })
+        };
+        let dead = FakePane::new_with_callback_probe(77, size, true, false, Arc::clone(&probe));
+        let replacement =
+            FakePane::new_with_callback_probe(77, size, false, false, Arc::clone(&probe));
+
+        tab.assign_pane(&dead);
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&replacement))
+            .expect("same numeric ID is permitted for an adversarial exact-identity test");
+        tab.set_active_idx(0);
+        armed.store(true, std::sync::atomic::Ordering::Release);
+
+        assert!(tab.prune_dead_panes_without_mux());
+        let survivors = tab.iter_all_panes();
+        assert_eq!(survivors.len(), 1);
+        assert!(Arc::ptr_eq(&survivors[0], &replacement));
+        assert!(
+            callback_count.load(std::sync::atomic::Ordering::Acquire) >= 4,
+            "liveness, resize, and focus effects should all exercise the unlocked callback path"
+        );
+    }
+
+    #[test]
+    fn kill_registration_preserves_same_id_visible_pane_when_current_is_hidden_in_stack() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let mux = Arc::new(Mux::new(None));
+        let stale_visible = FakePane::new(78, size);
+        mux.add_pane(&stale_visible)
+            .expect("stale pane should publish its original registration");
+        let stale_registration = mux
+            .capture_pane_registration(&stale_visible)
+            .expect("stale pane should expose its original registration");
+        assert!(
+            stale_registration.detach_local_if_current(),
+            "retiring the original local registration creates the stale topology identity"
+        );
+
+        let current_hidden = FakePane::new(78, size);
+        mux.add_pane(&current_hidden)
+            .expect("same-ID successor should publish after exact local retirement");
+        let current_registration = mux
+            .capture_pane_registration(&current_hidden)
+            .expect("successor should expose its current registration");
+
+        let tab = Tab::new(&size);
+        {
+            let mut inner = tab.inner.lock();
+            inner.pane = Some(Tree::Leaf(Arc::clone(&stale_visible)));
+            inner.pane_stacks.insert(
+                0,
+                PaneStack::new(vec![
+                    Arc::clone(&stale_visible),
+                    Arc::clone(&current_hidden),
+                ]),
+            );
+        }
+        {
+            let inner = tab.inner.lock();
+            let stack = inner
+                .pane_stacks
+                .get(&0)
+                .expect("adversarial setup should create one pane stack");
+            assert_eq!(stack.len(), 2);
+            assert_eq!(stack.active_index(), 0);
+            assert!(Arc::ptr_eq(stack.active_pane(), &stale_visible));
+            assert!(
+                Arc::ptr_eq(&stack.panes()[1], &current_hidden),
+                "the exact current registration must begin hidden behind its same-ID predecessor"
+            );
+            assert!(matches!(
+                inner.pane.as_ref(),
+                Some(Tree::Leaf(pane)) if Arc::ptr_eq(pane, &stale_visible)
+            ));
+        }
+
+        assert!(
+            !tab.kill_pane_registration(&stale_registration),
+            "a retired handle must not remove either same-ID topology identity"
+        );
+        assert!(
+            tab.kill_pane_registration(&current_registration),
+            "the current hidden registration should be removed and killed exactly once"
+        );
+
+        assert_eq!(
+            current_hidden
+                .downcast_ref::<FakePane>()
+                .expect("current pane should retain its concrete test type")
+                .kills
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the exact current registration may be killed"
+        );
+        assert_eq!(
+            stale_visible
+                .downcast_ref::<FakePane>()
+                .expect("stale pane should retain its concrete test type")
+                .kills
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the same-ID visible stale pane must not be killed"
+        );
+        assert!(
+            mux.get_pane(78).is_none(),
+            "retiring the current registration must leave the reusable numeric slot empty"
+        );
+        assert_eq!(current_registration.try_with_current(|_| ()), None);
+
+        let visible = tab.iter_panes();
+        assert_eq!(visible.len(), 1);
+        assert!(
+            Arc::ptr_eq(&visible[0].pane, &stale_visible),
+            "the original visible tree leaf must remain the exact stale Arc"
+        );
+        let all_panes = tab.iter_all_panes();
+        assert_eq!(all_panes.len(), 1);
+        assert!(Arc::ptr_eq(&all_panes[0], &stale_visible));
+
+        let inner = tab.inner.lock();
+        let stack = inner
+            .pane_stacks
+            .get(&0)
+            .expect("the surviving visible pane should retain its stack slot");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.active_index(), 0);
+        assert!(
+            Arc::ptr_eq(stack.active_pane(), &stale_visible),
+            "exact hidden removal must preserve the visible stack selection"
+        );
+        assert!(matches!(
+            inner.pane.as_ref(),
+            Some(Tree::Leaf(pane)) if Arc::ptr_eq(pane, &stale_visible)
+        ));
+    }
+
+    #[test]
+    fn staged_prune_retains_a_pane_when_is_dead_panics() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        let pane = FakePane::new_with_callback_probe(88, size, false, true, Arc::new(|| {}));
+        tab.assign_pane(&pane);
+
+        assert!(!tab.prune_dead_panes_without_mux());
+        assert_eq!(tab.count_panes(), Some(1));
+        assert!(!tab.is_dead());
     }
 
     #[test]

@@ -771,7 +771,12 @@ impl Publish {
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
             match frankenterm_client::client::Client::new_unix_domain(
-                None, &dom, false, &mut ui, true,
+                None,
+                &dom,
+                false,
+                &mut ui,
+                true,
+                std::sync::Weak::new(),
             ) {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
@@ -1027,7 +1032,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     let gui = crate::frontend::try_new()?;
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
-    let activity = Activity::new();
+    let activity = Activity::new_for_mux(&mux);
 
     promise::spawn::spawn(async move {
         if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {

@@ -373,7 +373,7 @@ fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> an
             continue;
         }
 
-        let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(client_config)?);
+        let domain: Arc<dyn Domain> = Arc::new(ClientDomain::new(client_config, &mux)?);
         mux.add_domain(&domain)?;
     }
 

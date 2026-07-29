@@ -1,4 +1,4 @@
-use crate::domain::{ClientDomain, ClientDomainConfig};
+use crate::domain::{ClientDomain, ClientDomainConfig, ClientInner};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
@@ -15,9 +15,9 @@ use futures::pin_mut;
 use mux::client::ClientId;
 use mux::connui::ConnectionUI;
 use mux::domain::DomainId;
-use mux::pane::PaneId;
+use mux::pane::{Pane, PaneId};
 use mux::ssh::ssh_connect_with_ui;
-use mux::Mux;
+use mux::{Mux, PaneRegistrationHandle};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
@@ -30,7 +30,8 @@ use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::Duration;
@@ -38,6 +39,7 @@ use thiserror::Error;
 use wezterm_uds::UnixStream;
 
 const UNIX_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const INITIAL_CONNECTION_GENERATION: u64 = 1;
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
@@ -58,10 +60,197 @@ enum ReaderMessage {
 pub struct Client {
     sender: Sender<ReaderMessage>,
     local_domain_id: Option<DomainId>,
+    incarnation: Arc<ClientIncarnation>,
+    connection_generation: Arc<AtomicU64>,
     pub client_id: ClientId,
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
     pub is_local: bool,
+}
+
+struct ClientIncarnation;
+
+#[derive(Clone)]
+enum ClientDispatchTarget {
+    Standalone,
+    Attached {
+        local_domain_id: DomainId,
+        mux_owner: Weak<Mux>,
+    },
+}
+
+/// Exact authority for dispatching work produced by one transport connection.
+///
+/// The client incarnation prevents an old reconnect thread from operating on a
+/// replacement `ClientInner`. The monotonically increasing connection
+/// generation revokes already-queued work as soon as its transport ends. The
+/// weak mux owner prevents process-global mux replacement from retargeting that
+/// work.
+#[derive(Clone)]
+struct ClientDispatchAuthority {
+    target: ClientDispatchTarget,
+    client_incarnation: Arc<ClientIncarnation>,
+    connection_generation: Arc<AtomicU64>,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct CurrentClientDispatch {
+    authority: ClientDispatchAuthority,
+    mux: Arc<Mux>,
+    domain: Arc<dyn mux::domain::Domain>,
+    inner: Arc<ClientInner>,
+}
+
+impl ClientDispatchAuthority {
+    fn new(
+        local_domain_id: Option<DomainId>,
+        mux_owner: Weak<Mux>,
+        client_incarnation: Arc<ClientIncarnation>,
+        connection_generation: Arc<AtomicU64>,
+    ) -> Self {
+        let target = match local_domain_id {
+            Some(local_domain_id) => ClientDispatchTarget::Attached {
+                local_domain_id,
+                mux_owner,
+            },
+            None => ClientDispatchTarget::Standalone,
+        };
+        Self {
+            target,
+            client_incarnation,
+            connection_generation,
+            generation: INITIAL_CONNECTION_GENERATION,
+        }
+    }
+
+    fn is_standalone(&self) -> bool {
+        matches!(&self.target, ClientDispatchTarget::Standalone)
+    }
+
+    fn generation_is_current(&self) -> bool {
+        self.generation != 0
+            && self.connection_generation.load(AtomicOrdering::Acquire) == self.generation
+    }
+
+    /// Revoke the current transport and mint the authority for its successor.
+    ///
+    /// The compare-exchange is deliberately exact: if some path ever attempts
+    /// to advance an already-retired authority, it fails closed rather than
+    /// accidentally blessing work from a different connection.
+    fn advance_generation(&self) -> anyhow::Result<Self> {
+        let Some(next_generation) = self.generation.checked_add(1) else {
+            let _ = self.connection_generation.compare_exchange(
+                self.generation,
+                0,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            );
+            bail!("mux client connection generation exhausted");
+        };
+        self.connection_generation
+            .compare_exchange(
+                self.generation,
+                next_generation,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .map_err(|observed| {
+                anyhow!(
+                    "cannot advance stale mux client connection generation {} (current {})",
+                    self.generation,
+                    observed
+                )
+            })?;
+
+        let mut next = self.clone();
+        next.generation = next_generation;
+        Ok(next)
+    }
+
+    fn captured_mux(&self) -> Option<Arc<Mux>> {
+        match &self.target {
+            ClientDispatchTarget::Standalone => None,
+            ClientDispatchTarget::Attached { mux_owner, .. } => mux_owner.upgrade(),
+        }
+    }
+
+    fn resolve_current(&self) -> anyhow::Result<Option<CurrentClientDispatch>> {
+        if !self.generation_is_current() {
+            return Ok(None);
+        }
+        let ClientDispatchTarget::Attached {
+            local_domain_id, ..
+        } = &self.target
+        else {
+            return Ok(None);
+        };
+        let Some(mux) = self.captured_mux() else {
+            return Ok(None);
+        };
+        let Some(domain) = mux.get_domain(*local_domain_id) else {
+            return Ok(None);
+        };
+        let client_domain = domain
+            .downcast_ref::<ClientDomain>()
+            .ok_or_else(|| anyhow!("domain {} is not a ClientDomain instance", local_domain_id))?;
+        let Some(inner) = client_domain.inner() else {
+            return Ok(None);
+        };
+        if inner.is_detached() || !inner.client.matches_dispatch_authority(self) {
+            return Ok(None);
+        }
+
+        let current = CurrentClientDispatch {
+            authority: self.clone(),
+            mux,
+            domain,
+            inner,
+        };
+        Ok(current.is_current().then_some(current))
+    }
+}
+
+impl CurrentClientDispatch {
+    fn local_domain_id(&self) -> DomainId {
+        self.domain.domain_id()
+    }
+
+    fn client_domain(&self) -> &ClientDomain {
+        self.domain
+            .downcast_ref::<ClientDomain>()
+            .expect("current client dispatch was resolved from a ClientDomain")
+    }
+
+    fn is_current(&self) -> bool {
+        if !self.authority.generation_is_current() || self.inner.is_detached() {
+            return false;
+        }
+        let ClientDispatchTarget::Attached {
+            local_domain_id,
+            mux_owner,
+        } = &self.authority.target
+        else {
+            return false;
+        };
+        if *local_domain_id != self.domain.domain_id()
+            || !mux_owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.mux))
+            || !self
+                .mux
+                .get_domain(*local_domain_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &self.domain))
+        {
+            return false;
+        }
+
+        self.client_domain().inner_is_current(&self.inner)
+            && self
+                .inner
+                .client
+                .matches_dispatch_authority(&self.authority)
+    }
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -117,67 +306,130 @@ macro_rules! rpc {
     };
 }
 
-fn process_unilateral_inner(pane_id: PaneId, local_domain_id: DomainId, decoded: DecodedPdu) {
+fn process_unilateral_inner(dispatch: CurrentClientDispatch, pane_id: PaneId, decoded: DecodedPdu) {
+    if !dispatch.is_current() {
+        return;
+    }
+    let admitted = admit_client_pane(&dispatch, pane_id);
+    if !dispatch.is_current() {
+        return;
+    }
     promise::spawn::spawn(async move {
-        process_unilateral_inner_async(pane_id, local_domain_id, decoded).await?;
+        process_unilateral_inner_async(dispatch, admitted, pane_id, decoded).await?;
         Ok::<(), anyhow::Error>(())
     })
     .detach();
 }
 
+fn admit_client_pane(
+    dispatch: &CurrentClientDispatch,
+    remote_pane_id: PaneId,
+) -> Option<(Arc<dyn Pane>, PaneRegistrationHandle)> {
+    if !dispatch.is_current() {
+        return None;
+    }
+    let local_pane_id = dispatch
+        .inner
+        .remote_to_local_pane_id(&dispatch.mux, remote_pane_id)?;
+    let pane = dispatch.mux.get_pane(local_pane_id)?;
+    let client_pane = pane.downcast_ref::<ClientPane>()?;
+    if !client_pane.belongs_to_client(&dispatch.inner)
+        || client_pane.remote_pane_id() != remote_pane_id
+    {
+        return None;
+    }
+    let registration = dispatch.mux.capture_pane_registration(&pane)?;
+    dispatch.is_current().then_some((pane, registration))
+}
+
 async fn process_unilateral_inner_async(
+    dispatch: CurrentClientDispatch,
+    admitted: Option<(Arc<dyn Pane>, PaneRegistrationHandle)>,
     pane_id: PaneId,
-    local_domain_id: DomainId,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
-    let mux = match Mux::try_get() {
-        Some(mux) => mux,
-        None => {
-            // This can happen for some client scenarios; it is ok to ignore it.
-            return Ok(());
-        }
-    };
+    let local_domain_id = dispatch.local_domain_id();
+    if !dispatch.is_current() {
+        log::trace!(
+            "discarding unilateral PDU for retired client connection in domain {}",
+            local_domain_id
+        );
+        return Ok(());
+    }
+    let client_domain = dispatch.client_domain();
 
-    let client_domain = mux
-        .get_domain(local_domain_id)
-        .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-    let client_domain = client_domain
-        .downcast_ref::<ClientDomain>()
-        .ok_or_else(|| anyhow!("domain {} is not a ClientDomain instance", local_domain_id))?;
+    let (pane, registration) = if let Some(admitted) = admitted {
+        admitted
+    } else {
+        // If we get a push for a pane that we don't yet know about, it means
+        // that some other client has manipulated the mux topology; re-sync on
+        // the captured origin, never a later process-global replacement.
+        let local_pane_id = match dispatch
+            .inner
+            .remote_to_local_pane_id(&dispatch.mux, pane_id)
+        {
+            Some(p) => p,
+            None => {
+                log::debug!("got {decoded:?}, pane not found locally, resync");
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                let resync_result = client_domain
+                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner))
+                    .await;
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                resync_result?;
+                dispatch
+                    .inner
+                    .remote_to_local_pane_id(&dispatch.mux, pane_id)
+                    .ok_or_else(|| {
+                        anyhow!("remote pane id {} does not have a local pane id", pane_id)
+                    })?
+            }
+        };
 
-    // If we get a push for a pane that we don't yet know about,
-    // it means that some other client has manipulated the mux
-    // topology; we need to re-sync.
-    let local_pane_id = match client_domain.remote_to_local_pane_id(pane_id) {
-        Some(p) => p,
-        None => {
-            log::debug!("got {decoded:?}, pane not found locally, resync");
-            client_domain.resync().await?;
-            client_domain
-                .remote_to_local_pane_id(pane_id)
-                .ok_or_else(|| {
-                    anyhow!("remote pane id {} does not have a local pane id", pane_id)
-                })?
-        }
-    };
+        let pane = match dispatch.mux.get_pane(local_pane_id) {
+            Some(p) => p,
+            None => {
+                log::debug!(
+                    "got {decoded:?}, but local pane {local_pane_id} no longer exists; resync"
+                );
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                let resync_result = client_domain
+                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner))
+                    .await;
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                resync_result?;
 
-    let pane = match mux.get_pane(local_pane_id) {
-        Some(p) => p,
-        None => {
-            log::debug!("got {decoded:?}, but local pane {local_pane_id} no longer exists; resync");
-            client_domain.resync().await?;
-
-            let local_pane_id =
-                client_domain
-                    .remote_to_local_pane_id(pane_id)
+                let local_pane_id = dispatch
+                    .inner
+                    .remote_to_local_pane_id(&dispatch.mux, pane_id)
                     .ok_or_else(|| {
                         anyhow!("remote pane id {} does not have a local pane id", pane_id)
                     })?;
 
-            mux.get_pane(local_pane_id)
-                .ok_or_else(|| anyhow!("local pane {local_pane_id} not found"))?
+                dispatch
+                    .mux
+                    .get_pane(local_pane_id)
+                    .ok_or_else(|| anyhow!("local pane {local_pane_id} not found"))?
+            }
+        };
+        if !dispatch.is_current() {
+            return Ok(());
         }
+        let registration = dispatch
+            .mux
+            .capture_pane_registration(&pane)
+            .ok_or_else(|| anyhow!("local pane {} is no longer registered", pane.pane_id()))?;
+        (pane, registration)
     };
+    let local_pane_id = pane.pane_id();
     let client_pane = pane.downcast_ref::<ClientPane>().ok_or_else(|| {
         log::error!(
             "received unilateral PDU for pane {} which is \
@@ -192,7 +444,24 @@ async fn process_unilateral_inner_async(
             decoded.pdu
         )
     })?;
-    client_pane.process_unilateral(decoded.pdu).await
+    if !dispatch.is_current()
+        || !client_pane.belongs_to_client(&dispatch.inner)
+        || client_pane.remote_pane_id() != pane_id
+    {
+        log::trace!(
+            "discarding unilateral PDU for stale client pane {} (remote {})",
+            local_pane_id,
+            pane_id
+        );
+        return Ok(());
+    }
+    let result = client_pane
+        .process_unilateral(&registration, decoded.pdu)
+        .await;
+    if !dispatch.is_current() {
+        return Ok(());
+    }
+    result
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -236,15 +505,19 @@ fn handle_unilateral_without_local_domain(decoded: &DecodedPdu) -> anyhow::Resul
 }
 
 fn process_unilateral(
-    local_domain_id: Option<DomainId>,
+    authority: &ClientDispatchAuthority,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
-    let local_domain_id = match local_domain_id {
-        Some(id) => id,
-        None => {
-            return handle_unilateral_without_local_domain(&decoded);
-        }
+    if !authority.generation_is_current() {
+        return Ok(());
+    }
+    if authority.is_standalone() {
+        return handle_unilateral_without_local_domain(&decoded);
+    }
+    let Some(dispatch) = authority.resolve_current()? else {
+        return Ok(());
     };
+
     match &decoded.pdu {
         Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
             window_id,
@@ -252,22 +525,24 @@ fn process_unilateral(
         }) => {
             let window_id = *window_id;
             let workspace = workspace.to_string();
+            if !dispatch.is_current() {
+                return Ok(());
+            }
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
-                let client_domain = mux
-                    .get_domain(local_domain_id)
-                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                let client_domain =
-                    client_domain
-                        .downcast_ref::<ClientDomain>()
-                        .ok_or_else(|| {
-                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
-                        })?;
-
-                let local_window_id = client_domain
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                let local_window_id = dispatch
+                    .client_domain()
                     .remote_to_local_window_id(window_id)
                     .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
-                if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                if let Some(mut window) = dispatch.mux.get_window_mut(local_window_id) {
+                    if !dispatch.is_current() {
+                        return Ok(());
+                    }
                     window.set_workspace(&workspace);
                 }
 
@@ -280,19 +555,21 @@ fn process_unilateral(
         Pdu::WindowTitleChanged(WindowTitleChanged { window_id, title }) => {
             let title = title.to_string();
             let window_id = *window_id;
+            if !dispatch.is_current() {
+                return Ok(());
+            }
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
-                let client_domain = mux
-                    .get_domain(local_domain_id)
-                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                let client_domain =
-                    client_domain
-                        .downcast_ref::<ClientDomain>()
-                        .ok_or_else(|| {
-                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
-                        })?;
-
-                client_domain.process_remote_window_title_change(window_id, title);
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                let local_window_id = dispatch
+                    .client_domain()
+                    .remote_to_local_window_id(window_id)
+                    .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                dispatch.mux.set_window_title(local_window_id, &title);
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
@@ -304,10 +581,17 @@ fn process_unilateral(
         }) => {
             let old_workspace = old_workspace.to_string();
             let new_workspace = new_workspace.to_string();
+            if !dispatch.is_current() {
+                return Ok(());
+            }
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
                 log::debug!("got a rename {old_workspace} -> {new_workspace}");
-                mux.rename_workspace(&old_workspace, &new_workspace);
+                dispatch
+                    .mux
+                    .rename_workspace(&old_workspace, &new_workspace);
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
@@ -316,19 +600,21 @@ fn process_unilateral(
         Pdu::TabTitleChanged(TabTitleChanged { tab_id, title }) => {
             let title = title.to_string();
             let tab_id = *tab_id;
+            if !dispatch.is_current() {
+                return Ok(());
+            }
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
-                let client_domain = mux
-                    .get_domain(local_domain_id)
-                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                let client_domain =
-                    client_domain
-                        .downcast_ref::<ClientDomain>()
-                        .ok_or_else(|| {
-                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
-                        })?;
-
-                client_domain.process_remote_tab_title_change(tab_id, title);
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                let local_tab_id = dispatch
+                    .inner
+                    .remote_to_local_tab_id(tab_id)
+                    .ok_or_else(|| anyhow!("no local tab for remote tab id {}", tab_id))?;
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                dispatch.mux.set_tab_title(local_tab_id, &title);
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
@@ -336,19 +622,21 @@ fn process_unilateral(
         }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
+            if !dispatch.is_current() {
+                return Ok(());
+            }
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::try_get().ok_or_else(|| anyhow!("no more mux"))?;
-                let client_domain = mux
-                    .get_domain(local_domain_id)
-                    .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                let client_domain =
-                    client_domain
-                        .downcast_ref::<ClientDomain>()
-                        .ok_or_else(|| {
-                            anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
-                        })?;
-
-                client_domain.resync().await
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                let result = dispatch
+                    .client_domain()
+                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner))
+                    .await;
+                if !dispatch.is_current() {
+                    return Ok(());
+                }
+                result
             })
             .detach();
 
@@ -358,8 +646,13 @@ fn process_unilateral(
     }
 
     if let Some(pane_id) = decoded.pdu.pane_id() {
+        if !dispatch.is_current() {
+            return Ok(());
+        }
         promise::spawn::spawn_into_main_thread(async move {
-            process_unilateral_inner(pane_id, local_domain_id, decoded)
+            if dispatch.is_current() {
+                process_unilateral_inner(dispatch, pane_id, decoded);
+            }
         })
         .detach();
     } else {
@@ -387,8 +680,8 @@ fn fallback_rewake(task_cx: &TaskContext<'_>) {
 
 fn client_thread(
     mut reconnectable: Reconnectable,
-    local_domain_id: Option<DomainId>,
     mut rx: Receiver<ReaderMessage>,
+    dispatch_authority: ClientDispatchAuthority,
 ) -> (anyhow::Result<()>, Reconnectable, Receiver<ReaderMessage>) {
     // The reader performs ALL of this connection's socket I/O, so it must run as
     // a scheduler-managed task (block_on_io) rather than a directly-polled
@@ -400,15 +693,15 @@ fn client_thread(
     // times out. We move the owned reconnectable + receiver into the task and
     // return them so the reconnect loop can reuse them on the next attempt.
     promise::spawn::block_on_io(async move {
-        let result = client_thread_async(&mut reconnectable, local_domain_id, &mut rx).await;
+        let result = client_thread_async(&mut reconnectable, &mut rx, &dispatch_authority).await;
         (result, reconnectable, rx)
     })
 }
 
 async fn client_thread_async(
     reconnectable: &mut Reconnectable,
-    local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
+    dispatch_authority: &ClientDispatchAuthority,
 ) -> anyhow::Result<()> {
     let mut next_serial = 1u64;
 
@@ -509,7 +802,7 @@ async fn client_thread_async(
                             decoded.pdu.pdu_name()
                         );
                         if decoded.serial == 0 {
-                            process_unilateral(local_domain_id, decoded)
+                            process_unilateral(dispatch_authority, decoded)
                                 .context("processing unilateral PDU from server")
                                 .map_err(|e| {
                                     log::error!("process_unilateral: {:?}", e);
@@ -1436,12 +1729,33 @@ impl Reconnectable {
 }
 
 impl Client {
-    fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
+    fn matches_dispatch_authority(&self, authority: &ClientDispatchAuthority) -> bool {
+        Arc::ptr_eq(&self.incarnation, &authority.client_incarnation)
+            && Arc::ptr_eq(
+                &self.connection_generation,
+                &authority.connection_generation,
+            )
+    }
+
+    fn new(
+        local_domain_id: Option<DomainId>,
+        mut reconnectable: Reconnectable,
+        mux_owner: Weak<Mux>,
+    ) -> Self {
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
+        let incarnation = Arc::new(ClientIncarnation);
+        let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
+        let initial_dispatch_authority = ClientDispatchAuthority::new(
+            local_domain_id,
+            mux_owner,
+            Arc::clone(&incarnation),
+            Arc::clone(&connection_generation),
+        );
+        let mut reconnect_dispatch_authority = initial_dispatch_authority.clone();
 
         if let Err(err) = thread::Builder::new()
             .name("client-reconnect".to_string())
@@ -1467,10 +1781,22 @@ impl Client {
                 let mut failed_cycles: u32 = 0;
                 loop {
                     let session_started = std::time::Instant::now();
-                    let (thread_result, returned_reconnectable, returned_receiver) =
-                        client_thread(reconnectable, local_domain_id, receiver);
+                    let (thread_result, returned_reconnectable, returned_receiver) = client_thread(
+                        reconnectable,
+                        receiver,
+                        reconnect_dispatch_authority.clone(),
+                    );
                     reconnectable = returned_reconnectable;
                     receiver = returned_receiver;
+                    reconnect_dispatch_authority = match reconnect_dispatch_authority
+                        .advance_generation()
+                    {
+                        Ok(next) => next,
+                        Err(err) => {
+                            log::error!("cannot retire mux client transport authority: {err:#}");
+                            break;
+                        }
+                    };
                     // A session that survived long enough is a genuine
                     // recovery, not churn: forget the earlier failures so a
                     // long-lived domain can still reconnect indefinitely
@@ -1555,12 +1881,39 @@ impl Client {
                                     backoff = base_interval;
                                     log::error!("Reconnected!");
                                     let reattach_ui = ui.clone();
-                                    promise::spawn::spawn_into_main_thread(async move {
-                                        ClientDomain::reattach(local_domain_id, reattach_ui)
-                                            .await
-                                            .ok();
-                                    })
-                                    .detach();
+                                    match reconnect_dispatch_authority.resolve_current() {
+                                        Ok(Some(dispatch)) => {
+                                            promise::spawn::spawn_into_main_thread(async move {
+                                                if !dispatch.is_current() {
+                                                    return Ok(());
+                                                }
+                                                let result = ClientDomain::reattach_if_current(
+                                                    Arc::clone(&dispatch.mux),
+                                                    Arc::clone(&dispatch.domain),
+                                                    Arc::clone(&dispatch.inner),
+                                                    reattach_ui,
+                                                )
+                                                .await;
+                                                if !dispatch.is_current() {
+                                                    return Ok(());
+                                                }
+                                                result
+                                            })
+                                            .detach();
+                                        }
+                                        Ok(None) => {
+                                            log::trace!(
+                                                "discarding reconnect reattach for retired client \
+                                                 authority in domain {local_domain_id}"
+                                            );
+                                        }
+                                        Err(err) => {
+                                            log::error!(
+                                                "cannot resolve reconnect reattach authority for \
+                                                 domain {local_domain_id}: {err:#}"
+                                            );
+                                        }
+                                    }
                                     reconnected = true;
                                     break;
                                 }
@@ -1594,34 +1947,44 @@ impl Client {
                     }
                 }
 
-                async fn detach(local_domain_id: DomainId) -> anyhow::Result<()> {
-                    if let Some(mux) = Mux::try_get() {
-                        let client_domain = mux
-                            .get_domain(local_domain_id)
-                            .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                        let client_domain = client_domain
-                            .downcast_ref::<ClientDomain>()
-                            .ok_or_else(|| {
-                                anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
-                            })?;
-                        client_domain.perform_detach();
+                match reconnect_dispatch_authority.resolve_current() {
+                    Ok(Some(dispatch)) => {
+                        promise::spawn::spawn_into_main_thread(async move {
+                            if !dispatch.is_current() {
+                                return Ok(());
+                            }
+                            let client_domain = dispatch.client_domain();
+                            if !dispatch.is_current() {
+                                return Ok(());
+                            }
+                            let _ = client_domain.perform_detach_if_current(&dispatch.inner);
+                            anyhow::Result::<()>::Ok(())
+                        })
+                        .detach();
                     }
-                    Ok(())
-                }
-                if let Some(domain_id) = local_domain_id {
-                    promise::spawn::spawn_into_main_thread(async move {
-                        detach(domain_id).await.ok();
-                    })
-                    .detach();
+                    Ok(None) => {}
+                    Err(err) => {
+                        if let Some(domain_id) = local_domain_id {
+                            log::error!(
+                                "cannot resolve final detach authority for domain \
+                                 {domain_id}: {err:#}"
+                            );
+                        } else {
+                            log::error!("cannot resolve final standalone authority: {err:#}");
+                        }
+                    }
                 }
             })
         {
             log::error!("failed to spawn client reconnect thread: {err:#}");
+            let _ = initial_dispatch_authority.advance_generation();
         }
 
         Self {
             sender,
             local_domain_id,
+            incarnation,
+            connection_generation,
             is_reconnectable,
             is_local,
             client_id,
@@ -1791,7 +2154,7 @@ impl Client {
         class_name: &str,
     ) -> anyhow::Result<Self> {
         let unix_dom = Self::compute_unix_domain(prefer_mux, class_name)?;
-        Self::new_unix_domain(None, &unix_dom, initial, ui, no_auto_start)
+        Self::new_unix_domain(None, &unix_dom, initial, ui, no_auto_start, Weak::new())
     }
 
     pub fn new_unix_domain(
@@ -1800,34 +2163,37 @@ impl Client {
         initial: bool,
         ui: &mut ConnectionUI,
         no_auto_start: bool,
+        mux_owner: Weak<Mux>,
     ) -> anyhow::Result<Self> {
         let mut reconnectable =
             Reconnectable::new(ClientDomainConfig::Unix(unix_dom.clone()), None);
         reconnectable.connect(initial, ui, no_auto_start)?;
-        Ok(Self::new(local_domain_id, reconnectable))
+        Ok(Self::new(local_domain_id, reconnectable, mux_owner))
     }
 
     pub fn new_tls(
         local_domain_id: DomainId,
         tls_client: &TlsDomainClient,
         ui: &mut ConnectionUI,
+        mux_owner: Weak<Mux>,
     ) -> anyhow::Result<Self> {
         let mut reconnectable =
             Reconnectable::new(ClientDomainConfig::Tls(tls_client.clone()), None);
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
-        Ok(Self::new(Some(local_domain_id), reconnectable))
+        Ok(Self::new(Some(local_domain_id), reconnectable, mux_owner))
     }
 
     pub fn new_ssh(
         local_domain_id: DomainId,
         ssh_dom: &SshDomain,
         ui: &mut ConnectionUI,
+        mux_owner: Weak<Mux>,
     ) -> anyhow::Result<Self> {
         let mut reconnectable = Reconnectable::new(ClientDomainConfig::Ssh(ssh_dom.clone()), None);
         let no_auto_start = true;
         reconnectable.connect(true, ui, no_auto_start)?;
-        Ok(Self::new(Some(local_domain_id), reconnectable))
+        Ok(Self::new(Some(local_domain_id), reconnectable, mux_owner))
     }
 
     pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
@@ -1927,6 +2293,15 @@ impl Client {
 
 #[cfg(test)]
 impl Client {
+    fn test_dispatch_authority(&self, mux_owner: Weak<Mux>) -> ClientDispatchAuthority {
+        ClientDispatchAuthority::new(
+            self.local_domain_id,
+            mux_owner,
+            Arc::clone(&self.incarnation),
+            Arc::clone(&self.connection_generation),
+        )
+    }
+
     pub(crate) fn new_test_client(
         local_domain_id: Option<DomainId>,
         client_domain_config: ClientDomainConfig,
@@ -1935,6 +2310,8 @@ impl Client {
         Self {
             sender,
             local_domain_id,
+            incarnation: Arc::new(ClientIncarnation),
+            connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             client_id: ClientId {
                 hostname: "test-host".to_string(),
                 username: "tester".to_string(),
@@ -1970,6 +2347,26 @@ mod tests {
         records: StdMutex::new(Vec::new()),
     };
     static TEST_LOGGER_INIT: Once = Once::new();
+
+    struct ScopedMux(Option<Arc<Mux>>);
+
+    impl ScopedMux {
+        fn install(mux: &Arc<Mux>) -> Self {
+            let prior = Mux::try_get();
+            Mux::set_mux(mux);
+            Self(prior)
+        }
+    }
+
+    impl Drop for ScopedMux {
+        fn drop(&mut self) {
+            if let Some(prior) = self.0.take() {
+                Mux::set_mux(&prior);
+            } else {
+                Mux::shutdown();
+            }
+        }
+    }
 
     struct TestLogger {
         records: StdMutex<Vec<String>>,
@@ -2210,15 +2607,19 @@ mod tests {
         let client = Client {
             sender,
             local_domain_id: None,
+            incarnation: Arc::new(ClientIncarnation),
+            connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
             is_local,
         };
+        let dispatch_authority = client.test_dispatch_authority(Weak::new());
 
         let info = asupersync_block_on(async {
             let handshake = client.verify_version_compat(&ui);
-            let worker = client_thread_async(&mut reconnectable, None, &mut receiver);
+            let worker =
+                client_thread_async(&mut reconnectable, &mut receiver, &dispatch_authority);
             pin_mut!(handshake);
             pin_mut!(worker);
             match select(handshake, worker).await {
@@ -2349,11 +2750,14 @@ mod tests {
         let client = Client {
             sender,
             local_domain_id: None,
+            incarnation: Arc::new(ClientIncarnation),
+            connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
             is_local,
         };
+        let dispatch_authority = client.test_dispatch_authority(Weak::new());
 
         // Run the REAL reader exactly as production does (client_thread ->
         // block_on_io -> scheduler-managed, reactor-driven task).
@@ -2361,7 +2765,7 @@ mod tests {
             .name("ft-connect-fix-reader".to_string())
             .spawn(move || {
                 let (result, _reconnectable, _receiver) =
-                    client_thread(reconnectable, None, receiver);
+                    client_thread(reconnectable, receiver, dispatch_authority);
                 result
             })
             .expect("spawn reader thread");
@@ -2463,17 +2867,20 @@ mod tests {
         let client = std::sync::Arc::new(Client {
             sender,
             local_domain_id: None,
+            incarnation: Arc::new(ClientIncarnation),
+            connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
             is_local,
         });
+        let dispatch_authority = client.test_dispatch_authority(Weak::new());
 
         let reader = std::thread::Builder::new()
             .name("ft-pane-write-reader".to_string())
             .spawn(move || {
                 let (result, _reconnectable, _receiver) =
-                    client_thread(reconnectable, None, receiver);
+                    client_thread(reconnectable, receiver, dispatch_authority);
                 result
             })
             .expect("spawn reader thread");
@@ -2654,10 +3061,20 @@ mod tests {
         DecodedPdu { serial: 0, pdu }
     }
 
+    fn standalone_dispatch_authority() -> ClientDispatchAuthority {
+        ClientDispatchAuthority::new(
+            None,
+            Weak::new(),
+            Arc::new(ClientIncarnation),
+            Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+        )
+    }
+
     #[test]
     fn standalone_client_ignores_cosmetic_unilateral_updates() {
+        let authority = standalone_dispatch_authority();
         let result = process_unilateral(
-            None,
+            &authority,
             unilateral(Pdu::WindowTitleChanged(WindowTitleChanged {
                 window_id: 3,
                 title: "dev shell".into(),
@@ -2668,8 +3085,9 @@ mod tests {
 
     #[test]
     fn standalone_client_rejects_workspace_rebinding_without_domain() {
+        let authority = standalone_dispatch_authority();
         let err = process_unilateral(
-            None,
+            &authority,
             unilateral(Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
                 window_id: 7,
                 workspace: "ops".into(),
@@ -2690,8 +3108,9 @@ mod tests {
 
     #[test]
     fn standalone_client_rejects_pane_removal_without_domain() {
+        let authority = standalone_dispatch_authority();
         let err = process_unilateral(
-            None,
+            &authority,
             unilateral(Pdu::PaneRemoved(PaneRemoved { pane_id: 9 })),
         )
         .expect_err("pane removal changes must not be silently ignored");
@@ -2705,6 +3124,58 @@ mod tests {
                 pdu_name: "PaneRemoved",
             }
         );
+    }
+
+    #[test]
+    fn retired_connection_generation_discards_queued_unilateral_work() {
+        let stale = standalone_dispatch_authority();
+        let current = stale
+            .advance_generation()
+            .expect("the successor transport generation should be minted");
+
+        assert!(!stale.generation_is_current());
+        assert!(current.generation_is_current());
+        process_unilateral(
+            &stale,
+            unilateral(Pdu::PaneRemoved(PaneRemoved { pane_id: 9 })),
+        )
+        .expect("a PDU queued by a retired transport must fail closed");
+        process_unilateral(
+            &current,
+            unilateral(Pdu::PaneRemoved(PaneRemoved { pane_id: 9 })),
+        )
+        .expect_err("the current standalone transport retains topology classification");
+    }
+
+    #[test]
+    fn client_incarnation_rejects_replacement_client_with_same_domain_id() {
+        let config = ClientDomainConfig::Unix(UnixDomain::default());
+        let old_client = Client::new_test_client(Some(42), config.clone());
+        let replacement_client = Client::new_test_client(Some(42), config);
+        let authority = old_client.test_dispatch_authority(Weak::new());
+
+        assert!(old_client.matches_dispatch_authority(&authority));
+        assert!(!replacement_client.matches_dispatch_authority(&authority));
+    }
+
+    #[test]
+    fn attached_authority_uses_captured_mux_not_process_global_mux() {
+        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let origin_mux = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let _global_mux = ScopedMux::install(&replacement_mux);
+
+        let authority = ClientDispatchAuthority::new(
+            Some(42),
+            Arc::downgrade(&origin_mux),
+            Arc::new(ClientIncarnation),
+            Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+        );
+        let captured = authority
+            .captured_mux()
+            .expect("captured mux owner should remain alive");
+        assert!(Arc::ptr_eq(&captured, &origin_mux));
+        assert!(!Arc::ptr_eq(&captured, &replacement_mux));
     }
 
     #[test]

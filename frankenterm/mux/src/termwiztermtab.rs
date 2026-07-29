@@ -13,7 +13,7 @@ use crate::pane::{
 use crate::renderable::*;
 use crate::tab::Tab;
 use crate::window::WindowId;
-use crate::Mux;
+use crate::{Mux, PaneRegistrationHandle, PaneRegistrationSlot};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
@@ -107,6 +107,7 @@ pub struct TermWizTerminalPane {
     dead: Mutex<bool>,
     writer: Mutex<Vec<u8>>,
     render_rx: FileDescriptor,
+    mux_registration: Arc<PaneRegistrationSlot>,
 }
 
 impl TermWizTerminalPane {
@@ -135,6 +136,7 @@ impl TermWizTerminalPane {
             render_rx,
             input_tx,
             dead: Mutex::new(false),
+            mux_registration: Arc::new(PaneRegistrationSlot::default()),
         })
     }
 }
@@ -142,6 +144,10 @@ impl TermWizTerminalPane {
 impl Pane for TermWizTerminalPane {
     fn pane_id(&self) -> PaneId {
         self.pane_id
+    }
+
+    fn mux_registration_slot(&self) -> &Arc<PaneRegistrationSlot> {
+        &self.mux_registration
     }
 
     fn get_cursor_position(&self) -> StableCursorPosition {
@@ -526,118 +532,197 @@ pub fn allocate(
     Ok((tw_term, pane))
 }
 
+struct TermWizCleanupDispatch {
+    registration: Option<PaneRegistrationHandle>,
+}
+
+impl TermWizCleanupDispatch {
+    fn new(registration: PaneRegistrationHandle) -> Self {
+        Self {
+            registration: Some(registration),
+        }
+    }
+
+    fn execute(mut self) {
+        if let Some(registration) = self.registration.take() {
+            let _ = registration.retire_and_prune_if_current();
+        }
+    }
+}
+
+impl Drop for TermWizCleanupDispatch {
+    fn drop(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            let _ = registration.retire_and_prune_if_current();
+        }
+    }
+}
+
+struct TermWizRunCleanup {
+    registration: Option<PaneRegistrationHandle>,
+}
+
+impl TermWizRunCleanup {
+    fn new(registration: PaneRegistrationHandle) -> Self {
+        Self {
+            registration: Some(registration),
+        }
+    }
+
+    fn schedule(&mut self) {
+        let Some(registration) = self.registration.take() else {
+            return;
+        };
+        let dispatch = TermWizCleanupDispatch::new(registration);
+        if promise::spawn::is_scheduler_configured() {
+            promise::spawn::spawn_into_main_thread(async move {
+                dispatch.execute();
+            })
+            .detach();
+        } else {
+            dispatch.execute();
+        }
+    }
+}
+
+impl Drop for TermWizRunCleanup {
+    fn drop(&mut self) {
+        self.schedule();
+    }
+}
+
 /// This function spawns a thread and constructs a GUI window with an
 /// associated termwiz Terminal object to execute the provided function.
 /// The function is expected to run in a loop to manage input and output
 /// from the terminal window.
 /// When it completes its loop it will fulfil a promise and yield
 /// the return value from the function.
-pub async fn run<
-    T: Send + 'static,
-    F: Send + 'static + FnOnce(TermWizTerminal) -> anyhow::Result<T>,
->(
+pub fn run<T: Send + 'static, F: Send + 'static + FnOnce(TermWizTerminal) -> anyhow::Result<T>>(
     size: TerminalSize,
     window_id: Option<WindowId>,
     f: F,
     term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
-) -> anyhow::Result<T> {
-    let render_pipe = Pipe::new().context(
-        "failed to create render pipe for TermWiz terminal — check file descriptor limits",
-    )?;
-    let render_rx = render_pipe.read;
-    let (input_tx, input_rx) = channel();
-    let should_close_window = window_id.is_none();
+) -> impl std::future::Future<Output = anyhow::Result<T>> {
+    // An async function body would not run until first poll. Capture the exact
+    // origin now so a global mux swap cannot retarget registration or cleanup.
+    let origin_mux = Mux::try_get();
+    async move {
+        let origin_mux = origin_mux
+            .ok_or_else(|| anyhow::anyhow!("cannot run TermWiz applet: no mux configured"))?;
+        let render_pipe = Pipe::new().context(
+            "failed to create render pipe for TermWiz terminal — check file descriptor limits",
+        )?;
+        let render_rx = render_pipe.read;
+        let (input_tx, input_rx) = channel();
 
-    let renderer = crate::terminfo_renderer::new_frankenterm_terminfo_renderer();
+        let renderer = crate::terminfo_renderer::new_frankenterm_terminfo_renderer();
 
-    let tw_term = TermWizTerminal {
-        render_tx: TermWizTerminalRenderTty {
-            render_tx: BufWriter::new(render_pipe.write),
-            screen_size: ScreenSize {
-                cols: size.cols as usize,
-                rows: size.rows as usize,
-                xpixel: size
-                    .pixel_width
-                    .checked_div(size.cols)
-                    .map_or(0, |value| value as usize),
-                ypixel: size
-                    .pixel_height
-                    .checked_div(size.rows)
-                    .map_or(0, |value| value as usize),
+        let tw_term = TermWizTerminal {
+            render_tx: TermWizTerminalRenderTty {
+                render_tx: BufWriter::new(render_pipe.write),
+                screen_size: ScreenSize {
+                    cols: size.cols as usize,
+                    rows: size.rows as usize,
+                    xpixel: size
+                        .pixel_width
+                        .checked_div(size.cols)
+                        .map_or(0, |value| value as usize),
+                    ypixel: size
+                        .pixel_height
+                        .checked_div(size.rows)
+                        .map_or(0, |value| value as usize),
+                },
             },
-        },
-        input_rx,
-        renderer,
-        grab_mouse: true,
-    };
-
-    async fn register_tab(
-        input_tx: Sender<InputEvent>,
-        render_rx: FileDescriptor,
-        size: TerminalSize,
-        window_id: Option<WindowId>,
-        term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
-    ) -> anyhow::Result<(PaneId, WindowId)> {
-        let mux = Mux::try_get()
-            .ok_or_else(|| anyhow::anyhow!("cannot register TermWiz tab: no mux configured"))?;
-
-        let domain = termwiz_terminal_domain();
-        let pane =
-            TermWizTerminalPane::new(domain.domain_id(), size, input_tx, render_rx, term_config)?;
-        let pane: Arc<dyn Pane> = Arc::new(pane);
-
-        mux.add_domain(&domain)?;
-        let window_builder;
-        let window_id = match window_id {
-            Some(id) => id,
-            None => {
-                window_builder = mux.new_empty_window(None, None);
-                *window_builder
-            }
+            input_rx,
+            renderer,
+            grab_mouse: true,
         };
 
-        let tab = Arc::new(Tab::new(&size));
-        tab.assign_pane(&pane);
+        async fn register_tab(
+            mux: Arc<Mux>,
+            input_tx: Sender<InputEvent>,
+            render_rx: FileDescriptor,
+            size: TerminalSize,
+            window_id: Option<WindowId>,
+            term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
+        ) -> anyhow::Result<TermWizRunCleanup> {
+            let domain = termwiz_terminal_domain();
+            let pane = TermWizTerminalPane::new(
+                domain.domain_id(),
+                size,
+                input_tx,
+                render_rx,
+                term_config,
+            )?;
+            let pane: Arc<dyn Pane> = Arc::new(pane);
 
-        mux.add_tab_and_active_pane(&tab)?;
-        mux.add_tab_to_window(&tab, window_id)?;
+            mux.add_domain(&domain)?;
 
-        let mut window = mux
-            .get_window_mut(window_id)
-            .ok_or_else(|| anyhow::anyhow!("invalid window id {}", window_id))?;
-        let tab_idx = window.len().saturating_sub(1);
-        window.save_and_then_set_active(tab_idx);
+            let tab = Arc::new(Tab::new(&size));
+            tab.assign_pane(&pane);
 
-        Ok((pane.pane_id(), window_id))
-    }
+            let registration = mux
+                .add_tab_and_active_pane(&tab)?
+                .context("TermWiz pane publication did not retain exact registration authority")?;
+            let cleanup = TermWizRunCleanup::new(registration);
 
-    let (pane_id, window_id) = promise::spawn::spawn_into_main_thread(async move {
-        register_tab(input_tx, render_rx, size, window_id, term_config).await
-    })
-    .await?;
-
-    let result = promise::spawn::spawn_into_new_thread(move || f(tw_term)).await;
-
-    // Since we're typically called with an outstanding Activity token active,
-    // the dead status of the tab will be ignored until after the activity
-    // resolves.  In the case of SSH where (currently!) several prompts may
-    // be shown in succession, we don't want to leave lingering dead windows
-    // on the screen so let's ask the mux to kill off our window now.
-    if promise::spawn::is_scheduler_configured() {
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Some(mux) = Mux::try_get() {
-                if should_close_window {
-                    mux.kill_window(window_id);
-                } else if let Some(pane) = mux.get_pane(pane_id) {
-                    pane.kill();
-                    mux.remove_pane(pane.pane_id());
+            // Delay allocating a new window until after pane publication, so a
+            // publication failure cannot leave a provisional empty window. If
+            // a later topology step fails, cancel its builder rather than
+            // publishing WindowCreated for an applet that never started.
+            let mut window_builder = window_id
+                .is_none()
+                .then(|| mux.new_empty_window(None, None));
+            let window_id =
+                window_id.unwrap_or_else(|| **window_builder.as_ref().expect("new window builder"));
+            if let Err(error) = mux.add_tab_to_window(&tab, window_id) {
+                if let Some(builder) = window_builder.take() {
+                    builder.cancel();
                 }
+                return Err(error);
             }
-        })
-        .detach();
-    }
 
-    result
+            let Some(mut window) = mux.get_window_mut(window_id) else {
+                if let Some(builder) = window_builder.take() {
+                    builder.cancel();
+                }
+                return Err(anyhow::anyhow!("invalid window id {}", window_id));
+            };
+            let tab_idx = window.len().saturating_sub(1);
+            window.save_and_then_set_active(tab_idx);
+            drop(window);
+
+            // Publish a newly-created window only after its tab is fully
+            // attached. Existing-window runs have no builder.
+            drop(window_builder);
+            Ok(cleanup)
+        }
+
+        let mut cleanup = promise::spawn::spawn_into_main_thread(async move {
+            register_tab(
+                origin_mux,
+                input_tx,
+                render_rx,
+                size,
+                window_id,
+                term_config,
+            )
+            .await
+        })
+        .await?;
+
+        let result = promise::spawn::spawn_into_new_thread(move || f(tw_term)).await;
+
+        // Since we're typically called with an outstanding Activity token active,
+        // the dead status of the tab will be ignored until after the activity
+        // resolves.  In the case of SSH where (currently!) several prompts may
+        // be shown in succession, we don't want to leave lingering dead windows
+        // on the screen. Exact cleanup is also armed in Drop for cancellation,
+        // panic, executor rejection, and scheduler-free headless execution.
+        cleanup.schedule();
+
+        result
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +802,54 @@ mod tests {
             mux.get_domain(pane_domain)
                 .map(|domain| domain.domain_name().to_string()),
             Some("TermWizTerminalDomain".to_string()),
+        );
+        let slot_registration = pane
+            .mux_registration_slot()
+            .load()
+            .expect("TermWiz publication must populate its pane-owned slot");
+        let registry_registration = mux
+            .capture_pane_registration(&pane)
+            .expect("TermWiz publication must retain exact registry authority");
+        assert!(
+            slot_registration.same_registration(&registry_registration),
+            "TermWiz slot and mux registry must expose one exact generation"
+        );
+    }
+
+    #[test]
+    fn dropping_unpolled_cleanup_dispatch_future_retires_exact_pane() {
+        let _guard = crate::MUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("termwiz-cleanup-default").unwrap());
+        let mux = Arc::new(Mux::new(Some(default_domain)));
+        let _mux = ScopedMux::install(Arc::clone(&mux));
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+            Arc::new(config::TermConfig::new());
+        let size = TerminalSize {
+            rows: 3,
+            cols: 7,
+            pixel_width: 70,
+            pixel_height: 30,
+            dpi: 96,
+        };
+
+        let (_terminal, pane) = allocate(size, config).expect("allocate TermWiz test pane");
+        let pane_id = pane.pane_id();
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("TermWiz pane should be registered");
+        let dispatch = TermWizCleanupDispatch::new(registration);
+        let unpolled = async move {
+            dispatch.execute();
+        };
+
+        drop(unpolled);
+
+        assert!(
+            mux.get_pane(pane_id).is_none(),
+            "dropping a never-polled scheduled cleanup must execute its Drop fallback"
         );
     }
 }

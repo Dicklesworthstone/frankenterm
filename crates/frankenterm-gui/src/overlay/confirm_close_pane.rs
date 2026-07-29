@@ -12,17 +12,23 @@ pub fn confirm_close_pane(
     mux_window_id: WindowId,
     window: ::window::Window,
 ) -> anyhow::Result<()> {
+    let close_target = Mux::try_get().and_then(|mux| {
+        let registration = mux.capture_current_pane(pane_id)?;
+        let (_domain_id, window_id, tab_id) = mux.resolve_pane_id(pane_id)?;
+        if window_id != mux_window_id {
+            return None;
+        }
+        let tab = mux.get_tab(tab_id)?;
+        Some((registration, tab))
+    });
+
     if confirm::run_confirmation("🛑 Really kill this pane?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
-            let Some(mux) = Mux::try_get() else {
-                log::warn!("cannot close pane {pane_id}: mux is no longer active");
+            let Some((registration, tab)) = close_target else {
+                log::warn!("cannot close pane {pane_id}: exact registration is no longer active");
                 return;
             };
-            let tab = match mux.get_active_tab_for_window(mux_window_id) {
-                Some(tab) => tab,
-                None => return,
-            };
-            tab.kill_pane(pane_id);
+            let _ = tab.kill_pane_registration(&registration);
         })
         .detach();
     }

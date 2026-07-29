@@ -87,7 +87,7 @@ pub async fn spawn_command_internal(
     term_config: Arc<TermConfig>,
 ) -> anyhow::Result<()> {
     let mux = Mux::try_get().context("mux singleton is not available")?;
-    let activity = Activity::new();
+    let activity = Activity::new_for_mux(&mux);
 
     let current_pane_id = match src_window_id {
         Some(window_id) => {

@@ -2114,6 +2114,7 @@ mod tests {
         lines: ParkingMutex<Vec<Line>>,
         writes: ParkingMutex<Vec<u8>>,
         dimensions: RenderableDimensions,
+        mux_registration: Arc<mux::PaneRegistrationSlot>,
     }
 
     impl CapturingPane {
@@ -2128,6 +2129,7 @@ mod tests {
                         .collect(),
                 ),
                 writes: ParkingMutex::new(Vec::new()),
+                mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 dimensions: RenderableDimensions {
                     cols: 80,
                     viewport_rows: line_count,
@@ -2150,6 +2152,10 @@ mod tests {
     impl Pane for CapturingPane {
         fn pane_id(&self) -> usize {
             self.pane_id
+        }
+
+        fn mux_registration_slot(&self) -> &Arc<mux::PaneRegistrationSlot> {
+            &self.mux_registration
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {

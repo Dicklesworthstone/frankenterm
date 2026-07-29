@@ -279,7 +279,7 @@ fn run() -> anyhow::Result<()> {
         config.tls_servers.len()
     );
 
-    let activity = Activity::new();
+    let activity = Activity::new_for_mux(&mux);
 
     promise::spawn::spawn(async move {
         if let Err(err) = async_run(cmd).await {

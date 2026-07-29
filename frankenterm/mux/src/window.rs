@@ -1,27 +1,16 @@
 use crate::pane::CloseReason;
 use crate::tab::{TabStackEntry, TabStackError, TabStackId, TabStackState};
-use crate::{Mux, MuxNotification, Tab, TabId, DEFAULT_WORKSPACE};
+use crate::{Mux, MuxNotification, Pane, Tab, TabId, DEFAULT_WORKSPACE};
 use config::GuiPosition;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 static WIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type WindowId = usize;
 
-fn notify_window(notification: MuxNotification) {
-    if promise::spawn::is_scheduler_configured() {
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Some(mux) = Mux::try_get() {
-                mux.notify(notification);
-            }
-        })
-        .detach();
-    } else if let Some(mux) = Mux::try_get() {
-        mux.notify(notification);
-    }
-}
-
 pub struct Window {
     id: WindowId,
+    owner: std::sync::Weak<Mux>,
     tabs: Vec<Arc<Tab>>,
     active: usize,
     last_active: Option<TabId>,
@@ -32,21 +21,48 @@ pub struct Window {
 }
 
 impl Window {
+    /// Construct an ownerless standalone window.
+    ///
+    /// Production mux windows are created through [`Mux::new_empty_window`],
+    /// which uses `new_for_owner` and binds all deferred notifications to that
+    /// exact mux.  An unregistered standalone value must not borrow authority
+    /// from the mutable process-global mux singleton.
     pub fn new(workspace: Option<String>, initial_position: Option<GuiPosition>) -> Self {
+        Self::new_for_owner(workspace, initial_position, std::sync::Weak::new())
+    }
+
+    pub(crate) fn new_for_owner(
+        workspace: Option<String>,
+        initial_position: Option<GuiPosition>,
+        owner: std::sync::Weak<Mux>,
+    ) -> Self {
+        let workspace = workspace.unwrap_or_else(|| {
+            owner
+                .upgrade()
+                .map(|mux| mux.active_workspace())
+                .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string())
+        });
         Self {
             id: crate::next_saturating_usize_id(&WIN_ID),
+            owner,
             tabs: vec![],
             active: 0,
             last_active: None,
             tab_stacks: TabStackState::default(),
             title: String::new(),
-            workspace: workspace.unwrap_or_else(|| {
-                Mux::try_get()
-                    .map(|mux| mux.active_workspace())
-                    .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string())
-            }),
+            workspace,
             initial_position,
         }
+    }
+
+    fn notify(&mut self, notification: MuxNotification) {
+        let Some(mux) = self.owner.upgrade() else {
+            return;
+        };
+        // Window mutations normally occur while the mux window-map write lock
+        // is held. Queue on a disjoint lock and let the owning mux guard flush
+        // after unlocking, so synchronous subscribers can safely re-enter.
+        mux.enqueue_window_notification(notification);
     }
 
     pub fn get_initial_position(&self) -> &Option<GuiPosition> {
@@ -58,13 +74,20 @@ impl Window {
     }
 
     pub fn set_title(&mut self, title: &str) {
-        if self.title != title {
-            self.title = title.to_string();
-            notify_window(MuxNotification::WindowTitleChanged {
+        if self.set_title_without_notify(title) {
+            self.notify(MuxNotification::WindowTitleChanged {
                 window_id: self.id,
                 title: title.to_string(),
             });
         }
+    }
+
+    pub(crate) fn set_title_without_notify(&mut self, title: &str) -> bool {
+        if self.title == title {
+            return false;
+        }
+        self.title = title.to_string();
+        true
     }
 
     pub fn get_title(&self) -> &str {
@@ -76,7 +99,7 @@ impl Window {
             return;
         }
         self.workspace = workspace.to_string();
-        notify_window(MuxNotification::WindowWorkspaceChanged(self.id));
+        self.notify(MuxNotification::WindowWorkspaceChanged(self.id));
     }
 
     pub fn window_id(&self) -> WindowId {
@@ -89,8 +112,8 @@ impl Window {
         }
     }
 
-    fn invalidate(&self) {
-        notify_window(MuxNotification::WindowInvalidated(self.id));
+    fn invalidate(&mut self) {
+        self.notify(MuxNotification::WindowInvalidated(self.id));
     }
 
     pub fn insert(&mut self, index: usize, tab: &Arc<Tab>) {
@@ -135,26 +158,7 @@ impl Window {
         None
     }
 
-    fn fixup_active_tab_after_removal(&mut self, active: Option<Arc<Tab>>) {
-        let len = self.tabs.len();
-        if let Some(active) = active {
-            for (idx, tab) in self.tabs.iter().enumerate() {
-                if tab.tab_id() == active.tab_id() {
-                    self.set_active_without_saving(idx);
-                    return;
-                }
-            }
-        }
-
-        if len > 0 && self.active >= len {
-            self.set_active_without_saving(len - 1);
-        } else {
-            self.invalidate();
-        }
-    }
-
     pub fn remove_by_idx(&mut self, idx: usize) -> Arc<Tab> {
-        self.invalidate();
         let active = self.get_active().map(Arc::clone);
         self.do_remove_idx(idx, active)
     }
@@ -166,25 +170,143 @@ impl Window {
         }
     }
 
-    fn do_remove_idx(&mut self, idx: usize, active: Option<Arc<Tab>>) -> Arc<Tab> {
-        if let (Some(active), Some(removing)) = (&active, self.tabs.get(idx)) {
-            if active.tab_id() == removing.tab_id()
-                && config::configuration().switch_to_last_active_tab_when_closing_tab
-            {
-                // If we are removing the active tab, switch back to
-                // the previously active tab
-                if let Some(last_active) = self.get_last_active_idx() {
-                    self.set_active_without_saving(last_active);
+    pub(crate) fn remove_tab_if_same(&mut self, expected: &Arc<Tab>) -> bool {
+        let Some(idx) = self.tabs.iter().position(|tab| Arc::ptr_eq(tab, expected)) else {
+            return false;
+        };
+        let active = self.get_active().map(Arc::clone);
+        self.do_remove_idx(idx, active);
+        true
+    }
+
+    pub(crate) fn remove_tabs_by_exact_identity_set(&mut self, removals: &HashSet<usize>) -> bool {
+        if removals.is_empty() {
+            return false;
+        }
+        let prior_active = self.get_active().map(Arc::clone);
+        let prior_active_pane = prior_active
+            .as_ref()
+            .and_then(|tab| tab.get_active_pane_callback_free());
+        let old_active_idx = self.active;
+        let mut removed_ids = HashSet::new();
+        self.tabs.retain(|tab| {
+            let remove = removals.contains(&(Arc::as_ptr(tab) as usize));
+            if remove {
+                removed_ids.insert(tab.tab_id());
+            }
+            !remove
+        });
+        if removed_ids.is_empty() {
+            return false;
+        }
+
+        for &tab_id in &removed_ids {
+            self.tab_stacks.remove_tab(tab_id);
+        }
+        if self
+            .last_active
+            .is_some_and(|last_active| removed_ids.contains(&last_active))
+        {
+            self.last_active = None;
+        }
+
+        self.active = prior_active
+            .as_ref()
+            .and_then(|prior| {
+                self.tabs
+                    .iter()
+                    .position(|candidate| Arc::ptr_eq(candidate, prior))
+            })
+            .unwrap_or_else(|| {
+                if self.tabs.is_empty() {
+                    0
+                } else {
+                    old_active_idx.min(self.tabs.len() - 1)
                 }
+            });
+
+        let active_changed = prior_active.as_ref().is_some_and(|prior| {
+            self.get_active()
+                .is_none_or(|current| !Arc::ptr_eq(current, prior))
+        });
+        if active_changed {
+            if let Some(pane) = prior_active_pane {
+                self.enqueue_focus_lost(pane);
             }
         }
+        self.invalidate();
+        true
+    }
+
+    fn do_remove_idx(&mut self, idx: usize, active: Option<Arc<Tab>>) -> Arc<Tab> {
+        let prior_active_pane = active
+            .as_ref()
+            .and_then(|tab| tab.get_active_pane_callback_free());
+        let removing_is_active = active.as_ref().is_some_and(|active| {
+            self.tabs
+                .get(idx)
+                .is_some_and(|removing| Arc::ptr_eq(active, removing))
+        });
+        let preferred_after_removal = if removing_is_active
+            && config::configuration().switch_to_last_active_tab_when_closing_tab
+        {
+            self.get_last_active_idx()
+                .and_then(|last_active| self.tabs.get(last_active))
+                .filter(|candidate| {
+                    self.tabs
+                        .get(idx)
+                        .is_none_or(|removing| !Arc::ptr_eq(candidate, removing))
+                })
+                .map(Arc::clone)
+        } else {
+            active.as_ref().map(Arc::clone)
+        };
+        let old_active_idx = self.active;
         let tab = self.tabs.remove(idx);
         if self.last_active == Some(tab.tab_id()) {
             self.last_active = None;
         }
         self.tab_stacks.remove_tab(tab.tab_id());
-        self.fixup_active_tab_after_removal(active);
+        self.active = preferred_after_removal
+            .as_ref()
+            .and_then(|preferred| {
+                self.tabs
+                    .iter()
+                    .position(|candidate| Arc::ptr_eq(candidate, preferred))
+            })
+            .unwrap_or_else(|| {
+                if self.tabs.is_empty() {
+                    0
+                } else {
+                    old_active_idx.min(self.tabs.len() - 1)
+                }
+            });
+        let active_changed = active.as_ref().is_some_and(|prior| {
+            self.get_active()
+                .is_none_or(|current| !Arc::ptr_eq(current, prior))
+        });
+        if active_changed {
+            if let Some(pane) = prior_active_pane {
+                self.enqueue_focus_lost(pane);
+            }
+        }
+        self.invalidate();
         tab
+    }
+
+    fn enqueue_focus_lost(&self, pane: Arc<dyn Pane>) {
+        if let Some(mux) = self.owner.upgrade() {
+            mux.enqueue_window_focus_lost(pane);
+        } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pane.focus_changed(false);
+        }))
+        .is_err()
+        {
+            log::error!(
+                "pane focus-loss callback panicked for standalone window pane {:p}",
+                Arc::as_ptr(&pane)
+            );
+        }
     }
 
     pub fn get_active(&self) -> Option<&Arc<Tab>> {
@@ -225,9 +347,9 @@ impl Window {
     pub fn set_active_without_saving(&mut self, idx: usize) {
         assert!(idx < self.tabs.len());
         if self.active != idx {
-            if let Some(tab) = self.tabs.get(self.active) {
-                if let Some(pane) = tab.get_active_pane() {
-                    pane.focus_changed(false);
+            if let Some(tab) = self.tabs.get(self.active).map(Arc::clone) {
+                if let Some(pane) = tab.get_active_pane_callback_free() {
+                    self.enqueue_focus_lost(pane);
                 }
             }
         }
@@ -281,54 +403,6 @@ impl Window {
 
     pub fn tab_stack_count(&self) -> usize {
         self.tab_stacks.stack_count()
-    }
-
-    pub fn prune_dead_tabs(&mut self, live_tab_ids: &[TabId]) {
-        let mut invalidated = false;
-        let dead: Vec<TabId> = self
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                if tab.prune_dead_panes() {
-                    invalidated = true;
-                }
-                if tab.is_dead() {
-                    Some(tab.tab_id())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for tab_id in dead {
-            log::trace!("Window::prune_dead_tabs: tab_id {} is dead", tab_id);
-            self.remove_by_id(tab_id);
-            invalidated = true;
-        }
-
-        let dead: Vec<TabId> = self
-            .tabs
-            .iter()
-            .filter_map(|tab| {
-                if live_tab_ids
-                    .iter()
-                    .find(|&&id| id == tab.tab_id())
-                    .is_none()
-                {
-                    Some(tab.tab_id())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for tab_id in dead {
-            log::trace!("Window::prune_dead_tabs: (live) tab_id {} is dead", tab_id);
-            self.remove_by_id(tab_id);
-        }
-
-        if invalidated {
-            self.invalidate();
-        }
     }
 }
 

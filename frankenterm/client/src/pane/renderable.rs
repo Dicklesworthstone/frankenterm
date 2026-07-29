@@ -1,12 +1,10 @@
 use crate::domain::ClientInner;
-use crate::pane::clientpane::ClientPane;
-use anyhow::anyhow;
 use codec::*;
 use config::{configuration, ConfigHandle};
 use lru::LruCache;
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-use mux::Mux;
+use mux::{PaneRegistrationHandle, PaneRegistrationSlot};
 use promise::BrokenPromise;
 use rangeset::*;
 use ratelim::RateLimiter;
@@ -15,7 +13,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
@@ -166,6 +164,8 @@ pub struct RenderableInner {
     pub client: Arc<ClientInner>,
     remote_pane_id: PaneId,
     local_pane_id: PaneId,
+    mux_registration: Arc<PaneRegistrationSlot>,
+    renderable: Weak<parking_lot::Mutex<RenderableState>>,
     last_poll: Instant,
     pub dead: bool,
     poll_in_progress: AtomicBool,
@@ -210,23 +210,53 @@ pub struct RenderableState {
     pub inner: RefCell<RenderableInner>,
 }
 
-impl RenderableInner {
-    pub fn new(
+pub(crate) struct RenderablePaneBinding {
+    client: Arc<ClientInner>,
+    remote_pane_id: PaneId,
+    local_pane_id: PaneId,
+    mux_registration: Arc<PaneRegistrationSlot>,
+}
+
+impl RenderablePaneBinding {
+    pub(crate) fn new(
         client: &Arc<ClientInner>,
         remote_pane_id: PaneId,
         local_pane_id: PaneId,
-        dimensions: RenderableDimensions,
-        title: &str,
-        fetch_limiter: RateLimiter,
+        mux_registration: Arc<PaneRegistrationSlot>,
     ) -> Self {
-        let now = Instant::now();
-        let config = configuration();
-        let line_cache_capacity = render_line_cache_capacity(&config, &dimensions);
-
         Self {
             client: Arc::clone(client),
             remote_pane_id,
             local_pane_id,
+            mux_registration,
+        }
+    }
+}
+
+impl RenderableInner {
+    pub(crate) fn new(
+        binding: RenderablePaneBinding,
+        dimensions: RenderableDimensions,
+        title: &str,
+        fetch_limiter: RateLimiter,
+        renderable: Weak<parking_lot::Mutex<RenderableState>>,
+    ) -> Self {
+        let now = Instant::now();
+        let config = configuration();
+        let line_cache_capacity = render_line_cache_capacity(&config, &dimensions);
+        let RenderablePaneBinding {
+            client,
+            remote_pane_id,
+            local_pane_id,
+            mux_registration,
+        } = binding;
+
+        Self {
+            client,
+            remote_pane_id,
+            local_pane_id,
+            mux_registration,
+            renderable,
             last_poll: initial_last_poll(now),
             dead: false,
             poll_in_progress: AtomicBool::new(false),
@@ -249,6 +279,24 @@ impl RenderableInner {
             prediction_score: 0,
             last_prediction_miss: now,
         }
+    }
+
+    pub fn registration_did_bind(&mut self) {
+        self.poll_in_progress.store(false, Ordering::Release);
+
+        let capacity = self.lines.cap();
+        let mut stale_lines = LruCache::new(capacity);
+        while let Some((stable_row, entry)) = self.lines.pop_lru() {
+            match entry {
+                LineEntry::Line(line)
+                | LineEntry::Stale(line)
+                | LineEntry::LineAndFetching(line, _) => {
+                    stale_lines.put(stable_row, LineEntry::Stale(line));
+                }
+                LineEntry::Fetching(_) => {}
+            }
+        }
+        self.lines = stale_lines;
     }
 
     /// Returns true if we think we should display the laggy connection
@@ -619,14 +667,6 @@ impl RenderableInner {
             dirty.remove(stable_row);
         }
 
-        log::trace!(
-            "apply_changes_to_surface: Generate PaneOutput event for local={}",
-            self.local_pane_id
-        );
-        if let Some(mux) = Mux::try_get() {
-            mux.notify(mux::MuxNotification::PaneOutput(self.local_pane_id));
-        }
-
         let mut to_fetch = RangeSet::new();
         log::trace!("dirty as of seq {} -> {:?}", delta.seqno, dirty);
         for r in dirty.iter() {
@@ -746,6 +786,22 @@ impl RenderableInner {
             return;
         }
 
+        let Some(registration) = self.mux_registration.load() else {
+            for range in to_fetch.iter() {
+                for stable_row in range.clone() {
+                    self.make_stale(stable_row);
+                }
+            }
+            return;
+        };
+        let Some(renderable) = self.renderable.upgrade() else {
+            for range in to_fetch.iter() {
+                for stable_row in range.clone() {
+                    self.make_stale(stable_row);
+                }
+            }
+            return;
+        };
         let local_pane_id = self.local_pane_id;
         log::trace!(
             "will fetch lines {:?} for remote tab id {} at {:?}",
@@ -774,25 +830,28 @@ impl RenderableInner {
                 }
                 Err(err) => Err(err),
             };
-            Self::apply_lines(local_pane_id, result, to_fetch, now)
+            Self::apply_lines(
+                registration,
+                renderable,
+                local_pane_id,
+                result,
+                to_fetch,
+                now,
+            )
         })
         .detach();
     }
 
     fn apply_lines(
+        registration: PaneRegistrationHandle,
+        renderable: Arc<parking_lot::Mutex<RenderableState>>,
         local_pane_id: PaneId,
         result: anyhow::Result<Vec<(StableRowIndex, Line)>>,
         to_fetch: RangeSet<StableRowIndex>,
         now: Instant,
     ) -> anyhow::Result<()> {
-        let Some(mux) = Mux::try_get() else {
-            return Ok(());
-        };
-        let pane = mux
-            .get_pane(local_pane_id)
-            .ok_or_else(|| anyhow!("no such tab {}", local_pane_id))?;
-        if let Some(client_tab) = pane.downcast_ref::<ClientPane>() {
-            let renderable = client_tab.renderable.lock();
+        let applied = registration.try_with_current_output(|_| {
+            let renderable = renderable.lock();
             let mut inner = renderable.inner.borrow_mut();
 
             match result {
@@ -825,12 +884,19 @@ impl RenderableInner {
                     }
                 }
             }
+            drop(inner);
+            drop(renderable);
+        });
+        if applied.is_none() {
+            log::trace!(
+                "discarding fetched lines for stale client pane registration {}",
+                local_pane_id
+            );
         }
         log::trace!(
-            "Generate PaneOutput event for local_pane_id={}",
-            local_pane_id
+            "exact-generation PaneOutput reservation completed for local_pane_id={}",
+            local_pane_id,
         );
-        mux.notify(mux::MuxNotification::PaneOutput(local_pane_id));
         Ok(())
     }
 
@@ -853,6 +919,13 @@ impl RenderableInner {
         // server-side push tracking that all subsequent pushes depend on. [zero-poll]
         self.poll_interval = max_poll_interval();
 
+        let Some(registration) = self.mux_registration.load() else {
+            return Ok(());
+        };
+        let Some(renderable) = self.renderable.upgrade() else {
+            return Ok(());
+        };
+
         self.last_poll = Instant::now();
         self.poll_in_progress.store(true, Ordering::SeqCst);
         let remote_pane_id = self.remote_pane_id;
@@ -873,19 +946,19 @@ impl RenderableInner {
                 Err(_) => client.client.is_reconnectable,
             };
 
-            let Some(mux) = Mux::try_get() else {
-                return Ok::<(), anyhow::Error>(());
-            };
-            let tab = mux
-                .get_pane(local_pane_id)
-                .ok_or_else(|| anyhow!("no such tab {}", local_pane_id))?;
-            if let Some(client_tab) = tab.downcast_ref::<ClientPane>() {
-                let renderable = client_tab.renderable.lock();
+            let updated = registration.try_with_current(|_| {
+                let renderable = renderable.lock();
                 let mut inner = renderable.inner.borrow_mut();
 
                 inner.dead = !alive;
                 inner.last_recv_time = Instant::now();
                 inner.poll_in_progress.store(false, Ordering::SeqCst);
+            });
+            if updated.is_none() {
+                log::trace!(
+                    "discarding liveness poll completion for stale client pane registration {}",
+                    local_pane_id
+                );
             }
             Ok::<(), anyhow::Error>(())
         })

@@ -1191,7 +1191,7 @@ impl TmuxDomainState {
         };
 
         expected_inner.finalize_launcher_tmux_binding(mux, should_send_detach);
-        let removed = mux.domain_was_detached_if_same(domain.as_ref());
+        let removed = mux.domain_was_detached_if_same(domain);
         let exact_instance_absent = removed
             || mux
                 .get_domain(expected_inner.domain_id)
@@ -2032,7 +2032,9 @@ impl TmuxDomainState {
                 if let Some((_domain, window_id, _tab)) = mux.resolve_pane_id(self.pane_id) {
                     MuxWindowBuilder {
                         window_id,
-                        activity: Some(Activity::new()),
+                        owner: Arc::downgrade(&mux),
+                        activity: Some(Activity::new_for_mux(&mux)),
+                        provisional: false,
                         notified: false,
                     }
                 } else {
@@ -2355,6 +2357,7 @@ mod tests {
         domain_id: DomainId,
         keys: Mutex<Vec<char>>,
         writes: Mutex<RecordingWriter>,
+        mux_registration: Arc<crate::PaneRegistrationSlot>,
     }
 
     struct RecordingWriter {
@@ -2453,6 +2456,7 @@ mod tests {
                     write_gate: None,
                     write_error: None,
                 }),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
             })
         }
 
@@ -2474,6 +2478,7 @@ mod tests {
                     }),
                     write_error: None,
                 }),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
             });
             (pane, entered_rx, release_tx)
         }
@@ -2488,6 +2493,7 @@ mod tests {
                     write_gate: None,
                     write_error: Some(std::io::ErrorKind::BrokenPipe),
                 }),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
             })
         }
 
@@ -2503,6 +2509,10 @@ mod tests {
     impl Pane for RecordingPane {
         fn pane_id(&self) -> PaneId {
             self.pane_id
+        }
+
+        fn mux_registration_slot(&self) -> &Arc<crate::PaneRegistrationSlot> {
+            &self.mux_registration
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {

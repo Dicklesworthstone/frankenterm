@@ -1119,6 +1119,10 @@ impl Pane for CopyOverlay {
         self.delegate.pane_id()
     }
 
+    fn mux_registration_slot(&self) -> &Arc<mux::PaneRegistrationSlot> {
+        self.delegate.mux_registration_slot()
+    }
+
     fn get_title(&self) -> String {
         format!("Copy mode: {}", self.delegate.get_title())
     }

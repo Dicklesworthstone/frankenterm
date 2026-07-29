@@ -511,6 +511,23 @@ pub trait Pane: Downcast + Send + Sync {
     fn is_mouse_grabbed(&self) -> bool;
     fn is_alt_screen_active(&self) -> bool;
 
+    /// Return the shared binding point for callbacks owned by this pane.
+    ///
+    /// Every pane identity must retain one stable
+    /// [`crate::PaneRegistrationSlot`]. The mux reserves this slot before
+    /// fallible preparation and commits it atomically with registry
+    /// publication, so no implementation can silently opt out of exact
+    /// generation authority. Returning a borrowed `Arc` also prevents an
+    /// implementation from manufacturing a fresh slot for each call.
+    fn mux_registration_slot(&self) -> &Arc<crate::PaneRegistrationSlot>;
+
+    /// Observe a successfully published exact mux registration.
+    ///
+    /// The mux invokes this only after the slot and registry entry are committed
+    /// and the `PaneAdded` lifecycle event is externally visible. Implementations
+    /// may use it to nudge work that became pending before publication; the
+    /// supplied handle remains the sole delayed authority.
+    fn mux_registration_did_bind(&self, _registration: crate::PaneRegistrationHandle) {}
     fn set_clipboard(&self, _clipboard: &Arc<dyn Clipboard>) {}
     fn set_download_handler(&self, _handler: &Arc<dyn DownloadHandler>) {}
     fn set_config(&self, _config: Arc<dyn TerminalConfiguration>) {}
@@ -774,6 +791,7 @@ mod test {
         writes: Mutex<Vec<u8>>,
         base_row: StableRowIndex,
         empty_one_line_rows: Vec<StableRowIndex>,
+        mux_registration: Arc<crate::PaneRegistrationSlot>,
     }
 
     impl FakePane {
@@ -803,6 +821,7 @@ mod test {
                 writes: Mutex::new(Vec::new()),
                 base_row,
                 empty_one_line_rows,
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
             }
         }
 
@@ -823,6 +842,11 @@ mod test {
         fn pane_id(&self) -> PaneId {
             0
         }
+
+        fn mux_registration_slot(&self) -> &Arc<crate::PaneRegistrationSlot> {
+            &self.mux_registration
+        }
+
         fn get_cursor_position(&self) -> StableCursorPosition {
             StableCursorPosition::default()
         }

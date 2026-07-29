@@ -583,6 +583,10 @@ impl Pane for QuickSelectOverlay {
         self.delegate.pane_id()
     }
 
+    fn mux_registration_slot(&self) -> &Arc<mux::PaneRegistrationSlot> {
+        self.delegate.mux_registration_slot()
+    }
+
     fn get_title(&self) -> String {
         self.delegate.get_title()
     }

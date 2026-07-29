@@ -1,6 +1,8 @@
 use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
-use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
+use crate::pane::renderable::{
+    hydrate_lines, RenderableInner, RenderablePaneBinding, RenderableState,
+};
 use anyhow::bail;
 use async_trait::async_trait;
 use codec::*;
@@ -13,7 +15,7 @@ use mux::pane::{
 };
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::TabId;
-use mux::{Mux, MuxNotification};
+use mux::PaneRegistrationSlot;
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
 use ratelim::RateLimiter;
@@ -36,7 +38,7 @@ pub struct ClientPane {
     local_pane_id: PaneId,
     pub remote_pane_id: PaneId,
     pub remote_tab_id: TabId,
-    pub renderable: Mutex<RenderableState>,
+    pub renderable: Arc<Mutex<RenderableState>>,
     configured_palette: Mutex<ColorPalette>,
     palette: Mutex<ColorPalette>,
     application_palette: Mutex<bool>,
@@ -50,6 +52,7 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    mux_registration: Arc<PaneRegistrationSlot>,
 }
 
 impl ClientPane {
@@ -75,45 +78,36 @@ impl ClientPane {
         let fetch_limiter =
             RateLimiter::new(|config| config.ratelimit_mux_line_prefetches_per_second);
 
-        let render = RenderableState {
-            inner: RefCell::new(RenderableInner::new(
-                client,
-                remote_pane_id,
-                local_pane_id,
-                RenderableDimensions {
-                    cols: size.cols as _,
-                    viewport_rows: size.rows as _,
-                    scrollback_rows: size.rows as _,
-                    physical_top: 0,
-                    scrollback_top: 0,
-                    dpi: size.dpi,
-                    pixel_width: size.pixel_width,
-                    pixel_height: size.pixel_height,
-                    reverse_video: false,
-                },
-                title,
-                fetch_limiter,
-            )),
-        };
+        let mux_registration = Arc::new(PaneRegistrationSlot::default());
+        let renderable = Arc::new_cyclic(|weak_renderable| {
+            Mutex::new(RenderableState {
+                inner: RefCell::new(RenderableInner::new(
+                    RenderablePaneBinding::new(
+                        client,
+                        remote_pane_id,
+                        local_pane_id,
+                        Arc::clone(&mux_registration),
+                    ),
+                    RenderableDimensions {
+                        cols: size.cols as _,
+                        viewport_rows: size.rows as _,
+                        scrollback_rows: size.rows as _,
+                        physical_top: 0,
+                        scrollback_top: 0,
+                        dpi: size.dpi,
+                        pixel_width: size.pixel_width,
+                        pixel_height: size.pixel_height,
+                        reverse_video: false,
+                    },
+                    title,
+                    fetch_limiter,
+                    weak_renderable.clone(),
+                )),
+            })
+        });
 
         let config = configuration();
         let palette: ColorPalette = config.resolved_palette.clone().into();
-
-        // Advise the server of our palette preference
-        promise::spawn::spawn({
-            let palette = palette.clone();
-            let client = Arc::clone(client);
-            async move {
-                client
-                    .client
-                    .set_configured_palette_for_pane(SetPalette {
-                        pane_id: remote_pane_id,
-                        palette,
-                    })
-                    .await
-            }
-        })
-        .detach();
 
         Self {
             client: Arc::clone(client),
@@ -122,7 +116,7 @@ impl ClientPane {
             local_pane_id,
             remote_tab_id,
             application_palette: Mutex::new(false),
-            renderable: Mutex::new(render),
+            renderable,
             writer: Mutex::new(writer),
             configured_palette: Mutex::new(palette.clone()),
             palette: Mutex::new(palette),
@@ -134,95 +128,135 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            mux_registration,
         }
     }
 
-    pub async fn process_unilateral(&self, pdu: Pdu) -> anyhow::Result<()> {
+    pub(crate) async fn process_unilateral(
+        &self,
+        registration: &mux::PaneRegistrationHandle,
+        pdu: Pdu,
+    ) -> anyhow::Result<()> {
+        let registration_matches_self = registration
+            .try_with_current(|current| current.is_same_pane_ref(self))
+            .unwrap_or(false);
+        if !registration_matches_self {
+            log::trace!(
+                "discarding unilateral PDU for mismatched or stale client pane registration {}",
+                self.local_pane_id
+            );
+            return Ok(());
+        }
+
         match pdu {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
                 let mouse_grabbed = delta.mouse_grabbed;
                 let alt_screen_active = delta.alt_screen_active;
-                {
-                    let renderable = self.renderable.lock();
-                    if renderable.get_current_seqno() > delta.seqno {
-                        return Ok(());
-                    }
+                let is_new_enough = registration
+                    .try_with_current(|_| {
+                        let renderable = self.renderable.lock();
+                        renderable.get_current_seqno() <= delta.seqno
+                    })
+                    .unwrap_or(false);
+                if !is_new_enough {
+                    return Ok(());
                 }
 
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
-                let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
+                let client = {
+                    let renderable = self.renderable.lock();
+                    let client = Arc::clone(&renderable.inner.borrow().client);
+                    client
+                };
                 let bonus_lines = hydrate_lines(client, delta.pane_id, bonus_lines).await;
 
-                let applied = self
-                    .renderable
-                    .lock()
-                    .inner
-                    .borrow_mut()
-                    .apply_changes_to_surface(delta, bonus_lines);
-                if applied {
-                    *self.mouse_grabbed.lock() = mouse_grabbed;
-                    *self.alt_screen_active.lock() = alt_screen_active;
+                let applied = registration
+                    .try_with_current_output(|_| {
+                        let applied = self
+                            .renderable
+                            .lock()
+                            .inner
+                            .borrow_mut()
+                            .apply_changes_to_surface(delta, bonus_lines);
+                        if applied {
+                            *self.mouse_grabbed.lock() = mouse_grabbed;
+                            *self.alt_screen_active.lock() = alt_screen_active;
+                        }
+                        applied
+                    })
+                    .unwrap_or(false);
+                if !applied {
+                    log::trace!(
+                        "discarding render delta for stale client pane registration {}",
+                        self.local_pane_id
+                    );
                 }
             }
             Pdu::SetClipboard(SetClipboard {
                 clipboard,
                 selection,
                 ..
-            }) => match self.clipboard.lock().as_ref() {
-                Some(clip) => {
-                    log::debug!(
-                        "Pdu::SetClipboard pane={} remote={} {:?} {:?}",
-                        self.local_pane_id,
-                        self.remote_pane_id,
-                        selection,
-                        clipboard
-                    );
-                    clip.set_contents(selection, clipboard)?;
-                }
-                None => {
-                    log::error!("ClientPane: Ignoring SetClipboard request {:?}", clipboard);
-                }
-            },
-            Pdu::SetPalette(SetPalette { palette, .. }) => {
-                *self.application_palette.lock() = palette != *self.configured_palette.lock();
-
-                *self.palette.lock() = palette;
-                self.renderable.lock().inner.borrow_mut().make_all_stale();
-                if let Some(mux) = Mux::try_get() {
-                    mux.notify(MuxNotification::Alert {
-                        pane_id: self.local_pane_id,
-                        alert: Alert::PaletteChanged,
-                    });
+            }) => {
+                if let Some(result) = registration.try_with_current(|current| {
+                    if !current.is_same_pane_ref(self) {
+                        return Ok(());
+                    }
+                    let clipboard_handler = { self.clipboard.lock().clone() };
+                    match clipboard_handler {
+                        Some(clip) => {
+                            log::debug!(
+                                "Pdu::SetClipboard pane={} remote={} {:?} {:?}",
+                                self.local_pane_id,
+                                self.remote_pane_id,
+                                selection,
+                                clipboard
+                            );
+                            clip.set_contents(selection, clipboard)
+                        }
+                        None => {
+                            log::error!(
+                                "ClientPane: Ignoring SetClipboard request {:?}",
+                                clipboard
+                            );
+                            Ok(())
+                        }
+                    }
+                }) {
+                    result?;
                 }
             }
+            Pdu::SetPalette(SetPalette { palette, .. }) => {
+                let _ = registration.try_with_current(|current| {
+                    *self.application_palette.lock() = palette != *self.configured_palette.lock();
+                    *self.palette.lock() = palette;
+                    self.renderable.lock().inner.borrow_mut().make_all_stale();
+                    current.dispatch_alert(Alert::PaletteChanged);
+                });
+            }
             Pdu::NotifyAlert(NotifyAlert { alert, .. }) => {
-                match &alert {
-                    Alert::SetUserVar { name, value } => {
-                        self.user_vars.lock().insert(name.clone(), value.clone());
+                let _ = registration.try_with_current(|current| {
+                    match &alert {
+                        Alert::SetUserVar { name, value } => {
+                            self.user_vars.lock().insert(name.clone(), value.clone());
+                        }
+                        Alert::OutputSinceFocusLost => {
+                            *self.unseen_output.lock() = true;
+                        }
+                        Alert::Progress(progress) => {
+                            *self.progress.lock() = progress.clone();
+                        }
+                        _ => {}
                     }
-                    Alert::OutputSinceFocusLost => {
-                        *self.unseen_output.lock() = true;
-                    }
-                    Alert::Progress(progress) => {
-                        *self.progress.lock() = progress.clone();
-                    }
-                    _ => {}
-                }
-                if let Some(mux) = Mux::try_get() {
-                    mux.notify(MuxNotification::Alert {
-                        pane_id: self.local_pane_id,
-                        alert,
-                    });
-                }
+                    current.dispatch_alert(alert);
+                });
             }
             Pdu::PaneRemoved(PaneRemoved { pane_id }) => {
                 log::trace!("remote pane {} has been removed", pane_id);
-                self.renderable.lock().inner.borrow_mut().dead = true;
-                if let Some(mux) = Mux::try_get() {
-                    mux.prune_dead_windows();
-                }
-
-                self.client.expire_stale_mappings();
+                let _ = registration.try_with_current(|current| {
+                    self.renderable.lock().inner.borrow_mut().dead = true;
+                    current.prune_dead_windows();
+                    self.client.expire_stale_mappings(&current);
+                });
             }
             Pdu::PaneFocused(PaneFocused { pane_id }) => {
                 // We get here whenever the pane focus is changed on the
@@ -236,11 +270,11 @@ impl ClientPane {
                 // it here.
                 log::trace!("advised of remote pane focus: {pane_id}");
 
-                if let Some(mux) = Mux::try_get() {
-                    if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
+                let _ = registration.try_with_current(|current| {
+                    if let Err(err) = current.focus_pane_and_containing_tab() {
                         log::error!("Error reconciling remote PaneFocused notification: {err:#}");
                     }
-                }
+                });
             }
             _ => bail!("unhandled unilateral pdu: {:?}", pdu),
         };
@@ -249,6 +283,10 @@ impl ClientPane {
 
     pub fn remote_pane_id(&self) -> PaneId {
         self.remote_pane_id
+    }
+
+    pub(crate) fn belongs_to_client(&self, client: &ClientInner) -> bool {
+        std::ptr::eq(self.client.as_ref(), client)
     }
 
     /// Arrange to suppress the next Pane::kill call.
@@ -271,6 +309,57 @@ impl ClientPane {
 impl Pane for ClientPane {
     fn pane_id(&self) -> PaneId {
         self.local_pane_id
+    }
+
+    fn mux_registration_slot(&self) -> &Arc<PaneRegistrationSlot> {
+        &self.mux_registration
+    }
+
+    fn mux_registration_did_bind(&self, registration: mux::PaneRegistrationHandle) {
+        let registration_matches_self = registration
+            .try_with_current(|current| current.is_same_pane_ref(self))
+            .unwrap_or(false);
+        if !registration_matches_self {
+            log::trace!(
+                "skipping client pane bind work for mismatched or stale registration {}",
+                self.local_pane_id
+            );
+            return;
+        }
+
+        self.renderable
+            .lock()
+            .inner
+            .borrow_mut()
+            .registration_did_bind();
+
+        // Advise the server only after the pane has acquired exact mux
+        // registration authority. Re-check the pane-owned slot when the
+        // detached task runs so work beginning after retirement/rebind is
+        // discarded.
+        let mux_registration = Arc::clone(&self.mux_registration);
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        let palette = self.configured_palette.lock().clone();
+        promise::spawn::spawn(async move {
+            let registration_is_current = mux_registration
+                .load()
+                .is_some_and(|current| current.same_registration(&registration))
+                && registration.try_with_current(|_| ()).is_some();
+            if !registration_is_current {
+                return Ok(());
+            }
+
+            client
+                .client
+                .set_configured_palette_for_pane(SetPalette {
+                    pane_id: remote_pane_id,
+                    palette,
+                })
+                .await
+                .map(|_| ())
+        })
+        .detach();
     }
 
     fn get_metadata(&self) -> Value {
@@ -518,7 +607,6 @@ impl Pane for ClientPane {
         }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let local_domain_id = self.client.local_domain_id;
 
         // We only want to ask the server to kill the pane if the user
         // explicitly requested it to die.
@@ -526,21 +614,7 @@ impl Pane for ClientPane {
         // in the domain, so we need to check here whether the domain is
         // in the detached state; if so then we must skip sending the
         // kill to the server.
-        let mut send_kill = true;
-
-        {
-            if let Some(mux) = Mux::try_get() {
-                if let Some(client_domain) = mux.get_domain(local_domain_id) {
-                    if client_domain.state() == mux::domain::DomainState::Detached {
-                        send_kill = false;
-                    }
-                }
-            } else {
-                send_kill = false;
-            }
-        }
-
-        if send_kill {
+        if !client.is_detached() {
             promise::spawn::spawn(async move {
                 client
                     .client
@@ -721,8 +795,9 @@ mod tests {
     use crate::domain::ClientDomainConfig;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
-    use mux::Mux;
+    use mux::{Mux, MuxNotification};
     use promise::spawn::SimpleExecutor;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex as StdMutex, Once};
 
     fn ensure_test_scheduler() {
@@ -766,6 +841,67 @@ mod tests {
         ))
     }
 
+    fn test_client_pane(
+        inner: &Arc<ClientInner>,
+        local_pane_id: PaneId,
+        remote_pane_id: PaneId,
+    ) -> Arc<ClientPane> {
+        Arc::new(ClientPane::new(
+            inner,
+            local_pane_id,
+            23,
+            remote_pane_id,
+            TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 800,
+                pixel_height: 480,
+                dpi: 96,
+            },
+            "shell",
+            false,
+        ))
+    }
+
+    struct NoopClipboard;
+
+    impl Clipboard for NoopClipboard {
+        fn set_contents(
+            &self,
+            _selection: wezterm_term::ClipboardSelection,
+            _data: Option<String>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ReentrantClipboard {
+        pane: std::sync::Weak<ClientPane>,
+        callback_ran: Arc<AtomicBool>,
+    }
+
+    impl Clipboard for ReentrantClipboard {
+        fn set_contents(
+            &self,
+            _selection: wezterm_term::ClipboardSelection,
+            _data: Option<String>,
+        ) -> anyhow::Result<()> {
+            let pane = self
+                .pane
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("test client pane was dropped"))?;
+            let clipboard_guard = pane.clipboard.try_lock().ok_or_else(|| {
+                anyhow::anyhow!("clipboard callback ran while the ClientPane mutex was held")
+            })?;
+            drop(clipboard_guard);
+
+            let replacement: Arc<dyn Clipboard> = Arc::new(NoopClipboard);
+            pane.set_clipboard(&replacement);
+            self.callback_ran.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
     #[test]
     fn render_delta_updates_authoritative_alt_screen_state() {
         let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
@@ -773,7 +909,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(&mux);
         let inner = test_client_inner(17);
-        let pane = ClientPane::new(
+        let pane = Arc::new(ClientPane::new(
             &inner,
             31,
             23,
@@ -787,12 +923,19 @@ mod tests {
             },
             "shell",
             false,
-        );
+        ));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("render-delta test pane should register");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("render-delta test pane should retain exact registration");
         assert!(!pane.is_alt_screen_active());
 
         promise::spawn::block_on(async {
-            pane.process_unilateral(Pdu::GetPaneRenderChangesResponse(
-                GetPaneRenderChangesResponse {
+            pane.process_unilateral(
+                &registration,
+                Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
                     pane_id: 29,
                     mouse_grabbed: false,
                     alt_screen_active: true,
@@ -815,13 +958,69 @@ mod tests {
                     bonus_lines: SerializedLines::default(),
                     input_serial: None,
                     seqno: 1,
-                },
-            ))
+                }),
+            )
             .await
         })
         .expect("render delta should apply");
 
         assert!(pane.is_alt_screen_active());
+    }
+
+    #[test]
+    fn registration_slot_is_stable_and_rejects_concurrent_mux_owners() {
+        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        ensure_test_scheduler();
+        let first_mux = Arc::new(Mux::new(None));
+        let second_mux = Arc::new(Mux::new(None));
+        let inner = test_client_inner(17);
+        let pane = Arc::new(ClientPane::new(
+            &inner,
+            33,
+            23,
+            29,
+            TerminalSize {
+                cols: 80,
+                rows: 24,
+                pixel_width: 800,
+                pixel_height: 480,
+                dpi: 96,
+            },
+            "shell",
+            false,
+        ));
+
+        assert!(
+            Arc::ptr_eq(pane.mux_registration_slot(), pane.mux_registration_slot()),
+            "a production ClientPane must expose one stable registration slot"
+        );
+
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        first_mux
+            .add_pane(&pane_for_mux)
+            .expect("the first mux should bind the ClientPane");
+        let slot_registration = pane
+            .mux_registration_slot()
+            .load()
+            .expect("publication must populate the pane-owned slot");
+        let registry_registration = first_mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("the mux registry must expose the same exact registration");
+        assert!(
+            slot_registration.same_registration(&registry_registration),
+            "the production pane slot and mux registry must carry one generation authority"
+        );
+
+        let error = second_mux
+            .add_pane(&pane_for_mux)
+            .expect_err("one ClientPane object cannot be bound to two mux owners");
+        assert!(
+            error
+                .to_string()
+                .contains("already bound to a live or draining mux registration"),
+            "unexpected dual-owner rejection: {:#}",
+            error,
+        );
     }
 
     #[test]
@@ -841,7 +1040,7 @@ mod tests {
         .expect("test mux subscription should allocate an identifier");
 
         let inner = test_client_inner(17);
-        let pane = ClientPane::new(
+        let pane = Arc::new(ClientPane::new(
             &inner,
             32,
             23,
@@ -855,18 +1054,30 @@ mod tests {
             },
             "shell",
             false,
-        );
+        ));
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("unilateral-alert test pane should register");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("unilateral-alert test pane should retain exact registration");
 
         promise::spawn::block_on(async {
-            pane.process_unilateral(Pdu::NotifyAlert(NotifyAlert {
-                pane_id: 29,
-                alert: Alert::OutputSinceFocusLost,
-            }))
+            pane.process_unilateral(
+                &registration,
+                Pdu::NotifyAlert(NotifyAlert {
+                    pane_id: 29,
+                    alert: Alert::OutputSinceFocusLost,
+                }),
+            )
             .await?;
-            pane.process_unilateral(Pdu::NotifyAlert(NotifyAlert {
-                pane_id: 29,
-                alert: Alert::Progress(Progress::Percentage(64)),
-            }))
+            pane.process_unilateral(
+                &registration,
+                Pdu::NotifyAlert(NotifyAlert {
+                    pane_id: 29,
+                    alert: Alert::Progress(Progress::Percentage(64)),
+                }),
+            )
             .await
         })
         .expect("unilateral alerts should apply");
@@ -880,6 +1091,100 @@ mod tests {
                 Alert::Progress(Progress::Percentage(64)),
             ],
             "state mutation and notification forwarding must not emit duplicate alerts"
+        );
+    }
+
+    #[test]
+    fn unilateral_rejects_registration_for_a_different_pane() {
+        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        ensure_test_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::Alert { pane_id, alert } = notification {
+                observed_for_subscriber
+                    .lock()
+                    .unwrap()
+                    .push((pane_id, alert));
+            }
+            true
+        })
+        .expect("wrong-registration test subscription should allocate an identifier");
+
+        let inner = test_client_inner(17);
+        let pane_a = test_client_pane(&inner, 34, 29);
+        let pane_b = test_client_pane(&inner, 35, 30);
+        let pane_a_for_mux: Arc<dyn Pane> = pane_a.clone();
+        let pane_b_for_mux: Arc<dyn Pane> = pane_b.clone();
+        mux.add_pane(&pane_a_for_mux)
+            .expect("first wrong-registration test pane should register");
+        mux.add_pane(&pane_b_for_mux)
+            .expect("second wrong-registration test pane should register");
+        let pane_b_registration = mux
+            .capture_pane_registration(&pane_b_for_mux)
+            .expect("second pane should retain exact registration");
+
+        promise::spawn::block_on(async {
+            pane_a
+                .process_unilateral(
+                    &pane_b_registration,
+                    Pdu::NotifyAlert(NotifyAlert {
+                        pane_id: 29,
+                        alert: Alert::OutputSinceFocusLost,
+                    }),
+                )
+                .await
+        })
+        .expect("a wrong registration should be discarded without failing the reader");
+
+        assert!(!*pane_a.unseen_output.lock());
+        assert!(!*pane_b.unseen_output.lock());
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "a registration for pane B must not authorize pane A or emit B-attributed alerts"
+        );
+    }
+
+    #[test]
+    fn unilateral_clipboard_callback_can_reenter_set_clipboard() {
+        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        ensure_test_scheduler();
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(&mux);
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 36, 31);
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("clipboard reentrancy test pane should register");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("clipboard reentrancy test pane should retain exact registration");
+
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let clipboard: Arc<dyn Clipboard> = Arc::new(ReentrantClipboard {
+            pane: Arc::downgrade(&pane),
+            callback_ran: Arc::clone(&callback_ran),
+        });
+        pane.set_clipboard(&clipboard);
+
+        promise::spawn::block_on(async {
+            pane.process_unilateral(
+                &registration,
+                Pdu::SetClipboard(SetClipboard {
+                    pane_id: 31,
+                    clipboard: Some("copied text".to_string()),
+                    selection: wezterm_term::ClipboardSelection::Clipboard,
+                }),
+            )
+            .await
+        })
+        .expect("clipboard callback should run outside the ClientPane clipboard mutex");
+
+        assert!(
+            callback_ran.load(Ordering::Acquire),
+            "the clipboard callback should reenter set_clipboard without deadlocking"
         );
     }
 }

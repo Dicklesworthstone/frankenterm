@@ -43,6 +43,7 @@ impl GuiFrontEnd {
         let client_id = mux
             .active_identity()
             .context("active mux identity is not set")?;
+        let mux_owner = Arc::downgrade(&mux);
 
         let front_end = Rc::new(GuiFrontEnd {
             connection,
@@ -191,9 +192,18 @@ impl GuiFrontEnd {
                 }
                 MuxNotification::Empty => {
                     if config::configuration().quit_when_all_windows_are_closed {
+                        let mux_owner = mux_owner.clone();
                         promise::spawn::spawn_into_main_thread(async move {
-                            if mux::activity::Activity::count() == 0 {
-                                log::trace!("Mux is now empty, terminate gui");
+                            let Some(notifying_mux) = mux_owner.upgrade() else {
+                                return;
+                            };
+                            let is_current_owner = Mux::try_get()
+                                .is_some_and(|current| Arc::ptr_eq(&current, &notifying_mux));
+                            if is_current_owner
+                                && notifying_mux.is_empty()
+                                && mux::activity::Activity::count_for_mux(&notifying_mux) == 0
+                            {
+                                log::trace!("Exact mux is still empty; terminate gui");
                                 if let Some(conn) = Connection::get() {
                                     conn.terminate_message_loop();
                                 }
@@ -269,7 +279,7 @@ impl GuiFrontEnd {
         match event {
             ApplicationEvent::OpenCommandScript(file_name) => {
                 let quoted_file_name = match shlex::try_quote(&file_name) {
-                    Ok(name) => name.to_owned().to_string(),
+                    Ok(name) => name.into_owned(),
                     Err(_) => {
                         log::error!(
                             "OpenCommandScript: {file_name} has embedded NUL bytes and

@@ -58,7 +58,7 @@ compile_error!(
 );
 
 use crate::client::{ClientId, ClientInfo};
-use crate::pane::{CachePolicy, Pane, PaneId};
+use crate::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
@@ -68,7 +68,7 @@ use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
-use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
+use frankenterm_term::{Alert, Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
 use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 use log::error;
@@ -114,7 +114,7 @@ mod tmux_pty;
 pub mod unify;
 pub mod window;
 
-use crate::activity::Activity;
+use crate::activity::{Activity, ActivityPruneState};
 
 pub const DEFAULT_WORKSPACE: &str = "default";
 
@@ -336,6 +336,7 @@ type MuxSubscriber = dyn Fn(MuxNotification) -> bool + Send + Sync;
 struct PreparedPaneRegistration {
     pane_id: PaneId,
     reader: Option<Box<dyn std::io::Read + Send>>,
+    registration_reservation: pane_registration_handle::PaneRegistrationReservation,
 }
 
 /// Process-local, non-forgeable identity for one live registration of a pane.
@@ -406,6 +407,13 @@ struct PaneRetirementCompletion {
     pane: Arc<dyn Pane>,
     kill: bool,
     lifecycle_notification: PaneLifecycleNotificationTicket,
+    cleanup_complete: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneRemovalFollowUp {
+    None,
+    PruneDeadWindowsIgnoringActivity,
 }
 
 #[derive(Clone, Copy)]
@@ -427,6 +435,7 @@ struct PaneRegistrationGeneration {
     retirement_tracker: Weak<PaneRetirementTracker>,
     owner: Weak<Mux>,
     cleanup: Mutex<PaneRetirementCleanupState>,
+    cleanup_complete: Arc<AtomicBool>,
 }
 
 const PANE_REGISTRATION_RETIRED: usize = 1usize << (usize::BITS - 1);
@@ -450,6 +459,7 @@ impl PaneRegistrationGeneration {
             retirement_tracker: Arc::downgrade(retirement_tracker),
             owner,
             cleanup: Mutex::new(PaneRetirementCleanupState::Unattached),
+            cleanup_complete: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -580,6 +590,678 @@ impl Drop for PaneRegistrationOperationLease {
         self.generation.release_operation();
     }
 }
+
+mod pane_registration_handle {
+    use super::*;
+
+    /// Process-local authority for one exact pane registration.
+    ///
+    /// A numeric [`PaneId`] names a reusable slot, not a durable capability.
+    /// Deferred work must carry this handle so that a stale callback cannot
+    /// re-resolve the slot and act on a later registration.  The handle deliberately
+    /// keeps only a weak pane reference and a weak mux owner; retaining queued work
+    /// therefore cannot keep either object alive.
+    #[derive(Clone)]
+    pub struct PaneRegistrationHandle {
+        pane: Weak<dyn Pane>,
+        generation: Arc<PaneRegistrationGeneration>,
+    }
+
+    impl std::fmt::Debug for PaneRegistrationHandle {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PaneRegistrationHandle")
+                .field("pane_id", &self.generation.pane_id)
+                .field(
+                    "generation",
+                    &(Arc::as_ptr(&self.generation) as *const () as usize),
+                )
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// Restricted view of one exact live pane registration.
+    ///
+    /// The underlying mux and pane references are intentionally private.  In
+    /// particular, this type has no `Deref`, downcast, or raw getter that could
+    /// mint an `Arc<dyn Pane>` and let registration authority escape the
+    /// generation lease.
+    pub struct CurrentPane<'a> {
+        owner: &'a Mux,
+        pane: &'a dyn Pane,
+        pane_id: PaneId,
+    }
+
+    impl CurrentPane<'_> {
+        pub fn pane_id(&self) -> PaneId {
+            self.pane_id
+        }
+
+        pub fn is_same_pane(&self, pane: &Arc<dyn Pane>) -> bool {
+            std::ptr::eq(
+                self.pane as *const dyn Pane as *const (),
+                Arc::as_ptr(pane) as *const (),
+            )
+        }
+
+        /// Compare this exact registration with a borrowed pane object without
+        /// allowing the registered `Arc` to escape its generation lease.
+        pub fn is_same_pane_ref(&self, pane: &dyn Pane) -> bool {
+            // Compare the allocation address, not the wide-pointer metadata.
+            // Separately formed trait-object views of the same allocation may
+            // carry equivalent but non-identical vtable pointers.
+            std::ptr::eq(
+                self.pane as *const dyn Pane as *const (),
+                pane as *const dyn Pane as *const (),
+            )
+        }
+
+        pub fn register_domain(
+            &self,
+            domain: &Arc<dyn Domain>,
+        ) -> Result<(), DomainRegistrationError> {
+            self.owner.add_domain(domain)
+        }
+
+        pub fn dispatch_alert(&self, alert: Alert) {
+            match &alert {
+                Alert::WindowTitleChanged(title) => {
+                    if let Some((_domain_id, window_id, _tab_id)) =
+                        self.owner.resolve_pane_id(self.pane_id)
+                    {
+                        self.owner.set_window_title(window_id, title);
+                    }
+                }
+                Alert::TabTitleChanged(title) => {
+                    if let Some((_domain_id, _window_id, tab_id)) =
+                        self.owner.resolve_pane_id(self.pane_id)
+                    {
+                        self.owner
+                            .set_tab_title(tab_id, title.as_deref().unwrap_or(""));
+                    }
+                }
+                _ => {}
+            }
+            self.owner.notify(MuxNotification::Alert {
+                pane_id: self.pane_id,
+                alert,
+            });
+        }
+
+        pub fn prune_dead_windows(&self) {
+            self.owner.prune_dead_windows();
+        }
+
+        pub fn focus_pane_and_containing_tab(&self) -> anyhow::Result<()> {
+            self.owner.focus_pane_and_containing_tab(self.pane_id)
+        }
+
+        pub fn record_input_for_current_identity(&self) {
+            self.owner.record_input_for_current_identity();
+        }
+
+        /// Query whether a pane slot is populated in this handle's exact mux.
+        ///
+        /// This is intentionally a boolean projection rather than a pane
+        /// getter: clients can expire numeric ID mappings without allowing an
+        /// `Arc<dyn Pane>` to escape this generation-scoped operation.
+        pub fn contains_pane_id(&self, pane_id: PaneId) -> bool {
+            self.owner.get_pane(pane_id).is_some()
+        }
+
+        /// Query tab membership against this handle's exact mux authority.
+        pub fn tab_has_panes_in_domain(&self, tab_id: TabId, domain_id: DomainId) -> bool {
+            self.owner
+                .get_tab(tab_id)
+                .is_some_and(|tab| tab.has_panes_in_domain(domain_id))
+        }
+
+        /// Query window membership against this handle's exact mux authority.
+        pub fn window_has_panes_in_domain(&self, window_id: WindowId, domain_id: DomainId) -> bool {
+            self.owner.window_has_panes_in_domain(window_id, domain_id)
+        }
+
+        pub(super) fn assign_clipboard(
+            &self,
+            selection: ClipboardSelection,
+            clipboard: Option<String>,
+        ) {
+            self.owner.notify(MuxNotification::AssignClipboard {
+                pane_id: self.pane_id(),
+                selection,
+                clipboard,
+            });
+        }
+
+        pub(super) fn save_to_downloads(&self, name: Option<String>, data: Vec<u8>) {
+            self.owner.notify(MuxNotification::SaveToDownloads {
+                name,
+                data: Arc::new(data),
+            });
+        }
+    }
+
+    /// Restricted output-mutation view of one exact live pane registration.
+    ///
+    /// Construction also reserves the pane's ordered output continuation.  The
+    /// continuation is finished before the registration lease is released, even
+    /// when the caller unwinds.
+    pub struct CurrentPaneOutput<'a> {
+        current: CurrentPane<'a>,
+    }
+
+    impl CurrentPaneOutput<'_> {
+        pub fn pane_id(&self) -> PaneId {
+            self.current.pane_id()
+        }
+
+        pub fn perform_actions(&self, actions: Vec<Action>) {
+            self.current.pane.perform_actions(actions);
+        }
+    }
+
+    impl PaneRegistrationHandle {
+        pub(super) fn new(
+            pane: &Arc<dyn Pane>,
+            generation: &Arc<PaneRegistrationGeneration>,
+        ) -> Self {
+            Self {
+                pane: Arc::downgrade(pane),
+                generation: Arc::clone(generation),
+            }
+        }
+
+        pub fn pane_id(&self) -> PaneId {
+            self.generation.pane_id
+        }
+
+        pub fn same_registration(&self, other: &Self) -> bool {
+            Weak::ptr_eq(&self.pane, &other.pane)
+                && Arc::ptr_eq(&self.generation, &other.generation)
+        }
+
+        /// Resolve the exact owner for mux-internal topology transactions.
+        ///
+        /// This remains crate-private so external consumers cannot bypass the
+        /// closure-only authority surface or retain raw mux authority.
+        pub(crate) fn owner(&self) -> Option<Arc<Mux>> {
+            self.generation.owner.upgrade()
+        }
+
+        fn is_rebindable_retirement(&self) -> bool {
+            pane_registration_is_quiescent(self.generation.operation_state.load(Ordering::Acquire))
+                && self.generation.cleanup_complete.load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        pub(super) fn active_operation_count(&self) -> usize {
+            self.generation.operation_state.load(Ordering::Acquire)
+                & PANE_REGISTRATION_OPERATION_MASK
+        }
+
+        /// Run `f` only if this exact owner, pane, and generation still has
+        /// authority.
+        ///
+        /// Admission is serialized with retirement.  Registry locks are released
+        /// before calling external code, while the generation operation lease
+        /// remains live until `f` returns (or unwinds).
+        pub fn try_with_current<R>(&self, f: impl FnOnce(CurrentPane<'_>) -> R) -> Option<R> {
+            let (operation, pane, mux) = self.resolve_current()?;
+            let result = f(CurrentPane {
+                owner: mux.as_ref(),
+                pane: pane.as_ref(),
+                pane_id: self.generation.pane_id,
+            });
+            drop(operation);
+            Some(result)
+        }
+
+        /// Reserve exact-generation output authority before mutating the pane.
+        ///
+        /// The output continuation is established before `f` runs, so accepted
+        /// state mutation is ordered before a racing `PaneRemoved`.  Its drop path
+        /// finishes the producer and releases the operation lease even if `f`
+        /// panics.
+        pub fn try_with_current_output<R>(
+            &self,
+            f: impl FnOnce(CurrentPaneOutput<'_>) -> R,
+        ) -> Option<R> {
+            let pane = self.pane.upgrade()?;
+            let mux = self.generation.owner.upgrade()?;
+            let output = mux.reserve_pane_output_for_reader(
+                &pane,
+                &self.generation,
+                promise::spawn::is_scheduler_configured(),
+            )?;
+            let result = f(CurrentPaneOutput {
+                current: CurrentPane {
+                    owner: mux.as_ref(),
+                    pane: pane.as_ref(),
+                    pane_id: self.generation.pane_id,
+                },
+            });
+            output.finish();
+            Some(result)
+        }
+
+        /// Remove and kill only the registration represented by this handle.
+        ///
+        /// Callers must not hold mux topology or tab locks; pane cleanup and
+        /// lifecycle subscribers may re-enter those surfaces synchronously.
+        pub fn retire_if_current(&self) -> bool {
+            let Some(owner) =
+                self.remove_if_current_without_recompute(true, PaneRemovalFollowUp::None)
+            else {
+                return false;
+            };
+            owner.recompute_pane_count();
+            true
+        }
+
+        /// Retire this exact registration and force its dead tab/window sweep
+        /// after `Pane::kill`, even while an unrelated activity token is live.
+        ///
+        /// TermWiz applets run under an activity token, so ordinary pruning is
+        /// intentionally suppressed while they are active. The follow-up runs
+        /// before the generation's replacement fence is released.
+        pub fn retire_and_prune_if_current(&self) -> bool {
+            let Some(owner) = self.remove_if_current_without_recompute(
+                true,
+                PaneRemovalFollowUp::PruneDeadWindowsIgnoringActivity,
+            ) else {
+                return false;
+            };
+            owner.recompute_pane_count();
+            true
+        }
+
+        /// Remove only the local registration represented by this handle.
+        ///
+        /// Callers must not hold mux topology or tab locks.
+        pub fn detach_local_if_current(&self) -> bool {
+            let Some(owner) =
+                self.remove_if_current_without_recompute(false, PaneRemovalFollowUp::None)
+            else {
+                return false;
+            };
+            owner.recompute_pane_count();
+            true
+        }
+
+        pub(crate) fn retire_batch_if_current(registrations: Vec<Self>) -> usize {
+            struct Candidate {
+                pane: Arc<dyn Pane>,
+                generation: Arc<PaneRegistrationGeneration>,
+                operation: PaneRegistrationOperationLease,
+            }
+
+            struct OwnerBatch {
+                owner: Arc<Mux>,
+                candidates: Vec<Candidate>,
+            }
+
+            let mut owners = Vec::<OwnerBatch>::new();
+            for registration in registrations {
+                let Some(operation) = registration.generation.try_acquire() else {
+                    continue;
+                };
+                let Some(pane) = registration.pane.upgrade() else {
+                    continue;
+                };
+                let Some(owner) = registration.generation.owner.upgrade() else {
+                    continue;
+                };
+                let candidate = Candidate {
+                    pane,
+                    generation: registration.generation,
+                    operation,
+                };
+                if let Some(batch) = owners
+                    .iter_mut()
+                    .find(|batch| Arc::ptr_eq(&batch.owner, &owner))
+                {
+                    batch.candidates.push(candidate);
+                } else {
+                    owners.push(OwnerBatch {
+                        owner,
+                        candidates: vec![candidate],
+                    });
+                }
+            }
+
+            let mut retired = 0;
+            for OwnerBatch { owner, candidates } in owners {
+                let (removed, rejected, output_batches) = {
+                    let _registration = owner.pane_registration.lock();
+                    let (removed, rejected) = {
+                        let mut panes = owner.panes.write();
+                        let mut removed = Vec::new();
+                        let mut rejected = Vec::new();
+                        for candidate in candidates {
+                            let pane_id = candidate.generation.pane_id;
+                            let matches = panes.get(&pane_id).is_some_and(|registered| {
+                                Arc::ptr_eq(&registered.pane, &candidate.pane)
+                                    && Arc::ptr_eq(&registered.generation, &candidate.generation)
+                            });
+                            if !matches {
+                                rejected.push(candidate);
+                                continue;
+                            }
+                            let registered = panes
+                                .remove(&pane_id)
+                                .expect("exact batch candidate was just validated");
+                            let pane = Arc::clone(&registered.pane);
+                            let generation = Arc::clone(&registered.generation);
+                            drop(registered);
+                            removed.push((pane_id, pane, generation, candidate.operation));
+                        }
+                        (removed, rejected)
+                    };
+
+                    {
+                        let mut retiring = owner.retiring_pane_ids.lock();
+                        for (pane_id, _, _, _) in &removed {
+                            retiring.insert(*pane_id);
+                        }
+                    }
+
+                    let output_batches = {
+                        let mut pending = owner.pending_pane_output.lock();
+                        removed
+                            .iter()
+                            .filter_map(|(pane_id, _, generation, _)| {
+                                let matches = pending.queued.get(pane_id).is_some_and(|batch| {
+                                    Arc::ptr_eq(&batch.generation, generation)
+                                });
+                                matches.then(|| pending.queued.remove(pane_id)).flatten()
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    let tickets = {
+                        let mut pending = owner.pending_pane_lifecycle.lock();
+                        removed
+                            .iter()
+                            .map(|(pane_id, _, generation, _)| {
+                                let ready = Arc::new(AtomicBool::new(false));
+                                pending.by_pane.entry(*pane_id).or_default().push_back(
+                                    PendingPaneLifecycleNotification {
+                                        notification: PaneLifecycleNotification::Removed(*pane_id),
+                                        ready: Arc::clone(&ready),
+                                        reader_start_gate: None,
+                                        cleanup_complete: Some(Arc::clone(
+                                            &generation.cleanup_complete,
+                                        )),
+                                        removal_follow_up: PaneRemovalFollowUp::None,
+                                    },
+                                );
+                                PaneLifecycleNotificationTicket {
+                                    pane_id: *pane_id,
+                                    ready,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    let removed = removed
+                        .into_iter()
+                        .zip(tickets)
+                        .map(
+                            |((pane_id, pane, generation, operation), lifecycle_notification)| {
+                                (
+                                    RemovedPaneRegistration {
+                                        pane_id,
+                                        pane,
+                                        generation,
+                                        lifecycle_notification,
+                                    },
+                                    operation,
+                                )
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    (removed, rejected, output_batches)
+                };
+
+                // Rejected candidates may own the final operation lease of an
+                // already-retired generation. Dropping them can synchronously
+                // run pane cleanup and lifecycle subscribers, so it must happen
+                // after every registry and topology guard has been released.
+                drop(rejected);
+                for output_batch in output_batches {
+                    histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
+                    output_batch.seal();
+                }
+                let pane_ids = removed
+                    .iter()
+                    .map(|(removed, _)| removed.pane_id)
+                    .collect::<Vec<_>>();
+                owner.discard_removed_pane_states(&pane_ids);
+                retired += removed.len();
+                for (removed, operation) in removed {
+                    owner.finish_pane_removal(removed, true);
+                    drop(operation);
+                }
+                owner.recompute_pane_count();
+            }
+            retired
+        }
+
+        fn resolve_current(
+            &self,
+        ) -> Option<(PaneRegistrationOperationLease, Arc<dyn Pane>, Arc<Mux>)> {
+            let operation = self.generation.try_acquire()?;
+            let pane = self.pane.upgrade()?;
+            let mux = self.generation.owner.upgrade()?;
+            let is_current = {
+                let _registration = mux.pane_registration.lock();
+                mux.panes
+                    .read()
+                    .get(&self.generation.pane_id)
+                    .is_some_and(|registered| {
+                        Arc::ptr_eq(&registered.pane, &pane)
+                            && Arc::ptr_eq(&registered.generation, &self.generation)
+                    })
+            };
+            is_current.then_some((operation, pane, mux))
+        }
+
+        fn remove_if_current_without_recompute(
+            &self,
+            kill: bool,
+            removal_follow_up: PaneRemovalFollowUp,
+        ) -> Option<Arc<Mux>> {
+            let operation = self.generation.try_acquire()?;
+            let pane = self.pane.upgrade()?;
+            let mux = self.generation.owner.upgrade()?;
+            let removed = mux.take_pane_for_removal(
+                self.generation.pane_id,
+                Some(&pane),
+                Some(&self.generation),
+                removal_follow_up,
+            )?;
+            mux.finish_pane_removal(removed, kill);
+            drop(operation);
+            Some(mux)
+        }
+    }
+
+    enum PaneRegistrationSlotState {
+        Unbound,
+        Reserved { token: Arc<()> },
+        Bound(PaneRegistrationHandle),
+    }
+
+    impl Default for PaneRegistrationSlotState {
+        fn default() -> Self {
+            Self::Unbound
+        }
+    }
+
+    /// Exclusive pre-publication claim on a pane-owned registration slot.
+    ///
+    /// The reservation is acquired before fallible pane preparation. Dropping it
+    /// rolls the slot back to `Unbound`; committing it is an allocation-free,
+    /// callback-free state transition that the mux performs while serializing
+    /// registry publication.
+    #[must_use = "dropping a pane registration reservation cancels the claim"]
+    pub(super) struct PaneRegistrationReservation {
+        slot: Arc<PaneRegistrationSlot>,
+        token: Arc<()>,
+        registration: Option<PaneRegistrationHandle>,
+        active: bool,
+    }
+
+    #[must_use = "pane registration commits must be finalized after registry publication"]
+    pub(super) struct PaneRegistrationCommitGuard {
+        slot: Arc<PaneRegistrationSlot>,
+        registration: Option<PaneRegistrationHandle>,
+        active: bool,
+    }
+
+    impl PaneRegistrationReservation {
+        pub(super) fn commit(mut self) -> Result<PaneRegistrationCommitGuard, Error> {
+            let registration = self
+                .registration
+                .take()
+                .expect("active pane registration reservation retains its handle");
+            {
+                let mut state = self.slot.current.write();
+                match &*state {
+                    PaneRegistrationSlotState::Reserved { token }
+                        if Arc::ptr_eq(token, &self.token) =>
+                    {
+                        *state = PaneRegistrationSlotState::Bound(registration.clone());
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "pane registration slot reservation was lost before publication"
+                        ));
+                    }
+                }
+            }
+            self.active = false;
+            Ok(PaneRegistrationCommitGuard {
+                slot: Arc::clone(&self.slot),
+                registration: Some(registration),
+                active: true,
+            })
+        }
+    }
+
+    impl Drop for PaneRegistrationReservation {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let mut state = self.slot.current.write();
+            if matches!(
+                &*state,
+                PaneRegistrationSlotState::Reserved { token }
+                    if Arc::ptr_eq(token, &self.token)
+            ) {
+                *state = PaneRegistrationSlotState::Unbound;
+            }
+        }
+    }
+
+    impl PaneRegistrationCommitGuard {
+        pub(super) fn finalize(mut self) -> PaneRegistrationHandle {
+            self.active = false;
+            self.registration
+                .take()
+                .expect("active pane registration commit retains its handle")
+        }
+    }
+
+    impl Drop for PaneRegistrationCommitGuard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let Some(registration) = self.registration.as_ref() else {
+                return;
+            };
+            let mut state = self.slot.current.write();
+            if matches!(
+                &*state,
+                PaneRegistrationSlotState::Bound(current)
+                    if current.same_registration(registration)
+            ) {
+                *state = PaneRegistrationSlotState::Unbound;
+            }
+        }
+    }
+
+    /// Shared binding point for pane-owned deferred callbacks.
+    ///
+    /// A pane may be registered more than once during its lifetime. Loading the
+    /// slot clones the exact current-generation handle; already queued clones stay
+    /// bound to their original generation and fail closed after replacement.
+    ///
+    /// Publication first reserves this slot. A different live registration or
+    /// concurrent reservation is rejected, which prevents one pane object from
+    /// silently acquiring two mux owners. While the owner remains alive, a
+    /// binding may be replaced only after its leases, pane cleanup, and removal
+    /// lifecycle have all completed. Owner destruction alone deliberately does
+    /// not authorize rebinding: subscriber work can escape into external
+    /// executors, so a weak-owner check is not a complete teardown barrier.
+    #[derive(Default)]
+    pub struct PaneRegistrationSlot {
+        current: RwLock<PaneRegistrationSlotState>,
+    }
+
+    impl PaneRegistrationSlot {
+        pub fn load(&self) -> Option<PaneRegistrationHandle> {
+            match &*self.current.read() {
+                PaneRegistrationSlotState::Bound(registration) => Some(registration.clone()),
+                PaneRegistrationSlotState::Unbound | PaneRegistrationSlotState::Reserved { .. } => {
+                    None
+                }
+            }
+        }
+
+        pub(super) fn reserve(
+            self: &Arc<Self>,
+            registration: PaneRegistrationHandle,
+        ) -> Result<PaneRegistrationReservation, Error> {
+            let token = Arc::new(());
+            {
+                let mut state = self.current.write();
+                match &*state {
+                    PaneRegistrationSlotState::Unbound => {}
+                    PaneRegistrationSlotState::Bound(current)
+                        if current.is_rebindable_retirement() => {}
+                    PaneRegistrationSlotState::Bound(current) => {
+                        return Err(anyhow!(
+                            "pane {} is already bound to a live or draining mux registration",
+                            current.pane_id()
+                        ));
+                    }
+                    PaneRegistrationSlotState::Reserved { .. } => {
+                        return Err(anyhow!(
+                            "pane {} already has a registration publication in progress",
+                            registration.pane_id()
+                        ));
+                    }
+                }
+                *state = PaneRegistrationSlotState::Reserved {
+                    token: Arc::clone(&token),
+                };
+            }
+            Ok(PaneRegistrationReservation {
+                slot: Arc::clone(self),
+                token,
+                registration: Some(registration),
+                active: true,
+            })
+        }
+    }
+}
+
+pub use pane_registration_handle::{
+    CurrentPane, CurrentPaneOutput, PaneRegistrationHandle, PaneRegistrationSlot,
+};
 
 struct PanePreparation {
     pane: Weak<dyn Pane>,
@@ -844,6 +1526,8 @@ struct PendingPaneLifecycleNotification {
     notification: PaneLifecycleNotification,
     ready: Arc<AtomicBool>,
     reader_start_gate: Option<PaneReaderStartGate>,
+    cleanup_complete: Option<Arc<AtomicBool>>,
+    removal_follow_up: PaneRemovalFollowUp,
 }
 
 #[derive(Default)]
@@ -1154,6 +1838,8 @@ impl PaneRetirementCompletion {
         }
         if let Some(mux) = mux {
             mux.complete_pane_lifecycle_notification(self.lifecycle_notification);
+        } else {
+            self.cleanup_complete.store(true, Ordering::Release);
         }
     }
 }
@@ -1163,11 +1849,6 @@ struct RemovedPaneRegistration {
     pane: Arc<dyn Pane>,
     generation: Arc<PaneRegistrationGeneration>,
     lifecycle_notification: PaneLifecycleNotificationTicket,
-}
-
-pub(crate) struct PaneRegistrationIdentity {
-    pane: Arc<dyn Pane>,
-    generation: Arc<PaneRegistrationGeneration>,
 }
 
 /// Discriminant key for the high-rate Alert variants we dedupe per pane.
@@ -1193,6 +1874,52 @@ const HIGH_RATE_ALERT_DEDUPE_WINDOW: Duration = Duration::from_millis(16);
 /// map bounded regardless of pane churn.
 const HIGH_RATE_ALERT_PRUNE_AFTER: Duration = Duration::from_secs(1);
 
+#[derive(Default)]
+struct PendingWindowNotifications {
+    queue: VecDeque<PendingWindowAction>,
+    draining: bool,
+    scheduled: bool,
+    owner: Weak<Mux>,
+}
+
+enum PendingWindowAction {
+    Notification {
+        notification: MuxNotification,
+        activity: Option<Activity>,
+    },
+    FocusLost(Arc<dyn Pane>),
+}
+
+struct WindowNotificationDispatch {
+    owner: Weak<Mux>,
+    armed: bool,
+}
+
+impl WindowNotificationDispatch {
+    fn new(owner: Weak<Mux>) -> Self {
+        Self { owner, armed: true }
+    }
+
+    fn execute(mut self) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.run_scheduled_window_notification_drain();
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for WindowNotificationDispatch {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(owner) = self.owner.upgrade() {
+            owner.window_notification_dispatch_dropped();
+        }
+        self.armed = false;
+    }
+}
+
 pub struct Mux {
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, LivePaneRegistration>>,
@@ -1202,6 +1929,10 @@ pub struct Mux {
     retiring_pane_ids: Mutex<HashSet<PaneId>>,
     pending_pane_lifecycle: Mutex<PendingPaneLifecycleNotifications>,
     windows: RwLock<HashMap<WindowId, Window>>,
+    provisional_windows: Mutex<HashSet<WindowId>>,
+    pending_window_notifications: Mutex<PendingWindowNotifications>,
+    activity_count: Arc<AtomicUsize>,
+    activity_prune_state: Arc<ActivityPruneState>,
     default_domain: RwLock<Option<Arc<dyn Domain>>>,
     domains: RwLock<HashMap<DomainId, Arc<dyn Domain>>>,
     domains_by_name: RwLock<HashMap<String, Arc<dyn Domain>>>,
@@ -1212,6 +1943,8 @@ pub struct Mux {
     pane_output_drain_scheduled: AtomicBool,
     #[cfg(test)]
     pane_reader_preparation_fault: Mutex<Option<PaneReaderPreparationFault>>,
+    #[cfg(test)]
+    pane_count_recomputes: AtomicUsize,
     banner: RwLock<Option<String>>,
     clients: RwLock<HashMap<ClientId, ClientInfo>>,
     identity: RwLock<Option<Arc<ClientId>>>,
@@ -1398,13 +2131,16 @@ fn resolve_pane_reader_mux(
     generation: &Arc<PaneRegistrationGeneration>,
 ) -> Option<Arc<Mux>> {
     let mux = generation.owner.upgrade()?;
-    let is_registered = mux
-        .panes
-        .read()
-        .get(&pane.pane_id())
-        .is_some_and(|registered| {
-            Arc::ptr_eq(&registered.pane, pane) && Arc::ptr_eq(&registered.generation, generation)
-        });
+    let is_registered = {
+        let _registration = mux.pane_registration.lock();
+        mux.panes
+            .read()
+            .get(&pane.pane_id())
+            .is_some_and(|registered| {
+                Arc::ptr_eq(&registered.pane, pane)
+                    && Arc::ptr_eq(&registered.generation, generation)
+            })
+    };
     is_registered.then_some(mux)
 }
 
@@ -1769,7 +2505,9 @@ pub(crate) static MUX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 
 pub struct MuxWindowBuilder {
     window_id: WindowId,
+    owner: Weak<Mux>,
     activity: Option<Activity>,
+    provisional: bool,
     notified: bool,
 }
 
@@ -1781,7 +2519,12 @@ impl MuxWindowBuilder {
     /// activity lease without making an abandoned window visible.
     pub(crate) fn cancel(mut self) {
         self.notified = true;
-        let _ = self.activity.take();
+        if self.provisional {
+            if let Some(owner) = self.owner.upgrade() {
+                owner.cancel_provisional_window(self.window_id, self.activity.take());
+            }
+        }
+        drop(self.activity.take());
     }
 
     fn notify(&mut self) {
@@ -1793,26 +2536,17 @@ impl MuxWindowBuilder {
             return;
         };
         let window_id = self.window_id;
-        let Some(mux) = Mux::try_get() else {
+        let Some(mux) = self.owner.upgrade() else {
             return;
         };
-        if mux.is_main_thread() {
-            // If we're already on the mux thread, just send the notification
-            // immediately.
-            // This is super important for Wayland; if we push it to the
-            // spawn queue below then the extra milliseconds of delay
-            // causes it to get confused and shutdown the connection!?
-            mux.notify(MuxNotification::WindowCreated(window_id));
-        } else if promise::spawn::is_scheduler_configured() {
-            promise::spawn::spawn_into_main_thread(async move {
-                if let Some(mux) = Mux::try_get() {
-                    mux.notify(MuxNotification::WindowCreated(window_id));
-                    drop(activity);
-                }
-            })
-            .detach();
-        } else {
-            mux.notify(MuxNotification::WindowCreated(window_id));
+        // Keep creation in the same exact-owner FIFO as mutations that may
+        // already have been queued for this window.  Retaining the Activity in
+        // the queue entry also prevents pruning until subscribers have
+        // observed the creation.  `flush_window_notifications` still delivers
+        // synchronously on the mux thread (important for Wayland), and uses
+        // the existing main-thread scheduler everywhere else.
+        if mux.enqueue_window_created_if_present(window_id, activity) {
+            mux.flush_window_notifications();
         }
     }
 }
@@ -1828,6 +2562,36 @@ impl std::ops::Deref for MuxWindowBuilder {
 
     fn deref(&self) -> &WindowId {
         &self.window_id
+    }
+}
+
+pub struct MuxWindowWriteGuard<'a> {
+    guard: Option<MappedRwLockWriteGuard<'a, Window>>,
+    mux: &'a Mux,
+}
+
+impl std::ops::Deref for MuxWindowWriteGuard<'_> {
+    type Target = Window;
+
+    fn deref(&self) -> &Window {
+        self.guard
+            .as_deref()
+            .expect("mux window write guard remains live until drop")
+    }
+}
+
+impl std::ops::DerefMut for MuxWindowWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Window {
+        self.guard
+            .as_deref_mut()
+            .expect("mux window write guard remains live until drop")
+    }
+}
+
+impl Drop for MuxWindowWriteGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.mux.flush_window_notifications();
     }
 }
 
@@ -1859,6 +2623,10 @@ impl Mux {
             retiring_pane_ids: Mutex::new(HashSet::new()),
             pending_pane_lifecycle: Mutex::new(PendingPaneLifecycleNotifications::default()),
             windows: RwLock::new(HashMap::new()),
+            provisional_windows: Mutex::new(HashSet::new()),
+            pending_window_notifications: Mutex::new(PendingWindowNotifications::default()),
+            activity_count: Arc::new(AtomicUsize::new(0)),
+            activity_prune_state: Arc::new(ActivityPruneState::default()),
             default_domain: RwLock::new(default_domain),
             domains_by_name: RwLock::new(domains_by_name),
             domains: RwLock::new(domains),
@@ -1869,6 +2637,8 @@ impl Mux {
             pane_output_drain_scheduled: AtomicBool::new(false),
             #[cfg(test)]
             pane_reader_preparation_fault: Mutex::new(None),
+            #[cfg(test)]
+            pane_count_recomputes: AtomicUsize::new(0),
             banner: RwLock::new(None),
             clients: RwLock::new(HashMap::new()),
             identity: RwLock::new(None),
@@ -1893,6 +2663,8 @@ impl Mux {
     }
 
     fn recompute_pane_count(&self) {
+        #[cfg(test)]
+        self.pane_count_recomputes.fetch_add(1, Ordering::Relaxed);
         let mut count = HashMap::new();
         for window in self.windows.read().values() {
             let workspace = window.get_workspace();
@@ -2083,11 +2855,15 @@ impl Mux {
             new_workspace: new_workspace.to_string(),
         });
 
-        for window in self.windows.write().values_mut() {
-            if window.get_workspace() == old_workspace {
-                window.set_workspace(new_workspace);
+        {
+            let mut windows = self.windows.write();
+            for window in windows.values_mut() {
+                if window.get_workspace() == old_workspace {
+                    window.set_workspace(new_workspace);
+                }
             }
         }
+        self.flush_window_notifications();
         self.recompute_pane_count();
         let changed_clients = {
             let mut clients = self.clients.write();
@@ -2224,6 +3000,199 @@ impl Mux {
         }
     }
 
+    fn bind_window_notification_owner(self: &Arc<Self>) {
+        let mut pending = self.pending_window_notifications.lock();
+        if let Some(owner) = pending.owner.upgrade() {
+            assert!(
+                Arc::ptr_eq(&owner, self),
+                "a mux window-notification queue must retain one exact owner",
+            );
+            return;
+        }
+        pending.owner = Arc::downgrade(self);
+    }
+
+    pub(crate) fn enqueue_window_notification(self: &Arc<Self>, notification: MuxNotification) {
+        self.enqueue_window_notification_entry(notification, None);
+    }
+
+    pub(crate) fn enqueue_window_focus_lost(self: &Arc<Self>, pane: Arc<dyn Pane>) {
+        self.bind_window_notification_owner();
+        let mut pending = self.pending_window_notifications.lock();
+        pending
+            .queue
+            .push_back(PendingWindowAction::FocusLost(pane));
+    }
+
+    fn enqueue_window_created_if_present(
+        self: &Arc<Self>,
+        window_id: WindowId,
+        activity: Activity,
+    ) -> bool {
+        self.bind_window_notification_owner();
+        let windows = self.windows.read();
+        if !windows.contains_key(&window_id) {
+            self.provisional_windows.lock().remove(&window_id);
+            return false;
+        }
+        if !self.provisional_windows.lock().remove(&window_id) {
+            return false;
+        }
+        // Queue while the window map read lock still prevents an explicit
+        // remover from publishing WindowRemoved first. If removal already won,
+        // suppress both sides of the unpublished provisional lifecycle.
+        self.queue_window_notification_entry(
+            MuxNotification::WindowCreated(window_id),
+            Some(activity),
+        );
+        true
+    }
+
+    fn enqueue_window_notification_entry(
+        self: &Arc<Self>,
+        notification: MuxNotification,
+        activity: Option<Activity>,
+    ) {
+        self.bind_window_notification_owner();
+        self.queue_window_notification_entry(notification, activity);
+    }
+
+    /// Queue a window event after the owning [`Arc<Mux>`] has been bound.
+    ///
+    /// A number of mux APIs intentionally accept `&Mux` because exact pane
+    /// generation handles borrow the mux without retaining it.  Every window
+    /// is nevertheless created by `new_empty_window`, which binds this queue
+    /// before publishing the window.  Keeping the non-retaining enqueue path
+    /// lets those APIs participate in the same FIFO without consulting the
+    /// mutable process-global mux singleton.
+    fn queue_window_notification(&self, notification: MuxNotification) {
+        self.queue_window_notification_entry(notification, None);
+    }
+
+    fn queue_window_notification_entry(
+        &self,
+        notification: MuxNotification,
+        activity: Option<Activity>,
+    ) {
+        let mut pending = self.pending_window_notifications.lock();
+        assert!(
+            std::ptr::eq(pending.owner.as_ptr(), self as *const Self),
+            "window notifications require the exact owner to be bound before publication",
+        );
+        pending.queue.push_back(PendingWindowAction::Notification {
+            notification,
+            activity,
+        });
+    }
+
+    fn flush_window_notifications(&self) {
+        if !promise::spawn::is_scheduler_configured() || self.is_main_thread() {
+            self.drain_window_notifications_inline();
+            return;
+        }
+
+        let dispatch = {
+            let mut pending = self.pending_window_notifications.lock();
+            if pending.scheduled || pending.draining || pending.queue.is_empty() {
+                return;
+            }
+            let Some(owner) = pending.owner.upgrade() else {
+                pending.queue.clear();
+                return;
+            };
+            pending.scheduled = true;
+            WindowNotificationDispatch::new(Arc::downgrade(&owner))
+        };
+        promise::spawn::spawn_into_main_thread(async move {
+            dispatch.execute();
+        })
+        .detach();
+    }
+
+    fn run_scheduled_window_notification_drain(&self) {
+        self.pending_window_notifications.lock().scheduled = false;
+        self.drain_window_notifications_inline();
+    }
+
+    fn window_notification_dispatch_dropped(&self) {
+        self.pending_window_notifications.lock().scheduled = false;
+        // The dispatch is dropped only after the mutation's window-map guard
+        // has been released. Inline fallback preserves delivery if an
+        // executor rejects or abandons the queued runnable.
+        self.drain_window_notifications_inline();
+    }
+
+    fn drain_window_notifications_inline(&self) {
+        let should_drain = {
+            let mut pending = self.pending_window_notifications.lock();
+            if pending.draining || pending.queue.is_empty() {
+                false
+            } else {
+                pending.draining = true;
+                true
+            }
+        };
+        if !should_drain {
+            return;
+        }
+
+        struct DrainReset<'a> {
+            pending: &'a Mutex<PendingWindowNotifications>,
+            armed: bool,
+        }
+
+        impl Drop for DrainReset<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.pending.lock().draining = false;
+                }
+            }
+        }
+
+        let mut reset = DrainReset {
+            pending: &self.pending_window_notifications,
+            armed: true,
+        };
+        loop {
+            let action = {
+                let mut pending = self.pending_window_notifications.lock();
+                let action = pending.queue.pop_front();
+                if action.is_none() {
+                    pending.draining = false;
+                    reset.armed = false;
+                }
+                action
+            };
+            let Some(action) = action else {
+                return;
+            };
+            match action {
+                PendingWindowAction::Notification {
+                    notification,
+                    activity,
+                } => {
+                    self.notify(notification);
+                    // The optional Activity deliberately remains live through
+                    // subscriber fanout, then releases only after the
+                    // corresponding WindowCreated event has been observed.
+                    drop(activity);
+                }
+                PendingWindowAction::FocusLost(pane) => {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pane.focus_changed(false);
+                    }))
+                    .is_err()
+                    {
+                        log::error!(
+                            "pane focus-loss callback panicked for exact pane identity {:p}",
+                            Arc::as_ptr(&pane)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     pub fn notify_from_any_thread(notification: MuxNotification) {
         if let MuxNotification::PaneOutput(pane_id) = notification {
             if let Some(mux) = Mux::try_get() {
@@ -2291,6 +3260,35 @@ impl Mux {
         notification: PaneLifecycleNotification,
         reader_start_gate: Option<PaneReaderStartGate>,
     ) -> PaneLifecycleNotificationTicket {
+        self.enqueue_pane_lifecycle_notification_with_cleanup_locked(
+            notification,
+            reader_start_gate,
+            None,
+            PaneRemovalFollowUp::None,
+        )
+    }
+
+    fn enqueue_pane_removal_notification_locked(
+        &self,
+        pane_id: PaneId,
+        generation: &Arc<PaneRegistrationGeneration>,
+        removal_follow_up: PaneRemovalFollowUp,
+    ) -> PaneLifecycleNotificationTicket {
+        self.enqueue_pane_lifecycle_notification_with_cleanup_locked(
+            PaneLifecycleNotification::Removed(pane_id),
+            None,
+            Some(Arc::clone(&generation.cleanup_complete)),
+            removal_follow_up,
+        )
+    }
+
+    fn enqueue_pane_lifecycle_notification_with_cleanup_locked(
+        &self,
+        notification: PaneLifecycleNotification,
+        reader_start_gate: Option<PaneReaderStartGate>,
+        cleanup_complete: Option<Arc<AtomicBool>>,
+        removal_follow_up: PaneRemovalFollowUp,
+    ) -> PaneLifecycleNotificationTicket {
         let pane_id = notification.pane_id();
         let ready = Arc::new(AtomicBool::new(false));
         self.pending_pane_lifecycle
@@ -2302,6 +3300,8 @@ impl Mux {
                 notification,
                 ready: Arc::clone(&ready),
                 reader_start_gate,
+                cleanup_complete,
+                removal_follow_up,
             });
         PaneLifecycleNotificationTicket { pane_id, ready }
     }
@@ -2427,18 +3427,42 @@ impl Mux {
 
             match step {
                 PaneLifecycleDrainStep::Notification(pending_notification) => {
-                    let notification = pending_notification.notification;
+                    let PendingPaneLifecycleNotification {
+                        notification,
+                        ready: _,
+                        reader_start_gate,
+                        cleanup_complete,
+                        removal_follow_up,
+                    } = pending_notification;
                     self.dispatch_notification(notification.into());
-                    if let Some(reader_start_gate) = pending_notification.reader_start_gate {
+                    if let Some(reader_start_gate) = reader_start_gate {
                         reader_start_gate.release_if_registered(self);
                     }
                     if let PaneLifecycleNotification::Removed(pane_id) = notification {
+                        if removal_follow_up
+                            == PaneRemovalFollowUp::PruneDeadWindowsIgnoringActivity
+                        {
+                            // The exact retired generation remains fenced while
+                            // pruning. No same-ID publication can race the
+                            // topology sweep between Pane::kill and removal of
+                            // its now-dead tab/window.
+                            self.prune_dead_windows_ignoring_activity();
+                        }
                         // The removal queue entry owns the retirement fence. A
                         // caller may complete a ticket reentrantly while an
                         // earlier callback is draining; clearing in the caller
                         // would permit same-ID replacement before delivery.
                         let _registration = self.pane_registration.lock();
                         self.retiring_pane_ids.lock().remove(&pane_id);
+                        if let Some(cleanup_complete) = cleanup_complete {
+                            cleanup_complete.store(true, Ordering::Release);
+                        }
+                    } else {
+                        debug_assert!(
+                            cleanup_complete.is_none(),
+                            "only pane removal notifications complete retirement cleanup",
+                        );
+                        debug_assert_eq!(removal_follow_up, PaneRemovalFollowUp::None);
                     }
                 }
                 PaneLifecycleDrainStep::Retirement(retirement) => {
@@ -2849,28 +3873,48 @@ impl Mux {
         self.tabs.read().get(&tab_id).map(Arc::clone)
     }
 
-    pub(crate) fn capture_pane_registration(
+    pub fn capture_pane_registration(
         &self,
         pane: &Arc<dyn Pane>,
-    ) -> Option<PaneRegistrationIdentity> {
+    ) -> Option<PaneRegistrationHandle> {
         let pane_id = pane.pane_id();
         let _registration = self.pane_registration.lock();
         self.panes.read().get(&pane_id).and_then(|registered| {
-            Arc::ptr_eq(&registered.pane, pane).then(|| PaneRegistrationIdentity {
-                pane: Arc::clone(pane),
-                generation: Arc::clone(&registered.generation),
-            })
+            Arc::ptr_eq(&registered.pane, pane)
+                .then(|| PaneRegistrationHandle::new(pane, &registered.generation))
         })
     }
 
-    pub(crate) fn remove_pane_registration(&self, identity: PaneRegistrationIdentity) {
-        self.remove_pane_if_same_generation(
-            identity.pane.pane_id(),
-            &identity.pane,
-            &identity.generation,
-        );
+    pub fn capture_pane_registrations(
+        &self,
+        panes: &[Arc<dyn Pane>],
+    ) -> Vec<PaneRegistrationHandle> {
+        let candidates = panes
+            .iter()
+            .map(|pane| (pane.pane_id(), pane))
+            .collect::<Vec<_>>();
+        let _registration = self.pane_registration.lock();
+        let registered = self.panes.read();
+        candidates
+            .into_iter()
+            .filter_map(|(pane_id, pane)| {
+                registered.get(&pane_id).and_then(|current| {
+                    Arc::ptr_eq(&current.pane, pane)
+                        .then(|| PaneRegistrationHandle::new(pane, &current.generation))
+                })
+            })
+            .collect()
     }
 
+    pub fn capture_current_pane(&self, pane_id: PaneId) -> Option<PaneRegistrationHandle> {
+        let _registration = self.pane_registration.lock();
+        self.panes
+            .read()
+            .get(&pane_id)
+            .map(|registered| PaneRegistrationHandle::new(&registered.pane, &registered.generation))
+    }
+
+    #[cfg(test)]
     fn remove_pane_registration_if_same(&self, pane_id: PaneId, expected: &Arc<dyn Pane>) -> bool {
         let mut panes = self.panes.write();
         if panes
@@ -2978,10 +4022,10 @@ impl Mux {
         pane_id: PaneId,
         generation: &Arc<PaneRegistrationGeneration>,
     ) -> Result<PreparedPaneRegistration, Error> {
-        let callback_target = PaneRegistrationCallbackTarget {
-            pane: Arc::downgrade(pane),
-            generation: Arc::downgrade(generation),
-        };
+        let callback_target = PaneRegistrationHandle::new(pane, generation);
+        let registration_reservation = pane
+            .mux_registration_slot()
+            .reserve(callback_target.clone())?;
         let clipboard: Arc<dyn Clipboard> = Arc::new(MuxClipboard {
             target: callback_target.clone(),
         });
@@ -2993,7 +4037,11 @@ impl Mux {
         pane.set_download_handler(&downloader);
 
         let reader = pane.reader()?;
-        Ok(PreparedPaneRegistration { pane_id, reader })
+        Ok(PreparedPaneRegistration {
+            pane_id,
+            reader,
+            registration_reservation,
+        })
     }
 
     fn insert_pane_registration_locked(
@@ -3064,8 +4112,18 @@ impl Mux {
         pane: &Arc<dyn Pane>,
         prepared: PreparedPaneRegistration,
         generation: &Arc<PaneRegistrationGeneration>,
-    ) -> Result<Option<PaneReaderStartGate>, Error> {
-        let PreparedPaneRegistration { pane_id, reader } = prepared;
+    ) -> Result<
+        (
+            Option<PaneReaderStartGate>,
+            pane_registration_handle::PaneRegistrationReservation,
+        ),
+        Error,
+    > {
+        let PreparedPaneRegistration {
+            pane_id,
+            reader,
+            registration_reservation,
+        } = prepared;
         if let Some(reader) = reader {
             #[cfg(test)]
             let fault = self.pane_reader_preparation_fault.lock().take();
@@ -3237,14 +4295,17 @@ impl Mux {
                 return Err(err);
             }
 
-            Ok(Some(PaneReaderStartGate {
-                coordinator,
-                pane_id,
-                pane: weak_pane,
-                generation: Arc::clone(generation),
-            }))
+            Ok((
+                Some(PaneReaderStartGate {
+                    coordinator,
+                    pane_id,
+                    pane: weak_pane,
+                    generation: Arc::clone(generation),
+                }),
+                registration_reservation,
+            ))
         } else {
-            Ok(None)
+            Ok((None, registration_reservation))
         }
     }
 
@@ -3260,27 +4321,35 @@ impl Mux {
         let pane_id = prepared.pane_id;
         // Spawning is the last fallible external operation and therefore must
         // precede publication. The thread waits on its start gate.
-        let mut reader_start_gate =
+        let (mut reader_start_gate, registration_reservation) =
             self.spawn_prepared_pane_reader(pane, prepared, &preparation_claim.generation)?;
         let publication_result = {
             let _registration = self.pane_registration.lock();
-            let result = if preparation_claim.is_authoritative_locked() {
-                self.insert_pane_registration_locked(pane_id, pane, &preparation_claim.generation)
-                    .map(|()| {
-                        self.enqueue_pane_lifecycle_notification_locked(
-                            PaneLifecycleNotification::Added(pane_id),
-                            reader_start_gate.take(),
-                        )
-                    })
-            } else {
-                Err(PanePreparationCancelled { pane_id }.into())
-            };
+            let result = (|| -> Result<_, Error> {
+                if !preparation_claim.is_authoritative_locked() {
+                    return Err(PanePreparationCancelled { pane_id }.into());
+                }
+                let commit_guard = registration_reservation.commit()?;
+                self.insert_pane_registration_locked(pane_id, pane, &preparation_claim.generation)?;
+                let lifecycle_notification = self.enqueue_pane_lifecycle_notification_locked(
+                    PaneLifecycleNotification::Added(pane_id),
+                    reader_start_gate.take(),
+                );
+                let registration = commit_guard.finalize();
+                Ok((lifecycle_notification, registration))
+            })();
             preparation_claim.retire_locked();
             result
         };
-        let lifecycle_notification = publication_result?;
+        let (lifecycle_notification, registration) = publication_result?;
 
         self.complete_pane_lifecycle_notification(lifecycle_notification);
+        let hook_registration = registration.clone();
+        let _ = registration.try_with_current(|current| {
+            if current.is_same_pane(pane) {
+                pane.mux_registration_did_bind(hook_registration);
+            }
+        });
         self.recompute_pane_count();
         Ok(())
     }
@@ -3296,7 +4365,10 @@ impl Mux {
         Ok(())
     }
 
-    pub fn add_tab_and_active_pane(self: &Arc<Self>, tab: &Arc<Tab>) -> Result<(), Error> {
+    pub fn add_tab_and_active_pane(
+        self: &Arc<Self>,
+        tab: &Arc<Tab>,
+    ) -> Result<Option<PaneRegistrationHandle>, Error> {
         let pane = tab
             .get_active_pane()
             .ok_or_else(|| anyhow!("tab MUST have an active pane"))?;
@@ -3309,20 +4381,24 @@ impl Mux {
             )?),
             None => None,
         };
-        let mut reader_start_gate = match prepared {
-            Some(prepared) => self.spawn_prepared_pane_reader(
-                &pane,
-                prepared,
-                &preparation_claim
-                    .as_ref()
-                    .expect("prepared panes retain their preparation claim")
-                    .generation,
-            )?,
-            None => None,
+        let (mut reader_start_gate, mut registration_reservation) = match prepared {
+            Some(prepared) => {
+                let (reader_start_gate, registration_reservation) = self
+                    .spawn_prepared_pane_reader(
+                        &pane,
+                        prepared,
+                        &preparation_claim
+                            .as_ref()
+                            .expect("prepared panes retain their preparation claim")
+                            .generation,
+                    )?;
+                (reader_start_gate, Some(registration_reservation))
+            }
+            None => (None, None),
         };
         let publication_result = {
             let _registration = self.pane_registration.lock();
-            let result = (|| -> Result<Option<PaneLifecycleNotificationTicket>, Error> {
+            let result = (|| -> Result<Option<_>, Error> {
                 let tab_needs_insert = self.tab_registration_needs_insert_locked(tab)?;
 
                 match preparation_claim.as_ref() {
@@ -3336,28 +4412,60 @@ impl Mux {
                         if !claim.is_authoritative_locked() {
                             return Err(PanePreparationCancelled { pane_id }.into());
                         }
-                        self.insert_pane_registration_locked(pane_id, &pane, &claim.generation)?;
-                        let tab_was_inserted = match self.insert_tab_registration_locked(tab) {
-                            Ok(tab_was_inserted) => tab_was_inserted,
-                            Err(err) => {
-                                self.remove_pane_registration_if_same(pane_id, &pane);
-                                return Err(err);
-                            }
-                        };
-                        debug_assert_eq!(tab_was_inserted, tab_needs_insert);
-                        if !tab_was_inserted && tab_needs_insert {
-                            self.remove_pane_registration_if_same(pane_id, &pane);
-                            return Err(anyhow!(
-                                "tab identifier {} changed registration state during serialized publication",
-                                tab.tab_id()
-                            ));
+                        if self.retiring_pane_ids.lock().contains(&pane_id)
+                            || self.pane_retirements.has_in_flight_retirement(pane_id)
+                        {
+                            return Err(PaneIdCollision { pane_id }.into());
                         }
+
+                        // Keep raw tab/pane readers from observing a half
+                        // transaction. The registry serializer is outermost;
+                        // tab-map then pane-map is the mux topology lock order.
+                        let tab_id = tab.tab_id();
+                        let mut tabs = self.tabs.write();
+                        let tab_needs_insert = match tabs.get(&tab_id) {
+                            Some(existing) if Arc::ptr_eq(existing, tab) => false,
+                            Some(_) => {
+                                return Err(anyhow!(
+                                    "tab identifier {tab_id} is already registered to a different tab instance"
+                                ));
+                            }
+                            None => true,
+                        };
+                        let mut panes = self.panes.write();
+                        if let Some(existing) = panes.get(&pane_id) {
+                            if Arc::ptr_eq(&existing.pane, &pane) {
+                                return Err(anyhow!(
+                                    "pane identifier {pane_id} became registered during a serialized preparation"
+                                ));
+                            }
+                            return Err(PaneIdCollision { pane_id }.into());
+                        }
+
+                        let commit_guard = registration_reservation
+                            .take()
+                            .expect("a prepared pane retains its registration reservation")
+                            .commit()?;
+                        panes.insert(
+                            pane_id,
+                            LivePaneRegistration {
+                                pane: Arc::clone(&pane),
+                                generation: Arc::clone(&claim.generation),
+                            },
+                        );
+                        if tab_needs_insert {
+                            tabs.insert(tab_id, Arc::clone(tab));
+                        }
+                        drop(panes);
+                        drop(tabs);
+
                         let lifecycle_notification = self
                             .enqueue_pane_lifecycle_notification_locked(
                                 PaneLifecycleNotification::Added(pane_id),
                                 reader_start_gate.take(),
                             );
-                        Ok(Some(lifecycle_notification))
+                        let registration = commit_guard.finalize();
+                        Ok(Some((lifecycle_notification, registration)))
                     }
                 }
             })();
@@ -3368,11 +4476,20 @@ impl Mux {
         };
         let published_pane = publication_result?;
 
-        if let Some(lifecycle_notification) = published_pane {
+        let registration = if let Some((lifecycle_notification, registration)) = published_pane {
             self.complete_pane_lifecycle_notification(lifecycle_notification);
-        }
+            let hook_registration = registration.clone();
+            let _ = registration.try_with_current(|current| {
+                if current.is_same_pane(&pane) {
+                    pane.mux_registration_did_bind(hook_registration);
+                }
+            });
+            Some(registration)
+        } else {
+            self.capture_pane_registration(&pane)
+        };
         self.recompute_pane_count();
-        Ok(())
+        Ok(registration)
     }
 
     fn take_pane_for_removal(
@@ -3380,6 +4497,7 @@ impl Mux {
         pane_id: PaneId,
         expected: Option<&Arc<dyn Pane>>,
         expected_generation: Option<&Arc<PaneRegistrationGeneration>>,
+        removal_follow_up: PaneRemovalFollowUp,
     ) -> Option<RemovedPaneRegistration> {
         let (removed, needs_cleanup, cleanup_only_fence_owned, output_batch) = {
             let _registration = self.pane_registration.lock();
@@ -3417,14 +4535,18 @@ impl Mux {
             let output_batch = registration.as_ref().and_then(|(_, generation)| {
                 self.take_pending_pane_output_batch_locked(pane_id, generation)
             });
-            let removed = registration.map(|(pane, generation)| RemovedPaneRegistration {
-                pane_id,
-                pane,
-                generation,
-                lifecycle_notification: self.enqueue_pane_lifecycle_notification_locked(
-                    PaneLifecycleNotification::Removed(pane_id),
-                    None,
-                ),
+            let removed = registration.map(|(pane, generation)| {
+                let lifecycle_notification = self.enqueue_pane_removal_notification_locked(
+                    pane_id,
+                    &generation,
+                    removal_follow_up,
+                );
+                RemovedPaneRegistration {
+                    pane_id,
+                    pane,
+                    generation,
+                    lifecycle_notification,
+                }
             });
             (
                 removed,
@@ -3460,12 +4582,15 @@ impl Mux {
             pane,
             kill,
             lifecycle_notification,
+            cleanup_complete: Arc::clone(&generation.cleanup_complete),
         });
     }
 
     fn remove_pane_internal(&self, pane_id: PaneId) {
         log::debug!("removing pane {}", pane_id);
-        if let Some(removed) = self.take_pane_for_removal(pane_id, None, None) {
+        if let Some(removed) =
+            self.take_pane_for_removal(pane_id, None, None, PaneRemovalFollowUp::None)
+        {
             self.finish_pane_removal(removed, true);
             self.recompute_pane_count();
         }
@@ -3474,7 +4599,9 @@ impl Mux {
     #[cfg(test)]
     fn remove_pane_if_same(&self, pane_id: PaneId, expected: &Arc<dyn Pane>) {
         log::debug!("removing exact pane instance {}", pane_id);
-        if let Some(removed) = self.take_pane_for_removal(pane_id, Some(expected), None) {
+        if let Some(removed) =
+            self.take_pane_for_removal(pane_id, Some(expected), None, PaneRemovalFollowUp::None)
+        {
             self.finish_pane_removal(removed, true);
             self.recompute_pane_count();
         }
@@ -3487,8 +4614,12 @@ impl Mux {
         generation: &Arc<PaneRegistrationGeneration>,
     ) {
         log::debug!("removing exact pane registration generation {}", pane_id);
-        if let Some(removed) = self.take_pane_for_removal(pane_id, Some(expected), Some(generation))
-        {
+        if let Some(removed) = self.take_pane_for_removal(
+            pane_id,
+            Some(expected),
+            Some(generation),
+            PaneRemovalFollowUp::None,
+        ) {
             self.finish_pane_removal(removed, true);
             self.recompute_pane_count();
         }
@@ -3497,15 +4628,19 @@ impl Mux {
     fn take_tab_and_panes_for_removal(
         &self,
         tab_id: TabId,
+        expected: Option<&Arc<Tab>>,
     ) -> Option<(Arc<Tab>, Vec<RemovedPaneRegistration>)> {
         let tab = self.tabs.read().get(&tab_id).map(Arc::clone)?;
+        if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &tab)) {
+            return None;
+        }
         let pane_candidates: Vec<(PaneId, Arc<dyn Pane>)> = tab
             .iter_all_panes()
             .into_iter()
             .map(|pane| (pane.pane_id(), pane))
             .collect();
 
-        let removed_panes = {
+        let (removed_panes, output_batches) = {
             let _registration = self.pane_registration.lock();
             {
                 let mut tabs = self.tabs.write();
@@ -3520,41 +4655,61 @@ impl Mux {
             for (pane_id, expected) in &pane_candidates {
                 self.cancel_pane_preparation_locked(*pane_id, Some(expected));
             }
-            let mut panes = self.panes.write();
-            let removed_panes = pane_candidates
+            let removed_panes = {
+                let mut panes = self.panes.write();
+                pane_candidates
+                    .into_iter()
+                    .filter_map(|(pane_id, expected)| {
+                        if panes
+                            .get(&pane_id)
+                            .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &expected))
+                        {
+                            panes.remove(&pane_id).map(|registered| {
+                                let pane = Arc::clone(&registered.pane);
+                                let generation = Arc::clone(&registered.generation);
+                                drop(registered);
+                                (pane_id, pane, generation)
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            {
+                let mut retiring = self.retiring_pane_ids.lock();
+                for (pane_id, _, _) in &removed_panes {
+                    retiring.insert(*pane_id);
+                }
+            }
+            let output_batches = removed_panes
+                .iter()
+                .filter_map(|(pane_id, _, generation)| {
+                    self.take_pending_pane_output_batch_locked(*pane_id, generation)
+                })
+                .collect::<Vec<_>>();
+            let removed_panes = removed_panes
                 .into_iter()
-                .filter_map(|(pane_id, expected)| {
-                    if panes
-                        .get(&pane_id)
-                        .is_some_and(|registered| Arc::ptr_eq(&registered.pane, &expected))
-                    {
-                        panes.remove(&pane_id).map(|registered| {
-                            let pane = Arc::clone(&registered.pane);
-                            let generation = Arc::clone(&registered.generation);
-                            drop(registered);
-                            (pane_id, pane, generation)
-                        })
-                    } else {
-                        None
+                .map(|(pane_id, pane, generation)| {
+                    let lifecycle_notification = self.enqueue_pane_removal_notification_locked(
+                        pane_id,
+                        &generation,
+                        PaneRemovalFollowUp::None,
+                    );
+                    RemovedPaneRegistration {
+                        pane_id,
+                        pane,
+                        generation,
+                        lifecycle_notification,
                     }
                 })
                 .collect::<Vec<_>>();
-            for (pane_id, _, _) in &removed_panes {
-                self.retiring_pane_ids.lock().insert(*pane_id);
-            }
-            removed_panes
-                .into_iter()
-                .map(|(pane_id, pane, generation)| RemovedPaneRegistration {
-                    pane_id,
-                    pane,
-                    generation,
-                    lifecycle_notification: self.enqueue_pane_lifecycle_notification_locked(
-                        PaneLifecycleNotification::Removed(pane_id),
-                        None,
-                    ),
-                })
-                .collect::<Vec<_>>()
+            (removed_panes, output_batches)
         };
+        for output_batch in output_batches {
+            histogram!("mux.notifications.pane_output.removal_forced_seal_rate").record(1.);
+            output_batch.seal();
+        }
         let pane_ids = removed_panes
             .iter()
             .map(|removed| removed.pane_id)
@@ -3566,13 +4721,15 @@ impl Mux {
     fn remove_tab_internal(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         log::debug!("remove_tab_internal tab {}", tab_id);
 
-        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id)?;
+        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None)?;
 
-        if let Some(mut windows) = self.windows.try_write() {
+        {
+            let mut windows = self.windows.write();
             for w in windows.values_mut() {
-                w.remove_by_id(tab_id);
+                w.remove_tab_if_same(&tab);
             }
         }
+        self.flush_window_notifications();
 
         let pane_ids: Vec<PaneId> = removed_panes
             .iter()
@@ -3587,10 +4744,168 @@ impl Mux {
         Some(tab)
     }
 
+    fn remove_tab_internal_if_same(&self, expected: &Arc<Tab>) -> Option<Arc<Tab>> {
+        let tab_id = expected.tab_id();
+        log::debug!("remove exact tab instance {}", tab_id);
+
+        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, Some(expected))?;
+
+        {
+            let mut windows = self.windows.write();
+            for window in windows.values_mut() {
+                window.remove_tab_if_same(&tab);
+            }
+        }
+        self.flush_window_notifications();
+
+        let pane_ids = removed_panes
+            .iter()
+            .map(|removed| removed.pane_id)
+            .collect::<Vec<_>>();
+        log::debug!("panes to remove from exact tab: {pane_ids:?}");
+        for removed in removed_panes {
+            self.finish_pane_removal(removed, true);
+        }
+        self.recompute_pane_count();
+
+        Some(tab)
+    }
+
+    fn remove_empty_tab_internal_if_same(&self, expected: &Arc<Tab>) -> Option<Arc<Tab>> {
+        let tab_id = expected.tab_id();
+        let tab = {
+            // Match the staged pane-prune lock order. Holding `Tab::inner`
+            // through the registry removal closes the final "dead tab gained a
+            // pane" race without invoking pane callbacks in this scope.
+            let _registration = self.pane_registration.lock();
+            expected
+                .with_structurally_empty(|| {
+                    let mut tabs = self.tabs.write();
+                    let matches = tabs
+                        .get(&tab_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, expected));
+                    matches.then(|| tabs.remove(&tab_id)).flatten()
+                })
+                .flatten()
+        }?;
+
+        {
+            let mut windows = self.windows.write();
+            for window in windows.values_mut() {
+                window.remove_tab_if_same(&tab);
+            }
+        }
+        self.flush_window_notifications();
+        self.recompute_pane_count();
+        Some(tab)
+    }
+
     fn remove_window_internal(&self, window_id: WindowId) {
+        self.remove_window_internal_with_notification(window_id, true);
+    }
+
+    fn cancel_provisional_window(&self, window_id: WindowId, mut activity: Option<Activity>) {
+        let (removed, preserved) = {
+            let mut windows = self.windows.write();
+            if !self.provisional_windows.lock().remove(&window_id) {
+                return;
+            }
+            match windows.get(&window_id) {
+                Some(window) if window.is_empty() => {
+                    windows.remove(&window_id);
+                    (true, false)
+                }
+                Some(_) => {
+                    // Linearize publication while the map lock still protects
+                    // the surviving topology. Any later removal queues behind
+                    // this creation event in the same exact-owner FIFO.
+                    self.queue_window_notification_entry(
+                        MuxNotification::WindowCreated(window_id),
+                        activity.take(),
+                    );
+                    (false, true)
+                }
+                None => (false, false),
+            }
+        };
+        if removed {
+            self.recompute_pane_count();
+        }
+        if preserved {
+            self.flush_window_notifications();
+        }
+    }
+
+    fn remove_window_if_empty_internal(&self, window_id: WindowId) -> bool {
+        let (removed, was_provisional) = {
+            let mut windows = self.windows.write();
+            let mut provisional_windows = self.provisional_windows.lock();
+            if provisional_windows.contains(&window_id) {
+                // Only the exact MuxWindowBuilder cancellation/publication
+                // transaction may retire an unpublished window. An activity
+                // count is an admission hint, not a topology lock; a prune
+                // admitted just before new_empty_window can otherwise reap
+                // the newly published provisional window.
+                (false, true)
+            } else if windows
+                .get(&window_id)
+                .is_some_and(|window| window.is_empty())
+            {
+                let removed = windows.remove(&window_id).is_some();
+                let was_provisional = provisional_windows.remove(&window_id);
+                (removed, was_provisional)
+            } else {
+                (false, false)
+            }
+        };
+        if removed {
+            if !was_provisional {
+                self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
+            }
+            self.recompute_pane_count();
+            self.flush_window_notifications();
+        }
+        removed
+    }
+
+    fn remove_window_internal_with_notification(&self, window_id: WindowId, notify_removed: bool) {
         log::debug!("remove_window_internal {}", window_id);
 
-        let window = self.windows.write().remove(&window_id);
+        if !notify_removed {
+            // A cancelled builder represents an unpublished, provisional
+            // window.  Remove it only while it is still empty.  If another
+            // topology operation raced a live tab into the window, silently
+            // tearing it down here would detach that tab's domain without
+            // ever publishing a corresponding window lifecycle event.
+            let removed = {
+                let mut windows = self.windows.write();
+                if windows
+                    .get(&window_id)
+                    .is_some_and(|window| window.is_empty())
+                {
+                    let removed = windows.remove(&window_id).is_some();
+                    self.provisional_windows.lock().remove(&window_id);
+                    removed
+                } else {
+                    false
+                }
+            };
+            if removed {
+                self.recompute_pane_count();
+            } else {
+                log::debug!(
+                    "preserving provisional window {window_id}: it is absent or acquired live topology"
+                );
+            }
+            return;
+        }
+
+        let (window, was_provisional) = {
+            let mut windows = self.windows.write();
+            let window = windows.remove(&window_id);
+            let was_provisional = self.provisional_windows.lock().remove(&window_id);
+            (window, was_provisional)
+        };
         if let Some(window) = window {
             // Gather all the domains referenced by this window
             let mut domains_of_window = HashSet::new();
@@ -3614,12 +4929,16 @@ impl Mux {
                 }
             }
 
-            for tab in window.iter() {
-                self.remove_tab_internal(tab.tab_id());
+            let tabs = window.iter().cloned().collect::<Vec<_>>();
+            for tab in tabs {
+                self.remove_tab_internal_if_same(&tab);
             }
-            self.notify(MuxNotification::WindowRemoved(window_id));
+            if !was_provisional {
+                self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
+            }
         }
         self.recompute_pane_count();
+        self.flush_window_notifications();
     }
 
     pub fn remove_pane(&self, pane_id: PaneId) {
@@ -3645,13 +4964,15 @@ impl Mux {
     pub fn remove_tab_local_only(&self, tab_id: TabId) -> Option<Arc<Tab>> {
         log::debug!("remove_tab_local_only tab {}", tab_id);
 
-        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id)?;
+        let (tab, removed_panes) = self.take_tab_and_panes_for_removal(tab_id, None)?;
 
-        if let Some(mut windows) = self.windows.try_write() {
+        {
+            let mut windows = self.windows.write();
             for w in windows.values_mut() {
-                w.remove_by_id(tab_id);
+                w.remove_tab_if_same(&tab);
             }
         }
+        self.flush_window_notifications();
 
         let pane_ids: Vec<PaneId> = removed_panes
             .iter()
@@ -3668,47 +4989,96 @@ impl Mux {
     }
 
     pub fn prune_dead_windows(&self) {
-        if Activity::count() > 0 {
-            log::trace!("prune_dead_windows: Activity::count={}", Activity::count());
+        self.prune_dead_windows_impl(false);
+    }
+
+    fn prune_dead_windows_ignoring_activity(&self) {
+        self.prune_dead_windows_impl(true);
+    }
+
+    fn prune_dead_windows_impl(&self, ignore_activity: bool) {
+        let activity_count = Activity::count_for_mux(self);
+        if !ignore_activity && activity_count > 0 {
+            log::trace!("prune_dead_windows: exact activity count={activity_count}");
             return;
         }
-        let live_tab_ids: Vec<TabId> = self.tabs.read().keys().cloned().collect();
-        let mut dead_windows = vec![];
-        let dead_tab_ids: Vec<TabId>;
+        // Snapshot exact tab identities before invoking pane callbacks. A tab
+        // may be retained by a window after leaving the mux registry, and a
+        // later tab may reuse its numeric ID in adversarial/remote scenarios.
+        // Pointer keys remain valid for this pass because every key has a
+        // retained Arc in `live_tabs` or `window_tabs`.
+        let live_tabs = self.tabs.read().clone();
+        let window_tabs = self
+            .windows
+            .read()
+            .values()
+            .flat_map(|window| window.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut tab_candidates = live_tabs.values().cloned().collect::<Vec<_>>();
+        let mut candidate_identities = tab_candidates
+            .iter()
+            .map(|tab| Arc::as_ptr(tab) as usize)
+            .collect::<HashSet<_>>();
+        for tab in window_tabs {
+            if candidate_identities.insert(Arc::as_ptr(&tab) as usize) {
+                tab_candidates.push(tab);
+            }
+        }
 
-        {
-            let mut windows = match self.windows.try_write() {
-                Some(w) => w,
-                None => {
-                    // It's ok if our caller already locked it; we can prune later.
-                    log::trace!("prune_dead_windows: self.windows already borrowed");
-                    return;
-                }
-            };
-            for (window_id, win) in windows.iter_mut() {
-                win.prune_dead_tabs(&live_tab_ids);
-                if win.is_empty() {
-                    log::trace!("prune_dead_windows: window is now empty");
+        let mut dead_pane_registrations = Vec::new();
+        let mut dead_tabs = Vec::new();
+        let mut stale_window_tabs = Vec::new();
+        for tab in tab_candidates {
+            let is_registered = live_tabs
+                .get(&tab.tab_id())
+                .is_some_and(|registered| Arc::ptr_eq(registered, &tab));
+            if !is_registered {
+                stale_window_tabs.push(tab);
+                continue;
+            }
+            let (_, mut registrations) = tab.prune_dead_panes_deferred(self);
+            dead_pane_registrations.append(&mut registrations);
+            if tab.with_structurally_empty(|| ()).is_some() {
+                dead_tabs.push(tab);
+            }
+        }
+
+        PaneRegistrationHandle::retire_batch_if_current(dead_pane_registrations);
+
+        for tab in dead_tabs {
+            log::trace!("exact tab {} is dead", tab.tab_id());
+            self.remove_empty_tab_internal_if_same(&tab);
+        }
+
+        // Revalidate stale exact tab Arcs against the live registry while
+        // holding its read lock through the window mutation. This prevents a
+        // same-ID exact re-registration from being stripped after callbacks.
+        let dead_windows = {
+            let tabs = self.tabs.read();
+            let stale_identities = stale_window_tabs
+                .iter()
+                .filter(|stale| {
+                    tabs.get(&stale.tab_id())
+                        .is_none_or(|current| !Arc::ptr_eq(current, stale))
+                })
+                .map(|stale| Arc::as_ptr(stale) as usize)
+                .collect::<HashSet<_>>();
+            let mut windows = self.windows.write();
+            let provisional_windows = self.provisional_windows.lock();
+            let mut dead_windows = Vec::new();
+            for (window_id, window) in windows.iter_mut() {
+                window.remove_tabs_by_exact_identity_set(&stale_identities);
+                if window.is_empty() && !provisional_windows.contains(window_id) {
                     dead_windows.push(*window_id);
                 }
             }
-
-            dead_tab_ids = self
-                .tabs
-                .read()
-                .iter()
-                .filter_map(|(&id, tab)| if tab.is_dead() { Some(id) } else { None })
-                .collect();
-        }
-
-        for tab_id in dead_tab_ids {
-            log::trace!("tab {} is dead", tab_id);
-            self.remove_tab_internal(tab_id);
-        }
+            dead_windows
+        };
+        self.flush_window_notifications();
 
         for window_id in dead_windows {
             log::trace!("window {} is dead", window_id);
-            self.remove_window_internal(window_id);
+            self.remove_window_if_empty_internal(window_id);
         }
 
         if self.is_empty() {
@@ -3728,16 +5098,63 @@ impl Mux {
         RwLockReadGuard::try_map(self.windows.read(), |windows| windows.get(&window_id)).ok()
     }
 
-    pub fn get_window_mut(
-        &self,
-        window_id: WindowId,
-    ) -> Option<MappedRwLockWriteGuard<'_, Window>> {
-        RwLockWriteGuard::try_map(self.windows.write(), |windows| windows.get_mut(&window_id)).ok()
+    pub fn get_window_mut(&self, window_id: WindowId) -> Option<MuxWindowWriteGuard<'_>> {
+        let guard =
+            RwLockWriteGuard::try_map(self.windows.write(), |windows| windows.get_mut(&window_id))
+                .ok()?;
+        Some(MuxWindowWriteGuard {
+            guard: Some(guard),
+            mux: self,
+        })
+    }
+
+    pub fn set_window_title(&self, window_id: WindowId, title: &str) -> bool {
+        let changed = {
+            let mut windows = self.windows.write();
+            let Some(window) = windows.get_mut(&window_id) else {
+                return false;
+            };
+            let changed = window.set_title_without_notify(title);
+            if changed {
+                self.queue_window_notification(MuxNotification::WindowTitleChanged {
+                    window_id,
+                    title: title.to_string(),
+                });
+            }
+            changed
+        };
+        self.flush_window_notifications();
+        changed
+    }
+
+    pub fn set_tab_title(&self, tab_id: TabId, title: &str) -> bool {
+        let Some(tab) = self.get_tab(tab_id) else {
+            return false;
+        };
+        let changed = tab.set_title_without_notify(title);
+        if changed {
+            self.notify(MuxNotification::TabTitleChanged {
+                tab_id,
+                title: title.to_string(),
+            });
+        }
+        changed
     }
 
     pub fn get_active_tab_for_window(&self, window_id: WindowId) -> Option<Arc<Tab>> {
         let window = self.get_window(window_id)?;
         window.get_active().map(Arc::clone)
+    }
+
+    pub fn window_can_close_without_prompting(&self, window_id: WindowId) -> Option<bool> {
+        let tabs = {
+            let window = self.get_window(window_id)?;
+            window.iter().cloned().collect::<Vec<_>>()
+        };
+        Some(
+            tabs.into_iter()
+                .all(|tab| tab.can_close_without_prompting(CloseReason::Window)),
+        )
     }
 
     pub fn window_has_panes_in_domain(&self, window_id: WindowId, domain_id: DomainId) -> bool {
@@ -3755,17 +5172,31 @@ impl Mux {
     }
 
     pub fn new_empty_window(
-        &self,
+        self: &Arc<Self>,
         workspace: Option<String>,
         position: Option<GuiPosition>,
     ) -> MuxWindowBuilder {
+        // Bind the deferred-event queue before the empty provisional window is
+        // published.  Even a cancellation or global-mux swap before its first
+        // mutation must retain this exact mux as notification authority.
+        self.bind_window_notification_owner();
         let workspace = Some(workspace.unwrap_or_else(|| self.active_workspace()));
-        let window = Window::new(workspace, position);
+        let window = Window::new_for_owner(workspace, position, Arc::downgrade(self));
         let window_id = window.window_id();
-        self.windows.write().insert(window_id, window);
+        // Acquire the pruning lease before publication. Otherwise an
+        // off-thread prune can remove the empty provisional window between
+        // insertion and builder construction, producing Created-after-Removed.
+        let activity = Activity::new_for_mux(self);
+        {
+            let mut windows = self.windows.write();
+            windows.insert(window_id, window);
+            self.provisional_windows.lock().insert(window_id);
+        }
         MuxWindowBuilder {
             window_id,
-            activity: Some(Activity::new()),
+            owner: Arc::downgrade(self),
+            activity: Some(activity),
+            provisional: true,
             notified: false,
         }
     }
@@ -3773,13 +5204,37 @@ impl Mux {
     pub fn add_tab_to_window(&self, tab: &Arc<Tab>, window_id: WindowId) -> anyhow::Result<()> {
         let tab_id = tab.tab_id();
         {
-            let mut window = self
-                .get_window_mut(window_id)
+            let tabs = self.tabs.read();
+            anyhow::ensure!(
+                tabs.get(&tab_id)
+                    .is_some_and(|registered| Arc::ptr_eq(registered, tab)),
+                "add_tab_to_window: tab {tab_id} is not the exact registered tab instance"
+            );
+            let mut windows = self.windows.write();
+            let existing_parent = windows.iter().find_map(|(candidate_id, candidate)| {
+                candidate
+                    .iter()
+                    .any(|existing| Arc::ptr_eq(existing, tab))
+                    .then_some(*candidate_id)
+            });
+            if let Some(existing_parent) = existing_parent {
+                return Err(anyhow!(
+                    "add_tab_to_window: exact tab {tab_id} is already attached to window \
+                     {existing_parent}"
+                ));
+            }
+            let window = windows
+                .get_mut(&window_id)
                 .ok_or_else(|| anyhow!("add_tab_to_window: no such window_id {}", window_id))?;
+            anyhow::ensure!(
+                window.idx_by_id(tab_id).is_none(),
+                "add_tab_to_window: window {window_id} already contains tab id {tab_id}"
+            );
             window.push(tab);
+            self.queue_window_notification(MuxNotification::TabAddedToWindow { tab_id, window_id });
         }
         self.recompute_pane_count();
-        self.notify(MuxNotification::TabAddedToWindow { tab_id, window_id });
+        self.flush_window_notifications();
         Ok(())
     }
 
@@ -3818,39 +5273,71 @@ impl Mux {
             .get(&tab_id)
             .map(Arc::clone)
             .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} not found in mux"))?;
-        let src_window = self.window_containing_tab(tab_id).ok_or_else(|| {
-            anyhow!("move_tab_between_windows: tab {tab_id} is not in any window")
-        })?;
+        let source_windows = self
+            .windows
+            .read()
+            .iter()
+            .filter_map(|(window_id, window)| {
+                window
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &tab))
+                    .then_some(*window_id)
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            source_windows.len() == 1,
+            "move_tab_between_windows: exact tab {tab_id} has {} parents; expected exactly one",
+            source_windows.len(),
+        );
+        let src_window = source_windows[0];
 
         {
             let mut windows = self.windows.write();
-            if !windows.contains_key(&dst_window) {
-                return Err(anyhow!(
-                    "move_tab_between_windows: destination window {dst_window} not found"
-                ));
+            let destination = windows.get(&dst_window).ok_or_else(|| {
+                anyhow!("move_tab_between_windows: destination window {dst_window} not found")
+            })?;
+            if src_window != dst_window {
+                anyhow::ensure!(
+                    !destination
+                        .iter()
+                        .any(|candidate| Arc::ptr_eq(candidate, &tab)),
+                    "move_tab_between_windows: destination window {dst_window} already contains \
+                     exact tab {tab_id}"
+                );
+                anyhow::ensure!(
+                    destination.idx_by_id(tab_id).is_none(),
+                    "move_tab_between_windows: destination window {dst_window} already contains \
+                     tab id {tab_id}"
+                );
             }
             // Detach from the source window's ordered tab list first. When
             // src == dst this also lets us re-insert at `idx` (a reorder).
             // `Window::remove_by_id` only touches window-local bookkeeping; it
             // does NOT kill panes or remove the tab from `self.tabs`.
-            if let Some(win) = windows.get_mut(&src_window) {
-                win.remove_by_id(tab_id);
+            let removed = windows
+                .get_mut(&src_window)
+                .is_some_and(|window| window.remove_tab_if_same(&tab));
+            if !removed {
+                return Err(anyhow!(
+                    "move_tab_between_windows: exact tab {tab_id} left source window {src_window}"
+                ));
             }
             let dst = windows
                 .get_mut(&dst_window)
                 .expect("destination window presence checked above");
             let pos = idx.map(|i| i.min(dst.len())).unwrap_or_else(|| dst.len());
             dst.insert(pos, &tab);
+            self.queue_window_notification(MuxNotification::TabAddedToWindow {
+                tab_id,
+                window_id: dst_window,
+            });
         }
 
         // Pane count is unchanged for a within-workspace move; recompute keeps
         // the per-workspace tallies correct if a caller ever moves across
         // workspaces.
         self.recompute_pane_count();
-        self.notify(MuxNotification::TabAddedToWindow {
-            tab_id,
-            window_id: dst_window,
-        });
+        self.flush_window_notifications();
         Ok(())
     }
 
@@ -3907,8 +5394,12 @@ impl Mux {
     }
 
     pub fn resolve_pane_id(&self, pane_id: PaneId) -> Option<(DomainId, WindowId, TabId)> {
+        // `Tab::domain_id_for_pane` calls pane trait methods. Snapshot the Arc
+        // values so no external pane callback runs while the mux tab registry
+        // is locked; callbacks are permitted to re-enter mux lookup APIs.
+        let tabs = self.tabs.read().values().cloned().collect::<Vec<_>>();
         let mut ids = None;
-        for tab in self.tabs.read().values() {
+        for tab in tabs {
             if let Some(domain_id) = tab.domain_id_for_pane(pane_id) {
                 ids = Some((tab.tab_id(), domain_id));
                 break;
@@ -3923,7 +5414,7 @@ impl Mux {
         let Some(expected) = self.get_domain(domain) else {
             return;
         };
-        let _ = self.domain_was_detached_if_same(expected.as_ref());
+        let _ = self.domain_was_detached_if_same(&expected);
     }
 
     /// Remove one exact domain instance and all of its topology.
@@ -3932,14 +5423,14 @@ impl Mux {
     /// exact detached domain remains discoverable until its panes have been
     /// killed. `ClientPane::kill` relies on that detached registration to
     /// suppress an unintended remote `KillPane` during transport teardown.
-    pub fn domain_was_detached_if_same(&self, expected: &dyn Domain) -> bool {
+    pub fn domain_was_detached_if_same(&self, expected: &Arc<dyn Domain>) -> bool {
         let domain = expected.domain_id();
         let removed = {
             let _registration = self.domain_registration.lock();
             let Some(registered) = self.domains.read().get(&domain).cloned() else {
                 return false;
             };
-            if !std::ptr::eq(registered.as_ref(), expected) {
+            if !Arc::ptr_eq(&registered, expected) {
                 return false;
             }
             if !self.retired_domain_ids.lock().insert(domain) {
@@ -3960,26 +5451,46 @@ impl Mux {
             }
         }
 
-        let mut dead_panes = vec![];
-        for registered in self.panes.read().values() {
-            if registered.pane.domain_id() == domain {
-                dead_panes.push(registered.pane.pane_id());
+        let domain_panes = self
+            .iter_panes()
+            .into_iter()
+            .filter(|pane| pane.domain_id() == domain)
+            .collect::<Vec<_>>();
+        let dead_panes = domain_panes
+            .iter()
+            .map(|pane| pane.pane_id())
+            .collect::<HashSet<_>>();
+        let mut dead_pane_registrations = self.capture_pane_registrations(&domain_panes);
+
+        // Snapshot exact tab Arcs before structural work. Pane callbacks,
+        // resize/focus effects, and registration retirement must never run
+        // while the mux window registry is locked.
+        let mut tabs = self.tabs.read().values().cloned().collect::<Vec<_>>();
+        let window_tabs = self
+            .windows
+            .read()
+            .values()
+            .flat_map(|window| window.iter().cloned())
+            .collect::<Vec<_>>();
+        for tab in window_tabs {
+            if !tabs.iter().any(|candidate| Arc::ptr_eq(candidate, &tab)) {
+                tabs.push(tab);
             }
         }
-
-        {
-            let mut windows = self.windows.write();
-            for win in windows.values_mut() {
-                for tab in win.iter() {
-                    tab.kill_panes_in_domain(domain);
+        for tab in tabs {
+            let (_, registrations) = tab.remove_exact_panes_deferred(self, &domain_panes);
+            for registration in registrations {
+                if !dead_pane_registrations
+                    .iter()
+                    .any(|current| current.same_registration(&registration))
+                {
+                    dead_pane_registrations.push(registration);
                 }
             }
         }
 
         log::info!("domain detached panes: {:?}", dead_panes);
-        for pane_id in dead_panes {
-            self.remove_pane_internal(pane_id);
-        }
+        PaneRegistrationHandle::retire_batch_if_current(dead_pane_registrations);
 
         self.prune_dead_windows();
 
@@ -4212,7 +5723,7 @@ impl Mux {
     }
 
     pub async fn spawn_tab_or_window(
-        &self,
+        self: &Arc<Self>,
         window_id: Option<WindowId>,
         domain: SpawnTabDomain,
         command: Option<CommandBuilder>,
@@ -4336,24 +5847,8 @@ pub(crate) fn terminal_size_to_pty_size(size: TerminalSize) -> anyhow::Result<Pt
     })
 }
 
-#[derive(Clone)]
-struct PaneRegistrationCallbackTarget {
-    pane: Weak<dyn Pane>,
-    generation: Weak<PaneRegistrationGeneration>,
-}
-
-impl PaneRegistrationCallbackTarget {
-    fn resolve(&self) -> Option<(PaneRegistrationOperationLease, Arc<dyn Pane>, Arc<Mux>)> {
-        let generation = self.generation.upgrade()?;
-        let operation = generation.try_acquire()?;
-        let pane = self.pane.upgrade()?;
-        let mux = resolve_pane_reader_mux(&pane, &generation)?;
-        Some((operation, pane, mux))
-    }
-}
-
 struct MuxClipboard {
-    target: PaneRegistrationCallbackTarget,
+    target: PaneRegistrationHandle,
 }
 
 impl Clipboard for MuxClipboard {
@@ -4362,30 +5857,27 @@ impl Clipboard for MuxClipboard {
         selection: ClipboardSelection,
         clipboard: Option<String>,
     ) -> anyhow::Result<()> {
-        let (_operation, pane, mux) = self.target.resolve().ok_or_else(|| {
-            anyhow::anyhow!("MuxClipboard::set_contents: pane registration is no longer current")
-        })?;
-        mux.notify(MuxNotification::AssignClipboard {
-            pane_id: pane.pane_id(),
-            selection,
-            clipboard,
-        });
-        Ok(())
+        self.target
+            .try_with_current(|current| {
+                current.assign_clipboard(selection, clipboard);
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MuxClipboard::set_contents: pane registration is no longer current"
+                )
+            })
     }
 }
 
 struct MuxDownloader {
-    target: PaneRegistrationCallbackTarget,
+    target: PaneRegistrationHandle,
 }
 
 impl frankenterm_term::DownloadHandler for MuxDownloader {
     fn save_to_downloads(&self, name: Option<String>, data: Vec<u8>) {
-        if let Some((_operation, _pane, mux)) = self.target.resolve() {
-            mux.notify(MuxNotification::SaveToDownloads {
-                name,
-                data: Arc::new(data),
-            });
-        }
+        let _ = self.target.try_with_current(|current| {
+            current.save_to_downloads(name, data);
+        });
     }
 }
 
@@ -4401,7 +5893,7 @@ mod tests {
     use rangeset::RangeSet;
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::MutexGuard as StdMutexGuard;
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
     use termwiz::surface::{Line, SequenceNo};
 
     fn global_test_lock() -> StdMutexGuard<'static, ()> {
@@ -4429,11 +5921,39 @@ mod tests {
             Self { receiver }
         }
 
-        fn run_one(&self) {
-            self.receiver
-                .recv_timeout(Duration::from_secs(30))
-                .expect("a bounded test scheduler task should arrive")
-                .run();
+        fn run_until(&self, timeout: Duration, mut completed: impl FnMut() -> bool) {
+            let started = Instant::now();
+            while !completed() {
+                // The promise scheduler is process-global. A worker from an
+                // earlier test may outlive that test and enqueue a harmless
+                // stale runnable after this executor is installed, so "tick
+                // exactly once" does not identify this test's own runnable.
+                let remaining = timeout.saturating_sub(started.elapsed());
+                assert!(
+                    !remaining.is_zero(),
+                    "the bounded test scheduler did not reach its completion condition",
+                );
+                self.receiver
+                    .recv_timeout(remaining)
+                    .expect("the bounded test scheduler should reach its completion condition")
+                    .run();
+            }
+        }
+    }
+
+    struct BlockingDropLatch {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Drop for BlockingDropLatch {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .recv_timeout(Duration::from_secs(30));
         }
     }
 
@@ -4442,11 +5962,14 @@ mod tests {
         size: Mutex<TerminalSize>,
         kills: Arc<AtomicUsize>,
         actions: Arc<AtomicUsize>,
+        binds: AtomicUsize,
         writes: Mutex<Vec<u8>>,
         reader: Mutex<Option<Box<dyn std::io::Read + Send>>>,
         on_reader: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         on_actions: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         on_kill: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        focus_events: Arc<Mutex<Vec<bool>>>,
+        mux_registration: Arc<PaneRegistrationSlot>,
         fail_reader: bool,
     }
 
@@ -4467,11 +5990,14 @@ mod tests {
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
                 writes: Mutex::new(Vec::new()),
                 reader: Mutex::new(reader),
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader,
             });
             (pane, kills)
@@ -4488,11 +6014,14 @@ mod tests {
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
                 writes: Mutex::new(Vec::new()),
                 reader: Mutex::new(None),
                 on_reader: Mutex::new(Some(Box::new(on_reader))),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(None),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
             });
             (pane, kills)
@@ -4509,11 +6038,14 @@ mod tests {
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
                 writes: Mutex::new(Vec::new()),
                 reader: Mutex::new(None),
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(None),
                 on_kill: Mutex::new(Some(Box::new(on_kill))),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
             });
             (pane, kills)
@@ -4530,20 +6062,54 @@ mod tests {
                 size: Mutex::new(size),
                 kills: Arc::clone(&kills),
                 actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
                 writes: Mutex::new(Vec::new()),
                 reader: Mutex::new(None),
                 on_reader: Mutex::new(None),
                 on_actions: Mutex::new(Some(Box::new(on_actions))),
                 on_kill: Mutex::new(None),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
             });
             (pane, kills)
+        }
+
+        fn new_with_focus_counter(
+            id: PaneId,
+            size: TerminalSize,
+        ) -> (Arc<dyn Pane>, Arc<Mutex<Vec<bool>>>) {
+            let focus_events = Arc::new(Mutex::new(Vec::new()));
+            let pane: Arc<dyn Pane> = Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                kills: Arc::new(AtomicUsize::new(0)),
+                actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
+                writes: Mutex::new(Vec::new()),
+                reader: Mutex::new(None),
+                on_reader: Mutex::new(None),
+                on_actions: Mutex::new(None),
+                on_kill: Mutex::new(None),
+                focus_events: Arc::clone(&focus_events),
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
+                fail_reader: false,
+            });
+            (pane, focus_events)
         }
     }
 
     impl Pane for KillCountingPane {
         fn pane_id(&self) -> PaneId {
             self.id
+        }
+
+        fn mux_registration_slot(&self) -> &Arc<PaneRegistrationSlot> {
+            &self.mux_registration
+        }
+
+        fn mux_registration_did_bind(&self, _registration: PaneRegistrationHandle) {
+            self.binds.fetch_add(1, Ordering::SeqCst);
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {
@@ -4657,6 +6223,10 @@ mod tests {
             if let Some(on_kill) = self.on_kill.lock().take() {
                 on_kill();
             }
+        }
+
+        fn focus_changed(&self, focused: bool) {
+            self.focus_events.lock().push(focused);
         }
 
         fn palette(&self) -> ColorPalette {
@@ -4832,13 +6402,13 @@ mod tests {
         let originating_mux = Arc::new(Mux::new(None));
         let replacement_mux = Arc::new(Mux::new(None));
         let (originating_pane, _) = KillCountingPane::new(105, test_size());
-        let replacement_pane = Arc::clone(&originating_pane);
+        let (replacement_pane, _) = KillCountingPane::new(105, test_size());
         originating_mux
             .add_pane(&originating_pane)
             .expect("originating pane should register");
         replacement_mux
             .add_pane(&replacement_pane)
-            .expect("replacement mux should register the exact same pane Arc independently");
+            .expect("replacement mux should register its distinct same-ID pane");
         Mux::set_mux(&replacement_mux);
 
         let generation = Arc::clone(
@@ -4849,10 +6419,7 @@ mod tests {
                 .expect("originating generation should be live")
                 .generation,
         );
-        let target = PaneRegistrationCallbackTarget {
-            pane: Arc::downgrade(&originating_pane),
-            generation: Arc::downgrade(&generation),
-        };
+        let target = PaneRegistrationHandle::new(&originating_pane, &generation);
         let clipboard_events = Arc::new(AtomicUsize::new(0));
         let download_events = Arc::new(AtomicUsize::new(0));
         let clipboard_events_for_subscriber = Arc::clone(&clipboard_events);
@@ -4910,6 +6477,12 @@ mod tests {
         assert_eq!(clipboard_events.load(Ordering::SeqCst), 1);
         assert_eq!(download_events.load(Ordering::SeqCst), 1);
         assert_eq!(replacement_events.load(Ordering::SeqCst), 0);
+        assert!(
+            replacement_mux
+                .get_pane(105)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement_pane)),
+            "retiring the origin must preserve the replacement mux's same-ID pane",
+        );
         Mux::shutdown();
     }
 
@@ -5138,7 +6711,9 @@ mod tests {
         assert_eq!(&*events.lock(), &["output"]);
         assert_eq!(kills.load(Ordering::SeqCst), 0);
 
-        executor.run_one();
+        executor.run_until(Duration::from_secs(30), || {
+            kills.load(Ordering::SeqCst) == 1
+        });
         assert_eq!(&*events.lock(), &["output", "removed"]);
         assert_eq!(kills.load(Ordering::SeqCst), 1);
         mux.add_pane(&pane)
@@ -5174,6 +6749,7 @@ mod tests {
                 pane: Arc::clone(&pane),
                 kill: true,
                 lifecycle_notification,
+                cleanup_complete: Arc::new(AtomicBool::new(false)),
             },
         );
         drop(dispatch);
@@ -5382,13 +6958,735 @@ mod tests {
         mux.remove_pane_if_same(102, &pane);
         mux.add_pane(&pane)
             .expect("same Arc should receive a fresh generation");
-        mux.remove_pane_registration(delayed);
+        assert!(
+            !delayed.retire_if_current(),
+            "a retired handle must not remove a replacement generation",
+        );
 
         assert!(
             mux.get_pane(102)
                 .is_some_and(|registered| Arc::ptr_eq(&registered, &pane)),
             "delayed cleanup for the old generation must preserve the replacement",
         );
+    }
+
+    #[test]
+    fn pane_registration_handle_fails_after_same_arc_reregistration() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(131, test_size());
+
+        mux.add_pane(&pane).expect("initial registration");
+        let stale = mux
+            .capture_pane_registration(&pane)
+            .expect("initial handle");
+
+        mux.remove_pane_if_same(131, &pane);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+
+        mux.add_pane(&pane).expect("same Arc replacement");
+        let current = mux
+            .capture_pane_registration(&pane)
+            .expect("replacement handle");
+
+        assert!(!stale.same_registration(&current));
+        assert_eq!(stale.try_with_current(|_| ()), None);
+        assert_eq!(stale.try_with_current_output(|_| ()), None);
+        assert!(!stale.retire_if_current());
+
+        assert_eq!(
+            current.try_with_current(|resolved| {
+                assert_eq!(resolved.pane_id(), 131);
+            }),
+            Some(()),
+        );
+    }
+
+    #[test]
+    fn pane_registration_handle_preserves_originating_mux_after_global_replacement() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let originating_mux = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let (originating_pane, _) = KillCountingPane::new(132, test_size());
+        let (replacement_pane, _) = KillCountingPane::new(132, test_size());
+
+        originating_mux
+            .add_pane(&originating_pane)
+            .expect("origin registration");
+        replacement_mux
+            .add_pane(&replacement_pane)
+            .expect("replacement mux should register its distinct same-ID pane");
+
+        let handle = originating_mux
+            .capture_pane_registration(&originating_pane)
+            .expect("origin handle");
+
+        let origin_outputs = Arc::new(AtomicUsize::new(0));
+        let observed_origin = Arc::clone(&origin_outputs);
+        originating_mux
+            .subscribe(move |event| {
+                if matches!(event, MuxNotification::PaneOutput(132)) {
+                    observed_origin.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("origin subscription");
+
+        let replacement_outputs = Arc::new(AtomicUsize::new(0));
+        let observed_replacement = Arc::clone(&replacement_outputs);
+        replacement_mux
+            .subscribe(move |event| {
+                if matches!(event, MuxNotification::PaneOutput(132)) {
+                    observed_replacement.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("replacement subscription");
+
+        Mux::set_mux(&originating_mux);
+        Mux::set_mux(&replacement_mux);
+
+        assert_eq!(
+            handle.try_with_current_output(|output| {
+                assert_eq!(output.pane_id(), 132);
+                output.perform_actions(vec![Action::Print('x')]);
+            }),
+            Some(()),
+        );
+        originating_mux.flush_pending_pane_output_notifications();
+
+        assert_eq!(origin_outputs.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement_outputs.load(Ordering::SeqCst), 0);
+        assert!(
+            Mux::try_get().is_some_and(|mux| Arc::ptr_eq(&mux, &replacement_mux)),
+            "the handle must not replace or consult the global mux",
+        );
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn panicking_handle_output_closure_releases_lease_before_removal() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(133, test_size());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&events);
+        let observed_kills = Arc::clone(&kills);
+
+        mux.subscribe(move |event| {
+            match event {
+                MuxNotification::PaneOutput(133) => {
+                    assert_eq!(observed_kills.load(Ordering::SeqCst), 0);
+                    observed.lock().push("output");
+                }
+                MuxNotification::PaneRemoved(133) => {
+                    assert_eq!(observed_kills.load(Ordering::SeqCst), 1);
+                    observed.lock().push("removed");
+                }
+                _ => {}
+            }
+            true
+        })
+        .expect("subscription");
+
+        mux.add_pane(&pane).expect("registration");
+        let handle = mux
+            .capture_pane_registration(&pane)
+            .expect("registration handle");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = handle.try_with_current_output::<()>(|output| {
+                output.perform_actions(vec![Action::Print('x')]);
+                panic!("intentional output-closure panic");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            handle.active_operation_count(),
+            0,
+            "unwind must release the output operation lease",
+        );
+
+        mux.remove_pane_if_same(133, &pane);
+        mux.flush_pending_pane_output_notifications();
+
+        assert_eq!(&*events.lock(), &["output", "removed"]);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert!(mux.pending_pane_output.lock().queued.is_empty());
+        assert!(mux.pending_pane_output.lock().notifications.is_empty());
+        assert!(mux.pending_pane_lifecycle.lock().by_pane.is_empty());
+        assert!(mux.pending_pane_lifecycle.lock().retirements.is_empty());
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn pane_registration_handle_runs_external_output_closure_without_mux_locks() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _) = KillCountingPane::new(134, test_size());
+        mux.add_pane(&pane).expect("registration");
+        let handle = mux
+            .capture_pane_registration(&pane)
+            .expect("registration handle");
+
+        assert_eq!(
+            handle.try_with_current_output(|output| {
+                assert!(mux.pane_registration.try_lock().is_some());
+                assert!(mux.panes.try_write().is_some());
+                assert!(mux.pending_pane_output.try_lock().is_some());
+                assert!(mux.pending_pane_lifecycle.try_lock().is_some());
+                assert!(mux.retiring_pane_ids.try_lock().is_some());
+                assert!(mux.subscribers.try_write().is_some());
+                output.perform_actions(vec![Action::Print('x')]);
+            }),
+            Some(()),
+        );
+
+        mux.flush_pending_pane_output_notifications();
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn pane_registration_handle_does_not_retain_pane() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(135, test_size());
+        let weak_pane = Arc::downgrade(&pane);
+
+        mux.add_pane(&pane).expect("registration");
+        let handle = mux
+            .capture_pane_registration(&pane)
+            .expect("registration handle");
+
+        assert!(handle.detach_local_if_current());
+        assert!(mux.get_pane(135).is_none());
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "local detach must never call Pane::kill",
+        );
+
+        drop(pane);
+        assert!(
+            weak_pane.upgrade().is_none(),
+            "the surviving handle must contain no strong pane reference",
+        );
+        assert_eq!(handle.try_with_current(|_| ()), None);
+    }
+
+    #[test]
+    fn pane_registration_handle_fails_closed_after_different_arc_replacement() {
+        let mux = Arc::new(Mux::new(None));
+        let (original, original_kills) = KillCountingPane::new(136, test_size());
+        let (replacement, replacement_kills) = KillCountingPane::new(136, test_size());
+
+        mux.add_pane(&original).expect("original registration");
+        let stale = mux
+            .capture_pane_registration(&original)
+            .expect("original handle");
+        assert!(stale.retire_if_current());
+        assert_eq!(original_kills.load(Ordering::SeqCst), 1);
+
+        mux.add_pane(&replacement)
+            .expect("different Arc replacement");
+        let current = mux
+            .capture_pane_registration(&replacement)
+            .expect("replacement handle");
+
+        assert!(!stale.same_registration(&current));
+        assert_eq!(stale.try_with_current(|_| ()), None);
+        assert_eq!(stale.try_with_current_output(|_| ()), None);
+        assert!(!stale.retire_if_current());
+        assert_eq!(replacement_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(current.try_with_current(|pane| pane.pane_id()), Some(136),);
+    }
+
+    #[test]
+    fn pane_registration_slot_rebind_does_not_retarget_queued_clone() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _) = KillCountingPane::new(137, test_size());
+        let slot = Arc::new(PaneRegistrationSlot::default());
+
+        mux.add_pane(&pane).expect("original registration");
+        let original = mux
+            .capture_pane_registration(&pane)
+            .expect("original handle");
+        slot.reserve(original.clone())
+            .expect("unbound slot accepts original reservation")
+            .commit()
+            .expect("original reservation commits")
+            .finalize();
+        let queued = slot.load().expect("queued work captures original handle");
+
+        assert!(original.detach_local_if_current());
+        mux.add_pane(&pane).expect("same Arc replacement");
+        let replacement = mux
+            .capture_pane_registration(&pane)
+            .expect("replacement handle");
+        slot.reserve(replacement.clone())
+            .expect("retired slot accepts replacement reservation")
+            .commit()
+            .expect("replacement reservation commits")
+            .finalize();
+
+        assert!(!queued.same_registration(&replacement));
+        assert_eq!(queued.try_with_current(|_| ()), None);
+        assert!(
+            slot.load()
+                .is_some_and(|bound| bound.same_registration(&replacement)),
+            "rebinding changes only future admissions",
+        );
+    }
+
+    #[test]
+    fn pane_registration_slot_rejects_a_second_live_mux_owner() {
+        let first_mux = Arc::new(Mux::new(None));
+        let second_mux = Arc::new(Mux::new(None));
+        let (pane, _) = KillCountingPane::new(151, test_size());
+
+        first_mux
+            .add_pane(&pane)
+            .expect("first mux should publish the pane");
+        let err = second_mux
+            .add_pane(&pane)
+            .expect_err("same pane object must not acquire a second live mux owner");
+
+        assert!(err
+            .to_string()
+            .contains("already bound to a live or draining mux registration"));
+        assert!(second_mux.get_pane(151).is_none());
+        assert!(
+            first_mux
+                .capture_pane_registration(&pane)
+                .is_some_and(|registration| {
+                    registration.try_with_current(|pane| pane.pane_id()) == Some(151)
+                }),
+            "the rejected publication must leave the first owner authoritative",
+        );
+    }
+
+    #[test]
+    fn pane_registration_slot_rejects_rebind_after_owner_destruction_without_cleanup() {
+        let first_mux = Arc::new(Mux::new(None));
+        let weak_first_mux = Arc::downgrade(&first_mux);
+        let second_mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(155, test_size());
+
+        first_mux
+            .add_pane(&pane)
+            .expect("first mux should publish the pane");
+        let stale = first_mux
+            .capture_pane_registration(&pane)
+            .expect("first registration handle");
+
+        drop(first_mux);
+        assert!(
+            weak_first_mux.upgrade().is_none(),
+            "the first owner must be destroyed before the pane is rebound",
+        );
+        assert_eq!(stale.try_with_current(|_| ()), None);
+        assert_eq!(stale.try_with_current_output(|_| ()), None);
+        assert!(!stale.retire_if_current());
+
+        let err = second_mux
+            .add_pane(&pane)
+            .expect_err("owner death cannot prove detached subscriber work is quiescent");
+        assert!(err
+            .to_string()
+            .contains("already bound to a live or draining mux registration"));
+        assert!(second_mux.get_pane(155).is_none());
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "rejecting an unproven rebind must not kill the retained pane",
+        );
+    }
+
+    #[test]
+    fn pane_slot_rebind_waits_for_claimed_cleanup_after_owner_destruction() {
+        let _guard = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let first_mux = Arc::new(Mux::new(None));
+        let weak_first_mux = Arc::downgrade(&first_mux);
+        let second_mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(156, test_size());
+
+        first_mux
+            .add_pane(&pane)
+            .expect("first mux should publish the pane");
+        let stale = first_mux
+            .capture_pane_registration(&pane)
+            .expect("first registration handle");
+        let generation = Arc::clone(
+            &first_mux
+                .panes
+                .read()
+                .get(&156)
+                .expect("first generation should be live")
+                .generation,
+        );
+        let admitted = generation
+            .try_acquire()
+            .expect("the live generation should admit one operation");
+
+        first_mux.remove_pane_if_same_generation(156, &pane, &generation);
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+
+        std::thread::spawn(move || drop(admitted))
+            .join()
+            .expect("operation release should not panic");
+        drop(first_mux);
+        assert!(weak_first_mux.upgrade().is_none());
+
+        let err = second_mux
+            .add_pane(&pane)
+            .expect_err("a claimed old-generation kill must fence rebinding");
+        assert!(err
+            .to_string()
+            .contains("already bound to a live or draining mux registration"));
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+
+        executor.run_until(Duration::from_secs(30), || {
+            kills.load(Ordering::SeqCst) == 1
+        });
+        second_mux
+            .add_pane(&pane)
+            .expect("completed old-generation cleanup should release the slot");
+        let current = second_mux
+            .capture_pane_registration(&pane)
+            .expect("replacement registration handle");
+
+        assert!(!stale.same_registration(&current));
+        assert_eq!(stale.try_with_current(|_| ()), None);
+        assert!(!stale.retire_if_current());
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert_eq!(current.try_with_current(|pane| pane.pane_id()), Some(156),);
+    }
+
+    #[test]
+    fn pane_slot_rebind_remains_fenced_after_full_owner_field_teardown() {
+        let first_mux = Arc::new(Mux::new(None));
+        let weak_first_mux = Arc::downgrade(&first_mux);
+        let second_mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(157, test_size());
+        let (drop_entered_tx, drop_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (drop_release_tx, drop_release_rx) = std::sync::mpsc::sync_channel(1);
+        let teardown_latch = BlockingDropLatch {
+            entered: drop_entered_tx,
+            release: StdMutex::new(drop_release_rx),
+        };
+
+        first_mux
+            .subscribe(move |_| {
+                let _keep_latch_alive = &teardown_latch;
+                true
+            })
+            .expect("teardown latch subscriber should register");
+        first_mux
+            .add_pane(&pane)
+            .expect("first mux should publish the pane");
+
+        let drop_thread = std::thread::spawn(move || drop(first_mux));
+        drop_entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("owner teardown should reach the blocking subscriber");
+        assert!(
+            weak_first_mux.upgrade().is_none(),
+            "Arc weak death is visible before owner field teardown completes",
+        );
+
+        let err = second_mux
+            .add_pane(&pane)
+            .expect_err("weak-owner death alone must not authorize rebinding");
+        assert!(err
+            .to_string()
+            .contains("already bound to a live or draining mux registration"));
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+
+        drop_release_tx
+            .send(())
+            .expect("owner teardown latch should release");
+        drop_thread.join().expect("owner teardown should not panic");
+        let err = second_mux
+            .add_pane(&pane)
+            .expect_err("owner field teardown cannot prove detached work is quiescent");
+        assert!(err
+            .to_string()
+            .contains("already bound to a live or draining mux registration"));
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert!(second_mux.get_pane(157).is_none());
+    }
+
+    #[test]
+    fn unfinalized_pane_registration_commit_rolls_back_the_slot() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _) = KillCountingPane::new(153, test_size());
+        mux.add_pane(&pane).expect("test pane registration");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("test registration handle");
+        let slot = Arc::new(PaneRegistrationSlot::default());
+
+        let commit = slot
+            .reserve(registration.clone())
+            .expect("unbound test slot accepts reservation")
+            .commit()
+            .expect("test reservation commits");
+        assert!(slot
+            .load()
+            .is_some_and(|bound| bound.same_registration(&registration)));
+        drop(commit);
+        assert!(
+            slot.load().is_none(),
+            "dropping an unfinalized commit must hide the unpublished handle",
+        );
+    }
+
+    #[test]
+    fn pane_slot_rebind_waits_until_removed_subscribers_finish() {
+        let first_mux = Arc::new(Mux::new(None));
+        let second_mux = Arc::new(Mux::new(None));
+        let (pane, _) = KillCountingPane::new(154, test_size());
+        first_mux
+            .add_pane(&pane)
+            .expect("first mux should publish the pane");
+        let registration = first_mux
+            .capture_pane_registration(&pane)
+            .expect("first registration handle");
+
+        let attempted = Arc::new(AtomicBool::new(false));
+        let rejected = Arc::new(AtomicBool::new(false));
+        let attempted_for_subscriber = Arc::clone(&attempted);
+        let rejected_for_subscriber = Arc::clone(&rejected);
+        let second_mux_for_subscriber = Arc::clone(&second_mux);
+        let pane_for_subscriber = Arc::clone(&pane);
+        first_mux
+            .subscribe(move |notification| {
+                if matches!(notification, MuxNotification::PaneRemoved(154)) {
+                    attempted_for_subscriber.store(true, Ordering::SeqCst);
+                    rejected_for_subscriber.store(
+                        second_mux_for_subscriber
+                            .add_pane(&pane_for_subscriber)
+                            .is_err(),
+                        Ordering::SeqCst,
+                    );
+                }
+                true
+            })
+            .expect("test subscriber identifier");
+
+        assert!(registration.retire_if_current());
+        assert!(attempted.load(Ordering::SeqCst));
+        assert!(
+            rejected.load(Ordering::SeqCst),
+            "old removal subscribers must finish before another mux can bind the pane",
+        );
+        second_mux
+            .add_pane(&pane)
+            .expect("completed removal lifecycle should release the pane slot");
+    }
+
+    #[test]
+    fn failed_pane_preparation_releases_its_slot_reservation() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, _) = KillCountingPane::new_with_reader(
+            152,
+            test_size(),
+            Some(Box::new(std::io::empty())),
+            false,
+        );
+
+        mux.fail_next_pane_reader_preparation(PaneReaderPreparationFault::Socketpair);
+        let err = mux
+            .add_pane(&pane)
+            .expect_err("injected preparation failure should reject publication");
+        assert!(err
+            .to_string()
+            .contains("injected pane reader socketpair failure"));
+        assert!(mux.get_pane(152).is_none());
+
+        mux.add_pane(&pane)
+            .expect("dropped reservation must permit a later publication");
+        assert!(mux.get_pane(152).is_some());
+    }
+
+    #[test]
+    fn pane_registration_handle_does_not_retain_mux() {
+        let handle = {
+            let mux = Arc::new(Mux::new(None));
+            let weak_mux = Arc::downgrade(&mux);
+            let (pane, _) = KillCountingPane::new(138, test_size());
+            mux.add_pane(&pane).expect("registration");
+            let handle = mux
+                .capture_pane_registration(&pane)
+                .expect("registration handle");
+            assert!(handle.detach_local_if_current());
+            drop(pane);
+            drop(mux);
+            assert!(
+                weak_mux.upgrade().is_none(),
+                "a surviving handle must not keep its owner mux alive",
+            );
+            handle
+        };
+
+        assert_eq!(handle.try_with_current(|_| ()), None);
+    }
+
+    #[test]
+    fn delayed_tab_close_stays_bound_to_origin_registration_across_mux_swap() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let origin = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let (origin_pane, origin_kills) = KillCountingPane::new(139, test_size());
+        let (foreign_pane, foreign_kills) = KillCountingPane::new(139, test_size());
+        let tab = Arc::new(Tab::new(&test_size()));
+        tab.assign_pane(&origin_pane);
+        origin
+            .add_tab_and_active_pane(&tab)
+            .expect("origin tab registration");
+        replacement_mux
+            .add_pane(&foreign_pane)
+            .expect("independent mux may reuse the process-local pane value");
+        let delayed = origin
+            .capture_pane_registration(&origin_pane)
+            .expect("pre-confirmation registration handle");
+
+        Mux::set_mux(&replacement_mux);
+        assert!(tab.kill_pane_registration(&delayed));
+        assert_eq!(origin_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(foreign_kills.load(Ordering::SeqCst), 0);
+        assert!(origin.get_pane(139).is_none());
+        assert!(
+            replacement_mux
+                .get_pane(139)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &foreign_pane)),
+            "the current singleton's same-ID pane must remain untouched",
+        );
+
+        let (origin_successor, successor_kills) = KillCountingPane::new(139, test_size());
+        tab.assign_pane(&origin_successor);
+        origin
+            .add_pane(&origin_successor)
+            .expect("origin may publish a later same-ID registration");
+
+        assert!(!tab.kill_pane_registration(&delayed));
+        assert_eq!(successor_kills.load(Ordering::SeqCst), 0);
+        assert!(tab.contains_pane(139));
+        assert!(origin
+            .get_pane(139)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &origin_successor)),);
+
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn exact_title_updates_ignore_global_mux_and_allow_reentrant_getters() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let origin = Arc::new(Mux::new(None));
+        let replacement = Arc::new(Mux::new(None));
+        let window = origin.new_empty_window(Some("titles".to_string()), None);
+        let window_id = *window;
+        let tab = Arc::new(Tab::new(&test_size()));
+        origin
+            .add_tab_no_panes(&tab)
+            .expect("title test tab registration");
+        origin
+            .add_tab_to_window(&tab, window_id)
+            .expect("title test window attachment");
+
+        let origin_notifications = Arc::new(AtomicUsize::new(0));
+        let observed_origin = Arc::clone(&origin_notifications);
+        let weak_origin = Arc::downgrade(&origin);
+        let tab_id = tab.tab_id();
+        origin
+            .subscribe(move |notification| {
+                if matches!(
+                    notification,
+                    MuxNotification::WindowTitleChanged { .. }
+                        | MuxNotification::TabTitleChanged { .. }
+                ) {
+                    let mux = weak_origin
+                        .upgrade()
+                        .expect("origin must remain live during callback");
+                    assert!(mux.get_window(window_id).is_some());
+                    assert!(mux.get_tab(tab_id).is_some());
+                    observed_origin.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("origin subscription");
+
+        let replacement_notifications = Arc::new(AtomicUsize::new(0));
+        let observed_replacement = Arc::clone(&replacement_notifications);
+        replacement
+            .subscribe(move |notification| {
+                if matches!(
+                    notification,
+                    MuxNotification::WindowTitleChanged { .. }
+                        | MuxNotification::TabTitleChanged { .. }
+                ) {
+                    observed_replacement.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("replacement subscription");
+
+        Mux::set_mux(&replacement);
+        assert!(origin.set_window_title(window_id, "origin window"));
+        assert!(origin.set_tab_title(tab_id, "origin tab"));
+        assert_eq!(origin_notifications.load(Ordering::SeqCst), 2);
+        assert_eq!(replacement_notifications.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            origin
+                .get_window(window_id)
+                .expect("origin window")
+                .get_title(),
+            "origin window",
+        );
+        assert_eq!(tab.get_title(), "origin tab");
+
+        drop(window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn batch_registration_retirement_recomputes_pane_count_once() {
+        let mux = Arc::new(Mux::new(None));
+        let mut handles = Vec::new();
+        let mut kill_counters = Vec::new();
+        for pane_id in 142..150 {
+            let (pane, kills) = KillCountingPane::new(pane_id, test_size());
+            mux.add_pane(&pane).expect("batch pane registration");
+            handles.push(
+                mux.capture_pane_registration(&pane)
+                    .expect("batch registration handle"),
+            );
+            kill_counters.push(kills);
+        }
+        mux.pane_count_recomputes.store(0, Ordering::Relaxed);
+
+        assert_eq!(PaneRegistrationHandle::retire_batch_if_current(handles), 8,);
+        assert_eq!(
+            mux.pane_count_recomputes.load(Ordering::Relaxed),
+            1,
+            "one owner batch must scan topology only once",
+        );
+        for (offset, kills) in kill_counters.into_iter().enumerate() {
+            let pane_id = 142 + offset;
+            assert_eq!(kills.load(Ordering::SeqCst), 1);
+            assert!(mux.get_pane(pane_id).is_none());
+        }
     }
 
     #[test]
@@ -5625,6 +7923,14 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 0);
         assert!(mux.get_pane(121).is_none());
         assert_eq!(&*events.lock(), &["added", "removed"]);
+        assert_eq!(
+            pane.downcast_ref::<KillCountingPane>()
+                .expect("test pane should retain its concrete type")
+                .binds
+                .load(Ordering::SeqCst),
+            0,
+            "a PaneAdded subscriber that retires the generation must suppress its stale bind hook"
+        );
     }
 
     #[test]
@@ -5690,7 +7996,7 @@ mod tests {
         let reader = std::io::Cursor::new(b"o".to_vec());
         let (originating_pane, _) =
             KillCountingPane::new_with_reader(123, test_size(), Some(Box::new(reader)), false);
-        let replacement_pane = Arc::clone(&originating_pane);
+        let (replacement_pane, _) = KillCountingPane::new(123, test_size());
 
         let (added_entered_tx, added_entered_rx) = std::sync::mpsc::channel();
         let (release_added_tx, release_added_rx) = std::sync::mpsc::channel();
@@ -5726,7 +8032,7 @@ mod tests {
             .expect("origin PaneAdded callback should pause release");
         replacement_mux
             .add_pane(&replacement_pane)
-            .expect("replacement mux should register the exact same pane Arc");
+            .expect("replacement mux should register its distinct same-ID pane");
         Mux::set_mux(&replacement_mux);
         release_added_tx
             .send(())
@@ -6412,6 +8718,7 @@ mod tests {
                 .expect("pane preparation should succeed");
             mux.spawn_prepared_pane_reader(&pane, prepared, &preparation_claim.generation)
                 .expect("reader thread should spawn")
+                .0
                 .expect("pane reader should produce a start gate")
         };
 
@@ -7208,8 +9515,18 @@ mod tests {
 
         Mux::set_mux(&mux);
         mux.enqueue_pane_output_notification(7);
+        let weak_mux = Arc::downgrade(&mux);
         Mux::shutdown();
+        assert_eq!(
+            Arc::strong_count(&mux),
+            1,
+            "only the test's local owner may retain a mux after singleton shutdown",
+        );
         drop(mux);
+        assert!(
+            weak_mux.upgrade().is_none(),
+            "pane registrations and deferred drain state must not form a strong mux cycle",
+        );
         executor
             .tick()
             .expect("scheduled pane-output drain should run");
@@ -7324,6 +9641,58 @@ mod tests {
             &*pane_outputs.lock(),
             &[7, 8],
             "the unrelated open batch must remain independently drainable",
+        );
+
+        executor
+            .tick()
+            .expect("scheduled pane-output drain should run");
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn tab_removal_force_seals_output_before_removed_and_preserves_unrelated_batch() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let (tab, tab_pane_kills) = tab_with_kill_counter(&mux, 140);
+        let _unrelated_pane = register_test_pane(&mux, 141);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&events);
+        mux.subscribe(move |notification| {
+            match notification {
+                MuxNotification::PaneOutput(140) => observed.lock().push("tab-output"),
+                MuxNotification::PaneRemoved(140) => observed.lock().push("tab-removed"),
+                MuxNotification::PaneOutput(141) => observed.lock().push("unrelated-output"),
+                _ => {}
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        mux.enqueue_pane_output_notification(140);
+        mux.enqueue_pane_output_notification(141);
+        mux.remove_tab(tab.tab_id())
+            .expect("tab and its exact pane registration should be removed");
+
+        assert_eq!(
+            &*events.lock(),
+            &["tab-output", "tab-removed"],
+            "accepted tab output must publish before its removal lifecycle",
+        );
+        assert_eq!(tab_pane_kills.load(Ordering::SeqCst), 1);
+        {
+            let pending = mux.pending_pane_output.lock();
+            assert!(!pending.queued.contains_key(&140));
+            assert!(pending.queued.contains_key(&141));
+        }
+
+        mux.flush_pending_pane_output_notifications();
+        assert_eq!(
+            &*events.lock(),
+            &["tab-output", "tab-removed", "unrelated-output"],
+            "tab cleanup must not erase another pane's independently open batch",
         );
 
         executor
@@ -7535,6 +9904,79 @@ mod tests {
     }
 
     #[test]
+    fn explicit_removal_of_unpublished_window_suppresses_both_lifecycle_edges() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let lifecycles = Arc::new(Mutex::new(Vec::new()));
+        let lifecycles_for_subscriber = Arc::clone(&lifecycles);
+        mux.subscribe(move |notification| {
+            match notification {
+                MuxNotification::WindowCreated(window_id) => {
+                    lifecycles_for_subscriber
+                        .lock()
+                        .push(("created", window_id));
+                }
+                MuxNotification::WindowRemoved(window_id) => {
+                    lifecycles_for_subscriber
+                        .lock()
+                        .push(("removed", window_id));
+                }
+                _ => {}
+            }
+            true
+        })
+        .expect("provisional lifecycle subscriber should allocate an identifier");
+
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+        mux.kill_window(window_id);
+        drop(window_builder);
+
+        assert!(
+            lifecycles.lock().is_empty(),
+            "an unpublished provisional window must emit neither Removed nor a later Created"
+        );
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn pruning_never_reaps_an_unpublished_provisional_window() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+
+        mux.prune_dead_windows();
+        assert!(
+            mux.get_window(window_id).is_some(),
+            "activity-aware pruning must preserve the provisional window",
+        );
+
+        mux.prune_dead_windows_ignoring_activity();
+        assert!(
+            mux.get_window(window_id).is_some(),
+            "pane-retirement pruning must not bypass provisional publication authority",
+        );
+        assert!(
+            mux.provisional_windows.lock().contains(&window_id),
+            "pruning must not consume the builder's publication marker",
+        );
+
+        window_builder.cancel();
+        assert!(
+            mux.get_window(window_id).is_none(),
+            "the exact builder must retain cancellation authority after both prune paths",
+        );
+        Mux::shutdown();
+    }
+
+    #[test]
     fn window_builder_non_main_drop_without_scheduler_notifies() {
         let _guard = global_test_lock();
         Mux::shutdown();
@@ -7594,7 +10036,7 @@ mod tests {
         let _guard = global_test_lock();
         Mux::shutdown();
 
-        let executor = promise::spawn::SimpleExecutor::new();
+        let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         Mux::set_mux(&mux);
 
@@ -7623,16 +10065,273 @@ mod tests {
         let tab = Arc::new(Tab::new(&size));
         mux.add_tab_no_panes(&tab)
             .expect("test tab should register");
-        mux.add_tab_to_window(&tab, window_id)
-            .expect("tab should be added to test window");
+        let mux_for_thread = Arc::clone(&mux);
+        let tab_for_thread = Arc::clone(&tab);
+        std::thread::spawn(move || {
+            mux_for_thread
+                .add_tab_to_window(&tab_for_thread, window_id)
+                .expect("tab should be added to test window");
+        })
+        .join()
+        .expect("off-main window mutation should not panic");
 
         assert!(!observed.load(Ordering::Relaxed));
-        executor
-            .tick()
-            .expect("window invalidation should be scheduled");
+        executor.run_until(Duration::from_secs(5), || observed.load(Ordering::Relaxed));
         assert!(observed.load(Ordering::Relaxed));
 
         drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_notifications_are_fifo_and_allow_reentrant_window_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let _executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_subscriber = Arc::clone(&events);
+        let did_reenter = Arc::new(AtomicBool::new(false));
+        let did_reenter_for_subscriber = Arc::clone(&did_reenter);
+        let mux_for_subscriber = Arc::clone(&mux);
+        mux.subscribe(move |notification| {
+            match notification {
+                MuxNotification::WindowInvalidated(id) if id == window_id => {
+                    events_for_subscriber.lock().push("invalidated");
+                    if !did_reenter_for_subscriber.swap(true, Ordering::SeqCst) {
+                        let mut window = mux_for_subscriber
+                            .get_window_mut(id)
+                            .expect("subscriber must re-enter after the map lock is released");
+                        window.set_workspace("reentrant-workspace");
+                    }
+                }
+                MuxNotification::TabAddedToWindow { window_id: id, .. } if id == window_id => {
+                    events_for_subscriber.lock().push("tab-added")
+                }
+                MuxNotification::WindowWorkspaceChanged(id) if id == window_id => {
+                    events_for_subscriber.lock().push("workspace-changed");
+                }
+                _ => {}
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab)
+            .expect("test tab should register");
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("tab should be added to test window");
+
+        assert_eq!(
+            &*events.lock(),
+            &["invalidated", "tab-added", "workspace-changed"],
+            "a reentrant event appends behind notifications already admitted at the mutation point",
+        );
+        assert_eq!(
+            mux.get_window(window_id)
+                .expect("test window should remain registered")
+                .get_workspace(),
+            "reentrant-workspace",
+        );
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_notification_fifo_stays_bound_to_origin_across_global_mux_swap() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let _executor = BoundedTestExecutor::new();
+        let origin = Arc::new(Mux::new(None));
+        let replacement = Arc::new(Mux::new(None));
+        let window_builder = origin.new_empty_window(None, None);
+        let window_id = *window_builder;
+
+        let origin_events = Arc::new(Mutex::new(Vec::new()));
+        let origin_events_for_subscriber = Arc::clone(&origin_events);
+        origin
+            .subscribe(move |notification| {
+                match notification {
+                    MuxNotification::WindowInvalidated(id) if id == window_id => {
+                        origin_events_for_subscriber.lock().push("invalidated");
+                    }
+                    MuxNotification::TabAddedToWindow { window_id: id, .. } if id == window_id => {
+                        origin_events_for_subscriber.lock().push("tab-added");
+                    }
+                    MuxNotification::WindowCreated(id) if id == window_id => {
+                        origin_events_for_subscriber.lock().push("created");
+                    }
+                    _ => {}
+                }
+                true
+            })
+            .expect("origin subscription");
+
+        let replacement_events = Arc::new(AtomicUsize::new(0));
+        let replacement_events_for_subscriber = Arc::clone(&replacement_events);
+        replacement
+            .subscribe(move |notification| {
+                if matches!(
+                    notification,
+                    MuxNotification::WindowInvalidated(_)
+                        | MuxNotification::TabAddedToWindow { .. }
+                        | MuxNotification::WindowCreated(_)
+                ) {
+                    replacement_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("replacement subscription");
+
+        Mux::set_mux(&replacement);
+        let tab = Arc::new(Tab::new(&test_size()));
+        origin
+            .add_tab_no_panes(&tab)
+            .expect("origin tab should register");
+        origin
+            .add_tab_to_window(&tab, window_id)
+            .expect("origin window should accept the tab");
+        drop(window_builder);
+
+        assert_eq!(
+            &*origin_events.lock(),
+            &["invalidated", "tab-added", "created"],
+        );
+        assert_eq!(replacement_events.load(Ordering::SeqCst), 0);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn deferred_window_focus_loss_targets_the_exact_pane_at_removal() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+
+        let first_tab = Arc::new(Tab::new(&test_size()));
+        let (first_pane, first_focus) = KillCountingPane::new_with_focus_counter(451, test_size());
+        first_tab.assign_pane(&first_pane);
+        mux.add_tab_and_active_pane(&first_tab)
+            .expect("first tab and pane should publish");
+
+        let second_tab = Arc::new(Tab::new(&test_size()));
+        let (second_pane, second_focus) =
+            KillCountingPane::new_with_focus_counter(452, test_size());
+        second_tab.assign_pane(&second_pane);
+        mux.add_tab_and_active_pane(&second_tab)
+            .expect("second tab and pane should publish");
+
+        mux.add_tab_to_window(&first_tab, window_id)
+            .expect("first tab should enter the window");
+        mux.add_tab_to_window(&second_tab, window_id)
+            .expect("second tab should enter the window");
+
+        let mux_for_thread = Arc::clone(&mux);
+        std::thread::spawn(move || {
+            mux_for_thread
+                .get_window_mut(window_id)
+                .expect("test window should remain registered")
+                .remove_by_idx(0);
+        })
+        .join()
+        .expect("off-main active-tab removal should not panic");
+
+        let (later_pane, later_focus) = KillCountingPane::new_with_focus_counter(453, test_size());
+        first_tab
+            .add_floating_pane(
+                later_pane,
+                crate::tab::FloatingPaneRect {
+                    left: 1,
+                    top: 1,
+                    width: 20,
+                    height: 10,
+                },
+            )
+            .expect("removed tab should accept a later active pane");
+        first_focus.lock().clear();
+        later_focus.lock().clear();
+
+        executor.run_until(Duration::from_secs(5), || !first_focus.lock().is_empty());
+        assert_eq!(
+            &*first_focus.lock(),
+            &[false],
+            "the pane active at removal linearization must receive one focus loss",
+        );
+        assert!(
+            later_focus.lock().is_empty(),
+            "changing the removed tab before drain must not retarget focus loss",
+        );
+        assert!(
+            second_focus.lock().is_empty(),
+            "the newly active tab must not receive the prior tab's focus loss",
+        );
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn provisional_cancel_publishes_topology_that_won_the_race() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let _executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+        let created_events = Arc::new(AtomicUsize::new(0));
+        let created_events_for_subscriber = Arc::clone(&created_events);
+        let removed_events = Arc::new(AtomicUsize::new(0));
+        let removed_events_for_subscriber = Arc::clone(&removed_events);
+        mux.subscribe(move |notification| {
+            match notification {
+                MuxNotification::WindowCreated(id) if id == window_id => {
+                    created_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+                }
+                MuxNotification::WindowRemoved(id) if id == window_id => {
+                    removed_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab)
+            .expect("racing tab should register");
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("racing tab should acquire the provisional window");
+        window_builder.cancel();
+
+        assert!(
+            mux.get_window(window_id)
+                .is_some_and(|window| window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))),
+            "cancellation must not silently tear down topology that raced into the window",
+        );
+        assert_eq!(
+            created_events.load(Ordering::SeqCst),
+            1,
+            "a surviving window must publish exactly one WindowCreated event",
+        );
+        assert_eq!(
+            removed_events.load(Ordering::SeqCst),
+            0,
+            "publishing raced live topology must not synthesize removal",
+        );
         Mux::shutdown();
     }
 
@@ -7671,6 +10370,68 @@ mod tests {
             0,
             "metadata move must not kill the pane",
         );
+
+        drop(dst_window);
+        drop(src_window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn tab_parent_conflicts_fail_without_partial_window_mutation() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let src_window = mux.new_empty_window(Some("parent-check".to_string()), None);
+        let src_window_id = *src_window;
+        let dst_window = mux.new_empty_window(Some("parent-check".to_string()), None);
+        let dst_window_id = *dst_window;
+        let (tab, _kills) = tab_with_kill_counter(&mux, 454);
+
+        mux.add_tab_to_window(&tab, src_window_id)
+            .expect("tab should acquire its one parent");
+        let duplicate_error = mux
+            .add_tab_to_window(&tab, dst_window_id)
+            .expect_err("one exact tab cannot acquire a second parent");
+        assert!(
+            duplicate_error.to_string().contains("already attached"),
+            "unexpected parent-conflict error: {:#}",
+            duplicate_error
+        );
+        assert!(
+            mux.get_window(src_window_id)
+                .is_some_and(|window| window.iter().any(|item| Arc::ptr_eq(item, &tab))),
+            "failed attachment must preserve the source parent",
+        );
+        assert!(
+            mux.get_window(dst_window_id)
+                .is_some_and(|window| window.iter().all(|item| !Arc::ptr_eq(item, &tab))),
+            "failed attachment must leave the destination unchanged",
+        );
+
+        // Construct legacy-corrupt multi-parent topology through the
+        // low-level Window surface, then verify the public move refuses to
+        // choose a HashMap-order-dependent source or mutate either parent.
+        mux.get_window_mut(dst_window_id)
+            .expect("destination should remain registered")
+            .push(&tab);
+        let move_error = mux
+            .move_tab_between_windows(tab.tab_id(), dst_window_id, None)
+            .expect_err("move must reject ambiguous multi-parent topology");
+        assert!(
+            move_error.to_string().contains("has 2 parents"),
+            "unexpected ambiguous-parent error: {:#}",
+            move_error
+        );
+        for window_id in [src_window_id, dst_window_id] {
+            assert!(
+                mux.get_window(window_id)
+                    .is_some_and(|window| window.iter().any(|item| Arc::ptr_eq(item, &tab))),
+                "ambiguous move must preserve window {}",
+                window_id
+            );
+        }
 
         drop(dst_window);
         drop(src_window);

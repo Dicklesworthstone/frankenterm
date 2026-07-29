@@ -1251,9 +1251,9 @@ mod tests {
     fn local_domain_spawn_pane_first_poll_stays_non_blocking() {
         const SPAWN_DELAY: Duration = Duration::from_millis(200);
 
-        let exec = promise::spawn::ScopedExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
+        let exec = promise::spawn::ScopedExecutor::new();
         let (pty_system, spawn_calls) = SlowSpawnPtySystem::new(SPAWN_DELAY);
         let domain = LocalDomain::with_pty_system("slow-spawn-test", Box::new(pty_system));
 

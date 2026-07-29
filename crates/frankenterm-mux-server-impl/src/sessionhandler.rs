@@ -1213,11 +1213,10 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = session_mux()?;
-                            let mut window = mux
-                                .get_window_mut(window_id)
-                                .ok_or_else(|| anyhow!("no such window {window_id}"))?;
-
-                            window.set_title(&title);
+                            if mux.get_window(window_id).is_none() {
+                                return Err(anyhow!("no such window {window_id}"));
+                            }
+                            mux.set_window_title(window_id, &title);
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -1231,11 +1230,10 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = session_mux()?;
-                            let tab = mux
-                                .get_tab(tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
-
-                            tab.set_title(&title);
+                            if mux.get_tab(tab_id).is_none() {
+                                return Err(anyhow!("no such tab {tab_id}"));
+                            }
+                            mux.set_tab_title(tab_id, &title);
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -1797,6 +1795,7 @@ mod tests {
         // don't crash the test binary on a code path that's
         // semantically a no-op for a fake pane. (br-ft-35yac.3)
         writer_sink: ParkingMutex<std::io::Sink>,
+        mux_registration: Arc<mux::PaneRegistrationSlot>,
     }
 
     impl FakePane {
@@ -1811,6 +1810,7 @@ mod tests {
             Self {
                 pane_id,
                 writer_sink: ParkingMutex::new(std::io::sink()),
+                mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
                         x: 4,
@@ -1849,6 +1849,10 @@ mod tests {
     impl Pane for FakePane {
         fn pane_id(&self) -> PaneId {
             self.pane_id
+        }
+
+        fn mux_registration_slot(&self) -> &Arc<mux::PaneRegistrationSlot> {
+            &self.mux_registration
         }
 
         fn get_cursor_position(&self) -> StableCursorPosition {

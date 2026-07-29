@@ -5,7 +5,7 @@ use crate::pane::{
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
-use crate::{Domain, Mux, MuxNotification};
+use crate::{Domain, PaneRegistrationHandle, PaneRegistrationSlot};
 use anyhow::Error;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
@@ -76,6 +76,218 @@ struct CachedProcInfo {
     /// implicitly to `None` when the warm worker replaces the whole struct.
     /// See ft-qhwpq.
     cached_is_stateful: Option<bool>,
+}
+
+/// Owns one close-time process-cache warm admission.
+///
+/// The flag must be released on every worker exit, including a stale pane
+/// registration, process-tree lookup failure, thread spawn failure, or panic.
+/// Keeping that responsibility in `Drop` prevents a failed warm from
+/// permanently suppressing all later close-time refreshes.
+struct ProcListWarmPendingGuard {
+    pending: Arc<AtomicBool>,
+}
+
+impl ProcListWarmPendingGuard {
+    fn try_acquire(pending: &Arc<AtomicBool>) -> Option<Self> {
+        pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Self {
+            pending: Arc::clone(pending),
+        })
+    }
+}
+
+impl Drop for ProcListWarmPendingGuard {
+    fn drop(&mut self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct ChildExitPruneTracker {
+    child_exited: bool,
+    next_intent: u64,
+    completed_intent: u64,
+    scheduled: bool,
+    failed_registration: Option<PaneRegistrationHandle>,
+}
+
+impl ChildExitPruneTracker {
+    fn record_child_exit(&mut self) {
+        self.child_exited = true;
+        self.next_intent = self.next_intent.saturating_add(1);
+        self.failed_registration = None;
+    }
+
+    fn record_registration_bound(&mut self) -> bool {
+        self.failed_registration = None;
+        if !self.child_exited {
+            return false;
+        }
+        self.next_intent = self.next_intent.saturating_add(1);
+        true
+    }
+
+    fn has_pending_intent(&self) -> bool {
+        self.completed_intent < self.next_intent
+    }
+
+    fn record_success(&mut self, target_intent: u64) {
+        self.completed_intent = self.completed_intent.max(target_intent);
+        self.failed_registration = None;
+    }
+}
+
+/// Lossless bridge between the child waiter and mux publication.
+///
+/// A very short-lived process can exit before its pane registration is
+/// published. Loading the slot only from the waiter would then lose the prune
+/// nudge forever. This state records the exit independently and lets the
+/// post-publication hook schedule it once an exact registration exists.
+///
+/// Intents are sequenced because the same pane object may be registered again
+/// after its prior generation retires. A prune accepted for generation N must
+/// not consume a concurrent bind intent for generation N+1.
+struct ChildExitPruneState {
+    mux_registration: Arc<PaneRegistrationSlot>,
+    tracker: Mutex<ChildExitPruneTracker>,
+}
+
+impl ChildExitPruneState {
+    fn new(mux_registration: Arc<PaneRegistrationSlot>) -> Arc<Self> {
+        Arc::new(Self {
+            mux_registration,
+            tracker: Mutex::new(ChildExitPruneTracker::default()),
+        })
+    }
+
+    fn mark_child_exited(self: &Arc<Self>) {
+        self.tracker.lock().record_child_exit();
+        self.try_schedule();
+    }
+
+    fn registration_bound(self: &Arc<Self>, registration: &PaneRegistrationHandle) {
+        let should_schedule = self.tracker.lock().record_registration_bound();
+        if should_schedule {
+            self.try_schedule_with_registration(Some(registration.clone()));
+        }
+    }
+
+    fn try_schedule(self: &Arc<Self>) {
+        self.try_schedule_with_registration(self.mux_registration.load());
+    }
+
+    fn try_schedule_with_registration(
+        self: &Arc<Self>,
+        registration: Option<PaneRegistrationHandle>,
+    ) {
+        if !promise::spawn::is_scheduler_configured() {
+            return;
+        }
+        let Some(registration) = registration else {
+            return;
+        };
+
+        let target_intent = {
+            let mut tracker = self.tracker.lock();
+            if !tracker.child_exited
+                || !tracker.has_pending_intent()
+                || tracker.scheduled
+                || tracker
+                    .failed_registration
+                    .as_ref()
+                    .is_some_and(|failed| failed.same_registration(&registration))
+            {
+                return;
+            }
+            tracker.scheduled = true;
+            tracker.next_intent
+        };
+
+        let dispatch = ChildExitPruneDispatch {
+            state: Arc::clone(self),
+            registration: Some(registration),
+            target_intent,
+            finished: false,
+        };
+        promise::spawn::spawn_into_main_thread(async move {
+            dispatch.execute();
+        })
+        .detach();
+    }
+
+    fn finish_dispatch(
+        self: &Arc<Self>,
+        target_intent: u64,
+        registration: &PaneRegistrationHandle,
+        pruned: bool,
+    ) {
+        let needs_retry = {
+            let mut tracker = self.tracker.lock();
+            tracker.scheduled = false;
+            if pruned {
+                tracker.record_success(target_intent);
+            } else {
+                tracker.failed_registration = Some(registration.clone());
+            }
+            tracker.has_pending_intent()
+        };
+        if !needs_retry {
+            return;
+        }
+
+        let current = self.mux_registration.load();
+        let registration_changed = current
+            .as_ref()
+            .is_some_and(|current| !current.same_registration(registration));
+        if pruned || registration_changed {
+            self.try_schedule_with_registration(current);
+        }
+    }
+
+    fn abandon_dispatch(&self) {
+        self.tracker.lock().scheduled = false;
+    }
+}
+
+/// Makes scheduler rejection/cancellation release the single-flight slot.
+///
+/// The exit intent remains pending and can be retried by the bind hook or a
+/// later `is_dead` probe. We intentionally do not prune inline from `Drop`,
+/// because the rejected future can be dropped on a non-main child-waiter
+/// thread.
+struct ChildExitPruneDispatch {
+    state: Arc<ChildExitPruneState>,
+    registration: Option<PaneRegistrationHandle>,
+    target_intent: u64,
+    finished: bool,
+}
+
+impl ChildExitPruneDispatch {
+    fn execute(mut self) {
+        let registration = self
+            .registration
+            .take()
+            .expect("child-exit prune dispatch executes at most once");
+        let pruned = registration
+            .try_with_current(|pane| {
+                pane.prune_dead_windows();
+            })
+            .is_some();
+        self.state
+            .finish_dispatch(self.target_intent, &registration, pruned);
+        self.finished = true;
+    }
+}
+
+impl Drop for ChildExitPruneDispatch {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.state.abandon_dispatch();
+        }
+    }
 }
 
 /// Walks a process tree to find the most-recently-started descendant.
@@ -344,19 +556,22 @@ where
 pub struct LocalPane {
     pane_id: PaneId,
     terminal: Arc<Mutex<Terminal>>,
-    process: Mutex<ProcessState>,
+    process: Arc<Mutex<ProcessState>>,
     pty: Arc<Mutex<Box<dyn MasterPty>>>,
     resize_queue: Arc<Mutex<ResizeQueueState>>,
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
-    tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
-    proc_list: Mutex<Option<CachedProcInfo>>,
+    tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
+    mux_registration: Arc<PaneRegistrationSlot>,
+    child_exit_prune: Arc<ChildExitPruneState>,
+    proc_list: Arc<Mutex<Option<CachedProcInfo>>>,
+    proc_list_prime_started: AtomicBool,
     /// Single-flight guard for the background warm task that
     /// `can_close_without_prompting` spawns when its cache-only fast path
     /// misses. Prevents stacking N warm tasks if the user closes N tabs in a
     /// burst — one warm runs, the rest just see the in-progress flag and
     /// rely on it populating proc_list. See ft-qhwpq.
-    proc_list_warm_pending: AtomicBool,
+    proc_list_warm_pending: Arc<AtomicBool>,
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
@@ -373,9 +588,11 @@ pub struct LocalPane {
     action_ring: Arc<ArrayQueue<Vec<Action>>>,
 }
 
-fn record_input_for_current_identity() {
-    if let Some(mux) = Mux::try_get() {
-        mux.record_input_for_current_identity();
+fn record_input_for_current_identity(registration: &PaneRegistrationSlot) {
+    if let Some(registration) = registration.load() {
+        let _ = registration.try_with_current(|pane| {
+            pane.record_input_for_current_identity();
+        });
     }
 }
 
@@ -519,6 +736,10 @@ impl Pane for LocalPane {
     }
 
     fn is_dead(&self) -> bool {
+        // This is normally scheduled directly by the child waiter. Retrying
+        // here also recovers if the main-thread scheduler rejected or cancelled
+        // that first runnable.
+        self.child_exit_prune.try_schedule();
         let mut proc = self.process.lock();
 
         const EXIT_BEHAVIOR: &str = "This message is shown because \
@@ -617,7 +838,9 @@ impl Pane for LocalPane {
         }
 
         if let Some(notify) = notify {
-            emit_output_for_pane(self.pane_id, &notify);
+            if let Some(registration) = self.mux_registration.load() {
+                emit_output_for_pane(registration, &notify);
+            }
         }
 
         match &*proc {
@@ -629,6 +852,15 @@ impl Pane for LocalPane {
 
     fn set_clipboard(&self, clipboard: &Arc<dyn Clipboard>) {
         self.locked_terminal().set_clipboard(clipboard);
+    }
+
+    fn mux_registration_slot(&self) -> &Arc<PaneRegistrationSlot> {
+        &self.mux_registration
+    }
+
+    fn mux_registration_did_bind(&self, registration: PaneRegistrationHandle) {
+        self.child_exit_prune.registration_bound(&registration);
+        self.spawn_proc_list_prime(registration);
     }
 
     fn set_download_handler(&self, handler: &Arc<dyn DownloadHandler>) {
@@ -657,12 +889,12 @@ impl Pane for LocalPane {
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
-        record_input_for_current_identity();
+        record_input_for_current_identity(&self.mux_registration);
         self.locked_terminal().mouse_event(event)
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
-        record_input_for_current_identity();
+        record_input_for_current_identity(&self.mux_registration);
         if self.tmux_domain.lock().is_some() {
             log::trace!("key: {:?}", key);
             if key == KeyCode::Char('q') {
@@ -675,7 +907,7 @@ impl Pane for LocalPane {
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
-        record_input_for_current_identity();
+        record_input_for_current_identity(&self.mux_registration);
         self.locked_terminal().key_up(key, mods)
     }
 
@@ -684,7 +916,7 @@ impl Pane for LocalPane {
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
-        record_input_for_current_identity();
+        record_input_for_current_identity(&self.mux_registration);
         MutexGuard::map(self.writer.lock(), |writer| {
             let w: &mut dyn std::io::Write = writer;
             w
@@ -696,7 +928,7 @@ impl Pane for LocalPane {
     }
 
     fn send_paste(&self, text: &str) -> Result<(), Error> {
-        record_input_for_current_identity();
+        record_input_for_current_identity(&self.mux_registration);
         if self.tmux_domain.lock().is_some() {
             Ok(())
         } else {
@@ -1174,22 +1406,20 @@ impl Pane for LocalPane {
 
 struct LocalPaneDCSHandler {
     pane_id: PaneId,
-    tmux_domain: Option<Arc<TmuxDomainState>>,
+    tmux_domain: Arc<Mutex<Option<Arc<TmuxDomainState>>>>,
+    mux_registration: Arc<PaneRegistrationSlot>,
 }
 
-pub(crate) fn emit_output_for_pane(pane_id: PaneId, message: &str) {
+pub(crate) fn emit_output_for_pane(registration: PaneRegistrationHandle, message: &str) {
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
     parser.parse(message.as_bytes(), |action| actions.push(action));
 
     if promise::spawn::is_scheduler_configured() {
         promise::spawn::spawn_into_main_thread(async move {
-            if let Some(mux) = Mux::try_get() {
-                if let Some(pane) = mux.get_pane(pane_id) {
-                    pane.perform_actions(actions);
-                    mux.notify(MuxNotification::PaneOutput(pane_id));
-                }
-            }
+            let _ = registration.try_with_current_output(|pane| {
+                pane.perform_actions(actions);
+            });
         })
         .detach();
     }
@@ -1211,35 +1441,38 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                     let tmux_domain = Arc::clone(&domain.inner);
 
                     let domain: Arc<dyn Domain> = Arc::new(domain);
-                    let Some(mux) = Mux::try_get() else {
-                        log::warn!("ignoring tmux control mode request without mux singleton");
+                    let Some(registration) = self.mux_registration.load() else {
+                        log::warn!(
+                            "ignoring tmux control mode request for unregistered pane {}",
+                            self.pane_id
+                        );
                         return;
                     };
-                    if let Err(err) = mux.add_domain(&domain) {
+                    let binding = Arc::clone(&tmux_domain);
+                    let Some(result) = registration.try_with_current(
+                        |pane| -> Result<(), crate::DomainRegistrationError> {
+                            pane.register_domain(&domain)?;
+                            self.tmux_domain.lock().replace(binding);
+                            Ok(())
+                        },
+                    ) else {
+                        log::warn!(
+                            "ignoring tmux control mode request for stale pane registration {}",
+                            self.pane_id
+                        );
+                        return;
+                    };
+                    if let Err(err) = result {
                         log::error!(
                             "cannot register tmux control-mode domain for pane {}: {err}",
                             self.pane_id
                         );
                         return;
                     }
-
-                    if let Some(pane) = mux.get_pane(self.pane_id) {
-                        if let Some(pane) = pane.downcast_ref::<LocalPane>() {
-                            pane.tmux_domain.lock().replace(Arc::clone(&tmux_domain));
-                        } else {
-                            log::warn!(
-                                "tmux control mode pane {} is not a LocalPane",
-                                self.pane_id
-                            );
-                        }
-
-                        emit_output_for_pane(
-                            self.pane_id,
-                            "\r\n[This pane is running tmux control mode. Press q to detach]",
-                        );
-                    }
-
-                    self.tmux_domain.replace(tmux_domain);
+                    emit_output_for_pane(
+                        registration,
+                        "\r\n[This pane is running tmux control mode. Press q to detach]",
+                    );
 
                     // Initial tmux enumeration is driven by control-mode events:
                     // SessionChanged -> ListCommands -> ListAllWindows ->
@@ -1250,20 +1483,9 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                 }
             }
             DeviceControlMode::Exit => {
-                if let Some(tmux) = self.tmux_domain.take() {
+                let tmux = self.tmux_domain.lock().take();
+                if let Some(tmux) = tmux {
                     tmux.transition_to_clean_exit();
-                    if let Some(mux) = Mux::try_get() {
-                        if let Some(pane) = mux.get_pane(self.pane_id) {
-                            if let Some(pane) = pane.downcast_ref::<LocalPane>() {
-                                let _ = pane.tmux_domain.lock().take();
-                            } else {
-                                log::warn!(
-                                    "tmux control mode pane {} is not a LocalPane",
-                                    self.pane_id
-                                );
-                            }
-                        }
-                    }
                 }
             }
             DeviceControlMode::Data(c) => {
@@ -1276,7 +1498,8 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                 }
             }
             DeviceControlMode::TmuxEvents(events) => {
-                if let Some(tmux) = self.tmux_domain.as_ref() {
+                let tmux = self.tmux_domain.lock().clone();
+                if let Some(tmux) = tmux {
                     tmux.advance(events);
                 } else {
                     log::warn!("unhandled DeviceControlMode::TmuxEvents {:?}", events);
@@ -1293,41 +1516,27 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
 
 struct LocalPaneNotifHandler {
     pane_id: PaneId,
+    mux_registration: Arc<PaneRegistrationSlot>,
 }
 
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, alert: Alert) {
-        let pane_id = self.pane_id;
-        if promise::spawn::is_scheduler_configured() {
-            promise::spawn::spawn_into_main_thread(async move {
-                if let Some(mux) = Mux::try_get() {
-                    match &alert {
-                        Alert::WindowTitleChanged(title) => {
-                            if let Some((_domain, window_id, _tab_id)) =
-                                mux.resolve_pane_id(pane_id)
-                            {
-                                if let Some(mut window) = mux.get_window_mut(window_id) {
-                                    window.set_title(title);
-                                }
-                            }
-                        }
-                        Alert::TabTitleChanged(title) => {
-                            if let Some((_domain, _window_id, tab_id)) =
-                                mux.resolve_pane_id(pane_id)
-                            {
-                                if let Some(tab) = mux.get_tab(tab_id) {
-                                    tab.set_title(title.as_deref().unwrap_or(""));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    mux.notify(MuxNotification::Alert { pane_id, alert });
-                }
-            })
-            .detach();
+        if !promise::spawn::is_scheduler_configured() {
+            return;
         }
+        let Some(registration) = self.mux_registration.load() else {
+            log::trace!(
+                "dropping alert for unregistered local pane {}",
+                self.pane_id
+            );
+            return;
+        };
+        promise::spawn::spawn_into_main_thread(async move {
+            let _ = registration.try_with_current(|pane| {
+                pane.dispatch_alert(alert);
+            });
+        })
+        .detach();
     }
 }
 
@@ -1341,6 +1550,7 @@ impl AlertHandler for LocalPaneNotifHandler {
 /// until something else triggered the mux to prune dead processes.
 fn split_child(
     mut process: Box<dyn Child>,
+    child_exit_prune: Arc<ChildExitPruneState>,
 ) -> (
     Receiver<IoResult<ExitStatus>>,
     Box<dyn ChildKiller + Sync>,
@@ -1354,25 +1564,20 @@ fn split_child(
     let thread_name = pid
         .map(|pid| format!("pane-child-waiter-{pid}"))
         .unwrap_or_else(|| "pane-child-waiter".to_string());
+    let waiter_prune = Arc::clone(&child_exit_prune);
 
     let spawn_result = std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
             let status = process.wait();
             waiter_tx.send(status).ok();
-            if promise::spawn::is_scheduler_configured() {
-                promise::spawn::spawn_into_main_thread(async move {
-                    if let Some(mux) = Mux::try_get() {
-                        mux.prune_dead_windows();
-                    }
-                })
-                .detach();
-            }
+            waiter_prune.mark_child_exited();
         });
 
     if let Err(err) = spawn_result {
         log::error!("failed to spawn child waiter thread pid={pid:?} error={err:#}");
         tx.send(Err(err)).ok();
+        child_exit_prune.mark_child_exited();
     }
 
     (rx, signaller, pid)
@@ -1828,61 +2033,50 @@ impl LocalPane {
         domain_id: DomainId,
         command_description: String,
     ) -> Self {
-        let (process, signaller, pid) = split_child(process);
+        let mux_registration = Arc::new(PaneRegistrationSlot::default());
+        let child_exit_prune = ChildExitPruneState::new(Arc::clone(&mux_registration));
+        let tmux_domain = Arc::new(Mutex::new(None));
+        let (process, signaller, pid) = split_child(process, Arc::clone(&child_exit_prune));
 
         terminal.set_device_control_handler(Box::new(LocalPaneDCSHandler {
             pane_id,
-            tmux_domain: None,
+            tmux_domain: Arc::clone(&tmux_domain),
+            mux_registration: Arc::clone(&mux_registration),
         }));
-        terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
+        terminal.set_notification_handler(Box::new(LocalPaneNotifHandler {
+            pane_id,
+            mux_registration: Arc::clone(&mux_registration),
+        }));
 
-        // Capture pid before it moves into the ProcessState. Used below to
-        // schedule a delayed cache prime so the first user-driven close
-        // attempt has warm proc_list data and skips the prompt — see ft-qhwpq.
-        let pid_for_prime = pid;
+        let process = Arc::new(Mutex::new(ProcessState::Running {
+            child_waiter: process,
+            pid,
+            signaller,
+            killed: false,
+        }));
+        let proc_list = Arc::new(Mutex::new(None));
+        let proc_list_warm_pending = Arc::new(AtomicBool::new(false));
 
-        let pane = Self {
+        Self {
             pane_id,
             terminal: Arc::new(Mutex::new(terminal)),
-            process: Mutex::new(ProcessState::Running {
-                child_waiter: process,
-                pid,
-                signaller,
-                killed: false,
-            }),
+            process: Arc::clone(&process),
             pty: Arc::new(Mutex::new(pty)),
             resize_queue: Arc::new(Mutex::new(ResizeQueueState::default())),
             writer: Mutex::new(writer),
             domain_id,
-            tmux_domain: Mutex::new(None),
-            proc_list: Mutex::new(None),
-            proc_list_warm_pending: AtomicBool::new(false),
+            tmux_domain,
+            mux_registration,
+            child_exit_prune,
+            proc_list: Arc::clone(&proc_list),
+            proc_list_prime_started: AtomicBool::new(false),
+            proc_list_warm_pending,
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
             #[cfg(feature = "disruptor-pane-io")]
             action_ring: Arc::new(ArrayQueue::new(PANE_ACTION_RING_CAPACITY)),
-        };
-
-        // Prime the proc_list cache asynchronously. The 250 ms delay gives
-        // `Mux::add_pane` time to register this pane (so the worker's
-        // `Mux::try_get + get_pane` lookup succeeds) and gives the spawned
-        // shell a moment to fork its initial subprocesses (so the cache
-        // reflects something close to steady-state).
-        //
-        // Caveat: if the user spawns a long-lived agent AFTER the prime
-        // window, the cache will be stale by the close-attempt time and
-        // they'll fall back to the cache-miss path (prompt + spawn warm).
-        // That's acceptable — the prime is opportunistic, not load-bearing.
-        // See ft-qhwpq.
-        if let Some(pid_for_prime) = pid_for_prime {
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(250));
-                Self::warm_proc_cache(pane_id, pid_for_prime, /*clear_flag=*/ false);
-            });
         }
-
-        pane
     }
 
     #[cfg(unix)]
@@ -1996,6 +2190,46 @@ impl LocalPane {
         }
     }
 
+    /// Starts the opportunistic process-cache prime after mux publication.
+    ///
+    /// Starting from `mux_registration_did_bind` avoids guessing how long mux
+    /// publication will take and gives the worker an exact generation handle.
+    /// The short delay still lets a freshly spawned shell fork its initial
+    /// subprocesses. If a user-driven close warm wins the single-flight race,
+    /// that fresher work supersedes the prime.
+    fn spawn_proc_list_prime(&self, registration: PaneRegistrationHandle) {
+        let pid_for_prime = match &*self.process.lock() {
+            ProcessState::Running { pid: Some(pid), .. } => *pid,
+            _ => return,
+        };
+        if self
+            .proc_list_prime_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let pane_id = registration.pane_id();
+        let process = Arc::clone(&self.process);
+        let proc_list = Arc::clone(&self.proc_list);
+        let warm_pending = Arc::clone(&self.proc_list_warm_pending);
+        let spawn_result = std::thread::Builder::new()
+            .name(format!("pane-proc-prime-{pane_id}"))
+            .spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                let Some(_pending_guard) = ProcListWarmPendingGuard::try_acquire(&warm_pending)
+                else {
+                    return;
+                };
+                Self::warm_proc_cache(registration, pid_for_prime, process, proc_list);
+            });
+        if let Err(err) = spawn_result {
+            self.proc_list_prime_started.store(false, Ordering::Release);
+            log::warn!("failed to spawn process-cache prime pane_id={pane_id} error={err:#}");
+        }
+    }
+
     /// Single-flight background warm of `proc_list`. Spawns a worker thread
     /// that does the slow `proc_listallpids` walk off the main thread,
     /// writing the result into the cache so the next
@@ -2004,92 +2238,104 @@ impl LocalPane {
     /// The actual work runs in `Self::warm_proc_cache`.
     /// See ft-qhwpq.
     fn spawn_proc_list_warm(&self) {
-        // Single-flight: bail if a previous warm is still running. The
-        // compare_exchange on AtomicBool is the gate; `warm_proc_cache`
-        // clears the flag at the end (success and fallback paths).
-        if self
-            .proc_list_warm_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let Some(pending_guard) =
+            ProcListWarmPendingGuard::try_acquire(&self.proc_list_warm_pending)
+        else {
             return;
-        }
+        };
 
         let pid_walked = match &*self.process.lock() {
             ProcessState::Running { pid: Some(pid), .. } => *pid,
-            _ => {
-                self.proc_list_warm_pending.store(false, Ordering::Release);
-                return;
-            }
+            _ => return,
         };
 
-        let pane_id = self.pane_id;
-        std::thread::spawn(move || {
-            Self::warm_proc_cache(pane_id, pid_walked, /*clear_flag=*/ true);
-        });
+        let Some(registration) = self.mux_registration.load() else {
+            return;
+        };
+        let pane_id = registration.pane_id();
+        let process = Arc::clone(&self.process);
+        let proc_list = Arc::clone(&self.proc_list);
+        let spawn_result = std::thread::Builder::new()
+            .name(format!("pane-proc-warm-{pane_id}"))
+            .spawn(move || {
+                let _pending_guard = pending_guard;
+                Self::warm_proc_cache(registration, pid_walked, process, proc_list);
+            });
+        if let Err(err) = spawn_result {
+            // `Builder::spawn` drops the rejected closure, so its pending guard
+            // has already released the single-flight flag.
+            log::warn!("failed to spawn process-cache warm pane_id={pane_id} error={err:#}");
+        }
     }
 
     /// Off-main-thread proc-tree walk + cache write for a specific pane.
     ///
-    /// Re-resolves the pane via `Mux::try_get + downcast_ref` (a since-
-    /// dropped pane is a no-op) and verifies the pane's *current* pid
-    /// still matches `pid_walked`. If the pid has changed (process
-    /// re-spawn, or the unlikely PaneId reuse with a recycled `usize`) we
-    /// drop the result — caching it would mislabel the new process tree.
-    ///
-    /// `clear_flag=true` is for `spawn_proc_list_warm` callers (which set
-    /// the single-flight `proc_list_warm_pending` flag and need it
-    /// released regardless of success). `clear_flag=false` is for the
-    /// creation-time priming path, which never sets the flag and should
-    /// not race with a concurrent close-time warm by clearing it.
+    /// The worker carries the exact registration captured at admission. A
+    /// removed or same-ID replacement pane is therefore a no-op, even if the
+    /// process-tree walk completes much later. The current process PID is also
+    /// checked before committing so an in-place respawn cannot receive stale
+    /// metadata.
     /// See ft-qhwpq.
-    fn warm_proc_cache(pane_id: PaneId, pid_walked: u32, clear_flag: bool) {
-        let root = LocalProcessInfo::with_root_pid(pid_walked);
-        if let (Some(root), Some(mux)) = (root, Mux::try_get()) {
-            if let Some(pane) = mux.get_pane(pane_id) {
-                if let Some(local) = pane.downcast_ref::<LocalPane>() {
-                    let pid_now = match &*local.process.lock() {
-                        ProcessState::Running { pid: Some(p), .. } => Some(*p),
-                        _ => None,
-                    };
-                    if pid_now == Some(pid_walked) {
-                        // Build foreground identically to divine_process_list
-                        // so the Windows `divine_current_working_dir(&fg.cwd)`
-                        // path stays correct when the cache is populated by
-                        // this off-main-thread warmer.
-                        let mut foreground = find_youngest_descendant(&root).clone();
-                        foreground.children.clear();
-                        local.proc_list.lock().replace(CachedProcInfo {
-                            root,
-                            foreground,
-                            updated: Instant::now(),
-                            cached_is_stateful: None,
-                        });
-                    } else {
-                        log::trace!(
-                            "warm_proc_cache: pid changed \
-                             ({pid_walked} -> {pid_now:?}) for pane \
-                             {pane_id}; dropping cache write"
-                        );
-                    }
-                    if clear_flag {
-                        local.proc_list_warm_pending.store(false, Ordering::Release);
-                    }
-                    return;
+    fn warm_proc_cache(
+        registration: PaneRegistrationHandle,
+        pid_walked: u32,
+        process: Arc<Mutex<ProcessState>>,
+        proc_list: Arc<Mutex<Option<CachedProcInfo>>>,
+    ) {
+        let pane_id = registration.pane_id();
+        let admitted = registration
+            .try_with_current(|_| {
+                let pid_now = match &*process.lock() {
+                    ProcessState::Running { pid: Some(pid), .. } => Some(*pid),
+                    _ => None,
+                };
+                if pid_now != Some(pid_walked) {
+                    log::trace!(
+                        "warm_proc_cache: pid changed before process walk \
+                         ({pid_walked} -> {pid_now:?}) for pane \
+                         {pane_id}; skipping cache refresh"
+                    );
+                    return false;
                 }
-            }
+                true
+            })
+            .unwrap_or(false);
+        if !admitted {
+            return;
         }
-        // Pane gone or proc walk failed — only worry about the flag if the
-        // caller asked us to manage it.
-        if clear_flag {
-            if let Some(mux) = Mux::try_get() {
-                if let Some(pane) = mux.get_pane(pane_id) {
-                    if let Some(local) = pane.downcast_ref::<LocalPane>() {
-                        local.proc_list_warm_pending.store(false, Ordering::Release);
-                    }
-                }
+
+        // This O(N_system_processes) walk intentionally runs outside the exact
+        // registration operation lease. The second admission below rejects its
+        // result if removal, replacement, or an in-place respawn raced the walk.
+        let Some(root) = LocalProcessInfo::with_root_pid(pid_walked) else {
+            return;
+        };
+        let _ = registration.try_with_current(|_| {
+            let pid_now = match &*process.lock() {
+                ProcessState::Running { pid: Some(pid), .. } => Some(*pid),
+                _ => None,
+            };
+            if pid_now != Some(pid_walked) {
+                log::trace!(
+                    "warm_proc_cache: pid changed \
+                     ({pid_walked} -> {pid_now:?}) for pane \
+                     {pane_id}; dropping cache write"
+                );
+                return;
             }
-        }
+
+            // Build foreground identically to divine_process_list so the
+            // Windows `divine_current_working_dir(&fg.cwd)` path stays correct
+            // when this off-main-thread warmer populates the cache.
+            let mut foreground = find_youngest_descendant(&root).clone();
+            foreground.children.clear();
+            proc_list.lock().replace(CachedProcInfo {
+                root,
+                foreground,
+                updated: Instant::now(),
+                cached_is_stateful: None,
+            });
+        });
     }
 }
 
@@ -2131,6 +2377,125 @@ mod tests {
             pixel_width: cols,
             pixel_height: rows,
         }
+    }
+
+    #[test]
+    fn proc_list_warm_pending_guard_is_single_flight_and_releases_on_drop() {
+        let pending = Arc::new(AtomicBool::new(false));
+        let guard = ProcListWarmPendingGuard::try_acquire(&pending)
+            .expect("idle warm flag should admit one worker");
+
+        assert!(pending.load(Ordering::Acquire));
+        assert!(
+            ProcListWarmPendingGuard::try_acquire(&pending).is_none(),
+            "a live guard must reject a second worker",
+        );
+
+        drop(guard);
+        assert!(!pending.load(Ordering::Acquire));
+        assert!(
+            ProcListWarmPendingGuard::try_acquire(&pending).is_some(),
+            "dropping the guard must make a later warm retryable",
+        );
+    }
+
+    #[test]
+    fn proc_list_warm_pending_guard_releases_during_unwind() {
+        let pending = Arc::new(AtomicBool::new(false));
+        let pending_for_unwind = Arc::clone(&pending);
+
+        let result = std::panic::catch_unwind(move || {
+            let _guard = ProcListWarmPendingGuard::try_acquire(&pending_for_unwind)
+                .expect("idle warm flag should admit the panicking worker");
+            panic!("intentional process-cache warm panic");
+        });
+
+        assert!(result.is_err());
+        assert!(
+            !pending.load(Ordering::Acquire),
+            "unwinding a warm worker must release its single-flight admission",
+        );
+    }
+
+    #[test]
+    fn child_exit_prune_tracker_preserves_exit_before_registration() {
+        let mut tracker = ChildExitPruneTracker::default();
+        tracker.record_child_exit();
+
+        assert!(tracker.has_pending_intent());
+        assert!(
+            tracker.record_registration_bound(),
+            "binding after exit must request a prune"
+        );
+        let post_bind_intent = tracker.next_intent;
+        tracker.record_success(post_bind_intent);
+        assert!(
+            !tracker.has_pending_intent(),
+            "a prune for the post-bind intent must consume the earlier exit"
+        );
+    }
+
+    #[test]
+    fn child_exit_prune_tracker_ignores_registration_before_exit() {
+        let mut tracker = ChildExitPruneTracker::default();
+
+        assert!(
+            !tracker.record_registration_bound(),
+            "a live child needs no prune at publication"
+        );
+        assert!(!tracker.has_pending_intent());
+
+        tracker.record_child_exit();
+        assert!(
+            tracker.has_pending_intent(),
+            "a later child exit must create the prune intent"
+        );
+    }
+
+    #[test]
+    fn child_exit_prune_tracker_does_not_consume_concurrent_rebind() {
+        let mut tracker = ChildExitPruneTracker::default();
+        tracker.record_child_exit();
+        let first_generation_intent = tracker.next_intent;
+
+        assert!(tracker.record_registration_bound());
+        let replacement_generation_intent = tracker.next_intent;
+        tracker.record_success(first_generation_intent);
+
+        assert!(
+            tracker.has_pending_intent(),
+            "completion for an old generation must preserve a newer bind intent"
+        );
+        tracker.record_success(replacement_generation_intent);
+        assert!(!tracker.has_pending_intent());
+    }
+
+    #[test]
+    fn child_exit_prune_dispatch_drop_releases_schedule_and_preserves_intent() {
+        let registration = Arc::new(PaneRegistrationSlot::default());
+        let state = ChildExitPruneState::new(registration);
+        {
+            let mut tracker = state.tracker.lock();
+            tracker.record_child_exit();
+            tracker.scheduled = true;
+        }
+
+        drop(ChildExitPruneDispatch {
+            state: Arc::clone(&state),
+            registration: None,
+            target_intent: 1,
+            finished: false,
+        });
+
+        let tracker = state.tracker.lock();
+        assert!(
+            !tracker.scheduled,
+            "dropping a rejected runnable must release single-flight admission"
+        );
+        assert!(
+            tracker.has_pending_intent(),
+            "scheduler rejection must not consume the child-exit intent"
+        );
     }
 
     #[derive(Default)]
