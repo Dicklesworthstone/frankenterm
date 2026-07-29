@@ -327,6 +327,10 @@ enum ReaderMessage {
         pdu: Box<Pdu>,
         promise: Sender<anyhow::Result<Pdu>>,
     },
+    AbortGeneration {
+        generation: NonZeroU64,
+        reason: &'static str,
+    },
 }
 
 impl ReaderMessage {
@@ -343,6 +347,7 @@ impl ReaderMessage {
                 );
                 let _ = promise.try_send(Err(anyhow::Error::new(error)));
             }
+            Self::AbortGeneration { .. } => {}
         }
     }
 }
@@ -409,6 +414,27 @@ impl RpcGenerationScope {
             rpc_transport,
             generation: Some(generation),
             allow_unready,
+        }
+    }
+
+    fn bootstrap(sender: Sender<ReaderMessage>, rpc_transport: Arc<RpcTransportState>) -> Self {
+        let generation = {
+            let phase = rpc_transport.phase.lock();
+            match *phase {
+                RpcTransportPhase::Live(generation)
+                    if rpc_transport.live_generation.load(AtomicOrdering::Acquire)
+                        == generation.get() =>
+                {
+                    Some(generation)
+                }
+                _ => None,
+            }
+        };
+        Self {
+            sender,
+            rpc_transport,
+            generation,
+            allow_unready: true,
         }
     }
 
@@ -634,6 +660,9 @@ impl ClientDispatchAuthority {
 
         let Some(next_generation) = next_generation else {
             self.rpc_transport
+                .ready_generation
+                .store(0, AtomicOrdering::Release);
+            self.rpc_transport
                 .live_generation
                 .store(0, AtomicOrdering::Release);
             if let Err(observed) = self.connection_generation.compare_exchange(
@@ -653,6 +682,9 @@ impl ClientDispatchAuthority {
             bail!("mux client connection generation exhausted");
         };
 
+        self.rpc_transport
+            .ready_generation
+            .store(0, AtomicOrdering::Release);
         self.rpc_transport
             .live_generation
             .store(0, AtomicOrdering::Release);
@@ -731,6 +763,9 @@ impl ClientDispatchAuthority {
             RpcTransportPhase::Reconnecting { next, .. } if next == generation => {
                 *phase = RpcTransportPhase::Live(generation);
                 self.rpc_transport
+                    .ready_generation
+                    .store(0, AtomicOrdering::Release);
+                self.rpc_transport
                     .live_generation
                     .store(generation.get(), AtomicOrdering::Release);
                 Ok(())
@@ -745,6 +780,9 @@ impl ClientDispatchAuthority {
 
     fn close_rpc_transport(&self, receiver: &Receiver<ReaderMessage>, reason: &str) {
         let mut phase = self.rpc_transport.phase.lock();
+        self.rpc_transport
+            .ready_generation
+            .store(0, AtomicOrdering::Release);
         self.rpc_transport
             .live_generation
             .store(0, AtomicOrdering::Release);
@@ -762,6 +800,9 @@ impl ClientDispatchAuthority {
 
     fn close_rpc_transport_without_receiver(&self) {
         let mut phase = self.rpc_transport.phase.lock();
+        self.rpc_transport
+            .ready_generation
+            .store(0, AtomicOrdering::Release);
         self.rpc_transport
             .live_generation
             .store(0, AtomicOrdering::Release);
@@ -3543,7 +3584,83 @@ impl Client {
             self.sender.clone(),
             Arc::clone(&self.rpc_transport),
             generation,
+            false,
         )
+    }
+
+    fn bootstrap_rpc_scope(&self) -> RpcGenerationScope {
+        RpcGenerationScope::bootstrap(self.sender.clone(), Arc::clone(&self.rpc_transport))
+    }
+
+    fn bootstrap_rpc_scope_at(&self, generation: NonZeroU64) -> RpcGenerationScope {
+        RpcGenerationScope::exact(
+            self.sender.clone(),
+            Arc::clone(&self.rpc_transport),
+            generation,
+            true,
+        )
+    }
+
+    fn publish_rpc_transport_ready(&self, rpc: &RpcGenerationScope) -> anyhow::Result<()> {
+        if !Arc::ptr_eq(&self.rpc_transport, &rpc.rpc_transport) {
+            bail!("cannot publish mux RPC readiness from a foreign client scope");
+        }
+        let generation = rpc
+            .generation
+            .ok_or_else(|| anyhow!("cannot publish readiness for an unavailable RPC scope"))?;
+        let phase = self.rpc_transport.phase.lock();
+        if !matches!(
+            *phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) || self
+            .rpc_transport
+            .live_generation
+            .load(AtomicOrdering::Acquire)
+            != generation.get()
+        {
+            bail!(
+                "cannot publish readiness for retired mux RPC generation {}",
+                generation
+            );
+        }
+        let observed = self
+            .rpc_transport
+            .ready_generation
+            .load(AtomicOrdering::Acquire);
+        if observed != 0 && observed != generation.get() {
+            bail!(
+                "cannot replace ready mux RPC generation {} with {}",
+                observed,
+                generation
+            );
+        }
+        self.rpc_transport
+            .ready_generation
+            .store(generation.get(), AtomicOrdering::Release);
+        Ok(())
+    }
+
+    fn abort_rpc_transport_generation(
+        &self,
+        rpc: &RpcGenerationScope,
+        reason: &'static str,
+    ) -> anyhow::Result<()> {
+        if !Arc::ptr_eq(&self.rpc_transport, &rpc.rpc_transport) {
+            bail!("cannot abort a mux RPC generation from a foreign client scope");
+        }
+        let generation = rpc
+            .generation
+            .ok_or_else(|| anyhow!("cannot abort an unavailable mux RPC scope"))?;
+        let phase = self.rpc_transport.phase.lock();
+        if !matches!(
+            *phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) {
+            return Ok(());
+        }
+        self.sender
+            .try_send(ReaderMessage::AbortGeneration { generation, reason })
+            .map_err(|_| anyhow!("mux RPC reader queue closed before generation abort"))
     }
 
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
