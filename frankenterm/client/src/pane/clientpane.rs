@@ -342,6 +342,12 @@ impl Pane for ClientPane {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let palette = self.configured_palette.lock().clone();
+        let request = client
+            .client
+            .set_configured_palette_for_pane(SetPalette {
+                pane_id: remote_pane_id,
+                palette,
+            });
         promise::spawn::spawn(async move {
             let registration_is_current = mux_registration
                 .load()
@@ -351,14 +357,7 @@ impl Pane for ClientPane {
                 return Ok(());
             }
 
-            client
-                .client
-                .set_configured_palette_for_pane(SetPalette {
-                    pane_id: remote_pane_id,
-                    palette,
-                })
-                .await
-                .map(|_| ())
+            request.await.map(|_| ())
         })
         .detach();
     }
@@ -446,16 +445,11 @@ impl Pane for ClientPane {
             .predict_from_paste(text);
 
         let data = text.to_owned();
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .send_paste(SendPaste {
-                    pane_id: remote_pane_id,
-                    data,
-                })
-                .await
-        })
-        .detach();
+        let request = client.client.send_paste(SendPaste {
+            pane_id: remote_pane_id,
+            data,
+        });
+        promise::spawn::spawn(async move { request.await }).detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -479,17 +473,12 @@ impl Pane for ClientPane {
         let remote_tab_id = self.remote_tab_id;
         // Invalidate any cached rows on a resize
         inner.make_all_stale();
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .set_zoomed(SetPaneZoomed {
-                    containing_tab_id: remote_tab_id,
-                    pane_id: remote_pane_id,
-                    zoomed,
-                })
-                .await
-        })
-        .detach();
+        let request = client.client.set_zoomed(SetPaneZoomed {
+            containing_tab_id: remote_tab_id,
+            pane_id: remote_pane_id,
+            zoomed,
+        });
+        promise::spawn::spawn(async move { request.await }).detach();
         inner.update_last_send();
     }
 
@@ -516,17 +505,12 @@ impl Pane for ClientPane {
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
             let remote_tab_id = self.remote_tab_id;
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .resize(Resize {
-                        containing_tab_id: remote_tab_id,
-                        pane_id: remote_pane_id,
-                        size,
-                    })
-                    .await
-            })
-            .detach();
+            let request = client.client.resize(Resize {
+                containing_tab_id: remote_tab_id,
+                pane_id: remote_pane_id,
+                size,
+            });
+            promise::spawn::spawn(async move { request.await }).detach();
             inner.update_last_send();
         }
         Ok(())
@@ -565,20 +549,15 @@ impl Pane for ClientPane {
         }
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .key_down(SendKeyDown {
-                    pane_id: remote_pane_id,
-                    event: KeyEvent {
-                        key,
-                        modifiers: mods,
-                    },
-                    input_serial,
-                })
-                .await
-        })
-        .detach();
+        let request = client.client.key_down(SendKeyDown {
+            pane_id: remote_pane_id,
+            event: KeyEvent {
+                key,
+                modifiers: mods,
+            },
+            input_serial,
+        });
+        promise::spawn::spawn(async move { request.await }).detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -586,19 +565,14 @@ impl Pane for ClientPane {
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .key_up(SendKeyUp {
-                    pane_id: remote_pane_id,
-                    event: KeyEvent {
-                        key,
-                        modifiers: mods,
-                    },
-                })
-                .await
-        })
-        .detach();
+        let request = client.client.key_up(SendKeyUp {
+            pane_id: remote_pane_id,
+            event: KeyEvent {
+                key,
+                modifiers: mods,
+            },
+        });
+        promise::spawn::spawn(async move { request.await }).detach();
         Ok(())
     }
 
@@ -618,15 +592,10 @@ impl Pane for ClientPane {
         // in the detached state; if so then we must skip sending the
         // kill to the server.
         if !client.is_detached() {
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .kill_pane(KillPane {
-                        pane_id: remote_pane_id,
-                    })
-                    .await
-            })
-            .detach();
+            let request = client.client.kill_pane(KillPane {
+                pane_id: remote_pane_id,
+            });
+            promise::spawn::spawn(async move { request.await }).detach();
         }
     }
 
@@ -672,16 +641,11 @@ impl Pane for ClientPane {
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .erase_scrollback(EraseScrollbackRequest {
-                    pane_id: remote_pane_id,
-                    erase_mode,
-                })
-                .await
-        })
-        .detach();
+        let request = client.client.erase_scrollback(EraseScrollbackRequest {
+            pane_id: remote_pane_id,
+            erase_mode,
+        });
+        promise::spawn::spawn(async move { request.await }).detach();
     }
 
     fn advise_focus(&self) {
@@ -693,15 +657,10 @@ impl Pane for ClientPane {
             focused_pane.replace(self.remote_pane_id);
             let client = Arc::clone(&self.client);
             let remote_pane_id = self.remote_pane_id;
-            promise::spawn::spawn(async move {
-                client
-                    .client
-                    .set_focused_pane_id(SetFocusedPane {
-                        pane_id: remote_pane_id,
-                    })
-                    .await
-            })
-            .detach();
+            let request = client.client.set_focused_pane_id(SetFocusedPane {
+                pane_id: remote_pane_id,
+            });
+            promise::spawn::spawn(async move { request.await }).detach();
         }
     }
 
@@ -734,16 +693,13 @@ impl Pane for ClientPane {
         // and now send the color palette to the server
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .set_configured_palette_for_pane(SetPalette {
-                    pane_id: remote_pane_id,
-                    palette,
-                })
-                .await
-        })
-        .detach();
+        let request = client
+            .client
+            .set_configured_palette_for_pane(SetPalette {
+                pane_id: remote_pane_id,
+                palette,
+            });
+        promise::spawn::spawn(async move { request.await }).detach();
         self.config.lock().replace(config);
     }
 
@@ -776,13 +732,8 @@ impl std::io::Write for PaneWriter {
         let pane_id = self.remote_pane_id;
         let data = data.to_vec();
         let len = data.len();
-        promise::spawn::spawn(async move {
-            client
-                .client
-                .write_to_pane(WriteToPane { pane_id, data })
-                .await
-        })
-        .detach();
+        let request = client.client.write_to_pane(WriteToPane { pane_id, data });
+        promise::spawn::spawn(async move { request.await }).detach();
         Ok(len)
     }
 

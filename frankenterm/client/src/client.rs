@@ -20,6 +20,7 @@ use mux::ssh::ssh_connect_with_ui;
 use mux::{Mux, PaneRegistrationHandle};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
+use parking_lot::Mutex as ParkingMutex;
 use portable_pty::Child;
 use std::collections::{hash_map::Entry, HashMap};
 use std::future::poll_fn;
@@ -46,15 +47,296 @@ const INITIAL_CONNECTION_GENERATION: u64 = 1;
 #[error("Timeout")]
 struct Timeout;
 
-#[derive(Error, Debug)]
-#[error("ChannelSendError")]
-struct ChannelSendError;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcDeliveryCertainty {
+    DefinitelyNotSent,
+    OutcomeUnknown,
+}
+
+impl std::fmt::Display for RpcDeliveryCertainty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefinitelyNotSent => f.write_str("definitely_not_sent"),
+            Self::OutcomeUnknown => f.write_str("outcome_unknown"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcRetirementStage {
+    Admission,
+    Enqueue,
+    Queued,
+    Dequeue,
+    SerialAssignment,
+    FrameEncoding,
+    BeforeWrite,
+    WriteStarted,
+    BeforeFlush,
+    AfterFlush,
+    AwaitingResponse,
+    ResponseMatch,
+    CompletionChannel,
+}
+
+impl RpcRetirementStage {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::Enqueue => "enqueue",
+            Self::Queued => "queued",
+            Self::Dequeue => "dequeue",
+            Self::SerialAssignment => "serial_assignment",
+            Self::FrameEncoding => "frame_encoding",
+            Self::BeforeWrite => "before_write",
+            Self::WriteStarted => "write_started",
+            Self::BeforeFlush => "before_flush",
+            Self::AfterFlush => "after_flush",
+            Self::AwaitingResponse => "awaiting_response",
+            Self::ResponseMatch => "response_match",
+            Self::CompletionChannel => "completion_channel",
+        }
+    }
+}
+
+impl std::fmt::Display for RpcRetirementStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.metric_label())
+    }
+}
+
+/// Stable caller-visible classification for an RPC that could not remain on
+/// the exact transport generation where it was admitted.
+///
+/// No variant authorizes an automatic retry. `OutcomeUnknown` means that a
+/// write was attempted and the server may already have observed or committed
+/// the operation even though no matching reply reached this client.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum RpcTransportError {
+    #[error(
+        "mux client RPC transport unavailable for attempt {attempt_id} ({request}) at {stage}"
+    )]
+    Unavailable {
+        attempt_id: NonZeroU64,
+        request: &'static str,
+        stage: RpcRetirementStage,
+    },
+    #[error(
+        "mux client RPC attempt {attempt_id} ({request}) bound to generation \
+         {bound_generation} retired at {stage} with {certainty}; active generation \
+         is {active_generation:?}: {reason}"
+    )]
+    Retired {
+        attempt_id: NonZeroU64,
+        request: &'static str,
+        bound_generation: NonZeroU64,
+        active_generation: Option<NonZeroU64>,
+        stage: RpcRetirementStage,
+        certainty: RpcDeliveryCertainty,
+        reason: String,
+    },
+    #[error("mux client RPC attempt identity space is exhausted for {request}")]
+    AttemptIdentityExhausted { request: &'static str },
+}
+
+fn record_rpc_transport_error(error: &RpcTransportError) {
+    match error {
+        RpcTransportError::Unavailable { stage, .. } => {
+            metrics::counter!(
+                "mux.client.rpc.transport_unavailable.total",
+                "stage" => stage.metric_label()
+            )
+            .increment(1);
+        }
+        RpcTransportError::Retired {
+            stage, certainty, ..
+        } => {
+            let certainty = match certainty {
+                RpcDeliveryCertainty::DefinitelyNotSent => "definitely_not_sent",
+                RpcDeliveryCertainty::OutcomeUnknown => "outcome_unknown",
+            };
+            metrics::counter!(
+                "mux.client.rpc.generation_retirement.total",
+                "stage" => stage.metric_label(),
+                "certainty" => certainty
+            )
+            .increment(1);
+        }
+        RpcTransportError::AttemptIdentityExhausted { .. } => {
+            metrics::counter!(
+                "mux.client.rpc.transport_unavailable.total",
+                "stage" => "attempt_identity_exhausted"
+            )
+            .increment(1);
+        }
+    }
+}
+
+fn complete_with_rpc_transport_error(
+    completion: &Sender<anyhow::Result<Pdu>>,
+    error: RpcTransportError,
+) {
+    record_rpc_transport_error(&error);
+    let _ = completion.try_send(Err(anyhow::Error::new(error)));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RpcBinding {
+    generation: NonZeroU64,
+    attempt_id: NonZeroU64,
+    request: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcTransportPhase {
+    Live(NonZeroU64),
+    Reconnecting {
+        retired: NonZeroU64,
+        next: NonZeroU64,
+    },
+    Closed {
+        last_live: NonZeroU64,
+    },
+}
+
+#[derive(Debug)]
+struct RpcTransportState {
+    phase: ParkingMutex<RpcTransportPhase>,
+    /// Hot-path mirror. Zero means that external RPC admission is disabled.
+    live_generation: AtomicU64,
+    next_attempt_id: AtomicU64,
+    /// Wire serials are never reused during one Client incarnation. This makes
+    /// a stale response from an old physical stream unmatched on its successor
+    /// even though the existing codec does not carry a generation nonce.
+    next_wire_serial: AtomicU64,
+}
+
+impl RpcTransportState {
+    fn new() -> Self {
+        let generation = NonZeroU64::new(INITIAL_CONNECTION_GENERATION)
+            .expect("the initial connection generation is nonzero");
+        Self {
+            phase: ParkingMutex::new(RpcTransportPhase::Live(generation)),
+            live_generation: AtomicU64::new(generation.get()),
+            next_attempt_id: AtomicU64::new(1),
+            next_wire_serial: AtomicU64::new(1),
+        }
+    }
+
+    fn allocate_monotonic(counter: &AtomicU64) -> Result<NonZeroU64, u64> {
+        counter
+            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
+                if current == 0 {
+                    None
+                } else if current == u64::MAX {
+                    Some(0)
+                } else {
+                    Some(current + 1)
+                }
+            })
+            .map(|value| NonZeroU64::new(value).expect("zero is never allocated"))
+    }
+
+    fn allocate_attempt(&self, request: &'static str) -> Result<NonZeroU64, RpcTransportError> {
+        Self::allocate_monotonic(&self.next_attempt_id).map_err(|_| {
+            let error = RpcTransportError::AttemptIdentityExhausted { request };
+            record_rpc_transport_error(&error);
+            error
+        })
+    }
+
+    fn allocate_wire_serial(&self) -> Result<NonZeroU64, PendingRpcError> {
+        Self::allocate_monotonic(&self.next_wire_serial)
+            .map_err(|_| PendingRpcError::SerialExhausted)
+    }
+
+    fn active_generation(&self) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.live_generation.load(AtomicOrdering::Acquire))
+    }
+
+    fn validate(
+        &self,
+        binding: RpcBinding,
+        stage: RpcRetirementStage,
+        certainty: RpcDeliveryCertainty,
+        reason: impl Into<String>,
+    ) -> Result<(), RpcTransportError> {
+        if self.live_generation.load(AtomicOrdering::Acquire) == binding.generation.get() {
+            return Ok(());
+        }
+
+        Err(self.make_retirement_error(binding, stage, certainty, reason))
+    }
+
+    fn make_retirement_error(
+        &self,
+        binding: RpcBinding,
+        stage: RpcRetirementStage,
+        certainty: RpcDeliveryCertainty,
+        reason: impl Into<String>,
+    ) -> RpcTransportError {
+        RpcTransportError::Retired {
+            attempt_id: binding.attempt_id,
+            request: binding.request,
+            bound_generation: binding.generation,
+            active_generation: self.active_generation(),
+            stage,
+            certainty,
+            reason: reason.into(),
+        }
+    }
+
+    fn retirement_error(
+        &self,
+        binding: RpcBinding,
+        stage: RpcRetirementStage,
+        certainty: RpcDeliveryCertainty,
+        reason: impl Into<String>,
+    ) -> RpcTransportError {
+        let error = self.make_retirement_error(binding, stage, certainty, reason);
+        record_rpc_transport_error(&error);
+        error
+    }
+
+    fn unavailable_error(
+        attempt_id: NonZeroU64,
+        request: &'static str,
+        stage: RpcRetirementStage,
+    ) -> RpcTransportError {
+        let error = RpcTransportError::Unavailable {
+            attempt_id,
+            request,
+            stage,
+        };
+        record_rpc_transport_error(&error);
+        error
+    }
+}
 
 enum ReaderMessage {
     SendPdu {
+        binding: RpcBinding,
         pdu: Box<Pdu>,
         promise: Sender<anyhow::Result<Pdu>>,
     },
+}
+
+impl ReaderMessage {
+    fn retire(self, rpc_transport: &RpcTransportState, stage: RpcRetirementStage, reason: &str) {
+        match self {
+            Self::SendPdu {
+                binding, promise, ..
+            } => {
+                let error = rpc_transport.retirement_error(
+                    binding,
+                    stage,
+                    RpcDeliveryCertainty::DefinitelyNotSent,
+                    reason,
+                );
+                let _ = promise.try_send(Err(anyhow::Error::new(error)));
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -63,10 +345,157 @@ pub struct Client {
     local_domain_id: Option<DomainId>,
     incarnation: Arc<ClientIncarnation>,
     connection_generation: Arc<AtomicU64>,
+    rpc_transport: Arc<RpcTransportState>,
     pub client_id: ClientId,
     client_domain_config: ClientDomainConfig,
     pub is_reconnectable: bool,
     pub is_local: bool,
+}
+
+/// Reusable exact-generation authority for a related group of mux RPCs.
+///
+/// Capturing a scope while no transport is live produces a permanently
+/// unavailable scope; it never upgrades itself onto a successor connection.
+/// Each call still receives a fresh attempt identity and remains lazy until
+/// first poll.
+#[derive(Clone)]
+pub(crate) struct RpcGenerationScope {
+    sender: Sender<ReaderMessage>,
+    rpc_transport: Arc<RpcTransportState>,
+    generation: Option<NonZeroU64>,
+}
+
+impl RpcGenerationScope {
+    fn capture(sender: Sender<ReaderMessage>, rpc_transport: Arc<RpcTransportState>) -> Self {
+        let generation = {
+            let phase = rpc_transport.phase.lock();
+            match *phase {
+                RpcTransportPhase::Live(generation)
+                    if rpc_transport.live_generation.load(AtomicOrdering::Acquire)
+                        == generation.get() =>
+                {
+                    Some(generation)
+                }
+                _ => None,
+            }
+        };
+        Self {
+            sender,
+            rpc_transport,
+            generation,
+        }
+    }
+
+    fn exact(
+        sender: Sender<ReaderMessage>,
+        rpc_transport: Arc<RpcTransportState>,
+        generation: NonZeroU64,
+    ) -> Self {
+        Self {
+            sender,
+            rpc_transport,
+            generation: Some(generation),
+        }
+    }
+
+    pub(crate) fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.rpc_transport, &other.rpc_transport)
+            && self.generation.is_some()
+            && self.generation == other.generation
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.generation.is_some()
+    }
+
+    fn send_pdu(
+        &self,
+        pdu: Pdu,
+    ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
+        let request = pdu.pdu_name();
+        let rpc_transport = Arc::clone(&self.rpc_transport);
+        let sender = self.sender.clone();
+        let scoped_generation = self.generation;
+        let attempt = rpc_transport.allocate_attempt(request);
+        let binding = attempt.and_then(|attempt_id| {
+            let Some(generation) = scoped_generation else {
+                return Err(RpcTransportState::unavailable_error(
+                    attempt_id,
+                    request,
+                    RpcRetirementStage::Admission,
+                ));
+            };
+            let phase = rpc_transport.phase.lock();
+            if !matches!(
+                *phase,
+                RpcTransportPhase::Live(observed) if observed == generation
+            ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire) != generation.get()
+            {
+                return Err(rpc_transport.retirement_error(
+                    RpcBinding {
+                        generation,
+                        attempt_id,
+                        request,
+                    },
+                    RpcRetirementStage::Admission,
+                    RpcDeliveryCertainty::DefinitelyNotSent,
+                    "exact-generation RPC scope is no longer live",
+                ));
+            }
+            Ok(RpcBinding {
+                generation,
+                attempt_id,
+                request,
+            })
+        });
+
+        async move {
+            let binding = binding.map_err(anyhow::Error::new)?;
+            let (promise, rx) = bounded(1);
+            // Hold the short admission gate through the nonblocking enqueue.
+            // Retirement takes the same gate before publishing Reconnecting,
+            // so bind-then-enqueue cannot straddle transport generations.
+            {
+                let phase = rpc_transport.phase.lock();
+                if !matches!(
+                    *phase,
+                    RpcTransportPhase::Live(generation) if generation == binding.generation
+                ) || rpc_transport.live_generation.load(AtomicOrdering::Acquire)
+                    != binding.generation.get()
+                {
+                    return Err(anyhow::Error::new(rpc_transport.retirement_error(
+                        binding,
+                        RpcRetirementStage::Enqueue,
+                        RpcDeliveryCertainty::DefinitelyNotSent,
+                        "bound RPC was first polled after its transport retired",
+                    )));
+                }
+                if let Err(TrySendError::Closed(_) | TrySendError::Full(_)) =
+                    sender.try_send(ReaderMessage::SendPdu {
+                        binding,
+                        pdu: Box::new(pdu),
+                        promise,
+                    })
+                {
+                    return Err(anyhow::Error::new(rpc_transport.retirement_error(
+                        binding,
+                        RpcRetirementStage::Enqueue,
+                        RpcDeliveryCertainty::DefinitelyNotSent,
+                        "RPC queue was unavailable during exact-generation admission",
+                    )));
+                }
+            }
+            match rx.recv().await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::Error::new(rpc_transport.retirement_error(
+                    binding,
+                    RpcRetirementStage::CompletionChannel,
+                    RpcDeliveryCertainty::OutcomeUnknown,
+                    "RPC completion channel closed without a terminal result",
+                ))),
+            }
+        }
+    }
 }
 
 struct ClientIncarnation;
@@ -92,6 +521,7 @@ struct ClientDispatchAuthority {
     target: ClientDispatchTarget,
     client_incarnation: Arc<ClientIncarnation>,
     connection_generation: Arc<AtomicU64>,
+    rpc_transport: Arc<RpcTransportState>,
     generation: u64,
 }
 
@@ -109,6 +539,7 @@ impl ClientDispatchAuthority {
         mux_owner: Weak<Mux>,
         client_incarnation: Arc<ClientIncarnation>,
         connection_generation: Arc<AtomicU64>,
+        rpc_transport: Arc<RpcTransportState>,
     ) -> Self {
         let target = match local_domain_id {
             Some(local_domain_id) => ClientDispatchTarget::Attached {
@@ -121,6 +552,7 @@ impl ClientDispatchAuthority {
             target,
             client_incarnation,
             connection_generation,
+            rpc_transport,
             generation: INITIAL_CONNECTION_GENERATION,
         }
     }
@@ -134,39 +566,184 @@ impl ClientDispatchAuthority {
             && self.connection_generation.load(AtomicOrdering::Acquire) == self.generation
     }
 
-    /// Revoke the current transport and mint the authority for its successor.
+    /// Revoke this reader's transport before any of its pending RPCs are
+    /// completed with a retirement error.
     ///
-    /// The compare-exchange is deliberately exact: if some path ever attempts
-    /// to advance an already-retired authority, it fails closed rather than
-    /// accidentally blessing work from a different connection.
-    fn advance_generation(&self) -> anyhow::Result<Self> {
-        let Some(next_generation) = self.generation.checked_add(1) else {
-            let _ = self.connection_generation.compare_exchange(
+    /// This closes admission immediately at the first terminal I/O/protocol
+    /// result. The reconnect loop later drains the now-stable queue and mints
+    /// the concrete successor authority. Repeating this for the same retired
+    /// authority is intentionally idempotent so cleanup cannot reopen a race.
+    fn begin_rpc_transport_retirement(&self) -> anyhow::Result<NonZeroU64> {
+        let current = NonZeroU64::new(self.generation)
+            .ok_or_else(|| anyhow!("cannot retire zero mux client connection generation"))?;
+        let mut phase = self.rpc_transport.phase.lock();
+        let next_generation = self.generation.checked_add(1).and_then(NonZeroU64::new);
+
+        if let (
+            Some(next_generation),
+            RpcTransportPhase::Reconnecting { retired, next },
+        ) = (next_generation, *phase)
+        {
+            if retired == current && next == next_generation {
+                return Ok(next);
+            }
+        }
+        if !matches!(*phase, RpcTransportPhase::Live(observed) if observed == current) {
+            bail!(
+                "cannot retire mux client RPC generation {} from phase {:?}",
+                current,
+                *phase
+            );
+        }
+        let observed_connection_generation =
+            self.connection_generation.load(AtomicOrdering::Acquire);
+        if observed_connection_generation != self.generation {
+            bail!(
+                "cannot retire stale mux client connection generation {} (current {})",
+                self.generation,
+                observed_connection_generation
+            );
+        }
+
+        let Some(next_generation) = next_generation else {
+            self.rpc_transport
+                .live_generation
+                .store(0, AtomicOrdering::Release);
+            if let Err(observed) = self.connection_generation.compare_exchange(
                 self.generation,
                 0,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
-            );
-            bail!("mux client connection generation exhausted");
-        };
-        self.connection_generation
-            .compare_exchange(
-                self.generation,
-                next_generation,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            )
-            .map_err(|observed| {
-                anyhow!(
-                    "cannot advance stale mux client connection generation {} (current {})",
+            ) {
+                *phase = RpcTransportPhase::Closed { last_live: current };
+                bail!(
+                    "cannot close exhausted mux client connection generation {} (current {})",
                     self.generation,
                     observed
-                )
-            })?;
+                );
+            }
+            *phase = RpcTransportPhase::Closed { last_live: current };
+            bail!("mux client connection generation exhausted");
+        };
+
+        self.rpc_transport
+            .live_generation
+            .store(0, AtomicOrdering::Release);
+        if let Err(observed) = self.connection_generation.compare_exchange(
+            self.generation,
+            next_generation.get(),
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            *phase = RpcTransportPhase::Closed { last_live: current };
+            bail!(
+                "cannot retire mux client connection generation {} after admission closed \
+                 (current {})",
+                self.generation,
+                observed
+            );
+        }
+        *phase = RpcTransportPhase::Reconnecting {
+            retired: current,
+            next: next_generation,
+        };
+        Ok(next_generation)
+    }
+
+    /// Drain the retired generation's stable queue and mint its successor.
+    fn advance_generation(&self, receiver: &Receiver<ReaderMessage>) -> anyhow::Result<Self> {
+        let next_generation = match self.begin_rpc_transport_retirement() {
+            Ok(next) => next,
+            Err(error) => {
+                receiver.close();
+                while let Ok(message) = receiver.try_recv() {
+                    message.retire(
+                        &self.rpc_transport,
+                        RpcRetirementStage::Queued,
+                        "connection generation space exhausted or became inconsistent",
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        // Admission is already disabled. Hold the phase gate while draining so
+        // no future phase implementation can accidentally activate the
+        // successor before every predecessor message has been retired.
+        let phase = self.rpc_transport.phase.lock();
+        if !matches!(
+            *phase,
+            RpcTransportPhase::Reconnecting { retired, next }
+                if retired.get() == self.generation && next == next_generation
+        ) {
+            bail!(
+                "cannot drain mux client RPC generation {} from phase {:?}",
+                self.generation,
+                *phase
+            );
+        }
+        while let Ok(message) = receiver.try_recv() {
+            message.retire(
+                &self.rpc_transport,
+                RpcRetirementStage::Queued,
+                "request remained queued when its transport retired",
+            );
+        }
+        drop(phase);
 
         let mut next = self.clone();
-        next.generation = next_generation;
+        next.generation = next_generation.get();
         Ok(next)
+    }
+
+    fn activate_rpc_transport(&self) -> anyhow::Result<()> {
+        let generation = NonZeroU64::new(self.generation)
+            .ok_or_else(|| anyhow!("cannot activate zero mux client connection generation"))?;
+        let mut phase = self.rpc_transport.phase.lock();
+        match *phase {
+            RpcTransportPhase::Reconnecting { next, .. } if next == generation => {
+                *phase = RpcTransportPhase::Live(generation);
+                self.rpc_transport
+                    .live_generation
+                    .store(generation.get(), AtomicOrdering::Release);
+                Ok(())
+            }
+            observed => bail!(
+                "cannot activate mux client RPC generation {} from phase {:?}",
+                generation,
+                observed
+            ),
+        }
+    }
+
+    fn close_rpc_transport(&self, receiver: &Receiver<ReaderMessage>, reason: &str) {
+        let mut phase = self.rpc_transport.phase.lock();
+        self.rpc_transport
+            .live_generation
+            .store(0, AtomicOrdering::Release);
+        let last_live = match *phase {
+            RpcTransportPhase::Live(generation) => generation,
+            RpcTransportPhase::Reconnecting { retired, .. } => retired,
+            RpcTransportPhase::Closed { last_live } => last_live,
+        };
+        *phase = RpcTransportPhase::Closed { last_live };
+        receiver.close();
+        while let Ok(message) = receiver.try_recv() {
+            message.retire(&self.rpc_transport, RpcRetirementStage::Queued, reason);
+        }
+    }
+
+    fn close_rpc_transport_without_receiver(&self) {
+        let mut phase = self.rpc_transport.phase.lock();
+        self.rpc_transport
+            .live_generation
+            .store(0, AtomicOrdering::Release);
+        let last_live = match *phase {
+            RpcTransportPhase::Live(generation) => generation,
+            RpcTransportPhase::Reconnecting { retired, .. } => retired,
+            RpcTransportPhase::Closed { last_live } => last_live,
+        };
+        *phase = RpcTransportPhase::Closed { last_live };
     }
 
     fn captured_mux(&self) -> Option<Arc<Mux>> {
@@ -221,6 +798,12 @@ impl CurrentClientDispatch {
         self.domain
             .downcast_ref::<ClientDomain>()
             .expect("current client dispatch was resolved from a ClientDomain")
+    }
+
+    fn rpc_scope(&self) -> RpcGenerationScope {
+        let generation = NonZeroU64::new(self.authority.generation)
+            .expect("current dispatch authority generation is nonzero");
+        self.inner.client.rpc_scope_at(generation)
     }
 
     fn is_current(&self) -> bool {
@@ -287,28 +870,36 @@ fn sanitized_remote_error_reason(reason: &str) -> String {
 
 macro_rules! rpc {
     ($method_name:ident, $request_type:ident, $response_type:ident) => {
-        pub async fn $method_name(&self, pdu: $request_type) -> anyhow::Result<$response_type> {
+        pub fn $method_name(
+            &self,
+            pdu: $request_type,
+        ) -> impl std::future::Future<Output = anyhow::Result<$response_type>> + Send + 'static {
             let start = std::time::Instant::now();
-            let result = self.send_pdu(Pdu::$request_type(pdu)).await;
-            let elapsed = start.elapsed();
-            metrics::histogram!("rpc", "method" => stringify!($method_name)).record(elapsed);
-            metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
-            match result {
-                Ok(Pdu::$response_type(res)) => Ok(res),
-                Ok(Pdu::ErrorResponse(err)) => {
-                    bail!(
-                        "{} failed: {}",
+            // `send_pdu` binds synchronously here, before this future can be
+            // moved into a detached task and first polled on a later transport.
+            let request = self.send_pdu(Pdu::$request_type(pdu));
+            async move {
+                let result = request.await;
+                let elapsed = start.elapsed();
+                metrics::histogram!("rpc", "method" => stringify!($method_name)).record(elapsed);
+                metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
+                match result {
+                    Ok(Pdu::$response_type(res)) => Ok(res),
+                    Ok(Pdu::ErrorResponse(err)) => {
+                        bail!(
+                            "{} failed: {}",
+                            stringify!($method_name),
+                            sanitized_remote_error_reason(&err.reason)
+                        )
+                    }
+                    Ok(other) => bail!(
+                        "unexpected {} response to {}; expected {}",
+                        other.pdu_name(),
                         stringify!($method_name),
-                        sanitized_remote_error_reason(&err.reason)
-                    )
+                        stringify!($response_type)
+                    ),
+                    Err(err) => Err(err),
                 }
-                Ok(other) => bail!(
-                    "unexpected {} response to {}; expected {}",
-                    other.pdu_name(),
-                    stringify!($method_name),
-                    stringify!($response_type)
-                ),
-                Err(err) => Err(err),
             }
         }
     };
@@ -318,30 +909,93 @@ macro_rules! rpc {
     // of typing the request.
     ($method_name:ident, $request_type:ident=(), $response_type:ident) => {
         #[allow(dead_code)]
-        pub async fn $method_name(&self) -> anyhow::Result<$response_type> {
+        pub fn $method_name(
+            &self,
+        ) -> impl std::future::Future<Output = anyhow::Result<$response_type>> + Send + 'static {
             let start = std::time::Instant::now();
-            let result = self.send_pdu(Pdu::$request_type($request_type{})).await;
-            let elapsed = start.elapsed();
-            metrics::histogram!("rpc", "method" => stringify!($method_name)).record(elapsed);
-            metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
-            match result {
-                Ok(Pdu::$response_type(res)) => Ok(res),
-                Ok(Pdu::ErrorResponse(err)) => {
-                    bail!(
-                        "{} failed: {}",
+            let request = self.send_pdu(Pdu::$request_type($request_type {}));
+            async move {
+                let result = request.await;
+                let elapsed = start.elapsed();
+                metrics::histogram!("rpc", "method" => stringify!($method_name)).record(elapsed);
+                metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
+                match result {
+                    Ok(Pdu::$response_type(res)) => Ok(res),
+                    Ok(Pdu::ErrorResponse(err)) => {
+                        bail!(
+                            "{} failed: {}",
+                            stringify!($method_name),
+                            sanitized_remote_error_reason(&err.reason)
+                        )
+                    }
+                    Ok(other) => bail!(
+                        "unexpected {} response to {}; expected {}",
+                        other.pdu_name(),
                         stringify!($method_name),
-                        sanitized_remote_error_reason(&err.reason)
-                    )
+                        stringify!($response_type)
+                    ),
+                    Err(err) => Err(err),
                 }
-                Ok(other) => bail!(
-                    "unexpected {} response to {}; expected {}",
-                    other.pdu_name(),
-                    stringify!($method_name),
-                    stringify!($response_type)
-                ),
-                Err(err) => Err(err),
             }
         }
+    };
+}
+
+macro_rules! rpc_surface {
+    () => {
+        rpc!(ping, Ping = (), Pong);
+        rpc!(list_panes, ListPanes = (), ListPanesResponse);
+        rpc!(spawn_v2, SpawnV2, SpawnResponse);
+        rpc!(split_pane, SplitPane, SpawnResponse);
+        rpc!(
+            move_pane_to_new_tab,
+            MovePaneToNewTab,
+            MovePaneToNewTabResponse
+        );
+        rpc!(write_to_pane, WriteToPane, UnitResponse);
+        rpc!(send_paste, SendPaste, UnitResponse);
+        rpc!(key_down, SendKeyDown, UnitResponse);
+        rpc!(key_up, SendKeyUp, UnitResponse);
+        rpc!(mouse_event, SendMouseEvent, UnitResponse);
+        rpc!(resize, Resize, UnitResponse);
+        rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
+        rpc!(activate_pane_direction, ActivatePaneDirection, UnitResponse);
+        rpc!(
+            get_pane_render_changes,
+            GetPaneRenderChanges,
+            LivenessResponse
+        );
+        rpc!(get_lines, GetLines, GetLinesResponse);
+        rpc!(
+            get_dimensions,
+            GetPaneRenderableDimensions,
+            GetPaneRenderableDimensionsResponse
+        );
+        rpc!(get_codec_version, GetCodecVersion, GetCodecVersionResponse);
+        rpc!(get_tls_creds, GetTlsCreds = (), GetTlsCredsResponse);
+        rpc!(
+            search_scrollback,
+            SearchScrollbackRequest,
+            SearchScrollbackResponse
+        );
+        rpc!(kill_pane, KillPane, UnitResponse);
+        rpc!(set_client_id, SetClientId, UnitResponse);
+        rpc!(list_clients, GetClientList = (), GetClientListResponse);
+        rpc!(set_window_workspace, SetWindowWorkspace, UnitResponse);
+        rpc!(set_active_workspace, SetActiveWorkspace, UnitResponse);
+        rpc!(set_focused_pane_id, SetFocusedPane, UnitResponse);
+        rpc!(get_image_cell, GetImageCell, GetImageCellResponse);
+        rpc!(set_configured_palette_for_pane, SetPalette, UnitResponse);
+        rpc!(set_tab_title, TabTitleChanged, UnitResponse);
+        rpc!(set_window_title, WindowTitleChanged, UnitResponse);
+        rpc!(rename_workspace, RenameWorkspace, UnitResponse);
+        rpc!(erase_scrollback, EraseScrollbackRequest, UnitResponse);
+        rpc!(
+            get_pane_direction,
+            GetPaneDirection,
+            GetPaneDirectionResponse
+        );
+        rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
     };
 }
 
@@ -709,7 +1363,8 @@ enum NotReconnectableError {
 #[derive(Debug)]
 struct PendingRpc {
     completion: Sender<anyhow::Result<Pdu>>,
-    pdu_name: &'static str,
+    binding: RpcBinding,
+    stage: RpcRetirementStage,
 }
 
 #[derive(Debug, Clone)]
@@ -826,6 +1481,15 @@ enum PendingRpcError {
         request: &'static str,
         response: &'static str,
     },
+    #[error(
+        "response serial {serial} belonged to generation {pending_generation}, \
+         not active transport generation {transport_generation}"
+    )]
+    ResponseGenerationMismatch {
+        serial: NonZeroU64,
+        pending_generation: NonZeroU64,
+        transport_generation: NonZeroU64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,18 +1501,24 @@ enum ReplyDisposition {
 #[derive(Debug)]
 struct PendingReplies {
     map: HashMap<NonZeroU64, PendingRpc>,
-    next_serial: Option<NonZeroU64>,
     highest_issued: u64,
     metrics: RpcMetrics,
+    generation: NonZeroU64,
+    rpc_transport: Arc<RpcTransportState>,
 }
 
 impl PendingReplies {
-    fn new(metrics: RpcMetrics) -> Self {
+    fn new(
+        metrics: RpcMetrics,
+        generation: NonZeroU64,
+        rpc_transport: Arc<RpcTransportState>,
+    ) -> Self {
         Self {
             map: HashMap::new(),
-            next_serial: NonZeroU64::new(1),
             highest_issued: 0,
             metrics,
+            generation,
+            rpc_transport,
         }
     }
 
@@ -861,16 +1531,39 @@ impl PendingReplies {
     fn admit(
         &mut self,
         completion: Sender<anyhow::Result<Pdu>>,
-        pdu_name: &'static str,
+        binding: RpcBinding,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
         if completion.is_closed() {
             self.metrics.preclosed.increment(1);
             return Ok(None);
         }
 
-        let Some(serial) = self.next_serial else {
-            self.metrics.serial_exhausted.increment(1);
-            return Self::reject_admission(completion, PendingRpcError::SerialExhausted);
+        if binding.generation != self.generation {
+            let error = self.rpc_transport.retirement_error(
+                binding,
+                RpcRetirementStage::SerialAssignment,
+                RpcDeliveryCertainty::DefinitelyNotSent,
+                "request generation does not match this transport actor",
+            );
+            let _ = completion.try_send(Err(anyhow::Error::new(error)));
+            return Ok(None);
+        }
+        if let Err(error) = self.rpc_transport.validate(
+            binding,
+            RpcRetirementStage::SerialAssignment,
+            RpcDeliveryCertainty::DefinitelyNotSent,
+            "transport retired before serial assignment",
+        ) {
+            complete_with_rpc_transport_error(&completion, error);
+            return Ok(None);
+        }
+
+        let serial = match self.rpc_transport.allocate_wire_serial() {
+            Ok(serial) => serial,
+            Err(error) => {
+                self.metrics.serial_exhausted.increment(1);
+                return Self::reject_admission(completion, error);
+            }
         };
         if let Err(err) = self.map.try_reserve(1) {
             self.metrics.reserve_failed.increment(1);
@@ -881,28 +1574,73 @@ impl PendingReplies {
             Entry::Vacant(entry) => {
                 entry.insert(PendingRpc {
                     completion,
-                    pdu_name,
+                    binding,
+                    stage: RpcRetirementStage::SerialAssignment,
                 });
             }
             Entry::Occupied(entry) => {
                 self.metrics.serial_collision.increment(1);
                 let error = PendingRpcError::SerialCollision {
                     serial,
-                    request: pdu_name,
-                    pending_request: entry.get().pdu_name,
+                    request: binding.request,
+                    pending_request: entry.get().binding.request,
                 };
                 return Self::reject_admission(completion, error);
             }
         }
 
+        if let Err(error) = self.rpc_transport.validate(
+            binding,
+            RpcRetirementStage::SerialAssignment,
+            RpcDeliveryCertainty::DefinitelyNotSent,
+            "transport retired while assigning a serial",
+        ) {
+            let pending = self
+                .map
+                .remove(&serial)
+                .expect("the just-inserted pending RPC must still exist");
+            complete_with_rpc_transport_error(&pending.completion, error);
+            return Ok(None);
+        }
+
         self.highest_issued = serial.get();
-        self.next_serial = serial.get().checked_add(1).and_then(NonZeroU64::new);
         self.metrics.admitted.increment(1);
         // This gauge is process-wide and intentionally unlabeled. Treat it as
         // an aggregate across every concurrent mux connection; absolute
         // per-connection `set` operations would clobber one another.
         self.metrics.pending.increment(1);
         Ok(Some(serial))
+    }
+
+    fn set_stage(
+        &mut self,
+        serial: NonZeroU64,
+        stage: RpcRetirementStage,
+    ) -> Result<RpcBinding, PendingRpcError> {
+        let Some(pending) = self.map.get_mut(&serial) else {
+            self.metrics.unmatched_serial.increment(1);
+            return Err(PendingRpcError::UnmatchedSerial {
+                serial,
+                highest_issued: self.highest_issued,
+            });
+        };
+        pending.stage = stage;
+        Ok(pending.binding)
+    }
+
+    fn validate_stage(
+        &self,
+        serial: NonZeroU64,
+        stage: RpcRetirementStage,
+        certainty: RpcDeliveryCertainty,
+        reason: &'static str,
+    ) -> Result<(), RpcTransportError> {
+        let pending = self
+            .map
+            .get(&serial)
+            .expect("stage validation requires an admitted pending RPC");
+        self.rpc_transport
+            .validate(pending.binding, stage, certainty, reason)
     }
 
     fn highest_issued(&self) -> u64 {
@@ -930,6 +1668,36 @@ impl PendingReplies {
         };
         self.metrics.pending.decrement(1);
 
+        if pending.binding.generation != self.generation {
+            let error = self.rpc_transport.retirement_error(
+                pending.binding,
+                RpcRetirementStage::ResponseMatch,
+                RpcDeliveryCertainty::OutcomeUnknown,
+                "response matched a pending request from another transport generation",
+            );
+            let _ = pending.completion.try_send(Err(anyhow::Error::new(error)));
+            self.metrics.transport_failed_live.increment(1);
+            return Err(PendingRpcError::ResponseGenerationMismatch {
+                serial,
+                pending_generation: pending.binding.generation,
+                transport_generation: self.generation,
+            });
+        }
+        if let Err(error) = self.rpc_transport.validate(
+            pending.binding,
+            RpcRetirementStage::ResponseMatch,
+            RpcDeliveryCertainty::OutcomeUnknown,
+            "transport retired before response correlation completed",
+        ) {
+            complete_with_rpc_transport_error(&pending.completion, error);
+            self.metrics.transport_failed_live.increment(1);
+            return Err(PendingRpcError::ResponseGenerationMismatch {
+                serial,
+                pending_generation: pending.binding.generation,
+                transport_generation: self.generation,
+            });
+        }
+
         let response_name = pdu.pdu_name();
         match pending.completion.try_send(Ok(pdu)) {
             Ok(()) => {
@@ -947,24 +1715,9 @@ impl PendingReplies {
                 self.metrics.protocol_reply_channel_full.increment(1);
                 Err(PendingRpcError::ReplyChannelFull {
                     serial,
-                    request: pending.pdu_name,
+                    request: pending.binding.request,
                     response: response_name,
                 })
-            }
-        }
-    }
-
-    fn complete_or_fail_transport(
-        &mut self,
-        serial: NonZeroU64,
-        pdu: Pdu,
-    ) -> Result<ReplyDisposition, PendingRpcError> {
-        match self.complete(serial, pdu) {
-            Ok(disposition) => Ok(disposition),
-            Err(error) => {
-                let reason = error.to_string();
-                self.fail_all(&reason);
-                Err(error)
             }
         }
     }
@@ -977,10 +1730,28 @@ impl PendingReplies {
                 self.metrics.transport_cleared_abandoned.increment(1);
                 continue;
             }
-            match pending.completion.try_send(Err(anyhow!(
-                "{reason} (pending {} serial {serial})",
-                pending.pdu_name
-            ))) {
+            let certainty = match pending.stage {
+                RpcRetirementStage::Admission
+                | RpcRetirementStage::Enqueue
+                | RpcRetirementStage::Queued
+                | RpcRetirementStage::Dequeue
+                | RpcRetirementStage::SerialAssignment
+                | RpcRetirementStage::FrameEncoding
+                | RpcRetirementStage::BeforeWrite => RpcDeliveryCertainty::DefinitelyNotSent,
+                RpcRetirementStage::WriteStarted
+                | RpcRetirementStage::BeforeFlush
+                | RpcRetirementStage::AfterFlush
+                | RpcRetirementStage::AwaitingResponse
+                | RpcRetirementStage::ResponseMatch
+                | RpcRetirementStage::CompletionChannel => RpcDeliveryCertainty::OutcomeUnknown,
+            };
+            let error = self.rpc_transport.retirement_error(
+                pending.binding,
+                pending.stage,
+                certainty,
+                format!("{reason} (pending serial {serial})"),
+            );
+            match pending.completion.try_send(Err(anyhow::Error::new(error))) {
                 Ok(()) => self.metrics.transport_failed_live.increment(1),
                 Err(TrySendError::Closed(_)) => {
                     self.metrics.transport_cleared_abandoned.increment(1);
@@ -990,7 +1761,7 @@ impl PendingReplies {
                     self.metrics.protocol_reply_channel_full.increment(1);
                     log::error!(
                         "reply channel unexpectedly full while failing pending {} serial {}",
-                        pending.pdu_name,
+                        pending.binding.request,
                         serial
                     );
                 }
@@ -1011,19 +1782,32 @@ impl PendingReplies {
         self.fail_all(&format!("{error:#}"));
     }
 
-    fn fail_after_decode_error(&mut self, error: &anyhow::Error) -> String {
-        self.record_decode_protocol_error(error);
-        let reason = format!("Error while decoding response pdu: {error:#}");
-        self.fail_all(&reason);
-        reason
-    }
-
     fn reject_admission(
         completion: Sender<anyhow::Result<Pdu>>,
         error: PendingRpcError,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
         let _ = completion.try_send(Err(anyhow!("{error}")));
         Err(error)
+    }
+
+    #[cfg(test)]
+    fn admit_named(
+        &mut self,
+        completion: Sender<anyhow::Result<Pdu>>,
+        request: &'static str,
+    ) -> Result<Option<NonZeroU64>, PendingRpcError> {
+        let attempt_id = self
+            .rpc_transport
+            .allocate_attempt(request)
+            .expect("test RPC attempt identity should be available");
+        self.admit(
+            completion,
+            RpcBinding {
+                generation: self.generation,
+                attempt_id,
+                request,
+            },
+        )
     }
 }
 
@@ -1069,7 +1853,13 @@ async fn client_thread_async(
     rx: &mut Receiver<ReaderMessage>,
     dispatch_authority: &ClientDispatchAuthority,
 ) -> anyhow::Result<()> {
-    let mut pending = PendingReplies::new(RpcMetrics::register());
+    let generation = NonZeroU64::new(dispatch_authority.generation)
+        .ok_or_else(|| anyhow!("mux client reader cannot own generation zero"))?;
+    let mut pending = PendingReplies::new(
+        RpcMetrics::register(),
+        generation,
+        Arc::clone(&dispatch_authority.rpc_transport),
+    );
 
     // Wrap the connection in a persistent buffered reader so PDU decoding pulls
     // its leb128 length headers and bodies from an in-memory buffer (one socket
@@ -1079,16 +1869,32 @@ async fn client_thread_async(
     // pipelined PDUs carry over between iterations. Writes still go straight to
     // the socket via `get_mut()` (BufReader only buffers reads), so the encode
     // path is byte-for-byte unchanged.
-    let mut reader = BufReader::new(reconnectable.take_stream().ok_or_else(|| {
-        anyhow::anyhow!("mux client stream not available — connection not established")
-    })?);
+    let stream = match reconnectable.take_stream() {
+        Some(stream) => stream,
+        None => {
+            let error =
+                anyhow::anyhow!("mux client stream not available — connection not established");
+            if let Err(retirement_error) =
+                dispatch_authority.begin_rpc_transport_retirement()
+            {
+                log::error!(
+                    "failed to retire mux client RPC transport without an installed stream: \
+                     {retirement_error:#}"
+                );
+            }
+            pending.fail_after_transport_error(&error);
+            return Err(error);
+        }
+    };
+    let mut reader = BufReader::new(stream);
 
     enum NextEvent {
         Message(Result<ReaderMessage, async_channel::RecvError>),
         Readable(anyhow::Result<()>),
     }
 
-    loop {
+    let result = async {
+        loop {
         let next_event = {
             let rx_msg = rx.recv();
             // Readiness must be buffer-aware: a prior socket read may have
@@ -1120,25 +1926,78 @@ async fn client_thread_async(
         };
 
         match next_event {
-            NextEvent::Message(Ok(ReaderMessage::SendPdu { pdu, promise })) => {
-                let request_name = pdu.pdu_name();
-                let serial = match pending.admit(promise, request_name) {
+            NextEvent::Message(Ok(ReaderMessage::SendPdu {
+                binding,
+                pdu,
+                promise,
+            })) => {
+                if let Err(error) = dispatch_authority.rpc_transport.validate(
+                    binding,
+                    RpcRetirementStage::Dequeue,
+                    RpcDeliveryCertainty::DefinitelyNotSent,
+                    "request reached a reader other than its bound transport",
+                ) {
+                    complete_with_rpc_transport_error(&promise, error);
+                    continue;
+                }
+                let serial = match pending.admit(promise, binding) {
                     Ok(Some(serial)) => serial,
                     Ok(None) => continue,
                     Err(error) => {
                         let error = anyhow::Error::new(error);
-                        pending.fail_after_transport_error(&error);
                         return Err(error);
                     }
                 };
 
-                if let Err(error) = pdu
-                    .encode_async(reader.get_mut(), serial.get())
-                    .await
-                    .context("encoding a PDU to send to the server")
+                pending.set_stage(serial, RpcRetirementStage::FrameEncoding)?;
+                if let Err(error) = pending.validate_stage(
+                    serial,
+                    RpcRetirementStage::FrameEncoding,
+                    RpcDeliveryCertainty::DefinitelyNotSent,
+                    "transport retired before frame encoding",
+                ) {
+                    return Err(anyhow::Error::new(error));
+                }
+                // Build the complete frame before touching the socket. Besides
+                // eliminating ambiguity at the encode boundary, this lets a
+                // retired request prove zero wire bytes before `write_all`.
+                let frame = match pdu
+                    .encode_frame(serial.get())
+                    .context("encoding a PDU frame to send to the server")
                 {
-                    pending.fail_after_transport_error(&error);
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        return Err(error);
+                    }
+                };
+                pending.set_stage(serial, RpcRetirementStage::BeforeWrite)?;
+                if let Err(error) = pending.validate_stage(
+                    serial,
+                    RpcRetirementStage::BeforeWrite,
+                    RpcDeliveryCertainty::DefinitelyNotSent,
+                    "transport retired after frame encoding and before socket write",
+                ) {
+                    return Err(anyhow::Error::new(error));
+                }
+
+                pending.set_stage(serial, RpcRetirementStage::WriteStarted)?;
+                if let Err(error) = reader
+                    .get_mut()
+                    .write_all(&frame)
+                    .await
+                    .context("writing an encoded PDU frame to the server")
+                {
                     return Err(error);
+                }
+
+                pending.set_stage(serial, RpcRetirementStage::BeforeFlush)?;
+                if let Err(error) = pending.validate_stage(
+                    serial,
+                    RpcRetirementStage::BeforeFlush,
+                    RpcDeliveryCertainty::OutcomeUnknown,
+                    "transport retired after socket write and before flush",
+                ) {
+                    return Err(anyhow::Error::new(error));
                 }
                 if let Err(error) = reader
                     .get_mut()
@@ -1146,9 +2005,18 @@ async fn client_thread_async(
                     .await
                     .context("flushing PDU to server")
                 {
-                    pending.fail_after_transport_error(&error);
                     return Err(error);
                 }
+                pending.set_stage(serial, RpcRetirementStage::AfterFlush)?;
+                if let Err(error) = pending.validate_stage(
+                    serial,
+                    RpcRetirementStage::AfterFlush,
+                    RpcDeliveryCertainty::OutcomeUnknown,
+                    "transport retired while flushing a request",
+                ) {
+                    return Err(anyhow::Error::new(error));
+                }
+                pending.set_stage(serial, RpcRetirementStage::AwaitingResponse)?;
             }
             NextEvent::Message(Err(_)) => {
                 return Err(NotReconnectableError::ClientWasDestroyed.into());
@@ -1166,22 +2034,19 @@ async fn client_thread_async(
                                 .context("processing unilateral PDU from server")
                             {
                                 log::error!("process_unilateral: {:?}", error);
-                                pending.fail_after_transport_error(&error);
                                 return Err(error);
                             }
                         } else {
                             let serial = NonZeroU64::new(decoded.serial)
                                 .expect("the unilateral serial-zero branch was handled above");
-                            if let Err(err) =
-                                pending.complete_or_fail_transport(serial, decoded.pdu)
-                            {
+                            if let Err(err) = pending.complete(serial, decoded.pdu) {
                                 return Err(err.into());
                             }
                         }
                     }
                     Err(err) => {
-                        let reason = pending.fail_after_decode_error(&err);
-                        log::error!("{}", reason);
+                        pending.record_decode_protocol_error(&err);
+                        log::error!("Error while decoding response pdu: {err:#}");
                         return Err(err).context("Error while decoding response pdu");
                     }
                 }
@@ -1189,11 +2054,23 @@ async fn client_thread_async(
             NextEvent::Readable(Err(err)) => {
                 let reason = format!("Error while waiting for stream readability: {:#}", err);
                 log::error!("{}", reason);
-                pending.fail_all(&reason);
                 return Err(err).context("Error while waiting for stream readability");
             }
         }
+        }
     }
+    .await;
+
+    if let Err(error) = &result {
+        if let Err(retirement_error) = dispatch_authority.begin_rpc_transport_retirement() {
+            log::error!(
+                "failed to retire mux client RPC transport after terminal reader result: \
+                 {retirement_error:#}"
+            );
+        }
+        pending.fail_after_transport_error(error);
+    }
+    result
 }
 
 pub fn unix_connect_with_retry(
@@ -2094,6 +2971,7 @@ impl Client {
                 &self.connection_generation,
                 &authority.connection_generation,
             )
+            && Arc::ptr_eq(&self.rpc_transport, &authority.rpc_transport)
     }
 
     fn new(
@@ -2108,11 +2986,13 @@ impl Client {
         let client_id = ClientId::new();
         let incarnation = Arc::new(ClientIncarnation);
         let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
+        let rpc_transport = Arc::new(RpcTransportState::new());
         let initial_dispatch_authority = ClientDispatchAuthority::new(
             local_domain_id,
             mux_owner,
             Arc::clone(&incarnation),
             Arc::clone(&connection_generation),
+            Arc::clone(&rpc_transport),
         );
         let mut reconnect_dispatch_authority = initial_dispatch_authority.clone();
 
@@ -2148,7 +3028,7 @@ impl Client {
                     reconnectable = returned_reconnectable;
                     receiver = returned_receiver;
                     reconnect_dispatch_authority = match reconnect_dispatch_authority
-                        .advance_generation()
+                        .advance_generation(&receiver)
                     {
                         Ok(next) => next,
                         Err(err) => {
@@ -2237,6 +3117,15 @@ impl Client {
                             let no_auto_start = true; // Don't auto-start on a reconnect
                             match reconnectable.connect(initial, ui, no_auto_start) {
                                 Ok(_) => {
+                                    if let Err(err) =
+                                        reconnect_dispatch_authority.activate_rpc_transport()
+                                    {
+                                        log::error!(
+                                            "cannot activate reconnected mux client transport: \
+                                             {err:#}"
+                                        );
+                                        break;
+                                    }
                                     backoff = base_interval;
                                     log::error!("Reconnected!");
                                     let reattach_ui = ui.clone();
@@ -2306,6 +3195,8 @@ impl Client {
                     }
                 }
 
+                reconnect_dispatch_authority
+                    .close_rpc_transport(&receiver, "mux client reconnect loop terminated");
                 match reconnect_dispatch_authority.resolve_current() {
                     Ok(Some(dispatch)) => {
                         promise::spawn::spawn_into_main_thread(async move {
@@ -2336,7 +3227,15 @@ impl Client {
             })
         {
             log::error!("failed to spawn client reconnect thread: {err:#}");
-            let _ = initial_dispatch_authority.advance_generation();
+            initial_dispatch_authority.close_rpc_transport_without_receiver();
+            let _ = initial_dispatch_authority
+                .connection_generation
+                .compare_exchange(
+                    initial_dispatch_authority.generation,
+                    0,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                );
         }
 
         Self {
@@ -2344,6 +3243,7 @@ impl Client {
             local_domain_id,
             incarnation,
             connection_generation,
+            rpc_transport,
             is_reconnectable,
             is_local,
             client_id,
@@ -2359,8 +3259,17 @@ impl Client {
         &self,
         ui: &ConnectionUI,
     ) -> anyhow::Result<GetCodecVersionResponse> {
+        let rpc = self.rpc_scope();
+        self.verify_version_compat_with_scope(ui, &rpc).await
+    }
+
+    pub(crate) async fn verify_version_compat_with_scope(
+        &self,
+        ui: &ConnectionUI,
+        rpc: &RpcGenerationScope,
+    ) -> anyhow::Result<GetCodecVersionResponse> {
         let version_info = {
-            let codec_version = self.get_codec_version(GetCodecVersion {});
+            let codec_version = rpc.get_codec_version(GetCodecVersion {});
             let timeout = async {
                 promise::spawn::sleep(Duration::from_secs(60)).await;
                 Err(Timeout).context("Timeout")
@@ -2412,7 +3321,7 @@ impl Client {
                             info.codec_vers,
                             agreed
                         );
-                        self.set_client_id(SetClientId {
+                        rpc.set_client_id(SetClientId {
                             client_id: self.client_id.clone(),
                             is_proxy: false,
                         })
@@ -2442,12 +3351,11 @@ impl Client {
                     to stdout prior to running commands. \
                     Check your shell startup!"
                         .to_string()
-                } else if err.root_cause().is::<ChannelSendError>() {
-                    "Internal channel was closed prior to sending request. \
-                    This may indicate that the remote host output invalid data \
-                    to stdout prior to running the requested command. \
-                    Check your shell startup!"
-                        .to_string()
+                } else if err.root_cause().is::<RpcTransportError>() {
+                    format!(
+                        "The mux transport retired while checking the server version: {err}. \
+                         Reconnect and retry the explicit attach operation."
+                    )
                 } else {
                     format!(
                         "Please install the same version of FrankenTerm on both \
@@ -2555,17 +3463,23 @@ impl Client {
         Ok(Self::new(Some(local_domain_id), reconnectable, mux_owner))
     }
 
-    pub async fn send_pdu(&self, pdu: Pdu) -> anyhow::Result<Pdu> {
-        let (promise, rx) = bounded(1);
-        self.sender
-            .send(ReaderMessage::SendPdu {
-                pdu: Box::new(pdu),
-                promise,
-            })
-            .await
-            .map_err(|_| ChannelSendError)
-            .context("send_pdu send")?;
-        rx.recv().await.context("send_pdu recv")?
+    pub fn send_pdu(
+        &self,
+        pdu: Pdu,
+    ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
+        self.rpc_scope().send_pdu(pdu)
+    }
+
+    pub(crate) fn rpc_scope(&self) -> RpcGenerationScope {
+        RpcGenerationScope::capture(self.sender.clone(), Arc::clone(&self.rpc_transport))
+    }
+
+    fn rpc_scope_at(&self, generation: NonZeroU64) -> RpcGenerationScope {
+        RpcGenerationScope::exact(
+            self.sender.clone(),
+            Arc::clone(&self.rpc_transport),
+            generation,
+        )
     }
 
     pub async fn resolve_pane_id(&self, pane_id: Option<PaneId>) -> anyhow::Result<PaneId> {
@@ -2595,59 +3509,11 @@ impl Client {
         Ok(pane_id)
     }
 
-    rpc!(ping, Ping = (), Pong);
-    rpc!(list_panes, ListPanes = (), ListPanesResponse);
-    rpc!(spawn_v2, SpawnV2, SpawnResponse);
-    rpc!(split_pane, SplitPane, SpawnResponse);
-    rpc!(
-        move_pane_to_new_tab,
-        MovePaneToNewTab,
-        MovePaneToNewTabResponse
-    );
-    rpc!(write_to_pane, WriteToPane, UnitResponse);
-    rpc!(send_paste, SendPaste, UnitResponse);
-    rpc!(key_down, SendKeyDown, UnitResponse);
-    rpc!(key_up, SendKeyUp, UnitResponse);
-    rpc!(mouse_event, SendMouseEvent, UnitResponse);
-    rpc!(resize, Resize, UnitResponse);
-    rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
-    rpc!(activate_pane_direction, ActivatePaneDirection, UnitResponse);
-    rpc!(
-        get_pane_render_changes,
-        GetPaneRenderChanges,
-        LivenessResponse
-    );
-    rpc!(get_lines, GetLines, GetLinesResponse);
-    rpc!(
-        get_dimensions,
-        GetPaneRenderableDimensions,
-        GetPaneRenderableDimensionsResponse
-    );
-    rpc!(get_codec_version, GetCodecVersion, GetCodecVersionResponse);
-    rpc!(get_tls_creds, GetTlsCreds = (), GetTlsCredsResponse);
-    rpc!(
-        search_scrollback,
-        SearchScrollbackRequest,
-        SearchScrollbackResponse
-    );
-    rpc!(kill_pane, KillPane, UnitResponse);
-    rpc!(set_client_id, SetClientId, UnitResponse);
-    rpc!(list_clients, GetClientList = (), GetClientListResponse);
-    rpc!(set_window_workspace, SetWindowWorkspace, UnitResponse);
-    rpc!(set_active_workspace, SetActiveWorkspace, UnitResponse);
-    rpc!(set_focused_pane_id, SetFocusedPane, UnitResponse);
-    rpc!(get_image_cell, GetImageCell, GetImageCellResponse);
-    rpc!(set_configured_palette_for_pane, SetPalette, UnitResponse);
-    rpc!(set_tab_title, TabTitleChanged, UnitResponse);
-    rpc!(set_window_title, WindowTitleChanged, UnitResponse);
-    rpc!(rename_workspace, RenameWorkspace, UnitResponse);
-    rpc!(erase_scrollback, EraseScrollbackRequest, UnitResponse);
-    rpc!(
-        get_pane_direction,
-        GetPaneDirection,
-        GetPaneDirectionResponse
-    );
-    rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
+    rpc_surface!();
+}
+
+impl RpcGenerationScope {
+    rpc_surface!();
 }
 
 #[cfg(test)]
@@ -2658,7 +3524,29 @@ impl Client {
             mux_owner,
             Arc::clone(&self.incarnation),
             Arc::clone(&self.connection_generation),
+            Arc::clone(&self.rpc_transport),
         )
+    }
+
+    fn test_reader_message(&self, pdu: Pdu, promise: Sender<anyhow::Result<Pdu>>) -> ReaderMessage {
+        let request = pdu.pdu_name();
+        let attempt_id = self
+            .rpc_transport
+            .allocate_attempt(request)
+            .expect("test RPC attempt identity should be available");
+        let generation = self
+            .rpc_transport
+            .active_generation()
+            .expect("test RPC transport should be live");
+        ReaderMessage::SendPdu {
+            binding: RpcBinding {
+                generation,
+                attempt_id,
+                request,
+            },
+            pdu: Box::new(pdu),
+            promise,
+        }
     }
 
     pub(crate) fn new_test_client(
@@ -2671,6 +3559,7 @@ impl Client {
             local_domain_id,
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            rpc_transport: Arc::new(RpcTransportState::new()),
             client_id: ClientId {
                 hostname: "test-host".to_string(),
                 username: "tester".to_string(),
@@ -2697,9 +3586,10 @@ mod tests {
     };
     use metrics::atomics::AtomicU64 as MetricAtomicU64;
     use metrics::{Counter, Gauge};
+    use std::fmt;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     #[cfg(unix)]
     use std::sync::mpsc;
     use std::sync::{Mutex as StdMutex, Once};
@@ -2918,7 +3808,17 @@ mod tests {
 
     fn pending_replies_for_test() -> (PendingReplies, RpcMetricProbe) {
         let (metrics, probe) = RpcMetricProbe::new();
-        (PendingReplies::new(metrics), probe)
+        (pending_replies_with_metrics(metrics), probe)
+    }
+
+    fn pending_replies_with_metrics(metrics: RpcMetrics) -> PendingReplies {
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        PendingReplies::new(
+            metrics,
+            NonZeroU64::new(INITIAL_CONNECTION_GENERATION)
+                .expect("initial test generation is nonzero"),
+            rpc_transport,
+        )
     }
 
     #[test]
@@ -2941,18 +3841,455 @@ mod tests {
         );
     }
 
+    fn client_with_idle_rpc_queue() -> (Client, Receiver<ReaderMessage>) {
+        let (sender, receiver) = unbounded();
+        (
+            Client {
+                sender,
+                local_domain_id: None,
+                incarnation: Arc::new(ClientIncarnation),
+                connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+                rpc_transport: Arc::new(RpcTransportState::new()),
+                client_id: ClientId::new(),
+                client_domain_config: ClientDomainConfig::Unix(UnixDomain::default()),
+                is_reconnectable: false,
+                is_local: true,
+            },
+            receiver,
+        )
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ScriptedFailureBoundary {
+        PartialWrite { accepted_prefix: usize },
+        Flush,
+        AwaitingResponseEof,
+    }
+
+    struct ScriptedTransportState {
+        transcript: StdMutex<Vec<u8>>,
+        write_calls: AtomicU64,
+        read_ready: AtomicBool,
+        read_waker: futures::task::AtomicWaker,
+    }
+
+    impl ScriptedTransportState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                transcript: StdMutex::new(Vec::new()),
+                write_calls: AtomicU64::new(0),
+                read_ready: AtomicBool::new(false),
+                read_waker: futures::task::AtomicWaker::new(),
+            })
+        }
+
+        fn transcript(&self) -> Vec<u8> {
+            self.transcript
+                .lock()
+                .expect("scripted transport transcript lock")
+                .clone()
+        }
+    }
+
+    struct ScriptedTransport {
+        boundary: ScriptedFailureBoundary,
+        state: Arc<ScriptedTransportState>,
+    }
+
+    impl fmt::Debug for ScriptedTransport {
+        fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt.debug_struct("ScriptedTransport")
+                .field("boundary", &self.boundary)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl AsyncRead for ScriptedTransport {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _task_cx: &mut TaskContext<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.boundary == ScriptedFailureBoundary::AwaitingResponseEof
+                && self.state.read_ready.load(Ordering::Acquire)
+            {
+                // A successful zero-byte read is EOF. The peer observed the
+                // complete request frame but deliberately withheld its reply.
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl AsyncWrite for ScriptedTransport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _task_cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            match self.boundary {
+                ScriptedFailureBoundary::PartialWrite { accepted_prefix } => {
+                    let write_call = self.state.write_calls.fetch_add(1, Ordering::AcqRel);
+                    if write_call == 0 {
+                        let accepted = accepted_prefix.min(buf.len());
+                        assert!(
+                            accepted > 0 && accepted < buf.len(),
+                            "partial-write script needs a strict non-empty frame prefix"
+                        );
+                        self.state
+                            .transcript
+                            .lock()
+                            .expect("scripted transport transcript lock")
+                            .extend_from_slice(&buf[..accepted]);
+                        Poll::Ready(Ok(accepted))
+                    } else {
+                        Poll::Ready(Err(std::io::Error::new(
+                            ErrorKind::BrokenPipe,
+                            "scripted failure after a partial frame write",
+                        )))
+                    }
+                }
+                ScriptedFailureBoundary::Flush
+                | ScriptedFailureBoundary::AwaitingResponseEof => {
+                    self.state.write_calls.fetch_add(1, Ordering::AcqRel);
+                    self.state
+                        .transcript
+                        .lock()
+                        .expect("scripted transport transcript lock")
+                        .extend_from_slice(buf);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _task_cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.boundary {
+                ScriptedFailureBoundary::Flush => Poll::Ready(Err(std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "scripted flush failure after a complete frame write",
+                ))),
+                ScriptedFailureBoundary::AwaitingResponseEof => {
+                    self.state.read_ready.store(true, Ordering::Release);
+                    self.state.read_waker.wake();
+                    Poll::Ready(Ok(()))
+                }
+                ScriptedFailureBoundary::PartialWrite { .. } => Poll::Ready(Ok(())),
+            }
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _task_cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[async_trait]
+    impl AsyncReadAndWrite for ScriptedTransport {
+        async fn wait_for_readable(&self) -> anyhow::Result<()> {
+            poll_fn(|task_cx| {
+                self.state.read_waker.register(task_cx.waker());
+                if self.state.read_ready.load(Ordering::Acquire) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        }
+    }
+
+    fn run_scripted_rpc_failure(
+        pdu: Pdu,
+        boundary: ScriptedFailureBoundary,
+    ) -> (anyhow::Error, anyhow::Error, Vec<u8>) {
+        let _watchdog = hang_watchdog(15, "scripted RPC failure boundary", 94);
+        let (client, mut receiver) = client_with_idle_rpc_queue();
+        let authority = client.test_dispatch_authority(Weak::new());
+        let state = ScriptedTransportState::new();
+        let stream = ScriptedTransport {
+            boundary,
+            state: Arc::clone(&state),
+        };
+        let mut reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(UnixDomain::default()),
+            Some(Box::new(stream)),
+        );
+        let rpc = client.send_pdu(pdu);
+
+        let (reader_result, rpc_result) = asupersync_block_on(futures::future::join(
+            client_thread_async(&mut reconnectable, &mut receiver, &authority),
+            rpc,
+        ));
+        (
+            reader_result.expect_err("the scripted reader must terminate at its boundary"),
+            rpc_result.expect_err("the RPC must receive one typed transport failure"),
+            state.transcript(),
+        )
+    }
+
+    fn assert_rpc_retirement(
+        error: &anyhow::Error,
+        expected_stage: RpcRetirementStage,
+        expected_certainty: RpcDeliveryCertainty,
+    ) {
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                stage,
+                certainty,
+                ..
+            }) if *stage == expected_stage && *certainty == expected_certainty
+        ), "unexpected RPC retirement: {error:#}");
+    }
+
+    #[test]
+    fn scripted_transport_boundaries_preserve_delivery_certainty_and_wire_evidence() {
+        let (_reader_error, rpc_error, transcript) = run_scripted_rpc_failure(
+            Pdu::Invalid { ident: 0xdead_beef },
+            ScriptedFailureBoundary::Flush,
+        );
+        assert_rpc_retirement(
+            &rpc_error,
+            RpcRetirementStage::FrameEncoding,
+            RpcDeliveryCertainty::DefinitelyNotSent,
+        );
+        assert!(
+            transcript.is_empty(),
+            "pure frame-construction failure must write zero bytes"
+        );
+
+        let (_reader_error, rpc_error, transcript) = run_scripted_rpc_failure(
+            Pdu::Ping(Ping {}),
+            ScriptedFailureBoundary::PartialWrite { accepted_prefix: 1 },
+        );
+        assert_rpc_retirement(
+            &rpc_error,
+            RpcRetirementStage::WriteStarted,
+            RpcDeliveryCertainty::OutcomeUnknown,
+        );
+        assert_eq!(
+            transcript.len(),
+            1,
+            "partial-write witness must retain the exact accepted prefix"
+        );
+        assert!(
+            Pdu::decode(std::io::Cursor::new(&transcript)).is_err(),
+            "a strict frame prefix must not decode as a complete request"
+        );
+
+        for (boundary, expected_stage) in [
+            (
+                ScriptedFailureBoundary::Flush,
+                RpcRetirementStage::BeforeFlush,
+            ),
+            (
+                ScriptedFailureBoundary::AwaitingResponseEof,
+                RpcRetirementStage::AwaitingResponse,
+            ),
+        ] {
+            let (_reader_error, rpc_error, transcript) =
+                run_scripted_rpc_failure(Pdu::Ping(Ping {}), boundary);
+            assert_rpc_retirement(
+                &rpc_error,
+                expected_stage,
+                RpcDeliveryCertainty::OutcomeUnknown,
+            );
+            let decoded = Pdu::decode(std::io::Cursor::new(&transcript))
+                .expect("post-write failure transcript must contain one complete request");
+            assert_eq!(decoded.serial, 1);
+            assert_eq!(decoded.pdu, Pdu::Ping(Ping {}));
+        }
+    }
+
+    #[test]
+    fn rpc_future_binds_synchronously_but_never_enqueues_before_first_poll() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let authority = client.test_dispatch_authority(Weak::new());
+
+        let bound_on_first = client.send_pdu(Pdu::Ping(Ping {}));
+        assert!(
+            matches!(receiver.try_recv(), Err(async_channel::TryRecvError::Empty)),
+            "constructing a bound RPC future must retain normal lazy-future semantics"
+        );
+
+        let successor = authority
+            .advance_generation(&receiver)
+            .expect("retire the generation captured by the unpolled future");
+        let error = asupersync_block_on(bound_on_first)
+            .expect_err("a future first-polled after reconnect must fail before enqueue");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                bound_generation,
+                active_generation: None,
+                stage: RpcRetirementStage::Enqueue,
+                certainty: RpcDeliveryCertainty::DefinitelyNotSent,
+                ..
+            }) if bound_generation.get() == INITIAL_CONNECTION_GENERATION
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+
+        let during_reconnect = client.send_pdu(Pdu::Ping(Ping {}));
+        let error = asupersync_block_on(during_reconnect)
+            .expect_err("external admission during reconnect must fail immediately");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Unavailable {
+                stage: RpcRetirementStage::Admission,
+                ..
+            })
+        ));
+
+        successor
+            .activate_rpc_transport()
+            .expect("publish the exact successor generation");
+        let fresh_but_unpolled = client.send_pdu(Pdu::Ping(Ping {}));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+        drop(fresh_but_unpolled);
+    }
+
+    #[test]
+    fn transport_retirement_drains_queued_generation_with_one_typed_outcome() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let authority = client.test_dispatch_authority(Weak::new());
+        let (completion, result) = bounded(1);
+        asupersync_block_on(
+            client
+                .sender
+                .send(client.test_reader_message(Pdu::Ping(Ping {}), completion)),
+        )
+        .expect("queue an exact-generation request");
+
+        authority
+            .advance_generation(&receiver)
+            .expect("retire and drain the queued generation");
+        let error = result
+            .try_recv()
+            .expect("retirement must complete the queued request")
+            .expect_err("queued work must not cross onto the successor");
+        assert!(matches!(
+            error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                stage: RpcRetirementStage::Queued,
+                certainty: RpcDeliveryCertainty::DefinitelyNotSent,
+                active_generation: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            result.try_recv(),
+            Err(async_channel::TryRecvError::Empty) | Err(async_channel::TryRecvError::Closed)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn wire_serials_are_never_reused_across_transport_generations() {
+        let rpc_transport = Arc::new(RpcTransportState::new());
+        let connection_generation = Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION));
+        let authority = ClientDispatchAuthority::new(
+            None,
+            Weak::new(),
+            Arc::new(ClientIncarnation),
+            Arc::clone(&connection_generation),
+            Arc::clone(&rpc_transport),
+        );
+        let (first_metrics, first_probe) = RpcMetricProbe::new();
+        let mut first = PendingReplies::new(
+            first_metrics,
+            NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("initial generation is nonzero"),
+            Arc::clone(&rpc_transport),
+        );
+        let (first_tx, first_rx) = bounded(1);
+        let first_serial = first
+            .admit_named(first_tx, "Ping")
+            .expect("admit first-generation request")
+            .expect("assign first-generation serial");
+        assert_eq!(first_serial.get(), 1);
+        first
+            .set_stage(first_serial, RpcRetirementStage::AwaitingResponse)
+            .expect("track the first request as emitted");
+        first.fail_all("first transport disconnected");
+        assert!(first_rx
+            .try_recv()
+            .expect("first waiter must retire")
+            .is_err());
+        first_probe.assert_balanced();
+
+        let (_sender, receiver) = unbounded();
+        let successor = authority
+            .advance_generation(&receiver)
+            .expect("mint successor generation");
+        successor
+            .activate_rpc_transport()
+            .expect("activate successor generation");
+        let successor_generation =
+            NonZeroU64::new(successor.generation).expect("successor generation is nonzero");
+        let (second_metrics, second_probe) = RpcMetricProbe::new();
+        let mut second = PendingReplies::new(
+            second_metrics,
+            successor_generation,
+            Arc::clone(&rpc_transport),
+        );
+        let (second_tx, second_rx) = bounded(1);
+        let second_serial = second
+            .admit_named(second_tx, "Ping")
+            .expect("admit successor request")
+            .expect("assign successor serial");
+        assert_eq!(second_serial.get(), 2);
+
+        let stale = second
+            .complete(first_serial, Pdu::Pong(Pong {}))
+            .expect_err("an old-generation serial must not match successor state");
+        assert!(matches!(
+            stale,
+            PendingRpcError::UnmatchedSerial { serial, .. } if serial == first_serial
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        ));
+
+        second
+            .complete(second_serial, Pdu::Pong(Pong {}))
+            .expect("the exact successor serial should complete");
+        assert_eq!(
+            second_rx
+                .try_recv()
+                .expect("successor completion")
+                .expect("successor RPC result"),
+            Pdu::Pong(Pong {})
+        );
+        second_probe.assert_balanced();
+    }
+
     #[test]
     fn pending_rpc_gauge_aggregates_across_connections_and_drop_drains_exactly_once() {
         let (metrics, probe) = RpcMetricProbe::new();
-        let mut first = PendingReplies::new(metrics.clone());
+        let mut first = pending_replies_with_metrics(metrics.clone());
         let (first_tx, first_rx) = bounded(1);
         let first_serial = first
-            .admit(first_tx, "Ping")
+            .admit_named(first_tx, "Ping")
             .expect("admit first connection RPC")
             .expect("assign first connection serial");
         assert_eq!(probe.pending(), 1.0);
 
-        let mut second = PendingReplies::new(metrics);
+        let mut second = pending_replies_with_metrics(metrics);
         assert_eq!(
             probe.pending(),
             1.0,
@@ -2960,7 +4297,7 @@ mod tests {
         );
         let (second_tx, second_rx) = bounded(1);
         second
-            .admit(second_tx, "SearchScrollbackRequest")
+            .admit_named(second_tx, "SearchScrollbackRequest")
             .expect("admit second connection RPC")
             .expect("assign second connection serial");
         assert_eq!(probe.pending(), 2.0);
@@ -2993,7 +4330,7 @@ mod tests {
 
         assert_eq!(
             pending
-                .admit(preclosed_tx, "SearchScrollbackRequest")
+                .admit_named(preclosed_tx, "SearchScrollbackRequest")
                 .expect("preclosed admission is a normal disposition"),
             None
         );
@@ -3004,7 +4341,7 @@ mod tests {
 
         let (live_tx, live_rx) = bounded(1);
         let serial = pending
-            .admit(live_tx, "Ping")
+            .admit_named(live_tx, "Ping")
             .expect("live request should admit")
             .expect("live request should receive a serial");
         assert_eq!(serial.get(), 1);
@@ -3031,20 +4368,29 @@ mod tests {
     #[test]
     fn pending_rpc_max_serial_is_issued_once_and_collision_never_replaces() {
         let (mut pending, probe) = pending_replies_for_test();
-        pending.next_serial = NonZeroU64::new(u64::MAX);
+        pending
+            .rpc_transport
+            .next_wire_serial
+            .store(u64::MAX, AtomicOrdering::Release);
         pending.highest_issued = u64::MAX - 1;
 
         let (max_tx, max_rx) = bounded(1);
         let max_serial = pending
-            .admit(max_tx, "Ping")
+            .admit_named(max_tx, "Ping")
             .expect("maximum serial should be admissible once")
             .expect("maximum serial should be assigned");
         assert_eq!(max_serial.get(), u64::MAX);
-        assert_eq!(pending.next_serial, None);
+        assert_eq!(
+            pending
+                .rpc_transport
+                .next_wire_serial
+                .load(AtomicOrdering::Acquire),
+            0
+        );
 
         let (exhausted_tx, exhausted_rx) = bounded(1);
         let exhausted = pending
-            .admit(exhausted_tx, "Ping")
+            .admit_named(exhausted_tx, "Ping")
             .expect_err("the serial after u64::MAX must fail closed");
         assert!(matches!(exhausted, PendingRpcError::SerialExhausted));
         assert!(exhausted_rx
@@ -3053,10 +4399,13 @@ mod tests {
             .is_err());
         assert_eq!(RpcMetricProbe::counter(&probe.serial_exhausted), 1);
 
-        pending.next_serial = Some(max_serial);
+        pending
+            .rpc_transport
+            .next_wire_serial
+            .store(max_serial.get(), AtomicOrdering::Release);
         let (collision_tx, collision_rx) = bounded(1);
         let collision = pending
-            .admit(collision_tx, "SearchScrollbackRequest")
+            .admit_named(collision_tx, "SearchScrollbackRequest")
             .expect_err("occupied serial must not be replaced");
         assert!(matches!(
             collision,
@@ -3076,7 +4425,8 @@ mod tests {
                 .map
                 .get(&max_serial)
                 .expect("original pending request must remain")
-                .pdu_name,
+                .binding
+                .request,
             "Ping"
         );
         assert_eq!(RpcMetricProbe::counter(&probe.serial_collision), 1);
@@ -3094,7 +4444,7 @@ mod tests {
 
         let (delivered_tx, delivered_rx) = bounded(1);
         let delivered_serial = pending
-            .admit(delivered_tx, "Ping")
+            .admit_named(delivered_tx, "Ping")
             .expect("admit delivered request")
             .expect("assign delivered serial");
         assert_eq!(
@@ -3125,7 +4475,7 @@ mod tests {
 
         let (abandoned_tx, abandoned_rx) = bounded(1);
         let abandoned_serial = pending
-            .admit(abandoned_tx, "SearchScrollbackRequest")
+            .admit_named(abandoned_tx, "SearchScrollbackRequest")
             .expect("admit abandoned request")
             .expect("assign abandoned serial");
         drop(abandoned_rx);
@@ -3144,7 +4494,7 @@ mod tests {
         let (full_tx, full_rx) = bounded(1);
         let filler = full_tx.clone();
         let full_serial = pending
-            .admit(full_tx, "Ping")
+            .admit_named(full_tx, "Ping")
             .expect("admit full-channel request")
             .expect("assign full-channel serial");
         filler
@@ -3180,12 +4530,12 @@ mod tests {
         let (mut duplicate_pending, duplicate_probe) = pending_replies_for_test();
         let (completed_tx, completed_rx) = bounded(1);
         let completed_serial = duplicate_pending
-            .admit(completed_tx, "Ping")
+            .admit_named(completed_tx, "Ping")
             .expect("admit first request")
             .expect("assign first serial");
         let (duplicate_witness_tx, duplicate_witness_rx) = bounded(1);
         duplicate_pending
-            .admit(duplicate_witness_tx, "GetCodecVersion")
+            .admit_named(duplicate_witness_tx, "GetCodecVersion")
             .expect("admit duplicate-failure witness")
             .expect("assign witness serial");
         duplicate_pending
@@ -3210,12 +4560,12 @@ mod tests {
         let (full_tx, full_rx) = bounded(1);
         let filler = full_tx.clone();
         let full_serial = full_pending
-            .admit(full_tx, "Ping")
+            .admit_named(full_tx, "Ping")
             .expect("admit full-channel request")
             .expect("assign full-channel serial");
         let (full_witness_tx, full_witness_rx) = bounded(1);
         full_pending
-            .admit(full_witness_tx, "GetCodecVersion")
+            .admit_named(full_witness_tx, "GetCodecVersion")
             .expect("admit full-channel witness")
             .expect("assign full-channel witness serial");
         filler
@@ -3245,7 +4595,7 @@ mod tests {
         let (mut pending, probe) = pending_replies_for_test();
         let (live_tx, live_rx) = bounded(1);
         let admitted_serial = pending
-            .admit(live_tx, "Ping")
+            .admit_named(live_tx, "Ping")
             .expect("admit live request")
             .expect("assign live serial");
         let future_serial = admitted_serial
@@ -3290,15 +4640,19 @@ mod tests {
         let (mut pending, probe) = pending_replies_for_test();
         let (live_tx, live_rx) = bounded(1);
         pending
-            .admit(live_tx, "Ping")
+            .admit_named(live_tx, "Ping")
             .expect("admit live waiter")
             .expect("assign live waiter serial");
         let (abandoned_tx, abandoned_rx) = bounded(1);
         pending
-            .admit(abandoned_tx, "SearchScrollbackRequest")
+            .admit_named(abandoned_tx, "SearchScrollbackRequest")
             .expect("admit eventual abandonment")
             .expect("assign abandoned waiter serial");
         drop(abandoned_rx);
+
+        for pending_rpc in pending.map.values_mut() {
+            pending_rpc.stage = RpcRetirementStage::BeforeFlush;
+        }
 
         let transport_error = anyhow!("test transport terminated during flush");
         pending.fail_after_transport_error(&transport_error);
@@ -3318,6 +4672,14 @@ mod tests {
             !live_error.to_string().contains("Client was destroyed"),
             "transport failure must preserve its real cause"
         );
+        assert!(matches!(
+            live_error.downcast_ref::<RpcTransportError>(),
+            Some(RpcTransportError::Retired {
+                stage: RpcRetirementStage::BeforeFlush,
+                certainty: RpcDeliveryCertainty::OutcomeUnknown,
+                ..
+            })
+        ));
         assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 1);
         assert_eq!(
             RpcMetricProbe::counter(&probe.transport_cleared_abandoned),
@@ -3475,6 +4837,7 @@ mod tests {
             local_domain_id: None,
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            rpc_transport: Arc::new(RpcTransportState::new()),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
@@ -3618,6 +4981,7 @@ mod tests {
             local_domain_id: None,
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            rpc_transport: Arc::new(RpcTransportState::new()),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
@@ -3800,10 +5164,11 @@ mod tests {
 
         let (preclosed_tx, preclosed_rx) = bounded(1);
         drop(preclosed_rx);
-        asupersync_block_on(client.sender.send(ReaderMessage::SendPdu {
-            pdu: Box::new(Pdu::Ping(Ping {})),
-            promise: preclosed_tx,
-        }))
+        asupersync_block_on(
+            client
+                .sender
+                .send(client.test_reader_message(Pdu::Ping(Ping {}), preclosed_tx)),
+        )
         .expect("queue preclosed request");
 
         let search_request = |pane_id| {
@@ -3821,31 +5186,22 @@ mod tests {
         asupersync_block_on(async {
             client
                 .sender
-                .send(ReaderMessage::SendPdu {
-                    pdu: Box::new(search_request(11)),
-                    promise: abandoned_one_tx,
-                })
+                .send(client.test_reader_message(search_request(11), abandoned_one_tx))
                 .await?;
             client
                 .sender
-                .send(ReaderMessage::SendPdu {
-                    pdu: Box::new(Pdu::GetCodecVersion(GetCodecVersion {})),
-                    promise: live_two_tx,
-                })
+                .send(
+                    client
+                        .test_reader_message(Pdu::GetCodecVersion(GetCodecVersion {}), live_two_tx),
+                )
                 .await?;
             client
                 .sender
-                .send(ReaderMessage::SendPdu {
-                    pdu: Box::new(search_request(33)),
-                    promise: abandoned_three_tx,
-                })
+                .send(client.test_reader_message(search_request(33), abandoned_three_tx))
                 .await?;
             client
                 .sender
-                .send(ReaderMessage::SendPdu {
-                    pdu: Box::new(Pdu::Ping(Ping {})),
-                    promise: live_four_tx,
-                })
+                .send(client.test_reader_message(Pdu::Ping(Ping {}), live_four_tx))
                 .await?;
             Ok::<(), async_channel::SendError<ReaderMessage>>(())
         })
@@ -3876,10 +5232,11 @@ mod tests {
         }
 
         let (final_tx, final_rx) = bounded(1);
-        asupersync_block_on(client.sender.send(ReaderMessage::SendPdu {
-            pdu: Box::new(Pdu::Ping(Ping {})),
-            promise: final_tx,
-        }))
+        asupersync_block_on(
+            client
+                .sender
+                .send(client.test_reader_message(Pdu::Ping(Ping {}), final_tx)),
+        )
         .expect("queue final Ping");
         assert_eq!(
             recv_rpc_with_timeout(&final_rx, "final Ping"),
@@ -4006,6 +5363,7 @@ mod tests {
             local_domain_id: None,
             incarnation: Arc::new(ClientIncarnation),
             connection_generation: Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            rpc_transport: Arc::new(RpcTransportState::new()),
             client_id: ClientId::new(),
             client_domain_config,
             is_reconnectable,
@@ -4204,6 +5562,7 @@ mod tests {
             Weak::new(),
             Arc::new(ClientIncarnation),
             Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            Arc::new(RpcTransportState::new()),
         )
     }
 
@@ -4266,9 +5625,13 @@ mod tests {
     #[test]
     fn retired_connection_generation_discards_queued_unilateral_work() {
         let stale = standalone_dispatch_authority();
+        let (_sender, receiver) = unbounded();
         let current = stale
-            .advance_generation()
+            .advance_generation(&receiver)
             .expect("the successor transport generation should be minted");
+        current
+            .activate_rpc_transport()
+            .expect("the successor transport should become live");
 
         assert!(!stale.generation_is_current());
         assert!(current.generation_is_current());
@@ -4307,6 +5670,7 @@ mod tests {
             Arc::downgrade(&origin_mux),
             Arc::new(ClientIncarnation),
             Arc::new(AtomicU64::new(INITIAL_CONNECTION_GENERATION)),
+            Arc::new(RpcTransportState::new()),
         );
         let captured = authority
             .captured_mux()

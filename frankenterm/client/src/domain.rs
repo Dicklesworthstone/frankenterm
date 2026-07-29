@@ -1,4 +1,4 @@
-use crate::client::Client;
+use crate::client::{Client, RpcGenerationScope};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -437,17 +437,6 @@ async fn update_remote_workspace(
     Ok(())
 }
 
-async fn update_remote_active_workspace(
-    inner: Arc<ClientInner>,
-    pdu: codec::SetActiveWorkspace,
-) -> anyhow::Result<()> {
-    if inner.is_detached() {
-        return Ok(());
-    }
-    inner.client.set_active_workspace(pdu).await?;
-    Ok(())
-}
-
 fn active_workspace_sync_request(
     owner_client_id: Option<&Arc<ClientId>>,
     changed_client_id: &Arc<ClientId>,
@@ -521,13 +510,14 @@ fn mux_notify_client_domain(
                 if let Some(request) =
                     active_workspace_sync_request(inner.owner_client_id.as_ref(), &client_id, &mux)
                 {
+                    let rpc = inner.client.set_active_workspace(request);
                     let mux = Arc::clone(&mux);
                     let domain = Arc::clone(&domain);
                     promise::spawn::spawn(async move {
                         if !client_inner_is_current(&mux, &domain, &inner) {
                             return Ok(());
                         }
-                        let _ = update_remote_active_workspace(inner, request).await;
+                        let _ = rpc.await;
                         anyhow::Result::<()>::Ok(())
                     })
                     .detach();
@@ -541,19 +531,17 @@ fn mux_notify_client_domain(
             if let Some(inner) = client_domain.inner() {
                 let workspaces = mux.iter_workspaces();
                 if workspaces.contains(&old_workspace) {
+                    let rpc = inner.client.rename_workspace(codec::RenameWorkspace {
+                        old_workspace,
+                        new_workspace,
+                    });
                     let mux = Arc::clone(&mux);
                     let domain = Arc::clone(&domain);
                     promise::spawn::spawn(async move {
                         if !client_inner_is_current(&mux, &domain, &inner) {
                             return Ok(());
                         }
-                        inner
-                            .client
-                            .rename_workspace(codec::RenameWorkspace {
-                                old_workspace,
-                                new_workspace,
-                            })
-                            .await?;
+                        rpc.await?;
                         anyhow::Result::<()>::Ok(())
                     })
                     .detach();
@@ -606,19 +594,17 @@ fn mux_notify_client_domain(
         MuxNotification::TabTitleChanged { tab_id, title } => {
             if let Some(remote_tab_id) = client_domain.local_to_remote_tab_id(tab_id) {
                 if let Some(inner) = client_domain.inner() {
+                    let rpc = inner.client.set_tab_title(codec::TabTitleChanged {
+                        tab_id: remote_tab_id,
+                        title,
+                    });
                     let mux = Arc::clone(&mux);
                     let domain = Arc::clone(&domain);
                     promise::spawn::spawn(async move {
                         if !client_inner_is_current(&mux, &domain, &inner) {
                             return Ok(());
                         }
-                        inner
-                            .client
-                            .set_tab_title(codec::TabTitleChanged {
-                                tab_id: remote_tab_id,
-                                title,
-                            })
-                            .await?;
+                        rpc.await?;
                         anyhow::Result::<()>::Ok(())
                     })
                     .detach();
@@ -629,39 +615,45 @@ fn mux_notify_client_domain(
             window_id,
             title: _,
         } => {
-            if let Some(remote_window_id) = client_domain.local_to_remote_window_id(window_id) {
-                if let Some(inner) = client_domain.inner() {
-                    let mux = Arc::clone(&mux);
-                    let domain = Arc::clone(&domain);
-                    promise::spawn::spawn_into_main_thread(async move {
-                        // De-bounce the title propagation.
-                        // There is a bit of a race condition with these async
-                        // updates that can trigger a cycle of WindowTitleChanged
-                        // PDUs being exchanged between client and server if the
-                        // title is changed twice in quick succession.
-                        // To avoid that, here on the client, we wait a second
-                        // and then report the now-current name of the window, rather
-                        // than propagating the title encoded in the MuxNotification.
-                        promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
-                        if !client_inner_is_current(&mux, &domain, &inner) {
-                            return Ok(());
-                        }
-                        let title = mux
-                            .get_window(window_id)
-                            .map(|win| win.get_title().to_string());
-                        if let Some(title) = title {
-                            inner
-                                .client
-                                .set_window_title(codec::WindowTitleChanged {
-                                    window_id: remote_window_id,
-                                    title,
-                                })
-                                .await?;
-                        }
-                        anyhow::Result::<()>::Ok(())
-                    })
-                    .detach();
-                }
+            if let Some(inner) = client_domain.inner() {
+                let mux = Arc::clone(&mux);
+                let domain = Arc::clone(&domain);
+                promise::spawn::spawn_into_main_thread(async move {
+                    // De-bounce the title propagation.
+                    // There is a bit of a race condition with these async
+                    // updates that can trigger a cycle of WindowTitleChanged
+                    // PDUs being exchanged between client and server if the
+                    // title is changed twice in quick succession.
+                    // To avoid that, here on the client, we wait a second
+                    // and then report the now-current name of the window, rather
+                    // than propagating the title encoded in the MuxNotification.
+                    promise::spawn::sleep(std::time::Duration::from_secs(1)).await;
+                    if !client_inner_is_current(&mux, &domain, &inner) {
+                        return Ok(());
+                    }
+                    let Some(client_domain) = domain.downcast_ref::<ClientDomain>() else {
+                        return Ok(());
+                    };
+                    let Some(remote_window_id) =
+                        client_domain.local_to_remote_window_id(window_id)
+                    else {
+                        return Ok(());
+                    };
+                    let title = mux
+                        .get_window(window_id)
+                        .map(|win| win.get_title().to_string());
+                    if let Some(title) = title {
+                        inner
+                            .client
+                            .set_window_title(codec::WindowTitleChanged {
+                                window_id: remote_window_id,
+                                title,
+                            })
+                            .await?;
+                    }
+                    anyhow::Result::<()>::Ok(())
+                })
+                .detach();
             }
         }
         _ => {}
@@ -800,6 +792,7 @@ impl ClientDomain {
         mux: Arc<Mux>,
         domain: Arc<dyn Domain>,
         expected: Arc<ClientInner>,
+        rpc: RpcGenerationScope,
         ui: ConnectionUI,
     ) -> anyhow::Result<()> {
         let domain_id = domain.domain_id();
@@ -816,8 +809,14 @@ impl ClientDomain {
             return Ok(());
         }
 
-        if !Self::sync_remote_topology(Arc::clone(&mux), client_domain, Arc::clone(&expected), None)
-            .await?
+        if !Self::sync_remote_topology(
+            Arc::clone(&mux),
+            client_domain,
+            Arc::clone(&expected),
+            &rpc,
+            None,
+        )
+        .await?
         {
             return Ok(());
         }
@@ -826,7 +825,7 @@ impl ClientDomain {
             return Ok(());
         }
         if let Some(request) = current_active_workspace_sync(&expected, &mux) {
-            let _ = update_remote_active_workspace(Arc::clone(&expected), request).await;
+            let _ = rpc.set_active_workspace(request).await;
         }
         if !client_inner_is_current(&mux, &domain, &expected) {
             return Ok(());
@@ -840,9 +839,10 @@ impl ClientDomain {
         &self,
         mux: Arc<Mux>,
         expected: Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
     ) -> anyhow::Result<()> {
         if self.inner_is_current(&expected) {
-            let _ = Self::sync_remote_topology(mux, self, expected, None).await?;
+            let _ = Self::sync_remote_topology(mux, self, expected, rpc, None).await?;
         }
         Ok(())
     }
@@ -851,6 +851,7 @@ impl ClientDomain {
         mux: Arc<Mux>,
         domain: &Self,
         inner: Arc<ClientInner>,
+        rpc: &RpcGenerationScope,
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<bool> {
         let request_epoch = inner.begin_topology_request()?;
@@ -869,7 +870,7 @@ impl ClientDomain {
         if !incarnation_is_current() {
             return Ok(false);
         }
-        let panes = inner.client.list_panes().await?;
+        let panes = rpc.list_panes().await?;
         if !incarnation_is_current() {
             return Ok(false);
         }
@@ -1385,8 +1386,9 @@ impl ClientDomain {
         drop(published);
 
         if let Some(request) = current_active_workspace_sync(&inner, mux) {
+            let rpc = inner.client.set_active_workspace(request);
             promise::spawn::spawn(async move {
-                let _ = update_remote_active_workspace(inner, request).await;
+                let _ = rpc.await;
             })
             .detach();
         }
@@ -1422,8 +1424,8 @@ impl Domain for ClientDomain {
 
         self.ensure_mux_owner(mux)?;
         let workspace = mux.active_workspace();
-        let result = inner
-            .client
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
             .spawn_v2(SpawnV2 {
                 domain: SpawnTabDomain::DefaultDomain,
                 window_id: None,
@@ -1434,7 +1436,15 @@ impl Domain for ClientDomain {
             })
             .await?;
 
-        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), None).await? {
+        if !Self::sync_remote_topology(
+            Arc::clone(mux),
+            self,
+            Arc::clone(&inner),
+            &rpc,
+            None,
+        )
+        .await?
+        {
             bail!("client attachment retired while resolving spawned pane");
         }
         let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
@@ -1472,8 +1482,8 @@ impl Domain for ClientDomain {
         let remote_window_id =
             window_id.and_then(|local_window| inner.local_to_remote_window(local_window));
 
-        let result = inner
-            .client
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
             .move_pane_to_new_tab(codec::MovePaneToNewTab {
                 pane_id: pane.remote_pane_id,
                 window_id: remote_window_id,
@@ -1481,7 +1491,15 @@ impl Domain for ClientDomain {
             })
             .await?;
 
-        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), None).await? {
+        if !Self::sync_remote_topology(
+            Arc::clone(mux),
+            self,
+            Arc::clone(&inner),
+            &rpc,
+            None,
+        )
+        .await?
+        {
             bail!("client attachment retired while moving pane");
         }
 
@@ -1520,8 +1538,8 @@ impl Domain for ClientDomain {
         self.ensure_mux_owner(mux)?;
         let workspace = workspace_for_spawn_window(mux, window);
 
-        let result = inner
-            .client
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
             .spawn_v2(SpawnV2 {
                 domain: SpawnTabDomain::DefaultDomain,
                 window_id: inner.local_to_remote_window(window),
@@ -1531,8 +1549,14 @@ impl Domain for ClientDomain {
                 workspace,
             })
             .await?;
-        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), Some(window))
-            .await?
+        if !Self::sync_remote_topology(
+            Arc::clone(mux),
+            self,
+            Arc::clone(&inner),
+            &rpc,
+            Some(window),
+        )
+        .await?
         {
             bail!("client attachment retired while resolving spawned tab");
         }
@@ -1588,8 +1612,8 @@ impl Domain for ClientDomain {
             }
         };
 
-        let result = inner
-            .client
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
             .split_pane(SplitPane {
                 domain: SpawnTabDomain::CurrentPaneDomain,
                 pane_id: pane.remote_pane_id,
@@ -1599,7 +1623,15 @@ impl Domain for ClientDomain {
                 move_pane_id,
             })
             .await?;
-        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), None).await? {
+        if !Self::sync_remote_topology(
+            Arc::clone(mux),
+            self,
+            Arc::clone(&inner),
+            &rpc,
+            None,
+        )
+        .await?
+        {
             bail!("client attachment retired while resolving split pane");
         }
         let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
@@ -1615,7 +1647,10 @@ impl Domain for ClientDomain {
         self.ensure_mux_owner(mux)?;
         if self.state() == DomainState::Attached {
             if let Some(inner) = self.inner() {
-                let _ = Self::sync_remote_topology(Arc::clone(mux), self, inner, window_id).await?;
+                let rpc = inner.client.rpc_scope();
+                let _ =
+                    Self::sync_remote_topology(Arc::clone(mux), self, inner, &rpc, window_id)
+                        .await?;
             }
             return Ok(());
         }
@@ -1659,10 +1694,11 @@ impl Domain for ClientDomain {
                 .await?;
 
                 ui.output_str("Checking server version\n");
-                client.verify_version_compat(&ui).await?;
+                let rpc = client.rpc_scope();
+                client.verify_version_compat_with_scope(&ui, &rpc).await?;
 
                 ui.output_str("Version check OK!  Requesting pane list...\n");
-                let panes = client.list_panes().await?;
+                let panes = rpc.list_panes().await?;
                 ui.output_str(&format!(
                     "Server has {} tabs.  Attaching to local UI...\n",
                     panes.tabs.len()
