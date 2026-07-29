@@ -86,7 +86,7 @@ proptest! {
             back.connected_at.timestamp_millis(),
             info.connected_at.timestamp_millis(),
         );
-        prop_assert_eq!(back.active_workspace, info.active_workspace);
+        prop_assert_eq!(&back.active_workspace, &info.active_workspace);
         prop_assert_eq!(
             back.last_input.timestamp_millis(),
             info.last_input.timestamp_millis(),
