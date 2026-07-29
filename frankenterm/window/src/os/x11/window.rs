@@ -2298,25 +2298,28 @@ fn parse_xmozurl_list(url_list: &str) -> Vec<Url> {
 
 /// Data may be UTF16 in either byte order, or UTF8
 fn decode_dropped_url_string(raw: &[u8]) -> String {
-    if raw.len() >= 2 && ((raw[0], raw[1]) == (0xfe, 0xff) || (raw[0] != 0x00 && raw[1] == 0x00)) {
-        String::from_utf16_lossy(
-            raw.chunks_exact(2)
-                .map(|x: &[u8]| u16::from(x[1]) << 8 | u16::from(x[0]))
-                .collect::<Vec<u16>>()
-                .as_slice(),
-        )
-    } else if raw.len() >= 2
-        && ((raw[0], raw[1]) == (0xff, 0xfe) || (raw[0] == 0x00 && raw[1] != 0x00))
-    {
-        String::from_utf16_lossy(
-            raw.chunks_exact(2)
-                .map(|x: &[u8]| u16::from(x[0]) << 8 | u16::from(x[1]))
-                .collect::<Vec<u16>>()
-                .as_slice(),
-        )
+    if raw.starts_with(&[0xfe, 0xff]) {
+        decode_utf16_bytes(&raw[2..], u16::from_be_bytes)
+    } else if raw.starts_with(&[0xff, 0xfe]) {
+        decode_utf16_bytes(&raw[2..], u16::from_le_bytes)
+    } else if raw.len() >= 2 && raw[0] != 0x00 && raw[1] == 0x00 {
+        decode_utf16_bytes(raw, u16::from_le_bytes)
+    } else if raw.len() >= 2 && raw[0] == 0x00 && raw[1] != 0x00 {
+        decode_utf16_bytes(raw, u16::from_be_bytes)
     } else {
         String::from_utf8_lossy(raw).to_string()
     }
+}
+
+fn decode_utf16_bytes(raw: &[u8], decode: fn([u8; 2]) -> u16) -> String {
+    let (units, remainder) = raw.as_chunks::<2>();
+    let mut decoded: String = char::decode_utf16(units.iter().copied().map(decode))
+        .map(|result| result.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    if !remainder.is_empty() {
+        decoded.push(char::REPLACEMENT_CHARACTER);
+    }
+    decoded
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2373,5 +2376,18 @@ mod tests {
             Some(MouseEventKind::Release(MousePress::Left))
         );
         assert_eq!(x11_button_event_kind(true, 8), None);
+    }
+
+    #[test]
+    fn dropped_url_utf16_boms_select_their_declared_byte_order() {
+        assert_eq!(decode_dropped_url_string(&[0xfe, 0xff, 0x00, b'A']), "A");
+        assert_eq!(decode_dropped_url_string(&[0xff, 0xfe, b'A', 0x00]), "A");
+    }
+
+    #[test]
+    fn dropped_url_utf16_heuristic_preserves_endian_and_odd_tail_errors() {
+        assert_eq!(decode_dropped_url_string(&[b'A', 0x00]), "A");
+        assert_eq!(decode_dropped_url_string(&[0x00, b'A']), "A");
+        assert_eq!(decode_dropped_url_string(&[b'A', 0x00, b'B']), "A\u{fffd}");
     }
 }

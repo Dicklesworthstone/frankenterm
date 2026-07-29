@@ -4,7 +4,7 @@ use crate::MouseCursor;
 use anyhow::{ensure, Context};
 use config::ConfigHandle;
 use std::collections::{HashMap, HashSet};
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::ffi::OsStr;
 use std::io::prelude::*;
 use std::io::SeekFrom;
@@ -20,6 +20,164 @@ pub const SB_V_DOUBLE_ARROW: u16 = 116;
 pub const TOP_LEFT_ARROW: u16 = 132;
 pub const TOP_LEFT_CORNER: u16 = 134;
 pub const XTERM: u16 = 152;
+
+const XCURSOR_IMAGE_MAX_DIMENSION: u16 = 0x7fff;
+const XCURSOR_IMAGE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const XCURSOR_MAGIC: u32 = 0x7275_6358;
+const XCURSOR_IMAGE_TYPE: u32 = 0xfffd_0002;
+const XCURSOR_FILE_HEADER_BASE_BYTES: u32 = 16;
+const XCURSOR_IMAGE_HEADER_BASE_BYTES: u32 = 36;
+const XCURSOR_MAX_TOC_ENTRIES: u32 = 0x1_0000;
+
+#[derive(Debug)]
+struct XcursorToc {
+    type_: u32,
+    subtype: u32,
+    position: u32,
+}
+
+struct XcursorImage {
+    width: u16,
+    height: u16,
+    xhot: u16,
+    yhot: u16,
+    pixels: Vec<u8>,
+}
+
+/// Read a u32 stored in Xcursor's little-endian file representation.
+fn read_xcursor_u32(reader: &mut impl Read) -> anyhow::Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_xcursor_toc(reader: &mut (impl Read + Seek)) -> anyhow::Result<Vec<XcursorToc>> {
+    let magic = read_xcursor_u32(reader)?;
+    let header_bytes = read_xcursor_u32(reader)?;
+    let _version = read_xcursor_u32(reader)?;
+    let ntoc = read_xcursor_u32(reader)?;
+
+    ensure!(
+        magic == XCURSOR_MAGIC,
+        "magic number doesn't match 0x{magic:x} != expected 0x{XCURSOR_MAGIC:x}"
+    );
+    ensure!(
+        header_bytes >= XCURSOR_FILE_HEADER_BASE_BYTES,
+        "Xcursor file header is {header_bytes} bytes, shorter than the \
+         {XCURSOR_FILE_HEADER_BASE_BYTES}-byte base header"
+    );
+    ensure!(
+        ntoc <= XCURSOR_MAX_TOC_ENTRIES,
+        "Xcursor table of contents has {ntoc} entries, exceeding the \
+         {XCURSOR_MAX_TOC_ENTRIES}-entry format limit"
+    );
+
+    // The declared header length includes any forward-compatible extension
+    // fields. TOC entries begin after those fields, not necessarily at byte 16.
+    reader.seek(SeekFrom::Start(u64::from(header_bytes)))?;
+
+    let ntoc = usize::try_from(ntoc).context("Xcursor TOC entry count does not fit in usize")?;
+    let mut toc = Vec::new();
+    toc.try_reserve_exact(ntoc)
+        .context("failed to allocate Xcursor table of contents")?;
+    for _ in 0..ntoc {
+        toc.push(XcursorToc {
+            type_: read_xcursor_u32(reader)?,
+            subtype: read_xcursor_u32(reader)?,
+            position: read_xcursor_u32(reader)?,
+        });
+    }
+    ensure!(!toc.is_empty(), "no images are present");
+    Ok(toc)
+}
+
+fn read_xcursor_image(
+    reader: &mut (impl Read + Seek),
+    item: &XcursorToc,
+) -> anyhow::Result<XcursorImage> {
+    reader.seek(SeekFrom::Start(u64::from(item.position)))?;
+
+    let chunk_header_bytes = read_xcursor_u32(reader)?;
+    let chunk_type = read_xcursor_u32(reader)?;
+    let chunk_subtype = read_xcursor_u32(reader)?;
+    let _chunk_version = read_xcursor_u32(reader)?;
+
+    ensure!(
+        chunk_header_bytes >= XCURSOR_IMAGE_HEADER_BASE_BYTES,
+        "Xcursor image header is {chunk_header_bytes} bytes, shorter than the \
+         {XCURSOR_IMAGE_HEADER_BASE_BYTES}-byte base header"
+    );
+    ensure!(
+        chunk_type == item.type_,
+        "chunk_type {chunk_type:x} != item.type_ {:x}",
+        item.type_
+    );
+    ensure!(
+        chunk_subtype == item.subtype,
+        "chunk_subtype {chunk_subtype:x} != item.subtype {:x}",
+        item.subtype
+    );
+
+    let width = read_xcursor_u32(reader)?;
+    let height = read_xcursor_u32(reader)?;
+    let xhot = read_xcursor_u32(reader)?;
+    let yhot = read_xcursor_u32(reader)?;
+    let _delay = read_xcursor_u32(reader)?;
+
+    ensure!(
+        width > 0 && height > 0,
+        "cursor image dimensions must be non-zero"
+    );
+    ensure!(
+        width <= u32::from(XCURSOR_IMAGE_MAX_DIMENSION)
+            && height <= u32::from(XCURSOR_IMAGE_MAX_DIMENSION),
+        "cursor image dimensions {width}x{height} exceed the Xcursor format maximum of \
+         {XCURSOR_IMAGE_MAX_DIMENSION}"
+    );
+    ensure!(
+        xhot <= width && yhot <= height,
+        "cursor hotspot ({xhot}, {yhot}) is outside {width}x{height} image"
+    );
+
+    let width = u16::try_from(width).context("cursor width does not fit in u16")?;
+    let height = u16::try_from(height).context("cursor height does not fit in u16")?;
+    let xhot = u16::try_from(xhot).context("cursor x hotspot does not fit in u16")?;
+    let yhot = u16::try_from(yhot).context("cursor y hotspot does not fit in u16")?;
+    let num_pixels = usize::from(width)
+        .checked_mul(usize::from(height))
+        .context("cursor pixel count overflow")?;
+    let pixel_bytes = num_pixels
+        .checked_mul(4)
+        .context("cursor byte count overflow")?;
+    ensure!(
+        pixel_bytes <= XCURSOR_IMAGE_MAX_BYTES,
+        "cursor image requires {pixel_bytes} bytes, exceeding the \
+         {XCURSOR_IMAGE_MAX_BYTES}-byte safety limit"
+    );
+
+    // The image header length likewise includes extension fields. Pixel words
+    // begin at the declared boundary rather than immediately after the base
+    // fields read above.
+    let pixel_offset = u64::from(item.position)
+        .checked_add(u64::from(chunk_header_bytes))
+        .context("Xcursor image pixel offset overflow")?;
+    reader.seek(SeekFrom::Start(pixel_offset))?;
+
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(pixel_bytes)
+        .context("failed to allocate cursor pixel storage")?;
+    pixels.resize(pixel_bytes, 0);
+    reader.read_exact(&mut pixels)?;
+
+    Ok(XcursorImage {
+        width,
+        height,
+        xhot,
+        yhot,
+        pixels,
+    })
+}
 
 pub struct XcbCursor {
     pub id: Cursor,
@@ -448,62 +606,15 @@ impl CursorInfo {
          *      CARD32          position    absolute file position
          */
 
-        #[derive(Debug)]
-        struct FileHeader {
-            magic: u32,
-            _header: u32,
-            _version: u32,
-            ntoc: u32,
-        }
-        const MAGIC: u32 = 0x72756358;
-        const IMAGE_TYPE: u32 = 0xfffd0002;
+        let toc = read_xcursor_toc(&mut file)?;
 
-        #[derive(Debug)]
-        struct Toc {
-            type_: u32,
-            subtype: u32,
-            position: u32,
-        }
-
-        /// Read a u32 that is stored in little endian format,
-        /// return in host byte order
-        fn read_u32(r: &mut dyn Read) -> anyhow::Result<u32> {
-            let mut u32buf = [0u8; 4];
-            r.read_exact(&mut u32buf)?;
-            Ok(u32::from_le_bytes(u32buf))
-        }
-
-        let header = FileHeader {
-            magic: read_u32(&mut file)?,
-            _header: read_u32(&mut file)?,
-            _version: read_u32(&mut file)?,
-            ntoc: read_u32(&mut file)?,
-        };
-        ensure!(
-            header.magic == MAGIC,
-            "magic number doesn't match 0x{:x} != expected 0x{:x}",
-            header.magic,
-            MAGIC
-        );
-
-        let mut toc = vec![];
-        for _ in 0..header.ntoc {
-            toc.push(Toc {
-                type_: read_u32(&mut file)?,
-                subtype: read_u32(&mut file)?,
-                position: read_u32(&mut file)?,
-            });
-        }
-
-        ensure!(!toc.is_empty(), "no images are present");
-
-        let size = self.size.unwrap_or(24) as isize;
+        let size = i64::from(self.size.unwrap_or(24));
         let mut best = None;
         for item in &toc {
-            if item.type_ != IMAGE_TYPE {
+            if item.type_ != XCURSOR_IMAGE_TYPE {
                 continue;
             }
-            let distance = ((item.subtype as isize) - size).abs();
+            let distance = (i64::from(item.subtype) - size).abs();
             match best.take() {
                 None => {
                     best.replace((item, distance));
@@ -523,58 +634,28 @@ impl CursorInfo {
             .ok_or_else(|| anyhow::anyhow!("no matching images"))?
             .0;
 
-        file.seek(SeekFrom::Start(item.position.into()))?;
+        let XcursorImage {
+            width,
+            height,
+            xhot,
+            yhot,
+            mut pixels,
+        } = read_xcursor_image(&mut file, item)?;
+        let pixel_bytes_u32: u32 = pixels
+            .len()
+            .try_into()
+            .context("cursor image byte count does not fit in u32")?;
 
-        let _chunk_header = read_u32(&mut file)?;
-        let chunk_type = read_u32(&mut file)?;
-        let chunk_subtype = read_u32(&mut file)?;
-        let _chunk_version = read_u32(&mut file)?;
-
-        ensure!(
-            chunk_type == item.type_,
-            "chunk_type {:x} != item.type_ {:x}",
-            chunk_type,
-            item.type_
-        );
-        ensure!(
-            chunk_subtype == item.subtype,
-            "chunk_subtype {:x} != item.subtype {:x}",
-            chunk_subtype,
-            item.subtype
-        );
-
-        let width = read_u32(&mut file)?;
-        let height = read_u32(&mut file)?;
-        let xhot = read_u32(&mut file)?;
-        let yhot = read_u32(&mut file)?;
-        let _delay = read_u32(&mut file)?;
-
-        let num_pixels = (width as usize) * (height as usize);
-        ensure!(
-            num_pixels < u32::MAX as usize,
-            "cursor image is larger than fits in u32"
-        );
-
-        let mut pixels = vec![0u8; num_pixels * 4];
-        file.read_exact(&mut pixels)?;
-
-        // The data is all little endian; convert to host order
-        for chunk in pixels.chunks_exact_mut(4) {
-            let mut data = [0u8; 4];
-            data.copy_from_slice(chunk);
-            let le = u32::from_le_bytes(data);
-            data = le.to_le_bytes();
-            chunk.copy_from_slice(&data);
-        }
+        xcursor_pixels_to_image_byte_order(&mut pixels, conn.get_setup().image_byte_order());
 
         let image = XcbImage::create_native(
             conn,
-            width.try_into()?,
-            height.try_into()?,
+            width,
+            height,
             xcb::x::ImageFormat::ZPixmap as u32,
             32,
             std::ptr::null_mut(),
-            pixels.len() as u32,
+            pixel_bytes_u32,
             pixels.as_mut_ptr(),
         )?;
 
@@ -583,8 +664,8 @@ impl CursorInfo {
             depth: 32,
             pid: pixmap,
             drawable: xcb::x::Drawable::Window(conn.root),
-            width: width as u16,
-            height: height as u16,
+            width,
+            height,
         })
         .context("create_pixmap")?;
 
@@ -619,14 +700,29 @@ impl CursorInfo {
         conn.send_request_no_reply(&xcb::render::CreateCursor {
             cid: cursor_id,
             source: pic,
-            x: xhot.try_into()?,
-            y: yhot.try_into()?,
+            x: xhot,
+            y: yhot,
         })
         .context("create_cursor")?;
 
         conn.send_request_no_reply(&xcb::render::FreePicture { picture: pic })?;
 
         Ok(cursor_id)
+    }
+}
+
+fn xcursor_pixels_to_image_byte_order(pixels: &mut [u8], image_order: xcb::x::ImageOrder) {
+    let (pixels, remainder) = pixels.as_chunks_mut::<4>();
+    debug_assert!(
+        remainder.is_empty(),
+        "Xcursor pixel storage must contain whole u32 values"
+    );
+    for pixel in pixels {
+        let value = u32::from_le_bytes(*pixel);
+        *pixel = match image_order {
+            xcb::x::ImageOrder::LsbFirst => value.to_le_bytes(),
+            xcb::x::ImageOrder::MsbFirst => value.to_be_bytes(),
+        };
     }
 }
 
@@ -660,4 +756,147 @@ fn extract_inherited_theme_name(p: PathBuf) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        read_xcursor_image, read_xcursor_toc, xcursor_pixels_to_image_byte_order, XcursorToc,
+        XCURSOR_IMAGE_HEADER_BASE_BYTES, XCURSOR_IMAGE_TYPE, XCURSOR_MAGIC,
+        XCURSOR_MAX_TOC_ENTRIES,
+    };
+    use std::io::Cursor as IoCursor;
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn image_chunk(
+        header_bytes: u32,
+        width: u32,
+        height: u32,
+        xhot: u32,
+        yhot: u32,
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, header_bytes);
+        push_u32(&mut bytes, XCURSOR_IMAGE_TYPE);
+        push_u32(&mut bytes, 24);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, width);
+        push_u32(&mut bytes, height);
+        push_u32(&mut bytes, xhot);
+        push_u32(&mut bytes, yhot);
+        push_u32(&mut bytes, 0);
+        assert_eq!(bytes.len(), XCURSOR_IMAGE_HEADER_BASE_BYTES as usize);
+        bytes.resize(header_bytes as usize, 0xa5);
+        bytes.extend_from_slice(pixels);
+        bytes
+    }
+
+    #[test]
+    fn xcursor_pixel_words_follow_the_connected_x_server_byte_order() {
+        let little_endian = [0x44, 0x33, 0x22, 0x11, 0xdd, 0xcc, 0xbb, 0xaa];
+
+        let mut lsb_first = little_endian;
+        xcursor_pixels_to_image_byte_order(&mut lsb_first, xcb::x::ImageOrder::LsbFirst);
+        assert_eq!(lsb_first, little_endian);
+
+        let mut msb_first = little_endian;
+        xcursor_pixels_to_image_byte_order(&mut msb_first, xcb::x::ImageOrder::MsbFirst);
+        assert_eq!(msb_first, [0x11, 0x22, 0x33, 0x44, 0xaa, 0xbb, 0xcc, 0xdd]);
+    }
+
+    #[test]
+    fn xcursor_extended_file_and_image_headers_are_skipped() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, XCURSOR_MAGIC);
+        push_u32(&mut bytes, 20);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 0xfeed_face);
+
+        push_u32(&mut bytes, XCURSOR_IMAGE_TYPE);
+        push_u32(&mut bytes, 24);
+        push_u32(&mut bytes, 32);
+        assert_eq!(bytes.len(), 32);
+
+        bytes.extend_from_slice(&image_chunk(40, 1, 1, 0, 0, &[0x44, 0x33, 0x22, 0x11]));
+
+        let mut reader = IoCursor::new(bytes);
+        let toc = read_xcursor_toc(&mut reader).expect("extended file header should parse");
+        assert_eq!(toc.len(), 1);
+        let image =
+            read_xcursor_image(&mut reader, &toc[0]).expect("extended image header should parse");
+        assert_eq!(
+            (image.width, image.height, image.xhot, image.yhot),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(image.pixels, [0x44, 0x33, 0x22, 0x11]);
+    }
+
+    #[test]
+    fn xcursor_rejects_oversized_toc_before_reading_entries() {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, XCURSOR_MAGIC);
+        push_u32(&mut bytes, 16);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, XCURSOR_MAX_TOC_ENTRIES + 1);
+
+        let error = read_xcursor_toc(&mut IoCursor::new(bytes))
+            .expect_err("oversized TOC must be rejected");
+        assert!(
+            error.to_string().contains("exceeding"),
+            "unexpected rejection: {:#}",
+            error
+        );
+    }
+
+    #[test]
+    fn xcursor_geometry_matches_reference_hotspot_and_memory_bounds() {
+        let item = XcursorToc {
+            type_: XCURSOR_IMAGE_TYPE,
+            subtype: 24,
+            position: 0,
+        };
+
+        let mut edge_hotspot = IoCursor::new(image_chunk(
+            XCURSOR_IMAGE_HEADER_BASE_BYTES,
+            1,
+            1,
+            1,
+            1,
+            &[0; 4],
+        ));
+        let image = read_xcursor_image(&mut edge_hotspot, &item)
+            .expect("reference Xcursor accepts a hotspot equal to the dimensions");
+        assert_eq!((image.xhot, image.yhot), (1, 1));
+
+        let mut outside_hotspot = IoCursor::new(image_chunk(
+            XCURSOR_IMAGE_HEADER_BASE_BYTES,
+            1,
+            1,
+            2,
+            1,
+            &[0; 4],
+        ));
+        let error = read_xcursor_image(&mut outside_hotspot, &item)
+            .err()
+            .expect("hotspot beyond the dimensions must be rejected");
+        assert!(error.to_string().contains("outside"));
+
+        let mut oversized_pixels = IoCursor::new(image_chunk(
+            XCURSOR_IMAGE_HEADER_BASE_BYTES,
+            4097,
+            4096,
+            0,
+            0,
+            &[],
+        ));
+        let error = read_xcursor_image(&mut oversized_pixels, &item)
+            .err()
+            .expect("cursor allocation beyond the safety cap must be rejected");
+        assert!(error.to_string().contains("safety limit"));
+    }
 }
