@@ -2739,7 +2739,11 @@ mod tests {
         .expect("nonzero client request serial should reach the session handler");
 
         let captured = captured.lock();
-        assert_eq!(captured.len(), 1, "Ping should produce exactly one response");
+        assert_eq!(
+            captured.len(),
+            1,
+            "Ping should produce exactly one response"
+        );
         assert_eq!(captured[0].serial, 1);
         assert_eq!(captured[0].pdu, Pdu::Pong(Pong {}));
     }

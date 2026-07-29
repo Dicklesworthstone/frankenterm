@@ -930,11 +930,9 @@ impl RenderableInner {
         let remote_pane_id = self.remote_pane_id;
         let local_pane_id = self.local_pane_id;
         let client = Arc::clone(&self.client);
-        let request = client
-            .client
-            .get_pane_render_changes(GetPaneRenderChanges {
-                pane_id: remote_pane_id,
-            });
+        let request = client.client.get_pane_render_changes(GetPaneRenderChanges {
+            pane_id: remote_pane_id,
+        });
         promise::spawn::spawn(async move {
             let alive = match request.await {
                 Ok(resp) => resp.is_alive,
