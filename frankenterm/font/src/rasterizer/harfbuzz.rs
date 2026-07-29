@@ -327,7 +327,7 @@ fn demultiply_alpha(alpha: u8, color: u8) -> u8 {
 
 #[allow(dead_code)]
 fn premultiply(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         let (r, g, b, a) = (pixel[0], pixel[1], pixel[2], pixel[3]);
         pixel[0] = multiply_alpha(a, r);
         pixel[1] = multiply_alpha(a, g);
@@ -337,10 +337,8 @@ fn premultiply(data: &mut [u8]) {
 }
 
 fn rgba_to_argb_and_multiply(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
-        let [mut r, mut g, mut b, a] = *pixel else {
-            unreachable!()
-        };
+    for pixel in data.as_chunks_mut::<4>().0 {
+        let [mut r, mut g, mut b, a] = *pixel;
 
         if a != 0xff {
             r = multiply_alpha(a, r);
@@ -358,17 +356,11 @@ fn rgba_to_argb_and_multiply(data: &mut [u8]) {
 }
 
 pub fn argb_to_rgba(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         #[cfg(target_endian = "little")]
-        let [b, g, r, a] = *pixel
-        else {
-            unreachable!()
-        };
+        let [b, g, r, a] = *pixel;
         #[cfg(target_endian = "big")]
-        let [a, r, g, b] = *pixel
-        else {
-            unreachable!()
-        };
+        let [a, r, g, b] = *pixel;
         pixel.copy_from_slice(&[r, g, b, a]);
     }
 }

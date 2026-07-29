@@ -437,7 +437,7 @@ pub mod cdc_dedup {
         fn reference_out_of_range_is_rejected() {
             // A REFERENCE to id 0 with an empty dictionary must fail, not panic.
             let mut out = Vec::new();
-            write_leb(&mut out, (0u64 << 2) | TAG_REFERENCE);
+            write_leb(&mut out, TAG_REFERENCE);
             assert!(CdcDedupDecoder::new().decode(&out).is_err());
         }
 

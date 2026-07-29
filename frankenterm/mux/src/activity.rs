@@ -872,7 +872,7 @@ mod tests {
                 drop(runnable);
                 high_depth.fetch_sub(1, Ordering::SeqCst);
             }),
-            Box::new(|runnable| drop(runnable)),
+            Box::new(drop),
         );
 
         drop(Activity::new_for_mux(&mux));

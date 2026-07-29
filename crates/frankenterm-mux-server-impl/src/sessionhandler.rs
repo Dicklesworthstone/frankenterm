@@ -99,16 +99,27 @@ impl SessionIncarnation {
     }
 
     fn release_operation(&self) {
-        let released =
-            self.operation_state
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                    let active = state & SESSION_OPERATION_MASK;
-                    (active > 0).then_some(state - 1)
-                });
-        debug_assert!(
-            released.is_ok(),
-            "session operation lease released without a matching acquisition"
-        );
+        let mut observed = self.operation_state.load(Ordering::Acquire);
+        loop {
+            let active = observed & SESSION_OPERATION_MASK;
+            if active == 0 {
+                debug_assert!(
+                    false,
+                    "session operation lease released without a matching acquisition"
+                );
+                return;
+            }
+
+            match self.operation_state.compare_exchange_weak(
+                observed,
+                observed - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => observed = current,
+            }
+        }
     }
 }
 
@@ -1893,7 +1904,7 @@ fn schedule_domain_spawn_v2<SND>(
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
     promise::spawn::spawn(async move {
-        send_response(domain_spawn_v2(authority, spawn, client_id).await)
+        send_response(domain_spawn_v2(authority, spawn, client_id).await);
     })
     .detach();
 }
@@ -1911,7 +1922,7 @@ fn schedule_split_pane<SND>(
     promise::spawn::spawn(async move {
         send_response(
             split_pane(authority, registration, move_registration, split, client_id).await,
-        )
+        );
     })
     .detach();
 }
@@ -1999,7 +2010,7 @@ fn schedule_move_pane<SND>(
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
     promise::spawn::spawn(async move {
-        send_response(move_pane(authority, registration, request, client_id).await)
+        send_response(move_pane(authority, registration, request, client_id).await);
     })
     .detach();
 }
