@@ -2177,6 +2177,7 @@ impl TmuxDomain {
 impl Domain for TmuxDomain {
     async fn spawn(
         &self,
+        _mux: &Arc<Mux>,
         _size: TerminalSize,
         _command: Option<CommandBuilder>,
         _command_dir: Option<String>,
@@ -2187,6 +2188,7 @@ impl Domain for TmuxDomain {
 
     async fn split_pane(
         &self,
+        mux: &Arc<Mux>,
         _source: SplitSource,
         tab: TabId,
         pane_id: PaneId,
@@ -2222,7 +2224,7 @@ impl Domain for TmuxDomain {
                     self.inner.domain_id
                 )
             })?;
-            return self.inner.split_pane(tab, pane_id, id, split_request);
+            return self.inner.split_pane(mux, tab, pane_id, id, split_request);
         }
 
         anyhow::bail!("Split_pane failed");
@@ -2230,6 +2232,7 @@ impl Domain for TmuxDomain {
 
     async fn spawn_pane(
         &self,
+        _mux: &Arc<Mux>,
         _size: TerminalSize,
         _command: Option<CommandBuilder>,
         _command_dir: Option<String>,
@@ -2245,7 +2248,12 @@ impl Domain for TmuxDomain {
         "tmux"
     }
 
-    async fn attach(&self, _window_id: Option<crate::WindowId>) -> anyhow::Result<()> {
+    async fn attach(
+        &self,
+        _mux: &Arc<Mux>,
+        _owner_client_id: Option<Arc<crate::client::ClientId>>,
+        _window_id: Option<crate::WindowId>,
+    ) -> anyhow::Result<()> {
         // Control-mode startup is bootstrapped by SessionChanged events rather
         // than an explicit attach command.
         Ok(())
@@ -2682,8 +2690,9 @@ mod tests {
 
     #[test]
     fn tmux_domain_spawn_is_explicitly_unsupported_without_queueing_side_effects() {
+        let mux = Arc::new(Mux::new(None));
         let tmux_domain = TmuxDomain::new(77);
-        let err = match block_on(tmux_domain.spawn(TerminalSize::default(), None, None, 0)) {
+        let err = match block_on(tmux_domain.spawn(&mux, TerminalSize::default(), None, None, 0)) {
             Ok(_) => panic!("tmux spawn should be unsupported"),
             Err(err) => err,
         };
@@ -2695,8 +2704,10 @@ mod tests {
 
     #[test]
     fn tmux_domain_spawn_pane_is_explicitly_unsupported_without_queueing_side_effects() {
+        let mux = Arc::new(Mux::new(None));
         let tmux_domain = TmuxDomain::new(77);
-        let err = match block_on(tmux_domain.spawn_pane(TerminalSize::default(), None, None)) {
+        let err = match block_on(tmux_domain.spawn_pane(&mux, TerminalSize::default(), None, None))
+        {
             Ok(_) => panic!("tmux spawn_pane should be unsupported"),
             Err(err) => err,
         };

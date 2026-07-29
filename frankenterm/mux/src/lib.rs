@@ -626,9 +626,16 @@ mod pane_registration_handle {
     /// particular, this type has no `Deref`, downcast, or raw getter that could
     /// mint an `Arc<dyn Pane>` and let registration authority escape the
     /// generation lease.
+    ///
+    /// ```compile_fail
+    /// # fn cannot_escape_raw_pane(current: &mux::CurrentPane<'_>) {
+    /// current.with_pane(|pane| pane);
+    /// # }
+    /// ```
     pub struct CurrentPane<'a> {
         owner: &'a Mux,
-        pane: &'a dyn Pane,
+        pane: &'a Arc<dyn Pane>,
+        registration: &'a PaneRegistrationHandle,
         pane_id: PaneId,
     }
 
@@ -637,9 +644,358 @@ mod pane_registration_handle {
             self.pane_id
         }
 
+        pub fn write_all(&self, data: &[u8]) -> std::io::Result<()> {
+            self.pane.writer().write_all(data)
+        }
+
+        pub fn write_all_and_flush(&self, data: &[u8]) -> std::io::Result<()> {
+            let mut writer = self.pane.writer();
+            writer.write_all(data)?;
+            writer.flush()
+        }
+
+        pub fn erase_scrollback(&self, erase_mode: config::keyassignment::ScrollbackEraseMode) {
+            self.pane.erase_scrollback(erase_mode);
+        }
+
+        pub fn send_paste(&self, text: &str) -> anyhow::Result<()> {
+            self.pane.send_paste(text)
+        }
+
+        pub fn key_down(
+            &self,
+            key: frankenterm_term::KeyCode,
+            modifiers: frankenterm_term::KeyModifiers,
+        ) -> anyhow::Result<()> {
+            self.pane.key_down(key, modifiers)
+        }
+
+        pub fn key_up(
+            &self,
+            key: frankenterm_term::KeyCode,
+            modifiers: frankenterm_term::KeyModifiers,
+        ) -> anyhow::Result<()> {
+            self.pane.key_up(key, modifiers)
+        }
+
+        pub fn mouse_event(&self, event: frankenterm_term::MouseEvent) -> anyhow::Result<()> {
+            self.pane.mouse_event(event)
+        }
+
+        pub fn is_mouse_grabbed(&self) -> bool {
+            self.pane.is_mouse_grabbed()
+        }
+
+        pub fn is_alt_screen_active(&self) -> bool {
+            self.pane.is_alt_screen_active()
+        }
+
+        pub fn get_dimensions(&self) -> crate::renderable::RenderableDimensions {
+            self.pane.get_dimensions()
+        }
+
+        pub fn get_tiered_scrollback_status(
+            &self,
+        ) -> Option<crate::renderable::PaneTieredScrollbackStatus> {
+            self.pane.get_tiered_scrollback_status()
+        }
+
+        pub fn get_cursor_position(&self) -> crate::renderable::StableCursorPosition {
+            self.pane.get_cursor_position()
+        }
+
+        pub fn get_title(&self) -> String {
+            self.pane.get_title()
+        }
+
+        pub fn get_current_working_dir(&self, policy: CachePolicy) -> Option<url::Url> {
+            self.pane.get_current_working_dir(policy)
+        }
+
+        pub fn get_current_seqno(&self) -> termwiz::surface::SequenceNo {
+            self.pane.get_current_seqno()
+        }
+
+        pub fn get_changed_since(
+            &self,
+            range: std::ops::Range<frankenterm_term::StableRowIndex>,
+            seqno: termwiz::surface::SequenceNo,
+        ) -> rangeset::RangeSet<frankenterm_term::StableRowIndex> {
+            self.pane.get_changed_since(range, seqno)
+        }
+
+        pub fn get_lines(
+            &self,
+            range: std::ops::Range<frankenterm_term::StableRowIndex>,
+        ) -> (
+            frankenterm_term::StableRowIndex,
+            Vec<termwiz::surface::Line>,
+        ) {
+            self.pane.get_lines(range)
+        }
+
+        pub fn palette(&self) -> frankenterm_term::color::ColorPalette {
+            self.pane.palette()
+        }
+
+        pub fn semantic_snapshot(
+            &self,
+        ) -> anyhow::Result<(
+            Vec<frankenterm_term::SemanticZone>,
+            Vec<String>,
+            Option<i32>,
+        )> {
+            let zones = self.pane.get_semantic_zones()?;
+            let zone_texts = zones
+                .iter()
+                .copied()
+                .map(|zone| self.pane.get_text_from_semantic_zone(zone))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let last_exit_code = self.pane.get_semantic_exit_code()?;
+            Ok((zones, zone_texts, last_exit_code))
+        }
+
+        pub fn set_client_palette(&self, palette: frankenterm_term::color::ColorPalette) {
+            match self.pane.get_config() {
+                Some(config) => match config.downcast_ref::<config::TermConfig>() {
+                    Some(term_config) => term_config.set_client_palette(palette),
+                    None => {
+                        log::error!(
+                            "pane {} does not have TermConfig as its configuration; \
+                             ignoring client palette update",
+                            self.pane_id,
+                        );
+                    }
+                },
+                None => {
+                    let config = config::TermConfig::new();
+                    config.set_client_palette(palette);
+                    self.pane.set_config(Arc::new(config));
+                }
+            }
+            self.owner.notify(MuxNotification::Alert {
+                pane_id: self.pane_id,
+                alert: Alert::PaletteChanged,
+            });
+        }
+
+        fn tab_contains_exact_pane(&self, tab: &Tab) -> bool {
+            tab.iter_all_panes()
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, self.pane))
+        }
+
+        fn tab_has_exact_tiled_pane(&self, tab: &Tab) -> bool {
+            tab.iter_panes_ignoring_zoom()
+                .iter()
+                .any(|candidate| Arc::ptr_eq(&candidate.pane, self.pane))
+        }
+
+        fn tab_has_exact_floating_pane(&self, tab: &Tab) -> bool {
+            tab.iter_floating_panes()
+                .iter()
+                .any(|candidate| Arc::ptr_eq(&candidate.pane, self.pane))
+        }
+
+        fn exact_tab(&self, tab_id: TabId) -> anyhow::Result<Arc<Tab>> {
+            let tab = self
+                .owner
+                .get_tab(tab_id)
+                .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+            anyhow::ensure!(
+                self.tab_contains_exact_pane(&tab),
+                "tab {tab_id} does not contain exact pane registration {}",
+                self.pane_id,
+            );
+            Ok(tab)
+        }
+
+        fn containing_exact_tab(&self) -> anyhow::Result<Arc<Tab>> {
+            for window_id in self.owner.iter_windows() {
+                let Some(window) = self.owner.get_window(window_id) else {
+                    continue;
+                };
+                for tab in window.iter() {
+                    if self.tab_contains_exact_pane(tab) {
+                        return Ok(Arc::clone(tab));
+                    }
+                }
+            }
+            Err(anyhow!(
+                "exact pane registration {} is not attached to a tab",
+                self.pane_id,
+            ))
+        }
+
+        fn containing_exact_floating_tab(&self) -> anyhow::Result<Arc<Tab>> {
+            for window_id in self.owner.iter_windows() {
+                let Some(window) = self.owner.get_window(window_id) else {
+                    continue;
+                };
+                for tab in window.iter() {
+                    if self.tab_has_exact_floating_pane(tab) {
+                        return Ok(Arc::clone(tab));
+                    }
+                }
+            }
+            Err(anyhow!(
+                "exact floating pane registration {} is not attached to a tab",
+                self.pane_id,
+            ))
+        }
+
+        pub fn set_zoomed_in_tab(&self, tab_id: TabId, zoomed: bool) -> anyhow::Result<()> {
+            let tab = self.exact_tab(tab_id)?;
+            match tab.get_zoomed_pane() {
+                Some(current) => {
+                    let is_zoomed = Arc::ptr_eq(&current, self.pane);
+                    if is_zoomed != zoomed {
+                        tab.set_zoomed(false);
+                        if zoomed {
+                            anyhow::ensure!(
+                                tab.set_active_pane_for_mux(self.pane, self.owner),
+                                "exact pane {} was not accepted as active by tab {tab_id}",
+                                self.pane_id,
+                            );
+                            tab.set_zoomed(true);
+                        }
+                    }
+                }
+                None if zoomed => {
+                    anyhow::ensure!(
+                        tab.set_active_pane_for_mux(self.pane, self.owner),
+                        "exact pane {} was not accepted as active by tab {tab_id}",
+                        self.pane_id,
+                    );
+                    tab.set_zoomed(true);
+                }
+                None => {}
+            }
+            Ok(())
+        }
+
+        pub fn pane_in_direction(
+            &self,
+            direction: config::keyassignment::PaneDirection,
+        ) -> anyhow::Result<Option<PaneId>> {
+            let tab = self.containing_exact_tab()?;
+            let panes = tab.iter_panes_ignoring_zoom();
+            Ok(tab
+                .get_pane_direction(direction, true)
+                .and_then(|pane_index| panes.get(pane_index))
+                .map(|positioned| positioned.pane.pane_id()))
+        }
+
+        pub fn activate_pane_direction(
+            &self,
+            direction: config::keyassignment::PaneDirection,
+        ) -> anyhow::Result<()> {
+            self.containing_exact_tab()?
+                .activate_pane_direction(direction);
+            Ok(())
+        }
+
+        pub fn resize_in_tab(&self, tab_id: TabId, size: TerminalSize) -> anyhow::Result<()> {
+            let tab = self.exact_tab(tab_id)?;
+            self.pane.resize(size)?;
+            tab.rebuild_splits_sizes_from_contained_panes();
+            Ok(())
+        }
+
+        pub fn adjust_pane_size(
+            &self,
+            direction: config::keyassignment::PaneDirection,
+            amount: usize,
+        ) -> anyhow::Result<()> {
+            self.containing_exact_tab()?
+                .adjust_pane_size(direction, amount);
+            Ok(())
+        }
+
+        pub fn create_floating_pane(
+            &self,
+            tab_id: TabId,
+            rect: crate::tab::FloatingPaneRect,
+        ) -> anyhow::Result<()> {
+            let tab = self
+                .owner
+                .get_tab(tab_id)
+                .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
+            if self.tab_has_exact_floating_pane(&tab) {
+                tab.set_floating_pane_rect(self.pane_id, rect);
+                tab.set_floating_pane_focus(self.pane_id);
+                return Ok(());
+            }
+            anyhow::ensure!(
+                !self.tab_has_exact_tiled_pane(&tab),
+                "pane {} is already tiled in tab {tab_id}; floating create expects a detached pane",
+                self.pane_id,
+            );
+            anyhow::ensure!(
+                !self.tab_contains_exact_pane(&tab),
+                "pane {} is already attached to tab {tab_id}",
+                self.pane_id,
+            );
+            tab.add_floating_pane(Arc::clone(self.pane), rect)?;
+            Ok(())
+        }
+
+        pub fn move_floating_pane(&self, rect: crate::tab::FloatingPaneRect) -> anyhow::Result<()> {
+            self.containing_exact_floating_tab()?
+                .set_floating_pane_rect(self.pane_id, rect)
+                .ok_or_else(|| anyhow!("floating pane {} not found", self.pane_id))?;
+            Ok(())
+        }
+
+        pub fn set_floating_pane_z_order(&self, z_order: u32) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.containing_exact_floating_tab()?
+                    .set_floating_pane_z_order(self.pane_id, z_order),
+                "floating pane {} not found",
+                self.pane_id,
+            );
+            Ok(())
+        }
+
+        pub fn set_floating_pane_visible(&self, visible: bool) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.containing_exact_floating_tab()?
+                    .set_floating_pane_visible(self.pane_id, visible),
+                "floating pane {} not found",
+                self.pane_id,
+            );
+            Ok(())
+        }
+
+        pub fn remove_floating_pane(&self) -> anyhow::Result<()> {
+            let removed = self
+                .containing_exact_floating_tab()?
+                .remove_floating_pane(self.pane_id)
+                .ok_or_else(|| anyhow!("floating pane {} not found", self.pane_id))?;
+            anyhow::ensure!(
+                Arc::ptr_eq(&removed, self.pane),
+                "floating pane {} changed registration during removal",
+                self.pane_id,
+            );
+            Ok(())
+        }
+
+        pub fn update_pane_constraints(
+            &self,
+            min_width: Option<usize>,
+            max_width: Option<usize>,
+            min_height: Option<usize>,
+            max_height: Option<usize>,
+        ) -> anyhow::Result<()> {
+            self.containing_exact_tab()?
+                .update_pane_constraints(self.pane_id, min_width, max_width, min_height, max_height)
+                .ok_or_else(|| anyhow!("pane {} not found in tab", self.pane_id))?;
+            Ok(())
+        }
+
         pub fn is_same_pane(&self, pane: &Arc<dyn Pane>) -> bool {
             std::ptr::eq(
-                self.pane as *const dyn Pane as *const (),
+                Arc::as_ptr(self.pane) as *const (),
                 Arc::as_ptr(pane) as *const (),
             )
         }
@@ -651,7 +1007,7 @@ mod pane_registration_handle {
             // Separately formed trait-object views of the same allocation may
             // carry equivalent but non-identical vtable pointers.
             std::ptr::eq(
-                self.pane as *const dyn Pane as *const (),
+                Arc::as_ptr(self.pane) as *const (),
                 pane as *const dyn Pane as *const (),
             )
         }
@@ -693,7 +1049,52 @@ mod pane_registration_handle {
         }
 
         pub fn focus_pane_and_containing_tab(&self) -> anyhow::Result<()> {
-            self.owner.focus_pane_and_containing_tab(self.pane_id)
+            self.owner.focus_exact_pane_and_containing_tab(self.pane)
+        }
+
+        /// Focus this exact pane and attribute focus to an exact client
+        /// registration when one is supplied.
+        pub fn focus_for_client_if_same(
+            &self,
+            client_id: Option<&Arc<ClientId>>,
+        ) -> anyhow::Result<()> {
+            if let Some(client_id) = client_id {
+                if !self.owner.client_registration_is_current(client_id) {
+                    anyhow::bail!("client registration is no longer current");
+                }
+            }
+            self.focus_pane_and_containing_tab()?;
+            if let Some(client_id) = client_id {
+                if self
+                    .owner
+                    .replace_client_focus_metadata_for_registration_if_same(
+                        client_id,
+                        self.pane_id,
+                        self.registration,
+                    )
+                    .is_none()
+                {
+                    metrics::counter!("mux.focus.client_attribution_lost").increment(1);
+                    log::warn!(
+                        "client registration retired after pane {} focus committed; \
+                         skipping stale client attribution",
+                        self.pane_id,
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn record_focus_for_client(&self, client_id: &Arc<ClientId>) -> bool {
+            self.owner.record_focus_for_client_registration_if_same(
+                client_id,
+                self.registration,
+                self.pane.as_ref(),
+            )
+        }
+
+        pub(super) fn focus_changed(&self, focused: bool) {
+            self.pane.focus_changed(focused);
         }
 
         pub fn record_input_for_current_identity(&self) {
@@ -809,9 +1210,122 @@ mod pane_registration_handle {
             let (operation, pane, mux) = self.resolve_current()?;
             let result = f(CurrentPane {
                 owner: mux.as_ref(),
-                pane: pane.as_ref(),
+                pane: &pane,
+                registration: self,
                 pane_id: self.generation.pane_id,
             });
+            drop(operation);
+            Some(result)
+        }
+
+        /// Search only this exact pane registration.
+        ///
+        /// The generation operation lease remains held across the search so a
+        /// same-ID replacement cannot satisfy a request admitted for this pane.
+        /// Dropping the future releases the lease through ordinary RAII.
+        pub async fn search_if_current(
+            &self,
+            expected_owner: &Arc<Mux>,
+            pattern: crate::pane::Pattern,
+            range: std::ops::Range<frankenterm_term::StableRowIndex>,
+            limit: Option<u32>,
+        ) -> Option<anyhow::Result<Vec<crate::pane::SearchResult>>> {
+            let (operation, pane, mux) = self.resolve_current()?;
+            if !Arc::ptr_eq(&mux, expected_owner) {
+                return None;
+            }
+            let result = pane.search(pattern, range, limit).await;
+            drop(mux);
+            drop(operation);
+            Some(result)
+        }
+
+        /// Split this exact pane registration, optionally moving another exact
+        /// registered pane into the new split.
+        pub async fn split_if_current(
+            &self,
+            expected_owner: &Arc<Mux>,
+            source_registration: Option<&Self>,
+            request: SplitRequest,
+            source: SplitSource,
+            domain: config::keyassignment::SpawnTabDomain,
+            client_id: Option<Arc<ClientId>>,
+        ) -> Option<anyhow::Result<(PaneId, TerminalSize, WindowId, TabId)>> {
+            let (operation, _pane, mux) = self.resolve_current()?;
+            if !Arc::ptr_eq(&mux, expected_owner) {
+                return None;
+            }
+            if matches!(
+                &source,
+                SplitSource::MovePane(source_id) if *source_id == self.pane_id()
+            ) {
+                return Some(Err(anyhow!(
+                    "cannot move pane {} into a split of itself",
+                    self.pane_id()
+                )));
+            }
+            let source_lease = match (&source, source_registration) {
+                (SplitSource::MovePane(source_id), Some(registration))
+                    if *source_id == registration.pane_id() =>
+                {
+                    let Some((operation, _pane, source_mux)) = registration.resolve_current()
+                    else {
+                        return Some(Err(anyhow!(
+                            "split source pane registration {source_id} is no longer current"
+                        )));
+                    };
+                    if !Arc::ptr_eq(&mux, &source_mux) {
+                        return Some(Err(anyhow!(
+                            "split source and target belong to different mux registrations"
+                        )));
+                    }
+                    Some((operation, source_mux))
+                }
+                (SplitSource::MovePane(source_id), _) => {
+                    return Some(Err(anyhow!(
+                        "missing exact registration for split source pane {source_id}"
+                    )));
+                }
+                (SplitSource::Spawn { .. }, None) => None,
+                (SplitSource::Spawn { .. }, Some(_)) => {
+                    return Some(Err(anyhow!(
+                        "unexpected pane registration for spawned split source"
+                    )));
+                }
+            };
+            let result = mux
+                .split_pane(self.pane_id(), request, source, domain, client_id)
+                .await
+                .map(|(pane, size, window_id, tab_id)| (pane.pane_id(), size, window_id, tab_id));
+            drop(source_lease);
+            drop(mux);
+            drop(operation);
+            Some(result)
+        }
+
+        /// Move only this exact pane registration to a new tab.
+        pub async fn move_to_new_tab_if_current(
+            &self,
+            expected_owner: &Arc<Mux>,
+            window_id: Option<WindowId>,
+            workspace_for_new_window: Option<String>,
+            client_id: Option<Arc<ClientId>>,
+        ) -> Option<anyhow::Result<(TabId, WindowId)>> {
+            let (operation, _pane, mux) = self.resolve_current()?;
+            if !Arc::ptr_eq(&mux, expected_owner) {
+                return None;
+            }
+            if client_id
+                .as_ref()
+                .is_some_and(|client_id| !mux.client_registration_is_current(client_id))
+            {
+                return Some(Err(anyhow!("client registration is no longer current")));
+            }
+            let result = mux
+                .move_pane_to_new_tab(self.pane_id(), window_id, workspace_for_new_window)
+                .await
+                .map(|(tab, window_id)| (tab.tab_id(), window_id));
+            drop(mux);
             drop(operation);
             Some(result)
         }
@@ -836,7 +1350,8 @@ mod pane_registration_handle {
             let result = f(CurrentPaneOutput {
                 current: CurrentPane {
                     owner: mux.as_ref(),
-                    pane: pane.as_ref(),
+                    pane: &pane,
+                    registration: self,
                     pane_id: self.generation.pane_id,
                 },
             });
@@ -2681,100 +3196,269 @@ impl Mux {
         *self.num_panes_by_workspace.write() = count;
     }
 
-    pub fn client_had_input(&self, client_id: &ClientId) {
-        if let Some(info) = self.clients.write().get_mut(client_id) {
-            info.update_last_input();
+    /// Record input only when `client_id` is the exact live registration.
+    ///
+    /// `ClientId` values are reusable across reconnects, so value equality is
+    /// insufficient for deferred connection work. The `Arc` allocation is the
+    /// process-local registration token.
+    pub fn client_had_input_if_same(&self, client_id: &Arc<ClientId>) -> bool {
+        let updated = {
+            let mut clients = self.clients.write();
+            clients
+                .get_mut(client_id.as_ref())
+                .filter(|info| Arc::ptr_eq(&info.client_id, client_id))
+                .is_some_and(|info| {
+                    info.update_last_input();
+                    true
+                })
+        };
+        if updated {
+            if let Some(agent) = &self.agent {
+                agent.update_target();
+            }
         }
-        if let Some(agent) = &self.agent {
-            agent.update_target();
-        }
+        updated
     }
 
     pub fn record_input_for_current_identity(&self) {
-        if let Some(ident) = self.identity.read().as_ref() {
-            self.client_had_input(ident);
+        if let Some(ident) = self.identity.read().clone() {
+            let _ = self.client_had_input_if_same(&ident);
         }
     }
 
     pub fn record_focus_for_current_identity(&self, pane_id: PaneId) {
-        if let Some(ident) = self.identity.read().as_ref() {
-            self.record_focus_for_client(ident, pane_id);
+        if let Some(ident) = self.identity.read().clone() {
+            let _ = self.record_focus_for_client(&ident, pane_id);
         }
     }
 
     pub fn resolve_focused_pane(
         &self,
-        client_id: &ClientId,
+        client_id: &Arc<ClientId>,
     ) -> Option<(DomainId, WindowId, TabId, PaneId)> {
-        let pane_id = self.clients.read().get(client_id)?.focused_pane_id?;
-        let (domain, window, tab) = self.resolve_pane_id(pane_id)?;
-        Some((domain, window, tab, pane_id))
+        let registration = {
+            self.clients
+                .read()
+                .get(client_id.as_ref())
+                .filter(|info| Arc::ptr_eq(&info.client_id, client_id))?
+                .focused_pane_registration()?
+        };
+        registration
+            .try_with_current(|current| {
+                let pane_id = current.pane_id();
+                let (domain, window, tab) = self.resolve_pane_id(pane_id)?;
+                Some((domain, window, tab, pane_id))
+            })
+            .flatten()
     }
 
-    pub fn record_focus_for_client(&self, client_id: &ClientId, pane_id: PaneId) {
-        let mut prior = None;
-        if let Some(info) = self.clients.write().get_mut(client_id) {
-            prior = info.focused_pane_id;
-            info.update_focused_pane(pane_id);
+    pub fn record_focus_for_client(&self, client_id: &Arc<ClientId>, pane_id: PaneId) -> bool {
+        if let Some(registration) = self.capture_current_pane(pane_id) {
+            return registration
+                .try_with_current(|current| current.record_focus_for_client(client_id))
+                .unwrap_or(false);
         }
+        false
+    }
 
-        if prior == Some(pane_id) {
-            return;
+    /// Record focus only for the exact live client and pane registrations.
+    fn record_focus_for_client_registration_if_same(
+        &self,
+        client_id: &Arc<ClientId>,
+        registration: &PaneRegistrationHandle,
+        pane: &dyn Pane,
+    ) -> bool {
+        self.update_client_focus(
+            client_id,
+            registration.pane_id(),
+            Some((registration, pane)),
+        )
+    }
+
+    #[cfg(test)]
+    fn record_focus_for_client_if_same(&self, client_id: &Arc<ClientId>, pane_id: PaneId) -> bool {
+        let Some(registration) = self.capture_current_pane(pane_id) else {
+            return false;
+        };
+        registration
+            .try_with_current(|current| current.record_focus_for_client(client_id))
+            .unwrap_or(false)
+    }
+
+    fn update_client_focus(
+        &self,
+        exact_client: &Arc<ClientId>,
+        pane_id: PaneId,
+        target: Option<(&PaneRegistrationHandle, &dyn Pane)>,
+    ) -> bool {
+        let Some((target_registration, target_pane)) = target else {
+            return false;
+        };
+        let Some((prior, same_registration)) = self
+            .replace_client_focus_metadata_for_registration_if_same(
+                exact_client,
+                pane_id,
+                target_registration,
+            )
+        else {
+            return false;
+        };
+
+        if same_registration {
+            return true;
         }
-        // Synthesize focus events
-        if let Some(prior_id) = prior {
-            if let Some(pane) = self.get_pane(prior_id) {
-                pane.focus_changed(false);
-            }
+        if let Some(prior) = prior {
+            let _ = prior.try_with_current(|current| current.focus_changed(false));
         }
-        if let Some(pane) = self.get_pane(pane_id) {
-            pane.focus_changed(true);
+        target_pane.focus_changed(true);
+        true
+    }
+
+    /// Replace client focus metadata only while one exact pane registration
+    /// remains published.
+    ///
+    /// The pane-registration serializer closes the retirement/check/store
+    /// window: removal either wins first and this fails, or wins afterward and
+    /// its cleanup clears the metadata installed here.
+    fn replace_client_focus_metadata_for_registration_if_same(
+        &self,
+        client_id: &Arc<ClientId>,
+        pane_id: PaneId,
+        target: &PaneRegistrationHandle,
+    ) -> Option<(Option<PaneRegistrationHandle>, bool)> {
+        let _registration = self.pane_registration.lock();
+        let remains_current = self.panes.read().get(&pane_id).is_some_and(|registered| {
+            target.same_registration(&PaneRegistrationHandle::new(
+                &registered.pane,
+                &registered.generation,
+            ))
+        });
+        if !remains_current {
+            return None;
         }
+        self.replace_client_focus_metadata_if_same(client_id, pane_id, Some(target))
+    }
+
+    /// Replace only the process-local client focus projection.
+    ///
+    /// No pane callback or mux notification is emitted here. Callers that
+    /// commit topology focus execute those effects exactly once through the
+    /// topology transition; metadata-only callers layer their own callbacks
+    /// after this lock has been released.
+    fn replace_client_focus_metadata_if_same(
+        &self,
+        client_id: &Arc<ClientId>,
+        pane_id: PaneId,
+        target: Option<&PaneRegistrationHandle>,
+    ) -> Option<(Option<PaneRegistrationHandle>, bool)> {
+        let mut clients = self.clients.write();
+        let info = clients
+            .get_mut(client_id.as_ref())
+            .filter(|info| Arc::ptr_eq(&info.client_id, client_id))?;
+        let prior = info.focused_pane_registration();
+        let same_registration = prior
+            .as_ref()
+            .zip(target)
+            .is_some_and(|(prior, target)| prior.same_registration(target));
+        info.replace_focused_pane(pane_id, target.cloned());
+        Some((prior, same_registration))
     }
 
     /// Called by PaneFocused event handlers to reconcile a remote
     /// pane focus event and apply its effects locally
     pub fn focus_pane_and_containing_tab(&self, pane_id: PaneId) -> anyhow::Result<()> {
-        let pane = self
-            .get_pane(pane_id)
-            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
+        let registration = self
+            .capture_current_pane(pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} not found"))?;
+        registration
+            .try_with_current(|current| current.focus_pane_and_containing_tab())
+            .ok_or_else(|| anyhow!("pane registration {pane_id} is no longer current"))?
+    }
 
-        let (_domain, window_id, tab_id) = self
-            .resolve_pane_id(pane_id)
-            .ok_or_else(|| anyhow::anyhow!("can't find {pane_id} in the mux"))?;
+    fn focus_exact_pane_and_containing_tab(&self, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
+        let pane_id = pane.pane_id();
+        let (window_id, tab) = {
+            let windows = self.windows.read();
+            windows
+                .iter()
+                .find_map(|(window_id, window)| {
+                    window
+                        .iter()
+                        .find(|tab| {
+                            tab.iter_all_panes()
+                                .iter()
+                                .any(|candidate| Arc::ptr_eq(candidate, pane))
+                        })
+                        .map(|tab| (*window_id, Arc::clone(tab)))
+                })
+                .ok_or_else(|| anyhow!("can't find exact pane {pane_id} in the mux topology"))?
+        };
 
-        // Focus/activate the containing tab within its window
         {
             let mut win = self
                 .get_window_mut(window_id)
                 .ok_or_else(|| anyhow::anyhow!("window_id {window_id} not found"))?;
             let tab_idx = win
-                .idx_by_id(tab_id)
-                .ok_or_else(|| anyhow::anyhow!("tab {tab_id} not in {window_id}"))?;
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, &tab))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "exact containing tab {} is no longer in window {window_id}",
+                        tab.tab_id(),
+                    )
+                })?;
             win.save_and_then_set_active(tab_idx);
         }
 
         // Focus/activate the pane locally
-        let tab = self
-            .get_tab(tab_id)
-            .ok_or_else(|| anyhow::anyhow!("tab {tab_id} not found"))?;
-
-        tab.set_active_pane(&pane);
+        anyhow::ensure!(
+            tab.set_active_pane_for_mux(pane, self),
+            "exact pane {pane_id} was not accepted as active by tab {}",
+            tab.tab_id(),
+        );
 
         Ok(())
     }
 
     pub fn register_client(&self, client_id: Arc<ClientId>) {
+        let replaced = {
+            let mut clients = self.clients.write();
+            if clients
+                .get(client_id.as_ref())
+                .is_some_and(|info| Arc::ptr_eq(&info.client_id, &client_id))
+            {
+                return;
+            }
+            clients.insert(
+                (*client_id).clone(),
+                ClientInfo::new(Arc::clone(&client_id)),
+            )
+        };
+        let Some(replaced) = replaced else {
+            return;
+        };
+
+        let mut identity = self.identity.write();
+        if identity
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &replaced.client_id))
+        {
+            *identity = None;
+        }
+    }
+
+    pub fn client_registration_is_current(&self, client_id: &Arc<ClientId>) -> bool {
         self.clients
-            .write()
-            .insert((*client_id).clone(), ClientInfo::new(client_id));
+            .read()
+            .get(client_id.as_ref())
+            .is_some_and(|info| Arc::ptr_eq(&info.client_id, client_id))
     }
 
     pub fn iter_clients(&self) -> Vec<ClientInfo> {
         self.clients
             .read()
             .values()
-            .map(|info| info.clone())
+            .map(ClientInfo::wire_snapshot)
             .collect()
     }
 
@@ -2807,42 +3491,55 @@ impl Mux {
     pub fn active_workspace(&self) -> String {
         self.identity
             .read()
-            .as_ref()
-            .and_then(|ident| {
-                self.clients
-                    .read()
-                    .get(&ident)
-                    .and_then(|info| info.active_workspace.clone())
-            })
+            .clone()
+            .and_then(|ident| self.active_workspace_for_client_if_same(&ident))
             .unwrap_or_else(|| self.get_default_workspace())
     }
 
     /// Returns the effective active workspace name for a given client
     pub fn active_workspace_for_client(&self, ident: &Arc<ClientId>) -> String {
-        self.clients
-            .read()
-            .get(&ident)
-            .and_then(|info| info.active_workspace.clone())
+        self.active_workspace_for_client_if_same(ident)
             .unwrap_or_else(|| self.get_default_workspace())
     }
 
+    fn active_workspace_for_client_if_same(&self, ident: &Arc<ClientId>) -> Option<String> {
+        self.clients
+            .read()
+            .get(ident.as_ref())
+            .filter(|info| Arc::ptr_eq(&info.client_id, ident))
+            .and_then(|info| info.active_workspace.clone())
+    }
+
     pub fn set_active_workspace_for_client(&self, ident: &Arc<ClientId>, workspace: &str) {
+        let _ = self.set_active_workspace_for_client_if_same(ident, workspace);
+    }
+
+    /// Assign a workspace only when `ident` is the exact live registration.
+    pub fn set_active_workspace_for_client_if_same(
+        &self,
+        ident: &Arc<ClientId>,
+        workspace: &str,
+    ) -> bool {
         let changed = {
             let mut clients = self.clients.write();
-            clients.get_mut(&ident).is_some_and(|info| {
-                info.active_workspace.replace(workspace.to_string());
-                true
-            })
+            clients
+                .get_mut(ident.as_ref())
+                .filter(|info| Arc::ptr_eq(&info.client_id, ident))
+                .is_some_and(|info| {
+                    info.active_workspace.replace(workspace.to_string());
+                    true
+                })
         };
         if changed {
             self.notify(MuxNotification::ActiveWorkspaceChanged(ident.clone()));
         }
+        changed
     }
 
     /// Assigns the active workspace name for the current identity
     pub fn set_active_workspace(&self, workspace: &str) {
         if let Some(ident) = self.identity.read().clone() {
-            self.set_active_workspace_for_client(&ident, workspace);
+            let _ = self.set_active_workspace_for_client_if_same(&ident, workspace);
         }
     }
 
@@ -2888,9 +3585,12 @@ impl Mux {
     /// Returns `IdentityHolder` which will restore the prior identity
     /// when it is dropped.
     /// This can be used to change the identity for the duration of a block.
-    pub fn with_identity(&self, id: Option<Arc<ClientId>>) -> IdentityHolder {
+    pub fn with_identity(self: &Arc<Self>, id: Option<Arc<ClientId>>) -> IdentityHolder {
         let prior = self.replace_identity(id);
-        IdentityHolder { prior }
+        IdentityHolder {
+            owner: Arc::downgrade(self),
+            prior,
+        }
     }
 
     /// Replace the identity, returning the prior identity
@@ -2903,15 +3603,8 @@ impl Mux {
         self.identity.read().clone()
     }
 
-    pub fn unregister_client(&self, client_id: &ClientId) {
-        self.clients.write().remove(client_id);
-        let mut identity = self.identity.write();
-        if identity
-            .as_ref()
-            .is_some_and(|ident| ident.as_ref() == client_id)
-        {
-            *identity = None;
-        }
+    pub fn unregister_client(&self, client_id: &Arc<ClientId>) {
+        let _ = self.unregister_client_if_same(client_id);
     }
 
     pub fn unregister_client_if_same(&self, client_id: &Arc<ClientId>) -> bool {
@@ -3662,11 +4355,14 @@ impl Mux {
             .lock()
             .retain(|(pane_id, _), _| !pane_ids.contains(pane_id));
         for client in self.clients.write().values_mut() {
-            if client
+            let removed_registration = client
+                .focused_pane_registration()
+                .is_some_and(|registration| pane_ids.contains(&registration.pane_id()));
+            let removed_projection = client
                 .focused_pane_id
-                .is_some_and(|pane_id| pane_ids.contains(&pane_id))
-            {
-                client.focused_pane_id = None;
+                .is_some_and(|pane_id| pane_ids.contains(&pane_id));
+            if removed_registration || removed_projection {
+                client.clear_focused_pane();
             }
         }
     }
@@ -5108,6 +5804,21 @@ impl Mux {
         })
     }
 
+    /// Non-blocking variant of [`Self::get_window_mut`].
+    ///
+    /// Returns `None` when the window registry is contended or the window is
+    /// absent.
+    pub fn try_get_window_mut(&self, window_id: WindowId) -> Option<MuxWindowWriteGuard<'_>> {
+        let guard = RwLockWriteGuard::try_map(self.windows.try_write()?, |windows| {
+            windows.get_mut(&window_id)
+        })
+        .ok()?;
+        Some(MuxWindowWriteGuard {
+            guard: Some(guard),
+            mux: self,
+        })
+    }
+
     pub fn set_window_title(&self, window_id: WindowId, title: &str) -> bool {
         let changed = {
             let mut windows = self.windows.write();
@@ -5604,12 +6315,25 @@ impl Mux {
     }
 
     pub async fn split_pane(
-        &self,
+        self: &Arc<Self>,
         source_pane_id: PaneId,
         request: SplitRequest,
         source: SplitSource,
         domain: config::keyassignment::SpawnTabDomain,
-    ) -> anyhow::Result<(Arc<dyn Pane>, TerminalSize)> {
+        owner_client_id: Option<Arc<ClientId>>,
+    ) -> anyhow::Result<(Arc<dyn Pane>, TerminalSize, WindowId, TabId)> {
+        if matches!(
+            &source,
+            SplitSource::MovePane(move_pane_id) if *move_pane_id == source_pane_id
+        ) {
+            anyhow::bail!("cannot move pane {source_pane_id} into a split of itself");
+        }
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|client_id| !self.client_registration_is_current(client_id))
+        {
+            anyhow::bail!("client registration is no longer current");
+        }
         let (_pane_domain_id, window_id, tab_id) = self
             .resolve_pane_id(source_pane_id)
             .ok_or_else(|| anyhow!("pane_id {} invalid", source_pane_id))?;
@@ -5619,7 +6343,9 @@ impl Mux {
             .context("resolve_spawn_tab_domain")?;
 
         if domain.state() == DomainState::Detached {
-            domain.attach(Some(window_id)).await?;
+            domain
+                .attach(self, owner_client_id, Some(window_id))
+                .await?;
         }
 
         let current_pane = self
@@ -5644,7 +6370,7 @@ impl Mux {
         };
 
         let pane = domain
-            .split_pane(source, tab_id, source_pane_id, request)
+            .split_pane(self, source, tab_id, source_pane_id, request)
             .await?;
         if let Some(config) = term_config {
             pane.set_config(config);
@@ -5660,7 +6386,7 @@ impl Mux {
             dpi: dims.dpi,
         };
 
-        Ok((pane, size))
+        Ok((pane, size, window_id, tab_id))
     }
 
     pub async fn move_pane_to_new_tab(
@@ -5678,7 +6404,7 @@ impl Mux {
             .ok_or_else(|| anyhow::anyhow!("domain {domain_id} of pane {pane_id} not found"))?;
 
         if let Some((tab, window_id)) = domain
-            .move_pane_to_new_tab(pane_id, window_id, workspace_for_new_window.clone())
+            .move_pane_to_new_tab(self, pane_id, window_id, workspace_for_new_window.clone())
             .await?
         {
             return Ok((tab, window_id));
@@ -5732,7 +6458,14 @@ impl Mux {
         current_pane_id: Option<PaneId>,
         workspace_for_new_window: String,
         window_position: Option<GuiPosition>,
+        owner_client_id: Option<Arc<ClientId>>,
     ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|client_id| !self.client_registration_is_current(client_id))
+        {
+            anyhow::bail!("client registration is no longer current");
+        }
         let domain = self
             .resolve_spawn_tab_domain(current_pane_id, &domain)
             .context("resolve_spawn_tab_domain")?;
@@ -5762,7 +6495,9 @@ impl Mux {
         };
 
         if domain.state() == DomainState::Detached {
-            domain.attach(Some(window_id)).await?;
+            domain
+                .attach(self, owner_client_id, Some(window_id))
+                .await?;
         }
 
         let cwd = self.resolve_cwd(
@@ -5787,7 +6522,7 @@ impl Mux {
         );
 
         let tab = domain
-            .spawn(size, command.clone(), cwd.clone(), window_id)
+            .spawn(self, size, command.clone(), cwd.clone(), window_id)
             .await
             .with_context(|| {
                 format!(
@@ -5816,12 +6551,13 @@ impl Mux {
 }
 
 pub struct IdentityHolder {
+    owner: Weak<Mux>,
     prior: Option<Arc<ClientId>>,
 }
 
 impl Drop for IdentityHolder {
     fn drop(&mut self) {
-        if let Some(mux) = Mux::try_get() {
+        if let Some(mux) = self.owner.upgrade() {
             mux.replace_identity(self.prior.take());
         }
     }
@@ -5971,6 +6707,7 @@ mod tests {
         focus_events: Arc<Mutex<Vec<bool>>>,
         mux_registration: Arc<PaneRegistrationSlot>,
         fail_reader: bool,
+        search_pending: bool,
     }
 
     impl KillCountingPane {
@@ -5999,6 +6736,31 @@ mod tests {
                 focus_events: Arc::new(Mutex::new(Vec::new())),
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader,
+                search_pending: false,
+            });
+            (pane, kills)
+        }
+
+        fn new_with_pending_search(
+            id: PaneId,
+            size: TerminalSize,
+        ) -> (Arc<dyn Pane>, Arc<AtomicUsize>) {
+            let kills = Arc::new(AtomicUsize::new(0));
+            let pane: Arc<dyn Pane> = Arc::new(Self {
+                id,
+                size: Mutex::new(size),
+                kills: Arc::clone(&kills),
+                actions: Arc::new(AtomicUsize::new(0)),
+                binds: AtomicUsize::new(0),
+                writes: Mutex::new(Vec::new()),
+                reader: Mutex::new(None),
+                on_reader: Mutex::new(None),
+                on_actions: Mutex::new(None),
+                on_kill: Mutex::new(None),
+                focus_events: Arc::new(Mutex::new(Vec::new())),
+                mux_registration: Arc::new(PaneRegistrationSlot::default()),
+                fail_reader: false,
+                search_pending: true,
             });
             (pane, kills)
         }
@@ -6023,6 +6785,7 @@ mod tests {
                 focus_events: Arc::new(Mutex::new(Vec::new())),
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
+                search_pending: false,
             });
             (pane, kills)
         }
@@ -6047,6 +6810,7 @@ mod tests {
                 focus_events: Arc::new(Mutex::new(Vec::new())),
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
+                search_pending: false,
             });
             (pane, kills)
         }
@@ -6071,6 +6835,7 @@ mod tests {
                 focus_events: Arc::new(Mutex::new(Vec::new())),
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
+                search_pending: false,
             });
             (pane, kills)
         }
@@ -6094,11 +6859,13 @@ mod tests {
                 focus_events: Arc::clone(&focus_events),
                 mux_registration: Arc::new(PaneRegistrationSlot::default()),
                 fail_reader: false,
+                search_pending: false,
             });
             (pane, focus_events)
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl Pane for KillCountingPane {
         fn pane_id(&self) -> PaneId {
             self.id
@@ -6167,6 +6934,18 @@ mod tests {
 
         fn get_title(&self) -> String {
             format!("kill-counting-pane-{}", self.id)
+        }
+
+        async fn search(
+            &self,
+            _pattern: crate::pane::Pattern,
+            _range: Range<StableRowIndex>,
+            _limit: Option<u32>,
+        ) -> anyhow::Result<Vec<crate::pane::SearchResult>> {
+            if self.search_pending {
+                std::future::pending::<()>().await;
+            }
+            Ok(Vec::new())
         }
 
         fn send_paste(&self, _text: &str) -> anyhow::Result<()> {
@@ -6998,6 +7777,104 @@ mod tests {
                 assert_eq!(resolved.pane_id(), 131);
             }),
             Some(()),
+        );
+    }
+
+    #[test]
+    fn cancelled_search_releases_exact_registration_lease() {
+        let _guard = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new_with_pending_search(158, test_size());
+        mux.add_pane(&pane)
+            .expect("pending-search pane registration");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("pending-search pane should yield an exact handle");
+
+        let mut search = Box::pin(registration.search_if_current(
+            &mux,
+            crate::pane::Pattern::default(),
+            0..1,
+            None,
+        ));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(search.as_mut(), &mut context).is_pending(),
+            "the test pane must keep search pending after exact admission",
+        );
+        assert_eq!(registration.active_operation_count(), 1);
+
+        assert!(
+            registration.retire_if_current(),
+            "retirement should claim the exact pending-search registration",
+        );
+        let (replacement, _) = KillCountingPane::new(158, test_size());
+        assert!(
+            mux.add_pane(&replacement).is_err(),
+            "the retiring generation must fence a same-ID replacement",
+        );
+
+        drop(search);
+        executor.run_until(Duration::from_secs(5), || kills.load(Ordering::SeqCst) == 1);
+        assert_eq!(
+            registration.active_operation_count(),
+            0,
+            "cancelling search must release its generation operation lease",
+        );
+        mux.add_pane(&replacement)
+            .expect("replacement should register once cancellation completes retirement");
+    }
+
+    #[test]
+    fn exact_split_rejects_moving_target_into_itself_without_mutation() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(159, test_size());
+        mux.add_pane(&pane).expect("target pane registration");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("target pane should yield an exact handle");
+
+        let raw_error = match promise::spawn::block_on(mux.split_pane(
+            159,
+            SplitRequest::default(),
+            SplitSource::MovePane(159),
+            SpawnTabDomain::CurrentPaneDomain,
+            None,
+        )) {
+            Ok(_) => panic!("the raw primitive must reject a self-move before topology lookup"),
+            Err(error) => error,
+        };
+        assert!(
+            raw_error.to_string().contains("into a split of itself"),
+            "unexpected raw split error: {raw_error:#}"
+        );
+
+        let error = promise::spawn::block_on(registration.split_if_current(
+            &mux,
+            Some(&registration),
+            SplitRequest::default(),
+            SplitSource::MovePane(159),
+            SpawnTabDomain::CurrentPaneDomain,
+            None,
+        ))
+        .expect("the target registration remains current")
+        .expect_err("moving a split target into itself must fail before mutation");
+
+        assert!(
+            error.to_string().contains("into a split of itself"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
+        assert!(
+            mux.get_pane(159)
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &pane)),
+            "the rejected operation must leave the exact target registered",
+        );
+        assert_eq!(
+            registration.try_with_current(|current| current.pane_id()),
+            Some(159),
         );
     }
 
@@ -9425,6 +10302,491 @@ mod tests {
             mux.active_identity().is_none(),
             "exact cleanup must clear the exact active identity",
         );
+    }
+
+    #[test]
+    fn register_client_is_idempotent_for_the_exact_registration() {
+        let mux = Mux::new(None);
+        let client = Arc::new(ClientId::new());
+        let (pane, _) = KillCountingPane::new(776, test_size());
+        mux.add_pane(&pane).expect("focus target registration");
+        mux.register_client(Arc::clone(&client));
+        assert!(mux.record_focus_for_client(&client, 776));
+        assert!(mux.set_active_workspace_for_client_if_same(&client, "preserved"));
+
+        let before = mux
+            .clients
+            .read()
+            .get(client.as_ref())
+            .cloned()
+            .expect("client registration before idempotent refresh");
+        let before_focus = before
+            .focused_pane_registration()
+            .expect("exact focus authority before idempotent refresh");
+
+        mux.register_client(Arc::clone(&client));
+
+        let after = mux
+            .clients
+            .read()
+            .get(client.as_ref())
+            .cloned()
+            .expect("client registration after idempotent refresh");
+        let after_focus = after
+            .focused_pane_registration()
+            .expect("exact focus authority after idempotent refresh");
+        assert_eq!(
+            after, before,
+            "re-registering the exact Arc must preserve all client metadata",
+        );
+        assert!(
+            Arc::ptr_eq(&after.client_id, &client),
+            "idempotent registration must preserve the exact client token",
+        );
+        assert!(
+            before_focus.same_registration(&after_focus),
+            "idempotent registration must preserve exact pane authority",
+        );
+    }
+
+    #[test]
+    fn resolve_focused_pane_rejects_an_equal_valued_stale_client() {
+        let mux = Arc::new(Mux::new(None));
+        let stale_client = Arc::new(ClientId::new());
+        let replacement_client = Arc::new(stale_client.as_ref().clone());
+        let (pane, _) = KillCountingPane::new(777, test_size());
+        let tab = Arc::new(Tab::new(&test_size()));
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("tab and active pane registration");
+        let window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&tab, *window)
+            .expect("tab attachment");
+
+        mux.register_client(Arc::clone(&stale_client));
+        mux.register_client(Arc::clone(&replacement_client));
+        assert!(mux.record_focus_for_client(&replacement_client, 777));
+
+        assert!(
+            mux.resolve_focused_pane(&stale_client).is_none(),
+            "a stale equal-valued client must not borrow replacement focus authority",
+        );
+        assert!(
+            mux.resolve_focused_pane(&replacement_client).is_some(),
+            "the exact replacement client must retain its focused-pane projection",
+        );
+    }
+
+    #[test]
+    fn guarded_client_mutations_reject_equal_valued_replacement_token() {
+        let mux = Mux::new(None);
+        let stale_client = Arc::new(ClientId::new());
+        let replacement_client = Arc::new(stale_client.as_ref().clone());
+
+        mux.register_client(Arc::clone(&stale_client));
+        mux.register_client(Arc::clone(&replacement_client));
+
+        let replacement_before = mux
+            .clients
+            .read()
+            .get(replacement_client.as_ref())
+            .cloned()
+            .expect("equal-valued replacement should be registered");
+
+        assert!(
+            !mux.client_had_input_if_same(&stale_client),
+            "stale input must not mutate an equal-valued replacement",
+        );
+        assert!(
+            !mux.record_focus_for_client_if_same(&stale_client, 777),
+            "stale focus must not mutate an equal-valued replacement",
+        );
+        assert!(
+            !mux.set_active_workspace_for_client_if_same(&stale_client, "stale"),
+            "stale workspace selection must not mutate an equal-valued replacement",
+        );
+
+        let replacement_after = mux
+            .clients
+            .read()
+            .get(replacement_client.as_ref())
+            .cloned()
+            .expect("stale mutations must preserve the replacement registration");
+        assert_eq!(
+            replacement_after, replacement_before,
+            "all guarded mutations must leave the replacement client untouched",
+        );
+        assert!(
+            Arc::ptr_eq(&replacement_after.client_id, &replacement_client),
+            "stale mutations must preserve the exact replacement registration token",
+        );
+    }
+
+    #[test]
+    fn current_identity_never_retargets_an_equal_valued_client_replacement() {
+        let mux = Arc::new(Mux::new(None));
+        let stale_client = Arc::new(ClientId::new());
+        let replacement_client = Arc::new(stale_client.as_ref().clone());
+        let (pane, focus_events) = KillCountingPane::new_with_focus_counter(777, test_size());
+        mux.add_pane(&pane).expect("focus target registration");
+        mux.register_client(Arc::clone(&stale_client));
+        mux.replace_identity(Some(Arc::clone(&stale_client)));
+
+        mux.register_client(Arc::clone(&replacement_client));
+        assert!(
+            mux.active_identity().is_none(),
+            "equal-valued replacement must retire the stale current-identity token",
+        );
+
+        {
+            let mut clients = mux.clients.write();
+            let replacement = clients
+                .get_mut(replacement_client.as_ref())
+                .expect("replacement client remains registered");
+            replacement.last_input = chrono::Utc::now() - chrono::Duration::seconds(30);
+        }
+        let replacement_before = mux
+            .clients
+            .read()
+            .get(replacement_client.as_ref())
+            .cloned()
+            .expect("replacement client snapshot");
+        let workspace_events = Arc::new(AtomicUsize::new(0));
+        let workspace_events_for_subscriber = Arc::clone(&workspace_events);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::ActiveWorkspaceChanged(_)) {
+                workspace_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("workspace event subscription");
+
+        // Reinstall the stale token to model delayed identity-bearing work that
+        // outlived replacement. Every current-identity mutation must still
+        // fail exact pointer validation.
+        mux.replace_identity(Some(Arc::clone(&stale_client)));
+        mux.record_input_for_current_identity();
+        mux.record_focus_for_current_identity(777);
+        mux.set_active_workspace("stale-workspace");
+
+        let replacement_after_stale = mux
+            .clients
+            .read()
+            .get(replacement_client.as_ref())
+            .cloned()
+            .expect("stale work must preserve the replacement");
+        assert_eq!(replacement_after_stale, replacement_before);
+        assert!(focus_events.lock().is_empty());
+        assert_eq!(workspace_events.load(Ordering::SeqCst), 0);
+
+        mux.replace_identity(Some(Arc::clone(&replacement_client)));
+        mux.record_input_for_current_identity();
+        mux.record_focus_for_current_identity(777);
+        mux.set_active_workspace("replacement-workspace");
+
+        let replacement_after_current = mux
+            .clients
+            .read()
+            .get(replacement_client.as_ref())
+            .cloned()
+            .expect("current replacement remains registered");
+        assert!(replacement_after_current.last_input > replacement_before.last_input);
+        assert_eq!(replacement_after_current.focused_pane_id, Some(777),);
+        assert!(replacement_after_current
+            .focused_pane_registration()
+            .is_some(),);
+        assert_eq!(
+            replacement_after_current.active_workspace.as_deref(),
+            Some("replacement-workspace"),
+        );
+        assert_eq!(focus_events.lock().as_slice(), &[true]);
+        assert_eq!(workspace_events.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_topology_focus_preserves_client_state_and_callbacks() {
+        let mux = Arc::new(Mux::new(None));
+        let client = Arc::new(ClientId::new());
+        let (prior_pane, prior_focus) = KillCountingPane::new_with_focus_counter(778, test_size());
+        let (target_pane, target_focus) =
+            KillCountingPane::new_with_focus_counter(779, test_size());
+        mux.add_pane(&prior_pane).expect("prior pane registration");
+        mux.add_pane(&target_pane)
+            .expect("target pane registration");
+        mux.register_client(Arc::clone(&client));
+        mux.record_focus_for_client(&client, 778);
+        prior_focus.lock().clear();
+        target_focus.lock().clear();
+
+        let target = mux
+            .capture_pane_registration(&target_pane)
+            .expect("target pane should yield an exact handle");
+        let result = target
+            .try_with_current(|current| current.focus_for_client_if_same(Some(&client)))
+            .expect("target registration remains current");
+
+        assert!(
+            result.is_err(),
+            "a pane outside mux topology must not report a focus commit",
+        );
+        assert_eq!(
+            mux.clients
+                .read()
+                .get(client.as_ref())
+                .expect("client remains registered")
+                .focused_pane_id,
+            Some(778),
+            "failed topology validation must preserve client focus",
+        );
+        assert!(
+            prior_focus.lock().is_empty(),
+            "failed validation must not emit prior-pane focus loss",
+        );
+        assert!(
+            target_focus.lock().is_empty(),
+            "failed validation must not emit target-pane focus gain",
+        );
+    }
+
+    #[test]
+    fn focus_transition_does_not_notify_same_id_replacement() {
+        let mux = Arc::new(Mux::new(None));
+        let client = Arc::new(ClientId::new());
+        let (original, original_focus) = KillCountingPane::new_with_focus_counter(780, test_size());
+        let (replacement, replacement_focus) =
+            KillCountingPane::new_with_focus_counter(780, test_size());
+        let (target, target_focus) = KillCountingPane::new_with_focus_counter(781, test_size());
+
+        mux.add_pane(&original).expect("original pane registration");
+        mux.add_pane(&target).expect("target pane registration");
+        mux.register_client(Arc::clone(&client));
+        mux.record_focus_for_client(&client, 780);
+        original_focus.lock().clear();
+        target_focus.lock().clear();
+
+        assert!(
+            mux.remove_pane_registration_if_same(780, &original),
+            "the test must retire only the original registry entry",
+        );
+        mux.add_pane(&replacement)
+            .expect("same-id replacement registration");
+        mux.record_focus_for_client(&client, 781);
+
+        assert!(
+            original_focus.lock().is_empty(),
+            "a retired exact registration cannot receive a later focus callback",
+        );
+        assert!(
+            replacement_focus.lock().is_empty(),
+            "the same-id replacement was never focused and must not receive focus loss",
+        );
+        assert_eq!(
+            target_focus.lock().as_slice(),
+            &[true],
+            "the exact target registration receives one focus-gain callback",
+        );
+    }
+
+    #[test]
+    fn exact_focus_emits_one_transition_only_on_the_originating_mux() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let origin = Arc::new(Mux::new(None));
+        let replacement = Arc::new(Mux::new(None));
+        let client = Arc::new(ClientId::new());
+        let (prior, prior_focus) = KillCountingPane::new_with_focus_counter(783, test_size());
+        let (target, target_focus) = KillCountingPane::new_with_focus_counter(784, test_size());
+
+        let window_builder = origin.new_empty_window(None, None);
+        let window_id = *window_builder;
+        let tab = Arc::new(Tab::new(&test_size()));
+        tab.assign_pane(&prior);
+        origin
+            .add_tab_and_active_pane(&tab)
+            .expect("origin tab and prior pane");
+        origin
+            .add_tab_to_window(&tab, window_id)
+            .expect("origin tab attachment");
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&target))
+            .expect("target split");
+        origin.add_pane(&target).expect("target registration");
+        tab.set_active_pane_for_mux(&prior, &origin);
+        origin.register_client(Arc::clone(&client));
+        assert!(origin.record_focus_for_client(&client, 783));
+        prior_focus.lock().clear();
+        target_focus.lock().clear();
+
+        let origin_notifications = Arc::new(AtomicUsize::new(0));
+        let origin_notifications_for_subscriber = Arc::clone(&origin_notifications);
+        origin
+            .subscribe(move |notification| {
+                if matches!(notification, MuxNotification::PaneFocused(784)) {
+                    origin_notifications_for_subscriber.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("origin focus subscription");
+        let replacement_notifications = Arc::new(AtomicUsize::new(0));
+        let replacement_notifications_for_subscriber = Arc::clone(&replacement_notifications);
+        replacement
+            .subscribe(move |notification| {
+                if matches!(notification, MuxNotification::PaneFocused(_)) {
+                    replacement_notifications_for_subscriber.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            })
+            .expect("replacement focus subscription");
+
+        Mux::set_mux(&replacement);
+        let registration = origin
+            .capture_pane_registration(&target)
+            .expect("exact target registration");
+        let result = registration
+            .try_with_current(|current| current.focus_for_client_if_same(Some(&client)))
+            .expect("target remains current");
+        result.expect("exact focus commit");
+
+        assert_eq!(prior_focus.lock().as_slice(), &[false]);
+        assert_eq!(target_focus.lock().as_slice(), &[true]);
+        assert_eq!(origin_notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement_notifications.load(Ordering::SeqCst), 0);
+
+        let repeated = registration
+            .try_with_current(|current| current.focus_for_client_if_same(Some(&client)))
+            .expect("target remains current");
+        repeated.expect("repeated exact focus is an idempotent success");
+        assert_eq!(prior_focus.lock().as_slice(), &[false]);
+        assert_eq!(target_focus.lock().as_slice(), &[true]);
+        assert_eq!(origin_notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement_notifications.load(Ordering::SeqCst), 0);
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn client_focus_wire_views_drop_process_local_pane_authority() {
+        let mux = Arc::new(Mux::new(None));
+        let client = Arc::new(ClientId::new());
+        let (pane, _) = KillCountingPane::new(782, test_size());
+        let weak_mux = Arc::downgrade(&mux);
+        let weak_pane = Arc::downgrade(&pane);
+
+        mux.add_pane(&pane).expect("pane registration");
+        mux.register_client(Arc::clone(&client));
+        mux.record_focus_for_client(&client, 782);
+
+        let stored = mux
+            .clients
+            .read()
+            .get(client.as_ref())
+            .cloned()
+            .expect("client remains registered");
+        assert!(
+            stored.focused_pane_registration().is_some(),
+            "the process-local client record must retain exact focus authority",
+        );
+
+        let json = serde_json::to_value(&stored).expect("serialize focused client");
+        let object = json
+            .as_object()
+            .expect("ClientInfo must serialize as a JSON object");
+        let mut fields = object.keys().map(String::as_str).collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "active_workspace",
+                "client_id",
+                "connected_at",
+                "focused_pane_id",
+                "last_input",
+            ],
+            "the wire schema must remain the five-field metadata projection",
+        );
+        assert!(
+            json.get("focused_pane_registration").is_none(),
+            "process-local pane authority must not enter the wire schema",
+        );
+        let decoded: ClientInfo = serde_json::from_value(json).expect("deserialize focused client");
+        assert_eq!(decoded.focused_pane_id, Some(782));
+        assert!(
+            decoded.focused_pane_registration().is_none(),
+            "wire metadata must not mint process-local pane authority",
+        );
+        assert_eq!(
+            decoded, stored,
+            "wire equality intentionally compares the serialized projection only",
+        );
+
+        let snapshots = mux.iter_clients();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].focused_pane_id, Some(782));
+        assert!(
+            snapshots[0].focused_pane_registration().is_none(),
+            "iter_clients must return a wire-safe projection",
+        );
+
+        drop(mux);
+        drop(pane);
+        assert!(
+            weak_mux.upgrade().is_none(),
+            "focused client records and wire snapshots must not retain the mux",
+        );
+        assert!(
+            weak_pane.upgrade().is_none(),
+            "focused client records and wire snapshots must not retain the pane",
+        );
+    }
+
+    #[test]
+    fn identity_holder_restores_originating_mux_after_global_replacement() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let originating_mux = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let prior_identity = Arc::new(ClientId::new());
+        let temporary_identity = Arc::new(ClientId::new());
+        let replacement_identity = Arc::new(ClientId::new());
+
+        originating_mux.replace_identity(Some(Arc::clone(&prior_identity)));
+        replacement_mux.replace_identity(Some(Arc::clone(&replacement_identity)));
+        Mux::set_mux(&originating_mux);
+
+        let holder = originating_mux.with_identity(Some(Arc::clone(&temporary_identity)));
+        assert!(
+            originating_mux
+                .active_identity()
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &temporary_identity)),
+            "with_identity must install the temporary identity on its owner",
+        );
+
+        Mux::set_mux(&replacement_mux);
+        drop(holder);
+
+        assert!(
+            originating_mux
+                .active_identity()
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &prior_identity)),
+            "dropping the holder must restore its originating mux",
+        );
+        assert!(
+            replacement_mux
+                .active_identity()
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &replacement_identity)),
+            "holder cleanup must not mutate the replacement global mux",
+        );
+        assert!(
+            Mux::try_get().is_some_and(|mux| Arc::ptr_eq(&mux, &replacement_mux)),
+            "holder cleanup must not replace the process-global mux",
+        );
+
+        Mux::shutdown();
     }
 
     #[test]

@@ -306,12 +306,14 @@ fn arb_client_info() -> impl Strategy<Value = ClientInfo> {
         arb_optional_id(),
     )
         .prop_map(
-            |(client_id, connected_at, active_workspace, last_input, focused_pane_id)| ClientInfo {
-                client_id: Arc::new(client_id),
-                connected_at: chrono::Utc.timestamp_opt(connected_at, 0).unwrap(),
-                active_workspace,
-                last_input: chrono::Utc.timestamp_opt(last_input, 0).unwrap(),
-                focused_pane_id,
+            |(client_id, connected_at, active_workspace, last_input, focused_pane_id)| {
+                ClientInfo::from_wire_parts(
+                    Arc::new(client_id),
+                    chrono::Utc.timestamp_opt(connected_at, 0).unwrap(),
+                    active_workspace,
+                    chrono::Utc.timestamp_opt(last_input, 0).unwrap(),
+                    focused_pane_id,
+                )
             },
         )
 }

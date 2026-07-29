@@ -273,6 +273,7 @@ impl SpawnWindow {
                 None,
                 self.workspace.unwrap_or_else(|| mux.active_workspace()),
                 self.position,
+                mux.active_identity(),
             )
             .await
             .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
@@ -324,6 +325,7 @@ impl SpawnTab {
                 pane,
                 String::new(),
                 None, // optional gui window position
+                mux.active_identity(),
             )
             .await
             .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;

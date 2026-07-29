@@ -5,6 +5,7 @@
 
 use std::convert::TryFrom;
 
+use crate::client::ClientId;
 use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use crate::pane::{
     alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
@@ -62,6 +63,7 @@ fn row_to_u16_saturating(value: i64) -> u16 {
 impl Domain for TermWizTerminalDomain {
     async fn spawn_pane(
         &self,
+        _mux: &Arc<Mux>,
         _size: TerminalSize,
         _command: Option<CommandBuilder>,
         _command_dir: Option<String>,
@@ -80,7 +82,12 @@ impl Domain for TermWizTerminalDomain {
     fn domain_name(&self) -> &str {
         "TermWizTerminalDomain"
     }
-    async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
+    async fn attach(
+        &self,
+        _mux: &Arc<Mux>,
+        _owner_client_id: Option<Arc<ClientId>>,
+        _window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

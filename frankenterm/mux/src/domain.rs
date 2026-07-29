@@ -5,6 +5,7 @@
 //! container or actually remote, running on the other end
 //! of an ssh session somewhere.
 
+use crate::client::ClientId;
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
@@ -51,39 +52,38 @@ pub enum SplitSource {
 
 #[async_trait(?Send)]
 pub trait Domain: Downcast + Send + Sync {
-    /// Spawn a new command within this domain
+    /// Spawn a new command within this domain on the exact originating mux.
     async fn spawn(
         &self,
+        mux: &Arc<Mux>,
         size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
         window: WindowId,
     ) -> anyhow::Result<Arc<Tab>> {
         let pane = self
-            .spawn_pane(size, command, command_dir)
+            .spawn_pane(mux, size, command, command_dir)
             .await
             .context("spawn")?;
 
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
 
-        let mux = Mux::try_get()
-            .ok_or_else(|| anyhow::anyhow!("cannot attach spawned tab: no mux configured"))?;
         mux.add_tab_and_active_pane(&tab)?;
         mux.add_tab_to_window(&tab, window)?;
 
         Ok(tab)
     }
 
+    /// Split a pane on the exact mux that admitted the operation.
     async fn split_pane(
         &self,
+        mux: &Arc<Mux>,
         source: SplitSource,
         tab: TabId,
         pane_id: PaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
-        let mux = Mux::try_get()
-            .ok_or_else(|| anyhow::anyhow!("cannot split pane: no mux configured"))?;
         let tab = match mux.get_tab(tab) {
             Some(t) => t,
             None => anyhow::bail!("Invalid tab id {}", tab),
@@ -108,7 +108,7 @@ pub trait Domain: Downcast + Send + Sync {
                 command,
                 command_dir,
             } => {
-                self.spawn_pane(split_size.second, command, command_dir)
+                self.spawn_pane(mux, split_size.second, command, command_dir)
                     .await?
             }
             SplitSource::MovePane(src_pane_id) => {
@@ -146,8 +146,10 @@ pub trait Domain: Downcast + Send + Sync {
         Ok(pane)
     }
 
+    /// Spawn and register a pane on the exact originating mux.
     async fn spawn_pane(
         &self,
+        mux: &Arc<Mux>,
         size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
@@ -155,10 +157,12 @@ pub trait Domain: Downcast + Send + Sync {
 
     /// The mux will call this method on the domain of the pane that
     /// is being moved to give the domain a chance to handle the movement.
+    /// `mux` is the exact originating mux that admitted that movement.
     /// If this method returns Ok(None), then the mux will handle the
     /// movement itself by mutating its local Tabs and Windows.
     async fn move_pane_to_new_tab(
         &self,
+        _mux: &Arc<Mux>,
         _pane_id: PaneId,
         _window_id: Option<WindowId>,
         _workspace_for_new_window: Option<String>,
@@ -194,7 +198,14 @@ pub trait Domain: Downcast + Send + Sync {
     }
 
     /// Re-attach to any tabs that might be pre-existing in this domain
-    async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()>;
+    /// Attach to this domain using mux and client authority captured before
+    /// any asynchronous connection work begins.
+    async fn attach(
+        &self,
+        mux: &Arc<Mux>,
+        owner_client_id: Option<Arc<ClientId>>,
+        window_id: Option<WindowId>,
+    ) -> anyhow::Result<()>;
 
     /// Detach all tabs
     fn detach(&self) -> anyhow::Result<()>;
@@ -528,6 +539,7 @@ impl LocalDomain {
 
     async fn build_command(
         &self,
+        mux: &Arc<Mux>,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
         pane_id: PaneId,
@@ -560,9 +572,7 @@ impl LocalDomain {
             cmd.env("WEZTERM_UNIX_SOCKET", sock);
         }
         cmd.env("WEZTERM_PANE", pane_id.to_string());
-        if let Some(agent_path) = Mux::try_get()
-            .and_then(|mux| mux.agent.as_ref().map(|agent| agent.path().to_path_buf()))
-        {
+        if let Some(agent_path) = mux.agent.as_ref().map(|agent| agent.path().to_path_buf()) {
             cmd.env("SSH_AUTH_SOCK", agent_path);
         }
         self.fixup_command(&mut cmd).await?;
@@ -671,13 +681,14 @@ impl portable_pty::ChildKiller for FailedProcessSpawn {
 impl Domain for LocalDomain {
     async fn spawn_pane(
         &self,
+        mux: &Arc<Mux>,
         size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let pane_id = alloc_pane_id()?;
         let cmd = self
-            .build_command(command, command_dir, pane_id)
+            .build_command(mux, command, command_dir, pane_id)
             .await
             .context("build_command")?;
         let pair = self
@@ -769,8 +780,6 @@ impl Domain for LocalDomain {
             }
         };
 
-        let mux = Mux::try_get()
-            .ok_or_else(|| anyhow::anyhow!("cannot add local pane: no mux configured"))?;
         mux.add_pane(&pane)?;
 
         Ok(pane)
@@ -834,7 +843,12 @@ impl Domain for LocalDomain {
         }
     }
 
-    async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
+    async fn attach(
+        &self,
+        _mux: &Arc<Mux>,
+        _owner_client_id: Option<Arc<ClientId>>,
+        _window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1259,6 +1273,7 @@ mod tests {
 
         let pane_id = promise::spawn::block_on(exec.run(async {
             let mut spawn_pane = std::pin::pin!(domain.spawn_pane(
+                &mux,
                 TerminalSize::default(),
                 Some(CommandBuilder::new("slow-spawn-test")),
                 None,

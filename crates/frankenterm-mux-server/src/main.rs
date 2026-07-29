@@ -342,11 +342,14 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
         let workspace = None;
         let position = None;
         let window_id = mux.new_empty_window(workspace, position);
-        domain.attach(Some(*window_id)).await?;
+        let owner_client_id = mux.active_identity();
+        domain
+            .attach(&mux, owner_client_id, Some(*window_id))
+            .await?;
 
         let _tab = mux
             .default_domain()
-            .spawn(config.initial_size(0, None), cmd, None, *window_id)
+            .spawn(&mux, config.initial_size(0, None), cmd, None, *window_id)
             .await?;
     }
     Ok(())

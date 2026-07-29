@@ -17,15 +17,16 @@ use codec::{
     TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
     WriteToPane,
 };
-use config::TermConfig;
 use mux::client::ClientId;
 use mux::domain::SplitSource;
-use mux::pane::{CachePolicy, Pane, PaneId};
+use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-use mux::{Mux, MuxNotification};
+use mux::{CurrentPane, Mux, PaneRegistrationHandle};
 use promise::spawn::spawn_into_main_thread;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 use termwiz::surface::SequenceNo;
 use url::Url;
@@ -50,6 +51,193 @@ impl PduSender {
     }
 }
 
+const SESSION_RETIRED: usize = 1usize << (usize::BITS - 1);
+const SESSION_OPERATION_MASK: usize = SESSION_RETIRED - 1;
+
+struct SessionIncarnation {
+    operation_state: AtomicUsize,
+}
+
+impl SessionIncarnation {
+    fn new() -> Self {
+        Self {
+            operation_state: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<SessionOperationLease> {
+        let mut observed = self.operation_state.load(Ordering::Acquire);
+        loop {
+            if observed & SESSION_RETIRED != 0 {
+                return None;
+            }
+
+            let active = observed & SESSION_OPERATION_MASK;
+            if active == SESSION_OPERATION_MASK {
+                return None;
+            }
+
+            match self.operation_state.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(SessionOperationLease {
+                        incarnation: Arc::clone(self),
+                    });
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn retire(&self) {
+        self.operation_state
+            .fetch_or(SESSION_RETIRED, Ordering::AcqRel);
+    }
+
+    fn release_operation(&self) {
+        let released =
+            self.operation_state
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    let active = state & SESSION_OPERATION_MASK;
+                    (active > 0).then_some(state - 1)
+                });
+        debug_assert!(
+            released.is_ok(),
+            "session operation lease released without a matching acquisition"
+        );
+    }
+}
+
+struct SessionOperationLease {
+    incarnation: Arc<SessionIncarnation>,
+}
+
+impl Drop for SessionOperationLease {
+    fn drop(&mut self) {
+        self.incarnation.release_operation();
+    }
+}
+
+/// Process-local authority for one exact mux-server connection.
+///
+/// Clones retain only the right to *attempt* an operation. Once the owning
+/// [`SessionHandler`] retires the incarnation, deferred clones fail closed and
+/// cannot redirect work through a replacement process-global mux.
+#[derive(Clone)]
+pub(crate) struct SessionAuthority {
+    mux: Weak<Mux>,
+    incarnation: Arc<SessionIncarnation>,
+}
+
+impl SessionAuthority {
+    pub(crate) fn new(mux: &Arc<Mux>) -> Self {
+        Self {
+            mux: Arc::downgrade(mux),
+            incarnation: Arc::new(SessionIncarnation::new()),
+        }
+    }
+
+    fn acquire(&self) -> anyhow::Result<CurrentSession> {
+        let operation = self
+            .incarnation
+            .try_acquire()
+            .ok_or_else(|| anyhow!("mux server session is retired"))?;
+        let mux = self
+            .mux
+            .upgrade()
+            .ok_or_else(|| anyhow!("mux server session owner no longer exists"))?;
+        Ok(CurrentSession {
+            mux,
+            _operation: operation,
+        })
+    }
+
+    fn capture_current_pane(&self, pane_id: PaneId) -> anyhow::Result<PaneRegistrationHandle> {
+        self.capture_current_pane_opt(pane_id)?
+            .ok_or_else(|| anyhow!("no such pane {pane_id}"))
+    }
+
+    fn capture_current_pane_opt(
+        &self,
+        pane_id: PaneId,
+    ) -> anyhow::Result<Option<PaneRegistrationHandle>> {
+        let session = self.acquire()?;
+        Ok(session.capture_current_pane(pane_id))
+    }
+
+    fn retire(&self) {
+        self.incarnation.retire();
+    }
+
+    pub(crate) fn try_run<R>(&self, f: impl FnOnce() -> R) -> anyhow::Result<R> {
+        let operation = self
+            .incarnation
+            .try_acquire()
+            .ok_or_else(|| anyhow!("mux server session is retired"))?;
+        let result = f();
+        drop(operation);
+        Ok(result)
+    }
+}
+
+struct CurrentSession {
+    mux: Arc<Mux>,
+    _operation: SessionOperationLease,
+}
+
+impl Deref for CurrentSession {
+    type Target = Mux;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mux
+    }
+}
+
+impl CurrentSession {
+    fn mux(&self) -> &Arc<Mux> {
+        &self.mux
+    }
+}
+
+/// Unique strong owner for one mux-server connection.
+///
+/// Cloneable deferred work receives only [`SessionAuthority`], which contains
+/// weak mux authority. This owner is therefore the sole connection-lifetime
+/// strong reference and retires the incarnation before releasing the mux.
+pub(crate) struct SessionOwner {
+    mux: Arc<Mux>,
+    authority: SessionAuthority,
+}
+
+impl SessionOwner {
+    pub(crate) fn new(mux: Arc<Mux>) -> Self {
+        let authority = SessionAuthority::new(&mux);
+        Self { mux, authority }
+    }
+
+    pub(crate) fn mux(&self) -> &Arc<Mux> {
+        &self.mux
+    }
+
+    pub(crate) fn authority(&self) -> SessionAuthority {
+        self.authority.clone()
+    }
+
+    fn retire(&self) {
+        self.authority.retire();
+    }
+}
+
+impl Drop for SessionOwner {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct PerPane {
     cursor_position: StableCursorPosition,
@@ -63,6 +251,21 @@ pub(crate) struct PerPane {
     seqno: SequenceNo,
     config_generation: usize,
     pub(crate) notifications: Vec<Alert>,
+}
+
+#[derive(Clone)]
+struct TrackedPane {
+    registration: Option<PaneRegistrationHandle>,
+    state: Arc<Mutex<PerPane>>,
+}
+
+impl TrackedPane {
+    fn exact(registration: PaneRegistrationHandle) -> Self {
+        Self {
+            registration: Some(registration),
+            state: Arc::new(Mutex::new(PerPane::default())),
+        }
+    }
 }
 
 fn stable_row_offset(row: StableRowIndex, offset: usize) -> Option<StableRowIndex> {
@@ -94,7 +297,7 @@ fn stable_row_range_from_signed_len(
 impl PerPane {
     fn compute_changes(
         &mut self,
-        pane: &Arc<dyn Pane>,
+        pane: &CurrentPane<'_>,
         force_with_input_serial: Option<InputSerial>,
     ) -> Option<GetPaneRenderChangesResponse> {
         let mut changed = false;
@@ -197,7 +400,7 @@ impl PerPane {
 }
 
 fn maybe_push_pane_changes(
-    pane: &Arc<dyn Pane>,
+    pane: &CurrentPane<'_>,
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
@@ -261,33 +464,25 @@ fn maybe_push_pane_changes(
     Ok(())
 }
 
-fn find_tab_matching<F>(mux: &Mux, mut predicate: F) -> Option<Arc<mux::tab::Tab>>
-where
-    F: FnMut(&Arc<mux::tab::Tab>) -> bool,
-{
-    for window_id in mux.iter_windows() {
-        let Some(window) = mux.get_window(window_id) else {
-            continue;
-        };
-        for tab in window.iter() {
-            if predicate(tab) {
-                return Some(Arc::clone(tab));
-            }
-        }
-    }
-    None
+fn session_mux(authority: &SessionAuthority) -> anyhow::Result<CurrentSession> {
+    authority.acquire()
 }
 
-fn find_tab_with_floating_pane(mux: &Mux, pane_id: PaneId) -> Option<Arc<mux::tab::Tab>> {
-    find_tab_matching(mux, |tab| tab.has_floating_pane(pane_id))
-}
-
-fn find_tab_containing_pane(mux: &Mux, pane_id: PaneId) -> Option<Arc<mux::tab::Tab>> {
-    find_tab_matching(mux, |tab| tab.contains_pane(pane_id))
-}
-
-fn session_mux() -> anyhow::Result<Arc<Mux>> {
-    Mux::try_get().ok_or_else(|| anyhow!("mux singleton is not available"))
+fn with_current_pane<R>(
+    authority: &SessionAuthority,
+    registration: &PaneRegistrationHandle,
+    f: impl FnOnce(&CurrentPane<'_>) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    authority.try_run(|| {
+        registration
+            .try_with_current(|current| f(&current))
+            .ok_or_else(|| {
+                anyhow!(
+                    "pane registration {} is no longer current",
+                    registration.pane_id()
+                )
+            })?
+    })?
 }
 
 fn unregister_owned_client(mux: &Mux, client_id: &Arc<ClientId>) {
@@ -296,39 +491,75 @@ fn unregister_owned_client(mux: &Mux, client_id: &Arc<ClientId>) {
 
 pub struct SessionHandler {
     to_write_tx: PduSender,
-    per_pane: HashMap<PaneId, Arc<Mutex<PerPane>>>,
+    owner: SessionOwner,
+    per_pane: HashMap<PaneId, TrackedPane>,
     client_id: Option<Arc<ClientId>>,
-    client_mux: Option<Arc<Mux>>,
     proxy_client_id: Option<ClientId>,
 }
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
+        self.owner.retire();
         if let Some(client_id) = self.client_id.take() {
-            if let Some(mux) = self.client_mux.take() {
-                unregister_owned_client(&mux, &client_id);
-            }
+            unregister_owned_client(self.owner.mux(), &client_id);
         }
     }
 }
 
 impl SessionHandler {
-    pub fn new(to_write_tx: PduSender) -> Self {
+    /// Construct a handler bound to one explicit mux incarnation.
+    ///
+    /// Production and fuzz callers must provide the owning mux rather than
+    /// consulting the process-global singleton. Deferred work therefore cannot
+    /// be redirected if another mux is installed while the session is alive.
+    pub fn new_for_mux(to_write_tx: PduSender, mux: Arc<Mux>) -> Self {
+        Self::new_for_session(to_write_tx, SessionOwner::new(mux))
+    }
+
+    pub(crate) fn new_for_session(to_write_tx: PduSender, owner: SessionOwner) -> Self {
         Self {
             to_write_tx,
+            owner,
             per_pane: HashMap::new(),
             client_id: None,
-            client_mux: None,
             proxy_client_id: None,
         }
     }
 
-    pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
-        Arc::clone(
-            self.per_pane
-                .entry(pane_id)
-                .or_insert_with(|| Arc::new(Mutex::new(PerPane::default()))),
-        )
+    #[cfg(test)]
+    fn new(to_write_tx: PduSender) -> Self {
+        let mux_owner = Mux::try_get().unwrap_or_else(|| Arc::new(Mux::new(None)));
+        Self::new_for_session(to_write_tx, SessionOwner::new(mux_owner))
+    }
+
+    fn per_pane_for_registration(
+        &mut self,
+        registration: &PaneRegistrationHandle,
+    ) -> Arc<Mutex<PerPane>> {
+        let pane_id = registration.pane_id();
+        let tracked = self
+            .per_pane
+            .entry(pane_id)
+            .and_modify(|tracked| {
+                let is_same = tracked
+                    .registration
+                    .as_ref()
+                    .is_some_and(|current| current.same_registration(registration));
+                if !is_same {
+                    *tracked = TrackedPane::exact(registration.clone());
+                }
+            })
+            .or_insert_with(|| TrackedPane::exact(registration.clone()));
+        Arc::clone(&tracked.state)
+    }
+
+    #[cfg(test)]
+    fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
+        let tracked = self.per_pane.entry(pane_id).or_insert_with(|| TrackedPane {
+            registration: None,
+            state: Arc::new(Mutex::new(PerPane::default())),
+        });
+        Arc::clone(&tracked.state)
     }
 
     /// Non-inserting accessor for cached per-pane state (ft-12e8l).
@@ -339,19 +570,49 @@ impl SessionHandler {
     /// pane that was already removed via `PaneRemoved` produces a permanent
     /// map leak — no subsequent `PaneRemoved` ever fires for a dead pane.
     pub(crate) fn per_pane_if_present(&self, pane_id: PaneId) -> Option<Arc<Mutex<PerPane>>> {
-        self.per_pane.get(&pane_id).map(Arc::clone)
+        self.per_pane
+            .get(&pane_id)
+            .map(|tracked| Arc::clone(&tracked.state))
     }
 
     /// Remove cached per-pane state when a pane is destroyed.
     /// Prevents unbounded HashMap growth in long-lived sessions.
     pub(crate) fn remove_per_pane(&mut self, pane_id: PaneId) {
-        self.per_pane.remove(&pane_id);
+        let should_remove = self.per_pane.get(&pane_id).is_some_and(|tracked| {
+            tracked
+                .registration
+                .as_ref()
+                .is_none_or(|registration| registration.try_with_current(|_| ()).is_none())
+        });
+        if should_remove {
+            self.per_pane.remove(&pane_id);
+        }
+    }
+
+    fn remove_per_pane_if_same(&mut self, registration: &PaneRegistrationHandle) {
+        let pane_id = registration.pane_id();
+        let should_remove = self
+            .per_pane
+            .get(&pane_id)
+            .and_then(|tracked| tracked.registration.as_ref())
+            .is_some_and(|current| current.same_registration(registration));
+        if should_remove {
+            self.per_pane.remove(&pane_id);
+        }
     }
 
     pub fn schedule_pane_push(&mut self, pane_id: PaneId) {
+        let authority = self.owner.authority();
+        let registration = match authority.capture_current_pane(pane_id) {
+            Ok(registration) => registration,
+            Err(err) => {
+                log::debug!("skipping pane {pane_id} push: {err:#}");
+                return;
+            }
+        };
         let sender = self.to_write_tx.clone();
-        let per_pane = self.per_pane(pane_id);
-        Self::schedule_pane_push_with_state(sender, pane_id, per_pane);
+        let per_pane = self.per_pane_for_registration(&registration);
+        Self::schedule_pane_push_with_state(sender, authority, registration, per_pane);
     }
 
     /// Push cached pane changes only for panes this session already tracks.
@@ -361,23 +622,38 @@ impl SessionHandler {
     /// later removal notification. Client request paths still use
     /// `schedule_pane_push`, which intentionally creates first-use state.
     pub(crate) fn schedule_tracked_pane_push(&self, pane_id: PaneId) {
-        if let Some(per_pane) = self.per_pane_if_present(pane_id) {
+        if let Some(tracked) = self.per_pane.get(&pane_id) {
+            let Some(registration) = tracked.registration.clone() else {
+                return;
+            };
             let sender = self.to_write_tx.clone();
-            Self::schedule_pane_push_with_state(sender, pane_id, per_pane);
+            let per_pane = Arc::clone(&tracked.state);
+            Self::schedule_pane_push_with_state(
+                sender,
+                self.owner.authority(),
+                registration,
+                per_pane,
+            );
         }
     }
 
     fn schedule_pane_push_with_state(
         sender: PduSender,
-        pane_id: PaneId,
+        authority: SessionAuthority,
+        registration: PaneRegistrationHandle,
         per_pane: Arc<Mutex<PerPane>>,
     ) {
         spawn_into_main_thread(async move {
-            let mux = session_mux()?;
-            let pane = mux
-                .get_pane(pane_id)
-                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-            maybe_push_pane_changes(&pane, sender, per_pane)?;
+            authority.try_run(|| {
+                registration
+                    .try_with_current(|pane| maybe_push_pane_changes(&pane, sender, per_pane))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "pane registration {} is no longer current",
+                            registration.pane_id()
+                        )
+                    })?
+            })??;
             Ok::<(), anyhow::Error>(())
         })
         .detach();
@@ -390,14 +666,19 @@ impl SessionHandler {
 
         if let Some(client_id) = &self.client_id {
             if decoded.pdu.is_user_input() {
-                if let Some(mux) = Mux::try_get() {
-                    mux.client_had_input(client_id);
-                } else {
-                    log::warn!("dropped client input activity marker because mux is unavailable");
+                match self.owner.authority().acquire() {
+                    Ok(mux) => {
+                        let _ = mux.client_had_input_if_same(client_id);
+                    }
+                    Err(err) => {
+                        log::warn!("dropped client input activity marker: {err:#}");
+                    }
                 }
             }
         }
 
+        let authority = self.owner.authority();
+        let response_authority = authority.clone();
         let send_response = move |result: anyhow::Result<Pdu>| {
             let pdu = match result {
                 Ok(pdu) => pdu,
@@ -406,7 +687,7 @@ impl SessionHandler {
                 }),
             };
             log::trace!("{} processing time {:?}", serial, start.elapsed());
-            sender.send(DecodedPdu { pdu, serial }).ok();
+            let _ = response_authority.try_run(|| sender.send(DecodedPdu { pdu, serial }));
         };
 
         fn catch<F, SND>(f: F, send_response: SND)
@@ -417,44 +698,43 @@ impl SessionHandler {
             send_response(f());
         }
 
-        fn pane_exists_now(pane_id: PaneId) -> anyhow::Result<bool> {
-            let mux = session_mux()?;
-            Ok(mux.get_pane(pane_id).is_some())
-        }
-
-        fn respond_if_pane_unavailable<SND>(pane_id: PaneId, send_response: &SND) -> bool
+        fn capture_pane_or_respond<SND>(
+            authority: &SessionAuthority,
+            pane_id: PaneId,
+            send_response: &SND,
+        ) -> Option<PaneRegistrationHandle>
         where
             SND: Fn(anyhow::Result<Pdu>),
         {
-            match pane_exists_now(pane_id) {
-                Ok(true) => false,
-                Ok(false) => {
-                    send_response(Err(anyhow!("no such pane {}", pane_id)));
-                    true
-                }
+            match authority.capture_current_pane(pane_id) {
+                Ok(registration) => Some(registration),
                 Err(err) => {
                     send_response(Err(err));
-                    true
+                    None
                 }
             }
         }
 
-        fn respond_liveness_if_pane_unavailable<SND>(pane_id: PaneId, send_response: &SND) -> bool
+        fn capture_pane_or_respond_liveness<SND>(
+            authority: &SessionAuthority,
+            pane_id: PaneId,
+            send_response: &SND,
+        ) -> Option<PaneRegistrationHandle>
         where
             SND: Fn(anyhow::Result<Pdu>),
         {
-            match pane_exists_now(pane_id) {
-                Ok(true) => false,
-                Ok(false) => {
+            match authority.capture_current_pane_opt(pane_id) {
+                Ok(Some(registration)) => Some(registration),
+                Ok(None) => {
                     send_response(Ok(Pdu::LivenessResponse(LivenessResponse {
                         pane_id,
                         is_alive: false,
                     })));
-                    true
+                    None
                 }
                 Err(err) => {
                     send_response(Err(err));
-                    true
+                    None
                 }
             }
         }
@@ -468,7 +748,7 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
+                            let mux = session_mux(&authority)?;
                             let mut window = mux
                                 .get_window_mut(window_id)
                                 .ok_or_else(|| anyhow!("window {} is invalid", window_id))?;
@@ -488,8 +768,11 @@ impl SessionHandler {
                             let client_id = client_id.ok_or_else(|| {
                                 anyhow!("set active workspace before SetClientId")
                             })?;
-                            let mux = session_mux()?;
-                            mux.set_active_workspace_for_client(&client_id, &workspace);
+                            let mux = session_mux(&authority)?;
+                            if !mux.set_active_workspace_for_client_if_same(&client_id, &workspace)
+                            {
+                                return Err(anyhow!("client registration is no longer current"));
+                            }
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -521,66 +804,47 @@ impl SessionHandler {
                     }
 
                     let client_id = Arc::new(client_id);
-                    let mux = match session_mux() {
+                    let mux = match session_mux(&authority) {
                         Ok(mux) => mux,
                         Err(err) => {
                             send_response(Err(err));
                             return;
                         }
                     };
-                    let registration_is_current = self.client_id.as_ref() == Some(&client_id)
-                        && self
-                            .client_mux
-                            .as_ref()
-                            .is_some_and(|owner| Arc::ptr_eq(owner, &mux));
+                    let registration_is_current = self.client_id.as_ref().is_some_and(|current| {
+                        current.as_ref() == client_id.as_ref()
+                            && mux.client_registration_is_current(current)
+                    });
                     if !registration_is_current {
-                        let prior_registration = self.client_id.take().zip(self.client_mux.take());
-                        if let Some((prior_client_id, prior_mux)) = prior_registration {
-                            unregister_owned_client(&prior_mux, &prior_client_id);
+                        if let Some(prior_client_id) = self.client_id.take() {
+                            unregister_owned_client(&mux, &prior_client_id);
                         }
                         mux.register_client(Arc::clone(&client_id));
                         self.client_id = Some(client_id);
-                        self.client_mux = Some(mux);
                     }
                 }
                 send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
             }
             Pdu::SetFocusedPane(SetFocusedPane { pane_id }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let _identity = mux.with_identity(client_id);
-
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
-
-                            let (_domain_id, window_id, tab_id) = mux
-                                .resolve_pane_id(pane_id)
-                                .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found"))?;
-                            {
-                                let mut window =
-                                    mux.get_window_mut(window_id).ok_or_else(|| {
-                                        anyhow::anyhow!("window {window_id} not found")
-                                    })?;
-                                let tab_idx = window.idx_by_id(tab_id).ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "tab {tab_id} isn't really in window {window_id}!?"
-                                    )
-                                })?;
-                                window.save_and_then_set_active(tab_idx);
-                            }
-                            let tab = mux
-                                .get_tab(tab_id)
-                                .ok_or_else(|| anyhow::anyhow!("tab {tab_id} not found"))?;
-                            tab.set_active_pane(&pane);
-
-                            mux.record_focus_for_current_identity(pane_id);
-                            mux.notify(mux::MuxNotification::PaneFocused(pane_id));
-
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            authority.try_run(|| {
+                                registration
+                                    .try_with_current(|current| {
+                                        current.focus_for_client_if_same(client_id.as_ref())?;
+                                        Ok(Pdu::UnitResponse(UnitResponse {}))
+                                    })
+                                    .ok_or_else(|| {
+                                        anyhow!("pane registration {pane_id} is no longer current")
+                                    })?
+                            })?
                         },
                         send_response,
                     );
@@ -591,7 +855,7 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
+                            let mux = session_mux(&authority)?;
                             let clients = mux.iter_clients();
                             Ok(Pdu::GetClientListResponse(GetClientListResponse {
                                 clients,
@@ -606,21 +870,31 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
+                            let mux = session_mux(&authority)?;
                             let mut tabs = vec![];
                             let mut tab_titles = vec![];
                             let mut window_titles = HashMap::new();
                             for window_id in mux.iter_windows() {
-                                let Some(window) = mux.get_window(window_id) else {
+                                let window_snapshot = mux.get_window(window_id).map(|window| {
+                                    (
+                                        window.get_title().to_string(),
+                                        window.get_workspace().to_string(),
+                                        window.iter().cloned().collect::<Vec<_>>(),
+                                    )
+                                });
+                                let Some((window_title, workspace, window_tabs)) = window_snapshot
+                                else {
                                     log::warn!(
                                         "ListPanes skipped stale window id {} from iter_windows",
                                         window_id
                                     );
                                     continue;
                                 };
-                                window_titles.insert(window_id, window.get_title().to_string());
-                                for tab in window.iter() {
-                                    tabs.push(tab.codec_pane_tree());
+                                window_titles.insert(window_id, window_title);
+                                for tab in window_tabs {
+                                    tabs.push(
+                                        tab.codec_pane_tree_in_window(window_id, &workspace)?,
+                                    );
                                     tab_titles.push(tab.get_title());
                                 }
                             }
@@ -640,7 +914,7 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
+                            let mux = session_mux(&authority)?;
                             let mut tab_stack_entries = vec![];
                             for window_id in mux.iter_windows() {
                                 let Some(window) = mux.get_window(window_id) else {
@@ -678,7 +952,7 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
+                            let mux = session_mux(&authority)?;
                             mux.rename_workspace(&old_workspace, &new_workspace);
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
@@ -689,21 +963,21 @@ impl SessionHandler {
             }
 
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
-                if respond_if_pane_unavailable(pane_id, &send_response) {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
                     return;
-                }
+                };
                 let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
+                let per_pane = self.per_pane_for_registration(&registration);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.writer().write_all(&data)?;
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.write_all(&data)?;
+                                maybe_push_pane_changes(pane, sender, per_pane)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -714,15 +988,18 @@ impl SessionHandler {
                 pane_id,
                 erase_mode,
             }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.erase_scrollback(erase_mode);
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.erase_scrollback(erase_mode);
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -730,20 +1007,21 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::KillPane(KillPane { pane_id }) => {
-                let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
-                // Clean up cached per-pane state to avoid unbounded growth.
-                self.per_pane.remove(&pane_id);
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
+                self.remove_per_pane_if_same(&registration);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.kill();
-                            mux.remove_pane(pane_id);
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
+                            let retired = authority.try_run(|| registration.retire_if_current())?;
+                            if !retired {
+                                return Err(anyhow!(
+                                    "pane registration {pane_id} is no longer current"
+                                ));
+                            }
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -752,21 +1030,21 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SendPaste(SendPaste { pane_id, data }) => {
-                if respond_if_pane_unavailable(pane_id, &send_response) {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
                     return;
-                }
+                };
                 let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
+                let per_pane = self.per_pane_for_registration(&registration);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.send_paste(&data)?;
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.send_paste(&data)?;
+                                maybe_push_pane_changes(pane, sender, per_pane)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -780,27 +1058,27 @@ impl SessionHandler {
                 range,
                 limit,
             }) => {
-                use mux::pane::Pattern;
-
-                async fn do_search(
-                    pane_id: PaneId,
-                    pattern: Pattern,
-                    range: std::ops::Range<StableRowIndex>,
-                    limit: Option<u32>,
-                ) -> anyhow::Result<Pdu> {
-                    let mux = session_mux()?;
-                    let pane = mux
-                        .get_pane(pane_id)
-                        .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-
-                    pane.search(pattern, range, limit).await.map(|results| {
-                        Pdu::SearchScrollbackResponse(SearchScrollbackResponse { results })
-                    })
-                }
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
 
                 spawn_into_main_thread(async move {
                     promise::spawn::spawn(async move {
-                        let result = do_search(pane_id, pattern, range, limit).await;
+                        let result = async {
+                            let session = authority.acquire()?;
+                            let results = registration
+                                .search_if_current(session.mux(), pattern, range, limit)
+                                .await
+                                .ok_or_else(|| {
+                                    anyhow!("pane registration {pane_id} is no longer current")
+                                })??;
+                            Ok(Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
+                                results,
+                            }))
+                        }
+                        .await;
                         send_response(result);
                     })
                     .detach();
@@ -813,35 +1091,18 @@ impl SessionHandler {
                 pane_id,
                 zoomed,
             }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            let tab = mux
-                                .get_tab(containing_tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
-                            match tab.get_zoomed_pane() {
-                                Some(p) => {
-                                    let is_zoomed = p.pane_id() == pane_id;
-                                    if is_zoomed != zoomed {
-                                        tab.set_zoomed(false);
-                                        if zoomed {
-                                            tab.set_active_pane(&pane);
-                                            tab.set_zoomed(zoomed);
-                                        }
-                                    }
-                                }
-                                None => {
-                                    if zoomed {
-                                        tab.set_active_pane(&pane);
-                                        tab.set_zoomed(zoomed);
-                                    }
-                                }
-                            }
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.set_zoomed_in_tab(containing_tab_id, zoomed)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -850,24 +1111,20 @@ impl SessionHandler {
             }
 
             Pdu::GetPaneDirection(GetPaneDirection { pane_id, direction }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let (_domain_id, _window_id, tab_id) = mux
-                                .resolve_pane_id(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            let tab = mux
-                                .get_tab(tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
-                            let panes = tab.iter_panes_ignoring_zoom();
-                            let pane_id = tab
-                                .get_pane_direction(direction, true)
-                                .map(|pane_index| panes[pane_index].pane.pane_id());
-
-                            Ok(Pdu::GetPaneDirectionResponse(GetPaneDirectionResponse {
-                                pane_id,
-                            }))
+                            with_current_pane(&authority, &registration, |pane| {
+                                let pane_id = pane.pane_in_direction(direction)?;
+                                Ok(Pdu::GetPaneDirectionResponse(GetPaneDirectionResponse {
+                                    pane_id,
+                                }))
+                            })
                         },
                         send_response,
                     );
@@ -876,18 +1133,18 @@ impl SessionHandler {
             }
 
             Pdu::ActivatePaneDirection(ActivatePaneDirection { pane_id, direction }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let (_domain_id, _window_id, tab_id) = mux
-                                .resolve_pane_id(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            let tab = mux
-                                .get_tab(tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
-                            tab.activate_pane_direction(direction);
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.activate_pane_direction(direction)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -900,19 +1157,18 @@ impl SessionHandler {
                 pane_id,
                 size,
             }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.resize(size)?;
-                            let tab = mux
-                                .get_tab(containing_tab_id)
-                                .ok_or_else(|| anyhow!("no such tab {}", containing_tab_id))?;
-                            tab.rebuild_splits_sizes_from_contained_panes();
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.resize_in_tab(containing_tab_id, size)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -925,36 +1181,35 @@ impl SessionHandler {
                 event,
                 input_serial,
             }) => {
-                if respond_if_pane_unavailable(pane_id, &send_response) {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
                     return;
-                }
+                };
                 let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
+                let per_pane = self.per_pane_for_registration(&registration);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.key_down(event.key, event.modifiers)?;
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.key_down(event.key, event.modifiers)?;
 
-                            // For a key press, we want to always send back the
-                            // cursor position so that the predictive echo doesn't
-                            // leave the cursor in the wrong place
-                            let render_changes = {
-                                let mut per_pane = per_pane.lock().map_err(|err| {
-                                    anyhow!("per-pane state lock poisoned: {err}")
-                                })?;
-                                per_pane.compute_changes(&pane, Some(input_serial))
-                            };
-                            if let Some(resp) = render_changes {
-                                sender.send(DecodedPdu {
-                                    pdu: Pdu::GetPaneRenderChangesResponse(resp),
-                                    serial: 0,
-                                })?;
-                            }
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                                // For a key press, always return the cursor
+                                // position so predictive echo remains aligned.
+                                let render_changes = {
+                                    let mut per_pane = per_pane.lock().map_err(|err| {
+                                        anyhow!("per-pane state lock poisoned: {err}")
+                                    })?;
+                                    per_pane.compute_changes(pane, Some(input_serial))
+                                };
+                                if let Some(resp) = render_changes {
+                                    sender.send(DecodedPdu {
+                                        pdu: Pdu::GetPaneRenderChangesResponse(resp),
+                                        serial: 0,
+                                    })?;
+                                }
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -962,15 +1217,18 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SendKeyUp(SendKeyUp { pane_id, event }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.key_up(event.key, event.modifiers)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.key_up(event.key, event.modifiers)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -978,21 +1236,21 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }) => {
-                if respond_if_pane_unavailable(pane_id, &send_response) {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
                     return;
-                }
+                };
                 let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
+                let per_pane = self.per_pane_for_registration(&registration);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.mouse_event(event)?;
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.mouse_event(event)?;
+                                maybe_push_pane_changes(pane, sender, per_pane)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -1003,45 +1261,77 @@ impl SessionHandler {
             Pdu::SpawnV2(spawn) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_domain_spawn_v2(spawn, send_response, client_id);
+                    schedule_domain_spawn_v2(authority, spawn, send_response, client_id);
                 })
                 .detach();
             }
 
             Pdu::SplitPane(split) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, split.pane_id, &send_response)
+                else {
+                    return;
+                };
+                let move_registration = match split.move_pane_id {
+                    Some(move_pane_id) => {
+                        let Some(registration) =
+                            capture_pane_or_respond(&authority, move_pane_id, &send_response)
+                        else {
+                            return;
+                        };
+                        Some(registration)
+                    }
+                    None => None,
+                };
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_split_pane(split, send_response, client_id);
+                    schedule_split_pane(
+                        authority,
+                        registration,
+                        move_registration,
+                        split,
+                        send_response,
+                        client_id,
+                    );
                 })
                 .detach();
             }
 
             Pdu::MovePaneToNewTab(request) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, request.pane_id, &send_response)
+                else {
+                    return;
+                };
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
-                    schedule_move_pane(request, send_response, client_id);
+                    schedule_move_pane(authority, registration, request, send_response, client_id);
                 })
                 .detach();
             }
 
             Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            let cursor_position = pane.get_cursor_position();
-                            let dimensions = pane.get_dimensions();
-                            Ok(Pdu::GetPaneRenderableDimensionsResponse(
-                                GetPaneRenderableDimensionsResponse {
-                                    pane_id,
-                                    cursor_position,
-                                    dimensions,
-                                    tiered_scrollback_status: pane.get_tiered_scrollback_status(),
-                                },
-                            ))
+                            with_current_pane(&authority, &registration, |pane| {
+                                let cursor_position = pane.get_cursor_position();
+                                let dimensions = pane.get_dimensions();
+                                Ok(Pdu::GetPaneRenderableDimensionsResponse(
+                                    GetPaneRenderableDimensionsResponse {
+                                        pane_id,
+                                        cursor_position,
+                                        dimensions,
+                                        tiered_scrollback_status: pane
+                                            .get_tiered_scrollback_status(),
+                                    },
+                                ))
+                            })
                         },
                         send_response,
                     );
@@ -1050,22 +1340,25 @@ impl SessionHandler {
             }
 
             Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id, .. }) => {
-                if respond_liveness_if_pane_unavailable(pane_id, &send_response) {
+                let Some(registration) =
+                    capture_pane_or_respond_liveness(&authority, pane_id, &send_response)
+                else {
                     return;
-                }
+                };
                 let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
+                let per_pane = self.per_pane_for_registration(&registration);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let is_alive = match mux.get_pane(pane_id) {
-                                Some(pane) => {
-                                    maybe_push_pane_changes(&pane, sender, per_pane)?;
-                                    true
-                                }
-                                None => false,
-                            };
+                            let is_alive = authority
+                                .try_run(|| {
+                                    registration
+                                        .try_with_current(|current| {
+                                            maybe_push_pane_changes(&current, sender, per_pane)
+                                        })
+                                        .transpose()
+                                })??
+                                .is_some();
                             Ok(Pdu::LivenessResponse(LivenessResponse {
                                 pane_id,
                                 is_alive,
@@ -1078,29 +1371,33 @@ impl SessionHandler {
             }
 
             Pdu::GetLines(GetLines { pane_id, lines }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            let mut lines_and_indices = vec![];
+                            with_current_pane(&authority, &registration, |pane| {
+                                let mut lines_and_indices = vec![];
 
-                            for range in lines {
-                                let (first_row, lines) = pane.get_lines(range);
-                                for (idx, mut line) in lines.into_iter().enumerate() {
-                                    let Some(stable_row) = stable_row_offset(first_row, idx) else {
-                                        break;
-                                    };
-                                    line.compress_for_scrollback();
-                                    lines_and_indices.push((stable_row, line));
+                                for range in lines {
+                                    let (first_row, lines) = pane.get_lines(range);
+                                    for (idx, mut line) in lines.into_iter().enumerate() {
+                                        let Some(stable_row) = stable_row_offset(first_row, idx)
+                                        else {
+                                            break;
+                                        };
+                                        line.compress_for_scrollback();
+                                        lines_and_indices.push((stable_row, line));
+                                    }
                                 }
-                            }
-                            Ok(Pdu::GetLinesResponse(GetLinesResponse {
-                                pane_id,
-                                lines: lines_and_indices.into(),
-                            }))
+                                Ok(Pdu::GetLinesResponse(GetLinesResponse {
+                                    pane_id,
+                                    lines: lines_and_indices.into(),
+                                }))
+                            })
                         },
                         send_response,
                     );
@@ -1109,26 +1406,24 @@ impl SessionHandler {
             }
 
             Pdu::GetSemanticZones(GetSemanticZones { pane_id }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            let zones = pane.get_semantic_zones()?;
-                            let zone_texts = zones
-                                .iter()
-                                .copied()
-                                .map(|zone| pane.get_text_from_semantic_zone(zone))
-                                .collect::<anyhow::Result<Vec<_>>>()?;
-                            let last_exit_code = pane.get_semantic_exit_code()?;
-                            Ok(Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse {
-                                pane_id,
-                                zones,
-                                zone_texts,
-                                last_exit_code,
-                            }))
+                            with_current_pane(&authority, &registration, |pane| {
+                                let (zones, zone_texts, last_exit_code) =
+                                    pane.semantic_snapshot()?;
+                                Ok(Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse {
+                                    pane_id,
+                                    zones,
+                                    zone_texts,
+                                    last_exit_code,
+                                }))
+                            })
                         },
                         send_response,
                     );
@@ -1142,36 +1437,38 @@ impl SessionHandler {
                 cell_idx,
                 data_hash,
             }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let mut data = None;
+                            with_current_pane(&authority, &registration, |pane| {
+                                let mut data = None;
 
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-
-                            let lines = match stable_row_range_from_len(line_idx, 1) {
-                                Some(line_range) => pane.get_lines(line_range).1,
-                                None => Vec::new(),
-                            };
-                            'found_data: for line in lines {
-                                if let Some(cell) = line.get_cell(cell_idx) {
-                                    if let Some(images) = cell.attrs().images() {
-                                        for im in images {
-                                            if im.image_data().hash() == data_hash {
-                                                data.replace(im.image_data().clone());
-                                                break 'found_data;
+                                let lines = match stable_row_range_from_len(line_idx, 1) {
+                                    Some(line_range) => pane.get_lines(line_range).1,
+                                    None => Vec::new(),
+                                };
+                                'found_data: for line in lines {
+                                    if let Some(cell) = line.get_cell(cell_idx) {
+                                        if let Some(images) = cell.attrs().images() {
+                                            for im in images {
+                                                if im.image_data().hash() == data_hash {
+                                                    data.replace(im.image_data().clone());
+                                                    break 'found_data;
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                            Ok(Pdu::GetImageCellResponse(GetImageCellResponse {
-                                pane_id,
-                                data,
-                            }))
+                                Ok(Pdu::GetImageCellResponse(GetImageCellResponse {
+                                    pane_id,
+                                    data,
+                                }))
+                            })
                         },
                         send_response,
                     );
@@ -1212,7 +1509,7 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
+                            let mux = session_mux(&authority)?;
                             if mux.get_window(window_id).is_none() {
                                 return Err(anyhow!("no such window {window_id}"));
                             }
@@ -1229,7 +1526,7 @@ impl SessionHandler {
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
+                            let mux = session_mux(&authority)?;
                             if mux.get_tab(tab_id).is_none() {
                                 return Err(anyhow!("no such tab {tab_id}"));
                             }
@@ -1243,38 +1540,18 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SetPalette(SetPalette { pane_id, palette }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-
-                            match pane.get_config() {
-                                Some(config) => match config.downcast_ref::<TermConfig>() {
-                                    Some(tc) => tc.set_client_palette(palette),
-                                    None => {
-                                        log::error!(
-                                            "pane {pane_id} doesn't \
-                                            have TermConfig as its config! \
-                                            Ignoring client palette update"
-                                        );
-                                    }
-                                },
-                                None => {
-                                    let config = TermConfig::new();
-                                    config.set_client_palette(palette);
-                                    pane.set_config(Arc::new(config));
-                                }
-                            }
-
-                            mux.notify(MuxNotification::Alert {
-                                pane_id,
-                                alert: Alert::PaletteChanged,
-                            });
-
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.set_client_palette(palette);
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -1287,26 +1564,18 @@ impl SessionHandler {
                 direction,
                 amount,
             }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
-                            let mux = session_mux()?;
-                            let (_pane_domain_id, _window_id, tab_id) = mux
-                                .resolve_pane_id(pane_id)
-                                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
-
-                            let tab = match mux.get_tab(tab_id) {
-                                Some(tab) => tab,
-                                None => {
-                                    return Err(anyhow!(
-                                        "Failed to retrieve tab with ID {}",
-                                        tab_id
-                                    ));
-                                }
-                            };
-
-                            tab.adjust_pane_size(direction, amount);
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                            with_current_pane(&authority, &registration, |pane| {
+                                pane.adjust_pane_size(direction, amount)?;
+                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                            })
                         },
                         send_response,
                     );
@@ -1319,32 +1588,20 @@ impl SessionHandler {
                 pane_id,
                 rect,
             }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread({
                     let send_response = send_response.clone();
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
-                                let tab = mux
-                                    .get_tab(tab_id)
-                                    .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
-                                if tab.has_floating_pane(pane_id) {
-                                    tab.set_floating_pane_rect(pane_id, rect);
-                                    tab.set_floating_pane_focus(pane_id);
-                                    return Ok(Pdu::UnitResponse(UnitResponse {}));
-                                }
-                                if tab.contains_pane(pane_id) {
-                                    return Err(anyhow!(
-                                        "pane {} is already tiled in tab {}; floating create expects a detached pane",
-                                        pane_id,
-                                        tab_id
-                                    ));
-                                }
-                                let pane = mux
-                                    .get_pane(pane_id)
-                                    .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                                tab.add_floating_pane(pane, rect)?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                                with_current_pane(&authority, &registration, |pane| {
+                                    pane.create_floating_pane(tab_id, rect)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
                             },
                             send_response,
                         );
@@ -1353,19 +1610,20 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::MoveFloatingPane(MoveFloatingPane { pane_id, rect }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread({
                     let send_response = send_response.clone();
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
-                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
-                                    || anyhow!("floating pane {} not found", pane_id),
-                                )?;
-                                tab.set_floating_pane_rect(pane_id, rect).ok_or_else(|| {
-                                    anyhow!("floating pane {} not found", pane_id)
-                                })?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                                with_current_pane(&authority, &registration, |pane| {
+                                    pane.move_floating_pane(rect)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
                             },
                             send_response,
                         );
@@ -1374,19 +1632,20 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SetFloatingPaneZ(SetFloatingPaneZ { pane_id, z_order }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread({
                     let send_response = send_response.clone();
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
-                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
-                                    || anyhow!("floating pane {} not found", pane_id),
-                                )?;
-                                if !tab.set_floating_pane_z_order(pane_id, z_order) {
-                                    return Err(anyhow!("floating pane {} not found", pane_id));
-                                }
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                                with_current_pane(&authority, &registration, |pane| {
+                                    pane.set_floating_pane_z_order(z_order)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
                             },
                             send_response,
                         );
@@ -1395,19 +1654,20 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::ToggleFloatingPane(ToggleFloatingPane { pane_id, visible }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread({
                     let send_response = send_response.clone();
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
-                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
-                                    || anyhow!("floating pane {} not found", pane_id),
-                                )?;
-                                if !tab.set_floating_pane_visible(pane_id, visible) {
-                                    return Err(anyhow!("floating pane {} not found", pane_id));
-                                }
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                                with_current_pane(&authority, &registration, |pane| {
+                                    pane.set_floating_pane_visible(visible)?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
                             },
                             send_response,
                         );
@@ -1416,19 +1676,20 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread({
                     let send_response = send_response.clone();
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
-                                let tab = find_tab_with_floating_pane(&mux, pane_id).ok_or_else(
-                                    || anyhow!("floating pane {} not found", pane_id),
-                                )?;
-                                tab.remove_floating_pane(pane_id).ok_or_else(|| {
-                                    anyhow!("floating pane {} not found", pane_id)
-                                })?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                                with_current_pane(&authority, &registration, |pane| {
+                                    pane.remove_floating_pane()?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
                             },
                             send_response,
                         );
@@ -1445,7 +1706,7 @@ impl SessionHandler {
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
+                                let mux = session_mux(&authority)?;
                                 let tab = mux
                                     .get_tab(tab_id)
                                     .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
@@ -1467,7 +1728,7 @@ impl SessionHandler {
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
+                                let mux = session_mux(&authority)?;
                                 let tab = mux
                                     .get_tab(tab_id)
                                     .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
@@ -1509,7 +1770,7 @@ impl SessionHandler {
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
+                                let mux = session_mux(&authority)?;
                                 let tab = mux
                                     .get_tab(tab_id)
                                     .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
@@ -1536,7 +1797,7 @@ impl SessionHandler {
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
+                                let mux = session_mux(&authority)?;
                                 let tab = mux
                                     .get_tab(tab_id)
                                     .ok_or_else(|| anyhow!("no such tab {}", tab_id))?;
@@ -1564,21 +1825,22 @@ impl SessionHandler {
                 min_height,
                 max_height,
             }) => {
+                let Some(registration) =
+                    capture_pane_or_respond(&authority, pane_id, &send_response)
+                else {
+                    return;
+                };
                 spawn_into_main_thread({
                     let send_response = send_response.clone();
                     async move {
                         catch(
                             move || {
-                                let mux = session_mux()?;
-                                let tab =
-                                    find_tab_containing_pane(&mux, pane_id).ok_or_else(|| {
-                                        anyhow!("pane {} not found in any tab", pane_id)
-                                    })?;
-                                tab.update_pane_constraints(
-                                    pane_id, min_width, max_width, min_height, max_height,
-                                )
-                                .ok_or_else(|| anyhow!("pane {} not found in tab", pane_id))?;
-                                Ok(Pdu::UnitResponse(UnitResponse {}))
+                                with_current_pane(&authority, &registration, |pane| {
+                                    pane.update_pane_constraints(
+                                        min_width, max_width, min_height, max_height,
+                                    )?;
+                                    Ok(Pdu::UnitResponse(UnitResponse {}))
+                                })
                             },
                             send_response,
                         );
@@ -1623,31 +1885,45 @@ impl SessionHandler {
 // We need to shimmy through this helper to break that aspect of the compiler flow
 // analysis and allow things to compile.
 fn schedule_domain_spawn_v2<SND>(
+    authority: SessionAuthority,
     spawn: SpawnV2,
     send_response: SND,
     client_id: Option<Arc<ClientId>>,
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(domain_spawn_v2(spawn, client_id).await) })
-        .detach();
+    promise::spawn::spawn(async move {
+        send_response(domain_spawn_v2(authority, spawn, client_id).await)
+    })
+    .detach();
 }
 
-fn schedule_split_pane<SND>(split: SplitPane, send_response: SND, client_id: Option<Arc<ClientId>>)
-where
+fn schedule_split_pane<SND>(
+    authority: SessionAuthority,
+    registration: PaneRegistrationHandle,
+    move_registration: Option<PaneRegistrationHandle>,
+    split: SplitPane,
+    send_response: SND,
+    client_id: Option<Arc<ClientId>>,
+) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(split_pane(split, client_id).await) })
-        .detach();
+    promise::spawn::spawn(async move {
+        send_response(
+            split_pane(authority, registration, move_registration, split, client_id).await,
+        )
+    })
+    .detach();
 }
 
-async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
-    let mux = session_mux()?;
-    let _identity = mux.with_identity(client_id);
-
-    let (_pane_domain_id, window_id, tab_id) = mux
-        .resolve_pane_id(split.pane_id)
-        .ok_or_else(|| anyhow!("pane_id {} invalid", split.pane_id))?;
+async fn split_pane(
+    authority: SessionAuthority,
+    registration: PaneRegistrationHandle,
+    move_registration: Option<PaneRegistrationHandle>,
+    split: SplitPane,
+    client_id: Option<Arc<ClientId>>,
+) -> anyhow::Result<Pdu> {
+    let session = authority.acquire()?;
 
     let source = if let Some(move_pane_id) = split.move_pane_id {
         SplitSource::MovePane(move_pane_id)
@@ -1658,23 +1934,40 @@ async fn split_pane(split: SplitPane, client_id: Option<Arc<ClientId>>) -> anyho
         }
     };
 
-    let (pane, size) = mux
-        .split_pane(split.pane_id, split.split_request, source, split.domain)
-        .await?;
+    let (pane_id, size, window_id, tab_id) = registration
+        .split_if_current(
+            session.mux(),
+            move_registration.as_ref(),
+            split.split_request,
+            source,
+            split.domain,
+            client_id,
+        )
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "pane registration {} is no longer current",
+                registration.pane_id()
+            )
+        })??;
 
     Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
-        pane_id: pane.pane_id(),
+        pane_id,
         tab_id,
         window_id,
         size,
     }))
 }
 
-async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> anyhow::Result<Pdu> {
-    let mux = session_mux()?;
-    let _identity = mux.with_identity(client_id);
+async fn domain_spawn_v2(
+    authority: SessionAuthority,
+    spawn: SpawnV2,
+    client_id: Option<Arc<ClientId>>,
+) -> anyhow::Result<Pdu> {
+    let mux = session_mux(&authority)?;
 
     let (tab, pane, window_id) = mux
+        .mux()
         .spawn_tab_or_window(
             spawn.window_id,
             spawn.domain,
@@ -1684,6 +1977,7 @@ async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> an
             None, // optional current pane_id
             spawn.workspace,
             None, // optional gui window position
+            client_id,
         )
         .await?;
 
@@ -1696,33 +1990,44 @@ async fn domain_spawn_v2(spawn: SpawnV2, client_id: Option<Arc<ClientId>>) -> an
 }
 
 fn schedule_move_pane<SND>(
+    authority: SessionAuthority,
+    registration: PaneRegistrationHandle,
     request: MovePaneToNewTab,
     send_response: SND,
     client_id: Option<Arc<ClientId>>,
 ) where
     SND: Fn(anyhow::Result<Pdu>) + 'static,
 {
-    promise::spawn::spawn(async move { send_response(move_pane(request, client_id).await) })
-        .detach();
+    promise::spawn::spawn(async move {
+        send_response(move_pane(authority, registration, request, client_id).await)
+    })
+    .detach();
 }
 
 async fn move_pane(
+    authority: SessionAuthority,
+    registration: PaneRegistrationHandle,
     request: MovePaneToNewTab,
     client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
-    let mux = session_mux()?;
-    let _identity = mux.with_identity(client_id);
-
-    let (tab, window_id) = mux
-        .move_pane_to_new_tab(
-            request.pane_id,
+    let session = authority.acquire()?;
+    let (tab_id, window_id) = registration
+        .move_to_new_tab_if_current(
+            session.mux(),
             request.window_id,
             request.workspace_for_new_window,
+            client_id,
         )
-        .await?;
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "pane registration {} is no longer current",
+                registration.pane_id()
+            )
+        })??;
 
     Ok::<Pdu, anyhow::Error>(Pdu::MovePaneToNewTabResponse(MovePaneToNewTabResponse {
-        tab_id: tab.tab_id(),
+        tab_id,
         window_id,
     }))
 }
@@ -1787,6 +2092,7 @@ mod tests {
     struct FakePane {
         pane_id: PaneId,
         state: Mutex<FakePaneState>,
+        callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         // Writer sink for the Pane::writer() trait obligation. FakePane
         // has no PTY; bytes written here are discarded. Keeping a real
         // writable buffer behind a parking_lot mutex (rather than
@@ -1809,6 +2115,7 @@ mod tests {
         ) -> Self {
             Self {
                 pane_id,
+                callback_probe: None,
                 writer_sink: ParkingMutex::new(std::io::sink()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 state: Mutex::new(FakePaneState {
@@ -1839,6 +2146,15 @@ mod tests {
                     ],
                 }),
             }
+        }
+
+        fn new_with_callback_probe(
+            pane_id: PaneId,
+            callback_probe: Arc<dyn Fn() + Send + Sync>,
+        ) -> Self {
+            let mut pane = Self::new_with_id(pane_id, None);
+            pane.callback_probe = Some(callback_probe);
+            pane
         }
 
         fn set_tiered_scrollback_status(&self, status: Option<PaneTieredScrollbackStatus>) {
@@ -1902,6 +2218,9 @@ mod tests {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
+            if let Some(probe) = &self.callback_probe {
+                probe();
+            }
             self.state.lock().unwrap().dimensions
         }
 
@@ -2014,6 +2333,15 @@ mod tests {
             Ok(())
         });
         (sender, captured)
+    }
+
+    fn register_test_pane(pane: &Arc<dyn Pane>) -> (Arc<Mux>, mux::PaneRegistrationHandle) {
+        let mux = Arc::new(Mux::new(None));
+        mux.add_pane(pane).expect("test pane registration");
+        let registration = mux
+            .capture_pane_registration(pane)
+            .expect("test pane should yield an exact handle");
+        (mux, registration)
     }
 
     /// Extract the single response PDU from the captured list.
@@ -2131,6 +2459,311 @@ mod tests {
             handler.per_pane_if_present(7).is_none(),
             "late mux notifications must not recreate cached state for removed panes"
         );
+    }
+
+    #[test]
+    fn session_owner_retirement_fails_closed_and_releases_its_mux() {
+        let mux = Arc::new(Mux::new(None));
+        let weak_mux = Arc::downgrade(&mux);
+        let owner = SessionOwner::new(mux);
+        let authority = owner.authority();
+        let operation = authority
+            .incarnation
+            .try_acquire()
+            .expect("live session should admit an operation");
+
+        owner.retire();
+
+        assert!(
+            authority.acquire().is_err(),
+            "retirement must reject new mux authority"
+        );
+        assert!(
+            authority.try_run(|| ()).is_err(),
+            "retirement must reject generic deferred work"
+        );
+        assert_eq!(
+            authority
+                .incarnation
+                .operation_state
+                .load(Ordering::Acquire),
+            SESSION_RETIRED | 1,
+            "retirement must preserve the admitted operation count until its lease drops"
+        );
+
+        drop(operation);
+        assert_eq!(
+            authority
+                .incarnation
+                .operation_state
+                .load(Ordering::Acquire),
+            SESSION_RETIRED,
+            "operation release must preserve the retirement fence"
+        );
+        drop(owner);
+        assert!(
+            weak_mux.upgrade().is_none(),
+            "cloneable deferred authority must not keep the owning mux alive"
+        );
+    }
+
+    #[test]
+    fn per_pane_cache_is_scoped_to_exact_registration() {
+        let mux = Arc::new(Mux::new(None));
+        let pane_id = 7_001;
+        let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&original).expect("register original pane");
+        let (sender, _captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+        let original_registration = handler
+            .owner
+            .authority()
+            .capture_current_pane(pane_id)
+            .expect("capture original registration");
+        let original_state = handler.per_pane_for_registration(&original_registration);
+
+        assert!(original_registration.retire_if_current());
+        let replacement: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&replacement)
+            .expect("register replacement pane");
+        let replacement_registration = handler
+            .owner
+            .authority()
+            .capture_current_pane(pane_id)
+            .expect("capture replacement registration");
+        let replacement_state = handler.per_pane_for_registration(&replacement_registration);
+
+        assert!(
+            !Arc::ptr_eq(&original_state, &replacement_state),
+            "same numeric PaneId must not reuse state across registration generations"
+        );
+        handler.remove_per_pane_if_same(&original_registration);
+        handler.remove_per_pane(pane_id);
+        let retained_state = handler
+            .per_pane_if_present(pane_id)
+            .expect("stale removal signals must preserve a live replacement cache");
+        assert!(
+            Arc::ptr_eq(&replacement_state, &retained_state),
+            "stale exact and raw removals must not clear replacement state"
+        );
+    }
+
+    #[test]
+    fn deferred_pane_read_stays_on_origin_mux_after_global_swap() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let pane_id = 7_002;
+        let originating_mux = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let originating_pane = Arc::new(FakePane::new_with_id(pane_id, None));
+        let replacement_pane = Arc::new(FakePane::new_with_id(pane_id, None));
+        originating_pane.state.lock().unwrap().dimensions.cols = 111;
+        replacement_pane.state.lock().unwrap().dimensions.cols = 222;
+        let originating_pane_dyn: Arc<dyn Pane> = originating_pane;
+        let replacement_pane_dyn: Arc<dyn Pane> = replacement_pane;
+        originating_mux
+            .add_pane(&originating_pane_dyn)
+            .expect("register originating pane");
+        replacement_mux
+            .add_pane(&replacement_pane_dyn)
+            .expect("register replacement-mux pane");
+        let _mux_guard = ScopedMux::install(&originating_mux);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session(
+            sender,
+            SessionOwner::new(Arc::clone(&originating_mux)),
+        );
+
+        handler.process_one(DecodedPdu {
+            serial: 301,
+            pdu: Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id }),
+        });
+        Mux::set_mux(&replacement_mux);
+        tick_until_response(&executor, &captured, 1);
+
+        match take_response(&captured).pdu {
+            Pdu::GetPaneRenderableDimensionsResponse(GetPaneRenderableDimensionsResponse {
+                dimensions,
+                ..
+            }) => {
+                assert_eq!(
+                    dimensions.cols, 111,
+                    "queued read must resolve against its originating mux"
+                );
+            }
+            other => panic!("expected GetPaneRenderableDimensionsResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deferred_kill_rejects_same_id_replacement() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let pane_id = 7_003;
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&original).expect("register original pane");
+        let original_registration = mux
+            .capture_current_pane(pane_id)
+            .expect("capture original registration");
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+
+        handler.process_one(DecodedPdu {
+            serial: 302,
+            pdu: Pdu::KillPane(KillPane { pane_id }),
+        });
+        assert!(original_registration.retire_if_current());
+        let replacement: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&replacement)
+            .expect("register replacement pane");
+        tick_until_response(&executor, &captured, 1);
+
+        match take_response(&captured).pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(
+                    reason.contains("no longer current"),
+                    "stale kill should report exact-registration loss, got {reason}"
+                );
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+        assert!(
+            mux.get_pane(pane_id)
+                .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)),
+            "stale queued kill must preserve the same-ID replacement"
+        );
+    }
+
+    #[test]
+    fn dropping_handler_retires_queued_pane_work() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let pane_id = 7_004;
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&pane).expect("register pane");
+        let registration = mux
+            .capture_current_pane(pane_id)
+            .expect("capture live pane registration");
+        let (sender, captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+
+        handler.process_one(DecodedPdu {
+            serial: 303,
+            pdu: Pdu::KillPane(KillPane { pane_id }),
+        });
+        drop(handler);
+        let drained = Arc::new(AtomicUsize::new(0));
+        let drained_task = Arc::clone(&drained);
+        spawn_into_main_thread(async move {
+            drained_task.store(1, Ordering::Release);
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+        for _ in 0..16 {
+            if drained.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            executor.tick().expect("drain queued session work");
+        }
+
+        assert_eq!(
+            drained.load(Ordering::Acquire),
+            1,
+            "sentinel must run after queued session work"
+        );
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "retired session must not emit a response from queued work"
+        );
+        assert_eq!(
+            registration.try_with_current(|current| current.pane_id()),
+            Some(pane_id),
+            "retired session work must not remove its formerly authorized pane"
+        );
+    }
+
+    #[test]
+    fn stale_equal_client_registration_cannot_focus_replacement() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let size = test_tab_size();
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        let first_pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_005, None));
+        let second_pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(7_006, None));
+        tab.assign_pane(&first_pane);
+        tab.split_and_insert(
+            0,
+            mux::tab::SplitRequest {
+                direction: mux::tab::SplitDirection::Horizontal,
+                ..Default::default()
+            },
+            Arc::clone(&second_pane),
+        )
+        .expect("insert second pane");
+        tab.set_active_pane(&first_pane);
+        let (mux, _mux_guard) = install_tab_with_window(&tab, &[Arc::clone(&second_pane)]);
+        let client = test_client_id("stale-focus", 41_008);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+        handler.process_one(DecodedPdu {
+            serial: 304,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client.clone(),
+                is_proxy: false,
+            }),
+        });
+        assert_eq!(
+            take_response(&captured).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        );
+        let stale_client = Arc::clone(handler.client_id.as_ref().expect("registered client"));
+        let replacement_client = Arc::new(client);
+        mux.register_client(Arc::clone(&replacement_client));
+        assert!(!mux.client_registration_is_current(&stale_client));
+
+        handler.process_one(DecodedPdu {
+            serial: 305,
+            pdu: Pdu::SetFocusedPane(SetFocusedPane {
+                pane_id: second_pane.pane_id(),
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        match take_response(&captured).pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(
+                    reason.contains("client registration is no longer current"),
+                    "stale focus should report exact client-registration loss, got {reason}"
+                );
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+        assert_eq!(
+            tab.get_active_pane().map(|pane| pane.pane_id()),
+            Some(first_pane.pane_id()),
+            "stale equal-valued client must not focus a replacement registration's pane"
+        );
+        drop(handler);
+        assert!(
+            mux.client_registration_is_current(&replacement_client),
+            "stale handler cleanup must preserve the equal-valued replacement client"
+        );
+        assert!(mux.unregister_client_if_same(&replacement_client));
     }
 
     #[test]
@@ -2353,6 +2986,70 @@ mod tests {
             Pdu::UnitResponse(UnitResponse {})
         );
         assert!(!tab.has_floating_pane(2));
+    }
+
+    #[test]
+    fn list_panes_releases_window_guard_before_observing_panes() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let size = test_tab_size();
+
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+
+        let armed = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(AtomicUsize::new(0));
+        let weak_mux = Arc::downgrade(&mux);
+        let armed_for_probe = Arc::clone(&armed);
+        let observations_for_probe = Arc::clone(&observations);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if armed_for_probe.load(Ordering::Acquire) == 0 {
+                return;
+            }
+
+            let mux = weak_mux.upgrade().expect("test mux remains live");
+            assert!(
+                mux.try_get_window_mut(window_id).is_some(),
+                "ListPanes must release the enclosing mux window read guard \
+                 before invoking Pane callbacks",
+            );
+            observations_for_probe.fetch_add(1, Ordering::AcqRel);
+        });
+
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(7_007, probe));
+        let tab = Arc::new(mux::tab::Tab::new(&size));
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("register test tab and pane");
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("attach test tab to window");
+        drop(window);
+
+        armed.store(1, Ordering::Release);
+
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        handler.process_one(DecodedPdu {
+            serial: 121,
+            pdu: Pdu::ListPanes(ListPanes {}),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 121);
+        let pdu = response.pdu;
+        let Pdu::ListPanesResponse(ListPanesResponse { tabs, .. }) = pdu else {
+            panic!("expected ListPanesResponse, got {pdu:?}");
+        };
+        assert_eq!(tabs.len(), 1);
+        assert!(
+            observations.load(Ordering::Acquire) > 0,
+            "the request must exercise the guarded pane-observation callback",
+        );
     }
 
     #[test]
@@ -3531,11 +4228,17 @@ mod tests {
                 .per_pane_if_present(pane_id)
                 .expect("current handler should track pane before reuse");
 
-            current_handler.remove_per_pane(pane_id);
+            let first_registration = mux
+                .capture_current_pane(pane_id)
+                .expect("capture pane registration before reuse");
             prop_assert!(
-                current_handler.per_pane_if_present(pane_id).is_none(),
-                "pane removal should clear current cached state before id reuse"
+                first_registration.retire_if_current(),
+                "the original pane registration should retire before reuse"
             );
+            let replacement: Arc<dyn Pane> =
+                Arc::new(FakePane::new_with_id(pane_id, None));
+            mux.add_pane(&replacement)
+                .expect("same-ID replacement should register");
             current_handler.process_one(DecodedPdu {
                 serial: 10_002,
                 pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id }),
@@ -3547,6 +4250,15 @@ mod tests {
             prop_assert!(
                 !Arc::ptr_eq(&first_pane_state, &reused_pane_state),
                 "PaneId reuse should allocate fresh per-pane state after removal"
+            );
+            current_handler.remove_per_pane_if_same(&first_registration);
+            current_handler.remove_per_pane(pane_id);
+            let retained_reused_state = current_handler
+                .per_pane_if_present(pane_id)
+                .expect("stale removal signals must preserve live reused pane state");
+            prop_assert!(
+                Arc::ptr_eq(&reused_pane_state, &retained_reused_state),
+                "stale exact and raw removal signals must preserve replacement state"
             );
 
             let expected_current: HashSet<ClientId> = std::iter::once(client.clone()).collect();
@@ -3787,7 +4499,7 @@ mod tests {
         }
 
         #[test]
-        fn prop_missing_mux_pane_cancel_paths_do_not_retain_per_pane_state(
+        fn prop_private_session_missing_pane_paths_do_not_retain_per_pane_state(
             ops in proptest::collection::vec(arb_missing_mux_pane_op(), 1..64)
         ) {
             let _lock = crate::GLOBAL_STATE_TEST_LOCK
@@ -3808,23 +4520,36 @@ mod tests {
                 let captured = captured.lock().expect("captured response lock");
                 let response = captured.last().expect("cancel path should respond");
                 prop_assert_eq!(response.serial, idx as u64 + 1);
-                match &response.pdu {
-                    Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                match (&op, &response.pdu) {
+                    (
+                        MissingMuxPaneOp::GetPaneRenderChanges { pane_id },
+                        Pdu::LivenessResponse(LivenessResponse {
+                            pane_id: response_pane_id,
+                            is_alive: false,
+                        }),
+                    ) => {
+                        prop_assert_eq!(response_pane_id, pane_id);
+                    }
+                    (_, Pdu::ErrorResponse(ErrorResponse { reason })) => {
                         prop_assert!(
-                            reason.contains("mux singleton is not available"),
-                            "missing-mux cancel path should report mux unavailability for {:?}, got {reason}",
+                            reason.contains("no such pane"),
+                            "private-session missing-pane path should report absence for {:?}, got {reason}",
                             op
                         );
                     }
                     other => {
-                        prop_assert!(false, "missing-mux cancel path for {:?} returned {other:?}", op);
+                        prop_assert!(
+                            false,
+                            "private-session missing-pane path for {:?} returned {other:?}",
+                            op
+                        );
                     }
                 }
                 drop(captured);
 
                 prop_assert!(
                     handler.per_pane.is_empty(),
-                    "missing-mux cancel path retained per-pane state after step {}: {:?}",
+                    "private-session missing-pane path retained per-pane state after step {}: {:?}",
                     idx,
                     op
                 );
@@ -3892,7 +4617,7 @@ mod tests {
         }
 
         #[test]
-        fn prop_missing_mux_session_error_paths_preserve_serial_and_state(
+        fn prop_private_session_empty_topology_paths_preserve_serial_and_state(
             ops in proptest::collection::vec(arb_missing_mux_session_error_op(), 1..64)
         ) {
             let _lock = crate::GLOBAL_STATE_TEST_LOCK
@@ -3912,20 +4637,77 @@ mod tests {
                 tick_until_response(&executor, &captured, idx + 1);
 
                 let captured = captured.lock().expect("captured response lock");
-                let response = captured.last().expect("missing-mux path should respond");
+                let response = captured
+                    .last()
+                    .expect("empty private-session path should respond");
                 prop_assert_eq!(response.serial, serial);
-                match &response.pdu {
-                    Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                match (&op, &response.pdu) {
+                    (
+                        MissingMuxSessionErrorOp::RenameWorkspace { .. },
+                        Pdu::UnitResponse(UnitResponse {}),
+                    ) => {}
+                    (
+                        MissingMuxSessionErrorOp::GetClientList,
+                        Pdu::GetClientListResponse(GetClientListResponse { clients }),
+                    ) => {
+                        prop_assert!(clients.is_empty());
+                    }
+                    (
+                        MissingMuxSessionErrorOp::ListPanes,
+                        Pdu::ListPanesResponse(ListPanesResponse {
+                            tabs,
+                            tab_titles,
+                            window_titles,
+                        }),
+                    ) => {
+                        prop_assert!(tabs.is_empty());
+                        prop_assert!(tab_titles.is_empty());
+                        prop_assert!(window_titles.is_empty());
+                    }
+                    (
+                        MissingMuxSessionErrorOp::ListPanesTabStacks,
+                        Pdu::ListPanesTabStacksResponse(ListPanesTabStacksResponse {
+                            tab_stack_entries,
+                        }),
+                    ) => {
+                        prop_assert!(tab_stack_entries.is_empty());
+                    }
+                    (request, Pdu::ErrorResponse(ErrorResponse { reason })) => {
+                        let expected = match request {
+                            MissingMuxSessionErrorOp::SetWindowWorkspace { .. } => "window",
+                            MissingMuxSessionErrorOp::WindowTitleChanged { .. } => {
+                                "no such window"
+                            }
+                            MissingMuxSessionErrorOp::TabTitleChanged { .. } => "no such tab",
+                            MissingMuxSessionErrorOp::SetFocusedPane { .. }
+                            | MissingMuxSessionErrorOp::SetPaneZoomed { .. }
+                            | MissingMuxSessionErrorOp::GetPaneDirection { .. }
+                            | MissingMuxSessionErrorOp::ActivatePaneDirection { .. }
+                            | MissingMuxSessionErrorOp::GetPaneRenderableDimensions { .. }
+                            | MissingMuxSessionErrorOp::GetLines { .. }
+                            | MissingMuxSessionErrorOp::GetImageCell { .. } => "no such pane",
+                            MissingMuxSessionErrorOp::RenameWorkspace { .. }
+                            | MissingMuxSessionErrorOp::GetClientList
+                            | MissingMuxSessionErrorOp::ListPanes
+                            | MissingMuxSessionErrorOp::ListPanesTabStacks => {
+                                prop_assert!(
+                                    false,
+                                    "successful empty-session request returned ErrorResponse: {:?}: {reason}",
+                                    request
+                                );
+                                ""
+                            }
+                        };
                         prop_assert!(
-                            reason.contains("mux singleton is not available"),
-                            "missing-mux session path should report mux unavailability for {:?}, got {reason}",
-                            op
+                            reason.contains(expected),
+                            "empty private-session path returned wrong error for {:?}: {reason}",
+                            request
                         );
                     }
                     other => {
                         prop_assert!(
                             false,
-                            "missing-mux session path for {:?} returned {other:?}",
+                            "empty private-session path for {:?} returned {other:?}",
                             op
                         );
                     }
@@ -3934,13 +4716,13 @@ mod tests {
 
                 prop_assert!(
                     handler.client_id.is_none(),
-                    "missing-mux session path retained client identity after step {}: {:?}",
+                    "empty private-session path retained client identity after step {}: {:?}",
                     idx,
                     op
                 );
                 prop_assert!(
                     handler.per_pane.is_empty(),
-                    "missing-mux session path retained per-pane state after step {}: {:?}",
+                    "empty private-session path retained per-pane state after step {}: {:?}",
                     idx,
                     op
                 );
@@ -4090,7 +4872,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_client_identity_rebinds_registration_after_mux_replacement() {
+    fn repeated_client_identity_stays_bound_to_connection_mux_after_global_replacement() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -4115,19 +4897,25 @@ mod tests {
         }
 
         assert!(
-            originating_mux.iter_clients().is_empty(),
-            "rebinding must remove the old mux registration",
+            originating_mux
+                .iter_clients()
+                .iter()
+                .any(|info| *info.client_id == client),
+            "repeated identity must remain registered on the connection's mux",
         );
-        assert_eq!(replacement_mux.iter_clients().len(), 1);
-        drop(handler);
         assert!(
             replacement_mux.iter_clients().is_empty(),
-            "drop must clean up the rebound registration",
+            "changing the process-global mux must not retarget a live connection",
+        );
+        drop(handler);
+        assert!(
+            originating_mux.iter_clients().is_empty(),
+            "drop must clean up the connection-owned registration",
         );
     }
 
     #[test]
-    fn dropping_handler_after_mux_shutdown_does_not_panic() {
+    fn dropping_handler_after_global_mux_shutdown_cleans_its_connection_mux() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -4147,10 +4935,14 @@ mod tests {
 
         Mux::shutdown();
         drop(handler);
+        assert!(
+            mux.iter_clients().is_empty(),
+            "global shutdown must not prevent exact connection-owner cleanup"
+        );
     }
 
     #[test]
-    fn set_client_id_without_mux_returns_error_instead_of_panicking() {
+    fn set_client_id_without_global_mux_uses_handler_owned_mux() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
@@ -4158,24 +4950,32 @@ mod tests {
         let client = test_client_id("missing-mux", 41_005);
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
+        let owned_mux = Arc::clone(handler.owner.mux());
 
         handler.process_one(DecodedPdu {
             serial: 13,
             pdu: Pdu::SetClientId(SetClientId {
-                client_id: client,
+                client_id: client.clone(),
                 is_proxy: false,
             }),
         });
 
         let resp = take_response(&captured);
         assert_eq!(resp.serial, 13);
-        match resp.pdu {
-            Pdu::ErrorResponse(ErrorResponse { reason }) => {
-                assert!(reason.contains("mux singleton is not available"));
-            }
-            other => panic!("expected ErrorResponse, got {other:?}"),
-        }
-        assert!(handler.client_id.is_none());
+        assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
+        assert!(
+            owned_mux
+                .iter_clients()
+                .iter()
+                .any(|info| *info.client_id == client),
+            "a handler created without a global mux must retain its private owner"
+        );
+        assert!(Mux::try_get().is_none());
+        drop(handler);
+        assert!(
+            owned_mux.iter_clients().is_empty(),
+            "dropping the handler must unregister from its private mux"
+        );
     }
 
     #[test]
@@ -4334,6 +5134,7 @@ mod tests {
     #[test]
     fn maybe_push_pane_changes_drops_per_pane_lock_before_sending() {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
         let send_count = Arc::new(AtomicUsize::new(0));
 
@@ -4350,7 +5151,10 @@ mod tests {
             }
         });
 
-        maybe_push_pane_changes(&pane, sender, per_pane).expect("pane changes should send");
+        registration
+            .try_with_current(|current| maybe_push_pane_changes(&current, sender, per_pane))
+            .expect("test pane registration remains current")
+            .expect("pane changes should send");
 
         assert!(
             send_count.load(Ordering::Relaxed) >= 2,
@@ -4362,10 +5166,12 @@ mod tests {
     fn compute_changes_includes_initial_tiered_scrollback_status_snapshot() {
         let pane = Arc::new(FakePane::new(Some(sample_tiered_scrollback_status(12))));
         let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
         let mut per_pane = PerPane::default();
 
-        let response = per_pane
-            .compute_changes(&pane_dyn, None)
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
             .expect("initial pane snapshot should produce a response");
 
         assert_eq!(
@@ -4382,22 +5188,29 @@ mod tests {
     fn compute_changes_detects_cleared_tiered_scrollback_status_without_other_deltas() {
         let pane = Arc::new(FakePane::new(Some(sample_tiered_scrollback_status(12))));
         let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
         let mut per_pane = PerPane::default();
 
-        let initial = per_pane.compute_changes(&pane_dyn, None);
+        let initial = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current");
         assert!(
             initial.is_some(),
             "first snapshot should populate cached pane state"
         );
         assert!(
-            per_pane.compute_changes(&pane_dyn, None).is_none(),
+            registration
+                .try_with_current(|current| per_pane.compute_changes(&current, None))
+                .expect("test pane registration remains current")
+                .is_none(),
             "unchanged pane state should not emit a redundant render delta"
         );
 
         pane.set_tiered_scrollback_status(None);
 
-        let response = per_pane
-            .compute_changes(&pane_dyn, None)
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
             .expect("clearing tiered scrollback status should produce a response");
 
         assert!(response.dirty_lines.is_empty());
@@ -4409,21 +5222,29 @@ mod tests {
     fn compute_changes_detects_alt_screen_transition_without_other_deltas() {
         let pane = Arc::new(FakePane::new(None));
         let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
         let mut per_pane = PerPane::default();
 
         assert!(
-            per_pane.compute_changes(&pane_dyn, None).is_some(),
+            registration
+                .try_with_current(|current| per_pane.compute_changes(&current, None))
+                .expect("test pane registration remains current")
+                .is_some(),
             "first snapshot should populate cached pane state"
         );
         assert!(
-            per_pane.compute_changes(&pane_dyn, None).is_none(),
+            registration
+                .try_with_current(|current| per_pane.compute_changes(&current, None))
+                .expect("test pane registration remains current")
+                .is_none(),
             "unchanged pane state should not emit a redundant render delta"
         );
 
         pane.state.lock().unwrap().alt_screen_active = true;
 
-        let response = per_pane
-            .compute_changes(&pane_dyn, None)
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
             .expect("alt-screen transition should produce a response");
 
         assert!(response.alt_screen_active);
@@ -4435,10 +5256,12 @@ mod tests {
         let pane = Arc::new(FakePane::new(None));
         pane.state.lock().unwrap().cursor_position.y = 99;
         let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
         let mut per_pane = PerPane::default();
 
-        let response = per_pane
-            .compute_changes(&pane_dyn, None)
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
             .expect("initial pane snapshot should still produce a response");
 
         let cursor_y = response.cursor_position.y;

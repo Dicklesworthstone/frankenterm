@@ -517,7 +517,8 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
     for dom in domains {
         if let Some(dom) = dom.downcast_ref::<ClientDomain>() {
             if dom.connect_automatically() {
-                dom.attach(None).await?;
+                let owner_client_id = mux.active_identity();
+                dom.attach(&mux, owner_client_id, None).await?;
             }
         }
     }
@@ -687,11 +688,15 @@ async fn async_run_terminal_gui(
                 *builder
             };
 
-            domain.attach(Some(window_id)).await?;
+            let owner_client_id = mux.active_identity();
+            domain
+                .attach(&mux, owner_client_id, Some(window_id))
+                .await?;
             let config = config::configuration();
             let dpi = config.dpi.unwrap_or_else(::window::default_dpi);
             let tab = domain
                 .spawn(
+                    &mux,
                     config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
                     cmd.clone(),
                     None,

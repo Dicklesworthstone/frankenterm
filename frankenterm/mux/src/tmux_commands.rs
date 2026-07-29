@@ -444,12 +444,12 @@ impl TmuxDomainState {
 
     pub fn split_pane(
         &self,
+        mux: &Arc<Mux>,
         tab_id: TabId,
         pane_id: PaneId,
         remote_id: TmuxPaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
-        let mux = tmux_mux()?;
         let tab = match mux.get_tab(tab_id) {
             Some(t) => t,
             None => anyhow::bail!("Invalid tab id {}", tab_id),
@@ -632,8 +632,7 @@ impl TmuxDomainState {
                 };
 
                 if let Some(tab) = mux.get_tab(local_tab.tab_id) {
-                    tab.set_active_pane(&local_pane);
-                    mux.notify(MuxNotification::PaneFocused(local_pane.pane_id()));
+                    let _ = tab.set_active_pane_for_mux(&local_pane, &mux);
                 }
             }
 

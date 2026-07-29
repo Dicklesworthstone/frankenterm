@@ -50,13 +50,17 @@ impl UserData for MuxDomain {
                 let mux = get_mux()?;
                 let domain = this.resolve(&mux)?;
                 let window_id = window.map(|w| w.0);
+                let owner_client_id = mux.active_identity();
                 promise::spawn::spawn(async move {
-                    domain.attach(window_id).await.map_err(|err| {
-                        mlua::Error::external(format!(
-                            "failed to attach domain {}: {err:#}",
-                            domain.domain_name()
-                        ))
-                    })
+                    domain
+                        .attach(&mux, owner_client_id, window_id)
+                        .await
+                        .map_err(|err| {
+                            mlua::Error::external(format!(
+                                "failed to attach domain {}: {err:#}",
+                                domain.domain_name()
+                            ))
+                        })
                 })
                 .await
             },

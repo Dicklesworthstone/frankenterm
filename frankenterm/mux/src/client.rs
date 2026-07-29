@@ -1,4 +1,4 @@
-use crate::PaneId;
+use crate::{PaneId, PaneRegistrationHandle};
 use chrono::serde::ts_milliseconds;
 use chrono::{DateTime, Utc};
 use serde::*;
@@ -39,7 +39,7 @@ impl ClientId {
     }
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ClientInfo {
     pub client_id: Arc<ClientId>,
     /// The time this client last connected
@@ -62,6 +62,13 @@ pub struct ClientInfo {
     pub last_input: DateTime<Utc>,
     /// The currently-focused pane
     pub focused_pane_id: Option<PaneId>,
+    /// Exact process-local authority for the focused pane registration.
+    ///
+    /// This is deliberately omitted from the wire representation. A decoded
+    /// numeric pane ID is metadata, not authority to synthesize callbacks
+    /// against whichever pane later occupies that reusable slot.
+    #[serde(skip, default)]
+    focused_pane_registration: Option<PaneRegistrationHandle>,
 }
 
 impl ClientInfo {
@@ -72,6 +79,24 @@ impl ClientInfo {
             active_workspace: None,
             last_input: Utc::now(),
             focused_pane_id: None,
+            focused_pane_registration: None,
+        }
+    }
+
+    pub fn from_wire_parts(
+        client_id: Arc<ClientId>,
+        connected_at: DateTime<Utc>,
+        active_workspace: Option<String>,
+        last_input: DateTime<Utc>,
+        focused_pane_id: Option<PaneId>,
+    ) -> Self {
+        Self {
+            client_id,
+            connected_at,
+            active_workspace,
+            last_input,
+            focused_pane_id,
+            focused_pane_registration: None,
         }
     }
 
@@ -79,8 +104,38 @@ impl ClientInfo {
         self.last_input = Utc::now();
     }
 
-    pub fn update_focused_pane(&mut self, pane_id: PaneId) {
+    pub(crate) fn replace_focused_pane(
+        &mut self,
+        pane_id: PaneId,
+        registration: Option<PaneRegistrationHandle>,
+    ) -> Option<PaneRegistrationHandle> {
         self.focused_pane_id.replace(pane_id);
+        std::mem::replace(&mut self.focused_pane_registration, registration)
+    }
+
+    pub(crate) fn clear_focused_pane(&mut self) {
+        self.focused_pane_id = None;
+        self.focused_pane_registration = None;
+    }
+
+    pub(crate) fn focused_pane_registration(&self) -> Option<PaneRegistrationHandle> {
+        self.focused_pane_registration.clone()
+    }
+
+    pub(crate) fn wire_snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.focused_pane_registration = None;
+        snapshot
+    }
+}
+
+impl PartialEq for ClientInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.client_id == other.client_id
+            && self.connected_at == other.connected_at
+            && self.active_workspace == other.active_workspace
+            && self.last_input == other.last_input
+            && self.focused_pane_id == other.focused_pane_id
     }
 }
 
@@ -182,9 +237,9 @@ mod tests {
         let cid = Arc::new(make_client_id("host", 1));
         let mut info = ClientInfo::new(cid);
         assert!(info.focused_pane_id.is_none());
-        info.update_focused_pane(42);
+        info.replace_focused_pane(42, None);
         assert_eq!(info.focused_pane_id, Some(42));
-        info.update_focused_pane(99);
+        info.replace_focused_pane(99, None);
         assert_eq!(info.focused_pane_id, Some(99));
     }
 
@@ -206,13 +261,7 @@ mod tests {
             .timestamp_opt(1_700_000_000, 123_000_000)
             .single()
             .expect("valid chrono timestamp");
-        let info = ClientInfo {
-            client_id: cid,
-            connected_at: ts,
-            active_workspace: None,
-            last_input: ts,
-            focused_pane_id: None,
-        };
+        let info = ClientInfo::from_wire_parts(cid, ts, None, ts, None);
 
         let json = serde_json::to_string(&info).expect("serialize ClientInfo");
         let back: ClientInfo =

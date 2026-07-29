@@ -1,6 +1,6 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::type_repetition_in_bounds)]
-use crate::sessionhandler::{PduSender, SessionHandler};
+use crate::sessionhandler::{PduSender, SessionHandler, SessionOwner};
 use anyhow::Context;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -1272,11 +1272,12 @@ where
     T: 'static,
     T: DispatchStream,
 {
+    let mux = Mux::try_get().context("mux singleton is not available")?;
     match detect_incoming_protocol(stream).await? {
         IncomingProtocol::CleanDisconnect => Ok(()),
-        IncomingProtocol::BinaryPdu(stream) => process_async_with_config(stream, config).await,
+        IncomingProtocol::BinaryPdu(stream) => process_async_with_mux(stream, config, mux).await,
         IncomingProtocol::TmuxControl { stream, prefix } => {
-            process_tmux_control_stream(stream, prefix).await
+            process_tmux_control_stream(stream, prefix, mux).await
         }
     }
 }
@@ -1496,7 +1497,11 @@ fn tmux_control_probe_prefix_is_text(bytes: &[u8]) -> bool {
     }
 }
 
-async fn process_tmux_control_stream<T>(mut stream: T, mut buffer: Vec<u8>) -> anyhow::Result<()>
+async fn process_tmux_control_stream<T>(
+    mut stream: T,
+    mut buffer: Vec<u8>,
+    mux: Arc<Mux>,
+) -> anyhow::Result<()>
 where
     T: DispatchStream,
 {
@@ -1506,6 +1511,7 @@ where
             let line = buffer.drain(..=line_end).collect::<Vec<_>>();
             command_id = command_id.saturating_add(1);
             let response = tmux_control_response_for_line_bytes(
+                &mux,
                 current_unix_timestamp_secs(),
                 command_id,
                 line,
@@ -1540,12 +1546,13 @@ where
 }
 
 fn tmux_control_response_for_line_bytes(
+    mux: &Mux,
     timestamp_secs: u64,
     command_id: u64,
     line: Vec<u8>,
 ) -> TmuxResponse {
     match String::from_utf8(line) {
-        Ok(line) => tmux_control_response_at(timestamp_secs, command_id, &line),
+        Ok(line) => tmux_control_response_at(mux, timestamp_secs, command_id, &line),
         Err(_) => tmux_error_response(
             timestamp_secs,
             command_id,
@@ -1575,40 +1582,43 @@ fn current_unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
-fn tmux_control_response_at(timestamp_secs: u64, command_id: u64, line: &str) -> TmuxResponse {
+fn tmux_control_response_at(
+    mux: &Mux,
+    timestamp_secs: u64,
+    command_id: u64,
+    line: &str,
+) -> TmuxResponse {
     match parse_command(line) {
-        Ok(command) => tmux_command_response_at(timestamp_secs, command_id, command),
+        Ok(command) => tmux_command_response_at(mux, timestamp_secs, command_id, command),
         Err(err) => tmux_error_response(timestamp_secs, command_id, &format!("parse error: {err}")),
     }
 }
 
 fn tmux_command_response_at(
+    mux: &Mux,
     timestamp_secs: u64,
     command_id: u64,
     command: TmuxCommand,
 ) -> TmuxResponse {
     match command {
-        TmuxCommand::SendKeys { target, keys } => match tmux_dispatch_send_keys(target, &keys) {
+        TmuxCommand::SendKeys { target, keys } => match tmux_dispatch_send_keys(mux, target, &keys)
+        {
             Ok(output) => tmux_success_response(timestamp_secs, command_id, output),
             Err(err) => tmux_error_response(timestamp_secs, command_id, &err),
         },
-        TmuxCommand::ListSessions => match Mux::try_get() {
-            Some(mux) => tmux_success_response(
-                timestamp_secs,
-                command_id,
-                tmux_control_list_sessions_output(&mux),
-            ),
-            None => tmux_error_response(timestamp_secs, command_id, "mux singleton is unavailable"),
-        },
-        TmuxCommand::ListWindows { target_session } => match Mux::try_get() {
-            Some(mux) => match tmux_control_list_windows_output(&mux, target_session.as_deref()) {
+        TmuxCommand::ListSessions => tmux_success_response(
+            timestamp_secs,
+            command_id,
+            tmux_control_list_sessions_output(mux),
+        ),
+        TmuxCommand::ListWindows { target_session } => {
+            match tmux_control_list_windows_output(mux, target_session.as_deref()) {
                 Ok(output) => tmux_success_response(timestamp_secs, command_id, output),
                 Err(err) => tmux_error_response(timestamp_secs, command_id, &err),
-            },
-            None => tmux_error_response(timestamp_secs, command_id, "mux singleton is unavailable"),
-        },
+            }
+        }
         TmuxCommand::CapturePane { target, print } => {
-            match tmux_dispatch_capture_pane(target, print) {
+            match tmux_dispatch_capture_pane(mux, target, print) {
                 Ok(output) => tmux_success_response(timestamp_secs, command_id, output),
                 Err(err) => tmux_error_response(timestamp_secs, command_id, &err),
             }
@@ -1642,18 +1652,24 @@ fn tmux_control_target_pane_id(target: Option<&str>) -> Result<usize, String> {
         .map_err(|_| "pane target is too large for this platform".to_string())
 }
 
-fn tmux_dispatch_send_keys(target: Option<String>, keys: &[String]) -> Result<Vec<String>, String> {
+fn tmux_dispatch_send_keys(
+    mux: &Mux,
+    target: Option<String>,
+    keys: &[String],
+) -> Result<Vec<String>, String> {
     let pane_id = tmux_control_target_pane_id(target.as_deref())?;
     let payload = tmux_send_keys_payload(keys);
-    let mux = Mux::try_get().ok_or_else(|| "mux singleton is unavailable".to_string())?;
-    let pane = mux
-        .get_pane(pane_id)
+    let registration = mux
+        .capture_current_pane(pane_id)
         .ok_or_else(|| format!("pane not found: %{pane_id}"))?;
-    let mut writer = pane.writer();
-    std::io::Write::write_all(&mut *writer, &payload)
-        .map_err(|err| format!("send-keys write failed: {err}"))?;
-    std::io::Write::flush(&mut *writer).map_err(|err| format!("send-keys flush failed: {err}"))?;
-    Ok(Vec::new())
+    registration
+        .try_with_current(|current| {
+            current
+                .write_all_and_flush(&payload)
+                .map_err(|err| format!("send-keys write failed or flush failed: {err}"))?;
+            Ok(Vec::new())
+        })
+        .ok_or_else(|| format!("pane registration is no longer current: %{pane_id}"))?
 }
 
 fn tmux_send_keys_payload(keys: &[String]) -> Vec<u8> {
@@ -1697,25 +1713,32 @@ fn tmux_control_key_byte(key: &str) -> Option<u8> {
     }
 }
 
-fn tmux_dispatch_capture_pane(target: Option<String>, print: bool) -> Result<Vec<String>, String> {
+fn tmux_dispatch_capture_pane(
+    mux: &Mux,
+    target: Option<String>,
+    print: bool,
+) -> Result<Vec<String>, String> {
     if !print {
         return Err("capture-pane without -p is unsupported by native tmux dispatcher".to_string());
     }
     let pane_id = tmux_control_target_pane_id(target.as_deref())?;
-    let mux = Mux::try_get().ok_or_else(|| "mux singleton is unavailable".to_string())?;
-    let pane = mux
-        .get_pane(pane_id)
+    let registration = mux
+        .capture_current_pane(pane_id)
         .ok_or_else(|| format!("pane not found: %{pane_id}"))?;
-    let dimensions = pane.get_dimensions();
-    let row_count = dimensions
-        .scrollback_rows
-        .saturating_add(dimensions.viewport_rows);
-    let row_end = isize::try_from(row_count).unwrap_or(isize::MAX);
-    let (_first_row, lines) = pane.get_lines(0..row_end);
-    Ok(lines
-        .into_iter()
-        .map(|line| line.columns_as_str(0..usize::MAX).trim_end().to_string())
-        .collect())
+    registration
+        .try_with_current(|current| {
+            let dimensions = current.get_dimensions();
+            let row_count = dimensions
+                .scrollback_rows
+                .saturating_add(dimensions.viewport_rows);
+            let row_end = isize::try_from(row_count).unwrap_or(isize::MAX);
+            let (_first_row, lines) = current.get_lines(0..row_end);
+            Ok(lines
+                .into_iter()
+                .map(|line| line.columns_as_str(0..usize::MAX).trim_end().to_string())
+                .collect())
+        })
+        .ok_or_else(|| format!("pane registration is no longer current: %{pane_id}"))?
 }
 
 fn tmux_command_name(command: &TmuxCommand) -> &'static str {
@@ -1834,8 +1857,21 @@ where
 }
 
 async fn process_async_with_config<T>(
+    stream: T,
+    config: DispatchRuntimeConfig,
+) -> anyhow::Result<()>
+where
+    T: 'static,
+    T: DispatchStream,
+{
+    let mux = Mux::try_get().context("mux singleton is not available")?;
+    process_async_with_mux(stream, config, mux).await
+}
+
+async fn process_async_with_mux<T>(
     mut stream: T,
     config: DispatchRuntimeConfig,
+    mux: Arc<Mux>,
 ) -> anyhow::Result<()>
 where
     T: 'static,
@@ -1866,19 +1902,26 @@ where
     #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
     let io_uring_runtime: Option<DispatchIoUringRuntime> = None;
 
+    let owner = SessionOwner::new(mux);
+    let authority = owner.authority();
+    let mux = Arc::clone(owner.mux());
     let pdu_sender = PduSender::new({
         let item_tx = item_tx.clone();
         move |pdu| queue_pdu(&item_tx, pdu.pdu, pdu.serial)
     });
-    let mut handler = SessionHandler::new(pdu_sender);
+    let mut handler = SessionHandler::new_for_session(pdu_sender, owner);
 
     {
-        let mux = Mux::try_get().context("mux singleton is not available")?;
         let tx = item_tx.clone();
+        let notification_authority = authority.clone();
         let sub_id = mux
-            .subscribe(move |n| queue_notification(&tx, n))
+            .subscribe(move |n| {
+                notification_authority
+                    .try_run(|| queue_notification(&tx, n))
+                    .unwrap_or(false)
+            })
             .context("allocate mux dispatch subscription")?;
-        let _subscription_guard = MuxSubscriptionGuard::new(mux, sub_id);
+        let _subscription_guard = MuxSubscriptionGuard::new(Arc::clone(&mux), sub_id);
 
         loop {
             let next_item = if let Some(pending) = pending_outbound.as_mut() {
@@ -1989,12 +2032,9 @@ where
                 Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowInvalidated(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowWorkspaceChanged(window_id))) => {
-                    let workspace = if let Some(mux) = Mux::try_get() {
-                        mux.get_window(window_id)
-                            .map(|w| w.get_workspace().to_string())
-                    } else {
-                        None
-                    };
+                    let workspace = mux
+                        .get_window(window_id)
+                        .map(|w| w.get_workspace().to_string());
                     if let Some(workspace) = workspace {
                         queue_pdu(
                             &item_tx,
@@ -2321,8 +2361,9 @@ mod tests {
 
     #[test]
     fn tmux_control_invalid_utf8_lines_are_framed_errors() {
+        let mux = Mux::new(None);
         let response =
-            tmux_control_response_for_line_bytes(10, 7, b"send-keys caf\xc3(\n".to_vec());
+            tmux_control_response_for_line_bytes(&mux, 10, 7, b"send-keys caf\xc3(\n".to_vec());
         let encoded = response.encode();
 
         assert!(encoded.contains("parse error: invalid utf-8 in tmux control command"));
@@ -2331,7 +2372,8 @@ mod tests {
 
     #[test]
     fn tmux_control_parse_errors_are_framed_errors() {
-        let response = tmux_control_response_at(10, 7, "send-keys \"unterminated\n");
+        let mux = Mux::new(None);
+        let response = tmux_control_response_at(&mux, 10, 7, "send-keys \"unterminated\n");
         let encoded = response.encode();
 
         assert!(encoded.contains("parse error:"));
@@ -2340,7 +2382,8 @@ mod tests {
 
     #[test]
     fn tmux_control_unknown_commands_return_tmux_error_frames() {
-        let response = tmux_control_response_at(11, 8, "kill-server\n");
+        let mux = Mux::new(None);
+        let response = tmux_control_response_at(&mux, 11, 8, "kill-server\n");
         let encoded = response.encode();
 
         assert!(encoded.contains("unsupported command: kill-server"));
@@ -2349,14 +2392,15 @@ mod tests {
 
     #[test]
     fn tmux_control_typed_tier_two_commands_return_safe_tmux_error_frames() {
-        let response = tmux_control_response_at(11, 8, "pipe-pane -o 'cat >/tmp/out'\n");
+        let mux = Mux::new(None);
+        let response = tmux_control_response_at(&mux, 11, 8, "pipe-pane -o 'cat >/tmp/out'\n");
         let encoded = response.encode();
 
         assert!(encoded.contains("unsupported command in native tmux dispatcher: pipe-pane"));
         assert!(!encoded.contains("cat >/tmp/out"));
         assert!(encoded.ends_with("%error 11 8 0\n"));
 
-        let response = tmux_control_response_at(12, 9, "copy-mode -t %1 -u\n");
+        let response = tmux_control_response_at(&mux, 12, 9, "copy-mode -t %1 -u\n");
         let encoded = response.encode();
 
         assert!(encoded.contains("unsupported command in native tmux dispatcher: copy-mode"));
@@ -2366,7 +2410,8 @@ mod tests {
 
     #[test]
     fn tmux_control_unsupported_tier_one_does_not_echo_payload() {
-        let response = tmux_control_response_at(11, 8, "send-keys secret-token Enter\n");
+        let mux = Mux::new(None);
+        let response = tmux_control_response_at(&mux, 11, 8, "send-keys secret-token Enter\n");
         let encoded = response.encode();
 
         assert!(encoded.contains("missing target pane"));
@@ -2381,7 +2426,7 @@ mod tests {
         let window = mux.new_empty_window(Some("dev".to_string()), None);
         drop(window);
 
-        let response = tmux_control_response_at(12, 9, "list-sessions\n");
+        let response = tmux_control_response_at(&mux, 12, 9, "list-sessions\n");
 
         assert!(response.outcome.is_ok());
         assert!(
@@ -2396,7 +2441,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(&mux);
 
-        let response = tmux_control_response_at(13, 10, "list-windows -t missing\n");
+        let response = tmux_control_response_at(&mux, 13, 10, "list-windows -t missing\n");
 
         assert!(response.outcome.is_err());
         assert_eq!(response.output, vec!["session not found: missing"]);
@@ -2406,9 +2451,9 @@ mod tests {
     fn tmux_control_capture_pane_prints_live_pane_lines() {
         let pane = Arc::new(CapturingPane::new(42, &["alpha", "beta"]));
         let pane_dyn: Arc<dyn Pane> = pane.clone();
-        let (_mux, _guard) = install_mux_with_pane(&pane_dyn);
+        let (mux, _guard) = install_mux_with_pane(&pane_dyn);
 
-        let response = tmux_control_response_at(14, 11, "capture-pane -p -t %42\n");
+        let response = tmux_control_response_at(&mux, 14, 11, "capture-pane -p -t %42\n");
 
         assert!(response.outcome.is_ok());
         assert_eq!(response.output, vec!["alpha", "beta"]);
@@ -2419,9 +2464,9 @@ mod tests {
     fn tmux_control_capture_pane_requires_print_mode() {
         let pane = Arc::new(CapturingPane::new(42, &["alpha"]));
         let pane_dyn: Arc<dyn Pane> = pane.clone();
-        let (_mux, _guard) = install_mux_with_pane(&pane_dyn);
+        let (mux, _guard) = install_mux_with_pane(&pane_dyn);
 
-        let response = tmux_control_response_at(14, 11, "capture-pane -t %42\n");
+        let response = tmux_control_response_at(&mux, 14, 11, "capture-pane -t %42\n");
 
         assert!(response.outcome.is_err());
         assert_eq!(
@@ -2434,10 +2479,10 @@ mod tests {
     fn tmux_control_send_keys_writes_live_pane_input() {
         let pane = Arc::new(CapturingPane::new(42, &[]));
         let pane_dyn: Arc<dyn Pane> = pane.clone();
-        let (_mux, _guard) = install_mux_with_pane(&pane_dyn);
+        let (mux, _guard) = install_mux_with_pane(&pane_dyn);
 
         let response =
-            tmux_control_response_at(14, 11, "send-keys -t %42 echo Space hi Enter C-c\n");
+            tmux_control_response_at(&mux, 14, 11, "send-keys -t %42 echo Space hi Enter C-c\n");
 
         assert!(response.outcome.is_ok());
         assert!(response.output.is_empty());
@@ -2445,9 +2490,39 @@ mod tests {
     }
 
     #[test]
+    fn tmux_control_commands_remain_bound_to_origin_mux_after_global_replacement() {
+        let origin_pane = Arc::new(CapturingPane::new(43, &[]));
+        let origin_pane_dyn: Arc<dyn Pane> = origin_pane.clone();
+        let origin = Arc::new(Mux::new(None));
+        origin.add_pane(&origin_pane_dyn).unwrap();
+
+        let replacement_pane = Arc::new(CapturingPane::new(43, &[]));
+        let replacement_pane_dyn: Arc<dyn Pane> = replacement_pane.clone();
+        let replacement = Arc::new(Mux::new(None));
+        replacement.add_pane(&replacement_pane_dyn).unwrap();
+
+        let _guard = ScopedMux::install(&origin);
+        Mux::set_mux(&replacement);
+
+        let response = tmux_control_response_at(&origin, 14, 12, "send-keys -t %43 origin Enter\n");
+
+        assert!(response.outcome.is_ok());
+        assert_eq!(origin_pane.written_bytes(), b"origin\r");
+        assert!(
+            replacement_pane.written_bytes().is_empty(),
+            "a live tmux-control connection must never redirect through a replacement singleton"
+        );
+    }
+
+    #[test]
     fn tmux_control_send_keys_rejects_non_pane_target_without_payload_echo() {
-        let response =
-            tmux_control_response_at(14, 11, "send-keys -t session:window secret-token Enter\n");
+        let mux = Mux::new(None);
+        let response = tmux_control_response_at(
+            &mux,
+            14,
+            11,
+            "send-keys -t session:window secret-token Enter\n",
+        );
         let encoded = response.encode();
 
         assert!(response.outcome.is_err());

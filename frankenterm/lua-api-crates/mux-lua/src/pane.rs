@@ -491,8 +491,14 @@ impl SplitPane {
         };
 
         let mux = get_mux()?;
-        let (pane, _size) = mux
-            .split_pane(pane.0, request, source, self.domain.clone())
+        let (pane, _size, _window_id, _tab_id) = mux
+            .split_pane(
+                pane.0,
+                request,
+                source,
+                self.domain.clone(),
+                mux.active_identity(),
+            )
             .await
             .map_err(|e| mlua::Error::external(format!("{:#?}", e)))?;
 

@@ -454,7 +454,9 @@ fn active_workspace_sync_request(
     mux: &Mux,
 ) -> Option<codec::SetActiveWorkspace> {
     let owner_client_id = owner_client_id?;
-    if owner_client_id != changed_client_id {
+    if !Arc::ptr_eq(owner_client_id, changed_client_id)
+        || !mux.client_registration_is_current(owner_client_id)
+    {
         return None;
     }
 
@@ -468,6 +470,9 @@ fn current_active_workspace_sync(
     mux: &Mux,
 ) -> Option<codec::SetActiveWorkspace> {
     let owner_client_id = inner.owner_client_id.as_ref()?;
+    if !mux.client_registration_is_current(owner_client_id) {
+        return None;
+    }
     Some(codec::SetActiveWorkspace {
         workspace: mux.active_workspace_for_client(owner_client_id),
     })
@@ -688,6 +693,20 @@ impl ClientDomain {
         lock_or_recover(&self.inner, "client_domain_inner")
             .as_ref()
             .map(Arc::clone)
+    }
+
+    fn ensure_mux_owner(&self, mux: &Arc<Mux>) -> anyhow::Result<()> {
+        let owner = self
+            .mux_owner
+            .upgrade()
+            .context("client domain's owning mux is not available")?;
+        if !Arc::ptr_eq(&owner, mux) {
+            bail!(
+                "client domain {} cannot operate on a different mux instance",
+                self.local_domain_id
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn inner_is_current(&self, expected: &Arc<ClientInner>) -> bool {
@@ -1283,6 +1302,7 @@ impl ClientDomain {
         domain_id: DomainId,
         client: Client,
         panes: ListPanesResponse,
+        owner_client_id: Option<Arc<ClientId>>,
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
         let domain_registration = mux
@@ -1291,10 +1311,17 @@ impl ClientDomain {
         let domain = domain_registration
             .downcast_ref::<Self>()
             .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", domain_id))?;
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|owner| !mux.client_registration_is_current(owner))
+        {
+            bail!(
+                "client domain {domain_id} owner client registration is no longer current before \
+                 attachment preparation"
+            );
+        }
         let threshold = domain.config.local_echo_threshold_ms();
         let overlay_lag_indicator = domain.config.overlay_lag_indicator();
-        let owner_client_id = mux.active_identity();
-
         let inner = Arc::new(ClientInner::new(
             domain_id,
             client,
@@ -1343,6 +1370,17 @@ impl ClientDomain {
             inner.mark_detached();
             bail!("client domain {domain_id} gained an attachment during preparation");
         }
+        if inner
+            .owner_client_id
+            .as_ref()
+            .is_some_and(|owner| !mux.client_registration_is_current(owner))
+        {
+            inner.mark_detached();
+            bail!(
+                "client domain {domain_id} owner client registration retired during attachment \
+                 preparation"
+            );
+        }
         *published = Some(Arc::clone(&inner));
         drop(published);
 
@@ -1373,6 +1411,7 @@ impl Domain for ClientDomain {
 
     async fn spawn_pane(
         &self,
+        mux: &Arc<Mux>,
         size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
@@ -1381,10 +1420,7 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let mux = self
-            .mux_owner
-            .upgrade()
-            .context("client domain's owning mux is not available")?;
+        self.ensure_mux_owner(mux)?;
         let workspace = mux.active_workspace();
         let result = inner
             .client
@@ -1398,10 +1434,10 @@ impl Domain for ClientDomain {
             })
             .await?;
 
-        if !Self::sync_remote_topology(Arc::clone(&mux), self, Arc::clone(&inner), None).await? {
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), None).await? {
             bail!("client attachment retired while resolving spawned pane");
         }
-        let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(&mux, &inner, result)?;
+        let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
         Ok(pane)
     }
 
@@ -1410,6 +1446,7 @@ impl Domain for ClientDomain {
     /// structure, and then translate the results back to local
     async fn move_pane_to_new_tab(
         &self,
+        mux: &Arc<Mux>,
         pane_id: PaneId,
         window_id: Option<WindowId>,
         workspace_for_new_window: Option<String>,
@@ -1418,10 +1455,7 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let mux = self
-            .mux_owner
-            .upgrade()
-            .context("client domain's owning mux is not available")?;
+        self.ensure_mux_owner(mux)?;
         let local_pane = mux
             .get_pane(pane_id)
             .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
@@ -1447,7 +1481,7 @@ impl Domain for ClientDomain {
             })
             .await?;
 
-        if !Self::sync_remote_topology(Arc::clone(&mux), self, Arc::clone(&inner), None).await? {
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), None).await? {
             bail!("client attachment retired while moving pane");
         }
 
@@ -1473,6 +1507,7 @@ impl Domain for ClientDomain {
 
     async fn spawn(
         &self,
+        mux: &Arc<Mux>,
         size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
@@ -1482,11 +1517,8 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let mux = self
-            .mux_owner
-            .upgrade()
-            .context("client domain's owning mux is not available")?;
-        let workspace = workspace_for_spawn_window(&mux, window);
+        self.ensure_mux_owner(mux)?;
+        let workspace = workspace_for_spawn_window(mux, window);
 
         let result = inner
             .client
@@ -1499,17 +1531,18 @@ impl Domain for ClientDomain {
                 workspace,
             })
             .await?;
-        if !Self::sync_remote_topology(Arc::clone(&mux), self, Arc::clone(&inner), Some(window))
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), Some(window))
             .await?
         {
             bail!("client attachment retired while resolving spawned tab");
         }
-        let (tab, _pane, _window_id) = Self::resolve_remote_spawn_entities(&mux, &inner, result)?;
+        let (tab, _pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
         Ok(tab)
     }
 
     async fn split_pane(
         &self,
+        mux: &Arc<Mux>,
         source: SplitSource,
         _tab_id: TabId,
         pane_id: PaneId,
@@ -1519,10 +1552,7 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let mux = self
-            .mux_owner
-            .upgrade()
-            .context("client domain's owning mux is not available")?;
+        self.ensure_mux_owner(mux)?;
         let local_pane = mux
             .get_pane(pane_id)
             .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
@@ -1569,21 +1599,23 @@ impl Domain for ClientDomain {
                 move_pane_id,
             })
             .await?;
-        if !Self::sync_remote_topology(Arc::clone(&mux), self, Arc::clone(&inner), None).await? {
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), None).await? {
             bail!("client attachment retired while resolving split pane");
         }
-        let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(&mux, &inner, result)?;
+        let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
         Ok(pane)
     }
 
-    async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
-        let mux = self
-            .mux_owner
-            .upgrade()
-            .context("client domain's owning mux is not available")?;
+    async fn attach(
+        &self,
+        mux: &Arc<Mux>,
+        owner_client_id: Option<Arc<ClientId>>,
+        window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        self.ensure_mux_owner(mux)?;
         if self.state() == DomainState::Attached {
             if let Some(inner) = self.inner() {
-                let _ = Self::sync_remote_topology(mux, self, inner, window_id).await?;
+                let _ = Self::sync_remote_topology(Arc::clone(mux), self, inner, window_id).await?;
             }
             return Ok(());
         }
@@ -1591,7 +1623,7 @@ impl Domain for ClientDomain {
         let domain_id = self.local_domain_id;
         let config = self.config.clone();
 
-        let activity = mux::activity::Activity::new_for_mux(&mux);
+        let activity = mux::activity::Activity::new_for_mux(mux);
         let ui = ConnectionUI::with_params(ConnectionUIParams {
             window_id,
             ..Default::default()
@@ -1600,7 +1632,7 @@ impl Domain for ClientDomain {
 
         ui.async_run_and_log_error({
             let ui = ui.clone();
-            let mux = Arc::clone(&mux);
+            let mux = Arc::clone(mux);
             async move {
                 let mut cloned_ui = ui.clone();
                 let mux_owner = Arc::downgrade(&mux);
@@ -1635,7 +1667,14 @@ impl Domain for ClientDomain {
                     "Server has {} tabs.  Attaching to local UI...\n",
                     panes.tabs.len()
                 ));
-                ClientDomain::finish_attach(&mux, domain_id, client, panes, window_id)
+                ClientDomain::finish_attach(
+                    &mux,
+                    domain_id,
+                    client,
+                    panes,
+                    owner_client_id,
+                    window_id,
+                )
             }
         })
         .await
@@ -1735,6 +1774,12 @@ mod tests {
         assert_eq!(
             active_workspace_sync_request(Some(&owner), &other, &mux),
             None
+        );
+        let same_value_stale_owner = Arc::new((*owner).clone());
+        assert_eq!(
+            active_workspace_sync_request(Some(&same_value_stale_owner), &owner, &mux),
+            None,
+            "an equal-valued stale client Arc must not inherit replacement authority"
         );
         assert_eq!(active_workspace_sync_request(None, &owner, &mux), None);
     }

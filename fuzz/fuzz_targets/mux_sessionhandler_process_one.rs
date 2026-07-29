@@ -214,9 +214,9 @@ struct ScopedMux {
 }
 
 impl ScopedMux {
-    fn install_empty() -> Self {
+    fn install(mux: &Arc<Mux>) -> Self {
         let prior = Mux::try_get();
-        Mux::set_mux(&Arc::new(Mux::new(None)));
+        Mux::set_mux(mux);
         Self { prior }
     }
 
@@ -278,13 +278,14 @@ fuzz_target!(|data: &[u8]| {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let _executor = SimpleExecutor::new();
+    let session_mux = Arc::new(Mux::new(None));
     let _mux_guard = if case.install_mux {
-        ScopedMux::install_empty()
+        ScopedMux::install(&session_mux)
     } else {
         ScopedMux::shutdown_current()
     };
     let (sender, captured) = capturing_sender();
-    let mut handler = SessionHandler::new(sender);
+    let mut handler = SessionHandler::new_for_mux(sender, session_mux);
 
     for frame in case.frames {
         handler.process_one(DecodedPdu {

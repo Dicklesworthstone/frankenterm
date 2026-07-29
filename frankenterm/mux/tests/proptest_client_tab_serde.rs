@@ -42,12 +42,14 @@ fn arb_client_info() -> impl Strategy<Value = ClientInfo> {
         prop_oneof![Just(None), (0usize..=4096).prop_map(Some),],
     )
         .prop_map(
-            |(client_id, connected_at, active_workspace, last_input, focused_pane_id)| ClientInfo {
-                client_id: Arc::new(client_id),
-                connected_at,
-                active_workspace,
-                last_input,
-                focused_pane_id,
+            |(client_id, connected_at, active_workspace, last_input, focused_pane_id)| {
+                ClientInfo::from_wire_parts(
+                    Arc::new(client_id),
+                    connected_at,
+                    active_workspace,
+                    last_input,
+                    focused_pane_id,
+                )
             },
         )
 }

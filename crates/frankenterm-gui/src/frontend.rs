@@ -318,6 +318,7 @@ impl GuiFrontEnd {
                             pane_id,
                             workspace,
                             None, // optional position
+                            mux.active_identity(),
                         )
                         .await
                     {

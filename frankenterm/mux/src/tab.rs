@@ -776,7 +776,7 @@ pub struct PositionedSplit {
 
 fn is_pane(pane: &Arc<dyn Pane>, other: &Option<&Arc<dyn Pane>>) -> bool {
     if let Some(other) = other {
-        other.pane_id() == pane.pane_id()
+        Arc::ptr_eq(other, pane)
     } else {
         false
     }
@@ -1851,8 +1851,71 @@ impl Tab {
         self.inner.lock().sync_with_pane_tree(size, root, make_pane)
     }
 
-    pub fn codec_pane_tree(&self) -> PaneNode {
-        self.inner.lock().codec_pane_tree()
+    /// Encode one coherent tab snapshot using caller-supplied owner metadata.
+    ///
+    /// The structural tree and focus identities are cloned under the tab lock;
+    /// all potentially reentrant `Pane` observations happen after unlocking.
+    /// A session therefore cannot accidentally consult a replacement process
+    /// singleton while encoding an exact mux.
+    pub fn codec_pane_tree_in_window(
+        &self,
+        window_id: WindowId,
+        workspace: &str,
+    ) -> anyhow::Result<PaneNode> {
+        const SNAPSHOT_ATTEMPTS: usize = 3;
+
+        for _ in 0..SNAPSHOT_ATTEMPTS {
+            let observed = Self::observe_panes(self.snapshot_panes_callback_free());
+            let mut pane_ids = HashMap::with_capacity(observed.len());
+            for pane in &observed {
+                let pane_id = pane.pane_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pane identity {:p} panicked while tab {} was being encoded",
+                        Arc::as_ptr(&pane.pane),
+                        self.tab_id,
+                    )
+                })?;
+                pane_ids.insert(pane_identity(&pane.pane), pane_id);
+            }
+
+            let snapshot = {
+                let inner = self.inner.lock();
+                let current = inner.snapshot_panes_callback_free();
+                let current_identities = current.iter().map(pane_identity).collect::<HashSet<_>>();
+                let observed_identities = pane_ids.keys().copied().collect::<HashSet<_>>();
+                if current_identities != observed_identities {
+                    None
+                } else {
+                    Some((
+                        inner.pane.clone(),
+                        inner.raw_active_pane_callback_free(&pane_ids),
+                        inner.zoomed.as_ref().map(Arc::clone),
+                    ))
+                }
+            };
+            let Some((tree, active, zoomed)) = snapshot else {
+                continue;
+            };
+
+            return Ok(match tree {
+                Some(tree) => pane_tree(
+                    &tree,
+                    self.tab_id,
+                    window_id,
+                    active.as_ref(),
+                    zoomed.as_ref(),
+                    workspace,
+                    0,
+                    0,
+                ),
+                None => PaneNode::Empty,
+            });
+        }
+
+        anyhow::bail!(
+            "tab {} topology changed during all {SNAPSHOT_ATTEMPTS} codec snapshot attempts",
+            self.tab_id,
+        )
     }
 
     /// Returns a count of how many panes are in this tab
@@ -2467,8 +2530,15 @@ impl Tab {
         self.inner.lock().get_active_idx()
     }
 
-    pub fn set_active_pane(&self, pane: &Arc<dyn Pane>) {
-        self.inner.lock().set_active_pane(pane)
+    pub fn set_active_pane(&self, pane: &Arc<dyn Pane>) -> bool {
+        let mux = Mux::try_get();
+        self.inner.lock().set_active_pane(pane, mux.as_deref())
+    }
+
+    /// Select a pane while routing the resulting notification through the
+    /// exact mux that owns the surrounding topology.
+    pub(crate) fn set_active_pane_for_mux(&self, pane: &Arc<dyn Pane>, mux: &Mux) -> bool {
+        self.inner.lock().set_active_pane(pane, Some(mux))
     }
 
     pub fn set_active_idx(&self, pane_index: usize) {
@@ -2600,49 +2670,6 @@ impl TabInner {
         );
         assert!(self.pane.is_some());
         Ok(())
-    }
-
-    fn codec_pane_tree(&mut self) -> PaneNode {
-        let Some(mux) = Mux::try_get() else {
-            log::error!("cannot encode tab {} without mux singleton", self.id);
-            return PaneNode::Empty;
-        };
-        let tab_id = self.id;
-        let window_id = match mux.window_containing_tab(tab_id) {
-            Some(w) => w,
-            None => {
-                log::error!("no window contains tab {}", tab_id);
-                return PaneNode::Empty;
-            }
-        };
-
-        let workspace = match mux
-            .get_window(window_id)
-            .map(|w| w.get_workspace().to_string())
-        {
-            Some(ws) => ws,
-            None => {
-                log::error!("window id {} doesn't have a window!?", window_id);
-                return PaneNode::Empty;
-            }
-        };
-
-        let active = self.get_active_pane();
-        let zoomed = self.zoomed.as_ref();
-        if let Some(root) = self.pane.as_ref() {
-            pane_tree(
-                root,
-                tab_id,
-                window_id,
-                active.as_ref(),
-                zoomed,
-                &workspace,
-                0,
-                0,
-            )
-        } else {
-            PaneNode::Empty
-        }
     }
 
     /// Returns a count of how many panes are in this tab
@@ -4689,53 +4716,67 @@ impl TabInner {
         self.active
     }
 
-    fn set_active_pane(&mut self, pane: &Arc<dyn Pane>) {
+    fn set_active_pane(&mut self, pane: &Arc<dyn Pane>, mux: Option<&Mux>) -> bool {
         let prior = self.get_active_pane();
 
         if is_pane(pane, &prior.as_ref()) {
-            return;
+            return true;
         }
 
         if self.zoomed.is_some() {
             if !configuration().unzoom_on_switch_pane {
-                return;
+                return false;
             }
             self.toggle_zoom();
         }
 
-        if self.has_floating_pane(pane.pane_id()) {
+        if let Some(index) = self
+            .floating_panes
+            .iter()
+            .position(|floating| Arc::ptr_eq(&floating.pane, pane))
+        {
+            if !self.floating_panes[index].visible {
+                return false;
+            }
+            let next_z = self.next_floating_z_order();
             self.floating_focus = Some(pane.pane_id());
-            self.bring_floating_pane_to_front(pane.pane_id());
-            self.advise_focus_change(prior);
-            return;
+            self.floating_panes[index].z_order = next_z;
+            self.advise_focus_change_with_mux(prior, mux);
+            return true;
         }
 
         if let Some(item) = self
             .iter_panes_ignoring_zoom()
             .iter()
-            .find(|p| p.pane.pane_id() == pane.pane_id())
+            .find(|positioned| Arc::ptr_eq(&positioned.pane, pane))
         {
             self.active = item.index;
             self.recency.tag(item.index);
             self.clear_floating_focus();
-            self.advise_focus_change(prior);
+            self.advise_focus_change_with_mux(prior, mux);
+            return true;
         }
+        false
     }
 
     fn advise_focus_change(&mut self, prior: Option<Arc<dyn Pane>>) {
         let mux = Mux::try_get();
+        self.advise_focus_change_with_mux(prior, mux.as_deref());
+    }
+
+    fn advise_focus_change_with_mux(&mut self, prior: Option<Arc<dyn Pane>>, mux: Option<&Mux>) {
         let current = self.get_active_pane();
         match (prior, current) {
-            (Some(prior), Some(current)) if prior.pane_id() != current.pane_id() => {
+            (Some(prior), Some(current)) if !Arc::ptr_eq(&prior, &current) => {
                 prior.focus_changed(false);
                 current.focus_changed(true);
-                if let Some(mux) = &mux {
+                if let Some(mux) = mux {
                     mux.notify(MuxNotification::PaneFocused(current.pane_id()));
                 }
             }
             (None, Some(current)) => {
                 current.focus_changed(true);
-                if let Some(mux) = &mux {
+                if let Some(mux) = mux {
                     mux.notify(MuxNotification::PaneFocused(current.pane_id()));
                 }
             }
@@ -5687,6 +5728,9 @@ mod test {
         }
 
         fn get_dimensions(&self) -> RenderableDimensions {
+            if let Some(probe) = &self.callback_probe {
+                probe();
+            }
             let size = *self.size.lock();
             RenderableDimensions {
                 cols: size.cols,
@@ -6318,9 +6362,52 @@ mod test {
             .expect("split should succeed");
 
         tab.activate_pane_direction(PaneDirection::Right);
-        assert_eq!(tab.codec_pane_tree(), PaneNode::Empty);
+        assert_ne!(
+            tab.codec_pane_tree_in_window(7, "detached")
+                .expect("codec snapshot must not require a mux singleton"),
+            PaneNode::Empty,
+        );
         assert!(!tab.prune_dead_panes_without_mux());
         assert_eq!(tab.count_panes(), Some(2));
+    }
+
+    #[test]
+    fn codec_snapshot_uses_explicit_owner_metadata_and_observes_after_unlock() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Arc::new(Tab::new(&size));
+        let weak_tab = Arc::downgrade(&tab);
+        let observations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observations_for_probe = Arc::clone(&observations);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let tab = weak_tab.upgrade().expect("tab retained by test");
+            assert!(
+                tab.inner.try_lock().is_some(),
+                "pane observation must run after the codec snapshot releases Tab::inner",
+            );
+            observations_for_probe.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        let pane = FakePane::new_with_callback_probe(89, size, false, false, probe);
+        tab.assign_pane(&pane);
+
+        let encoded = tab
+            .codec_pane_tree_in_window(700, "origin-workspace")
+            .expect("stable tab snapshot");
+        let PaneNode::Leaf(entry) = encoded else {
+            panic!("one-pane tab must encode as a leaf");
+        };
+        assert_eq!(entry.window_id, 700);
+        assert_eq!(entry.workspace, "origin-workspace");
+        assert_eq!(entry.pane_id, 89);
+        assert!(
+            observations.load(std::sync::atomic::Ordering::Acquire) > 0,
+            "the codec path must exercise a reentrancy-checked pane observation",
+        );
     }
 
     #[test]
@@ -8596,6 +8683,62 @@ mod test {
         assert!(tab.iter_floating_panes().is_empty());
         assert_eq!(tab.count_panes(), Some(3));
         assert_eq!(tab.inner.lock().size, size);
+    }
+
+    #[test]
+    fn exact_focus_rejects_a_hidden_stack_member_without_changing_selection() {
+        use crate::layout::default_cycle;
+
+        let (tab, _size) = make_tab_with_n_panes(3);
+        tab.set_layout_cycle(default_cycle());
+        assert_eq!(tab.swap_to_layout_index(2).as_deref(), Some("stacked"));
+
+        let visible = tab
+            .get_active_pane()
+            .expect("stacked layout has one visible active pane");
+        let hidden_id = tab
+            .all_stacked_pane_ids()
+            .into_iter()
+            .find(|pane_id| *pane_id != visible.pane_id())
+            .expect("stacked layout has a hidden pane");
+        let hidden = tab
+            .inner
+            .lock()
+            .find_pane_by_id(hidden_id)
+            .expect("hidden pane remains an exact tab member");
+
+        assert!(
+            !tab.set_active_pane(&hidden),
+            "a hidden stack member cannot be accepted as the active visible pane",
+        );
+        assert!(
+            tab.get_active_pane()
+                .is_some_and(|current| Arc::ptr_eq(&current, &visible)),
+            "a rejected exact focus must preserve the prior visible pane",
+        );
+    }
+
+    #[test]
+    fn exact_focus_rejects_a_distinct_same_id_nonmember() {
+        let (tab, size) = make_tab_with_n_panes(2);
+        let member = tab
+            .iter_panes_ignoring_zoom()
+            .into_iter()
+            .find(|positioned| positioned.pane.pane_id() == 1)
+            .map(|positioned| positioned.pane)
+            .expect("first exact pane member");
+        assert!(tab.set_active_pane(&member));
+
+        let stale_same_id = FakePane::new(2, size);
+        assert!(
+            !tab.set_active_pane(&stale_same_id),
+            "a distinct Arc must not focus the equal-ID pane that is actually in the tab",
+        );
+        assert!(
+            tab.get_active_pane()
+                .is_some_and(|current| Arc::ptr_eq(&current, &member)),
+            "same-ID authority rejection must preserve the exact active pane",
+        );
     }
 
     #[test]

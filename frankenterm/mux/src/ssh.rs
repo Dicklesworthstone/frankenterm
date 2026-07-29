@@ -1,3 +1,4 @@
+use crate::client::ClientId;
 use crate::connui::ConnectionUI;
 use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, WriterWrapper};
 use crate::localpane::LocalPane;
@@ -21,7 +22,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Read, Write};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, AttributeChange, Intensity};
 use termwiz::input::{InputEvent, InputParser};
@@ -347,6 +348,7 @@ impl RemoteSshDomain {
 
     async fn start_new_session(
         &self,
+        mux: &Arc<Mux>,
         command_line: Option<String>,
         env: HashMap<String, String>,
         size: TerminalSize,
@@ -384,6 +386,7 @@ impl RemoteSshDomain {
             child: None,
             rx: child_rx,
             exited: None,
+            mux_owner: Arc::downgrade(mux),
             killer: WrappedSshChildKiller {
                 inner: Arc::new(Mutex::new(KillerInner {
                     killer: None,
@@ -739,6 +742,7 @@ fn connect_ssh_session(
 impl Domain for RemoteSshDomain {
     async fn spawn_pane(
         &self,
+        mux: &Arc<Mux>,
         size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
@@ -780,7 +784,7 @@ impl Domain for RemoteSshDomain {
                     {
                         // Session died (perhaps they closed the initial tab?)
                         // So we'll try making a new one
-                        self.start_new_session(command_line, env, size).await?
+                        self.start_new_session(mux, command_line, env, size).await?
                     } else {
                         log::error!("{err:#?}");
                         return Err(err);
@@ -788,7 +792,7 @@ impl Domain for RemoteSshDomain {
                 }
             }
         } else {
-            self.start_new_session(command_line, env, size).await?
+            self.start_new_session(mux, command_line, env, size).await?
         };
 
         // Wrap up the pty etc. in a LocalPane.  That allows for
@@ -817,8 +821,6 @@ impl Domain for RemoteSshDomain {
             self.id,
             command_description,
         ));
-        let mux = Mux::try_get()
-            .ok_or_else(|| anyhow::anyhow!("cannot add SSH pane: no mux configured"))?;
         mux.add_pane(&pane)?;
 
         Ok(pane)
@@ -832,7 +834,12 @@ impl Domain for RemoteSshDomain {
         &self.name
     }
 
-    async fn attach(&self, _window_id: Option<crate::WindowId>) -> anyhow::Result<()> {
+    async fn attach(
+        &self,
+        _mux: &Arc<Mux>,
+        _owner_client_id: Option<Arc<ClientId>>,
+        _window_id: Option<crate::WindowId>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -874,6 +881,7 @@ pub(crate) struct WrappedSshChild {
     child: Option<SshChildProcess>,
     rx: Receiver<SshChildProcess>,
     exited: Option<ExitStatus>,
+    mux_owner: Weak<Mux>,
     killer: WrappedSshChildKiller,
 }
 
@@ -904,10 +912,11 @@ impl WrappedSshChild {
 
         let (tx, rx) = bounded(1);
         if promise::spawn::is_scheduler_configured() {
+            let mux_owner = Weak::clone(&self.mux_owner);
             promise::spawn::spawn_into_main_thread(async move {
                 if let Ok(status) = child.async_wait().await {
                     tx.send(status).await.ok();
-                    if let Some(mux) = Mux::try_get() {
+                    if let Some(mux) = mux_owner.upgrade() {
                         mux.prune_dead_windows();
                     }
                 }
@@ -946,7 +955,7 @@ impl portable_pty::Child for WrappedSshChild {
             match portable_pty::Child::try_wait(child) {
                 Ok(Some(status)) => {
                     self.exited.replace(status.clone());
-                    if let Some(mux) = Mux::try_get() {
+                    if let Some(mux) = self.mux_owner.upgrade() {
                         mux.prune_dead_windows();
                     }
                     Ok(Some(status))
@@ -993,7 +1002,7 @@ impl portable_pty::Child for WrappedSshChild {
         } else if let Some(child) = self.child.as_mut() {
             let status = portable_pty::Child::wait(child)?;
             self.exited.replace(status.clone());
-            if let Some(mux) = Mux::try_get() {
+            if let Some(mux) = self.mux_owner.upgrade() {
                 mux.prune_dead_windows();
             }
             Ok(status)

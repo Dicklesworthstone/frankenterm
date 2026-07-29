@@ -28,9 +28,10 @@ pub async fn attach_domain_to_window_or_spawn_recovery(
     let mux = Mux::try_get().context("mux singleton is not available")?;
     let domain_id = domain.domain_id();
     let domain_name = domain.domain_name().to_string();
+    let owner_client_id = mux.active_identity();
 
     domain
-        .attach(Some(window_id))
+        .attach(&mux, owner_client_id, Some(window_id))
         .await
         .with_context(|| format!("attaching domain `{domain_name}` to window {window_id}"))?;
 
@@ -42,6 +43,7 @@ pub async fn attach_domain_to_window_or_spawn_recovery(
     config.update_ulimit()?;
     let _tab = domain
         .spawn(
+            &mux,
             config.initial_size(dpi, Some(crate::cell_pixel_dims(&config, f64::from(dpi))?)),
             command,
             command_dir,
@@ -147,7 +149,7 @@ pub async fn spawn_command_internal(
                     .ok_or_else(|| anyhow!("tab to have a pane"))?;
 
                 log::trace!("doing split_pane");
-                let (pane, _size) = mux
+                let (pane, _size, _window_id, _tab_id) = mux
                     .split_pane(
                         // tab.tab_id(),
                         pane.pane_id(),
@@ -157,6 +159,7 @@ pub async fn spawn_command_internal(
                             command_dir: cwd,
                         },
                         spawn.domain,
+                        mux.active_identity(),
                     )
                     .await
                     .context("split_pane")?;
@@ -185,6 +188,7 @@ pub async fn spawn_command_internal(
                     current_pane_id,
                     workspace,
                     spawn.position,
+                    mux.active_identity(),
                 )
                 .await
                 .context("spawn_tab_or_window for floating pane")?;
@@ -225,6 +229,7 @@ pub async fn spawn_command_internal(
                     current_pane_id,
                     workspace,
                     spawn.position,
+                    mux.active_identity(),
                 )
                 .await
                 .context("spawn_tab_or_window")?;
