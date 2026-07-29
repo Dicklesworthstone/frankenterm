@@ -1,7 +1,7 @@
 use crate::termwindow::frame_budget::{OpKind, OpPriority};
 use crate::termwindow::{RenderFrame, TermWindowNotif};
 use ::window::WindowOps;
-use ::window::bitmaps::atlas::OutOfTextureSpace;
+use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
 use anyhow::Context;
 use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
 use frankenterm_font::ClearShapeCache;
@@ -94,6 +94,8 @@ impl crate::TermWindow {
                     if let Some(&OutOfTextureSpace {
                         size: Some(size),
                         current_size,
+                        failure: AtlasAllocationFailure::Capacity,
+                        ..
                     }) = err.root_cause().downcast_ref::<OutOfTextureSpace>()
                     {
                         let result = if pass == 0 {

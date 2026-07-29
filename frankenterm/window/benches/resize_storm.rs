@@ -74,10 +74,11 @@ fn reflow_payload() -> &'static [u8] {
             for idx in 0..512 {
                 writeln!(
                     payload,
-                    "pane-{idx:04} {} {} {}",
-                    "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789",
-                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                    "diagnostics=warning,error,rate-limit,context-window cwd=/tmp/frankenterm/term/src/screen.rs"
+                    "pane-{idx:04} \
+                     abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789 \
+                     ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \
+                     diagnostics=warning,error,rate-limit,context-window \
+                     cwd=/tmp/frankenterm/term/src/screen.rs"
                 )
                 .expect("write reflow payload");
             }

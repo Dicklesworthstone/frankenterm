@@ -14,6 +14,7 @@ categories = ["command-line-utilities"]
 [dev-dependencies]
 criterion = { workspace = true }
 frankenterm-term.workspace = true
+guillotiere.workspace = true
 k9.workspace = true
 
 [[bench]]
@@ -40,7 +41,6 @@ downcast-rs.workspace = true
 thiserror.workspace = true
 bitflags.workspace = true
 euclid.workspace = true
-guillotiere.workspace = true
 lazy_static.workspace = true
 libloading.workspace = true
 line_drawing.workspace = true

@@ -3,7 +3,7 @@ use super::quad::*;
 use super::utilsprites::{RenderMetrics, UtilSprites};
 use crate::termwindow::webgpu::{WebGpuState, WebGpuTexture, adapter_info_to_gpu_info};
 use ::window::bitmaps::Texture2d;
-use ::window::bitmaps::atlas::OutOfTextureSpace;
+use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
 use ::window::glium::backend::Context as GliumContext;
 use ::window::glium::buffer::{BufferMutSlice, Mapping};
 use ::window::glium::{
@@ -57,6 +57,7 @@ fn enforce_texture_atlas_budget(size: usize) -> Result<(), OutOfTextureSpace> {
     Err(OutOfTextureSpace {
         size: None,
         current_size: max_texture_atlas_side_for_budget(budget),
+        failure: AtlasAllocationFailure::MemoryBudget,
     })
 }
 
@@ -804,13 +805,13 @@ impl RenderState {
                     });
                 }
                 Err(OutOfTextureSpace {
-                    size: Some(size), ..
+                    size: Some(size),
+                    failure: AtlasAllocationFailure::Capacity,
+                    ..
                 }) => {
                     atlas_size = size;
                 }
-                Err(OutOfTextureSpace { size: None, .. }) => {
-                    anyhow::bail!("requested texture size is impossible!?")
-                }
+                Err(err) => return Err(err.into()),
             };
         }
     }
@@ -966,6 +967,7 @@ impl RenderState {
 
                     if let Some(&OutOfTextureSpace {
                         size: Some(needed_size),
+                        failure: AtlasAllocationFailure::Capacity,
                         ..
                     }) = err.downcast_ref::<OutOfTextureSpace>()
                     {
@@ -1006,9 +1008,9 @@ impl RenderState {
 #[cfg(test)]
 mod tests {
     use super::{
-        INDICES_PER_CELL, QUAD_CAPACITY_GROWTH_GRANULARITY, build_quad_indices,
-        enforce_texture_atlas_budget, max_texture_atlas_side_for_budget, round_quad_capacity,
-        texture_atlas_footprint_bytes,
+        AtlasAllocationFailure, INDICES_PER_CELL, QUAD_CAPACITY_GROWTH_GRANULARITY,
+        build_quad_indices, enforce_texture_atlas_budget, max_texture_atlas_side_for_budget,
+        round_quad_capacity, texture_atlas_footprint_bytes,
     };
     use crate::quad::{V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT, VERTICES_PER_CELL};
 
@@ -1086,5 +1088,6 @@ mod tests {
 
         assert_eq!(err.size, None);
         assert_eq!(err.current_size, 8192);
+        assert_eq!(err.failure, AtlasAllocationFailure::MemoryBudget);
     }
 }

@@ -18,11 +18,28 @@ use thiserror::*;
 
 const PADDING: i32 = 1;
 
-#[derive(Debug, Error)]
-#[error("Texture Size exceeded, need {:?}", size)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AtlasAllocationFailure {
+    #[error("texture capacity exhausted")]
+    Capacity,
+    #[error("image dimensions must be non-zero and representable")]
+    InvalidDimensions,
+    #[error("scale-down factor must be non-zero")]
+    InvalidScaleFactor,
+    #[error("sprite geometry overflowed its checked representation")]
+    ArithmeticOverflow,
+    #[error("texture allocation exceeds the configured memory budget")]
+    MemoryBudget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "atlas allocation failed: {failure}; current side {current_size}, suggested next side {size:?}"
+)]
 pub struct OutOfTextureSpace {
     pub size: Option<usize>,
     pub current_size: usize,
+    pub failure: AtlasAllocationFailure,
 }
 
 /// Atlases are bitmaps of srgba data that are sized as a power of 2.
@@ -129,11 +146,39 @@ impl Atlas {
     ) -> Result<Sprite, OutOfTextureSpace> {
         let (width, height) = im.image_dimensions();
 
+        if width == 0 || height == 0 {
+            return Err(OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+                failure: AtlasAllocationFailure::InvalidDimensions,
+            });
+        }
+
         if let Some(scale_down) = scale_down {
+            if scale_down == 0 {
+                return Err(OutOfTextureSpace {
+                    size: None,
+                    current_size: self.side,
+                    failure: AtlasAllocationFailure::InvalidScaleFactor,
+                });
+            }
+            if scale_down == 1 {
+                return self.allocate_with_padding(im, padding, None);
+            }
+
+            width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or(OutOfTextureSpace {
+                    size: None,
+                    current_size: self.side,
+                    failure: AtlasAllocationFailure::ArithmeticOverflow,
+                })?;
+
             let mut copied = crate::Image::new(width, height);
             copied.draw_image(Point::new(0, 0), None, im);
 
-            let scaled = copied.resize(width / scale_down, height / scale_down);
+            let scaled = copied.resize((width / scale_down).max(1), (height / scale_down).max(1));
 
             return self.allocate_with_padding(&scaled, padding, None);
         }
@@ -143,46 +188,103 @@ impl Atlas {
         let reserve_width: i32 = width.try_into().map_err(|_| OutOfTextureSpace {
             size: None,
             current_size: self.side,
+            failure: AtlasAllocationFailure::InvalidDimensions,
         })?;
         let reserve_height: i32 = height.try_into().map_err(|_| OutOfTextureSpace {
             size: None,
             current_size: self.side,
+            failure: AtlasAllocationFailure::InvalidDimensions,
         })?;
 
         // We pad each sprite reservation with blank space to avoid
         // surprising and unexpected artifacts when the texture is
         // interpolated on to the render surface.
-        let reserve_width = reserve_width + padding.unwrap_or(0) as i32 + PADDING * 2;
-        let reserve_height = reserve_height + padding.unwrap_or(0) as i32 + PADDING * 2;
+        let extra_padding: i32 =
+            padding
+                .unwrap_or(0)
+                .try_into()
+                .map_err(|_| OutOfTextureSpace {
+                    size: None,
+                    current_size: self.side,
+                    failure: AtlasAllocationFailure::ArithmeticOverflow,
+                })?;
+        let interpolation_padding = PADDING.checked_mul(2).ok_or(OutOfTextureSpace {
+            size: None,
+            current_size: self.side,
+            failure: AtlasAllocationFailure::ArithmeticOverflow,
+        })?;
+        let reserve_width = reserve_width
+            .checked_add(extra_padding)
+            .and_then(|value| value.checked_add(interpolation_padding))
+            .ok_or(OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+                failure: AtlasAllocationFailure::ArithmeticOverflow,
+            })?;
+        let reserve_height = reserve_height
+            .checked_add(extra_padding)
+            .and_then(|value| value.checked_add(interpolation_padding))
+            .ok_or(OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+                failure: AtlasAllocationFailure::ArithmeticOverflow,
+            })?;
 
         let start = std::time::Instant::now();
         let glyph = GlyphSize::try_new(
             reserve_width.try_into().map_err(|_| OutOfTextureSpace {
                 size: None,
                 current_size: self.side,
+                failure: AtlasAllocationFailure::ArithmeticOverflow,
             })?,
             reserve_height.try_into().map_err(|_| OutOfTextureSpace {
                 size: None,
                 current_size: self.side,
+                failure: AtlasAllocationFailure::ArithmeticOverflow,
             })?,
         )
         .ok_or(OutOfTextureSpace {
             size: None,
             current_size: self.side,
+            failure: AtlasAllocationFailure::InvalidDimensions,
         })?;
 
         let res = if let AllocationOutcome::Placed(allocation) = self.allocator.try_alloc(glyph) {
             let left = isize::try_from(allocation.x).map_err(|_| OutOfTextureSpace {
                 size: None,
                 current_size: self.side,
+                failure: AtlasAllocationFailure::ArithmeticOverflow,
             })?;
             let top = isize::try_from(allocation.y).map_err(|_| OutOfTextureSpace {
                 size: None,
                 current_size: self.side,
+                failure: AtlasAllocationFailure::ArithmeticOverflow,
+            })?;
+            let sprite_left = left
+                .checked_add(PADDING as isize)
+                .ok_or(OutOfTextureSpace {
+                    size: None,
+                    current_size: self.side,
+                    failure: AtlasAllocationFailure::ArithmeticOverflow,
+                })?;
+            let sprite_top = top.checked_add(PADDING as isize).ok_or(OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+                failure: AtlasAllocationFailure::ArithmeticOverflow,
+            })?;
+            let visible_width = isize::try_from(width).map_err(|_| OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+                failure: AtlasAllocationFailure::InvalidDimensions,
+            })?;
+            let visible_height = isize::try_from(height).map_err(|_| OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+                failure: AtlasAllocationFailure::InvalidDimensions,
             })?;
             let rect = Rect::new(
-                Point::new(left + PADDING as isize, top + PADDING as isize),
-                Size::new(width as isize, height as isize),
+                Point::new(sprite_left, sprite_top),
+                Size::new(visible_width, visible_height),
             );
 
             self.texture.write(rect, im);
@@ -212,8 +314,9 @@ impl Atlas {
             )
             .increment(1);
             Err(OutOfTextureSpace {
-                size: Some((self.side * 2).max(size)),
+                size: Some(self.side.saturating_mul(2).max(size)),
                 current_size: self.side,
+                failure: AtlasAllocationFailure::Capacity,
             })
         };
         metrics::histogram!("window.atlas.allocate.latency").record(start.elapsed());
@@ -393,6 +496,33 @@ mod tests {
     use crate::bitmaps::ImageTexture;
     use crate::Image;
     use guillotiere::{SimpleAtlasAllocator, Size as LegacyAtlasSize};
+    use std::cell::Cell;
+
+    struct DimensionsOnlyBitmap {
+        width: usize,
+        height: usize,
+        pixel_accessed: Cell<bool>,
+    }
+
+    impl BitmapImage for DimensionsOnlyBitmap {
+        unsafe fn pixel_data(&self) -> *const u8 {
+            self.pixel_accessed.set(true);
+            panic!("invalid dimensions must be rejected before pixel access");
+        }
+
+        unsafe fn pixel_data_mut(&mut self) -> *mut u8 {
+            self.pixel_accessed.set(true);
+            panic!("invalid dimensions must be rejected before mutable pixel access");
+        }
+
+        fn is_mutable(&self) -> bool {
+            false
+        }
+
+        fn image_dimensions(&self) -> (usize, usize) {
+            (self.width, self.height)
+        }
+    }
 
     fn cell(width: usize, height: usize, byte: u8) -> Image {
         let mut image = Image::new(width, height);
@@ -436,6 +566,47 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn assert_fixture_allocation_semantics(
+        side: isize,
+        images: &[(usize, usize)],
+        coords: &[Rect],
+    ) {
+        assert_eq!(coords.len(), images.len());
+        let padding = isize::try_from(PADDING).expect("padding fits");
+        let usable_max = side - padding;
+
+        for (&(width, height), rect) in images.iter().zip(coords) {
+            assert_eq!(
+                rect.size,
+                Size::new(
+                    isize::try_from(width).expect("fixture width fits"),
+                    isize::try_from(height).expect("fixture height fits"),
+                )
+            );
+            assert!(
+                rect.min_x() >= padding
+                    && rect.min_y() >= padding
+                    && rect.max_x() <= usable_max
+                    && rect.max_y() <= usable_max,
+                "fixture allocation {:?} must retain one pixel of atlas-edge padding",
+                rect
+            );
+        }
+
+        for (index, rect) in coords.iter().enumerate() {
+            for other in &coords[index + 1..] {
+                let padded_rect = rect.inflate(padding, padding);
+                let padded_other = other.inflate(padding, padding);
+                assert!(
+                    !padded_rect.intersects(&padded_other),
+                    "padded fixture allocations must not overlap: {:?} and {:?}",
+                    padded_rect,
+                    padded_other
+                );
+            }
+        }
     }
 
     #[test]
@@ -487,13 +658,86 @@ mod tests {
         let mut atlas = fresh_atlas(16);
         let baseline = atlas.version();
 
-        let result = atlas.allocate(&cell(32, 32, 0x55));
-        assert!(result.is_err(), "oversized allocate must fail");
+        let err = atlas
+            .allocate(&cell(32, 32, 0x55))
+            .expect_err("oversized allocate must fail");
+        assert_eq!(err.failure, AtlasAllocationFailure::Capacity);
         assert_eq!(
             atlas.version(),
             baseline,
             "failed allocation must not bump version",
         );
+    }
+
+    #[test]
+    fn invalid_scale_down_and_dimensions_return_typed_errors() {
+        let mut atlas = fresh_atlas(16);
+        let baseline = atlas.version();
+        let image = cell(4, 4, 0x55);
+
+        let err = atlas
+            .allocate_with_padding(&image, None, Some(0))
+            .expect_err("zero scale-down factor must fail");
+        assert_eq!(err.failure, AtlasAllocationFailure::InvalidScaleFactor);
+
+        let zero_width = cell(0, 4, 0x55);
+        let err = atlas
+            .allocate(&zero_width)
+            .expect_err("zero-width images must fail");
+        assert_eq!(err.failure, AtlasAllocationFailure::InvalidDimensions);
+        assert_eq!(atlas.version(), baseline);
+    }
+
+    #[test]
+    fn scale_down_keeps_positive_dimensions_positive() {
+        let mut atlas = fresh_atlas(16);
+        let image = cell(1, 2, 0x55);
+
+        let sprite = atlas
+            .allocate_with_padding(&image, None, Some(8))
+            .expect("valid scale-down must retain a one-pixel image");
+
+        assert_eq!(sprite.coords.size, Size::new(1, 1));
+        assert_eq!(sprite.version(), atlas.version());
+    }
+
+    #[test]
+    fn scale_down_rejects_source_byte_overflow_before_pixel_access() {
+        let mut atlas = fresh_atlas(16);
+        let baseline = atlas.version();
+        let image = DimensionsOnlyBitmap {
+            width: usize::MAX,
+            height: 2,
+            pixel_accessed: Cell::new(false),
+        };
+
+        let err = atlas
+            .allocate_with_padding(&image, None, Some(2))
+            .expect_err("overflowing source byte geometry must fail");
+
+        assert_eq!(err.failure, AtlasAllocationFailure::ArithmeticOverflow);
+        assert!(!image.pixel_accessed.get());
+        assert_eq!(atlas.version(), baseline);
+    }
+
+    #[test]
+    fn oversized_padding_returns_arithmetic_error_without_mutation() {
+        let mut atlas = fresh_atlas(16);
+        let baseline = atlas.version();
+        let image = cell(1, 1, 0x55);
+
+        let err = atlas
+            .allocate_with_padding(&image, Some(usize::MAX), None)
+            .expect_err("unrepresentable padding must fail");
+
+        assert_eq!(err.failure, AtlasAllocationFailure::ArithmeticOverflow);
+        assert_eq!(atlas.version(), baseline);
+
+        let err = atlas
+            .allocate_with_padding(&image, Some(i32::MAX as usize), None)
+            .expect_err("padding addition overflow must fail");
+        assert_eq!(err.failure, AtlasAllocationFailure::ArithmeticOverflow);
+        assert_eq!(atlas.version(), baseline);
     }
 
     #[test]
@@ -614,9 +858,9 @@ mod tests {
     }
 
     #[test]
-    fn bin_packer_backed_atlas_matches_legacy_simple_atlas_fixture() {
+    fn bin_packer_backed_atlas_preserves_legacy_fixture_semantics() {
         let fixtures = [(8, 8), (10, 6), (4, 12), (12, 12), (6, 6)];
-        let expected = legacy_simple_atlas_coords(128, &fixtures);
+        let legacy = legacy_simple_atlas_coords(128, &fixtures);
         let mut atlas = fresh_atlas(128);
 
         let actual: Vec<Rect> = fixtures
@@ -634,7 +878,13 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(actual, expected);
+        // Adaptive packers intentionally choose different coordinates from
+        // guillotiere. The caller-visible compatibility contract is that the
+        // same fixture corpus is accepted with the same sprite dimensions,
+        // atlas-edge padding, and non-overlap guarantees; requiring identical
+        // coordinates would make algorithm selection impossible.
+        assert_fixture_allocation_semantics(128, &fixtures, &legacy);
+        assert_fixture_allocation_semantics(128, &fixtures, &actual);
         assert_eq!(atlas.version(), fixtures.len() as u64);
     }
 }
