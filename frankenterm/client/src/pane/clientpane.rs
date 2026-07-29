@@ -21,6 +21,7 @@ use rangeset::RangeSet;
 use ratelim::RateLimiter;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
 use std::ops::Range;
 use std::sync::Arc;
 use termwiz::input::KeyEvent;
@@ -373,7 +374,9 @@ impl Pane for ClientPane {
         );
         map.insert(
             Value::String("since_last_response_ms".to_string()),
-            Value::U64(inner.last_recv_time.elapsed().as_millis() as u64),
+            Value::U64(
+                u64::try_from(inner.last_recv_time.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ),
         );
 
         Value::Object(map.into())
@@ -793,39 +796,12 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use crate::domain::ClientDomainConfig;
+    use crate::MuxTestScope;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::{Mux, MuxNotification};
-    use promise::spawn::SimpleExecutor;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex as StdMutex, Once};
-
-    fn ensure_test_scheduler() {
-        static TEST_SCHEDULER: Once = Once::new();
-        TEST_SCHEDULER.call_once(|| {
-            let _ = Box::leak(Box::new(SimpleExecutor::new()));
-        });
-    }
-
-    struct ScopedMux(Option<Arc<Mux>>);
-
-    impl ScopedMux {
-        fn install(mux: &Arc<Mux>) -> Self {
-            let prior = Mux::try_get();
-            Mux::set_mux(mux);
-            Self(prior)
-        }
-    }
-
-    impl Drop for ScopedMux {
-        fn drop(&mut self) {
-            if let Some(prior) = self.0.take() {
-                Mux::set_mux(&prior);
-            } else {
-                Mux::shutdown();
-            }
-        }
-    }
+    use std::sync::Mutex as StdMutex;
 
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
         let unix = UnixDomain {
@@ -904,10 +880,9 @@ mod tests {
 
     #[test]
     fn render_delta_updates_authoritative_alt_screen_state() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let inner = test_client_inner(17);
         let pane = Arc::new(ClientPane::new(
             &inner,
@@ -969,8 +944,7 @@ mod tests {
 
     #[test]
     fn registration_slot_is_stable_and_rejects_concurrent_mux_owners() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let _scope = MuxTestScope::enter();
         let first_mux = Arc::new(Mux::new(None));
         let second_mux = Arc::new(Mux::new(None));
         let inner = test_client_inner(17);
@@ -1025,10 +999,9 @@ mod tests {
 
     #[test]
     fn unilateral_state_alert_is_forwarded_exactly_once() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let observed = Arc::new(StdMutex::new(Vec::new()));
         let observed_for_subscriber = Arc::clone(&observed);
         mux.subscribe(move |notification| {
@@ -1096,10 +1069,9 @@ mod tests {
 
     #[test]
     fn unilateral_rejects_registration_for_a_different_pane() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let observed = Arc::new(StdMutex::new(Vec::new()));
         let observed_for_subscriber = Arc::clone(&observed);
         mux.subscribe(move |notification| {
@@ -1149,10 +1121,9 @@ mod tests {
 
     #[test]
     fn unilateral_clipboard_callback_can_reenter_set_clipboard() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let inner = test_client_inner(17);
         let pane = test_client_pane(&inner, 36, 31);
         let pane_for_mux: Arc<dyn Pane> = pane.clone();

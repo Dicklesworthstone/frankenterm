@@ -1710,36 +1710,8 @@ impl Domain for ClientDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MuxTestScope;
     use mux::tab::{PaneEntry, PaneNode};
-    use promise::spawn::SimpleExecutor;
-    use std::sync::Once;
-
-    fn ensure_test_scheduler() {
-        static TEST_SCHEDULER: Once = Once::new();
-        TEST_SCHEDULER.call_once(|| {
-            let _ = Box::leak(Box::new(SimpleExecutor::new()));
-        });
-    }
-
-    struct ScopedMux(Option<Arc<Mux>>);
-
-    impl ScopedMux {
-        fn install(mux: &Arc<Mux>) -> Self {
-            let prior = Mux::try_get();
-            Mux::set_mux(mux);
-            Self(prior)
-        }
-    }
-
-    impl Drop for ScopedMux {
-        fn drop(&mut self) {
-            if let Some(prior) = self.0.take() {
-                Mux::set_mux(&prior);
-            } else {
-                Mux::shutdown();
-            }
-        }
-    }
 
     fn test_client_id(name: &str, pid: u32) -> Arc<ClientId> {
         Arc::new(ClientId {
@@ -1754,9 +1726,9 @@ mod tests {
 
     #[test]
     fn active_workspace_sync_request_only_targets_attached_owner_client() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
 
         let owner = test_client_id("owner", 41_001);
         let other = test_client_id("other", 41_002);
@@ -1786,9 +1758,9 @@ mod tests {
 
     #[test]
     fn active_workspace_sync_request_tracks_renamed_owner_workspace() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
 
         let owner = test_client_id("owner", 41_003);
         mux.register_client(Arc::clone(&owner));
@@ -1805,9 +1777,9 @@ mod tests {
 
     #[test]
     fn spawn_workspace_prefers_target_window_over_active_workspace() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
 
         let owner = test_client_id("owner", 41_004);
         mux.register_client(Arc::clone(&owner));
@@ -1842,9 +1814,9 @@ mod tests {
 
     #[test]
     fn stale_attachment_cannot_detach_a_same_domain_replacement() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let config = ClientDomainConfig::Unix(UnixDomain {
             name: "exact-detach-test".to_string(),
             ..UnixDomain::default()
@@ -1913,9 +1885,9 @@ mod tests {
 
     #[test]
     fn malformed_remote_tab_title_cardinality_is_rejected_before_topology_mutation() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let inner = test_client_inner(91_001);
         let mut listing = sample_remote_tab_listing();
         listing.tab_titles.clear();
@@ -1939,9 +1911,9 @@ mod tests {
 
     #[test]
     fn duplicate_remote_pane_identity_is_rejected_before_topology_mutation() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let inner = test_client_inner(91_003);
         let mut listing = sample_remote_tab_listing();
         listing.tabs.push(listing.tabs[0].clone());
@@ -1967,10 +1939,9 @@ mod tests {
 
     #[test]
     fn process_pane_list_uses_its_explicit_mux_when_the_global_mux_differs() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let ambient_mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&ambient_mux);
+        scope.set_mux(&ambient_mux);
         let target_mux = Arc::new(Mux::new(None));
         let inner = test_client_inner(91_004);
 
@@ -2020,9 +1991,9 @@ mod tests {
 
     #[test]
     fn stable_topology_resync_reuses_unconsumed_fallback_pane_id() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let inner = test_client_inner(91_002);
 
         ClientDomain::process_pane_list(
@@ -2086,7 +2057,7 @@ mod tests {
                     return;
                 }
             }
-            if !flag.load(Ordering::SeqCst) {
+            if !flag.swap(true, Ordering::SeqCst) {
                 eprintln!(
                     "WATCHDOG: `{label}` did not complete within {secs}s — likely a \
                      mux-lock deadlock regression (read guard held across a write lock)."
@@ -2122,14 +2093,13 @@ mod tests {
     /// regression fail fast instead of hanging.
     #[test]
     fn process_pane_list_seeds_spawned_client_pane_alt_screen_state() {
+        let scope = MuxTestScope::enter();
         let _wd = deadlock_watchdog(
             30,
             "process_pane_list_seeds_spawned_client_pane_alt_screen_state",
         );
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
 
         let local_domain_id = alloc_domain_id();
         let inner = test_client_inner(local_domain_id);
@@ -2163,10 +2133,9 @@ mod tests {
 
     #[test]
     fn process_pane_list_keeps_workspace_mismatch_out_of_primary_window() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
 
         let local_domain_id = alloc_domain_id();
         let inner = test_client_inner(local_domain_id);
@@ -2191,10 +2160,9 @@ mod tests {
 
     #[test]
     fn resolve_remote_spawn_entities_returns_local_ids_after_sync() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
 
         let local_domain_id = alloc_domain_id();
         let inner = test_client_inner(local_domain_id);
@@ -2240,10 +2208,9 @@ mod tests {
 
     #[test]
     fn resolve_remote_spawn_entities_errors_when_remote_ids_do_not_resolve() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
-        ensure_test_scheduler();
+        let scope = MuxTestScope::enter();
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(&mux);
+        scope.set_mux(&mux);
         let inner = test_client_inner(alloc_domain_id());
 
         let error = match ClientDomain::resolve_remote_spawn_entities(

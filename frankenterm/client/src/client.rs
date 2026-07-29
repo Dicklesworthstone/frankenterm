@@ -2689,6 +2689,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MuxTestScope;
     use asupersync::runtime::RuntimeBuilder;
     use codec::{
         GetCodecVersionResponse, PaneRemoved, SetClientId, UnitResponse, WindowTitleChanged,
@@ -2711,26 +2712,6 @@ mod tests {
     static TEST_LOGGER_INIT: Once = Once::new();
     #[cfg(unix)]
     static TEST_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    struct ScopedMux(Option<Arc<Mux>>);
-
-    impl ScopedMux {
-        fn install(mux: &Arc<Mux>) -> Self {
-            let prior = Mux::try_get();
-            Mux::set_mux(mux);
-            Self(prior)
-        }
-    }
-
-    impl Drop for ScopedMux {
-        fn drop(&mut self) {
-            if let Some(prior) = self.0.take() {
-                Mux::set_mux(&prior);
-            } else {
-                Mux::shutdown();
-            }
-        }
-    }
 
     struct TestLogger {
         records: StdMutex<Vec<String>>,
@@ -2820,7 +2801,7 @@ mod tests {
                     return;
                 }
             }
-            if !flag.load(Ordering::SeqCst) {
+            if !flag.swap(true, Ordering::SeqCst) {
                 eprintln!("WATCHDOG: `{label}` HUNG after {secs}s");
                 std::process::exit(exit_code);
             }
@@ -4316,10 +4297,10 @@ mod tests {
 
     #[test]
     fn attached_authority_uses_captured_mux_not_process_global_mux() {
-        let _lock = crate::MUX_TEST_LOCK.lock().unwrap();
+        let scope = MuxTestScope::enter();
         let origin_mux = Arc::new(Mux::new(None));
         let replacement_mux = Arc::new(Mux::new(None));
-        let _global_mux = ScopedMux::install(&replacement_mux);
+        scope.set_mux(&replacement_mux);
 
         let authority = ClientDispatchAuthority::new(
             Some(42),
