@@ -339,12 +339,10 @@ impl Pane for ClientPane {
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
         let palette = self.configured_palette.lock().clone();
-        let request = client
-            .client
-            .set_configured_palette_for_pane(SetPalette {
-                pane_id: remote_pane_id,
-                palette,
-            });
+        let request = client.client.set_configured_palette_for_pane(SetPalette {
+            pane_id: remote_pane_id,
+            palette,
+        });
         promise::spawn::spawn(async move {
             let registration_is_current = mux_registration
                 .load()
@@ -446,7 +444,7 @@ impl Pane for ClientPane {
             pane_id: remote_pane_id,
             data,
         });
-        promise::spawn::spawn(async move { request.await }).detach();
+        promise::spawn::spawn(request).detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -475,7 +473,7 @@ impl Pane for ClientPane {
             pane_id: remote_pane_id,
             zoomed,
         });
-        promise::spawn::spawn(async move { request.await }).detach();
+        promise::spawn::spawn(request).detach();
         inner.update_last_send();
     }
 
@@ -507,7 +505,7 @@ impl Pane for ClientPane {
                 pane_id: remote_pane_id,
                 size,
             });
-            promise::spawn::spawn(async move { request.await }).detach();
+            promise::spawn::spawn(request).detach();
             inner.update_last_send();
         }
         Ok(())
@@ -554,7 +552,7 @@ impl Pane for ClientPane {
             },
             input_serial,
         });
-        promise::spawn::spawn(async move { request.await }).detach();
+        promise::spawn::spawn(request).detach();
         self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
@@ -569,7 +567,7 @@ impl Pane for ClientPane {
                 modifiers: mods,
             },
         });
-        promise::spawn::spawn(async move { request.await }).detach();
+        promise::spawn::spawn(request).detach();
         Ok(())
     }
 
@@ -592,7 +590,7 @@ impl Pane for ClientPane {
             let request = client.client.kill_pane(KillPane {
                 pane_id: remote_pane_id,
             });
-            promise::spawn::spawn(async move { request.await }).detach();
+            promise::spawn::spawn(request).detach();
         }
     }
 
@@ -642,7 +640,7 @@ impl Pane for ClientPane {
             pane_id: remote_pane_id,
             erase_mode,
         });
-        promise::spawn::spawn(async move { request.await }).detach();
+        promise::spawn::spawn(request).detach();
     }
 
     fn advise_focus(&self) {
@@ -657,7 +655,7 @@ impl Pane for ClientPane {
             let request = client.client.set_focused_pane_id(SetFocusedPane {
                 pane_id: remote_pane_id,
             });
-            promise::spawn::spawn(async move { request.await }).detach();
+            promise::spawn::spawn(request).detach();
         }
     }
 
@@ -690,13 +688,11 @@ impl Pane for ClientPane {
         // and now send the color palette to the server
         let client = Arc::clone(&self.client);
         let remote_pane_id = self.remote_pane_id;
-        let request = client
-            .client
-            .set_configured_palette_for_pane(SetPalette {
-                pane_id: remote_pane_id,
-                palette,
-            });
-        promise::spawn::spawn(async move { request.await }).detach();
+        let request = client.client.set_configured_palette_for_pane(SetPalette {
+            pane_id: remote_pane_id,
+            palette,
+        });
+        promise::spawn::spawn(request).detach();
         self.config.lock().replace(config);
     }
 
@@ -730,7 +726,7 @@ impl std::io::Write for PaneWriter {
         let data = data.to_vec();
         let len = data.len();
         let request = client.client.write_to_pane(WriteToPane { pane_id, data });
-        promise::spawn::spawn(async move { request.await }).detach();
+        promise::spawn::spawn(request).detach();
         Ok(len)
     }
 

@@ -22,8 +22,8 @@ use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use parking_lot::Mutex as ParkingMutex;
 use portable_pty::Child;
-use std::collections::{hash_map::Entry, HashMap};
-use std::future::poll_fn;
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::future::{poll_fn, Future};
 use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
@@ -42,10 +42,41 @@ use wezterm_uds::UnixStream;
 
 const UNIX_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const INITIAL_CONNECTION_GENERATION: u64 = 1;
+const MAX_PRE_READY_UNILATERAL_PDUS: usize = 1_024;
+const MAX_PRE_READY_UNILATERAL_BYTES: usize = 64 * 1024 * 1024;
+const MUX_RPC_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
 struct Timeout;
+
+pub(crate) async fn with_mux_rpc_bootstrap_timeout<T, F>(operation: F) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    with_mux_rpc_bootstrap_timeout_for(MUX_RPC_BOOTSTRAP_TIMEOUT, operation).await
+}
+
+async fn with_mux_rpc_bootstrap_timeout_for<T, F>(
+    timeout_duration: Duration,
+    operation: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let timeout = async move {
+        promise::spawn::sleep(timeout_duration).await;
+        Err(anyhow::Error::new(Timeout)).context(format!(
+            "mux RPC bootstrap exceeded its {:?} deadline",
+            timeout_duration
+        ))
+    };
+    pin_mut!(operation);
+    pin_mut!(timeout);
+    match select(operation, timeout).await {
+        Either::Left((result, _)) | Either::Right((result, _)) => result,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcDeliveryCertainty {
@@ -172,12 +203,23 @@ fn record_rpc_transport_error(error: &RpcTransportError) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcErrorCompletion {
+    Delivered,
+    Abandoned,
+    Full,
+}
+
 fn complete_with_rpc_transport_error(
     completion: &Sender<anyhow::Result<Pdu>>,
     error: RpcTransportError,
-) {
+) -> RpcErrorCompletion {
     record_rpc_transport_error(&error);
-    let _ = completion.try_send(Err(anyhow::Error::new(error)));
+    match completion.try_send(Err(anyhow::Error::new(error))) {
+        Ok(()) => RpcErrorCompletion::Delivered,
+        Err(TrySendError::Closed(_)) => RpcErrorCompletion::Abandoned,
+        Err(TrySendError::Full(_)) => RpcErrorCompletion::Full,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +378,19 @@ enum ReaderMessage {
         generation: NonZeroU64,
         reason: &'static str,
     },
+    PublishReady {
+        generation: NonZeroU64,
+        reader_sender: Sender<ReaderMessage>,
+        promise: Sender<anyhow::Result<()>>,
+    },
+    FinishReadyReplay {
+        generation: NonZeroU64,
+        reader_sender: Sender<ReaderMessage>,
+        promise: Sender<anyhow::Result<()>>,
+        replayed_pdus: usize,
+        replayed_bytes: usize,
+        result: anyhow::Result<()>,
+    },
 }
 
 impl ReaderMessage {
@@ -353,6 +408,16 @@ impl ReaderMessage {
                 let _ = promise.try_send(Err(anyhow::Error::new(error)));
             }
             Self::AbortGeneration { .. } => {}
+            Self::PublishReady { promise, .. } => {
+                let _ = promise.try_send(Err(anyhow!(
+                    "mux RPC readiness publication retired before reader admission: {reason}"
+                )));
+            }
+            Self::FinishReadyReplay { promise, .. } => {
+                let _ = promise.try_send(Err(anyhow!(
+                    "mux RPC readiness replay retired before completion: {reason}"
+                )));
+            }
         }
     }
 }
@@ -382,6 +447,41 @@ pub(crate) struct RpcGenerationScope {
     rpc_transport: Arc<RpcTransportState>,
     generation: Option<NonZeroU64>,
     allow_unready: bool,
+}
+
+/// Cancellation-safe retirement for a bootstrap operation that may have
+/// received a state-subsuming response but has not yet published readiness.
+pub(crate) struct RpcGenerationAbortGuard {
+    sender: Sender<ReaderMessage>,
+    rpc_transport: Arc<RpcTransportState>,
+    generation: NonZeroU64,
+    reason: &'static str,
+    armed: bool,
+}
+
+impl RpcGenerationAbortGuard {
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RpcGenerationAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let phase = self.rpc_transport.phase.lock();
+        if !matches!(
+            *phase,
+            RpcTransportPhase::Live(observed) if observed == self.generation
+        ) {
+            return;
+        }
+        let _ = self.sender.try_send(ReaderMessage::AbortGeneration {
+            generation: self.generation,
+            reason: self.reason,
+        });
+    }
 }
 
 impl RpcGenerationScope {
@@ -451,6 +551,22 @@ impl RpcGenerationScope {
 
     pub(crate) fn is_available(&self) -> bool {
         self.generation.is_some()
+    }
+
+    pub(crate) fn abort_guard(
+        &self,
+        reason: &'static str,
+    ) -> anyhow::Result<RpcGenerationAbortGuard> {
+        let generation = self
+            .generation
+            .ok_or_else(|| anyhow!("cannot guard an unavailable mux RPC scope"))?;
+        Ok(RpcGenerationAbortGuard {
+            sender: self.sender.clone(),
+            rpc_transport: Arc::clone(&self.rpc_transport),
+            generation,
+            reason,
+            armed: true,
+        })
     }
 
     fn send_pdu(
@@ -544,7 +660,21 @@ impl RpcGenerationScope {
                 }
             }
             match rx.recv().await {
-                Ok(result) => result,
+                Ok(Ok(pdu)) => {
+                    rpc_transport
+                        .validate(
+                            binding,
+                            RpcRetirementStage::CompletionChannel,
+                            RpcDeliveryCertainty::OutcomeUnknown,
+                            "transport retired after response delivery and before caller observation",
+                        )
+                        .map_err(|error| {
+                            record_rpc_transport_error(&error);
+                            anyhow::Error::new(error)
+                        })?;
+                    Ok(pdu)
+                }
+                Ok(Err(error)) => Err(error),
                 Err(_) => Err(anyhow::Error::new(rpc_transport.retirement_error(
                     binding,
                     RpcRetirementStage::CompletionChannel,
@@ -637,10 +767,8 @@ impl ClientDispatchAuthority {
         let mut phase = self.rpc_transport.phase.lock();
         let next_generation = self.generation.checked_add(1).and_then(NonZeroU64::new);
 
-        if let (
-            Some(next_generation),
-            RpcTransportPhase::Reconnecting { retired, next },
-        ) = (next_generation, *phase)
+        if let (Some(next_generation), RpcTransportPhase::Reconnecting { retired, next }) =
+            (next_generation, *phase)
         {
             if retired == current && next == next_generation {
                 return Ok(next);
@@ -873,12 +1001,6 @@ impl CurrentClientDispatch {
             .expect("current client dispatch was resolved from a ClientDomain")
     }
 
-    fn rpc_scope(&self) -> RpcGenerationScope {
-        let generation = NonZeroU64::new(self.authority.generation)
-            .expect("current dispatch authority generation is nonzero");
-        self.inner.client.rpc_scope_at(generation)
-    }
-
     pub(crate) fn bootstrap_rpc_scope(&self) -> RpcGenerationScope {
         let generation = NonZeroU64::new(self.authority.generation)
             .expect("current dispatch authority generation is nonzero");
@@ -1078,21 +1200,6 @@ macro_rules! rpc_surface {
     };
 }
 
-fn process_unilateral_inner(dispatch: CurrentClientDispatch, pane_id: PaneId, decoded: DecodedPdu) {
-    if !dispatch.is_current() {
-        return;
-    }
-    let admitted = admit_client_pane(&dispatch, pane_id);
-    if !dispatch.is_current() {
-        return;
-    }
-    promise::spawn::spawn(async move {
-        process_unilateral_inner_async(dispatch, admitted, pane_id, decoded).await?;
-        Ok::<(), anyhow::Error>(())
-    })
-    .detach();
-}
-
 fn admit_client_pane(
     dispatch: &CurrentClientDispatch,
     remote_pane_id: PaneId,
@@ -1129,7 +1236,7 @@ async fn process_unilateral_inner_async(
         return Ok(());
     }
     let client_domain = dispatch.client_domain();
-    let rpc = dispatch.rpc_scope();
+    let rpc = dispatch.bootstrap_rpc_scope();
 
     let (pane, registration) = if let Some(admitted) = admitted {
         admitted
@@ -1148,16 +1255,12 @@ async fn process_unilateral_inner_async(
                     return Ok(());
                 }
                 let resync_result = client_domain
-                    .resync_if_current(
-                        Arc::clone(&dispatch.mux),
-                        Arc::clone(&dispatch.inner),
-                        &rpc,
-                    )
+                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                     .await;
                 if !dispatch.is_current() {
                     return Ok(());
                 }
-                resync_result?;
+                let _ = resync_result?;
                 dispatch
                     .inner
                     .remote_to_local_pane_id(&dispatch.mux, pane_id)
@@ -1177,16 +1280,12 @@ async fn process_unilateral_inner_async(
                     return Ok(());
                 }
                 let resync_result = client_domain
-                    .resync_if_current(
-                        Arc::clone(&dispatch.mux),
-                        Arc::clone(&dispatch.inner),
-                        &rpc,
-                    )
+                    .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
                     .await;
                 if !dispatch.is_current() {
                     return Ok(());
                 }
-                resync_result?;
+                let _ = resync_result?;
 
                 let local_pane_id = dispatch
                     .inner
@@ -1242,7 +1341,8 @@ async fn process_unilateral_inner_async(
     if !dispatch.is_current() {
         return Ok(());
     }
-    result
+    result?;
+    Ok(())
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -1298,7 +1398,37 @@ fn process_unilateral(
     let Some(dispatch) = authority.resolve_current()? else {
         return Ok(());
     };
+    promise::spawn::spawn_into_main_thread(async move {
+        apply_unilateral_on_main_thread(dispatch, decoded).await
+    })
+    .detach();
+    Ok(())
+}
 
+async fn process_unilateral_with_barrier(
+    authority: &ClientDispatchAuthority,
+    decoded: DecodedPdu,
+) -> anyhow::Result<()> {
+    if !authority.generation_is_current() {
+        return Ok(());
+    }
+    if authority.is_standalone() {
+        handle_unilateral_without_local_domain(&decoded)?;
+        return Ok(());
+    }
+    let Some(dispatch) = authority.resolve_current()? else {
+        return Ok(());
+    };
+    promise::spawn::spawn_into_main_thread(async move {
+        apply_unilateral_on_main_thread(dispatch, decoded).await
+    })
+    .await
+}
+
+async fn apply_unilateral_on_main_thread(
+    dispatch: CurrentClientDispatch,
+    decoded: DecodedPdu,
+) -> anyhow::Result<()> {
     match &decoded.pdu {
         Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
             window_id,
@@ -1309,28 +1439,19 @@ fn process_unilateral(
             if !dispatch.is_current() {
                 return Ok(());
             }
-            promise::spawn::spawn_into_main_thread(async move {
+            let local_window_id = dispatch
+                .client_domain()
+                .remote_to_local_window_id(window_id)
+                .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
+            if !dispatch.is_current() {
+                return Ok(());
+            }
+            if let Some(mut window) = dispatch.mux.get_window_mut(local_window_id) {
                 if !dispatch.is_current() {
                     return Ok(());
                 }
-                let local_window_id = dispatch
-                    .client_domain()
-                    .remote_to_local_window_id(window_id)
-                    .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                if let Some(mut window) = dispatch.mux.get_window_mut(local_window_id) {
-                    if !dispatch.is_current() {
-                        return Ok(());
-                    }
-                    window.set_workspace(&workspace);
-                }
-
-                anyhow::Result::<()>::Ok(())
-            })
-            .detach();
-
+                window.set_workspace(&workspace);
+            }
             return Ok(());
         }
         Pdu::WindowTitleChanged(WindowTitleChanged { window_id, title }) => {
@@ -1339,21 +1460,14 @@ fn process_unilateral(
             if !dispatch.is_current() {
                 return Ok(());
             }
-            promise::spawn::spawn_into_main_thread(async move {
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                let local_window_id = dispatch
-                    .client_domain()
-                    .remote_to_local_window_id(window_id)
-                    .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                dispatch.mux.set_window_title(local_window_id, &title);
-                anyhow::Result::<()>::Ok(())
-            })
-            .detach();
+            let local_window_id = dispatch
+                .client_domain()
+                .remote_to_local_window_id(window_id)
+                .ok_or_else(|| anyhow!("no local window for remote window id {}", window_id))?;
+            if !dispatch.is_current() {
+                return Ok(());
+            }
+            dispatch.mux.set_window_title(local_window_id, &title);
             return Ok(());
         }
         Pdu::RenameWorkspace(RenameWorkspace {
@@ -1365,17 +1479,10 @@ fn process_unilateral(
             if !dispatch.is_current() {
                 return Ok(());
             }
-            promise::spawn::spawn_into_main_thread(async move {
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                log::debug!("got a rename {old_workspace} -> {new_workspace}");
-                dispatch
-                    .mux
-                    .rename_workspace(&old_workspace, &new_workspace);
-                anyhow::Result::<()>::Ok(())
-            })
-            .detach();
+            log::debug!("got a rename {old_workspace} -> {new_workspace}");
+            dispatch
+                .mux
+                .rename_workspace(&old_workspace, &new_workspace);
             return Ok(());
         }
         Pdu::TabTitleChanged(TabTitleChanged { tab_id, title }) => {
@@ -1384,21 +1491,14 @@ fn process_unilateral(
             if !dispatch.is_current() {
                 return Ok(());
             }
-            promise::spawn::spawn_into_main_thread(async move {
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                let local_tab_id = dispatch
-                    .inner
-                    .remote_to_local_tab_id(tab_id)
-                    .ok_or_else(|| anyhow!("no local tab for remote tab id {}", tab_id))?;
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                dispatch.mux.set_tab_title(local_tab_id, &title);
-                anyhow::Result::<()>::Ok(())
-            })
-            .detach();
+            let local_tab_id = dispatch
+                .inner
+                .remote_to_local_tab_id(tab_id)
+                .ok_or_else(|| anyhow!("no local tab for remote tab id {}", tab_id))?;
+            if !dispatch.is_current() {
+                return Ok(());
+            }
+            dispatch.mux.set_tab_title(local_tab_id, &title);
             return Ok(());
         }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
@@ -1406,26 +1506,15 @@ fn process_unilateral(
             if !dispatch.is_current() {
                 return Ok(());
             }
-            let rpc = dispatch.rpc_scope();
-            promise::spawn::spawn_into_main_thread(async move {
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                let result = dispatch
-                    .client_domain()
-                    .resync_if_current(
-                        Arc::clone(&dispatch.mux),
-                        Arc::clone(&dispatch.inner),
-                        &rpc,
-                    )
-                    .await;
-                if !dispatch.is_current() {
-                    return Ok(());
-                }
-                result
-            })
-            .detach();
-
+            let rpc = dispatch.bootstrap_rpc_scope();
+            let result = dispatch
+                .client_domain()
+                .resync_if_current(Arc::clone(&dispatch.mux), Arc::clone(&dispatch.inner), &rpc)
+                .await;
+            if !dispatch.is_current() {
+                return Ok(());
+            }
+            let _ = result?;
             return Ok(());
         }
         _ => {}
@@ -1435,14 +1524,267 @@ fn process_unilateral(
         if !dispatch.is_current() {
             return Ok(());
         }
-        promise::spawn::spawn_into_main_thread(async move {
-            if dispatch.is_current() {
-                process_unilateral_inner(dispatch, pane_id, decoded);
-            }
-        })
-        .detach();
+        let admitted = admit_client_pane(&dispatch, pane_id);
+        if !dispatch.is_current() {
+            return Ok(());
+        }
+        return process_unilateral_inner_async(dispatch, admitted, pane_id, decoded).await;
     } else {
         bail!("don't know how to handle {:?}", decoded);
+    }
+}
+
+#[derive(Debug)]
+struct QuarantinedUnilateral {
+    frame: Vec<u8>,
+    snapshot_subsumed: bool,
+}
+
+impl QuarantinedUnilateral {
+    fn encode(decoded: DecodedPdu) -> anyhow::Result<Self> {
+        debug_assert_eq!(decoded.serial, 0);
+        let snapshot_subsumed = matches!(
+            decoded.pdu,
+            Pdu::PaneRemoved(_)
+                | Pdu::PaneFocused(_)
+                | Pdu::TabResized(_)
+                | Pdu::TabAddedToWindow(_)
+                | Pdu::TabTitleChanged(_)
+                | Pdu::WindowTitleChanged(_)
+        );
+        let frame = decoded
+            .pdu
+            .encode_retained_frame(0)
+            .context("encoding a pre-ready unilateral PDU for bounded retention")?;
+        Ok(Self {
+            frame,
+            snapshot_subsumed,
+        })
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.frame.len()
+    }
+
+    fn decode(self) -> anyhow::Result<DecodedPdu> {
+        let decoded = Pdu::decode_retained_frame(self.frame.as_slice())
+            .context("decoding a retained pre-ready unilateral PDU")?;
+        if decoded.serial != 0 {
+            bail!(
+                "retained unilateral PDU replay decoded reserved serial {}",
+                decoded.serial
+            );
+        }
+        Ok(decoded)
+    }
+}
+
+#[derive(Default)]
+struct PreReadyUnilateralQueue {
+    waiting: VecDeque<QuarantinedUnilateral>,
+    waiting_bytes: usize,
+}
+
+impl PreReadyUnilateralQueue {
+    fn enqueue(
+        &mut self,
+        decoded: DecodedPdu,
+        replayed_pdus_in_flight: usize,
+        replayed_bytes_in_flight: usize,
+    ) -> anyhow::Result<()> {
+        self.enqueue_with_limits(
+            decoded,
+            replayed_pdus_in_flight,
+            replayed_bytes_in_flight,
+            MAX_PRE_READY_UNILATERAL_PDUS,
+            MAX_PRE_READY_UNILATERAL_BYTES,
+        )
+    }
+
+    fn enqueue_with_limits(
+        &mut self,
+        decoded: DecodedPdu,
+        replayed_pdus_in_flight: usize,
+        replayed_bytes_in_flight: usize,
+        max_pdus: usize,
+        max_bytes: usize,
+    ) -> anyhow::Result<()> {
+        let retained_pdus = self
+            .waiting
+            .len()
+            .checked_add(replayed_pdus_in_flight)
+            .context("pre-ready unilateral PDU count overflow")?;
+        if retained_pdus >= max_pdus {
+            metrics::counter!(
+                "mux.client.rpc.pre_ready_quarantine_rejected.total",
+                "reason" => "count_limit"
+            )
+            .increment(1);
+            bail!(
+                "pre-ready unilateral quarantine reached its {} PDU limit",
+                max_pdus
+            );
+        }
+
+        let queued = QuarantinedUnilateral::encode(decoded)?;
+        let retained_bytes = self
+            .waiting_bytes
+            .checked_add(replayed_bytes_in_flight)
+            .context("pre-ready unilateral retained-byte count overflow")?;
+        let total_bytes = retained_bytes
+            .checked_add(queued.retained_bytes())
+            .context("pre-ready unilateral retained-byte count overflow")?;
+        if total_bytes > max_bytes {
+            metrics::counter!(
+                "mux.client.rpc.pre_ready_quarantine_rejected.total",
+                "reason" => "byte_limit"
+            )
+            .increment(1);
+            bail!(
+                "pre-ready unilateral quarantine would retain {} bytes, above its {} byte limit",
+                total_bytes,
+                max_bytes
+            );
+        }
+        self.waiting
+            .try_reserve(1)
+            .context("reserving the bounded pre-ready unilateral queue")?;
+        self.waiting_bytes = self
+            .waiting_bytes
+            .checked_add(queued.retained_bytes())
+            .context("pre-ready unilateral waiting-byte count overflow")?;
+        self.waiting.push_back(queued);
+        Ok(())
+    }
+
+    fn discard_snapshot_subsumed(&mut self) {
+        let mut discarded_bytes = 0usize;
+        self.waiting.retain(|queued| {
+            if queued.snapshot_subsumed {
+                discarded_bytes = discarded_bytes.saturating_add(queued.retained_bytes());
+                false
+            } else {
+                true
+            }
+        });
+        self.waiting_bytes = self.waiting_bytes.saturating_sub(discarded_bytes);
+    }
+
+    fn take_batch(&mut self) -> (VecDeque<QuarantinedUnilateral>, usize) {
+        let queued = self
+            .waiting
+            .pop_front()
+            .expect("pre-ready replay batch requires one waiting PDU");
+        let bytes = queued.retained_bytes();
+        self.waiting_bytes = self.waiting_bytes.saturating_sub(bytes);
+        let mut batch = VecDeque::with_capacity(1);
+        batch.push_back(queued);
+        (batch, bytes)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+}
+
+fn spawn_pre_ready_unilateral_replay(
+    dispatch_authority: ClientDispatchAuthority,
+    generation: NonZeroU64,
+    reader_sender: Sender<ReaderMessage>,
+    publication: Sender<anyhow::Result<()>>,
+    batch: VecDeque<QuarantinedUnilateral>,
+    replayed_bytes: usize,
+) {
+    let replayed_pdus = batch.len();
+    let replay_scope = RpcGenerationScope::exact(
+        reader_sender.clone(),
+        Arc::clone(&dispatch_authority.rpc_transport),
+        generation,
+        true,
+    );
+    let mut abort_guard = replay_scope
+        .abort_guard("pre-ready unilateral replay failed or was cancelled")
+        .expect("an exact pre-ready replay scope always has a generation");
+    promise::spawn::spawn(async move {
+        let result = async {
+            for queued in batch {
+                let decoded = queued.decode()?;
+                process_unilateral_with_barrier(&dispatch_authority, decoded)
+                    .await
+                    .context("replaying a pre-ready unilateral PDU")?;
+            }
+            anyhow::Result::<()>::Ok(())
+        }
+        .await;
+
+        let completion = ReaderMessage::FinishReadyReplay {
+            generation,
+            reader_sender: reader_sender.clone(),
+            promise: publication,
+            replayed_pdus,
+            replayed_bytes,
+            result,
+        };
+        match reader_sender.try_send(completion) {
+            Ok(()) => abort_guard.disarm(),
+            Err(error) => {
+                let completion = error.into_inner();
+                if let ReaderMessage::FinishReadyReplay { promise, .. } = completion {
+                    let _ = promise.try_send(Err(anyhow!(
+                        "mux RPC reader closed before pre-ready replay completion"
+                    )));
+                }
+            }
+        }
+        anyhow::Result::<()>::Ok(())
+    })
+    .detach();
+}
+
+fn commit_rpc_transport_ready(
+    dispatch_authority: &ClientDispatchAuthority,
+    generation: NonZeroU64,
+    publication: Sender<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    if publication.is_closed() {
+        bail!(
+            "readiness publication for mux RPC generation {} was abandoned",
+            generation
+        );
+    }
+    {
+        let phase = dispatch_authority.rpc_transport.phase.lock();
+        if !matches!(
+            *phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) || dispatch_authority
+            .rpc_transport
+            .live_generation
+            .load(AtomicOrdering::Acquire)
+            != generation.get()
+        {
+            let message = format!(
+                "mux RPC generation {} retired before readiness publication",
+                generation
+            );
+            let _ = publication.try_send(Err(anyhow!(message.clone())));
+            bail!(message);
+        }
+        dispatch_authority
+            .rpc_transport
+            .ready_generation
+            .store(generation.get(), AtomicOrdering::Release);
+    }
+    if let Err(error) = publication.try_send(Ok(())) {
+        dispatch_authority
+            .rpc_transport
+            .ready_generation
+            .store(0, AtomicOrdering::Release);
+        bail!(
+            "readiness publication completion failed for mux RPC generation {}: {}",
+            generation,
+            error
+        );
     }
     Ok(())
 }
@@ -1458,6 +1800,9 @@ struct PendingRpc {
     completion: Sender<anyhow::Result<Pdu>>,
     binding: RpcBinding,
     stage: RpcRetirementStage,
+    /// A successfully matched `ListPanesResponse` snapshots all topology
+    /// unilateral PDUs that reached this reader before that response.
+    subsumes_pre_ready_topology: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1591,6 +1936,12 @@ enum ReplyDisposition {
     Abandoned,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplyCompletion {
+    disposition: ReplyDisposition,
+    subsumes_pre_ready_topology: bool,
+}
+
 #[derive(Debug)]
 struct PendingReplies {
     map: HashMap<NonZeroU64, PendingRpc>,
@@ -1625,6 +1976,7 @@ impl PendingReplies {
         &mut self,
         completion: Sender<anyhow::Result<Pdu>>,
         binding: RpcBinding,
+        subsumes_pre_ready_topology: bool,
     ) -> Result<Option<NonZeroU64>, PendingRpcError> {
         if completion.is_closed() {
             self.metrics.preclosed.increment(1);
@@ -1669,6 +2021,7 @@ impl PendingReplies {
                     completion,
                     binding,
                     stage: RpcRetirementStage::SerialAssignment,
+                    subsumes_pre_ready_topology,
                 });
             }
             Entry::Occupied(entry) => {
@@ -1744,7 +2097,7 @@ impl PendingReplies {
         &mut self,
         serial: NonZeroU64,
         pdu: Pdu,
-    ) -> Result<ReplyDisposition, PendingRpcError> {
+    ) -> Result<ReplyCompletion, PendingRpcError> {
         let Some(pending) = self.map.remove(&serial) else {
             if serial.get() > self.highest_issued {
                 self.metrics.future_serial.increment(1);
@@ -1762,14 +2115,14 @@ impl PendingReplies {
         self.metrics.pending.decrement(1);
 
         if pending.binding.generation != self.generation {
-            let error = self.rpc_transport.retirement_error(
+            let error = self.rpc_transport.make_retirement_error(
                 pending.binding,
                 RpcRetirementStage::ResponseMatch,
                 RpcDeliveryCertainty::OutcomeUnknown,
                 "response matched a pending request from another transport generation",
             );
-            let _ = pending.completion.try_send(Err(anyhow::Error::new(error)));
-            self.metrics.transport_failed_live.increment(1);
+            let disposition = complete_with_rpc_transport_error(&pending.completion, error);
+            self.record_transport_error_completion(disposition);
             return Err(PendingRpcError::ResponseGenerationMismatch {
                 serial,
                 pending_generation: pending.binding.generation,
@@ -1782,8 +2135,8 @@ impl PendingReplies {
             RpcDeliveryCertainty::OutcomeUnknown,
             "transport retired before response correlation completed",
         ) {
-            complete_with_rpc_transport_error(&pending.completion, error);
-            self.metrics.transport_failed_live.increment(1);
+            let disposition = complete_with_rpc_transport_error(&pending.completion, error);
+            self.record_transport_error_completion(disposition);
             return Err(PendingRpcError::ResponseGenerationMismatch {
                 serial,
                 pending_generation: pending.binding.generation,
@@ -1792,16 +2145,24 @@ impl PendingReplies {
         }
 
         let response_name = pdu.pdu_name();
+        let subsumes_pre_ready_topology =
+            pending.subsumes_pre_ready_topology && matches!(&pdu, Pdu::ListPanesResponse(_));
         match pending.completion.try_send(Ok(pdu)) {
             Ok(()) => {
                 // "delivered" is linearized at successful enqueue into the
                 // one-shot channel; the caller may close before observing it.
                 self.metrics.delivered.increment(1);
-                Ok(ReplyDisposition::Delivered)
+                Ok(ReplyCompletion {
+                    disposition: ReplyDisposition::Delivered,
+                    subsumes_pre_ready_topology,
+                })
             }
             Err(TrySendError::Closed(_)) => {
                 self.metrics.abandoned.increment(1);
-                Ok(ReplyDisposition::Abandoned)
+                Ok(ReplyCompletion {
+                    disposition: ReplyDisposition::Abandoned,
+                    subsumes_pre_ready_topology: false,
+                })
             }
             Err(TrySendError::Full(_)) => {
                 self.metrics.retirement_reply_channel_full.increment(1);
@@ -1815,12 +2176,25 @@ impl PendingReplies {
         }
     }
 
+    fn record_transport_error_completion(&self, disposition: RpcErrorCompletion) {
+        match disposition {
+            RpcErrorCompletion::Delivered => self.metrics.transport_failed_live.increment(1),
+            RpcErrorCompletion::Abandoned => {
+                self.metrics.transport_cleared_abandoned.increment(1);
+            }
+            RpcErrorCompletion::Full => {
+                self.metrics.retirement_reply_channel_full.increment(1);
+                self.metrics.protocol_reply_channel_full.increment(1);
+            }
+        }
+    }
+
     #[cfg(test)]
     fn complete_or_fail_transport(
         &mut self,
         serial: NonZeroU64,
         pdu: Pdu,
-    ) -> Result<ReplyDisposition, PendingRpcError> {
+    ) -> Result<ReplyCompletion, PendingRpcError> {
         match self.complete(serial, pdu) {
             Ok(disposition) => Ok(disposition),
             Err(error) => {
@@ -1921,6 +2295,7 @@ impl PendingReplies {
                 attempt_id,
                 request,
             },
+            request == "ListPanes",
         )
     }
 }
@@ -1988,9 +2363,7 @@ async fn client_thread_async(
         None => {
             let error =
                 anyhow::anyhow!("mux client stream not available — connection not established");
-            if let Err(retirement_error) =
-                dispatch_authority.begin_rpc_transport_retirement()
-            {
+            if let Err(retirement_error) = dispatch_authority.begin_rpc_transport_retirement() {
                 log::error!(
                     "failed to retire mux client RPC transport without an installed stream: \
                      {retirement_error:#}"
@@ -2001,6 +2374,10 @@ async fn client_thread_async(
         }
     };
     let mut reader = BufReader::new(stream);
+    let mut pre_ready_unilateral = PreReadyUnilateralQueue::default();
+    let mut readiness_replay_in_flight = false;
+    let mut replayed_pdus_in_flight = 0usize;
+    let mut replayed_bytes_in_flight = 0usize;
 
     enum NextEvent {
         Message(Result<ReaderMessage, async_channel::RecvError>),
@@ -2009,185 +2386,335 @@ async fn client_thread_async(
 
     let result = async {
         loop {
-        let next_event = {
-            let rx_msg = rx.recv();
-            // Readiness must be buffer-aware: a prior socket read may have
-            // already buffered a complete (pipelined) PDU while the underlying
-            // socket has nothing pending. Waiting on the socket alone would then
-            // strand that buffered PDU until more bytes happen to arrive (a
-            // latency stall / hang). So treat a non-empty buffer as immediately
-            // readable and only park on the socket once the buffer is drained.
-            //
-            // The two cases must be combined via `Either` rather than an `async`
-            // block: `wait_for_readable()` is an `#[async_trait]` boxed `Send`
-            // future, but an `async` block awaiting it would capture `&reader`
-            // across the await, and `Box<dyn AsyncReadAndWrite>` is `Send` but
-            // not `Sync`, so that reference is `!Send` — which would make the
-            // whole reader future `!Send` and fail `block_on_io`.
-            let wait_for_read = if reader.buffer().is_empty() {
-                Either::Left(reader.get_ref().wait_for_readable())
-            } else {
-                Either::Right(ready(Ok::<(), anyhow::Error>(())))
+            let next_event = {
+                let rx_msg = rx.recv();
+                // Readiness must be buffer-aware: a prior socket read may have
+                // already buffered a complete (pipelined) PDU while the underlying
+                // socket has nothing pending. Waiting on the socket alone would then
+                // strand that buffered PDU until more bytes happen to arrive (a
+                // latency stall / hang). So treat a non-empty buffer as immediately
+                // readable and only park on the socket once the buffer is drained.
+                //
+                // The two cases must be combined via `Either` rather than an `async`
+                // block: `wait_for_readable()` is an `#[async_trait]` boxed `Send`
+                // future, but an `async` block awaiting it would capture `&reader`
+                // across the await, and `Box<dyn AsyncReadAndWrite>` is `Send` but
+                // not `Sync`, so that reference is `!Send` — which would make the
+                // whole reader future `!Send` and fail `block_on_io`.
+                let wait_for_read = if reader.buffer().is_empty() {
+                    Either::Left(reader.get_ref().wait_for_readable())
+                } else {
+                    Either::Right(ready(Ok::<(), anyhow::Error>(())))
+                };
+
+                pin_mut!(rx_msg);
+                pin_mut!(wait_for_read);
+
+                match select(rx_msg, wait_for_read).await {
+                    Either::Left((message, _)) => NextEvent::Message(message),
+                    Either::Right((readable, _)) => NextEvent::Readable(readable),
+                }
             };
 
-            pin_mut!(rx_msg);
-            pin_mut!(wait_for_read);
-
-            match select(rx_msg, wait_for_read).await {
-                Either::Left((message, _)) => NextEvent::Message(message),
-                Either::Right((readable, _)) => NextEvent::Readable(readable),
-            }
-        };
-
-        match next_event {
-            NextEvent::Message(Ok(ReaderMessage::AbortGeneration {
-                generation: aborted_generation,
-                reason,
-            })) => {
-                if aborted_generation == generation {
-                    bail!(
-                        "mux RPC generation {} aborted before becoming usable: {}",
-                        generation,
-                        reason
+            match next_event {
+                NextEvent::Message(Ok(ReaderMessage::AbortGeneration {
+                    generation: aborted_generation,
+                    reason,
+                })) => {
+                    if aborted_generation == generation {
+                        bail!(
+                            "mux RPC generation {} aborted before becoming usable: {}",
+                            generation,
+                            reason
+                        );
+                    }
+                    log::trace!(
+                        "discarding abort for retired mux RPC generation {} on reader {}",
+                        aborted_generation,
+                        generation
                     );
                 }
-                log::trace!(
-                    "discarding abort for retired mux RPC generation {} on reader {}",
-                    aborted_generation,
-                    generation
-                );
-            }
-            NextEvent::Message(Ok(ReaderMessage::SendPdu {
-                binding,
-                pdu,
-                promise,
-            })) => {
-                if let Err(error) = dispatch_authority.rpc_transport.validate(
-                    binding,
-                    RpcRetirementStage::Dequeue,
-                    RpcDeliveryCertainty::DefinitelyNotSent,
-                    "request reached a reader other than its bound transport",
-                ) {
-                    complete_with_rpc_transport_error(&promise, error);
-                    continue;
-                }
-                let serial = match pending.admit(promise, binding) {
-                    Ok(Some(serial)) => serial,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        let error = anyhow::Error::new(error);
-                        return Err(error);
+                NextEvent::Message(Ok(ReaderMessage::PublishReady {
+                    generation: published_generation,
+                    reader_sender,
+                    promise,
+                })) => {
+                    if published_generation != generation {
+                        let _ = promise.try_send(Err(anyhow!(
+                            "readiness publication for generation {} reached reader {}",
+                            published_generation,
+                            generation
+                        )));
+                        continue;
                     }
-                };
-
-                pending.set_stage(serial, RpcRetirementStage::FrameEncoding)?;
-                if let Err(error) = pending.validate_stage(
-                    serial,
-                    RpcRetirementStage::FrameEncoding,
-                    RpcDeliveryCertainty::DefinitelyNotSent,
-                    "transport retired before frame encoding",
-                ) {
-                    return Err(anyhow::Error::new(error));
-                }
-                // Build the complete frame before touching the socket. Besides
-                // eliminating ambiguity at the encode boundary, this lets a
-                // retired request prove zero wire bytes before `write_all`.
-                let frame = match pdu
-                    .encode_frame(serial.get())
-                    .context("encoding a PDU frame to send to the server")
-                {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        return Err(error);
+                    if readiness_replay_in_flight {
+                        let _ = promise.try_send(Err(anyhow!(
+                            "readiness publication for mux RPC generation {} is already in flight",
+                            generation
+                        )));
+                        continue;
                     }
-                };
-                pending.set_stage(serial, RpcRetirementStage::BeforeWrite)?;
-                if let Err(error) = pending.validate_stage(
-                    serial,
-                    RpcRetirementStage::BeforeWrite,
-                    RpcDeliveryCertainty::DefinitelyNotSent,
-                    "transport retired after frame encoding and before socket write",
-                ) {
-                    return Err(anyhow::Error::new(error));
-                }
+                    if dispatch_authority
+                        .rpc_transport
+                        .ready_generation
+                        .load(AtomicOrdering::Acquire)
+                        == generation.get()
+                    {
+                        let _ = promise.try_send(Ok(()));
+                        continue;
+                    }
 
-                pending.set_stage(serial, RpcRetirementStage::WriteStarted)?;
-                if let Err(error) = reader
-                    .get_mut()
-                    .write_all(&frame)
-                    .await
-                    .context("writing an encoded PDU frame to the server")
-                {
-                    return Err(error);
-                }
+                    if pre_ready_unilateral.is_empty() {
+                        commit_rpc_transport_ready(dispatch_authority, generation, promise)?;
+                        continue;
+                    }
 
-                pending.set_stage(serial, RpcRetirementStage::BeforeFlush)?;
-                if let Err(error) = pending.validate_stage(
-                    serial,
-                    RpcRetirementStage::BeforeFlush,
-                    RpcDeliveryCertainty::OutcomeUnknown,
-                    "transport retired after socket write and before flush",
-                ) {
-                    return Err(anyhow::Error::new(error));
+                    let (batch, replayed_bytes) = pre_ready_unilateral.take_batch();
+                    replayed_pdus_in_flight = batch.len();
+                    replayed_bytes_in_flight = replayed_bytes;
+                    readiness_replay_in_flight = true;
+                    spawn_pre_ready_unilateral_replay(
+                        dispatch_authority.clone(),
+                        generation,
+                        reader_sender,
+                        promise,
+                        batch,
+                        replayed_bytes,
+                    );
                 }
-                if let Err(error) = reader
-                    .get_mut()
-                    .flush()
-                    .await
-                    .context("flushing PDU to server")
-                {
-                    return Err(error);
-                }
-                pending.set_stage(serial, RpcRetirementStage::AfterFlush)?;
-                if let Err(error) = pending.validate_stage(
-                    serial,
-                    RpcRetirementStage::AfterFlush,
-                    RpcDeliveryCertainty::OutcomeUnknown,
-                    "transport retired while flushing a request",
-                ) {
-                    return Err(anyhow::Error::new(error));
-                }
-                pending.set_stage(serial, RpcRetirementStage::AwaitingResponse)?;
-            }
-            NextEvent::Message(Err(_)) => {
-                return Err(NotReconnectableError::ClientWasDestroyed.into());
-            }
-            NextEvent::Readable(Ok(())) => {
-                match Pdu::decode_async(&mut reader, Some(pending.highest_issued())).await {
-                    Ok(decoded) => {
-                        log::debug!(
-                            "decoded serial {} {}",
-                            decoded.serial,
-                            decoded.pdu.pdu_name()
+                NextEvent::Message(Ok(ReaderMessage::FinishReadyReplay {
+                    generation: replay_generation,
+                    reader_sender,
+                    promise,
+                    replayed_pdus,
+                    replayed_bytes,
+                    result,
+                })) => {
+                    if replay_generation != generation || !readiness_replay_in_flight {
+                        let _ = promise.try_send(Err(anyhow!(
+                            "unexpected pre-ready replay completion for mux RPC generation {} \
+                         on reader {}",
+                            replay_generation,
+                            generation
+                        )));
+                        continue;
+                    }
+                    if replayed_pdus != replayed_pdus_in_flight
+                        || replayed_bytes != replayed_bytes_in_flight
+                    {
+                        let _ = promise.try_send(Err(anyhow!(
+                            "pre-ready replay accounting mismatch for mux RPC generation {}",
+                            generation
+                        )));
+                        bail!(
+                            "pre-ready replay accounting mismatch: expected {} PDUs/{} bytes, \
+                         completed {} PDUs/{} bytes",
+                            replayed_pdus_in_flight,
+                            replayed_bytes_in_flight,
+                            replayed_pdus,
+                            replayed_bytes
                         );
-                        if decoded.serial == 0 {
-                            if let Err(error) = process_unilateral(dispatch_authority, decoded)
-                                .context("processing unilateral PDU from server")
-                            {
-                                log::error!("process_unilateral: {:?}", error);
-                                return Err(error);
-                            }
-                        } else {
-                            let serial = NonZeroU64::new(decoded.serial)
-                                .expect("the unilateral serial-zero branch was handled above");
-                            if let Err(err) = pending.complete(serial, decoded.pdu) {
-                                return Err(err.into());
-                            }
+                    }
+                    readiness_replay_in_flight = false;
+                    replayed_pdus_in_flight = 0;
+                    replayed_bytes_in_flight = 0;
+                    match result {
+                        Ok(()) => {}
+                        Err(error) => {
+                            let message = format!(
+                                "pre-ready unilateral replay failed for mux RPC generation \
+                                 {}: {error:#}",
+                                generation
+                            );
+                            let _ = promise.try_send(Err(anyhow!(message.clone())));
+                            return Err(error).context(message);
                         }
                     }
-                    Err(err) => {
-                        pending.record_decode_protocol_error(&err);
-                        log::error!("Error while decoding response pdu: {err:#}");
-                        return Err(err).context("Error while decoding response pdu");
+
+                    if pre_ready_unilateral.is_empty() {
+                        commit_rpc_transport_ready(dispatch_authority, generation, promise)?;
+                        continue;
+                    }
+
+                    let (batch, next_replayed_bytes) = pre_ready_unilateral.take_batch();
+                    replayed_pdus_in_flight = batch.len();
+                    replayed_bytes_in_flight = next_replayed_bytes;
+                    readiness_replay_in_flight = true;
+                    spawn_pre_ready_unilateral_replay(
+                        dispatch_authority.clone(),
+                        generation,
+                        reader_sender,
+                        promise,
+                        batch,
+                        next_replayed_bytes,
+                    );
+                }
+                NextEvent::Message(Ok(ReaderMessage::SendPdu {
+                    binding,
+                    pdu,
+                    promise,
+                })) => {
+                    if binding.generation != generation {
+                        let error = dispatch_authority.rpc_transport.make_retirement_error(
+                            binding,
+                            RpcRetirementStage::Dequeue,
+                            RpcDeliveryCertainty::DefinitelyNotSent,
+                            "request reached a reader other than its bound transport",
+                        );
+                        complete_with_rpc_transport_error(&promise, error);
+                        continue;
+                    }
+                    if let Err(error) = dispatch_authority.rpc_transport.validate(
+                        binding,
+                        RpcRetirementStage::Dequeue,
+                        RpcDeliveryCertainty::DefinitelyNotSent,
+                        "request transport retired before reader dequeue",
+                    ) {
+                        complete_with_rpc_transport_error(&promise, error);
+                        continue;
+                    }
+                    let subsumes_pre_ready_topology = matches!(pdu.as_ref(), Pdu::ListPanes(_));
+                    let serial = match pending.admit(promise, binding, subsumes_pre_ready_topology)
+                    {
+                        Ok(Some(serial)) => serial,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            let error = anyhow::Error::new(error);
+                            return Err(error);
+                        }
+                    };
+
+                    pending.set_stage(serial, RpcRetirementStage::FrameEncoding)?;
+                    if let Err(error) = pending.validate_stage(
+                        serial,
+                        RpcRetirementStage::FrameEncoding,
+                        RpcDeliveryCertainty::DefinitelyNotSent,
+                        "transport retired before frame encoding",
+                    ) {
+                        return Err(anyhow::Error::new(error));
+                    }
+                    // Build the complete frame before touching the socket. Besides
+                    // eliminating ambiguity at the encode boundary, this lets a
+                    // retired request prove zero wire bytes before `write_all`.
+                    let frame = match pdu
+                        .encode_frame(serial.get())
+                        .context("encoding a PDU frame to send to the server")
+                    {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            return Err(error);
+                        }
+                    };
+                    pending.set_stage(serial, RpcRetirementStage::BeforeWrite)?;
+                    if let Err(error) = pending.validate_stage(
+                        serial,
+                        RpcRetirementStage::BeforeWrite,
+                        RpcDeliveryCertainty::DefinitelyNotSent,
+                        "transport retired after frame encoding and before socket write",
+                    ) {
+                        return Err(anyhow::Error::new(error));
+                    }
+
+                    pending.set_stage(serial, RpcRetirementStage::WriteStarted)?;
+                    reader
+                        .get_mut()
+                        .write_all(&frame)
+                        .await
+                        .context("writing an encoded PDU frame to the server")?;
+
+                    pending.set_stage(serial, RpcRetirementStage::BeforeFlush)?;
+                    if let Err(error) = pending.validate_stage(
+                        serial,
+                        RpcRetirementStage::BeforeFlush,
+                        RpcDeliveryCertainty::OutcomeUnknown,
+                        "transport retired after socket write and before flush",
+                    ) {
+                        return Err(anyhow::Error::new(error));
+                    }
+                    reader
+                        .get_mut()
+                        .flush()
+                        .await
+                        .context("flushing PDU to server")?;
+                    pending.set_stage(serial, RpcRetirementStage::AfterFlush)?;
+                    if let Err(error) = pending.validate_stage(
+                        serial,
+                        RpcRetirementStage::AfterFlush,
+                        RpcDeliveryCertainty::OutcomeUnknown,
+                        "transport retired while flushing a request",
+                    ) {
+                        return Err(anyhow::Error::new(error));
+                    }
+                    pending.set_stage(serial, RpcRetirementStage::AwaitingResponse)?;
+                }
+                NextEvent::Message(Err(_)) => {
+                    return Err(NotReconnectableError::ClientWasDestroyed.into());
+                }
+                NextEvent::Readable(Ok(())) => {
+                    match Pdu::decode_async(&mut reader, Some(pending.highest_issued())).await {
+                        Ok(decoded) => {
+                            log::debug!(
+                                "decoded serial {} {}",
+                                decoded.serial,
+                                decoded.pdu.pdu_name()
+                            );
+                            if decoded.serial == 0 {
+                                let generation_is_ready = dispatch_authority
+                                    .rpc_transport
+                                    .ready_generation
+                                    .load(AtomicOrdering::Acquire)
+                                    == generation.get();
+                                if generation_is_ready {
+                                    if let Err(error) =
+                                        process_unilateral(dispatch_authority, decoded)
+                                            .context("processing unilateral PDU from server")
+                                    {
+                                        log::error!("process_unilateral: {:?}", error);
+                                        return Err(error);
+                                    }
+                                } else {
+                                    pre_ready_unilateral
+                                    .enqueue(
+                                        decoded,
+                                        replayed_pdus_in_flight,
+                                        replayed_bytes_in_flight,
+                                    )
+                                    .context(
+                                        "quarantining a unilateral PDU before mux RPC readiness",
+                                    )?;
+                                }
+                            } else {
+                                let serial = NonZeroU64::new(decoded.serial)
+                                    .expect("the unilateral serial-zero branch was handled above");
+                                match pending.complete(serial, decoded.pdu) {
+                                    Ok(ReplyCompletion {
+                                        disposition: ReplyDisposition::Delivered,
+                                        subsumes_pre_ready_topology: true,
+                                    }) => {
+                                        // This is the exact response boundary:
+                                        // queued topology pushes precede the
+                                        // server snapshot, while anything read
+                                        // after this point must still replay.
+                                        pre_ready_unilateral.discard_snapshot_subsumed();
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => return Err(err.into()),
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            pending.record_decode_protocol_error(&err);
+                            log::error!("Error while decoding response pdu: {err:#}");
+                            return Err(err).context("Error while decoding response pdu");
+                        }
                     }
                 }
+                NextEvent::Readable(Err(err)) => {
+                    let reason = format!("Error while waiting for stream readability: {:#}", err);
+                    log::error!("{}", reason);
+                    return Err(err).context("Error while waiting for stream readability");
+                }
             }
-            NextEvent::Readable(Err(err)) => {
-                let reason = format!("Error while waiting for stream readability: {:#}", err);
-                log::error!("{}", reason);
-                return Err(err).context("Error while waiting for stream readability");
-            }
-        }
         }
     }
     .await;
@@ -3393,7 +3920,18 @@ impl Client {
         ui: &ConnectionUI,
     ) -> anyhow::Result<GetCodecVersionResponse> {
         let rpc = self.bootstrap_rpc_scope();
-        self.verify_version_compat_with_scope(ui, &rpc).await
+        let mut abort_guard =
+            rpc.abort_guard("standalone mux RPC bootstrap failed, timed out, or was cancelled")?;
+        let result = with_mux_rpc_bootstrap_timeout(async {
+            let info = self.verify_version_compat_with_scope(ui, &rpc).await?;
+            self.publish_rpc_transport_ready(&rpc).await?;
+            Ok(info)
+        })
+        .await;
+        if result.is_ok() {
+            abort_guard.disarm();
+        }
+        result
     }
 
     pub(crate) async fn verify_version_compat_with_scope(
@@ -3459,7 +3997,6 @@ impl Client {
                             is_proxy: false,
                         })
                         .await?;
-                        self.publish_rpc_transport_ready(rpc)?;
                         Ok(info)
                     }
                     Err(_) => {
@@ -3608,16 +4145,7 @@ impl Client {
         RpcGenerationScope::capture(self.sender.clone(), Arc::clone(&self.rpc_transport))
     }
 
-    fn rpc_scope_at(&self, generation: NonZeroU64) -> RpcGenerationScope {
-        RpcGenerationScope::exact(
-            self.sender.clone(),
-            Arc::clone(&self.rpc_transport),
-            generation,
-            false,
-        )
-    }
-
-    fn bootstrap_rpc_scope(&self) -> RpcGenerationScope {
+    pub(crate) fn bootstrap_rpc_scope(&self) -> RpcGenerationScope {
         RpcGenerationScope::bootstrap(self.sender.clone(), Arc::clone(&self.rpc_transport))
     }
 
@@ -3630,43 +4158,45 @@ impl Client {
         )
     }
 
-    fn publish_rpc_transport_ready(&self, rpc: &RpcGenerationScope) -> anyhow::Result<()> {
+    pub(crate) async fn publish_rpc_transport_ready(
+        &self,
+        rpc: &RpcGenerationScope,
+    ) -> anyhow::Result<()> {
         if !Arc::ptr_eq(&self.rpc_transport, &rpc.rpc_transport) {
             bail!("cannot publish mux RPC readiness from a foreign client scope");
         }
         let generation = rpc
             .generation
             .ok_or_else(|| anyhow!("cannot publish readiness for an unavailable RPC scope"))?;
-        let phase = self.rpc_transport.phase.lock();
-        if !matches!(
-            *phase,
-            RpcTransportPhase::Live(observed) if observed == generation
-        ) || self
-            .rpc_transport
-            .live_generation
-            .load(AtomicOrdering::Acquire)
-            != generation.get()
         {
-            bail!(
-                "cannot publish readiness for retired mux RPC generation {}",
-                generation
-            );
+            let phase = self.rpc_transport.phase.lock();
+            if !matches!(
+                *phase,
+                RpcTransportPhase::Live(observed) if observed == generation
+            ) || self
+                .rpc_transport
+                .live_generation
+                .load(AtomicOrdering::Acquire)
+                != generation.get()
+            {
+                bail!(
+                    "cannot publish readiness for retired mux RPC generation {}",
+                    generation
+                );
+            }
+            let (promise, result) = bounded(1);
+            self.sender
+                .try_send(ReaderMessage::PublishReady {
+                    generation,
+                    reader_sender: self.sender.clone(),
+                    promise,
+                })
+                .map_err(|_| anyhow!("mux RPC reader queue closed before readiness publication"))?;
+            result
         }
-        let observed = self
-            .rpc_transport
-            .ready_generation
-            .load(AtomicOrdering::Acquire);
-        if observed != 0 && observed != generation.get() {
-            bail!(
-                "cannot replace ready mux RPC generation {} with {}",
-                observed,
-                generation
-            );
-        }
-        self.rpc_transport
-            .ready_generation
-            .store(generation.get(), AtomicOrdering::Release);
-        Ok(())
+        .recv()
+        .await
+        .map_err(|_| anyhow!("mux RPC reader dropped readiness publication"))?
     }
 
     pub(crate) fn abort_rpc_transport_generation(
@@ -3722,6 +4252,10 @@ impl Client {
     rpc_surface!();
 }
 
+// Exact-generation scopes intentionally mirror the complete client RPC surface.
+// Individual flows use coherent subsets, but keeping one generated surface
+// prevents a future call site from escaping back to ambient generation lookup.
+#[allow(dead_code)]
 impl RpcGenerationScope {
     rpc_surface!();
 }
@@ -4164,8 +4698,7 @@ mod tests {
                         )))
                     }
                 }
-                ScriptedFailureBoundary::Flush
-                | ScriptedFailureBoundary::AwaitingResponseEof => {
+                ScriptedFailureBoundary::Flush | ScriptedFailureBoundary::AwaitingResponseEof => {
                     self.state.write_calls.fetch_add(1, Ordering::AcqRel);
                     self.state
                         .transcript
@@ -4252,14 +4785,18 @@ mod tests {
         expected_stage: RpcRetirementStage,
         expected_certainty: RpcDeliveryCertainty,
     ) {
-        assert!(matches!(
-            error.downcast_ref::<RpcTransportError>(),
-            Some(RpcTransportError::Retired {
-                stage,
-                certainty,
-                ..
-            }) if *stage == expected_stage && *certainty == expected_certainty
-        ), "unexpected RPC retirement: {error:#}");
+        assert!(
+            matches!(
+                error.downcast_ref::<RpcTransportError>(),
+                Some(RpcTransportError::Retired {
+                    stage,
+                    certainty,
+                    ..
+                }) if *stage == expected_stage && *certainty == expected_certainty
+            ),
+            "unexpected RPC retirement: {:#}",
+            error
+        );
     }
 
     #[test]
@@ -4400,10 +4937,9 @@ mod tests {
             Err(async_channel::TryRecvError::Empty)
         ));
 
-        let bootstrap = client.bootstrap_rpc_scope();
         client
-            .publish_rpc_transport_ready(&bootstrap)
-            .expect("publish readiness only after the test handshake barrier");
+            .rpc_transport
+            .mark_current_generation_ready_for_test();
         let fresh_but_unpolled = client.send_pdu(Pdu::Ping(Ping {}));
         assert!(matches!(
             receiver.try_recv(),
@@ -4490,8 +5026,7 @@ mod tests {
             ));
             assert!(matches!(
                 result.try_recv(),
-                Err(async_channel::TryRecvError::Empty)
-                    | Err(async_channel::TryRecvError::Closed)
+                Err(async_channel::TryRecvError::Empty) | Err(async_channel::TryRecvError::Closed)
             ));
         }
         assert!(matches!(
@@ -4653,7 +5188,8 @@ mod tests {
         assert_eq!(
             pending
                 .complete(serial, Pdu::Pong(Pong {}))
-                .expect("live response should deliver"),
+                .expect("live response should deliver")
+                .disposition,
             ReplyDisposition::Delivered
         );
         assert_eq!(
@@ -4752,7 +5288,8 @@ mod tests {
         assert_eq!(
             pending
                 .complete(delivered_serial, Pdu::Pong(Pong {}))
-                .expect("response before receiver drop should deliver"),
+                .expect("response before receiver drop should deliver")
+                .disposition,
             ReplyDisposition::Delivered
         );
         drop(delivered_rx);
@@ -4789,7 +5326,8 @@ mod tests {
                         results: Vec::new(),
                     }),
                 )
-                .expect("a late response to an abandoned caller must drain"),
+                .expect("a late response to an abandoned caller must drain")
+                .disposition,
             ReplyDisposition::Abandoned
         );
 
@@ -5223,6 +5761,7 @@ mod tests {
         reset_test_logger();
         let socket_path = unique_handshake_socket_path();
         let listener = UnixListener::bind(&socket_path).expect("bind local UDS handshake server");
+        let (server_release_tx, server_release_rx) = mpsc::channel::<()>();
         let server = std::thread::Builder::new()
             .name("ft-connect-fix-delayed-server".to_string())
             .spawn(move || -> anyhow::Result<()> {
@@ -5254,6 +5793,9 @@ mod tests {
                         .context("server encode response PDU")?;
                     stream.flush().context("server flush response PDU")?;
                     if matches!(response, Pdu::UnitResponse(_)) {
+                        server_release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .context("hold delayed server through readiness publication")?;
                         break;
                     }
                 }
@@ -5306,6 +5848,9 @@ mod tests {
             .expect("delayed handshake reply must be consumed by the reader");
         assert_eq!(info.codec_vers, CODEC_VERSION);
 
+        server_release_tx
+            .send(())
+            .expect("release delayed server after readiness acknowledgement");
         drop(client);
         assert_expected_reader_shutdown(reader.join().expect("reader thread panicked"));
         server
@@ -5856,6 +6401,134 @@ mod tests {
 
     fn unilateral(pdu: Pdu) -> DecodedPdu {
         DecodedPdu { serial: 0, pdu }
+    }
+
+    #[test]
+    fn mux_rpc_bootstrap_deadline_cancels_a_stalled_stage() {
+        let error = asupersync_block_on(with_mux_rpc_bootstrap_timeout_for(
+            Duration::from_millis(5),
+            futures::future::pending::<anyhow::Result<()>>(),
+        ))
+        .expect_err("a stalled bootstrap stage must have one finite deadline");
+
+        assert!(error.root_cause().is::<Timeout>());
+        assert!(error.to_string().contains("bootstrap exceeded"));
+    }
+
+    #[test]
+    fn pre_ready_quarantine_is_count_and_byte_bounded_including_replay() {
+        let mut queue = PreReadyUnilateralQueue::default();
+        queue
+            .enqueue_with_limits(
+                unilateral(Pdu::WindowTitleChanged(WindowTitleChanged {
+                    window_id: 1,
+                    title: "one".to_string(),
+                })),
+                0,
+                0,
+                2,
+                1_024,
+            )
+            .expect("first small PDU fits");
+
+        let count_error = queue
+            .enqueue_with_limits(
+                unilateral(Pdu::WindowTitleChanged(WindowTitleChanged {
+                    window_id: 1,
+                    title: "blocked-by-in-flight-count".to_string(),
+                })),
+                1,
+                0,
+                2,
+                1_024,
+            )
+            .expect_err("waiting plus in-flight PDUs must share one count budget");
+        assert!(count_error.to_string().contains("2 PDU limit"));
+        assert_eq!(queue.waiting.len(), 1);
+
+        let oversized = Pdu::SetClipboard(SetClipboard {
+            pane_id: 7,
+            clipboard: Some("x".repeat(128)),
+            selection: wezterm_term::ClipboardSelection::Clipboard,
+        });
+        let encoded_bytes = oversized
+            .encode_retained_frame(0)
+            .expect("measure the exact retained frame")
+            .len();
+        let mut byte_queue = PreReadyUnilateralQueue::default();
+        let byte_error = byte_queue
+            .enqueue_with_limits(unilateral(oversized), 0, 1, 8, encoded_bytes)
+            .expect_err("in-flight and waiting frames must share one byte budget");
+        assert!(byte_error.to_string().contains("byte limit"));
+        assert!(byte_queue.waiting.is_empty());
+        assert_eq!(byte_queue.waiting_bytes, 0);
+    }
+
+    #[test]
+    fn list_panes_snapshot_prunes_only_subsumed_pre_ready_notifications() {
+        let mut queue = PreReadyUnilateralQueue::default();
+        let subsumed = [
+            Pdu::PaneRemoved(PaneRemoved { pane_id: 1 }),
+            Pdu::PaneFocused(PaneFocused { pane_id: 1 }),
+            Pdu::TabResized(TabResized { tab_id: 2 }),
+            Pdu::TabAddedToWindow(TabAddedToWindow {
+                tab_id: 2,
+                window_id: 3,
+            }),
+            Pdu::TabTitleChanged(TabTitleChanged {
+                tab_id: 2,
+                title: "old tab".to_string(),
+            }),
+            Pdu::WindowTitleChanged(WindowTitleChanged {
+                window_id: 3,
+                title: "old window".to_string(),
+            }),
+        ];
+        for pdu in subsumed {
+            queue
+                .enqueue_with_limits(unilateral(pdu), 0, 0, 16, 1_048_576)
+                .expect("snapshot-subsumed notification fits");
+        }
+        let retained = [
+            Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
+                window_id: 3,
+                workspace: "campaign".to_string(),
+            }),
+            Pdu::RenameWorkspace(RenameWorkspace {
+                old_workspace: "campaign".to_string(),
+                new_workspace: "campaign-fast".to_string(),
+            }),
+            Pdu::SetClipboard(SetClipboard {
+                pane_id: 1,
+                clipboard: Some("must survive snapshot".to_string()),
+                selection: wezterm_term::ClipboardSelection::Clipboard,
+            }),
+        ];
+        for pdu in retained {
+            queue
+                .enqueue_with_limits(unilateral(pdu), 0, 0, 16, 1_048_576)
+                .expect("non-subsumed notification fits");
+        }
+        let bytes_before = queue.waiting_bytes;
+
+        queue.discard_snapshot_subsumed();
+
+        assert_eq!(queue.waiting.len(), 3);
+        assert!(queue.waiting_bytes < bytes_before);
+        let retained_names = queue
+            .waiting
+            .iter()
+            .map(|queued| {
+                Pdu::decode_retained_frame(queued.frame.as_slice())
+                    .expect("decode retained notification")
+                    .pdu
+                    .pdu_name()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained_names,
+            ["WindowWorkspaceChanged", "RenameWorkspace", "SetClipboard"]
+        );
     }
 
     fn standalone_dispatch_authority() -> ClientDispatchAuthority {
