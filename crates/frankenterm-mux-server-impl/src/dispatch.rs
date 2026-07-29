@@ -1868,6 +1868,23 @@ where
     process_async_with_mux(stream, config, mux).await
 }
 
+fn dispatch_client_request(
+    handler: &mut SessionHandler,
+    decoded: DecodedPdu,
+) -> anyhow::Result<()> {
+    if decoded.serial == 0 {
+        metrics::counter!(
+            "mux.dispatch.protocol_error",
+            "reason" => "reserved_request_serial_zero"
+        )
+        .increment(1);
+        anyhow::bail!("mux client request used reserved server-unilateral serial zero");
+    }
+
+    handler.process_one(decoded);
+    Ok(())
+}
+
 async fn process_async_with_mux<T>(
     mut stream: T,
     config: DispatchRuntimeConfig,
@@ -1959,7 +1976,7 @@ where
                             return Err(err).context("reading Pdu from client");
                         }
                     };
-                    handler.process_one(decoded);
+                    dispatch_client_request(&mut handler, decoded)?;
                 }
                 Ok(Item::WritePdu(decoded)) => {
                     match prepare_pending_outbound_batch(
@@ -2317,6 +2334,16 @@ mod tests {
         (mux, guard)
     }
 
+    fn capturing_pdu_sender() -> (PduSender, Arc<ParkingMutex<Vec<DecodedPdu>>>) {
+        let captured = Arc::new(ParkingMutex::new(Vec::new()));
+        let captured_for_sender = Arc::clone(&captured);
+        let sender = PduSender::new(move |pdu| {
+            captured_for_sender.lock().push(pdu);
+            Ok(())
+        });
+        (sender, captured)
+    }
+
     #[test]
     fn protocol_probe_recognizes_tmux_control_line() {
         assert_eq!(
@@ -2662,6 +2689,59 @@ mod tests {
         );
         mux.notify(MuxNotification::Empty);
         assert_eq!(observed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn dispatch_client_request_rejects_reserved_zero_before_handler() {
+        let mux = Arc::new(Mux::new(None));
+        let (sender, captured) = capturing_pdu_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+
+        let error = dispatch_client_request(
+            &mut handler,
+            DecodedPdu {
+                serial: 0,
+                pdu: Pdu::SetClientId(codec::SetClientId {
+                    client_id: mux::client::ClientId::new(),
+                    is_proxy: false,
+                }),
+            },
+        )
+        .expect_err("client request serial zero must be a hard protocol error");
+
+        assert!(
+            format!("{error:#}").contains("reserved server-unilateral serial zero"),
+            "serial-zero rejection should retain its fixed protocol classification: {error:#}"
+        );
+        assert!(
+            captured.lock().is_empty(),
+            "serial-zero rejection must not enqueue a response that the client would treat as unilateral"
+        );
+        assert!(
+            mux.iter_clients().is_empty(),
+            "serial-zero SetClientId must be rejected before session mutation"
+        );
+    }
+
+    #[test]
+    fn dispatch_client_request_delegates_nonzero_serial_unchanged() {
+        let mux = Arc::new(Mux::new(None));
+        let (sender, captured) = capturing_pdu_sender();
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+
+        dispatch_client_request(
+            &mut handler,
+            DecodedPdu {
+                serial: 1,
+                pdu: Pdu::Ping(Ping {}),
+            },
+        )
+        .expect("nonzero client request serial should reach the session handler");
+
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 1, "Ping should produce exactly one response");
+        assert_eq!(captured[0].serial, 1);
+        assert_eq!(captured[0].pdu, Pdu::Pong(Pong {}));
     }
 
     #[test]
