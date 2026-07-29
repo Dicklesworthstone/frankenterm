@@ -721,13 +721,47 @@ fn max_pdu_read_limit() -> anyhow::Result<u64> {
         .context("MAX_PDU_SIZE read limit overflow")
 }
 
+fn encoded_frame_len(
+    ident: u64,
+    serial: u64,
+    data_len: usize,
+    is_compressed: bool,
+) -> anyhow::Result<usize> {
+    let len = data_len
+        .checked_add(encoded_length(ident))
+        .and_then(|len| len.checked_add(encoded_length(serial)))
+        .context("encoded PDU body length overflow")?;
+    let len_u64 = u64::try_from(len).context("encoded PDU length does not fit in u64")?;
+    let masked_len = if is_compressed {
+        len_u64 | COMPRESSED_MASK
+    } else {
+        len_u64
+    };
+    len.checked_add(encoded_length(masked_len))
+        .context("encoded PDU frame length overflow")
+}
+
 fn encode_raw_as_vec(
     ident: u64,
     serial: u64,
     data: &[u8],
     is_compressed: bool,
 ) -> anyhow::Result<Vec<u8>> {
-    let len = data.len() + encoded_length(ident) + encoded_length(serial);
+    encode_raw_as_vec_impl(ident, serial, data, is_compressed, true)
+}
+
+fn encode_raw_as_vec_impl(
+    ident: u64,
+    serial: u64,
+    data: &[u8],
+    is_compressed: bool,
+    record_metrics: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let len = data
+        .len()
+        .checked_add(encoded_length(ident))
+        .and_then(|len| len.checked_add(encoded_length(serial)))
+        .context("encoded PDU body length overflow")?;
     let len_u64 = u64::try_from(len).context("encoded PDU length does not fit in u64")?;
     let masked_len = if is_compressed {
         len_u64 | COMPRESSED_MASK
@@ -738,9 +772,7 @@ fn encode_raw_as_vec(
     // Double-buffer the data; since we run with nodelay enabled, it is
     // desirable for the write to be a single packet (or at least, for
     // the header portion to go out in a single packet)
-    let capacity = len
-        .checked_add(encoded_length(masked_len))
-        .context("encoded PDU frame capacity overflow")?;
+    let capacity = encoded_frame_len(ident, serial, data.len(), is_compressed)?;
     let mut buffer = Vec::with_capacity(capacity);
 
     leb128::write::unsigned(&mut buffer, masked_len).context("writing pdu len")?;
@@ -748,10 +780,12 @@ fn encode_raw_as_vec(
     leb128::write::unsigned(&mut buffer, ident).context("writing pdu ident")?;
     buffer.extend_from_slice(data);
 
-    if is_compressed {
-        metrics::histogram!("pdu.encode.compressed.size").record(buffer.len() as f64);
-    } else {
-        metrics::histogram!("pdu.encode.size").record(buffer.len() as f64);
+    if record_metrics {
+        if is_compressed {
+            metrics::histogram!("pdu.encode.compressed.size").record(buffer.len() as f64);
+        } else {
+            metrics::histogram!("pdu.encode.size").record(buffer.len() as f64);
+        }
     }
 
     Ok(buffer)
@@ -1085,6 +1119,10 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
 /// Decode a frame.
 /// See encode_raw() for the frame format.
 fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
+    decode_raw_impl(&mut r, true)
+}
+
+fn decode_raw_impl<R: std::io::Read>(mut r: R, record_metrics: bool) -> anyhow::Result<Decoded> {
     let (len, _len_len) = read_u64_with_len(&mut r).context("reading PDU length")?;
     let (len, is_compressed) = if (len & COMPRESSED_MASK) != 0 {
         (len & !COMPRESSED_MASK, true)
@@ -1105,10 +1143,12 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
         );
     }
 
-    if is_compressed {
-        metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
-    } else {
-        metrics::histogram!("pdu.decode.size").record(data_len as f64);
+    if record_metrics {
+        if is_compressed {
+            metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
+        } else {
+            metrics::histogram!("pdu.decode.size").record(data_len as f64);
+        }
     }
 
     let data = read_payload_chunked(&mut r, data_len, len, serial, ident)?;
@@ -1254,6 +1294,25 @@ macro_rules! pdu {
                 serial: u64,
                 compression_mode: CompressionMode,
             ) -> Result<Vec<u8>, Error> {
+                self.encode_frame_with_mode_impl(serial, compression_mode, true)
+            }
+
+            /// Encode an uncompressed frame for bounded in-memory retention
+            /// without recording a second outbound wire sample.
+            ///
+            /// This is intended for a queue that already decoded the physical
+            /// frame and needs a compact, ownership-complete representation
+            /// while protocol dispatch is temporarily quarantined.
+            pub fn encode_retained_frame(&self, serial: u64) -> Result<Vec<u8>, Error> {
+                self.encode_frame_with_mode_impl(serial, CompressionMode::Never, false)
+            }
+
+            fn encode_frame_with_mode_impl(
+                &self,
+                serial: u64,
+                compression_mode: CompressionMode,
+                record_metrics: bool,
+            ) -> Result<Vec<u8>, Error> {
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
@@ -1261,17 +1320,48 @@ macro_rules! pdu {
                             let (data, is_compressed) =
                                 serialize_with_mode(s, compression_mode)?;
                             let frame =
-                                encode_raw_as_vec($vers, serial, &data, is_compressed)?;
+                                encode_raw_as_vec_impl(
+                                    $vers,
+                                    serial,
+                                    &data,
+                                    is_compressed,
+                                    record_metrics,
+                                )?;
                             log::debug!(
                                 "encode_frame {} size={}",
                                 stringify!($name),
                                 frame.len()
                             );
-                            metrics::histogram!("pdu.size", "pdu" => stringify!($name))
-                                .record(frame.len() as f64);
-                            metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name))
-                                .record(frame.len() as f64);
+                            if record_metrics {
+                                metrics::histogram!("pdu.size", "pdu" => stringify!($name))
+                                    .record(frame.len() as f64);
+                                metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name))
+                                    .record(frame.len() as f64);
+                            }
                             Ok(frame)
+                        }
+                    ,)*
+                }
+            }
+
+            /// Measure the canonical framed size without allocating the final
+            /// frame or recording an outbound-size metric.
+            ///
+            /// The serializer still materializes its payload once. Callers can
+            /// select [`CompressionMode::Never`] when the result is used as a
+            /// retained-memory admission weight rather than a wire-size sample.
+            pub fn encoded_frame_len_with_mode(
+                &self,
+                serial: u64,
+                compression_mode: CompressionMode,
+            ) -> Result<usize, Error> {
+                match self {
+                    Pdu::Invalid{..} => bail!("attempted to measure Pdu::Invalid"),
+                    $(
+                        Pdu::$name(s) => {
+                            let (data, is_compressed) =
+                                serialize_with_mode(s, compression_mode)?;
+                            encoded_frame_len($vers, serial, data.len(), is_compressed)
                         }
                     ,)*
                 }
@@ -1315,12 +1405,29 @@ macro_rules! pdu {
             }
 
             pub fn decode<R: std::io::Read>(r: R) -> Result<DecodedPdu, Error> {
-                let decoded = decode_raw(r).context("decoding a PDU")?;
+                Self::decode_impl(r, true)
+            }
+
+            /// Decode a frame previously produced by
+            /// [`Self::encode_retained_frame`] without recording a duplicate
+            /// inbound wire-size sample.
+            pub fn decode_retained_frame<R: std::io::Read>(r: R) -> Result<DecodedPdu, Error> {
+                Self::decode_impl(r, false)
+            }
+
+            fn decode_impl<R: std::io::Read>(
+                r: R,
+                record_metrics: bool,
+            ) -> Result<DecodedPdu, Error> {
+                let decoded =
+                    decode_raw_impl(r, record_metrics).context("decoding a PDU")?;
                 match decoded.ident {
                     $(
                         $vers => {
-                            metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
+                            if record_metrics {
+                                metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
+                                metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
+                            }
                             Ok(DecodedPdu {
                                 serial: decoded.serial,
                                 pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?)
@@ -1328,8 +1435,10 @@ macro_rules! pdu {
                         }
                     ,)*
                     _ => {
-                        metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
-                        metrics::histogram!("pdu.size.rate", "pdu" => "??").record(decoded.data.len() as f64);
+                        if record_metrics {
+                            metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
+                            metrics::histogram!("pdu.size.rate", "pdu" => "??").record(decoded.data.len() as f64);
+                        }
                         Ok(DecodedPdu {
                             serial: decoded.serial,
                             pdu: Pdu::Invalid{ident:decoded.ident}
@@ -2634,6 +2743,24 @@ mod test {
         assert_eq!(direct_frame, existing_encoding);
         let decoded = Pdu::decode(direct_frame.as_slice()).expect("decode direct frame");
         assert_eq!(decoded.serial, serial);
+        assert_eq!(decoded.pdu, pdu);
+    }
+
+    #[test]
+    fn retained_pdu_frame_is_uncompressed_bounded_and_roundtrips() {
+        let pdu = Pdu::WriteToPane(WriteToPane {
+            pane_id: 42,
+            data: vec![b'x'; 4_096],
+        });
+        let retained = pdu.encode_retained_frame(0).expect("encode retained frame");
+        let measured = pdu
+            .encoded_frame_len_with_mode(0, CompressionMode::Never)
+            .expect("measure retained frame");
+
+        assert_eq!(retained.len(), measured);
+        let decoded =
+            Pdu::decode_retained_frame(retained.as_slice()).expect("decode retained frame");
+        assert_eq!(decoded.serial, 0);
         assert_eq!(decoded.pdu, pdu);
     }
 
