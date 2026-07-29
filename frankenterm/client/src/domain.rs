@@ -812,10 +812,17 @@ impl ClientDomain {
         // Every physical server connection owns a fresh SessionHandler with no
         // client identity. Re-establish codec compatibility and SetClientId on
         // the exact successor generation before any topology or workspace RPC.
-        expected
+        if let Err(error) = expected
             .client
             .verify_version_compat_with_scope(&ui, &rpc)
-            .await?;
+            .await
+        {
+            let _ = expected.client.abort_rpc_transport_generation(
+                &rpc,
+                "successor mux RPC bootstrap failed",
+            );
+            return Err(error);
+        }
 
         if !Self::sync_remote_topology(
             Arc::clone(&mux),
@@ -1702,8 +1709,14 @@ impl Domain for ClientDomain {
                 .await?;
 
                 ui.output_str("Checking server version\n");
-                let rpc = client.rpc_scope();
-                client.verify_version_compat_with_scope(&ui, &rpc).await?;
+                let rpc = client.bootstrap_rpc_scope();
+                if let Err(error) = client.verify_version_compat_with_scope(&ui, &rpc).await {
+                    let _ = client.abort_rpc_transport_generation(
+                        &rpc,
+                        "initial mux RPC bootstrap failed",
+                    );
+                    return Err(error);
+                }
 
                 ui.output_str("Version check OK!  Requesting pane list...\n");
                 let panes = rpc.list_panes().await?;

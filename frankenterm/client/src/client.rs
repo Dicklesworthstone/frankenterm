@@ -319,6 +319,15 @@ impl RpcTransportState {
         record_rpc_transport_error(&error);
         error
     }
+
+    #[cfg(test)]
+    fn mark_current_generation_ready_for_test(&self) {
+        let generation = self
+            .active_generation()
+            .expect("test RPC transport generation should be live");
+        self.ready_generation
+            .store(generation.get(), AtomicOrdering::Release);
+    }
 }
 
 enum ReaderMessage {
@@ -872,6 +881,12 @@ impl CurrentClientDispatch {
         let generation = NonZeroU64::new(self.authority.generation)
             .expect("current dispatch authority generation is nonzero");
         self.inner.client.rpc_scope_at(generation)
+    }
+
+    pub(crate) fn bootstrap_rpc_scope(&self) -> RpcGenerationScope {
+        let generation = NonZeroU64::new(self.authority.generation)
+            .expect("current dispatch authority generation is nonzero");
+        self.inner.client.bootstrap_rpc_scope_at(generation)
     }
 
     fn is_current(&self) -> bool {
@@ -2029,6 +2044,23 @@ async fn client_thread_async(
         };
 
         match next_event {
+            NextEvent::Message(Ok(ReaderMessage::AbortGeneration {
+                generation: aborted_generation,
+                reason,
+            })) => {
+                if aborted_generation == generation {
+                    bail!(
+                        "mux RPC generation {} aborted before becoming usable: {}",
+                        generation,
+                        reason
+                    );
+                }
+                log::trace!(
+                    "discarding abort for retired mux RPC generation {} on reader {}",
+                    aborted_generation,
+                    generation
+                );
+            }
             NextEvent::Message(Ok(ReaderMessage::SendPdu {
                 binding,
                 pdu,
@@ -3234,7 +3266,7 @@ impl Client {
                                     let reattach_ui = ui.clone();
                                     match reconnect_dispatch_authority.resolve_current() {
                                         Ok(Some(dispatch)) => {
-                                            let rpc = dispatch.rpc_scope();
+                                            let rpc = dispatch.bootstrap_rpc_scope();
                                             promise::spawn::spawn_into_main_thread(async move {
                                                 if !dispatch.is_current() {
                                                     return Ok(());
@@ -3364,7 +3396,7 @@ impl Client {
         &self,
         ui: &ConnectionUI,
     ) -> anyhow::Result<GetCodecVersionResponse> {
-        let rpc = self.rpc_scope();
+        let rpc = self.bootstrap_rpc_scope();
         self.verify_version_compat_with_scope(ui, &rpc).await
     }
 
@@ -3431,6 +3463,7 @@ impl Client {
                             is_proxy: false,
                         })
                         .await?;
+                        self.publish_rpc_transport_ready(rpc)?;
                         Ok(info)
                     }
                     Err(_) => {
@@ -3640,7 +3673,7 @@ impl Client {
         Ok(())
     }
 
-    fn abort_rpc_transport_generation(
+    pub(crate) fn abort_rpc_transport_generation(
         &self,
         rpc: &RpcGenerationScope,
         reason: &'static str,
