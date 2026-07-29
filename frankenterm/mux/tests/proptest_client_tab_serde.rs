@@ -9,7 +9,8 @@ fn arb_small_string() -> impl Strategy<Value = String> {
 }
 
 fn arb_timestamp() -> impl Strategy<Value = chrono::DateTime<Utc>> {
-    (0i64..=4_102_444_800).prop_map(|secs| Utc.timestamp_opt(secs, 0).single().unwrap())
+    (0i64..=4_102_444_800, 0u32..1_000_000_000)
+        .prop_map(|(secs, nanos)| Utc.timestamp_opt(secs, nanos).single().unwrap())
 }
 
 fn arb_client_id() -> impl Strategy<Value = ClientId> {
@@ -81,10 +82,17 @@ proptest! {
         let back: ClientInfo = serde_json::from_str(&json).unwrap();
 
         prop_assert_eq!(back.client_id.as_ref(), info.client_id.as_ref());
-        prop_assert_eq!(back.connected_at, info.connected_at);
+        prop_assert_eq!(
+            back.connected_at.timestamp_millis(),
+            info.connected_at.timestamp_millis(),
+        );
         prop_assert_eq!(back.active_workspace, info.active_workspace);
-        prop_assert_eq!(back.last_input, info.last_input);
+        prop_assert_eq!(
+            back.last_input.timestamp_millis(),
+            info.last_input.timestamp_millis(),
+        );
         prop_assert_eq!(back.focused_pane_id, info.focused_pane_id);
+        prop_assert_eq!(back, info);
     }
 
     #[test]

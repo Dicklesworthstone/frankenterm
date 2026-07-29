@@ -124,17 +124,23 @@ impl ClientInfo {
 
     pub(crate) fn wire_snapshot(&self) -> Self {
         let mut snapshot = self.clone();
+        snapshot.client_id = Arc::new(self.client_id.as_ref().clone());
         snapshot.focused_pane_registration = None;
         snapshot
     }
 }
 
+/// Equality follows the serialized five-field client projection.
+///
+/// The wire schema records timestamps as integer milliseconds and omits
+/// process-local pane authority. Comparing with greater timestamp precision
+/// would make a value unequal to its own successful wire roundtrip.
 impl PartialEq for ClientInfo {
     fn eq(&self, other: &Self) -> bool {
         self.client_id == other.client_id
-            && self.connected_at == other.connected_at
+            && self.connected_at.timestamp_millis() == other.connected_at.timestamp_millis()
             && self.active_workspace == other.active_workspace
-            && self.last_input == other.last_input
+            && self.last_input.timestamp_millis() == other.last_input.timestamp_millis()
             && self.focused_pane_id == other.focused_pane_id
     }
 }
@@ -285,6 +291,59 @@ mod tests {
             back.connected_at.timestamp_subsec_millis(),
             123,
             "ft-ztcsl: the 123ms remainder must survive the roundtrip"
+        );
+    }
+
+    #[test]
+    fn client_info_equality_uses_wire_timestamp_precision() {
+        use chrono::TimeZone;
+
+        let client_id = Arc::new(make_client_id("wire-equality", 2));
+        let first = Utc
+            .timestamp_opt(1_700_000_000, 123_456_789)
+            .single()
+            .expect("valid first timestamp");
+        let same_wire_millisecond = Utc
+            .timestamp_opt(1_700_000_000, 123_999_999)
+            .single()
+            .expect("valid same-millisecond timestamp");
+        let next_wire_millisecond = Utc
+            .timestamp_opt(1_700_000_000, 124_000_000)
+            .single()
+            .expect("valid next-millisecond timestamp");
+
+        let original =
+            ClientInfo::from_wire_parts(Arc::clone(&client_id), first, None, first, None);
+        let same_projection = ClientInfo::from_wire_parts(
+            Arc::clone(&client_id),
+            same_wire_millisecond,
+            None,
+            same_wire_millisecond,
+            None,
+        );
+        let next_projection = ClientInfo::from_wire_parts(
+            client_id,
+            next_wire_millisecond,
+            None,
+            next_wire_millisecond,
+            None,
+        );
+
+        assert_eq!(
+            original, same_projection,
+            "sub-millisecond differences omitted by the wire schema must compare equal",
+        );
+        assert_ne!(
+            original, next_projection,
+            "adjacent serialized milliseconds must remain distinguishable",
+        );
+
+        let json = serde_json::to_string(&original).expect("serialize sub-millisecond client");
+        let decoded: ClientInfo =
+            serde_json::from_str(&json).expect("deserialize sub-millisecond client");
+        assert_eq!(
+            decoded, original,
+            "wire equality must be stable across sub-millisecond truncation",
         );
     }
 

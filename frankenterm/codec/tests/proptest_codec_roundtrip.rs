@@ -297,21 +297,30 @@ fn arb_set_client_id() -> impl Strategy<Value = SetClientId> {
     })
 }
 
+fn arb_client_timestamp() -> impl Strategy<Value = chrono::DateTime<chrono::Utc>> {
+    (0i64..=4_102_444_800, 0u32..1_000_000_000).prop_map(|(secs, nanos)| {
+        chrono::Utc
+            .timestamp_opt(secs, nanos)
+            .single()
+            .expect("generated timestamp is in range")
+    })
+}
+
 fn arb_client_info() -> impl Strategy<Value = ClientInfo> {
     (
         arb_client_id(),
-        0i64..=4_102_444_800,
+        arb_client_timestamp(),
         prop::option::of(arb_small_string()),
-        0i64..=4_102_444_800,
+        arb_client_timestamp(),
         arb_optional_id(),
     )
         .prop_map(
             |(client_id, connected_at, active_workspace, last_input, focused_pane_id)| {
                 ClientInfo::from_wire_parts(
                     Arc::new(client_id),
-                    chrono::Utc.timestamp_opt(connected_at, 0).unwrap(),
+                    connected_at,
                     active_workspace,
-                    chrono::Utc.timestamp_opt(last_input, 0).unwrap(),
+                    last_input,
                     focused_pane_id,
                 )
             },

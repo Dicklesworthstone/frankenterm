@@ -3879,9 +3879,18 @@ mod tests {
                         }
 
                         let client = reconnect_client(client_variant);
-                        let owner_changes = slot_owner[slot]
-                            .as_ref()
-                            .is_none_or(|(_, prior_client)| *prior_client != client);
+                        let registration_is_current =
+                            slot_owner[slot]
+                                .as_ref()
+                                .is_some_and(|(prior_owner, prior_client)| {
+                                    *prior_client == client
+                                        && latest_owner_by_client
+                                            .get(prior_client)
+                                            .is_some_and(|current_owner| {
+                                                current_owner == prior_owner
+                                            })
+                                });
+                        let owner_changes = !registration_is_current;
 
                         slots[slot]
                             .handler
@@ -4398,6 +4407,7 @@ mod tests {
             let _mux_guard = ScopedMux::install(&mux);
             let (sender, captured) = capturing_sender();
             let mut handler = SessionHandler::new(sender);
+            let default_workspace = mux.active_workspace();
             let mut expected_client: Option<ClientId> = None;
             let mut expected_workspace: Option<String> = None;
 
@@ -4477,16 +4487,39 @@ mod tests {
                     op
                 );
                 if let Some(client) = expected_client.as_ref() {
-                    let client = Arc::new(client.clone());
+                    let registered_client = handler
+                        .client_id
+                        .as_ref()
+                        .expect("expected client must have an exact registration");
+                    prop_assert_eq!(
+                        registered_client.as_ref(),
+                        client,
+                        "handler retained the wrong exact client after step {}: {:?}",
+                        idx,
+                        op,
+                    );
+                    prop_assert!(
+                        mux.client_registration_is_current(registered_client),
+                        "handler retained a stale client registration after step {}: {:?}",
+                        idx,
+                        op,
+                    );
                     let expected_workspace = expected_workspace
                         .as_deref()
-                        .unwrap_or(mux::DEFAULT_WORKSPACE);
+                        .unwrap_or(default_workspace.as_str());
                     prop_assert_eq!(
-                        mux.active_workspace_for_client(&client),
+                        mux.active_workspace_for_client(registered_client),
                         expected_workspace,
                         "active workspace drifted after step {}: {:?}",
                         idx,
                         op
+                    );
+                } else {
+                    prop_assert!(
+                        handler.client_id.is_none(),
+                        "handler retained a client before SetClientId after step {}: {:?}",
+                        idx,
+                        op,
                     );
                 }
             }
@@ -4834,6 +4867,107 @@ mod tests {
     }
 
     #[test]
+    fn same_value_client_reclaims_after_equal_replacement_departed() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let mux = Arc::new(Mux::new(None));
+        let _mux_guard = ScopedMux::install(&mux);
+        let client_five = reconnect_client(5);
+        let client_zero = reconnect_client(0);
+
+        let (slot_two_sender, slot_two_responses) = capturing_sender();
+        let mut slot_two = SessionHandler::new(slot_two_sender);
+        slot_two.process_one(DecodedPdu {
+            serial: 1,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client_five.clone(),
+                is_proxy: false,
+            }),
+        });
+        assert!(matches!(
+            take_response(&slot_two_responses).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        ));
+        let slot_two_first = Arc::clone(
+            slot_two
+                .client_id
+                .as_ref()
+                .expect("slot two must retain its first exact registration"),
+        );
+        assert!(mux.client_registration_is_current(&slot_two_first));
+
+        let (slot_three_sender, slot_three_responses) = capturing_sender();
+        let mut slot_three = SessionHandler::new(slot_three_sender);
+        slot_three.process_one(DecodedPdu {
+            serial: 2,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client_five.clone(),
+                is_proxy: false,
+            }),
+        });
+        assert!(matches!(
+            take_response(&slot_three_responses).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        ));
+        let slot_three_client_five = Arc::clone(
+            slot_three
+                .client_id
+                .as_ref()
+                .expect("slot three must retain the equal replacement"),
+        );
+        assert!(mux.client_registration_is_current(&slot_three_client_five));
+        assert!(!mux.client_registration_is_current(&slot_two_first));
+
+        slot_three.process_one(DecodedPdu {
+            serial: 3,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client_zero.clone(),
+                is_proxy: false,
+            }),
+        });
+        assert!(matches!(
+            take_response(&slot_three_responses).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        ));
+        assert_eq!(mux_client_set(&mux), HashSet::from([client_zero.clone()]));
+
+        slot_two.process_one(DecodedPdu {
+            serial: 4,
+            pdu: Pdu::SetClientId(SetClientId {
+                client_id: client_five.clone(),
+                is_proxy: false,
+            }),
+        });
+        assert!(matches!(
+            take_response(&slot_two_responses).pdu,
+            Pdu::UnitResponse(UnitResponse {})
+        ));
+
+        let slot_two_reclaimed = Arc::clone(
+            slot_two
+                .client_id
+                .as_ref()
+                .expect("slot two must retain its reclaimed registration"),
+        );
+        assert!(
+            !Arc::ptr_eq(&slot_two_first, &slot_two_reclaimed),
+            "reclaim must retain the newly received exact token",
+        );
+        assert!(mux.client_registration_is_current(&slot_two_reclaimed));
+        assert!(!mux.client_registration_is_current(&slot_two_first));
+        assert_eq!(
+            mux_client_set(&mux),
+            HashSet::from([client_zero.clone(), client_five.clone()]),
+        );
+
+        drop(slot_three);
+        assert_eq!(mux_client_set(&mux), HashSet::from([client_five]));
+        drop(slot_two);
+        assert!(mux.iter_clients().is_empty());
+    }
+
+    #[test]
     fn handler_drop_unregisters_from_owning_mux_after_global_replacement() {
         let _lock = crate::GLOBAL_STATE_TEST_LOCK
             .lock()
@@ -4863,10 +4997,7 @@ mod tests {
             "handler cleanup must unregister from the mux that owns its registration",
         );
         assert!(
-            replacement_mux
-                .iter_clients()
-                .iter()
-                .any(|info| Arc::ptr_eq(&info.client_id, &replacement_client)),
+            replacement_mux.client_registration_is_current(&replacement_client),
             "cleanup from an old mux must not remove an equal-valued replacement registration",
         );
     }
@@ -5011,8 +5142,16 @@ mod tests {
         assert_eq!(resp.serial, 22);
         assert_eq!(resp.pdu, Pdu::UnitResponse(UnitResponse {}));
 
-        let client = Arc::new(client);
-        assert_eq!(mux.active_workspace_for_client(&client), "remote-dev");
+        let registered_client = handler
+            .client_id
+            .as_ref()
+            .expect("SetClientId must retain the exact registration");
+        assert_eq!(registered_client.as_ref(), &client);
+        assert!(mux.client_registration_is_current(registered_client));
+        assert_eq!(
+            mux.active_workspace_for_client(registered_client),
+            "remote-dev",
+        );
     }
 
     #[test]

@@ -7848,7 +7848,8 @@ mod tests {
         };
         assert!(
             raw_error.to_string().contains("into a split of itself"),
-            "unexpected raw split error: {raw_error:#}"
+            "unexpected raw split error: {:#}",
+            raw_error,
         );
 
         let error = promise::spawn::block_on(registration.split_if_current(
@@ -7864,7 +7865,8 @@ mod tests {
 
         assert!(
             error.to_string().contains("into a split of itself"),
-            "unexpected error: {error:#}"
+            "unexpected error: {:#}",
+            error,
         );
         assert_eq!(kills.load(Ordering::SeqCst), 0);
         assert!(
@@ -10222,33 +10224,87 @@ mod tests {
 
     #[test]
     fn remove_pane_discards_client_focus_for_removed_pane() {
-        let mux = Mux::new(None);
+        let mux = Arc::new(Mux::new(None));
         let removed_client = Arc::new(ClientId::new());
         let unrelated_client = Arc::new(ClientId::new());
+        let (removed_pane, _) = KillCountingPane::new(7, test_size());
+        let (unrelated_pane, _) = KillCountingPane::new(8, test_size());
+        mux.add_pane(&removed_pane)
+            .expect("removed pane registration");
+        mux.add_pane(&unrelated_pane)
+            .expect("unrelated pane registration");
         mux.register_client(Arc::clone(&removed_client));
         mux.register_client(Arc::clone(&unrelated_client));
-        mux.record_focus_for_client(&removed_client, 7);
-        mux.record_focus_for_client(&unrelated_client, 8);
+        assert!(mux.record_focus_for_client(&removed_client, 7));
+        assert!(mux.record_focus_for_client(&unrelated_client, 8));
 
-        {
+        let (removed_focus, unrelated_focus) = {
             let clients = mux.clients.read();
-            assert_eq!(clients[removed_client.as_ref()].focused_pane_id, Some(7));
-            assert_eq!(clients[unrelated_client.as_ref()].focused_pane_id, Some(8));
-        }
+            let removed = &clients[removed_client.as_ref()];
+            let unrelated = &clients[unrelated_client.as_ref()];
+            assert_eq!(removed.focused_pane_id, Some(7));
+            assert_eq!(unrelated.focused_pane_id, Some(8));
+            (
+                removed
+                    .focused_pane_registration()
+                    .expect("removed client must retain exact pane authority"),
+                unrelated
+                    .focused_pane_registration()
+                    .expect("unrelated client must retain exact pane authority"),
+            )
+        };
 
         mux.remove_pane(7);
 
+        assert!(
+            removed_focus.try_with_current(|_| ()).is_none(),
+            "the removed pane registration must be retired",
+        );
         let clients = mux.clients.read();
+        let removed = &clients[removed_client.as_ref()];
         assert_eq!(
-            clients[removed_client.as_ref()].focused_pane_id,
-            None,
+            removed.focused_pane_id, None,
             "remove_pane must clear per-client focus state for the removed pane",
         );
+        assert!(
+            removed.focused_pane_registration().is_none(),
+            "remove_pane must clear the removed exact focus authority",
+        );
+        let unrelated = &clients[unrelated_client.as_ref()];
         assert_eq!(
-            clients[unrelated_client.as_ref()].focused_pane_id,
+            unrelated.focused_pane_id,
             Some(8),
             "removing one pane must not clear client focus for unrelated panes",
         );
+        let surviving_focus = unrelated
+            .focused_pane_registration()
+            .expect("unrelated exact focus authority must survive");
+        assert!(
+            surviving_focus.same_registration(&unrelated_focus),
+            "unrelated focus must retain the same exact pane generation",
+        );
+        assert_eq!(
+            surviving_focus.try_with_current(|current| current.pane_id()),
+            Some(8),
+            "unrelated focus authority must remain live",
+        );
+    }
+
+    #[test]
+    fn record_focus_rejects_unregistered_numeric_pane_id() {
+        let mux = Arc::new(Mux::new(None));
+        let client = Arc::new(ClientId::new());
+        mux.register_client(Arc::clone(&client));
+
+        assert!(
+            !mux.record_focus_for_client(&client, 7),
+            "a raw numeric ID must not mint focus authority without a live pane registration",
+        );
+
+        let clients = mux.clients.read();
+        let stored = &clients[client.as_ref()];
+        assert_eq!(stored.focused_pane_id, None);
+        assert!(stored.focused_pane_registration().is_none());
     }
 
     #[test]
@@ -10306,7 +10362,7 @@ mod tests {
 
     #[test]
     fn register_client_is_idempotent_for_the_exact_registration() {
-        let mux = Mux::new(None);
+        let mux = Arc::new(Mux::new(None));
         let client = Arc::new(ClientId::new());
         let (pane, _) = KillCountingPane::new(776, test_size());
         mux.add_pane(&pane).expect("focus target registration");
@@ -10385,6 +10441,23 @@ mod tests {
 
         mux.register_client(Arc::clone(&stale_client));
         mux.register_client(Arc::clone(&replacement_client));
+        let default_workspace = mux.active_workspace();
+        assert!(
+            mux.set_active_workspace_for_client_if_same(
+                &replacement_client,
+                "replacement-workspace",
+            )
+        );
+        assert_eq!(
+            mux.active_workspace_for_client(&replacement_client),
+            "replacement-workspace",
+            "the exact replacement token must read its selected workspace",
+        );
+        assert_eq!(
+            mux.active_workspace_for_client(&stale_client),
+            default_workspace,
+            "an equal-valued stale token must not borrow replacement workspace authority",
+        );
 
         let replacement_before = mux
             .clients
@@ -10723,6 +10796,14 @@ mod tests {
         let snapshots = mux.iter_clients();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].focused_pane_id, Some(782));
+        assert!(
+            !Arc::ptr_eq(&snapshots[0].client_id, &client),
+            "wire snapshots must not leak the exact process-local client token",
+        );
+        assert!(
+            !mux.client_registration_is_current(&snapshots[0].client_id),
+            "wire metadata must not carry live client mutation authority",
+        );
         assert!(
             snapshots[0].focused_pane_registration().is_none(),
             "iter_clients must return a wire-safe projection",
