@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context};
 use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use asupersync::runtime::{Interest, IoRegistration};
 use asupersync::Cx;
-use async_channel::{bounded, unbounded, Receiver, Sender};
+use async_channel::{bounded, unbounded, Receiver, Sender, TrySendError};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
 use codec::*;
@@ -21,11 +21,12 @@ use mux::{Mux, PaneRegistrationHandle};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod};
 use openssl::x509::X509;
 use portable_pty::Child;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::future::poll_fn;
 use std::io::{ErrorKind, IoSlice, Read, Write};
 use std::marker::Unpin;
 use std::net::TcpStream;
+use std::num::NonZeroU64;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -270,6 +271,20 @@ pub struct IncompatibleVersionError {
     pub codec_vers: usize,
 }
 
+const MAX_REMOTE_ERROR_REASON_CHARS: usize = 512;
+
+fn sanitized_remote_error_reason(reason: &str) -> String {
+    let mut sanitized = String::with_capacity(reason.len().min(MAX_REMOTE_ERROR_REASON_CHARS));
+    for (index, ch) in reason.chars().enumerate() {
+        if index == MAX_REMOTE_ERROR_REASON_CHARS {
+            sanitized.push('…');
+            break;
+        }
+        sanitized.extend(ch.escape_debug());
+    }
+    sanitized
+}
+
 macro_rules! rpc {
     ($method_name:ident, $request_type:ident, $response_type:ident) => {
         pub async fn $method_name(&self, pdu: $request_type) -> anyhow::Result<$response_type> {
@@ -280,7 +295,19 @@ macro_rules! rpc {
             metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
             match result {
                 Ok(Pdu::$response_type(res)) => Ok(res),
-                Ok(_) => bail!("unexpected response {:?}", result),
+                Ok(Pdu::ErrorResponse(err)) => {
+                    bail!(
+                        "{} failed: {}",
+                        stringify!($method_name),
+                        sanitized_remote_error_reason(&err.reason)
+                    )
+                }
+                Ok(other) => bail!(
+                    "unexpected {} response to {}; expected {}",
+                    other.pdu_name(),
+                    stringify!($method_name),
+                    stringify!($response_type)
+                ),
                 Err(err) => Err(err),
             }
         }
@@ -299,7 +326,19 @@ macro_rules! rpc {
             metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
             match result {
                 Ok(Pdu::$response_type(res)) => Ok(res),
-                Ok(_) => bail!("unexpected response {:?}", result),
+                Ok(Pdu::ErrorResponse(err)) => {
+                    bail!(
+                        "{} failed: {}",
+                        stringify!($method_name),
+                        sanitized_remote_error_reason(&err.reason)
+                    )
+                }
+                Ok(other) => bail!(
+                    "unexpected {} response to {}; expected {}",
+                    other.pdu_name(),
+                    stringify!($method_name),
+                    stringify!($response_type)
+                ),
                 Err(err) => Err(err),
             }
         }
@@ -667,6 +706,333 @@ enum NotReconnectableError {
     ClientWasDestroyed,
 }
 
+#[derive(Debug)]
+struct PendingRpc {
+    completion: Sender<anyhow::Result<Pdu>>,
+    pdu_name: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct RpcMetrics {
+    pending: metrics::Gauge,
+    admitted: metrics::Counter,
+    preclosed: metrics::Counter,
+    delivered: metrics::Counter,
+    abandoned: metrics::Counter,
+    transport_failed_live: metrics::Counter,
+    transport_cleared_abandoned: metrics::Counter,
+    retirement_reply_channel_full: metrics::Counter,
+    future_serial: metrics::Counter,
+    unmatched_serial: metrics::Counter,
+    serial_exhausted: metrics::Counter,
+    reserve_failed: metrics::Counter,
+    serial_collision: metrics::Counter,
+    protocol_reply_channel_full: metrics::Counter,
+}
+
+impl RpcMetrics {
+    fn register() -> Self {
+        Self {
+            pending: metrics::gauge!("mux.client.rpc.pending"),
+            admitted: metrics::counter!(
+                "mux.client.rpc.admission.total",
+                "outcome" => "admitted"
+            ),
+            preclosed: metrics::counter!(
+                "mux.client.rpc.admission.total",
+                "outcome" => "preclosed"
+            ),
+            delivered: metrics::counter!(
+                "mux.client.rpc.retirement.total",
+                "outcome" => "delivered"
+            ),
+            abandoned: metrics::counter!(
+                "mux.client.rpc.retirement.total",
+                "outcome" => "abandoned"
+            ),
+            transport_failed_live: metrics::counter!(
+                "mux.client.rpc.retirement.total",
+                "outcome" => "transport_failed_live"
+            ),
+            transport_cleared_abandoned: metrics::counter!(
+                "mux.client.rpc.retirement.total",
+                "outcome" => "transport_cleared_abandoned"
+            ),
+            retirement_reply_channel_full: metrics::counter!(
+                "mux.client.rpc.retirement.total",
+                "outcome" => "reply_channel_full"
+            ),
+            future_serial: metrics::counter!(
+                "mux.client.rpc.protocol_error.total",
+                "kind" => "future_serial"
+            ),
+            unmatched_serial: metrics::counter!(
+                "mux.client.rpc.protocol_error.total",
+                "kind" => "unmatched_serial"
+            ),
+            serial_exhausted: metrics::counter!(
+                "mux.client.rpc.protocol_error.total",
+                "kind" => "serial_exhausted"
+            ),
+            reserve_failed: metrics::counter!(
+                "mux.client.rpc.protocol_error.total",
+                "kind" => "reserve_failed"
+            ),
+            serial_collision: metrics::counter!(
+                "mux.client.rpc.protocol_error.total",
+                "kind" => "serial_collision"
+            ),
+            protocol_reply_channel_full: metrics::counter!(
+                "mux.client.rpc.protocol_error.total",
+                "kind" => "reply_channel_full"
+            ),
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+enum PendingRpcError {
+    #[error("mux client RPC serial space is exhausted")]
+    SerialExhausted,
+    #[error("cannot reserve capacity for another pending mux client RPC")]
+    Reserve(#[source] std::collections::TryReserveError),
+    #[error(
+        "mux client RPC serial {serial} for {request} collides with pending request {pending_request}"
+    )]
+    SerialCollision {
+        serial: NonZeroU64,
+        request: &'static str,
+        pending_request: &'static str,
+    },
+    #[error(
+        "server replied with future RPC serial {serial}; highest serial issued by this transport is {highest_issued}"
+    )]
+    FutureSerial {
+        serial: NonZeroU64,
+        highest_issued: u64,
+    },
+    #[error(
+        "server replied with RPC serial {serial}, which is no longer pending (highest issued {highest_issued})"
+    )]
+    UnmatchedSerial {
+        serial: NonZeroU64,
+        highest_issued: u64,
+    },
+    #[error(
+        "reply channel for RPC serial {serial} ({request} -> {response}) was unexpectedly full"
+    )]
+    ReplyChannelFull {
+        serial: NonZeroU64,
+        request: &'static str,
+        response: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyDisposition {
+    Delivered,
+    Abandoned,
+}
+
+#[derive(Debug)]
+struct PendingReplies {
+    map: HashMap<NonZeroU64, PendingRpc>,
+    next_serial: Option<NonZeroU64>,
+    highest_issued: u64,
+    metrics: RpcMetrics,
+}
+
+impl PendingReplies {
+    fn new(metrics: RpcMetrics) -> Self {
+        Self {
+            map: HashMap::new(),
+            next_serial: NonZeroU64::new(1),
+            highest_issued: 0,
+            metrics,
+        }
+    }
+
+    /// Admit a request at the reader's local write-attempt boundary.
+    ///
+    /// If the caller closed its receiver while this request was still queued,
+    /// it consumes neither a serial nor a wire frame. A close after this check
+    /// is an admitted abandonment even if a later encode or flush fails, and
+    /// retains this same map entry until reply drainage or transport teardown.
+    fn admit(
+        &mut self,
+        completion: Sender<anyhow::Result<Pdu>>,
+        pdu_name: &'static str,
+    ) -> Result<Option<NonZeroU64>, PendingRpcError> {
+        if completion.is_closed() {
+            self.metrics.preclosed.increment(1);
+            return Ok(None);
+        }
+
+        let Some(serial) = self.next_serial else {
+            self.metrics.serial_exhausted.increment(1);
+            return Self::reject_admission(completion, PendingRpcError::SerialExhausted);
+        };
+        if let Err(err) = self.map.try_reserve(1) {
+            self.metrics.reserve_failed.increment(1);
+            return Self::reject_admission(completion, PendingRpcError::Reserve(err));
+        };
+
+        match self.map.entry(serial) {
+            Entry::Vacant(entry) => {
+                entry.insert(PendingRpc {
+                    completion,
+                    pdu_name,
+                });
+            }
+            Entry::Occupied(entry) => {
+                self.metrics.serial_collision.increment(1);
+                let error = PendingRpcError::SerialCollision {
+                    serial,
+                    request: pdu_name,
+                    pending_request: entry.get().pdu_name,
+                };
+                return Self::reject_admission(completion, error);
+            }
+        }
+
+        self.highest_issued = serial.get();
+        self.next_serial = serial.get().checked_add(1).and_then(NonZeroU64::new);
+        self.metrics.admitted.increment(1);
+        // This gauge is process-wide and intentionally unlabeled. Treat it as
+        // an aggregate across every concurrent mux connection; absolute
+        // per-connection `set` operations would clobber one another.
+        self.metrics.pending.increment(1);
+        Ok(Some(serial))
+    }
+
+    fn highest_issued(&self) -> u64 {
+        self.highest_issued
+    }
+
+    fn complete(
+        &mut self,
+        serial: NonZeroU64,
+        pdu: Pdu,
+    ) -> Result<ReplyDisposition, PendingRpcError> {
+        let Some(pending) = self.map.remove(&serial) else {
+            if serial.get() > self.highest_issued {
+                self.metrics.future_serial.increment(1);
+                return Err(PendingRpcError::FutureSerial {
+                    serial,
+                    highest_issued: self.highest_issued,
+                });
+            }
+            self.metrics.unmatched_serial.increment(1);
+            return Err(PendingRpcError::UnmatchedSerial {
+                serial,
+                highest_issued: self.highest_issued,
+            });
+        };
+        self.metrics.pending.decrement(1);
+
+        let response_name = pdu.pdu_name();
+        match pending.completion.try_send(Ok(pdu)) {
+            Ok(()) => {
+                // "delivered" is linearized at successful enqueue into the
+                // one-shot channel; the caller may close before observing it.
+                self.metrics.delivered.increment(1);
+                Ok(ReplyDisposition::Delivered)
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.metrics.abandoned.increment(1);
+                Ok(ReplyDisposition::Abandoned)
+            }
+            Err(TrySendError::Full(_)) => {
+                self.metrics.retirement_reply_channel_full.increment(1);
+                self.metrics.protocol_reply_channel_full.increment(1);
+                Err(PendingRpcError::ReplyChannelFull {
+                    serial,
+                    request: pending.pdu_name,
+                    response: response_name,
+                })
+            }
+        }
+    }
+
+    fn complete_or_fail_transport(
+        &mut self,
+        serial: NonZeroU64,
+        pdu: Pdu,
+    ) -> Result<ReplyDisposition, PendingRpcError> {
+        match self.complete(serial, pdu) {
+            Ok(disposition) => Ok(disposition),
+            Err(error) => {
+                let reason = error.to_string();
+                self.fail_all(&reason);
+                Err(error)
+            }
+        }
+    }
+
+    fn fail_all(&mut self, reason: &str) {
+        log::trace!("failing all pending RPCs: {reason}");
+        for (serial, pending) in self.map.drain() {
+            self.metrics.pending.decrement(1);
+            if pending.completion.is_closed() {
+                self.metrics.transport_cleared_abandoned.increment(1);
+                continue;
+            }
+            match pending.completion.try_send(Err(anyhow!(
+                "{reason} (pending {} serial {serial})",
+                pending.pdu_name
+            ))) {
+                Ok(()) => self.metrics.transport_failed_live.increment(1),
+                Err(TrySendError::Closed(_)) => {
+                    self.metrics.transport_cleared_abandoned.increment(1);
+                }
+                Err(TrySendError::Full(_)) => {
+                    self.metrics.retirement_reply_channel_full.increment(1);
+                    self.metrics.protocol_reply_channel_full.increment(1);
+                    log::error!(
+                        "reply channel unexpectedly full while failing pending {} serial {}",
+                        pending.pdu_name,
+                        serial
+                    );
+                }
+            }
+        }
+    }
+
+    fn record_decode_protocol_error(&self, error: &anyhow::Error) {
+        if matches!(
+            error.downcast_ref::<CorruptResponse>(),
+            Some(CorruptResponse::SerialAboveCeiling { .. })
+        ) {
+            self.metrics.future_serial.increment(1);
+        }
+    }
+
+    fn fail_after_transport_error(&mut self, error: &anyhow::Error) {
+        self.fail_all(&format!("{error:#}"));
+    }
+
+    fn fail_after_decode_error(&mut self, error: &anyhow::Error) -> String {
+        self.record_decode_protocol_error(error);
+        let reason = format!("Error while decoding response pdu: {error:#}");
+        self.fail_all(&reason);
+        reason
+    }
+
+    fn reject_admission(
+        completion: Sender<anyhow::Result<Pdu>>,
+        error: PendingRpcError,
+    ) -> Result<Option<NonZeroU64>, PendingRpcError> {
+        let _ = completion.try_send(Err(anyhow!("{error}")));
+        Err(error)
+    }
+}
+
+impl Drop for PendingReplies {
+    fn drop(&mut self) {
+        self.fail_all("Client was destroyed");
+    }
+}
+
 const FALLBACK_IO_BACKOFF: Duration = Duration::from_millis(1);
 
 fn fallback_rewake(task_cx: &TaskContext<'_>) {
@@ -703,29 +1069,7 @@ async fn client_thread_async(
     rx: &mut Receiver<ReaderMessage>,
     dispatch_authority: &ClientDispatchAuthority,
 ) -> anyhow::Result<()> {
-    let mut next_serial = 1u64;
-
-    struct Promises {
-        map: HashMap<u64, Sender<anyhow::Result<Pdu>>>,
-    }
-
-    impl Promises {
-        fn fail_all(&mut self, reason: &str) {
-            log::trace!("failing all promises: {}", reason);
-            for (_, promise) in self.map.drain() {
-                let _ = promise.try_send(Err(anyhow!("{}", reason)));
-            }
-        }
-    }
-
-    impl Drop for Promises {
-        fn drop(&mut self) {
-            self.fail_all("Client was destroyed");
-        }
-    }
-    let mut promises = Promises {
-        map: HashMap::new(),
-    };
+    let mut pending = PendingReplies::new(RpcMetrics::register());
 
     // Wrap the connection in a persistent buffered reader so PDU decoding pulls
     // its leb128 length headers and bodies from an in-memory buffer (one socket
@@ -777,24 +1121,40 @@ async fn client_thread_async(
 
         match next_event {
             NextEvent::Message(Ok(ReaderMessage::SendPdu { pdu, promise })) => {
-                let serial = next_serial;
-                next_serial += 1;
-                promises.map.insert(serial, promise);
+                let request_name = pdu.pdu_name();
+                let serial = match pending.admit(promise, request_name) {
+                    Ok(Some(serial)) => serial,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        let error = anyhow::Error::new(error);
+                        pending.fail_after_transport_error(&error);
+                        return Err(error);
+                    }
+                };
 
-                pdu.encode_async(reader.get_mut(), serial)
+                if let Err(error) = pdu
+                    .encode_async(reader.get_mut(), serial.get())
                     .await
-                    .context("encoding a PDU to send to the server")?;
-                reader
+                    .context("encoding a PDU to send to the server")
+                {
+                    pending.fail_after_transport_error(&error);
+                    return Err(error);
+                }
+                if let Err(error) = reader
                     .get_mut()
                     .flush()
                     .await
-                    .context("flushing PDU to server")?;
+                    .context("flushing PDU to server")
+                {
+                    pending.fail_after_transport_error(&error);
+                    return Err(error);
+                }
             }
             NextEvent::Message(Err(_)) => {
                 return Err(NotReconnectableError::ClientWasDestroyed.into());
             }
             NextEvent::Readable(Ok(())) => {
-                match Pdu::decode_async(&mut reader, Some(next_serial)).await {
+                match Pdu::decode_async(&mut reader, Some(pending.highest_issued())).await {
                     Ok(decoded) => {
                         log::debug!(
                             "decoded serial {} {}",
@@ -802,27 +1162,26 @@ async fn client_thread_async(
                             decoded.pdu.pdu_name()
                         );
                         if decoded.serial == 0 {
-                            process_unilateral(dispatch_authority, decoded)
+                            if let Err(error) = process_unilateral(dispatch_authority, decoded)
                                 .context("processing unilateral PDU from server")
-                                .map_err(|e| {
-                                    log::error!("process_unilateral: {:?}", e);
-                                    e
-                                })?;
-                        } else if let Some(promise) = promises.map.remove(&decoded.serial) {
-                            if promise.try_send(Ok(decoded.pdu)).is_err() {
-                                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                            {
+                                log::error!("process_unilateral: {:?}", error);
+                                pending.fail_after_transport_error(&error);
+                                return Err(error);
                             }
                         } else {
-                            let reason =
-                                format!("got serial {:?} without a corresponding promise", decoded);
-                            promises.fail_all(&reason);
-                            anyhow::bail!("{}", reason);
+                            let serial = NonZeroU64::new(decoded.serial)
+                                .expect("the unilateral serial-zero branch was handled above");
+                            if let Err(err) =
+                                pending.complete_or_fail_transport(serial, decoded.pdu)
+                            {
+                                return Err(err.into());
+                            }
                         }
                     }
                     Err(err) => {
-                        let reason = format!("Error while decoding response pdu: {:#}", err);
+                        let reason = pending.fail_after_decode_error(&err);
                         log::error!("{}", reason);
-                        promises.fail_all(&reason);
                         return Err(err).context("Error while decoding response pdu");
                     }
                 }
@@ -830,7 +1189,7 @@ async fn client_thread_async(
             NextEvent::Readable(Err(err)) => {
                 let reason = format!("Error while waiting for stream readability: {:#}", err);
                 log::error!("{}", reason);
-                promises.fail_all(&reason);
+                pending.fail_all(&reason);
                 return Err(err).context("Error while waiting for stream readability");
             }
         }
@@ -2335,8 +2694,11 @@ mod tests {
         GetCodecVersionResponse, PaneRemoved, SetClientId, UnitResponse, WindowTitleChanged,
         WindowWorkspaceChanged,
     };
+    use metrics::atomics::AtomicU64 as MetricAtomicU64;
+    use metrics::{Counter, Gauge};
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::Ordering;
     #[cfg(unix)]
     use std::sync::mpsc;
     use std::sync::{Mutex as StdMutex, Once};
@@ -2347,6 +2709,8 @@ mod tests {
         records: StdMutex::new(Vec::new()),
     };
     static TEST_LOGGER_INIT: Once = Once::new();
+    #[cfg(unix)]
+    static TEST_SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct ScopedMux(Option<Arc<Mux>>);
 
@@ -2415,6 +2779,22 @@ mod tests {
             .block_on(future)
     }
 
+    fn assert_expected_reader_shutdown(result: anyhow::Result<()>) {
+        let error = result.expect_err("reader must not report success when its transport ends");
+        let client_destroyed = error
+            .downcast_ref::<NotReconnectableError>()
+            .is_some_and(|kind| *kind == NotReconnectableError::ClientWasDestroyed);
+        let clean_eof = error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == ErrorKind::UnexpectedEof);
+        assert!(
+            client_destroyed || clean_eof,
+            "unexpected reader shutdown disposition: {:#}",
+            error
+        );
+    }
+
     /// Cancellable hang watchdog. Returns a guard; dropping it (test finished,
     /// even on panic) stops the watchdog. A fire-and-forget watchdog that
     /// outlived its test could `process::exit` during a *later* test if the
@@ -2454,11 +2834,516 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
+        let sequence = TEST_SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         PathBuf::from(format!(
-            "/tmp/ftk4-{}-{}.sock",
+            "/tmp/ftk4-{}-{nanos}-{sequence}.sock",
             std::process::id(),
-            nanos % 1_000_000
         ))
+    }
+
+    #[derive(Debug)]
+    struct RpcMetricProbe {
+        pending: Arc<MetricAtomicU64>,
+        admitted: Arc<MetricAtomicU64>,
+        preclosed: Arc<MetricAtomicU64>,
+        delivered: Arc<MetricAtomicU64>,
+        abandoned: Arc<MetricAtomicU64>,
+        transport_failed_live: Arc<MetricAtomicU64>,
+        transport_cleared_abandoned: Arc<MetricAtomicU64>,
+        retirement_reply_channel_full: Arc<MetricAtomicU64>,
+        future_serial: Arc<MetricAtomicU64>,
+        unmatched_serial: Arc<MetricAtomicU64>,
+        serial_exhausted: Arc<MetricAtomicU64>,
+        reserve_failed: Arc<MetricAtomicU64>,
+        serial_collision: Arc<MetricAtomicU64>,
+        protocol_reply_channel_full: Arc<MetricAtomicU64>,
+    }
+
+    impl RpcMetricProbe {
+        fn new() -> (RpcMetrics, Self) {
+            let probe = Self {
+                pending: Arc::new(MetricAtomicU64::new(0.0_f64.to_bits())),
+                admitted: Arc::new(MetricAtomicU64::new(0)),
+                preclosed: Arc::new(MetricAtomicU64::new(0)),
+                delivered: Arc::new(MetricAtomicU64::new(0)),
+                abandoned: Arc::new(MetricAtomicU64::new(0)),
+                transport_failed_live: Arc::new(MetricAtomicU64::new(0)),
+                transport_cleared_abandoned: Arc::new(MetricAtomicU64::new(0)),
+                retirement_reply_channel_full: Arc::new(MetricAtomicU64::new(0)),
+                future_serial: Arc::new(MetricAtomicU64::new(0)),
+                unmatched_serial: Arc::new(MetricAtomicU64::new(0)),
+                serial_exhausted: Arc::new(MetricAtomicU64::new(0)),
+                reserve_failed: Arc::new(MetricAtomicU64::new(0)),
+                serial_collision: Arc::new(MetricAtomicU64::new(0)),
+                protocol_reply_channel_full: Arc::new(MetricAtomicU64::new(0)),
+            };
+            let metrics = RpcMetrics {
+                pending: Gauge::from_arc(Arc::clone(&probe.pending)),
+                admitted: Counter::from_arc(Arc::clone(&probe.admitted)),
+                preclosed: Counter::from_arc(Arc::clone(&probe.preclosed)),
+                delivered: Counter::from_arc(Arc::clone(&probe.delivered)),
+                abandoned: Counter::from_arc(Arc::clone(&probe.abandoned)),
+                transport_failed_live: Counter::from_arc(Arc::clone(&probe.transport_failed_live)),
+                transport_cleared_abandoned: Counter::from_arc(Arc::clone(
+                    &probe.transport_cleared_abandoned,
+                )),
+                retirement_reply_channel_full: Counter::from_arc(Arc::clone(
+                    &probe.retirement_reply_channel_full,
+                )),
+                future_serial: Counter::from_arc(Arc::clone(&probe.future_serial)),
+                unmatched_serial: Counter::from_arc(Arc::clone(&probe.unmatched_serial)),
+                serial_exhausted: Counter::from_arc(Arc::clone(&probe.serial_exhausted)),
+                reserve_failed: Counter::from_arc(Arc::clone(&probe.reserve_failed)),
+                serial_collision: Counter::from_arc(Arc::clone(&probe.serial_collision)),
+                protocol_reply_channel_full: Counter::from_arc(Arc::clone(
+                    &probe.protocol_reply_channel_full,
+                )),
+            };
+            (metrics, probe)
+        }
+
+        fn counter(counter: &MetricAtomicU64) -> u64 {
+            counter.load(Ordering::Acquire)
+        }
+
+        fn pending(&self) -> f64 {
+            let value = f64::from_bits(self.pending.load(Ordering::Acquire));
+            assert!(
+                value.is_finite() && value >= 0.0 && value.fract() == 0.0,
+                "pending gauge must be a finite non-negative integer, got {}",
+                value
+            );
+            value
+        }
+
+        fn assert_balanced(&self) {
+            assert_eq!(
+                self.pending(),
+                0.0,
+                "balance is asserted only at a quiescent boundary"
+            );
+            let retired = Self::counter(&self.delivered)
+                + Self::counter(&self.abandoned)
+                + Self::counter(&self.transport_failed_live)
+                + Self::counter(&self.transport_cleared_abandoned)
+                + Self::counter(&self.retirement_reply_channel_full);
+            assert_eq!(
+                Self::counter(&self.admitted),
+                retired,
+                "at quiescence every admitted request must have exactly one retirement outcome"
+            );
+        }
+    }
+
+    fn pending_replies_for_test() -> (PendingReplies, RpcMetricProbe) {
+        let (metrics, probe) = RpcMetricProbe::new();
+        (PendingReplies::new(metrics), probe)
+    }
+
+    #[test]
+    fn remote_rpc_error_reason_is_control_escaped_and_bounded() {
+        let reason = format!("\u{1b}[31mdenied\n{}\r", "x".repeat(600));
+        let sanitized = sanitized_remote_error_reason(&reason);
+
+        assert!(
+            sanitized.chars().all(|ch| !ch.is_control()),
+            "sanitized remote reason retained a control character: {:?}",
+            sanitized
+        );
+        assert!(
+            sanitized.ends_with('…'),
+            "oversized remote reason must advertise truncation"
+        );
+        assert!(
+            sanitized.len() < reason.len(),
+            "sanitized remote reason must not preserve an attacker-sized payload"
+        );
+    }
+
+    #[test]
+    fn pending_rpc_gauge_aggregates_across_connections_and_drop_drains_exactly_once() {
+        let (metrics, probe) = RpcMetricProbe::new();
+        let mut first = PendingReplies::new(metrics.clone());
+        let (first_tx, first_rx) = bounded(1);
+        let first_serial = first
+            .admit(first_tx, "Ping")
+            .expect("admit first connection RPC")
+            .expect("assign first connection serial");
+        assert_eq!(probe.pending(), 1.0);
+
+        let mut second = PendingReplies::new(metrics);
+        assert_eq!(
+            probe.pending(),
+            1.0,
+            "constructing another connection must not reset the process gauge"
+        );
+        let (second_tx, second_rx) = bounded(1);
+        second
+            .admit(second_tx, "SearchScrollbackRequest")
+            .expect("admit second connection RPC")
+            .expect("assign second connection serial");
+        assert_eq!(probe.pending(), 2.0);
+
+        first
+            .complete(first_serial, Pdu::Pong(Pong {}))
+            .expect("first connection reply should enqueue");
+        assert!(first_rx
+            .try_recv()
+            .expect("first connection completion")
+            .is_ok());
+        assert_eq!(probe.pending(), 1.0);
+
+        drop(second);
+        assert!(second_rx
+            .try_recv()
+            .expect("PendingReplies::drop must wake the live waiter")
+            .is_err());
+        assert_eq!(probe.pending(), 0.0);
+        assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
+        assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 1);
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn pending_rpc_preclosed_admission_consumes_neither_frame_slot_nor_serial() {
+        let (mut pending, probe) = pending_replies_for_test();
+        let (preclosed_tx, preclosed_rx) = bounded(1);
+        drop(preclosed_rx);
+
+        assert_eq!(
+            pending
+                .admit(preclosed_tx, "SearchScrollbackRequest")
+                .expect("preclosed admission is a normal disposition"),
+            None
+        );
+        assert_eq!(pending.highest_issued(), 0);
+        assert!(pending.map.is_empty());
+        assert_eq!(RpcMetricProbe::counter(&probe.preclosed), 1);
+        probe.assert_balanced();
+
+        let (live_tx, live_rx) = bounded(1);
+        let serial = pending
+            .admit(live_tx, "Ping")
+            .expect("live request should admit")
+            .expect("live request should receive a serial");
+        assert_eq!(serial.get(), 1);
+        assert_eq!(pending.highest_issued(), 1);
+        assert_eq!(probe.pending(), 1.0);
+
+        assert_eq!(
+            pending
+                .complete(serial, Pdu::Pong(Pong {}))
+                .expect("live response should deliver"),
+            ReplyDisposition::Delivered
+        );
+        assert_eq!(
+            live_rx
+                .try_recv()
+                .expect("live response should be queued")
+                .expect("live response should be successful"),
+            Pdu::Pong(Pong {})
+        );
+        assert_eq!(probe.pending(), 0.0);
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn pending_rpc_max_serial_is_issued_once_and_collision_never_replaces() {
+        let (mut pending, probe) = pending_replies_for_test();
+        pending.next_serial = NonZeroU64::new(u64::MAX);
+        pending.highest_issued = u64::MAX - 1;
+
+        let (max_tx, max_rx) = bounded(1);
+        let max_serial = pending
+            .admit(max_tx, "Ping")
+            .expect("maximum serial should be admissible once")
+            .expect("maximum serial should be assigned");
+        assert_eq!(max_serial.get(), u64::MAX);
+        assert_eq!(pending.next_serial, None);
+
+        let (exhausted_tx, exhausted_rx) = bounded(1);
+        let exhausted = pending
+            .admit(exhausted_tx, "Ping")
+            .expect_err("the serial after u64::MAX must fail closed");
+        assert!(matches!(exhausted, PendingRpcError::SerialExhausted));
+        assert!(exhausted_rx
+            .try_recv()
+            .expect("admission failure should wake the caller")
+            .is_err());
+        assert_eq!(RpcMetricProbe::counter(&probe.serial_exhausted), 1);
+
+        pending.next_serial = Some(max_serial);
+        let (collision_tx, collision_rx) = bounded(1);
+        let collision = pending
+            .admit(collision_tx, "SearchScrollbackRequest")
+            .expect_err("occupied serial must not be replaced");
+        assert!(matches!(
+            collision,
+            PendingRpcError::SerialCollision {
+                serial,
+                request: "SearchScrollbackRequest",
+                pending_request: "Ping",
+            } if serial == max_serial
+        ));
+        assert!(collision_rx
+            .try_recv()
+            .expect("collision should wake the caller")
+            .is_err());
+        assert_eq!(pending.map.len(), 1);
+        assert_eq!(
+            pending
+                .map
+                .get(&max_serial)
+                .expect("original pending request must remain")
+                .pdu_name,
+            "Ping"
+        );
+        assert_eq!(RpcMetricProbe::counter(&probe.serial_collision), 1);
+
+        pending
+            .complete(max_serial, Pdu::Pong(Pong {}))
+            .expect("the original maximum-serial request should complete");
+        assert!(max_rx.try_recv().expect("maximum-serial response").is_ok());
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn pending_rpc_completion_classifies_delivery_abandonment_and_protocol_errors() {
+        let (mut pending, probe) = pending_replies_for_test();
+
+        let (delivered_tx, delivered_rx) = bounded(1);
+        let delivered_serial = pending
+            .admit(delivered_tx, "Ping")
+            .expect("admit delivered request")
+            .expect("assign delivered serial");
+        assert_eq!(
+            pending
+                .complete(delivered_serial, Pdu::Pong(Pong {}))
+                .expect("response before receiver drop should deliver"),
+            ReplyDisposition::Delivered
+        );
+        drop(delivered_rx);
+
+        let duplicate = pending
+            .complete(delivered_serial, Pdu::Pong(Pong {}))
+            .expect_err("a duplicate response must be fatal");
+        assert!(matches!(
+            duplicate,
+            PendingRpcError::UnmatchedSerial { serial, .. } if serial == delivered_serial
+        ));
+
+        let future_serial =
+            NonZeroU64::new(delivered_serial.get() + 1).expect("future serial is nonzero");
+        let future = pending
+            .complete(future_serial, Pdu::Pong(Pong {}))
+            .expect_err("a never-issued future response must be fatal");
+        assert!(matches!(
+            future,
+            PendingRpcError::FutureSerial { serial, .. } if serial == future_serial
+        ));
+
+        let (abandoned_tx, abandoned_rx) = bounded(1);
+        let abandoned_serial = pending
+            .admit(abandoned_tx, "SearchScrollbackRequest")
+            .expect("admit abandoned request")
+            .expect("assign abandoned serial");
+        drop(abandoned_rx);
+        assert_eq!(
+            pending
+                .complete(
+                    abandoned_serial,
+                    Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
+                        results: Vec::new(),
+                    }),
+                )
+                .expect("a late response to an abandoned caller must drain"),
+            ReplyDisposition::Abandoned
+        );
+
+        let (full_tx, full_rx) = bounded(1);
+        let filler = full_tx.clone();
+        let full_serial = pending
+            .admit(full_tx, "Ping")
+            .expect("admit full-channel request")
+            .expect("assign full-channel serial");
+        filler
+            .try_send(Ok(Pdu::Pong(Pong {})))
+            .expect("test should prefill completion channel");
+        let full = pending
+            .complete(full_serial, Pdu::Pong(Pong {}))
+            .expect_err("a full one-shot reply channel is an invariant failure");
+        assert!(matches!(
+            full,
+            PendingRpcError::ReplyChannelFull { serial, .. } if serial == full_serial
+        ));
+        drop(full_rx);
+
+        assert_eq!(RpcMetricProbe::counter(&probe.delivered), 1);
+        assert_eq!(RpcMetricProbe::counter(&probe.abandoned), 1);
+        assert_eq!(RpcMetricProbe::counter(&probe.unmatched_serial), 1);
+        assert_eq!(RpcMetricProbe::counter(&probe.future_serial), 1);
+        assert_eq!(
+            RpcMetricProbe::counter(&probe.retirement_reply_channel_full),
+            1
+        );
+        assert_eq!(
+            RpcMetricProbe::counter(&probe.protocol_reply_channel_full),
+            1
+        );
+        assert_eq!(probe.pending(), 0.0);
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn fatal_reply_dispositions_fail_every_other_live_waiter() {
+        let (mut duplicate_pending, duplicate_probe) = pending_replies_for_test();
+        let (completed_tx, completed_rx) = bounded(1);
+        let completed_serial = duplicate_pending
+            .admit(completed_tx, "Ping")
+            .expect("admit first request")
+            .expect("assign first serial");
+        let (duplicate_witness_tx, duplicate_witness_rx) = bounded(1);
+        duplicate_pending
+            .admit(duplicate_witness_tx, "GetCodecVersion")
+            .expect("admit duplicate-failure witness")
+            .expect("assign witness serial");
+        duplicate_pending
+            .complete(completed_serial, Pdu::Pong(Pong {}))
+            .expect("first reply should enqueue");
+        assert!(completed_rx.try_recv().expect("first completion").is_ok());
+
+        let duplicate_error = duplicate_pending
+            .complete_or_fail_transport(completed_serial, Pdu::Pong(Pong {}))
+            .expect_err("duplicate reply must retire the transport");
+        assert!(matches!(
+            duplicate_error,
+            PendingRpcError::UnmatchedSerial { serial, .. } if serial == completed_serial
+        ));
+        assert!(duplicate_witness_rx
+            .try_recv()
+            .expect("duplicate reply must wake every other live waiter")
+            .is_err());
+        duplicate_probe.assert_balanced();
+
+        let (mut full_pending, full_probe) = pending_replies_for_test();
+        let (full_tx, full_rx) = bounded(1);
+        let filler = full_tx.clone();
+        let full_serial = full_pending
+            .admit(full_tx, "Ping")
+            .expect("admit full-channel request")
+            .expect("assign full-channel serial");
+        let (full_witness_tx, full_witness_rx) = bounded(1);
+        full_pending
+            .admit(full_witness_tx, "GetCodecVersion")
+            .expect("admit full-channel witness")
+            .expect("assign full-channel witness serial");
+        filler
+            .try_send(Ok(Pdu::Pong(Pong {})))
+            .expect("prefill completion channel");
+
+        let full_error = full_pending
+            .complete_or_fail_transport(full_serial, Pdu::Pong(Pong {}))
+            .expect_err("full reply channel must retire the transport");
+        assert!(matches!(
+            full_error,
+            PendingRpcError::ReplyChannelFull { serial, .. } if serial == full_serial
+        ));
+        assert!(full_rx
+            .try_recv()
+            .expect("prefilled reply must remain intact")
+            .is_ok());
+        assert!(full_witness_rx
+            .try_recv()
+            .expect("full reply channel must wake every other live waiter")
+            .is_err());
+        full_probe.assert_balanced();
+    }
+
+    #[test]
+    fn codec_future_serial_rejection_reaches_client_protocol_metric() {
+        let (mut pending, probe) = pending_replies_for_test();
+        let (live_tx, live_rx) = bounded(1);
+        let admitted_serial = pending
+            .admit(live_tx, "Ping")
+            .expect("admit live request")
+            .expect("assign live serial");
+        let future_serial = admitted_serial
+            .get()
+            .checked_add(1)
+            .expect("test serial has headroom");
+
+        let mut encoded = Vec::new();
+        Pdu::Pong(Pong {})
+            .encode(&mut encoded, future_serial)
+            .expect("encode future response");
+        let mut reader = std::io::Cursor::new(encoded);
+        let error = asupersync_block_on(Pdu::decode_async(
+            &mut reader,
+            Some(pending.highest_issued()),
+        ))
+        .expect_err("codec must reject a response above the transport high-water mark");
+        assert_eq!(
+            error.downcast_ref::<CorruptResponse>(),
+            Some(&CorruptResponse::SerialAboveCeiling {
+                serial: future_serial,
+                max_serial: admitted_serial.get(),
+            })
+        );
+
+        pending.fail_after_decode_error(&error);
+        assert_eq!(RpcMetricProbe::counter(&probe.future_serial), 1);
+        assert_eq!(
+            probe.pending(),
+            0.0,
+            "header rejection must retire the transport and clear every waiter"
+        );
+        assert!(live_rx
+            .try_recv()
+            .expect("transport teardown must wake the admitted waiter")
+            .is_err());
+        probe.assert_balanced();
+    }
+
+    #[test]
+    fn pending_rpc_transport_teardown_wakes_live_and_clears_abandoned_waiters() {
+        let (mut pending, probe) = pending_replies_for_test();
+        let (live_tx, live_rx) = bounded(1);
+        pending
+            .admit(live_tx, "Ping")
+            .expect("admit live waiter")
+            .expect("assign live waiter serial");
+        let (abandoned_tx, abandoned_rx) = bounded(1);
+        pending
+            .admit(abandoned_tx, "SearchScrollbackRequest")
+            .expect("admit eventual abandonment")
+            .expect("assign abandoned waiter serial");
+        drop(abandoned_rx);
+
+        let transport_error = anyhow!("test transport terminated during flush");
+        pending.fail_after_transport_error(&transport_error);
+
+        let live_error = live_rx
+            .try_recv()
+            .expect("transport teardown should wake live waiter")
+            .expect_err("transport teardown should report an error");
+        assert!(
+            live_error
+                .to_string()
+                .contains("test transport terminated during flush"),
+            "unexpected transport error: {:#}",
+            live_error
+        );
+        assert!(
+            !live_error.to_string().contains("Client was destroyed"),
+            "transport failure must preserve its real cause"
+        );
+        assert_eq!(RpcMetricProbe::counter(&probe.transport_failed_live), 1);
+        assert_eq!(
+            RpcMetricProbe::counter(&probe.transport_cleared_abandoned),
+            1
+        );
+        assert_eq!(probe.pending(), 0.0);
+        probe.assert_balanced();
     }
 
     #[test]
@@ -2775,11 +3660,282 @@ mod tests {
         assert_eq!(info.codec_vers, CODEC_VERSION);
 
         drop(client);
-        let _ = reader.join();
+        assert_expected_reader_shutdown(reader.join().expect("reader thread panicked"));
         server
             .join()
             .expect("server thread should join")
             .expect("server handshake loop should succeed");
+    }
+
+    /// A caller dropping an RPC is abandonment, not transport destruction.
+    ///
+    /// This socket-pair regression covers both cancellation sides of the
+    /// reader's admission boundary through the production reconnect loop and
+    /// deliberately reorders multiple live and abandoned replies. The
+    /// preclosed request must consume neither a frame nor serial. Requests
+    /// dropped after the server confirms receipt remain as tombstones until
+    /// their replies are drained. Distinct live response types prove exact
+    /// serial correlation, and a final Ping proves that every operation used
+    /// the same socket, reader, and connection generation.
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_rpc_replies_drain_without_retiring_transport_generation() {
+        fn recv_rpc_with_timeout(receiver: &Receiver<anyhow::Result<Pdu>>, label: &str) -> Pdu {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        return result.unwrap_or_else(|err| panic!("{}: {:#}", label, err));
+                    }
+                    Err(async_channel::TryRecvError::Closed) => {
+                        panic!("{}: completion channel closed without a response", label)
+                    }
+                    Err(async_channel::TryRecvError::Empty) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{}: timed out waiting for RPC completion",
+                            label
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+
+        let (client_stream, mut server_stream) =
+            UnixStream::pair().expect("create in-memory mux socket pair");
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound server reads");
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("bound server writes");
+        let (requests_admitted_tx, requests_admitted_rx) = mpsc::channel::<()>();
+        let (release_replies_tx, release_replies_rx) = mpsc::channel::<()>();
+        let (release_server_tx, release_server_rx) = mpsc::channel::<()>();
+        let (server_done_tx, server_done_rx) = mpsc::channel::<()>();
+        let server = std::thread::Builder::new()
+            .name("ft-rpc-abandonment-server".to_string())
+            .spawn(move || -> anyhow::Result<()> {
+                let result = (|| -> anyhow::Result<()> {
+                    let first =
+                        Pdu::decode(&mut server_stream).context("decode first admitted RPC")?;
+                    let second =
+                        Pdu::decode(&mut server_stream).context("decode second admitted RPC")?;
+                    let third =
+                        Pdu::decode(&mut server_stream).context("decode third admitted RPC")?;
+                    let fourth =
+                        Pdu::decode(&mut server_stream).context("decode fourth admitted RPC")?;
+
+                    anyhow::ensure!(first.serial == 1, "preclosed request consumed a serial");
+                    anyhow::ensure!(second.serial == 2, "unexpected second serial");
+                    anyhow::ensure!(third.serial == 3, "unexpected third serial");
+                    anyhow::ensure!(fourth.serial == 4, "unexpected fourth serial");
+                    anyhow::ensure!(
+                        matches!(first.pdu, Pdu::SearchScrollbackRequest(_)),
+                        "unexpected first request"
+                    );
+                    anyhow::ensure!(
+                        matches!(second.pdu, Pdu::GetCodecVersion(_)),
+                        "unexpected second request"
+                    );
+                    anyhow::ensure!(
+                        matches!(third.pdu, Pdu::SearchScrollbackRequest(_)),
+                        "unexpected third request"
+                    );
+                    anyhow::ensure!(
+                        matches!(fourth.pdu, Pdu::Ping(_)),
+                        "unexpected fourth request"
+                    );
+
+                    requests_admitted_tx
+                        .send(())
+                        .context("notify caller of wire admission")?;
+                    release_replies_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .context("wait for caller abandonment")?;
+
+                    Pdu::Pong(Pong {})
+                        .encode(&mut server_stream, fourth.serial)
+                        .context("encode fourth response")?;
+                    Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
+                        results: Vec::new(),
+                    })
+                    .encode(&mut server_stream, third.serial)
+                    .context("encode third response")?;
+                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                        codec_vers: CODEC_VERSION,
+                        version_string: "ft-rpc-correlation".to_string(),
+                        executable_path: PathBuf::from("/test/ft"),
+                        config_file_path: None,
+                        min_supported: CODEC_VERSION,
+                    })
+                    .encode(&mut server_stream, second.serial)
+                    .context("encode second response")?;
+                    Pdu::SearchScrollbackResponse(SearchScrollbackResponse {
+                        results: Vec::new(),
+                    })
+                    .encode(&mut server_stream, first.serial)
+                    .context("encode first response")?;
+                    Write::flush(&mut server_stream).context("flush reverse-order responses")?;
+
+                    let final_ping =
+                        Pdu::decode(&mut server_stream).context("decode final live Ping")?;
+                    anyhow::ensure!(
+                        final_ping.serial == 5,
+                        "same transport did not retain its serial high-water mark"
+                    );
+                    anyhow::ensure!(
+                        matches!(final_ping.pdu, Pdu::Ping(_)),
+                        "unexpected final request"
+                    );
+                    Pdu::Pong(Pong {})
+                        .encode(&mut server_stream, final_ping.serial)
+                        .context("encode final Pong")?;
+                    Write::flush(&mut server_stream).context("flush final Pong")?;
+
+                    release_server_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .context("hold transport through client assertions")?;
+                    Ok(())
+                })();
+                let _ = server_done_tx.send(());
+                result
+            })
+            .expect("spawn socket-pair RPC server");
+
+        let unix_domain = UnixDomain {
+            name: "ft-rpc-abandonment".to_string(),
+            no_serve_automatically: true,
+            read_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(unix_domain),
+            Some(Box::new(client_stream)),
+        );
+        let client = Client::new(None, reconnectable, Weak::new());
+
+        let (preclosed_tx, preclosed_rx) = bounded(1);
+        drop(preclosed_rx);
+        asupersync_block_on(client.sender.send(ReaderMessage::SendPdu {
+            pdu: Box::new(Pdu::Ping(Ping {})),
+            promise: preclosed_tx,
+        }))
+        .expect("queue preclosed request");
+
+        let search_request = |pane_id| {
+            Pdu::SearchScrollbackRequest(SearchScrollbackRequest {
+                pane_id,
+                pattern: mux::pane::Pattern::CaseSensitiveString("needle".to_string()),
+                range: 0..100,
+                limit: Some(4),
+            })
+        };
+        let (abandoned_one_tx, abandoned_one_rx) = bounded(1);
+        let (live_two_tx, live_two_rx) = bounded(1);
+        let (abandoned_three_tx, abandoned_three_rx) = bounded(1);
+        let (live_four_tx, live_four_rx) = bounded(1);
+        asupersync_block_on(async {
+            client
+                .sender
+                .send(ReaderMessage::SendPdu {
+                    pdu: Box::new(search_request(11)),
+                    promise: abandoned_one_tx,
+                })
+                .await?;
+            client
+                .sender
+                .send(ReaderMessage::SendPdu {
+                    pdu: Box::new(Pdu::GetCodecVersion(GetCodecVersion {})),
+                    promise: live_two_tx,
+                })
+                .await?;
+            client
+                .sender
+                .send(ReaderMessage::SendPdu {
+                    pdu: Box::new(search_request(33)),
+                    promise: abandoned_three_tx,
+                })
+                .await?;
+            client
+                .sender
+                .send(ReaderMessage::SendPdu {
+                    pdu: Box::new(Pdu::Ping(Ping {})),
+                    promise: live_four_tx,
+                })
+                .await?;
+            Ok::<(), async_channel::SendError<ReaderMessage>>(())
+        })
+        .expect("queue mixed RPCs");
+
+        requests_admitted_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("server should confirm all requests reached the wire");
+        drop(abandoned_one_rx);
+        drop(abandoned_three_rx);
+        release_replies_tx
+            .send(())
+            .expect("release reverse-order server replies");
+
+        let fourth = recv_rpc_with_timeout(&live_four_rx, "fourth live RPC");
+        let second = recv_rpc_with_timeout(&live_two_rx, "second live RPC");
+        assert_eq!(fourth, Pdu::Pong(Pong {}));
+        match second {
+            Pdu::GetCodecVersionResponse(info) => {
+                assert_eq!(info.codec_vers, CODEC_VERSION);
+                assert_eq!(info.version_string, "ft-rpc-correlation");
+                assert_eq!(info.executable_path, PathBuf::from("/test/ft"));
+            }
+            other => panic!(
+                "serial two received the wrong response type: {}",
+                other.pdu_name()
+            ),
+        }
+
+        let (final_tx, final_rx) = bounded(1);
+        asupersync_block_on(client.sender.send(ReaderMessage::SendPdu {
+            pdu: Box::new(Pdu::Ping(Ping {})),
+            promise: final_tx,
+        }))
+        .expect("queue final Ping");
+        assert_eq!(
+            recv_rpc_with_timeout(&final_rx, "final Ping"),
+            Pdu::Pong(Pong {})
+        );
+        assert_eq!(
+            client.connection_generation.load(AtomicOrdering::Acquire),
+            INITIAL_CONNECTION_GENERATION,
+            "caller abandonment must not retire the connection generation"
+        );
+
+        let generation = Arc::clone(&client.connection_generation);
+        drop(client);
+        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while generation.load(AtomicOrdering::Acquire) == INITIAL_CONNECTION_GENERATION {
+            assert!(
+                std::time::Instant::now() < retirement_deadline,
+                "production reconnect loop did not retire the destroyed transport"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            generation.load(AtomicOrdering::Acquire),
+            INITIAL_CONNECTION_GENERATION + 1,
+            "client destruction must retire exactly one transport generation"
+        );
+
+        release_server_tx
+            .send(())
+            .expect("release server after transport retirement");
+        server_done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("RPC server did not reach its bounded terminal state");
+        server
+            .join()
+            .expect("RPC server thread should join")
+            .expect("RPC server should complete without protocol errors");
     }
 
     /// Regression guard for the remote-pane write path (#4): the WriteToPane mux
@@ -2906,7 +4062,7 @@ mod tests {
         result.expect("remote pane write RPC must round-trip without panic or hang");
 
         drop(client);
-        let _ = reader.join();
+        assert_expected_reader_shutdown(reader.join().expect("reader thread panicked"));
         server
             .join()
             .expect("server thread should join")

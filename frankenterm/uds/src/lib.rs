@@ -334,6 +334,11 @@ impl UnixStream {
         Ok(Self::from_inner(StreamImpl::connect(path)?))
     }
 
+    pub fn pair() -> std::io::Result<(Self, Self)> {
+        let (first, second) = StreamImpl::pair()?;
+        Ok((Self::from_inner(first), Self::from_inner(second)))
+    }
+
     #[cfg(feature = "async-asupersync")]
     fn lock_registration(&self) -> MutexGuard<'_, Option<IoRegistration>> {
         lock_registration_mutex(&self.registration)
@@ -726,6 +731,23 @@ mod tests {
         }
 
         assert!(!registration.is_poisoned());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_pair_round_trips_without_filesystem_state() {
+        let (mut first, mut second) = UnixStream::pair().expect("create Unix socket pair");
+        first.write_all(b"first").expect("write first half");
+        let mut from_first = [0; 5];
+        second
+            .read_exact(&mut from_first)
+            .expect("read second half");
+        assert_eq!(&from_first, b"first");
+
+        second.write_all(b"back").expect("write second half");
+        let mut from_second = [0; 4];
+        first.read_exact(&mut from_second).expect("read first half");
+        assert_eq!(&from_second, b"back");
     }
 
     #[cfg(feature = "async-asupersync")]

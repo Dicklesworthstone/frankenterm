@@ -672,9 +672,29 @@ mod runtime {
     pub type Cursor<T> = smol::io::Cursor<T>;
 }
 
-#[derive(Error, Debug)]
-#[error("Corrupt Response: {0}")]
-pub struct CorruptResponse(String);
+#[derive(Error, Clone, PartialEq, Eq)]
+pub enum CorruptResponse {
+    #[error("Corrupt Response: {0}")]
+    Message(String),
+    #[error(
+        "Corrupt Response: serial {serial} exceeds the highest serial issued by this transport \
+         ({max_serial})"
+    )]
+    SerialAboveCeiling { serial: u64, max_serial: u64 },
+}
+
+impl std::fmt::Debug for CorruptResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => f.debug_tuple("CorruptResponse").field(message).finish(),
+            Self::SerialAboveCeiling { serial, max_serial } => f
+                .debug_struct("CorruptResponse::SerialAboveCeiling")
+                .field("serial", serial)
+                .field("max_serial", max_serial)
+                .finish(),
+        }
+    }
+}
 
 /// Returns the encoded length of the leb128 representation of value
 fn encoded_length(value: u64) -> usize {
@@ -985,7 +1005,7 @@ fn decoded_payload_len(
     let frame_len = match usize::try_from(len) {
         Ok(frame_len) => frame_len,
         Err(_) => {
-            return Err(CorruptResponse(format!(
+            return Err(CorruptResponse::Message(format!(
                 "{label}: PDU length {len} does not fit in usize"
             ))
             .into());
@@ -994,7 +1014,7 @@ fn decoded_payload_len(
 
     match frame_len.checked_sub(header_len) {
         Some(data_len) => Ok(data_len),
-        None => Err(CorruptResponse(format!(
+        None => Err(CorruptResponse::Message(format!(
             "{label}: sizes don't make sense: \
              len:{len} serial:{serial} (enc={serial_len}) ident:{ident} (enc={ident_len})",
         ))
@@ -1020,12 +1040,8 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         .await
         .context("decode_raw_async failed to read PDU serial")?;
     if let Some(max_serial) = max_serial {
-        if serial > max_serial && max_serial > 0 {
-            return Err(CorruptResponse(format!(
-                "decode_raw_async: serial {serial} is implausibly large \
-                (bigger than {max_serial})"
-            ))
-            .into());
+        if serial > max_serial {
+            return Err(CorruptResponse::SerialAboveCeiling { serial, max_serial }.into());
         }
     }
     let (ident, ident_len) = read_u64_async_with_len(r)
@@ -3147,16 +3163,26 @@ mod test {
 
     #[test]
     fn corrupt_response_display() {
-        let err = CorruptResponse("bad data".into());
+        let err = CorruptResponse::Message("bad data".into());
         assert_eq!(format!("{}", err), "Corrupt Response: bad data");
     }
 
     #[test]
     fn corrupt_response_debug() {
-        let err = CorruptResponse("test".into());
-        let dbg = format!("{:?}", err);
-        assert!(dbg.contains("CorruptResponse"));
-        assert!(dbg.contains("test"));
+        let err = CorruptResponse::Message("test".into());
+        assert_eq!(format!("{err:?}"), "CorruptResponse(\"test\")");
+    }
+
+    #[test]
+    fn serial_above_ceiling_debug_is_typed() {
+        let err = CorruptResponse::SerialAboveCeiling {
+            serial: 43,
+            max_serial: 42,
+        };
+        assert_eq!(
+            format!("{err:?}"),
+            "CorruptResponse::SerialAboveCeiling { serial: 43, max_serial: 42 }"
+        );
     }
 
     // --- DecodedPdu tests ---
@@ -3521,12 +3547,57 @@ mod test {
             let err = decode_raw_async(&mut reader, Some(10))
                 .await
                 .expect_err("serial should be rejected");
-            let message = err.to_string();
-            assert!(
-                message.contains("implausibly large"),
-                "unexpected error message: {}",
-                message
+            assert_eq!(
+                err.downcast_ref::<CorruptResponse>(),
+                Some(&CorruptResponse::SerialAboveCeiling {
+                    serial: 99,
+                    max_serial: 10,
+                })
             );
+        });
+    }
+
+    #[test]
+    fn decode_raw_async_zero_ceiling_accepts_only_serial_zero() {
+        runtime::block_on(async {
+            let mut unilateral = Vec::new();
+            encode_raw(3, 0, b"push", false, &mut unilateral).expect("encode unilateral");
+            let mut unilateral_reader = runtime::Cursor::new(unilateral);
+            let decoded = decode_raw_async(&mut unilateral_reader, Some(0))
+                .await
+                .expect("serial zero is within the zero ceiling");
+            assert_eq!(decoded.serial, 0);
+            assert_eq!(decoded.data, b"push");
+
+            let mut response = Vec::new();
+            encode_raw(3, 1, b"reply", false, &mut response).expect("encode response");
+            let mut response_reader = runtime::Cursor::new(response);
+            let err = decode_raw_async(&mut response_reader, Some(0))
+                .await
+                .expect_err("a nonzero serial exceeds the zero ceiling");
+            assert_eq!(
+                err.downcast_ref::<CorruptResponse>(),
+                Some(&CorruptResponse::SerialAboveCeiling {
+                    serial: 1,
+                    max_serial: 0,
+                }),
+                "unexpected zero-ceiling error: {:#}",
+                err
+            );
+        });
+    }
+
+    #[test]
+    fn decode_raw_async_accepts_serial_equal_to_ceiling() {
+        runtime::block_on(async {
+            let mut encoded = Vec::new();
+            encode_raw(3, 10, b"exact", false, &mut encoded).expect("encode exact ceiling");
+            let mut reader = runtime::Cursor::new(encoded);
+            let decoded = decode_raw_async(&mut reader, Some(10))
+                .await
+                .expect("the serial ceiling is inclusive");
+            assert_eq!(decoded.serial, 10);
+            assert_eq!(decoded.data, b"exact");
         });
     }
 
