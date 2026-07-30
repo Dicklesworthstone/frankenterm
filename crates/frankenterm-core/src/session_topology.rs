@@ -5,6 +5,14 @@
 //! Supports reconstruction after crash/restart via split-tree inference from
 //! pane positions.
 //!
+//! Schema v1 is a deterministic, pane-list-derived layout snapshot. It sorts
+//! numeric window/tab IDs and therefore does **not** preserve authoritative
+//! user tab order. Its `active_tab_index` is relative to that sorted vector,
+//! not a stable tab identity. Durable order/active-tab capture must use the
+//! richer identity and authority contract in
+//! `docs/proposals/ft-7xqz4-8-10-1-tab-order-authority-contract.md`; the schema
+//! migration is owned by `ft-interactive-swarm-product-convergence-7xqz4.8.10.7`.
+//!
 //! # Data flow
 //!
 //! ```text
@@ -152,7 +160,8 @@ impl TopologySnapshot {
     /// Build a `TopologySnapshot` from a list of panes.
     ///
     /// Groups panes by window and tab, then infers split structure within
-    /// each tab from pane sizes.
+    /// each tab from pane sizes. This legacy builder sorts numeric IDs for
+    /// reproducibility; it is not an authoritative user-tab-order capture.
     #[must_use]
     pub fn from_panes(panes: &[PaneInfo], captured_at: u64) -> (Self, CaptureReport) {
         let workspace_id = panes.first().and_then(|p| p.workspace.clone());

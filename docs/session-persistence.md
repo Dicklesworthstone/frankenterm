@@ -16,6 +16,11 @@ At a high level, a snapshot stores:
 - **Per-pane state**: pane id, cwd, command, terminal size + alt-screen flag, agent metadata (a `PaneStateSnapshot`)
 - **Dedup hash**: a BLAKE3 `state_hash` so identical snapshots can be skipped
 
+The current topology schema v1 sorts numeric tab IDs for deterministic output.
+It does not yet preserve user tab order or an incarnation-scoped active-tab
+identity. The migration contract is
+`docs/proposals/ft-7xqz4-8-10-1-tab-order-authority-contract.md`.
+
 What it does **not** (currently) guarantee:
 
 - Restoring interactive in-process state (REPL variables, editor buffers, etc.)

@@ -27,6 +27,11 @@ This document explains how ft captures and restores session state for crash reco
 
 - `frankenterm_core::session_topology::TopologySnapshot`
   - Serializes mux layout (window/tab/split tree) as JSON
+  - Schema v1 is pane-list-derived and numerically sorts tab IDs; it is
+    deterministic but does not preserve user tab order or stable active-tab
+    identity. See
+    `docs/proposals/ft-7xqz4-8-10-1-tab-order-authority-contract.md` for the
+    authoritative successor contract.
 
 - `frankenterm_core::session_pane_state::PaneStateSnapshot`
   - Captures per-pane metadata (cwd, command, terminal state, agent metadata, redacted env)

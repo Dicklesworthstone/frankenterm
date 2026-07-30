@@ -1,14 +1,17 @@
 //! Pure planner for the "unify windows on a domain" feature (ft-winunify).
 //!
 //! Computes a [`MergePlan`] that consolidates the GUI windows mirroring the
-//! same remote mux domain into a single canonical window, de-duplicating the
-//! local tab mirrors that point at the SAME remote session.
+//! same remote mux domain into a single canonical window, de-duplicating local
+//! tab mirrors that appear to describe the same live remote pane set.
 //!
 //! Model: `Mux -> Window -> Tab -> Pane`. A remote-domain (`ClientDomain`) pane
 //! is a LOCAL mirror of a remote pane and carries a `remote_pane_id`. Two local
-//! tabs mirror the same remote session iff they share an identity of
-//! `(domain_id, sorted set of their panes' remote_pane_ids)` — see
-//! [`TabIdentity`].
+//! tabs are treated as duplicate live mirrors when they share the heuristic
+//! `(process-local domain_id, sorted set of remote_pane_ids)` — see
+//! [`TabIdentity`]. This is deliberately not a durable identity: it cannot key
+//! tab-order persistence, reconnect authority, or a reorder CAS. Those require
+//! the binding/session-incarnation keys frozen in
+//! `docs/proposals/ft-7xqz4-8-10-1-tab-order-authority-contract.md`.
 //!
 //! This module is intentionally PURE and side-effect free: it operates on
 //! caller-supplied snapshots ([`WindowSnapshot`] / [`TabSnapshot`]) rather than
@@ -26,9 +29,12 @@ use crate::tab::TabId;
 use crate::window::WindowId;
 use std::collections::{HashMap, HashSet};
 
-/// Identity of a tab as a mirror of a remote mux session: the domain it belongs
-/// to plus the sorted, de-duplicated set of its panes' remote pane ids. Two
-/// local mirror tabs are duplicates iff their identities are equal.
+/// Process-local duplicate-mirror heuristic: the domain a tab belongs to plus
+/// the sorted, de-duplicated set of its panes' remote pane IDs.
+///
+/// Equality is sufficient only for this live window-unify planner. It is not
+/// stable across client or server incarnation changes and must not be used as
+/// persistence, protocol, or reorder authority.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TabIdentity {
     pub domain_id: DomainId,
