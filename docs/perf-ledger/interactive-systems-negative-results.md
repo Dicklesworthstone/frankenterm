@@ -193,6 +193,38 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Retry only if a profiler attributes a clearly-above-noise share to the exact retired operation on the real keypress, live-resize, or aged-session workload.
 
+### IS-N012 — Detached-test executors and fabricated protocol states are not production I/O failures
+
+- **Classification:** wrong test execution model / harness-state rejection
+- **Candidate revision:** `23c25e0254932660d15c717e18bffc0d02f4d21b`
+  (developed from base `d5c4a89c7ff08918365a11ba411c8bbe39287770`)
+- **Observed result:** strict-remote `fmd` job `j-29953507796713727`
+  reported 642/645 mux tests passing, with three explicit-detach timeouts.
+  The deterministic `ScopedExecutor` fixture does not pump the detached
+  supervisor tasks used by the production I/O lane. Targeted job
+  `j-29953507796713728` then passed the new explicit-detach case and exposed
+  a synchronization race in an older clean-exit fixture. After the fixtures
+  drove the admitted sender and clean-exit barriers, canonical job
+  `j-29953507796713730` passed 646/646 and job
+  `j-29953507796713732` passed Clippy with warnings denied.
+- **Second rejection:** after first-claim lifecycle authority was added,
+  `j-29953507796713735` passed 646/649. The three failures manually installed
+  `WaitingForResponse` and `in_flight` state without the lifecycle I/O lease
+  that every production admission installs. They therefore exercised an
+  impossible partial state rather than a response/deadline defect.
+- **Canonical result:** fixtures were corrected to install the same
+  generation-tagged command lease as production. Targeted job
+  `j-29953507796713737` passed 11/11 guarded-response tests; full job
+  `j-29953507796713740` passed 649/649; and job
+  `j-29953507796713742` passed Clippy with warnings denied.
+- **Decision:** preserve both failed runs as negative evidence. Test through
+  admitted sender/protocol callbacks and model the complete lifecycle lease;
+  do not weaken the production state machine to accommodate an executor that
+  does not run its detached tasks or a fixture that fabricates an unreachable
+  subset of protocol state.
+- **Primary retry condition:**
+  > Do not retry either rejected harness model; retry only after a fixture drives the production admission path or installs the complete generation-tagged lifecycle lease and explicit synchronization barriers.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
