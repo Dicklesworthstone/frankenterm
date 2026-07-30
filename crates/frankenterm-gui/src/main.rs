@@ -87,7 +87,7 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
-mod window_state_persist;
+use frankenterm_gui::window_state_persist;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -1035,6 +1035,16 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         return Ok(());
     }
 
+    // Pay the one-time persistence worker startup cost before entering GUI
+    // callbacks. The worker remains idle and performs no filesystem access
+    // until the first state update or explicit lifecycle barrier.
+    if let Err(failure) = window_state_persist::initialize() {
+        log::warn!(
+            "window-state: could not initialize persistence worker ({:?})",
+            failure.code()
+        );
+    }
+
     let gui = crate::frontend::try_new()?;
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
     let activity = Activity::new_for_mux(&mux);
@@ -1048,7 +1058,30 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    let result = gui.run_forever();
+    flush_window_state_at_shutdown();
+    result
+}
+
+fn flush_window_state_at_shutdown() {
+    let receiver = match window_state_persist::flush() {
+        Ok(receiver) => receiver,
+        Err(failure) => {
+            log::warn!(
+                "window-state: could not request shutdown barrier ({:?})",
+                failure.code()
+            );
+            return;
+        }
+    };
+    match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(_)) => {}
+        Ok(Err(failure)) => log::warn!(
+            "window-state: shutdown barrier failed ({:?})",
+            failure.code()
+        ),
+        Err(_) => log::warn!("window-state: shutdown barrier timed out"),
+    }
 }
 
 fn fatal_toast_notification(title: &str, message: &str) {

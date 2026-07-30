@@ -78,10 +78,10 @@ impl super::TermWindow {
         );
         if last_state != self.window_state {
             self.load_os_parameters();
-            // Persist the maximize/fullscreen bits for this window's workspace
-            // so a relaunch can restore them. This only fires on genuine state
-            // transitions (maximize/fullscreen/etc.), not on every live-resize
-            // pixel, so the read-modify-write of the small JSON map is cheap.
+            // Queue the maximize/fullscreen bits for this window's workspace
+            // so a relaunch can restore them. The persistence coordinator only
+            // takes a short in-memory lock here; bounded coalescing, validation,
+            // and crash-consistent disk I/O run on its dedicated worker.
             if let Some(mux) = Mux::try_get() {
                 if let Some(mux_window) = mux.get_window(self.mux_window_id) {
                     crate::window_state_persist::save_for_workspace(

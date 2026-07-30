@@ -129,6 +129,7 @@ euclid.workspace = true
 fastrand.workspace = true
 finl_unicode.workspace = true
 flume.workspace = true
+fs2.workspace = true
 futures.workspace = true
 hdrhistogram.workspace = true
 http_req.workspace = true
@@ -146,6 +147,7 @@ rayon.workspace = true
 regex.workspace = true
 serde = { workspace = true, features = ["rc", "derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 shlex.workspace = true
 tempfile.workspace = true
 terminfo.workspace = true
@@ -155,6 +157,7 @@ tiny-skia.workspace = true
 unicode-normalization.workspace = true
 unicode-segmentation.workspace = true
 url.workspace = true
+uuid = { workspace = true, features = ["v4", "rng"] }
 walkdir.workspace = true
 wgpu.workspace = true
 

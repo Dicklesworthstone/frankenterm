@@ -13,6 +13,7 @@ pub mod osc8_gui;
 pub mod plugins;
 pub mod renderer_slo;
 pub mod rollout_env;
+pub mod window_state_persist;
 
 /// Keep drag-selection geometry alive while live output dirties rows under it.
 ///
