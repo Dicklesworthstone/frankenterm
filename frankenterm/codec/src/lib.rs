@@ -25,6 +25,7 @@ use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::{FloatingPaneRect, PaneNode, SerdeUrl, SplitRequest, TabId, TabStackId};
 use mux::window::WindowId;
+use mux::{MuxSessionIncarnation, TopologyRevision};
 use portable_pty::CommandBuilder;
 use rangeset::*;
 use serde::{Deserialize, Serialize};
@@ -1479,7 +1480,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 48;
+pub const CODEC_VERSION: usize = 49;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -1662,6 +1663,9 @@ pdu! {
     GetSemanticZonesResponse: 78,
     RenderApplicationUpdate: 79,
     RenderApplicationResult: 80,
+    ListPanesCoherent: 81,
+    ListPanesCoherentResponse: 82,
+    TopologyEvent: 83,
 }
 
 impl Pdu {
@@ -1842,6 +1846,158 @@ pub struct GetTlsCredsResponse {
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanes {}
+
+/// Negotiated topology-fence features.
+///
+/// Unknown bits are preserved on decode but never implicitly accepted. A
+/// server computes the intersection with [`Self::SERVER_SUPPORTED`] and must
+/// return [`ListPanesCoherentOutcome::Unsupported`] when the request's
+/// `required` set is not a subset of that intersection.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize,
+)]
+pub struct TopologyCapabilities(u64);
+
+impl TopologyCapabilities {
+    pub const NONE: Self = Self(0);
+    pub const FENCED_SNAPSHOT_V1: Self = Self(1 << 0);
+    pub const SERVER_SUPPORTED: Self = Self::FENCED_SNAPSHOT_V1;
+
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn contains(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+}
+
+/// Unpredictable identity of one connection-generation topology stream.
+///
+/// It is server-owned, rotates on reconnect or any loss-terminal transition,
+/// and is bound to a mux-session incarnation by a coherent snapshot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct TopologyStreamId([u8; 16]);
+
+impl TopologyStreamId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// Request a mux-wide pane snapshot that is validated at one topology
+/// revision and establishes a connection-generation topology stream.
+///
+/// This is deliberately a separate PDU from legacy [`ListPanes`]. Receiving
+/// or decoding `ListPanesResponse` never grants fence authority.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ListPanesCoherent {
+    pub supported: TopologyCapabilities,
+    pub required: TopologyCapabilities,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct CoherentPaneSnapshot {
+    pub session_incarnation: MuxSessionIncarnation,
+    pub snapshot_revision: TopologyRevision,
+    pub panes: ListPanesResponse,
+}
+
+/// Typed result of bounded coherent-snapshot construction.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub enum ListPanesCoherentOutcome {
+    Snapshot(CoherentPaneSnapshot),
+    /// Every bounded attempt observed topology movement. No snapshot in this
+    /// response is authoritative.
+    Contended {
+        attempts: u8,
+        first_revision: TopologyRevision,
+        last_revision: TopologyRevision,
+    },
+    /// The mux revision authority exhausted its nonwrapping namespace.
+    RevisionExhausted,
+    /// The server cannot satisfy every capability the requester marked
+    /// required. `supported` is the server's exact finite bit set.
+    Unsupported {
+        supported: TopologyCapabilities,
+    },
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ListPanesCoherentResponse {
+    pub negotiated: TopologyCapabilities,
+    pub stream_id: TopologyStreamId,
+    pub outcome: ListPanesCoherentOutcome,
+}
+
+/// Every mux notification that advances [`TopologyRevision`] has an explicit
+/// wire representation. Variants that legacy clients historically ignored
+/// remain represented so a fenced stream never creates an unexplained gap.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub enum TopologyEventKind {
+    PaneAdded {
+        pane_id: PaneId,
+    },
+    PaneRemoved {
+        pane_id: PaneId,
+    },
+    WindowCreated {
+        window_id: WindowId,
+    },
+    WindowRemoved {
+        window_id: WindowId,
+    },
+    WindowInvalidated {
+        window_id: WindowId,
+    },
+    WindowWorkspaceChanged {
+        window_id: WindowId,
+        workspace: Option<String>,
+    },
+    Empty,
+    TabAddedToWindow {
+        tab_id: TabId,
+        window_id: WindowId,
+    },
+    PaneFocused {
+        pane_id: PaneId,
+    },
+    TabResized {
+        tab_id: TabId,
+    },
+    TabTitleChanged {
+        tab_id: TabId,
+        title: String,
+    },
+    WindowTitleChanged {
+        window_id: WindowId,
+        title: String,
+    },
+    WorkspaceRenamed {
+        old_workspace: String,
+        new_workspace: String,
+    },
+}
+
+/// One connection-scoped, revision-stamped topology transition.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct TopologyEvent {
+    pub stream_id: TopologyStreamId,
+    pub revision: TopologyRevision,
+    pub event: TopologyEventKind,
+}
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanesTabStacks {}
@@ -4006,6 +4162,130 @@ mod test {
         assert_eq!(decoded.pdu, pdu);
     }
 
+    #[test]
+    fn topology_capability_negotiation_is_explicit_and_preserves_unknown_bits() {
+        let offered = TopologyCapabilities::from_bits(
+            TopologyCapabilities::FENCED_SNAPSHOT_V1.bits() | (1_u64 << 63),
+        );
+        let negotiated = offered.intersection(TopologyCapabilities::SERVER_SUPPORTED);
+
+        assert_eq!(
+            negotiated,
+            TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            "unknown capability bits must not be implicitly accepted",
+        );
+        assert!(offered.contains(TopologyCapabilities::FENCED_SNAPSHOT_V1));
+        assert!(!TopologyCapabilities::NONE.contains(offered));
+        assert_eq!(offered.bits(), (1_u64 << 63) | 1);
+    }
+
+    #[test]
+    fn coherent_list_panes_request_and_typed_outcomes_roundtrip() {
+        let request = Pdu::ListPanesCoherent(ListPanesCoherent {
+            supported: TopologyCapabilities::from_bits(0b101),
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        });
+        let mut encoded = Vec::new();
+        request
+            .encode_with_mode(&mut encoded, 1100, CompressionMode::Never)
+            .expect("encode coherent snapshot request");
+        let decoded = Pdu::decode(encoded.as_slice()).expect("decode coherent snapshot request");
+        assert_eq!(decoded.serial, 1100);
+        assert_eq!(decoded.pdu, request);
+
+        let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
+        let outcomes = [
+            ListPanesCoherentOutcome::Snapshot(CoherentPaneSnapshot {
+                session_incarnation: MuxSessionIncarnation::from_bytes([0xa5; 16]),
+                snapshot_revision: TopologyRevision::new(41),
+                panes: ListPanesResponse {
+                    tabs: Vec::new(),
+                    tab_titles: Vec::new(),
+                    window_titles: HashMap::new(),
+                },
+            }),
+            ListPanesCoherentOutcome::Contended {
+                attempts: 3,
+                first_revision: TopologyRevision::new(41),
+                last_revision: TopologyRevision::new(47),
+            },
+            ListPanesCoherentOutcome::RevisionExhausted,
+            ListPanesCoherentOutcome::Unsupported {
+                supported: TopologyCapabilities::NONE,
+            },
+        ];
+
+        for (offset, outcome) in outcomes.iter().cloned().enumerate() {
+            let response = Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                stream_id,
+                outcome,
+            });
+            let serial = 1200 + offset as u64;
+            let mut encoded = Vec::new();
+            response
+                .encode_with_mode(&mut encoded, serial, CompressionMode::Never)
+                .expect("encode coherent snapshot response");
+            let decoded =
+                Pdu::decode(encoded.as_slice()).expect("decode coherent snapshot response");
+            assert_eq!(decoded.serial, serial);
+            assert_eq!(decoded.pdu, response);
+        }
+    }
+
+    #[test]
+    fn every_revision_advancing_topology_event_has_a_wire_roundtrip() {
+        let stream_id = TopologyStreamId::from_bytes([0x33; 16]);
+        let events = [
+            TopologyEventKind::PaneAdded { pane_id: 1 },
+            TopologyEventKind::PaneRemoved { pane_id: 2 },
+            TopologyEventKind::WindowCreated { window_id: 3 },
+            TopologyEventKind::WindowRemoved { window_id: 4 },
+            TopologyEventKind::WindowInvalidated { window_id: 5 },
+            TopologyEventKind::WindowWorkspaceChanged {
+                window_id: 6,
+                workspace: Some("workspace".to_string()),
+            },
+            TopologyEventKind::WindowWorkspaceChanged {
+                window_id: 7,
+                workspace: None,
+            },
+            TopologyEventKind::Empty,
+            TopologyEventKind::TabAddedToWindow {
+                tab_id: 8,
+                window_id: 9,
+            },
+            TopologyEventKind::PaneFocused { pane_id: 10 },
+            TopologyEventKind::TabResized { tab_id: 11 },
+            TopologyEventKind::TabTitleChanged {
+                tab_id: 12,
+                title: "tab".to_string(),
+            },
+            TopologyEventKind::WindowTitleChanged {
+                window_id: 13,
+                title: "window".to_string(),
+            },
+            TopologyEventKind::WorkspaceRenamed {
+                old_workspace: "before".to_string(),
+                new_workspace: "after".to_string(),
+            },
+        ];
+
+        for (offset, event) in events.iter().cloned().enumerate() {
+            let pdu = Pdu::TopologyEvent(TopologyEvent {
+                stream_id,
+                revision: TopologyRevision::new(offset as u64 + 1),
+                event,
+            });
+            let mut encoded = Vec::new();
+            pdu.encode_with_mode(&mut encoded, 0, CompressionMode::Never)
+                .expect("encode topology event");
+            let decoded = Pdu::decode(encoded.as_slice()).expect("decode topology event");
+            assert_eq!(decoded.serial, 0);
+            assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
     // --- Pdu::encode Invalid should fail ---
 
     #[test]
@@ -4181,7 +4461,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 48);
+        assert_eq!(CODEC_VERSION, 49);
     }
 
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
@@ -4189,7 +4469,7 @@ mod test {
     #[test]
     fn check_compat_additive_window_keeps_min_supported() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(CODEC_VERSION, 48);
+        assert_eq!(CODEC_VERSION, 49);
     }
 
     #[test]
