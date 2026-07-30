@@ -9,16 +9,21 @@ use asupersync::runtime::IoDriverHandle;
 use asupersync::runtime::reactor::{Interest, IoUringReactor};
 use async_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use async_ossl::AsyncSslStream;
-use codec::{DecodedPdu, Pdu};
+use codec::{
+    DecodedPdu, ListPanesCoherent, ListPanesCoherentOutcome, ListPanesCoherentResponse, Pdu,
+    TopologyCapabilities, TopologyEvent, TopologyEventKind, TopologyStreamId,
+};
 use frankenterm_core::tmux_control_protocol::{TmuxCommand, TmuxResponse, parse_command};
 use futures::future::{Either, select};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use futures::task::{ArcWake, waker};
 use futures::{FutureExt, pin_mut};
-use mux::{Mux, MuxNotification};
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use mux::{
+    Mux, MuxNotification, MuxNotificationEnvelope, MuxSessionIncarnation, MuxTopologyStamp,
+    TopologyRevision,
+};
 use parking_lot::Mutex as ParkingMutex;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io::{self, ErrorKind};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -44,6 +49,14 @@ const NOTIFICATION_QUEUE_OVERFLOW: &str =
     "mux notification queue overflowed; topology delivery is no longer lossless";
 const RESPONSE_QUEUE_FAILURE: &str =
     "mux response queue rejected a frame; request/response delivery is no longer lossless";
+const TOPOLOGY_PROTOCOL_FAILURE: &str =
+    "mux topology fence observed an impossible stream transition";
+const TOPOLOGY_BUFFER_OVERFLOW: &str =
+    "mux topology fence exceeded its retained event or byte bound";
+const TOPOLOGY_REVISION_EXHAUSTED: &str =
+    "mux topology revision authority is exhausted";
+const TOPOLOGY_FENCE_MAX_EVENTS: usize = 4096;
+const TOPOLOGY_FENCE_MAX_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 struct DispatchTerminal {
@@ -621,6 +634,644 @@ fn queue_notification(
         }
         Err(TrySendError::Closed(_)) => false,
     }
+}
+
+#[derive(Debug)]
+struct RetainedTopologyEvent {
+    notification: MuxNotification,
+    revision: TopologyRevision,
+    event: TopologyEventKind,
+    retained_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct TopologyEventBuffer {
+    events: BTreeMap<TopologyRevision, RetainedTopologyEvent>,
+    retained_bytes: usize,
+}
+
+impl TopologyEventBuffer {
+    fn insert(&mut self, event: RetainedTopologyEvent) -> anyhow::Result<()> {
+        if self.events.contains_key(&event.revision) {
+            anyhow::bail!(
+                "duplicate mux topology revision {}",
+                event.revision.get()
+            );
+        }
+        let next_len = self
+            .events
+            .len()
+            .checked_add(1)
+            .context("counting retained mux topology events")?;
+        let next_bytes = self
+            .retained_bytes
+            .checked_add(event.retained_bytes)
+            .context("counting retained mux topology bytes")?;
+        if next_len > TOPOLOGY_FENCE_MAX_EVENTS
+            || next_bytes > TOPOLOGY_FENCE_MAX_RETAINED_BYTES
+        {
+            anyhow::bail!(
+                "mux topology fence buffer would retain {next_len} events and {next_bytes} bytes"
+            );
+        }
+        self.retained_bytes = next_bytes;
+        self.events.insert(event.revision, event);
+        metrics::histogram!("mux.dispatch.topology_fence.retained_events")
+            .record(next_len as f64);
+        metrics::histogram!("mux.dispatch.topology_fence.retained_bytes")
+            .record(next_bytes as f64);
+        Ok(())
+    }
+
+    fn remove(
+        &mut self,
+        revision: TopologyRevision,
+    ) -> anyhow::Result<Option<RetainedTopologyEvent>> {
+        let Some(event) = self.events.remove(&revision) else {
+            return Ok(None);
+        };
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_sub(event.retained_bytes)
+            .context("decrementing retained mux topology bytes")?;
+        Ok(Some(event))
+    }
+
+    fn take_all(&mut self) -> Vec<RetainedTopologyEvent> {
+        self.retained_bytes = 0;
+        std::mem::take(&mut self.events).into_values().collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TopologySubscriptionAuthority {
+    session_incarnation: MuxSessionIncarnation,
+    baseline_revision: TopologyRevision,
+}
+
+#[derive(Debug)]
+enum TopologyFencePrior {
+    Legacy,
+    Established {
+        snapshot_revision: TopologyRevision,
+        next_revision: Option<TopologyRevision>,
+    },
+}
+
+#[derive(Debug)]
+struct TopologyFenceInFlight {
+    serial: u64,
+    negotiated: TopologyCapabilities,
+    prior: TopologyFencePrior,
+    buffer: TopologyEventBuffer,
+}
+
+#[derive(Debug)]
+struct EstablishedTopologyStream {
+    snapshot_revision: TopologyRevision,
+    next_revision: Option<TopologyRevision>,
+    buffer: TopologyEventBuffer,
+}
+
+#[derive(Debug)]
+enum TopologyStreamPhase {
+    Legacy,
+    Fencing(TopologyFenceInFlight),
+    Established(EstablishedTopologyStream),
+    Exhausted,
+}
+
+#[derive(Debug)]
+struct TopologyStreamState {
+    subscription: Option<TopologySubscriptionAuthority>,
+    prebind: TopologyEventBuffer,
+    phase: TopologyStreamPhase,
+}
+
+impl Default for TopologyStreamState {
+    fn default() -> Self {
+        Self {
+            subscription: None,
+            prebind: TopologyEventBuffer::default(),
+            phase: TopologyStreamPhase::Legacy,
+        }
+    }
+}
+
+struct TopologyStreamCoordinator {
+    item_tx: Sender<Item>,
+    terminal: DispatchTerminal,
+    stream_id: TopologyStreamId,
+    state: ParkingMutex<TopologyStreamState>,
+}
+
+impl TopologyStreamCoordinator {
+    fn new(
+        item_tx: Sender<Item>,
+        terminal: DispatchTerminal,
+        stream_id: TopologyStreamId,
+    ) -> Self {
+        Self {
+            item_tx,
+            terminal,
+            stream_id,
+            state: ParkingMutex::new(TopologyStreamState::default()),
+        }
+    }
+
+    fn bind_subscription(
+        &self,
+        session_incarnation: MuxSessionIncarnation,
+        baseline_revision: TopologyRevision,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock();
+        if state.subscription.is_some() {
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            anyhow::bail!("mux topology stream subscription was bound more than once");
+        }
+        state.subscription = Some(TopologySubscriptionAuthority {
+            session_incarnation,
+            baseline_revision,
+        });
+
+        for event in state.prebind.take_all() {
+            if event.revision <= baseline_revision {
+                continue;
+            }
+            if !queue_notification(&self.item_tx, &self.terminal, event.notification) {
+                anyhow::bail!("failed to enqueue a pre-bind mux topology notification");
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_fence(&self, serial: u64, request: &ListPanesCoherent) -> anyhow::Result<()> {
+        let negotiated = request
+            .supported
+            .intersection(TopologyCapabilities::SERVER_SUPPORTED);
+        if !negotiated.contains(TopologyCapabilities::FENCED_SNAPSHOT_V1)
+            || !negotiated.contains(request.required)
+        {
+            return Ok(());
+        }
+
+        let mut state = self.state.lock();
+        if state.subscription.is_none() {
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            anyhow::bail!("mux topology fence began before its subscription was bound");
+        }
+        let phase = std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
+        state.phase = match phase {
+            TopologyStreamPhase::Legacy => {
+                TopologyStreamPhase::Fencing(TopologyFenceInFlight {
+                    serial,
+                    negotiated,
+                    prior: TopologyFencePrior::Legacy,
+                    buffer: TopologyEventBuffer::default(),
+                })
+            }
+            TopologyStreamPhase::Established(established) => {
+                TopologyStreamPhase::Fencing(TopologyFenceInFlight {
+                    serial,
+                    negotiated,
+                    prior: TopologyFencePrior::Established {
+                        snapshot_revision: established.snapshot_revision,
+                        next_revision: established.next_revision,
+                    },
+                    buffer: established.buffer,
+                })
+            }
+            TopologyStreamPhase::Fencing(in_flight) => {
+                state.phase = TopologyStreamPhase::Fencing(in_flight);
+                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                anyhow::bail!("overlapping coherent mux topology snapshot requests")
+            }
+            TopologyStreamPhase::Exhausted => {
+                state.phase = TopologyStreamPhase::Exhausted;
+                self.terminal.trip(TOPOLOGY_REVISION_EXHAUSTED);
+                anyhow::bail!("mux topology stream is exhausted")
+            }
+        };
+        Ok(())
+    }
+
+    fn queue_response(&self, decoded: DecodedPdu) -> anyhow::Result<()> {
+        let DecodedPdu { pdu, serial } = decoded;
+        let mut state = self.state.lock();
+        match pdu {
+            Pdu::ListPanesCoherentResponse(response) => {
+                self.complete_fence_response(&mut state, serial, response)
+            }
+            other => {
+                let phase =
+                    std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
+                match phase {
+                    TopologyStreamPhase::Fencing(in_flight)
+                        if in_flight.serial == serial =>
+                    {
+                        queue_response_pdu(
+                            &self.item_tx,
+                            &self.terminal,
+                            other,
+                            serial,
+                        )?;
+                        state.phase = self.restore_prior(in_flight)?;
+                    }
+                    phase => {
+                        state.phase = phase;
+                        queue_response_pdu(
+                            &self.item_tx,
+                            &self.terminal,
+                            other,
+                            serial,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn complete_fence_response(
+        &self,
+        state: &mut TopologyStreamState,
+        serial: u64,
+        response: ListPanesCoherentResponse,
+    ) -> anyhow::Result<()> {
+        if response.stream_id != self.stream_id {
+            state.phase = TopologyStreamPhase::Exhausted;
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            anyhow::bail!("coherent mux snapshot response carried the wrong topology stream id");
+        }
+
+        let phase = std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
+        let TopologyStreamPhase::Fencing(mut in_flight) = phase else {
+            state.phase = phase;
+            if matches!(
+                &response.outcome,
+                ListPanesCoherentOutcome::Unsupported { .. }
+            ) {
+                return queue_response_pdu(
+                    &self.item_tx,
+                    &self.terminal,
+                    Pdu::ListPanesCoherentResponse(response),
+                    serial,
+                );
+            }
+            state.phase = TopologyStreamPhase::Exhausted;
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            anyhow::bail!("coherent mux snapshot response arrived without an active fence");
+        };
+        if in_flight.serial != serial || in_flight.negotiated != response.negotiated {
+            self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+            anyhow::bail!("coherent mux snapshot response did not match its request fence");
+        }
+
+        match response.outcome.clone() {
+            ListPanesCoherentOutcome::Snapshot(snapshot) => {
+                let subscription = state
+                    .subscription
+                    .context("coherent mux snapshot completed before subscription binding")?;
+                if snapshot.session_incarnation != subscription.session_incarnation
+                    || snapshot.snapshot_revision < subscription.baseline_revision
+                    || snapshot.snapshot_revision.get() == u64::MAX
+                {
+                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    anyhow::bail!(
+                        "coherent mux snapshot authority did not match the connection subscription"
+                    );
+                }
+                queue_response_pdu(
+                    &self.item_tx,
+                    &self.terminal,
+                    Pdu::ListPanesCoherentResponse(response),
+                    serial,
+                )?;
+
+                let mut established = EstablishedTopologyStream {
+                    snapshot_revision: snapshot.snapshot_revision,
+                    next_revision: snapshot
+                        .snapshot_revision
+                        .get()
+                        .checked_add(1)
+                        .map(TopologyRevision::new),
+                    buffer: TopologyEventBuffer::default(),
+                };
+                for event in in_flight.buffer.take_all() {
+                    if event.revision > snapshot.snapshot_revision {
+                        established.buffer.insert(event)?;
+                    }
+                }
+                self.drain_established(&mut established)?;
+                state.phase = TopologyStreamPhase::Established(established);
+            }
+            ListPanesCoherentOutcome::Contended { .. } => {
+                queue_response_pdu(
+                    &self.item_tx,
+                    &self.terminal,
+                    Pdu::ListPanesCoherentResponse(response),
+                    serial,
+                )?;
+                state.phase = self.restore_prior(in_flight)?;
+            }
+            ListPanesCoherentOutcome::RevisionExhausted => {
+                queue_response_pdu(
+                    &self.item_tx,
+                    &self.terminal,
+                    Pdu::ListPanesCoherentResponse(response),
+                    serial,
+                )?;
+                state.phase = TopologyStreamPhase::Exhausted;
+            }
+            ListPanesCoherentOutcome::Unsupported { .. } => {
+                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                anyhow::bail!(
+                    "coherent mux snapshot became unsupported after its fence was admitted"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_prior(
+        &self,
+        mut in_flight: TopologyFenceInFlight,
+    ) -> anyhow::Result<TopologyStreamPhase> {
+        match in_flight.prior {
+            TopologyFencePrior::Legacy => {
+                for event in in_flight.buffer.take_all() {
+                    if !queue_notification(
+                        &self.item_tx,
+                        &self.terminal,
+                        event.notification,
+                    ) {
+                        anyhow::bail!(
+                            "failed to restore a buffered legacy mux topology notification"
+                        );
+                    }
+                }
+                Ok(TopologyStreamPhase::Legacy)
+            }
+            TopologyFencePrior::Established {
+                snapshot_revision,
+                next_revision,
+            } => {
+                let mut established = EstablishedTopologyStream {
+                    snapshot_revision,
+                    next_revision,
+                    buffer: in_flight.buffer,
+                };
+                self.drain_established(&mut established)?;
+                Ok(TopologyStreamPhase::Established(established))
+            }
+        }
+    }
+
+    fn drain_established(
+        &self,
+        established: &mut EstablishedTopologyStream,
+    ) -> anyhow::Result<()> {
+        loop {
+            let Some(next_revision) = established.next_revision else {
+                break;
+            };
+            let Some(event) = established.buffer.remove(next_revision)? else {
+                break;
+            };
+            self.queue_stamped_event(event)?;
+            established.next_revision = next_revision
+                .get()
+                .checked_add(1)
+                .map(TopologyRevision::new);
+        }
+        Ok(())
+    }
+
+    fn queue_stamped_event(&self, event: RetainedTopologyEvent) -> anyhow::Result<()> {
+        queue_response_pdu(
+            &self.item_tx,
+            &self.terminal,
+            Pdu::TopologyEvent(TopologyEvent {
+                stream_id: self.stream_id,
+                revision: event.revision,
+                event: event.event,
+            }),
+            0,
+        )
+    }
+
+    fn on_notification(&self, mux: &Mux, envelope: MuxNotificationEnvelope) -> bool {
+        let revision = match envelope.topology {
+            MuxTopologyStamp::NonTopology => {
+                if envelope.notification.is_topology() {
+                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    return false;
+                }
+                return queue_notification(
+                    &self.item_tx,
+                    &self.terminal,
+                    envelope.notification,
+                );
+            }
+            MuxTopologyStamp::Revision(revision) => {
+                if !envelope.notification.is_topology() {
+                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    return false;
+                }
+                revision
+            }
+            MuxTopologyStamp::Exhausted => {
+                self.terminal.trip(TOPOLOGY_REVISION_EXHAUSTED);
+                return false;
+            }
+        };
+
+        let notification = envelope.notification;
+        let use_legacy_fast_path = {
+            let state = self.state.lock();
+            state.subscription.is_some()
+                && matches!(&state.phase, TopologyStreamPhase::Legacy)
+        };
+        if use_legacy_fast_path {
+            return queue_notification(&self.item_tx, &self.terminal, notification);
+        }
+
+        let event = match retained_topology_event(mux, notification, revision) {
+            Ok(event) => event,
+            Err(err) => {
+                log::error!("failed to retain mux topology event: {err:#}");
+                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                return false;
+            }
+        };
+
+        let mut state = self.state.lock();
+        if state.subscription.is_none() {
+            if let Err(err) = state.prebind.insert(event) {
+                log::error!("failed to retain pre-bind mux topology event: {err:#}");
+                self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                return false;
+            }
+            return true;
+        }
+
+        let phase = &mut state.phase;
+        match phase {
+            TopologyStreamPhase::Legacy => {
+                queue_notification(&self.item_tx, &self.terminal, event.notification)
+            }
+            TopologyStreamPhase::Fencing(in_flight) => {
+                if let Err(err) = in_flight.buffer.insert(event) {
+                    log::error!("failed to retain in-flight mux topology event: {err:#}");
+                    self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                    false
+                } else {
+                    true
+                }
+            }
+            TopologyStreamPhase::Established(established) => {
+                if event.revision <= established.snapshot_revision {
+                    return true;
+                }
+                let Some(next_revision) = established.next_revision else {
+                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    return false;
+                };
+                if event.revision < next_revision {
+                    self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                    return false;
+                }
+                if event.revision == next_revision {
+                    if let Err(err) = self.queue_stamped_event(event) {
+                        log::error!("failed to enqueue contiguous mux topology event: {err:#}");
+                        return false;
+                    }
+                    established.next_revision = next_revision
+                        .get()
+                        .checked_add(1)
+                        .map(TopologyRevision::new);
+                    if let Err(err) = self.drain_established(established) {
+                        log::error!("failed to drain reordered mux topology events: {err:#}");
+                        return false;
+                    }
+                } else if let Err(err) = established.buffer.insert(event) {
+                    log::error!("failed to retain gapped mux topology event: {err:#}");
+                    self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                    return false;
+                }
+                true
+            }
+            TopologyStreamPhase::Exhausted => {
+                self.terminal.trip(TOPOLOGY_REVISION_EXHAUSTED);
+                false
+            }
+        }
+    }
+}
+
+fn retained_topology_event(
+    mux: &Mux,
+    notification: MuxNotification,
+    revision: TopologyRevision,
+) -> anyhow::Result<RetainedTopologyEvent> {
+    let event = match &notification {
+        MuxNotification::PaneAdded(pane_id) => {
+            TopologyEventKind::PaneAdded { pane_id: *pane_id }
+        }
+        MuxNotification::PaneRemoved(pane_id) => {
+            TopologyEventKind::PaneRemoved { pane_id: *pane_id }
+        }
+        MuxNotification::WindowCreated(window_id) => TopologyEventKind::WindowCreated {
+            window_id: *window_id,
+        },
+        MuxNotification::WindowRemoved(window_id) => TopologyEventKind::WindowRemoved {
+            window_id: *window_id,
+        },
+        MuxNotification::WindowInvalidated(window_id) => TopologyEventKind::WindowInvalidated {
+            window_id: *window_id,
+        },
+        MuxNotification::WindowWorkspaceChanged(window_id) => {
+            TopologyEventKind::WindowWorkspaceChanged {
+                window_id: *window_id,
+                workspace: mux
+                    .get_window(*window_id)
+                    .map(|window| window.get_workspace().to_string()),
+            }
+        }
+        MuxNotification::Empty => TopologyEventKind::Empty,
+        MuxNotification::TabAddedToWindow { tab_id, window_id } => {
+            TopologyEventKind::TabAddedToWindow {
+                tab_id: *tab_id,
+                window_id: *window_id,
+            }
+        }
+        MuxNotification::PaneFocused(pane_id) => {
+            TopologyEventKind::PaneFocused { pane_id: *pane_id }
+        }
+        MuxNotification::TabResized(tab_id) => {
+            TopologyEventKind::TabResized { tab_id: *tab_id }
+        }
+        MuxNotification::TabTitleChanged { tab_id, title } => {
+            TopologyEventKind::TabTitleChanged {
+                tab_id: *tab_id,
+                title: title.clone(),
+            }
+        }
+        MuxNotification::WindowTitleChanged { window_id, title } => {
+            TopologyEventKind::WindowTitleChanged {
+                window_id: *window_id,
+                title: title.clone(),
+            }
+        }
+        MuxNotification::WorkspaceRenamed {
+            old_workspace,
+            new_workspace,
+        } => TopologyEventKind::WorkspaceRenamed {
+            old_workspace: old_workspace.clone(),
+            new_workspace: new_workspace.clone(),
+        },
+        MuxNotification::PaneOutput(_)
+        | MuxNotification::SynchronizedOutput { .. }
+        | MuxNotification::ActiveWorkspaceChanged(_)
+        | MuxNotification::Alert { .. }
+        | MuxNotification::AssignClipboard { .. }
+        | MuxNotification::SaveToDownloads { .. } => {
+            anyhow::bail!("non-topology mux notification carried a topology revision")
+        }
+    };
+
+    let dynamic_bytes = match &event {
+        TopologyEventKind::WindowWorkspaceChanged { workspace, .. } => {
+            workspace.as_ref().map_or(0, String::len)
+        }
+        TopologyEventKind::TabTitleChanged { title, .. }
+        | TopologyEventKind::WindowTitleChanged { title, .. } => title.len(),
+        TopologyEventKind::WorkspaceRenamed {
+            old_workspace,
+            new_workspace,
+        } => old_workspace
+            .len()
+            .checked_add(new_workspace.len())
+            .context("counting retained workspace rename bytes")?,
+        TopologyEventKind::PaneAdded { .. }
+        | TopologyEventKind::PaneRemoved { .. }
+        | TopologyEventKind::WindowCreated { .. }
+        | TopologyEventKind::WindowRemoved { .. }
+        | TopologyEventKind::WindowInvalidated { .. }
+        | TopologyEventKind::Empty
+        | TopologyEventKind::TabAddedToWindow { .. }
+        | TopologyEventKind::PaneFocused { .. }
+        | TopologyEventKind::TabResized { .. } => 0,
+    };
+    let retained_bytes = std::mem::size_of::<RetainedTopologyEvent>()
+        .checked_add(dynamic_bytes)
+        .context("counting retained mux topology event bytes")?;
+    Ok(RetainedTopologyEvent {
+        notification,
+        revision,
+        event,
+        retained_bytes,
+    })
 }
 
 fn prepare_unilateral_pdu(
@@ -1932,6 +2583,7 @@ where
 
 fn dispatch_client_request(
     handler: &mut SessionHandler,
+    topology: &TopologyStreamCoordinator,
     decoded: DecodedPdu,
 ) -> anyhow::Result<()> {
     if decoded.serial == 0 {
@@ -1943,6 +2595,9 @@ fn dispatch_client_request(
         anyhow::bail!("mux client request used reserved server-unilateral serial zero");
     }
 
+    if let Pdu::ListPanesCoherent(request) = &decoded.pdu {
+        topology.begin_fence(decoded.serial, request)?;
+    }
     handler.process_one(decoded);
     Ok(())
 }
@@ -1985,24 +2640,40 @@ where
     let owner = SessionOwner::new(mux);
     let authority = owner.authority();
     let mux = Arc::clone(owner.mux());
+    let topology_stream_id =
+        TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
+    let topology = Arc::new(TopologyStreamCoordinator::new(
+        item_tx.clone(),
+        terminal.clone(),
+        topology_stream_id,
+    ));
     let pdu_sender = PduSender::new({
-        let item_tx = item_tx.clone();
-        let terminal = terminal.clone();
-        move |pdu| queue_response_pdu(&item_tx, &terminal, pdu.pdu, pdu.serial)
+        let topology = Arc::clone(&topology);
+        move |pdu| topology.queue_response(pdu)
     });
-    let mut handler = SessionHandler::new_for_session(pdu_sender, owner);
+    let mut handler = SessionHandler::new_for_session_with_topology_stream(
+        pdu_sender,
+        owner,
+        topology_stream_id,
+    );
 
     {
-        let tx = item_tx.clone();
-        let notification_terminal = terminal.clone();
         let notification_authority = authority.clone();
-        let sub_id = mux
-            .subscribe(move |n| {
+        let notification_mux = Arc::clone(&mux);
+        let notification_topology = Arc::clone(&topology);
+        let (sub_id, session_incarnation, baseline_revision) = mux
+            .subscribe_with_topology_fence(move |envelope| {
                 notification_authority
-                    .try_run(|| queue_notification(&tx, &notification_terminal, n))
+                    .try_run(|| {
+                        notification_topology
+                            .on_notification(&notification_mux, envelope)
+                    })
                     .unwrap_or(false)
             })
-            .context("allocate mux dispatch subscription")?;
+            .context("allocate fenced mux dispatch subscription")?;
+        topology
+            .bind_subscription(session_incarnation, baseline_revision)
+            .context("bind fenced mux dispatch subscription")?;
         let _subscription_guard = MuxSubscriptionGuard::new(Arc::clone(&mux), sub_id);
 
         loop {
@@ -2070,7 +2741,7 @@ where
                             return Err(err).context("reading Pdu from client");
                         }
                     };
-                    dispatch_client_request(&mut handler, decoded)?;
+                    dispatch_client_request(&mut handler, &topology, decoded)?;
                 }
                 Ok(Item::WritePdu(decoded)) => {
                     match prepare_pending_outbound_batch(
@@ -2442,6 +3113,84 @@ mod tests {
         (sender, captured)
     }
 
+    fn idle_topology_coordinator() -> TopologyStreamCoordinator {
+        let (item_tx, _item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (terminal, _terminal_rx) = DispatchTerminal::channel();
+        TopologyStreamCoordinator::new(
+            item_tx,
+            terminal,
+            TopologyStreamId::from_bytes([0x5a; 16]),
+        )
+    }
+
+    fn bound_topology_coordinator() -> (
+        TopologyStreamCoordinator,
+        Receiver<Item>,
+        Receiver<&'static str>,
+        MuxSessionIncarnation,
+        TopologyStreamId,
+    ) {
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xa5; 16]);
+        let coordinator = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
+        coordinator
+            .bind_subscription(session_incarnation, TopologyRevision::INITIAL)
+            .expect("bind test topology subscription");
+        (
+            coordinator,
+            item_rx,
+            terminal_rx,
+            session_incarnation,
+            stream_id,
+        )
+    }
+
+    fn fenced_snapshot_request() -> ListPanesCoherent {
+        ListPanesCoherent {
+            supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+        }
+    }
+
+    fn coherent_snapshot_response(
+        stream_id: TopologyStreamId,
+        session_incarnation: MuxSessionIncarnation,
+        snapshot_revision: TopologyRevision,
+    ) -> ListPanesCoherentResponse {
+        ListPanesCoherentResponse {
+            negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            stream_id,
+            outcome: ListPanesCoherentOutcome::Snapshot(codec::CoherentPaneSnapshot {
+                session_incarnation,
+                snapshot_revision,
+                panes: codec::ListPanesResponse {
+                    tabs: Vec::new(),
+                    tab_titles: Vec::new(),
+                    window_titles: std::collections::HashMap::new(),
+                },
+            }),
+        }
+    }
+
+    fn topology_envelope(
+        revision: u64,
+        notification: MuxNotification,
+    ) -> MuxNotificationEnvelope {
+        MuxNotificationEnvelope {
+            notification,
+            topology: MuxTopologyStamp::Revision(TopologyRevision::new(revision)),
+        }
+    }
+
+    fn take_written_pdu(item_rx: &Receiver<Item>) -> DecodedPdu {
+        match item_rx.try_recv().expect("queued dispatch item") {
+            Item::WritePdu(decoded) => *decoded,
+            other => panic!("expected queued PDU, got {other:?}"),
+        }
+    }
+
     #[test]
     fn protocol_probe_recognizes_tmux_control_line() {
         assert_eq!(
@@ -2794,9 +3543,11 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
         let mut handler = SessionHandler::new_for_mux(sender, Arc::clone(&mux));
+        let topology = idle_topology_coordinator();
 
         let error = dispatch_client_request(
             &mut handler,
+            &topology,
             DecodedPdu {
                 serial: 0,
                 pdu: Pdu::SetClientId(codec::SetClientId {
@@ -2826,9 +3577,11 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let (sender, captured) = capturing_pdu_sender();
         let mut handler = SessionHandler::new_for_mux(sender, mux);
+        let topology = idle_topology_coordinator();
 
         dispatch_client_request(
             &mut handler,
+            &topology,
             DecodedPdu {
                 serial: 1,
                 pdu: Pdu::Ping(Ping {}),
@@ -2844,6 +3597,243 @@ mod tests {
         );
         assert_eq!(captured[0].serial, 1);
         assert_eq!(captured[0].pdu, Pdu::Pong(Pong {}));
+    }
+
+    #[test]
+    fn topology_fence_queues_snapshot_before_reordered_contiguous_events() {
+        let (coordinator, item_rx, _terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let mux = Mux::new(None);
+        coordinator
+            .begin_fence(41, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(2, MuxNotification::PaneRemoved(2)),
+        ));
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+        assert!(
+            item_rx.is_empty(),
+            "events remain quarantined until the coherent snapshot response"
+        );
+
+        coordinator
+            .queue_response(DecodedPdu {
+                serial: 41,
+                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                    stream_id,
+                    session_incarnation,
+                    TopologyRevision::INITIAL,
+                )),
+            })
+            .expect("complete coherent topology fence");
+
+        let snapshot = take_written_pdu(&item_rx);
+        assert_eq!(snapshot.serial, 41);
+        assert!(matches!(
+            snapshot.pdu,
+            Pdu::ListPanesCoherentResponse(_)
+        ));
+        for expected_revision in [1, 2] {
+            let event = take_written_pdu(&item_rx);
+            assert_eq!(event.serial, 0);
+            let Pdu::TopologyEvent(event) = event.pdu else {
+                panic!("expected stamped topology event");
+            };
+            assert_eq!(event.stream_id, stream_id);
+            assert_eq!(event.revision, TopologyRevision::new(expected_revision));
+        }
+        assert!(item_rx.is_empty());
+    }
+
+    #[test]
+    fn established_topology_stream_holds_a_gap_until_its_missing_revision_arrives() {
+        let (coordinator, item_rx, _terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let mux = Mux::new(None);
+        coordinator
+            .begin_fence(42, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+        coordinator
+            .queue_response(DecodedPdu {
+                serial: 42,
+                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                    stream_id,
+                    session_incarnation,
+                    TopologyRevision::INITIAL,
+                )),
+            })
+            .expect("establish topology stream");
+        let _snapshot = take_written_pdu(&item_rx);
+
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(2, MuxNotification::PaneRemoved(2)),
+        ));
+        assert!(
+            item_rx.is_empty(),
+            "revision two must remain quarantined while revision one is missing"
+        );
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+
+        for expected_revision in [1, 2] {
+            let event = take_written_pdu(&item_rx);
+            let Pdu::TopologyEvent(event) = event.pdu else {
+                panic!("expected stamped topology event");
+            };
+            assert_eq!(event.revision, TopologyRevision::new(expected_revision));
+        }
+        assert!(item_rx.is_empty());
+    }
+
+    #[test]
+    fn coherent_snapshot_prunes_only_buffered_revisions_at_or_before_its_fence() {
+        let (coordinator, item_rx, _terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let mux = Mux::new(None);
+        coordinator
+            .begin_fence(43, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(2, MuxNotification::PaneRemoved(2)),
+        ));
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+
+        coordinator
+            .queue_response(DecodedPdu {
+                serial: 43,
+                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                    stream_id,
+                    session_incarnation,
+                    TopologyRevision::new(1),
+                )),
+            })
+            .expect("complete coherent topology fence");
+
+        let _snapshot = take_written_pdu(&item_rx);
+        let event = take_written_pdu(&item_rx);
+        let Pdu::TopologyEvent(event) = event.pdu else {
+            panic!("expected post-snapshot topology event");
+        };
+        assert_eq!(event.revision, TopologyRevision::new(2));
+        assert!(item_rx.is_empty());
+    }
+
+    #[test]
+    fn contended_snapshot_restores_every_quarantined_legacy_notification() {
+        let (coordinator, item_rx, _terminal_rx, _session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let mux = Mux::new(None);
+        coordinator
+            .begin_fence(44, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(2, MuxNotification::PaneRemoved(2)),
+        ));
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+
+        coordinator
+            .queue_response(DecodedPdu {
+                serial: 44,
+                pdu: Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                    negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                    stream_id,
+                    outcome: ListPanesCoherentOutcome::Contended {
+                        attempts: 3,
+                        first_revision: TopologyRevision::INITIAL,
+                        last_revision: TopologyRevision::new(2),
+                    },
+                }),
+            })
+            .expect("return typed snapshot contention");
+
+        let response = take_written_pdu(&item_rx);
+        assert!(matches!(
+            response.pdu,
+            Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                outcome: ListPanesCoherentOutcome::Contended { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            item_rx.try_recv().expect("first restored notification"),
+            Item::Notif(MuxNotification::PaneAdded(1))
+        ));
+        assert!(matches!(
+            item_rx.try_recv().expect("second restored notification"),
+            Item::Notif(MuxNotification::PaneRemoved(2))
+        ));
+        assert!(item_rx.is_empty());
+    }
+
+    #[test]
+    fn topology_fence_duplicate_and_retained_byte_overflow_are_terminal() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let mux = Mux::new(None);
+        coordinator
+            .begin_fence(45, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+        let oversized_title = "x".repeat(TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(
+                1,
+                MuxNotification::WindowTitleChanged {
+                    window_id: 1,
+                    title: oversized_title,
+                },
+            ),
+        ));
+        assert_eq!(
+            terminal_rx.try_recv().expect("terminal overflow reason"),
+            TOPOLOGY_BUFFER_OVERFLOW
+        );
+        assert!(item_rx.is_empty());
+
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        coordinator
+            .begin_fence(46, &fenced_snapshot_request())
+            .expect("begin second coherent topology fence");
+        coordinator
+            .queue_response(DecodedPdu {
+                serial: 46,
+                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                    stream_id,
+                    session_incarnation,
+                    TopologyRevision::INITIAL,
+                )),
+            })
+            .expect("establish second topology stream");
+        let _snapshot = take_written_pdu(&item_rx);
+        assert!(coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+        let _first = take_written_pdu(&item_rx);
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+        assert_eq!(
+            terminal_rx.try_recv().expect("terminal duplicate reason"),
+            TOPOLOGY_PROTOCOL_FAILURE
+        );
     }
 
     #[test]

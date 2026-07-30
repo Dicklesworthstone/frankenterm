@@ -133,6 +133,10 @@ impl MuxSessionIncarnation {
         Self(*uuid::Uuid::new_v4().as_bytes())
     }
 
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
     pub const fn as_bytes(self) -> [u8; 16] {
         self.0
     }
@@ -158,6 +162,10 @@ pub struct TopologyRevision(u64);
 impl TopologyRevision {
     pub const INITIAL: Self = Self(0);
 
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -168,6 +176,14 @@ impl TopologyRevision {
     "mux topology revision space is exhausted; refusing to wrap, saturate, reset, or reuse a revision"
 )]
 pub struct TopologyRevisionExhausted;
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum TopologySubscriptionError {
+    #[error(transparent)]
+    RevisionExhausted(#[from] TopologyRevisionExhausted),
+    #[error(transparent)]
+    IdentifierAllocation(#[from] IdAllocationError),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MuxTopologyStamp {
@@ -213,7 +229,7 @@ impl MuxTopologyAuthority {
     fn snapshot(
         &self,
     ) -> Result<(MuxSessionIncarnation, TopologyRevision), TopologyRevisionExhausted> {
-        if self.exhausted {
+        if self.exhausted || self.revision.0 == u64::MAX {
             Err(TopologyRevisionExhausted)
         } else {
             Ok((self.session_incarnation, self.revision))
@@ -4149,6 +4165,33 @@ impl Mux {
             .write()
             .insert(sub_id, Arc::new(subscriber));
         Ok(sub_id)
+    }
+
+    /// Atomically subscribe to the topology stream and capture its baseline.
+    ///
+    /// Holding the topology authority while publishing the subscriber prevents
+    /// a revision from being reserved after the returned baseline without the
+    /// new subscriber being visible to that publication. An older envelope
+    /// that was reserved before this call may still arrive afterward; protocol
+    /// consumers must discard revisions at or below the returned baseline.
+    pub fn subscribe_with_topology_fence<F>(
+        &self,
+        subscriber: F,
+    ) -> Result<
+        (usize, MuxSessionIncarnation, TopologyRevision),
+        TopologySubscriptionError,
+    >
+    where
+        F: Fn(MuxNotificationEnvelope) -> bool + 'static + Send + Sync,
+    {
+        let topology = self.topology.lock();
+        let (session_incarnation, baseline_revision) = topology.snapshot()?;
+        let sub_id = try_reserve_usize_ids(&SUB_ID, 1, "mux subscriber")?.start;
+        self.subscribers
+            .write()
+            .insert(sub_id, Arc::new(subscriber));
+        drop(topology);
+        Ok((sub_id, session_incarnation, baseline_revision))
     }
 
     pub fn unsubscribe(&self, sub_id: usize) -> bool {
@@ -11300,6 +11343,43 @@ mod tests {
             mux.topology_snapshot_authority().unwrap_err(),
             TopologyRevisionExhausted,
         );
+    }
+
+    #[test]
+    fn topology_fence_subscription_captures_an_atomic_baseline() {
+        let mux = Mux::new(None);
+        mux.notify(MuxNotification::PaneAdded(17));
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        let (_sub_id, session, baseline) = mux
+            .subscribe_with_topology_fence(move |envelope| {
+                observed_for_subscriber.lock().push(envelope.topology);
+                true
+            })
+            .expect("live topology authority should permit a fenced subscription");
+
+        assert_ne!(session.as_bytes(), [0; 16]);
+        assert_eq!(baseline, TopologyRevision(1));
+        mux.notify(MuxNotification::PaneRemoved(17));
+        assert_eq!(
+            *observed.lock(),
+            vec![MuxTopologyStamp::Revision(TopologyRevision(2))],
+        );
+    }
+
+    #[test]
+    fn topology_fence_subscription_fails_closed_after_revision_exhaustion() {
+        let mux = Mux::new(None);
+        mux.topology.lock().revision = TopologyRevision(u64::MAX);
+
+        assert!(matches!(
+            mux.subscribe_with_topology_fence(|_| true),
+            Err(TopologySubscriptionError::RevisionExhausted(
+                TopologyRevisionExhausted
+            )),
+        ));
+        assert!(mux.subscribers.read().is_empty());
     }
 
     #[test]

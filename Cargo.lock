@@ -4205,6 +4205,7 @@ dependencies = [
  "tempfile",
  "termwiz 0.24.0",
  "url",
+ "uuid",
  "varbincode",
  "winapi",
  "zstd",
@@ -7297,6 +7298,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
+ "uuid",
  "winapi",
 ]
 
@@ -13653,83 +13655,3 @@ dependencies = [
 name = "rich_rust"
 version = "0.2.2"
 source = "git+https://github.com/Dicklesworthstone/rich_rust?rev=a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae#a4c3735ab62ffb7feb15d02bc3beb3bfe1e087ae"
-
-[[patch.unused]]
-name = "fsqlite"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-ast"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-btree"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-core"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-error"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-ext-fts5"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-ext-icu"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-ext-json"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-ext-misc"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-ext-rtree"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-func"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-mvcc"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-observability"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-pager"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-parser"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-planner"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-types"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-vdbe"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-vfs"
-version = "0.1.19"
-
-[[patch.unused]]
-name = "fsqlite-wal"
-version = "0.1.19"

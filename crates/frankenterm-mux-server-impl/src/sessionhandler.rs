@@ -3,19 +3,20 @@ use crate::PKI;
 use anyhow::{Context, anyhow};
 use codec::{
     ActivatePaneDirection, AdjustPaneSize, CODEC_VERSION, CreateFloatingPane, CycleStack,
-    DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList, GetClientListResponse,
-    GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse,
-    GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
-    GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetSemanticZones,
-    GetSemanticZonesResponse, GetTlsCredsResponse, InputSerial, KillPane, ListPanes,
+    CoherentPaneSnapshot, DecodedPdu, EraseScrollbackRequest, ErrorResponse, GetClientList,
+    GetClientListResponse, GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines,
+    GetLinesResponse, GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges,
+    GetPaneRenderChangesResponse, GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse,
+    GetSemanticZones, GetSemanticZonesResponse, GetTlsCredsResponse, InputSerial, KillPane,
+    ListPanes, ListPanesCoherent, ListPanesCoherentOutcome, ListPanesCoherentResponse,
     ListPanesResponse, ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse,
     LivenessResponse, MoveFloatingPane, MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert,
     Pdu, Ping, Pong, RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
     SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
     SetActiveWorkspace, SetClientId, SetFloatingPaneZ, SetFocusedPane, SetLayoutCycle, SetPalette,
     SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane, SwapToLayout,
-    TabTitleChanged, ToggleFloatingPane, UnitResponse, UpdatePaneConstraints, WindowTitleChanged,
-    WriteToPane,
+    TabTitleChanged, ToggleFloatingPane, TopologyCapabilities, TopologyStreamId, UnitResponse,
+    UpdatePaneConstraints, WindowTitleChanged, WriteToPane,
 };
 use mux::client::ClientId;
 use mux::pane::{CachePolicy, PaneId};
@@ -483,6 +484,93 @@ fn session_mux(authority: &SessionAuthority) -> anyhow::Result<CurrentSession> {
     authority.acquire()
 }
 
+fn collect_list_panes_snapshot(mux: &Mux) -> anyhow::Result<ListPanesResponse> {
+    let mut tabs = Vec::new();
+    let mut tab_titles = Vec::new();
+    let mut window_titles = HashMap::new();
+    for window_id in mux.iter_windows() {
+        let window_snapshot = mux.get_window(window_id).map(|window| {
+            (
+                window.get_title().to_string(),
+                window.get_workspace().to_string(),
+                window.iter().cloned().collect::<Vec<_>>(),
+            )
+        });
+        let Some((window_title, workspace, window_tabs)) = window_snapshot else {
+            log::warn!(
+                "ListPanes skipped stale window id {} from iter_windows",
+                window_id
+            );
+            continue;
+        };
+        window_titles.insert(window_id, window_title);
+        for tab in window_tabs {
+            tabs.push(tab.codec_pane_tree_in_window(window_id, &workspace)?);
+            tab_titles.push(tab.get_title());
+        }
+    }
+    log::trace!(
+        "ListPanes snapshot has {} tab trees, {} tab titles, and {} windows",
+        tabs.len(),
+        tab_titles.len(),
+        window_titles.len()
+    );
+    Ok(ListPanesResponse {
+        tabs,
+        tab_titles,
+        window_titles,
+    })
+}
+
+const COHERENT_SNAPSHOT_ATTEMPTS: u8 = 3;
+
+fn collect_coherent_list_panes_snapshot(
+    mux: &Mux,
+) -> anyhow::Result<ListPanesCoherentOutcome> {
+    let mut first_revision = None;
+    let mut last_revision = None;
+
+    for _ in 0..COHERENT_SNAPSHOT_ATTEMPTS {
+        let (before_session, before_revision) = match mux.topology_snapshot_authority() {
+            Ok(authority) => authority,
+            Err(_) => return Ok(ListPanesCoherentOutcome::RevisionExhausted),
+        };
+        if before_revision.get() == u64::MAX {
+            return Ok(ListPanesCoherentOutcome::RevisionExhausted);
+        }
+
+        let panes = collect_list_panes_snapshot(mux)?;
+
+        let (after_session, after_revision) = match mux.topology_snapshot_authority() {
+            Ok(authority) => authority,
+            Err(_) => return Ok(ListPanesCoherentOutcome::RevisionExhausted),
+        };
+        if before_session != after_session {
+            return Err(anyhow!(
+                "mux session incarnation changed while constructing a coherent pane snapshot"
+            ));
+        }
+        if before_revision == after_revision {
+            return Ok(ListPanesCoherentOutcome::Snapshot(CoherentPaneSnapshot {
+                session_incarnation: after_session,
+                snapshot_revision: after_revision,
+                panes,
+            }));
+        }
+
+        first_revision.get_or_insert(before_revision);
+        last_revision = Some(after_revision);
+    }
+
+    Ok(ListPanesCoherentOutcome::Contended {
+        attempts: COHERENT_SNAPSHOT_ATTEMPTS,
+        first_revision: first_revision
+            .expect("a contended snapshot records its first observed revision"),
+        last_revision: last_revision
+            .expect("a contended snapshot records its last observed revision"),
+    })
+}
+
 fn with_current_pane<R>(
     authority: &SessionAuthority,
     registration: &PaneRegistrationHandle,
@@ -507,6 +595,7 @@ fn unregister_owned_client(mux: &Mux, client_id: &Arc<ClientId>) {
 pub struct SessionHandler {
     to_write_tx: PduSender,
     owner: SessionOwner,
+    topology_stream_id: TopologyStreamId,
     per_pane: HashMap<PaneId, TrackedPane>,
     client_id: Option<Arc<ClientId>>,
     proxy_client_id: Option<ClientId>,
@@ -532,9 +621,20 @@ impl SessionHandler {
     }
 
     pub(crate) fn new_for_session(to_write_tx: PduSender, owner: SessionOwner) -> Self {
+        let topology_stream_id =
+            TopologyStreamId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
+        Self::new_for_session_with_topology_stream(to_write_tx, owner, topology_stream_id)
+    }
+
+    pub(crate) fn new_for_session_with_topology_stream(
+        to_write_tx: PduSender,
+        owner: SessionOwner,
+        topology_stream_id: TopologyStreamId,
+    ) -> Self {
         Self {
             to_write_tx,
             owner,
+            topology_stream_id,
             per_pane: HashMap::new(),
             client_id: None,
             proxy_client_id: None,
@@ -886,44 +986,41 @@ impl SessionHandler {
                     catch(
                         move || {
                             let mux = session_mux(&authority)?;
-                            let mut tabs = vec![];
-                            let mut tab_titles = vec![];
-                            let mut window_titles = HashMap::new();
-                            for window_id in mux.iter_windows() {
-                                let window_snapshot = mux.get_window(window_id).map(|window| {
-                                    (
-                                        window.get_title().to_string(),
-                                        window.get_workspace().to_string(),
-                                        window.iter().cloned().collect::<Vec<_>>(),
-                                    )
-                                });
-                                let Some((window_title, workspace, window_tabs)) = window_snapshot
-                                else {
-                                    log::warn!(
-                                        "ListPanes skipped stale window id {} from iter_windows",
-                                        window_id
-                                    );
-                                    continue;
-                                };
-                                window_titles.insert(window_id, window_title);
-                                for tab in window_tabs {
-                                    tabs.push(
-                                        tab.codec_pane_tree_in_window(window_id, &workspace)?,
-                                    );
-                                    tab_titles.push(tab.get_title());
+                            Ok(Pdu::ListPanesResponse(collect_list_panes_snapshot(&mux)?))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+            Pdu::ListPanesCoherent(ListPanesCoherent {
+                supported,
+                required,
+            }) => {
+                let stream_id = self.topology_stream_id;
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let negotiated =
+                                supported.intersection(TopologyCapabilities::SERVER_SUPPORTED);
+                            let outcome = if negotiated
+                                .contains(TopologyCapabilities::FENCED_SNAPSHOT_V1)
+                                && negotiated.contains(required)
+                            {
+                                let mux = session_mux(&authority)?;
+                                collect_coherent_list_panes_snapshot(&mux)?
+                            } else {
+                                ListPanesCoherentOutcome::Unsupported {
+                                    supported: TopologyCapabilities::SERVER_SUPPORTED,
                                 }
-                            }
-                            log::trace!(
-                                "ListPanes snapshot has {} tab trees, {} tab titles, and {} windows",
-                                tabs.len(),
-                                tab_titles.len(),
-                                window_titles.len()
-                            );
-                            Ok(Pdu::ListPanesResponse(ListPanesResponse {
-                                tabs,
-                                tab_titles,
-                                window_titles,
-                            }))
+                            };
+                            Ok(Pdu::ListPanesCoherentResponse(
+                                ListPanesCoherentResponse {
+                                    negotiated,
+                                    stream_id,
+                                    outcome,
+                                },
+                            ))
                         },
                         send_response,
                     );
@@ -1877,6 +1974,7 @@ impl SessionHandler {
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
+            | Pdu::ListPanesCoherentResponse { .. }
             | Pdu::ListPanesTabStacksResponse { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
@@ -1902,6 +2000,12 @@ impl SessionHandler {
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)));
+            }
+            Pdu::TopologyEvent { .. } => {
+                send_response(Err(anyhow!(
+                    "expected a request, got server-unilateral topology event {:?}",
+                    decoded.pdu
+                )));
             }
         }
     }
@@ -3089,6 +3193,147 @@ mod tests {
             observations.load(Ordering::Acquire) > 0,
             "the request must exercise the guarded pane-observation callback",
         );
+    }
+
+    #[test]
+    fn coherent_list_panes_returns_exact_stream_session_and_snapshot_revision() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let expected_authority = mux
+            .topology_snapshot_authority()
+            .expect("fresh mux topology authority");
+        let stream_id = TopologyStreamId::from_bytes([0x5a; 16]);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(mux),
+            stream_id,
+        );
+
+        handler.process_one(DecodedPdu {
+            serial: 122,
+            pdu: Pdu::ListPanesCoherent(ListPanesCoherent {
+                supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let response = take_response(&captured);
+        assert_eq!(response.serial, 122);
+        let Pdu::ListPanesCoherentResponse(response) = response.pdu else {
+            panic!("expected coherent ListPanes response");
+        };
+        assert_eq!(response.stream_id, stream_id);
+        assert_eq!(
+            response.negotiated,
+            TopologyCapabilities::FENCED_SNAPSHOT_V1
+        );
+        let ListPanesCoherentOutcome::Snapshot(snapshot) = response.outcome else {
+            panic!("expected an authoritative coherent pane snapshot");
+        };
+        assert_eq!(snapshot.session_incarnation, expected_authority.0);
+        assert_eq!(snapshot.snapshot_revision, expected_authority.1);
+        assert!(snapshot.panes.tabs.is_empty());
+        assert!(snapshot.panes.tab_titles.is_empty());
+        assert!(snapshot.panes.window_titles.is_empty());
+    }
+
+    #[test]
+    fn coherent_list_panes_reports_typed_contention_after_three_moving_attempts() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let weak_mux = Arc::downgrade(&mux);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(mux) = weak_mux.upgrade() {
+                mux.notify(mux::MuxNotification::Empty);
+            }
+        });
+        let pane: Arc<dyn Pane> =
+            Arc::new(FakePane::new_with_callback_probe(7_008, probe));
+        let tab = Arc::new(mux::tab::Tab::new(&test_tab_size()));
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("register moving-snapshot test tab");
+        let window = mux.new_empty_window(None, None);
+        mux.add_tab_to_window(&tab, *window)
+            .expect("attach moving-snapshot test tab");
+        drop(window);
+
+        let stream_id = TopologyStreamId::from_bytes([0x6b; 16]);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(mux),
+            stream_id,
+        );
+        handler.process_one(DecodedPdu {
+            serial: 123,
+            pdu: Pdu::ListPanesCoherent(ListPanesCoherent {
+                supported: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                required: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let response = take_response(&captured);
+        let Pdu::ListPanesCoherentResponse(response) = response.pdu else {
+            panic!("expected coherent ListPanes response");
+        };
+        let ListPanesCoherentOutcome::Contended {
+            attempts,
+            first_revision,
+            last_revision,
+        } = response.outcome
+        else {
+            panic!("moving topology must not mint a coherent snapshot");
+        };
+        assert_eq!(attempts, COHERENT_SNAPSHOT_ATTEMPTS);
+        assert!(last_revision > first_revision);
+    }
+
+    #[test]
+    fn coherent_list_panes_rejects_unknown_required_capability_without_authority() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let stream_id = TopologyStreamId::from_bytes([0x7c; 16]);
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new_for_session_with_topology_stream(
+            sender,
+            SessionOwner::new(mux),
+            stream_id,
+        );
+        handler.process_one(DecodedPdu {
+            serial: 124,
+            pdu: Pdu::ListPanesCoherent(ListPanesCoherent {
+                supported: TopologyCapabilities::from_bits(
+                    TopologyCapabilities::FENCED_SNAPSHOT_V1.bits() | (1 << 63),
+                ),
+                required: TopologyCapabilities::from_bits(1 << 63),
+            }),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let response = take_response(&captured);
+        let Pdu::ListPanesCoherentResponse(response) = response.pdu else {
+            panic!("expected coherent ListPanes response");
+        };
+        assert_eq!(response.stream_id, stream_id);
+        assert!(matches!(
+            response.outcome,
+            ListPanesCoherentOutcome::Unsupported {
+                supported: TopologyCapabilities::SERVER_SUPPORTED
+            }
+        ));
     }
 
     #[test]
