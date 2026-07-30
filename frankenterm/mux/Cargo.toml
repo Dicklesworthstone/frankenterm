@@ -63,6 +63,7 @@ textwrap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+uuid = { workspace = true, features = ["v4", "rng"] }
 frankenterm-dynamic.workspace = true
 # Keep ssh backend selection explicit here so runtime selection is controlled
 # by mux feature flags instead of frankenterm-ssh defaults.

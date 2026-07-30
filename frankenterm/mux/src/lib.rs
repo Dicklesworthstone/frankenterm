@@ -79,6 +79,7 @@ use parking_lot::{
 };
 use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::io::{Read, Write};
@@ -117,6 +118,108 @@ pub mod window;
 use crate::activity::{Activity, ActivityPruneState};
 
 pub const DEFAULT_WORKSPACE: &str = "default";
+
+/// Unpredictable identity for one live mux-session incarnation.
+///
+/// Numeric pane, tab, and window identifiers are meaningful only inside this
+/// scope. A newly constructed mux always receives a fresh incarnation so a
+/// reconnect can distinguish a surviving session from a restarted server even
+/// when process-local numeric identifiers happen to repeat.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct MuxSessionIncarnation([u8; 16]);
+
+impl MuxSessionIncarnation {
+    pub fn new() -> Self {
+        Self(*uuid::Uuid::new_v4().as_bytes())
+    }
+
+    pub const fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl Default for MuxSessionIncarnation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Session-global revision of the mux topology publication stream.
+///
+/// Revision zero names the initial empty state. Every topology notification
+/// publication reserves the next value with checked addition. Exhaustion is a
+/// terminal authority state; the counter never wraps, saturates, resets, or
+/// reuses a prior value.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct TopologyRevision(u64);
+
+impl TopologyRevision {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error(
+    "mux topology revision space is exhausted; refusing to wrap, saturate, reset, or reuse a revision"
+)]
+pub struct TopologyRevisionExhausted;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MuxTopologyStamp {
+    NonTopology,
+    Revision(TopologyRevision),
+    Exhausted,
+}
+
+#[derive(Clone, Debug)]
+pub struct MuxNotificationEnvelope {
+    pub notification: MuxNotification,
+    pub topology: MuxTopologyStamp,
+}
+
+#[derive(Debug)]
+struct MuxTopologyAuthority {
+    session_incarnation: MuxSessionIncarnation,
+    revision: TopologyRevision,
+    exhausted: bool,
+}
+
+impl MuxTopologyAuthority {
+    fn new() -> Self {
+        Self {
+            session_incarnation: MuxSessionIncarnation::new(),
+            revision: TopologyRevision::INITIAL,
+            exhausted: false,
+        }
+    }
+
+    fn reserve_revision(&mut self) -> Result<TopologyRevision, TopologyRevisionExhausted> {
+        if self.exhausted {
+            return Err(TopologyRevisionExhausted);
+        }
+        let Some(next) = self.revision.0.checked_add(1) else {
+            self.exhausted = true;
+            return Err(TopologyRevisionExhausted);
+        };
+        self.revision = TopologyRevision(next);
+        Ok(self.revision)
+    }
+
+    fn snapshot(
+        &self,
+    ) -> Result<(MuxSessionIncarnation, TopologyRevision), TopologyRevisionExhausted> {
+        if self.exhausted {
+            Err(TopologyRevisionExhausted)
+        } else {
+            Ok((self.session_incarnation, self.revision))
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum MuxNotification {
@@ -164,6 +267,29 @@ pub enum MuxNotification {
         old_workspace: String,
         new_workspace: String,
     },
+}
+
+impl MuxNotification {
+    /// Whether this notification describes state represented by a mux
+    /// topology snapshot and therefore participates in the revision stream.
+    pub const fn is_topology(&self) -> bool {
+        matches!(
+            self,
+            Self::PaneAdded(_)
+                | Self::PaneRemoved(_)
+                | Self::WindowCreated(_)
+                | Self::WindowRemoved(_)
+                | Self::WindowInvalidated(_)
+                | Self::WindowWorkspaceChanged(_)
+                | Self::Empty
+                | Self::TabAddedToWindow { .. }
+                | Self::PaneFocused(_)
+                | Self::TabResized(_)
+                | Self::TabTitleChanged { .. }
+                | Self::WindowTitleChanged { .. }
+                | Self::WorkspaceRenamed { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,7 +457,7 @@ pub(crate) fn next_saturating_usize_id(counter: &AtomicUsize) -> usize {
     }
 }
 
-type MuxSubscriber = dyn Fn(MuxNotification) -> bool + Send + Sync;
+type MuxSubscriber = dyn Fn(MuxNotificationEnvelope) -> bool + Send + Sync;
 
 struct PreparedPaneRegistration {
     pane_id: PaneId,
@@ -1846,15 +1972,25 @@ mod pane_registration_handle {
                             .collect::<Vec<_>>()
                     };
 
+                    let removal_topology = removed
+                        .iter()
+                        .map(|(pane_id, _, _, _)| {
+                            owner
+                                .envelope_notification(MuxNotification::PaneRemoved(*pane_id))
+                                .topology
+                        })
+                        .collect::<Vec<_>>();
                     let tickets = {
                         let mut pending = owner.pending_pane_lifecycle.lock();
                         removed
                             .iter()
-                            .map(|(pane_id, _, generation, _)| {
+                            .zip(removal_topology)
+                            .map(|((pane_id, _, generation, _), topology)| {
                                 let ready = Arc::new(AtomicBool::new(false));
                                 pending.by_pane.entry(*pane_id).or_default().push_back(
                                     PendingPaneLifecycleNotification {
                                         notification: PaneLifecycleNotification::Removed(*pane_id),
+                                        topology,
                                         ready: Arc::clone(&ready),
                                         reader_start_gate: None,
                                         cleanup_complete: Some(Arc::clone(
@@ -2393,6 +2529,7 @@ impl From<PaneLifecycleNotification> for MuxNotification {
 
 struct PendingPaneLifecycleNotification {
     notification: PaneLifecycleNotification,
+    topology: MuxTopologyStamp,
     ready: Arc<AtomicBool>,
     reader_start_gate: Option<PaneReaderStartGate>,
     cleanup_complete: Option<Arc<AtomicBool>>,
@@ -2753,7 +2890,7 @@ struct PendingWindowNotifications {
 
 enum PendingWindowAction {
     Notification {
-        notification: MuxNotification,
+        envelope: MuxNotificationEnvelope,
         activity: Option<Activity>,
     },
     FocusLost(Arc<dyn Pane>),
@@ -2790,6 +2927,7 @@ impl Drop for WindowNotificationDispatch {
 }
 
 pub struct Mux {
+    topology: Mutex<MuxTopologyAuthority>,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, LivePaneRegistration>>,
     pane_retirements: Arc<PaneRetirementTracker>,
@@ -3484,6 +3622,7 @@ impl Mux {
         };
 
         Self {
+            topology: Mutex::new(MuxTopologyAuthority::new()),
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             pane_retirements: Arc::new(PaneRetirementTracker::default()),
@@ -3992,6 +4131,19 @@ impl Mux {
     where
         F: Fn(MuxNotification) -> bool + 'static + Send + Sync,
     {
+        self.subscribe_with_topology(move |envelope| subscriber(envelope.notification))
+    }
+
+    /// Subscribe to mux notifications together with their topology authority.
+    ///
+    /// Existing in-process consumers should normally use [`Self::subscribe`].
+    /// Protocol bridges use this form so topology events retain the exact
+    /// revision reserved at publication rather than reconstructing order from
+    /// callback timing.
+    pub fn subscribe_with_topology<F>(&self, subscriber: F) -> Result<usize, IdAllocationError>
+    where
+        F: Fn(MuxNotificationEnvelope) -> bool + 'static + Send + Sync,
+    {
         let sub_id = try_reserve_usize_ids(&SUB_ID, 1, "mux subscriber")?.start;
         self.subscribers
             .write()
@@ -4001,6 +4153,27 @@ impl Mux {
 
     pub fn unsubscribe(&self, sub_id: usize) -> bool {
         self.subscribers.write().remove(&sub_id).is_some()
+    }
+
+    pub fn topology_snapshot_authority(
+        &self,
+    ) -> Result<(MuxSessionIncarnation, TopologyRevision), TopologyRevisionExhausted> {
+        self.topology.lock().snapshot()
+    }
+
+    fn envelope_notification(&self, notification: MuxNotification) -> MuxNotificationEnvelope {
+        let topology = if notification.is_topology() {
+            match self.topology.lock().reserve_revision() {
+                Ok(revision) => MuxTopologyStamp::Revision(revision),
+                Err(_) => MuxTopologyStamp::Exhausted,
+            }
+        } else {
+            MuxTopologyStamp::NonTopology
+        };
+        MuxNotificationEnvelope {
+            notification,
+            topology,
+        }
     }
 
     pub fn notify(&self, notification: MuxNotification) {
@@ -4045,6 +4218,11 @@ impl Mux {
             MuxNotification::PaneOutput(pane_id) => self.enqueue_pane_output_notification(pane_id),
             notification => self.dispatch_notification(notification),
         }
+    }
+
+    fn dispatch_notification(&self, notification: MuxNotification) {
+        let envelope = self.envelope_notification(notification);
+        self.dispatch_notification_envelope(envelope);
     }
 
     fn bind_window_notification_owner(self: &Arc<Self>) {
@@ -4121,13 +4299,14 @@ impl Mux {
         notification: MuxNotification,
         activity: Option<Activity>,
     ) {
+        let envelope = self.envelope_notification(notification);
         let mut pending = self.pending_window_notifications.lock();
         assert!(
             std::ptr::eq(pending.owner.as_ptr(), self as *const Self),
             "window notifications require the exact owner to be bound before publication",
         );
         pending.queue.push_back(PendingWindowAction::Notification {
-            notification,
+            envelope,
             activity,
         });
     }
@@ -4215,10 +4394,10 @@ impl Mux {
             };
             match action {
                 PendingWindowAction::Notification {
-                    notification,
+                    envelope,
                     activity,
                 } => {
-                    self.notify(notification);
+                    self.dispatch_notification_envelope(envelope);
                     // The optional Activity deliberately remains live through
                     // subscriber fanout, then releases only after the
                     // corresponding WindowCreated event has been observed.
@@ -4266,7 +4445,7 @@ impl Mux {
     // Callbacks are invoked without holding the subscribers lock. A callback
     // removed concurrently may still observe the current notification if it
     // was present in the snapshot; removals only affect future notifications.
-    fn dispatch_notification(&self, notification: MuxNotification) {
+    fn dispatch_notification_envelope(&self, envelope: MuxNotificationEnvelope) {
         let subscribers = self
             .subscribers
             .read()
@@ -4278,7 +4457,7 @@ impl Mux {
         let mut dead_subscribers = Vec::new();
         for (id, subscriber) in subscribers {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                subscriber(notification.clone())
+                subscriber(envelope.clone())
             })) {
                 Ok(true) => {} // subscriber still alive
                 Ok(false) => dead_subscribers.push(id),
@@ -4337,6 +4516,7 @@ impl Mux {
         removal_follow_up: PaneRemovalFollowUp,
     ) -> PaneLifecycleNotificationTicket {
         let pane_id = notification.pane_id();
+        let topology = self.envelope_notification(notification.into()).topology;
         let ready = Arc::new(AtomicBool::new(false));
         self.pending_pane_lifecycle
             .lock()
@@ -4345,6 +4525,7 @@ impl Mux {
             .or_default()
             .push_back(PendingPaneLifecycleNotification {
                 notification,
+                topology,
                 ready: Arc::clone(&ready),
                 reader_start_gate,
                 cleanup_complete,
@@ -4476,12 +4657,16 @@ impl Mux {
                 PaneLifecycleDrainStep::Notification(pending_notification) => {
                     let PendingPaneLifecycleNotification {
                         notification,
+                        topology,
                         ready: _,
                         reader_start_gate,
                         cleanup_complete,
                         removal_follow_up,
                     } = pending_notification;
-                    self.dispatch_notification(notification.into());
+                    self.dispatch_notification_envelope(MuxNotificationEnvelope {
+                        notification: notification.into(),
+                        topology,
+                    });
                     if let Some(reader_start_gate) = reader_start_gate {
                         reader_start_gate.release_if_registered(self);
                     }
@@ -11014,6 +11199,107 @@ mod tests {
         mux.notify(MuxNotification::Empty);
         assert_eq!(notifications.load(Ordering::Relaxed), 1);
         assert!(!mux.unsubscribe(sub_id));
+    }
+
+    #[test]
+    fn topology_subscriber_receives_checked_revisions_and_non_topology_markers() {
+        let mux = Mux::new(None);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe_with_topology(move |envelope| {
+            observed_for_subscriber.lock().push(envelope.topology);
+            true
+        })
+        .expect("test topology subscription should allocate an identifier");
+
+        mux.notify(MuxNotification::PaneAdded(17));
+        mux.notify(MuxNotification::SynchronizedOutput {
+            pane_id: 17,
+            event: SynchronizedOutputEvent::ModeQuery,
+        });
+        mux.notify(MuxNotification::WindowTitleChanged {
+            window_id: 23,
+            title: "two".to_string(),
+        });
+
+        assert_eq!(
+            *observed.lock(),
+            vec![
+                MuxTopologyStamp::Revision(TopologyRevision(1)),
+                MuxTopologyStamp::NonTopology,
+                MuxTopologyStamp::Revision(TopologyRevision(2)),
+            ]
+        );
+        let (session, revision) = mux
+            .topology_snapshot_authority()
+            .expect("live topology authority should remain available");
+        assert_ne!(session.as_bytes(), [0; 16]);
+        assert_eq!(revision, TopologyRevision(2));
+    }
+
+    #[test]
+    fn queued_window_notification_keeps_enqueue_revision_across_later_dispatch() {
+        let mux = Arc::new(Mux::new(None));
+        mux.bind_window_notification_owner();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe_with_topology(move |envelope| {
+            if let MuxTopologyStamp::Revision(revision) = envelope.topology {
+                observed_for_subscriber.lock().push(revision);
+            }
+            true
+        })
+        .expect("test topology subscription should allocate an identifier");
+
+        mux.queue_window_notification(MuxNotification::WindowTitleChanged {
+            window_id: 31,
+            title: "queued".to_string(),
+        });
+        assert_eq!(
+            mux.topology_snapshot_authority()
+                .expect("queued topology publication should retain authority")
+                .1,
+            TopologyRevision(1),
+        );
+
+        mux.notify(MuxNotification::TabTitleChanged {
+            tab_id: 41,
+            title: "direct".to_string(),
+        });
+        mux.flush_window_notifications();
+
+        assert_eq!(
+            *observed.lock(),
+            vec![TopologyRevision(2), TopologyRevision(1)],
+            "delivery timing may differ across internal queues, but each envelope must retain \
+             the revision reserved at its mutation publication point",
+        );
+    }
+
+    #[test]
+    fn topology_revision_exhaustion_is_terminal_and_never_wraps() {
+        let mux = Mux::new(None);
+        mux.topology.lock().revision = TopologyRevision(u64::MAX);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe_with_topology(move |envelope| {
+            observed_for_subscriber.lock().push(envelope.topology);
+            true
+        })
+        .expect("test topology subscription should allocate an identifier");
+
+        mux.notify(MuxNotification::Empty);
+        mux.notify(MuxNotification::PaneRemoved(99));
+
+        assert_eq!(
+            *observed.lock(),
+            vec![MuxTopologyStamp::Exhausted, MuxTopologyStamp::Exhausted],
+        );
+        assert_eq!(mux.topology.lock().revision, TopologyRevision(u64::MAX));
+        assert_eq!(
+            mux.topology_snapshot_authority().unwrap_err(),
+            TopologyRevisionExhausted,
+        );
     }
 
     #[test]
