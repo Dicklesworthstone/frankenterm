@@ -2,6 +2,8 @@ use crate::client::{RpcConsumerKind, RpcGenerationScope};
 use crate::domain::ClientInner;
 use codec::*;
 use config::{configuration, ConfigHandle};
+use futures::future::{select, Either};
+use futures::pin_mut;
 use lru::LruCache;
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
@@ -10,7 +12,8 @@ use promise::BrokenPromise;
 use rangeset::*;
 use ratelim::RateLimiter;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -603,6 +606,66 @@ impl RenderableInner {
         delta: GetPaneRenderChangesResponse,
         bonus_lines: Vec<(StableRowIndex, Line)>,
     ) -> bool {
+        self.apply_changes_to_surface_inner(delta, bonus_lines, false, false)
+    }
+
+    pub fn apply_render_application_to_surface(
+        &mut self,
+        delta: GetPaneRenderChangesResponse,
+        bonus_lines: Vec<(StableRowIndex, Line)>,
+        kind: RenderApplicationKind,
+    ) -> bool {
+        if delta.dirty_lines.len() > MAX_RENDER_APPLICATION_DIRTY_RANGES {
+            return false;
+        }
+        let supplied_rows = if delta.dirty_lines.is_empty() {
+            None
+        } else {
+            Some(
+                bonus_lines
+                    .iter()
+                    .map(|(stable_row, _)| *stable_row)
+                    .collect::<HashSet<_>>(),
+            )
+        };
+        let mut dirty_rows = 0usize;
+        for range in &delta.dirty_lines {
+            let Some(span) = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|span| usize::try_from(span).ok())
+            else {
+                return false;
+            };
+            let Some(total) = dirty_rows.checked_add(span) else {
+                return false;
+            };
+            dirty_rows = total;
+            if dirty_rows > MAX_RENDER_APPLICATION_LINES
+                || range.clone().any(|row| {
+                    supplied_rows
+                        .as_ref()
+                        .is_none_or(|rows| !rows.contains(&row))
+                })
+            {
+                return false;
+            }
+        }
+        self.apply_changes_to_surface_inner(
+            delta,
+            bonus_lines,
+            kind == RenderApplicationKind::Snapshot,
+            true,
+        )
+    }
+
+    fn apply_changes_to_surface_inner(
+        &mut self,
+        delta: GetPaneRenderChangesResponse,
+        bonus_lines: Vec<(StableRowIndex, Line)>,
+        authoritative_snapshot: bool,
+        complete_application: bool,
+    ) -> bool {
         log::trace!(
             "apply_changes_to_surface local={} remote={}",
             self.local_pane_id,
@@ -622,7 +685,7 @@ impl RenderableInner {
         // user input for echo/tardy responsiveness. [mux round-trip optimization]
         self.last_recv_time = now;
 
-        if !should_apply_unilateral_delta(self.seqno, delta.seqno) {
+        if !authoritative_snapshot && !should_apply_unilateral_delta(self.seqno, delta.seqno) {
             log::trace!(
                 "ignoring stale render delta for local={} remote={} seqno {} < {}",
                 self.local_pane_id,
@@ -632,12 +695,23 @@ impl RenderableInner {
             );
             return false;
         }
+        if authoritative_snapshot {
+            self.lines.clear();
+            self.predictions.clear();
+        }
 
         let mut dirty = RangeSet::new();
         for r in delta.dirty_lines {
             dirty.add_range(r.clone());
         }
-        if delta.cursor_position != self.cursor_position {
+        // Legacy deltas mark cursor rows for an on-demand refetch because they
+        // may omit changed row content. A render application is already a
+        // complete atomic unit: all content-dirty rows were validated above,
+        // and cursor movement alone does not change line content. Refetching
+        // those rows after ACK would reintroduce an untracked network
+        // dependency and make the supposedly complete application only
+        // partially applied.
+        if !complete_application && delta.cursor_position != self.cursor_position {
             dirty.add(self.cursor_position.y);
             // But note that the server may have sent this in bonus_lines;
             // we'll address that below
@@ -1199,6 +1273,193 @@ pub(crate) async fn hydrate_lines(
     }
 
     line_by_idx.into_iter().collect()
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+pub(crate) async fn hydrate_render_application_lines(
+    rpc: &RpcGenerationScope,
+    pane_id: PaneId,
+    serialized_lines: SerializedLines,
+    max_unique_image_bytes: usize,
+    application_deadline: Instant,
+) -> Result<Vec<(StableRowIndex, Line)>, RenderApplicationNackReason> {
+    let structure_error = |error| {
+        let component = match error {
+            SerializedLinesStructureError::HyperlinkLineOutOfRange
+            | SerializedLinesStructureError::HyperlinkCellRangeOutOfRange => {
+                RenderApplicationComponent::Hyperlinks
+            }
+            SerializedLinesStructureError::ImageLineMissing
+            | SerializedLinesStructureError::ImageCellOutOfRange => {
+                RenderApplicationComponent::Images
+            }
+            SerializedLinesStructureError::DuplicateStableRow
+            | SerializedLinesStructureError::CellCountOverflow => {
+                RenderApplicationComponent::Lines
+            }
+        };
+        RenderApplicationNackReason::MalformedOrIncomplete { component }
+    };
+    let (mut lines, image_cells) = serialized_lines
+        .extract_data_checked()
+        .map_err(structure_error)?;
+
+    if Instant::now() >= application_deadline {
+        return Err(RenderApplicationNackReason::ApplicationFailure {
+            stage: RenderApplicationStage::Hydrate,
+        });
+    }
+    if image_cells.is_empty() {
+        return Ok(lines);
+    }
+
+    let mut requests = HashMap::new();
+    let mut data_by_hash = HashMap::new();
+    let mut unique_image_bytes = 0usize;
+    for image in &image_cells {
+        if Instant::now() >= application_deadline {
+            return Err(RenderApplicationNackReason::ApplicationFailure {
+                stage: RenderApplicationStage::Hydrate,
+            });
+        }
+        if data_by_hash.contains_key(&image.data_hash) {
+            continue;
+        }
+        if let Some(data) = lock_image_lru().get(&image.data_hash) {
+            unique_image_bytes = unique_image_bytes.checked_add(data.len()).ok_or(
+                RenderApplicationNackReason::BoundedResourceRejected {
+                    resource: RenderApplicationResource::Images,
+                    requested: u64::MAX,
+                    limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
+                },
+            )?;
+            if unique_image_bytes > max_unique_image_bytes {
+                return Err(RenderApplicationNackReason::BoundedResourceRejected {
+                    resource: RenderApplicationResource::Images,
+                    requested: u64::try_from(unique_image_bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
+                });
+            }
+            data_by_hash.insert(image.data_hash, data);
+        } else {
+            requests
+                .entry(image.data_hash)
+                .or_insert_with(|| GetImageCell {
+                    pane_id,
+                    line_idx: image.line_idx,
+                    cell_idx: image.cell_idx,
+                    data_hash: image.data_hash,
+                });
+        }
+    }
+
+    for (hash, request) in requests {
+        let Some(remaining) = application_deadline.checked_duration_since(Instant::now()) else {
+            return Err(RenderApplicationNackReason::ApplicationFailure {
+                stage: RenderApplicationStage::Hydrate,
+            });
+        };
+        if remaining.is_zero() {
+            return Err(RenderApplicationNackReason::ApplicationFailure {
+                stage: RenderApplicationStage::Hydrate,
+            });
+        }
+        let operation = rpc.get_image_cell(request);
+        let timeout = async move {
+            promise::spawn::sleep(remaining).await;
+        };
+        pin_mut!(operation);
+        pin_mut!(timeout);
+        let response = match select(operation, timeout).await {
+            Either::Left((response, _)) => response,
+            Either::Right(((), _)) => {
+                return Err(RenderApplicationNackReason::ApplicationFailure {
+                    stage: RenderApplicationStage::Hydrate,
+                });
+            }
+        };
+        let data = match response {
+            Ok(GetImageCellResponse {
+                data: Some(data), ..
+            }) if data.hash() == hash => data,
+            Ok(GetImageCellResponse {
+                data: Some(_), ..
+            }) => {
+                return Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                    component: RenderApplicationComponent::Images,
+                });
+            }
+            Ok(GetImageCellResponse { data: None, .. }) => {
+                return Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                    component: RenderApplicationComponent::Images,
+                });
+            }
+            Err(_) => {
+                return Err(RenderApplicationNackReason::ApplicationFailure {
+                    stage: RenderApplicationStage::Hydrate,
+                });
+            }
+        };
+        unique_image_bytes = unique_image_bytes.checked_add(data.len()).ok_or(
+            RenderApplicationNackReason::BoundedResourceRejected {
+                resource: RenderApplicationResource::Images,
+                requested: u64::MAX,
+                limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
+            },
+        )?;
+        if unique_image_bytes > max_unique_image_bytes {
+            return Err(RenderApplicationNackReason::BoundedResourceRejected {
+                resource: RenderApplicationResource::Images,
+                requested: u64::try_from(unique_image_bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(max_unique_image_bytes).unwrap_or(u64::MAX),
+            });
+        }
+        lock_image_lru().put(Arc::clone(&data));
+        data_by_hash.insert(hash, data);
+    }
+
+    let line_index_by_row = lines
+        .iter()
+        .enumerate()
+        .map(|(index, (stable_row, _))| (*stable_row, index))
+        .collect::<HashMap<_, _>>();
+    for image in image_cells {
+        let data = data_by_hash.get(&image.data_hash).ok_or(
+            RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Images,
+            },
+        )?;
+        let line_index = *line_index_by_row.get(&image.line_idx).ok_or(
+            RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Images,
+            },
+        )?;
+        let cell = lines[line_index]
+            .1
+            .cells_mut_for_attr_changes_only()
+            .get_mut(image.cell_idx)
+            .ok_or(RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Images,
+            })?;
+        cell.attrs_mut()
+            .attach_image(Box::new(ImageCell::with_z_index(
+                image.top_left,
+                image.bottom_right,
+                Arc::clone(data),
+                image.z_index,
+                image.padding_left,
+                image.padding_top,
+                image.padding_right,
+                image.padding_bottom,
+                image.image_id,
+                image.placement_id,
+            )));
+    }
+
+    Ok(lines)
 }
 
 impl RenderableState {

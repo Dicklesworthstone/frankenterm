@@ -2,7 +2,8 @@ use crate::client::{RpcConsumerKind, RpcGenerationScope};
 use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
-    hydrate_lines, RenderableInner, RenderablePaneBinding, RenderableState,
+    hydrate_lines, hydrate_render_application_lines, RenderableInner, RenderablePaneBinding,
+    RenderableState,
 };
 use anyhow::bail;
 use async_trait::async_trait;
@@ -25,6 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use termwiz::input::KeyEvent;
 use termwiz::surface::SequenceNo;
 use url::Url;
@@ -32,8 +34,338 @@ use wezterm_dynamic::Value;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Alert, Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, Progress, StableRowIndex,
-    TerminalConfiguration, TerminalSize,
+    SemanticZone, TerminalConfiguration, TerminalSize,
 };
+
+const MAX_RENDER_APPLICATION_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+#[derive(Clone, Copy, Debug)]
+struct ClientRenderApplicationLimits {
+    dirty_ranges: usize,
+    lines: usize,
+    cells: usize,
+    hyperlink_spans: usize,
+    image_references: usize,
+    image_bytes: usize,
+    semantic_zones: usize,
+    semantic_text_bytes: usize,
+    alert_text_bytes: usize,
+    title_bytes: usize,
+    working_dir_bytes: usize,
+    scrollback_rows: usize,
+    viewport_cells: usize,
+    supports_images: bool,
+    supports_semantic_zones: bool,
+    supports_palette: bool,
+    supports_alerts: bool,
+}
+
+impl Default for ClientRenderApplicationLimits {
+    fn default() -> Self {
+        Self {
+            dirty_ranges: MAX_RENDER_APPLICATION_DIRTY_RANGES,
+            lines: MAX_RENDER_APPLICATION_LINES,
+            cells: MAX_RENDER_APPLICATION_CELLS,
+            hyperlink_spans: MAX_RENDER_APPLICATION_HYPERLINK_SPANS,
+            image_references: MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
+            image_bytes: MAX_RENDER_APPLICATION_IMAGE_BYTES,
+            semantic_zones: MAX_RENDER_APPLICATION_SEMANTIC_ZONES,
+            semantic_text_bytes: MAX_RENDER_APPLICATION_SEMANTIC_TEXT_BYTES,
+            alert_text_bytes: MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES,
+            title_bytes: MAX_RENDER_APPLICATION_TITLE_BYTES,
+            working_dir_bytes: MAX_RENDER_APPLICATION_WORKING_DIR_BYTES,
+            scrollback_rows: MAX_RENDER_APPLICATION_SCROLLBACK_ROWS,
+            viewport_cells: MAX_RENDER_APPLICATION_CELLS,
+            supports_images: true,
+            supports_semantic_zones: true,
+            supports_palette: true,
+            supports_alerts: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderApplicationLogicalIdentity {
+    connection_generation: u64,
+    coordinator_instance: u64,
+    scheduler_sequence: u64,
+    ledger_instance: u64,
+    render_generation: u64,
+    ledger_obligation: u64,
+    pane_id: PaneId,
+    base_state: Option<RenderStateIdentity>,
+    resulting_state: RenderStateIdentity,
+    kind: RenderApplicationKind,
+}
+
+impl From<RenderApplicationIdentity> for RenderApplicationLogicalIdentity {
+    fn from(identity: RenderApplicationIdentity) -> Self {
+        Self {
+            connection_generation: identity.token.connection_generation,
+            coordinator_instance: identity.token.coordinator_instance,
+            scheduler_sequence: identity.token.scheduler_sequence,
+            ledger_instance: identity.token.ledger_instance,
+            render_generation: identity.token.render_generation,
+            ledger_obligation: identity.token.ledger_obligation,
+            pane_id: identity.pane_id,
+            base_state: identity.base_state,
+            resulting_state: identity.resulting_state,
+            kind: identity.kind,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ClientRenderApplicationCounters {
+    pub applications_started: u64,
+    pub acknowledgements: u64,
+    pub duplicate_acknowledgements: u64,
+    pub duplicate_in_progress: u64,
+    pub nacks: u64,
+    pub cancelled_attempts: u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+#[derive(Default)]
+struct ClientRenderApplicationState {
+    applied_connection_generation: Option<u64>,
+    applied_state: Option<RenderStateIdentity>,
+    last_applied: Option<RenderApplicationLogicalIdentity>,
+    applying: Option<RenderApplicationIdentity>,
+    counters: ClientRenderApplicationCounters,
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+enum ClientRenderApplicationBegin {
+    Apply,
+    DuplicateApplied,
+    DuplicateInProgress,
+    Nack {
+        reason: RenderApplicationNackReason,
+        observed_state: RenderApplicationObservedState,
+    },
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+impl ClientRenderApplicationState {
+    fn observation(&self) -> RenderApplicationObservedState {
+        self.applied_state.map_or(
+            RenderApplicationObservedState::Uninitialized,
+            RenderApplicationObservedState::Applied,
+        )
+    }
+
+    fn begin(
+        &mut self,
+        expected_connection_generation: Option<u64>,
+        expected_pane_id: PaneId,
+        identity: RenderApplicationIdentity,
+    ) -> ClientRenderApplicationBegin {
+        if expected_connection_generation != Some(identity.token.connection_generation) {
+            return ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::GenerationMismatch,
+                observed_state: self.observation(),
+            };
+        }
+        if identity.pane_id != expected_pane_id {
+            return ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::MalformedOrIncomplete {
+                    component: RenderApplicationComponent::Surface,
+                },
+                observed_state: RenderApplicationObservedState::NotApplicable,
+            };
+        }
+
+        let logical_identity = RenderApplicationLogicalIdentity::from(identity);
+        if self.last_applied == Some(logical_identity)
+            && self.applied_state == Some(identity.resulting_state)
+        {
+            self.counters.duplicate_acknowledgements =
+                self.counters.duplicate_acknowledgements.saturating_add(1);
+            return ClientRenderApplicationBegin::DuplicateApplied;
+        }
+        if let Some(applying) = self.applying {
+            if RenderApplicationLogicalIdentity::from(applying) == logical_identity {
+                self.counters.duplicate_in_progress =
+                    self.counters.duplicate_in_progress.saturating_add(1);
+                return ClientRenderApplicationBegin::DuplicateInProgress;
+            }
+            return ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::ApplicationFailure {
+                    stage: RenderApplicationStage::Commit,
+                },
+                observed_state: RenderApplicationObservedState::NotApplicable,
+            };
+        }
+
+        if self.applied_state.is_some()
+            && self.applied_connection_generation != Some(identity.token.connection_generation)
+            && identity.kind == RenderApplicationKind::Delta
+        {
+            return ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::GenerationMismatch,
+                observed_state: self.observation(),
+            };
+        }
+
+        match identity.kind {
+            RenderApplicationKind::Delta => {
+                let Some(base_state) = identity.base_state else {
+                    return ClientRenderApplicationBegin::Nack {
+                        reason: RenderApplicationNackReason::MalformedOrIncomplete {
+                            component: RenderApplicationComponent::Surface,
+                        },
+                        observed_state: RenderApplicationObservedState::NotApplicable,
+                    };
+                };
+                match self.applied_state {
+                    None => {
+                        return ClientRenderApplicationBegin::Nack {
+                            reason: RenderApplicationNackReason::BaseMismatch,
+                            observed_state: RenderApplicationObservedState::Uninitialized,
+                        };
+                    }
+                    Some(current) if current.render_generation != base_state.render_generation => {
+                        return ClientRenderApplicationBegin::Nack {
+                            reason: RenderApplicationNackReason::GenerationMismatch,
+                            observed_state: RenderApplicationObservedState::Applied(current),
+                        };
+                    }
+                    Some(current) if current.state_sequence < base_state.state_sequence => {
+                        return ClientRenderApplicationBegin::Nack {
+                            reason: RenderApplicationNackReason::DetectedGap,
+                            observed_state: RenderApplicationObservedState::Applied(current),
+                        };
+                    }
+                    Some(current) if current.state_sequence > base_state.state_sequence => {
+                        return ClientRenderApplicationBegin::Nack {
+                            reason: RenderApplicationNackReason::BaseMismatch,
+                            observed_state: RenderApplicationObservedState::Applied(current),
+                        };
+                    }
+                    Some(_) => {}
+                }
+            }
+            RenderApplicationKind::Snapshot => {
+                if self.applied_connection_generation
+                    == Some(identity.token.connection_generation)
+                {
+                    if let Some(current) = self.applied_state {
+                        if current.render_generation == identity.resulting_state.render_generation
+                            && current.state_sequence >= identity.resulting_state.state_sequence
+                        {
+                            return ClientRenderApplicationBegin::Nack {
+                                reason: RenderApplicationNackReason::BaseMismatch,
+                                observed_state: RenderApplicationObservedState::Applied(current),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        self.applying = Some(identity);
+        self.counters.applications_started =
+            self.counters.applications_started.saturating_add(1);
+        ClientRenderApplicationBegin::Apply
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+struct ClientRenderApplicationGuard<'a> {
+    state: &'a Mutex<ClientRenderApplicationState>,
+    identity: RenderApplicationIdentity,
+    armed: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+impl<'a> ClientRenderApplicationGuard<'a> {
+    fn new(
+        state: &'a Mutex<ClientRenderApplicationState>,
+        identity: RenderApplicationIdentity,
+    ) -> Self {
+        Self {
+            state,
+            identity,
+            armed: true,
+        }
+    }
+
+    fn acknowledge(mut self) {
+        let mut state = self.state.lock();
+        if state.applying == Some(self.identity) {
+            state.applied_connection_generation =
+                Some(self.identity.token.connection_generation);
+            state.applied_state = Some(self.identity.resulting_state);
+            state.last_applied = Some(RenderApplicationLogicalIdentity::from(self.identity));
+            state.applying = None;
+            state.counters.acknowledgements =
+                state.counters.acknowledgements.saturating_add(1);
+        }
+        self.armed = false;
+    }
+
+    fn nack(mut self) {
+        let mut state = self.state.lock();
+        if state.applying == Some(self.identity) {
+            state.applying = None;
+            state.counters.nacks = state.counters.nacks.saturating_add(1);
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for ClientRenderApplicationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut state = self.state.lock();
+        if state.applying == Some(self.identity) {
+            state.applying = None;
+            state.counters.cancelled_attempts =
+                state.counters.cancelled_attempts.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "the live delivery integration must send settlements and explicitly coalesce in-progress duplicates"]
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+pub(crate) enum ClientRenderApplicationDisposition {
+    Settlement(RenderApplicationResult),
+    DuplicateInProgress,
+    ProtocolViolation(RenderApplicationContractError),
+}
+
+#[derive(Default)]
+struct ClientSemanticState {
+    zones: Vec<SemanticZone>,
+    zone_texts: Vec<String>,
+    last_exit_code: Option<i32>,
+}
 
 pub struct ClientPane {
     client: Arc<ClientInner>,
@@ -54,7 +386,278 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    semantic_state: Mutex<ClientSemanticState>,
+    #[allow(
+        dead_code,
+        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+    )]
+    render_application_state: Mutex<ClientRenderApplicationState>,
+    #[allow(
+        dead_code,
+        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+    )]
+    render_application_limits: ClientRenderApplicationLimits,
     mux_registration: Arc<PaneRegistrationSlot>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+fn render_application_nack(
+    identity: RenderApplicationIdentity,
+    reason: RenderApplicationNackReason,
+    observed_state: RenderApplicationObservedState,
+) -> RenderApplicationResult {
+    RenderApplicationResult {
+        identity,
+        outcome: RenderApplicationOutcome::Nack(RenderApplicationNack {
+            reason,
+            observed_state,
+        }),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+fn render_application_ack(identity: RenderApplicationIdentity) -> RenderApplicationResult {
+    RenderApplicationResult {
+        identity,
+        outcome: RenderApplicationOutcome::Applied {
+            applied_state: identity.resulting_state,
+        },
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+fn bounded_resource_rejection(
+    resource: RenderApplicationResource,
+    requested: usize,
+    limit: usize,
+) -> RenderApplicationNackReason {
+    RenderApplicationNackReason::BoundedResourceRejected {
+        resource,
+        requested: u64::try_from(requested).unwrap_or(u64::MAX),
+        limit: u64::try_from(limit).unwrap_or(u64::MAX),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+fn validate_render_application_resources(
+    update: &RenderApplicationUpdate,
+    limits: ClientRenderApplicationLimits,
+) -> Result<(), RenderApplicationNackReason> {
+    if let Err(error) = update.validate() {
+        return Err(match error {
+            RenderApplicationContractError::ResourceLimitExceeded {
+                resource,
+                requested,
+                limit,
+            } => RenderApplicationNackReason::BoundedResourceRejected {
+                resource,
+                requested,
+                limit,
+            },
+            RenderApplicationContractError::MalformedSurfaceComponent { component } => {
+                RenderApplicationNackReason::MalformedOrIncomplete { component }
+            }
+            RenderApplicationContractError::TooManyAlerts => bounded_resource_rejection(
+                RenderApplicationResource::Alerts,
+                update.alerts.len(),
+                MAX_RENDER_APPLICATION_ALERTS,
+            ),
+            RenderApplicationContractError::DuplicateStateAlert => {
+                RenderApplicationNackReason::MalformedOrIncomplete {
+                    component: RenderApplicationComponent::Alerts,
+                }
+            }
+            _ => RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Surface,
+            },
+        });
+    }
+
+    if update.surface.dirty_lines.len() > limits.dirty_ranges {
+        return Err(bounded_resource_rejection(
+            RenderApplicationResource::Lines,
+            update.surface.dirty_lines.len(),
+            limits.dirty_ranges,
+        ));
+    }
+    let mut prior_end = None;
+    for range in &update.surface.dirty_lines {
+        if range.is_empty() || prior_end.is_some_and(|end| end > range.start) {
+            return Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Lines,
+            });
+        }
+        prior_end = Some(range.end);
+    }
+    if update.surface.title.len() > limits.title_bytes {
+        return Err(bounded_resource_rejection(
+            RenderApplicationResource::Title,
+            update.surface.title.len(),
+            limits.title_bytes,
+        ));
+    }
+    if let Some(working_dir) = &update.surface.working_dir {
+        let requested = working_dir.url.as_str().len();
+        if requested > limits.working_dir_bytes {
+            return Err(bounded_resource_rejection(
+                RenderApplicationResource::WorkingDirectory,
+                requested,
+                limits.working_dir_bytes,
+            ));
+        }
+    }
+    if update.surface.dimensions.scrollback_rows > limits.scrollback_rows {
+        return Err(bounded_resource_rejection(
+            RenderApplicationResource::Lines,
+            update.surface.dimensions.scrollback_rows,
+            limits.scrollback_rows,
+        ));
+    }
+    let viewport_cells = update
+        .surface
+        .dimensions
+        .cols
+        .saturating_mul(update.surface.dimensions.viewport_rows);
+    if viewport_cells > limits.viewport_cells {
+        return Err(bounded_resource_rejection(
+            RenderApplicationResource::Dimensions,
+            viewport_cells,
+            limits.viewport_cells,
+        ));
+    }
+
+    let line_counts = update
+        .surface
+        .bonus_lines
+        .validate_structure()
+        .map_err(|error| {
+            let component = match error {
+                SerializedLinesStructureError::HyperlinkLineOutOfRange
+                | SerializedLinesStructureError::HyperlinkCellRangeOutOfRange => {
+                    RenderApplicationComponent::Hyperlinks
+                }
+                SerializedLinesStructureError::ImageLineMissing
+                | SerializedLinesStructureError::ImageCellOutOfRange => {
+                    RenderApplicationComponent::Images
+                }
+                SerializedLinesStructureError::DuplicateStableRow
+                | SerializedLinesStructureError::CellCountOverflow => {
+                    RenderApplicationComponent::Lines
+                }
+            };
+            RenderApplicationNackReason::MalformedOrIncomplete { component }
+        })?;
+    for (resource, requested, limit) in [
+        (
+            RenderApplicationResource::Lines,
+            line_counts.lines,
+            limits.lines,
+        ),
+        (
+            RenderApplicationResource::Cells,
+            line_counts.cells,
+            limits.cells,
+        ),
+        (
+            RenderApplicationResource::Hyperlinks,
+            line_counts.hyperlink_spans,
+            limits.hyperlink_spans,
+        ),
+        (
+            RenderApplicationResource::Images,
+            line_counts.images,
+            limits.image_references,
+        ),
+    ] {
+        if requested > limit {
+            return Err(bounded_resource_rejection(resource, requested, limit));
+        }
+    }
+    if line_counts.images > 0 && !limits.supports_images {
+        return Err(RenderApplicationNackReason::UnsupportedResource {
+            resource: RenderApplicationResource::Images,
+        });
+    }
+
+    if let RenderComponentUpdate::Replace(semantic) = &update.semantic_zones {
+        if !limits.supports_semantic_zones {
+            return Err(RenderApplicationNackReason::UnsupportedResource {
+                resource: RenderApplicationResource::SemanticZones,
+            });
+        }
+        if semantic.zones.len() != semantic.zone_texts.len() {
+            return Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::SemanticZones,
+            });
+        }
+        if semantic.zones.len() > limits.semantic_zones {
+            return Err(bounded_resource_rejection(
+                RenderApplicationResource::SemanticZones,
+                semantic.zones.len(),
+                limits.semantic_zones,
+            ));
+        }
+        let semantic_text_bytes =
+            semantic
+                .zone_texts
+                .iter()
+                .try_fold(0usize, |total, text| {
+                    total.checked_add(text.len()).ok_or_else(|| {
+                        bounded_resource_rejection(
+                            RenderApplicationResource::SemanticZones,
+                            usize::MAX,
+                            limits.semantic_text_bytes,
+                        )
+                    })
+                })?;
+        if semantic_text_bytes > limits.semantic_text_bytes {
+            return Err(bounded_resource_rejection(
+                RenderApplicationResource::SemanticZones,
+                semantic_text_bytes,
+                limits.semantic_text_bytes,
+            ));
+        }
+        if semantic.zones.iter().any(|zone| {
+            zone.start_y > zone.end_y
+                || (zone.start_y == zone.end_y && zone.start_x > zone.end_x)
+        }) {
+            return Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::SemanticZones,
+            });
+        }
+    }
+    if matches!(&update.palette, RenderComponentUpdate::Replace(_)) && !limits.supports_palette {
+        return Err(RenderApplicationNackReason::UnsupportedResource {
+            resource: RenderApplicationResource::Palette,
+        });
+    }
+    if !update.alerts.is_empty() && !limits.supports_alerts {
+        return Err(RenderApplicationNackReason::UnsupportedResource {
+            resource: RenderApplicationResource::Alerts,
+        });
+    }
+    let alert_text_bytes = update.alert_text_bytes().unwrap_or(usize::MAX);
+    if alert_text_bytes > limits.alert_text_bytes {
+        return Err(bounded_resource_rejection(
+            RenderApplicationResource::Alerts,
+            alert_text_bytes,
+            limits.alert_text_bytes,
+        ));
+    }
+
+    Ok(())
 }
 
 impl ClientPane {
@@ -130,8 +733,210 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            semantic_state: Mutex::new(ClientSemanticState::default()),
+            render_application_state: Mutex::new(ClientRenderApplicationState::default()),
+            render_application_limits: ClientRenderApplicationLimits::default(),
             mux_registration,
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+    )]
+    fn record_render_application_nack(&self) {
+        let mut state = self.render_application_state.lock();
+        state.counters.nacks = state.counters.nacks.saturating_add(1);
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+    )]
+    pub(crate) fn render_application_counters(&self) -> ClientRenderApplicationCounters {
+        self.render_application_state.lock().counters
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+    )]
+    pub(crate) async fn apply_render_application(
+        &self,
+        registration: &mux::PaneRegistrationHandle,
+        rpc: &RpcGenerationScope,
+        mut update: RenderApplicationUpdate,
+    ) -> ClientRenderApplicationDisposition {
+        let identity = update.identity;
+        if let Err(error) = identity.validate() {
+            return ClientRenderApplicationDisposition::ProtocolViolation(error);
+        }
+        if let Err(reason) =
+            validate_render_application_resources(&update, self.render_application_limits)
+        {
+            self.record_render_application_nack();
+            return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                identity,
+                reason,
+                RenderApplicationObservedState::NotApplicable,
+            ));
+        }
+        let Some(application_deadline) = Instant::now().checked_add(Duration::from_millis(
+            u64::from(update.retry_budget.remaining_millis),
+        )) else {
+            self.record_render_application_nack();
+            return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                identity,
+                RenderApplicationNackReason::ApplicationFailure {
+                    stage: RenderApplicationStage::Validate,
+                },
+                RenderApplicationObservedState::NotApplicable,
+            ));
+        };
+
+        let expected_connection_generation =
+            rpc.connection_generation().map(std::num::NonZeroU64::get);
+        let begin = self.render_application_state.lock().begin(
+            expected_connection_generation,
+            self.remote_pane_id,
+            identity,
+        );
+        match begin {
+            ClientRenderApplicationBegin::DuplicateApplied => {
+                return ClientRenderApplicationDisposition::Settlement(render_application_ack(
+                    identity,
+                ));
+            }
+            ClientRenderApplicationBegin::DuplicateInProgress => {
+                return ClientRenderApplicationDisposition::DuplicateInProgress;
+            }
+            ClientRenderApplicationBegin::Nack {
+                reason,
+                observed_state,
+            } => {
+                self.record_render_application_nack();
+                return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                    identity,
+                    reason,
+                    observed_state,
+                ));
+            }
+            ClientRenderApplicationBegin::Apply => {}
+        }
+
+        let guard = ClientRenderApplicationGuard::new(&self.render_application_state, identity);
+        let bonus_lines = std::mem::take(&mut update.surface.bonus_lines);
+        let bonus_lines = match hydrate_render_application_lines(
+            rpc,
+            update.surface.pane_id,
+            bonus_lines,
+            self.render_application_limits.image_bytes,
+            application_deadline,
+        )
+        .await
+        {
+            Ok(lines) => lines,
+            Err(reason) => {
+                guard.nack();
+                return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                    identity,
+                    reason,
+                    RenderApplicationObservedState::NotApplicable,
+                ));
+            }
+        };
+
+        let mouse_grabbed = update.surface.mouse_grabbed;
+        let alt_screen_active = update.surface.alt_screen_active;
+        let kind = identity.kind;
+        let surface = update.surface;
+        let semantic_zones = update.semantic_zones;
+        let palette = update.palette;
+        let alerts = update.alerts;
+        if Instant::now() >= application_deadline {
+            guard.nack();
+            return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                identity,
+                RenderApplicationNackReason::ApplicationFailure {
+                    stage: RenderApplicationStage::Commit,
+                },
+                RenderApplicationObservedState::NotApplicable,
+            ));
+        }
+        let application = rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
+            registration.try_with_current_output(|current| {
+                if !current.is_same_pane_ref(self) {
+                    return None;
+                }
+                let applied = self
+                    .renderable
+                    .lock()
+                    .inner
+                    .borrow_mut()
+                    .apply_render_application_to_surface(surface, bonus_lines, kind);
+                if !applied {
+                    return Some(false);
+                }
+                *self.mouse_grabbed.lock() = mouse_grabbed;
+                *self.alt_screen_active.lock() = alt_screen_active;
+
+                if kind == RenderApplicationKind::Snapshot {
+                    // Snapshot alert absence is authoritative for latest-value
+                    // state. Deltas leave these values untouched unless they
+                    // carry the corresponding coalesced alert below.
+                    *self.unseen_output.lock() = false;
+                    *self.progress.lock() = Progress::None;
+                }
+                if let RenderComponentUpdate::Replace(semantic) = semantic_zones {
+                    *self.semantic_state.lock() = ClientSemanticState {
+                        zones: semantic.zones,
+                        zone_texts: semantic.zone_texts,
+                        last_exit_code: semantic.last_exit_code,
+                    };
+                }
+                if let RenderComponentUpdate::Replace(palette) = palette {
+                    *self.application_palette.lock() =
+                        palette.palette != *self.configured_palette.lock();
+                    *self.palette.lock() = palette.palette;
+                    current.dispatch_alert(Alert::PaletteChanged);
+                }
+                for NotifyAlert { alert, .. } in alerts {
+                    match &alert {
+                        Alert::SetUserVar { name, value } => {
+                            self.user_vars.lock().insert(name.clone(), value.clone());
+                        }
+                        Alert::OutputSinceFocusLost => {
+                            *self.unseen_output.lock() = true;
+                        }
+                        Alert::Progress(progress) => {
+                            *self.progress.lock() = progress.clone();
+                        }
+                        _ => {}
+                    }
+                    current.dispatch_alert(alert);
+                }
+                Some(true)
+            })
+        });
+
+        let failure_stage = match application {
+            Ok(Some(Some(true))) => {
+                guard.acknowledge();
+                return ClientRenderApplicationDisposition::Settlement(render_application_ack(
+                    identity,
+                ));
+            }
+            Ok(Some(Some(false))) => RenderApplicationStage::ApplySurface,
+            Ok(Some(None)) | Ok(None) | Err(_) => RenderApplicationStage::Commit,
+        };
+        guard.nack();
+        ClientRenderApplicationDisposition::Settlement(render_application_nack(
+            identity,
+            RenderApplicationNackReason::ApplicationFailure {
+                stage: failure_stage,
+            },
+            RenderApplicationObservedState::NotApplicable,
+        ))
     }
 
     pub(crate) async fn process_unilateral(
@@ -700,6 +1505,23 @@ impl Pane for ClientPane {
         self.user_vars.lock().clone()
     }
 
+    fn get_semantic_zones(&self) -> anyhow::Result<Vec<SemanticZone>> {
+        Ok(self.semantic_state.lock().zones.clone())
+    }
+
+    fn get_text_from_semantic_zone(&self, zone: SemanticZone) -> anyhow::Result<String> {
+        let semantic = self.semantic_state.lock();
+        if let Some(index) = semantic.zones.iter().position(|candidate| *candidate == zone) {
+            return Ok(semantic.zone_texts[index].clone());
+        }
+        drop(semantic);
+        Ok(mux::pane::text_from_semantic_zone(self, zone))
+    }
+
+    fn get_semantic_exit_code(&self) -> anyhow::Result<Option<i32>> {
+        Ok(self.semantic_state.lock().last_exit_code)
+    }
+
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
         let palette = config.color_palette();
         // If the application running in the pane hasn't changed the
@@ -771,6 +1593,7 @@ mod tests {
     use mux::{Mux, MuxNotification};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
+    use termwiz::cell::{CellAttributes, SemanticType};
 
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
         let unix = UnixDomain {
@@ -806,6 +1629,131 @@ mod tests {
             "shell",
             false,
         ))
+    }
+
+    fn test_render_application_update(
+        connection_generation: u64,
+        pane_id: PaneId,
+        scheduler_sequence: u64,
+        attempt: u64,
+        kind: RenderApplicationKind,
+        base_state: Option<RenderStateIdentity>,
+        state_sequence: u64,
+    ) -> RenderApplicationUpdate {
+        const RENDER_GENERATION: u64 = 101;
+        let surface_sequence =
+            usize::try_from(state_sequence).expect("test state sequence should fit SequenceNo");
+        let bonus_lines = if kind == RenderApplicationKind::Snapshot {
+            (0isize..24)
+                .map(|row| {
+                    let line = if row == 0 {
+                        Line::from_text(
+                            "ready",
+                            &CellAttributes::default(),
+                            surface_sequence,
+                            None,
+                        )
+                    } else {
+                        Line::with_width(80, surface_sequence)
+                    };
+                    (row, line)
+                })
+                .collect()
+        } else {
+            vec![(
+                0,
+                Line::from_text(
+                    "ready",
+                    &CellAttributes::default(),
+                    surface_sequence,
+                    None,
+                ),
+            )]
+        };
+        RenderApplicationUpdate {
+            identity: RenderApplicationIdentity {
+                protocol_version: RENDER_APPLICATION_PROTOCOL_VERSION,
+                token: RenderApplicationToken {
+                    connection_generation,
+                    coordinator_instance: 103,
+                    scheduler_sequence,
+                    attempt,
+                    ledger_instance: 107,
+                    render_generation: RENDER_GENERATION,
+                    ledger_obligation: scheduler_sequence,
+                },
+                pane_id,
+                base_state,
+                resulting_state: RenderStateIdentity {
+                    render_generation: RENDER_GENERATION,
+                    state_sequence,
+                },
+                kind,
+            },
+            retry_budget: RenderApplicationRetryBudget {
+                attempt_ordinal: u16::try_from(attempt)
+                    .expect("test attempt should fit the retry ordinal"),
+                max_attempts: 3,
+                remaining_millis: 250,
+            },
+            surface: GetPaneRenderChangesResponse {
+                pane_id,
+                mouse_grabbed: true,
+                alt_screen_active: true,
+                cursor_position: StableCursorPosition::default(),
+                dimensions: RenderableDimensions {
+                    cols: 80,
+                    viewport_rows: 24,
+                    scrollback_rows: 24,
+                    physical_top: 0,
+                    scrollback_top: 0,
+                    dpi: 96,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    reverse_video: false,
+                },
+                tiered_scrollback_status: None,
+                dirty_lines: std::iter::once(0..1).collect(),
+                title: "render-application".to_string(),
+                working_dir: None,
+                bonus_lines: SerializedLines::from(bonus_lines),
+                input_serial: None,
+                seqno: surface_sequence,
+            },
+            semantic_zones: if kind == RenderApplicationKind::Snapshot {
+                RenderComponentUpdate::Replace(GetSemanticZonesResponse {
+                    pane_id,
+                    zones: Vec::new(),
+                    zone_texts: Vec::new(),
+                    last_exit_code: None,
+                })
+            } else {
+                RenderComponentUpdate::Unchanged
+            },
+            palette: if kind == RenderApplicationKind::Snapshot {
+                RenderComponentUpdate::Replace(SetPalette {
+                    pane_id,
+                    palette: ColorPalette::default(),
+                })
+            } else {
+                RenderComponentUpdate::Unchanged
+            },
+            alerts: Vec::new(),
+        }
+    }
+
+    fn settlement(
+        disposition: ClientRenderApplicationDisposition,
+    ) -> RenderApplicationResult {
+        match disposition {
+            ClientRenderApplicationDisposition::Settlement(result) => result,
+            ClientRenderApplicationDisposition::DuplicateInProgress => {
+                panic!("test expected a terminal render-application settlement")
+            }
+            ClientRenderApplicationDisposition::ProtocolViolation(error) => {
+                panic!("test expected a settlement, got protocol violation: {}", error)
+            }
+        }
     }
 
     struct NoopClipboard;
@@ -845,6 +1793,544 @@ mod tests {
             self.callback_ran.store(true, Ordering::Release);
             Ok(())
         }
+    }
+
+    #[test]
+    fn render_application_acks_only_after_atomic_apply_and_deduplicates_retry() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::Alert { pane_id: 40, alert } = notification {
+                observed_for_subscriber.lock().unwrap().push(alert);
+            }
+            true
+        })
+        .expect("render-application subscription should allocate an identifier");
+
+        let inner = test_client_inner(17);
+        let pane = test_client_pane(&inner, 40, 29);
+        let pane_for_mux: Arc<dyn Pane> = pane.clone();
+        mux.add_pane(&pane_for_mux)
+            .expect("render-application test pane should register");
+        let registration = mux
+            .capture_pane_registration(&pane_for_mux)
+            .expect("render-application test pane should retain exact registration");
+        let rpc = inner.client.rpc_scope();
+        let connection_generation = rpc
+            .connection_generation()
+            .expect("test RPC scope should carry an exact generation")
+            .get();
+
+        let mut update = test_render_application_update(
+            connection_generation,
+            pane.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        let semantic_zone = SemanticZone {
+            start_y: 0,
+            start_x: 0,
+            end_y: 0,
+            end_x: 5,
+            semantic_type: SemanticType::Prompt,
+        };
+        update.semantic_zones =
+            RenderComponentUpdate::Replace(GetSemanticZonesResponse {
+                pane_id: pane.remote_pane_id,
+                zones: vec![semantic_zone],
+                zone_texts: vec!["ready".to_string()],
+                last_exit_code: Some(0),
+            });
+        let application_palette = ColorPalette::default();
+        update.palette = RenderComponentUpdate::Replace(SetPalette {
+            pane_id: pane.remote_pane_id,
+            palette: application_palette.clone(),
+        });
+        update.alerts = vec![
+            NotifyAlert {
+                pane_id: pane.remote_pane_id,
+                alert: Alert::OutputSinceFocusLost,
+            },
+            NotifyAlert {
+                pane_id: pane.remote_pane_id,
+                alert: Alert::Progress(Progress::Percentage(64)),
+            },
+        ];
+        update
+            .validate()
+            .expect("complete snapshot fixture should satisfy the wire contract");
+
+        let result = promise::spawn::block_on(pane.apply_render_application(
+            &registration,
+            &rpc,
+            update.clone(),
+        ));
+        settlement(result)
+            .validate_for(&update)
+            .expect("ACK must bind the fully applied update");
+
+        assert_eq!(pane.get_current_seqno(), 1);
+        assert_eq!(pane.get_title(), "render-application");
+        assert!(pane.is_mouse_grabbed());
+        assert!(pane.is_alt_screen_active());
+        assert!(pane.has_unseen_output());
+        assert_eq!(pane.get_progress(), Progress::Percentage(64));
+        assert_eq!(pane.get_semantic_zones().unwrap(), vec![semantic_zone]);
+        assert_eq!(
+            pane.get_text_from_semantic_zone(semantic_zone).unwrap(),
+            "ready"
+        );
+        assert_eq!(pane.get_semantic_exit_code().unwrap(), Some(0));
+        assert_eq!(*pane.palette.lock(), application_palette);
+        let (_, lines) = pane.get_lines(0..1);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].as_str(), "ready");
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                Alert::PaletteChanged,
+                Alert::OutputSinceFocusLost,
+                Alert::Progress(Progress::Percentage(64)),
+            ],
+            "each atomic component must become observable exactly once before ACK"
+        );
+
+        let mut retry = update.clone();
+        retry.identity.token.attempt = 2;
+        retry.retry_budget.attempt_ordinal = 2;
+        let retry_result = promise::spawn::block_on(pane.apply_render_application(
+            &registration,
+            &rpc,
+            retry.clone(),
+        ));
+        settlement(retry_result)
+            .validate_for(&retry)
+            .expect("idempotent retry ACK must bind the retry attempt identity");
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                Alert::PaletteChanged,
+                Alert::OutputSinceFocusLost,
+                Alert::Progress(Progress::Percentage(64)),
+            ],
+            "an already-applied logical update must never replay event-like alerts"
+        );
+        assert_eq!(
+            pane.render_application_counters(),
+            ClientRenderApplicationCounters {
+                applications_started: 1,
+                acknowledgements: 1,
+                duplicate_acknowledgements: 1,
+                duplicate_in_progress: 0,
+                nacks: 0,
+                cancelled_attempts: 0,
+            }
+        );
+
+        let reset_snapshot = test_render_application_update(
+            connection_generation,
+            pane.remote_pane_id,
+            113,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            2,
+        );
+        let reset_result = promise::spawn::block_on(pane.apply_render_application(
+            &registration,
+            &rpc,
+            reset_snapshot.clone(),
+        ));
+        settlement(reset_result)
+            .validate_for(&reset_snapshot)
+            .expect("authoritative snapshot without state alerts should ACK");
+        assert!(!pane.has_unseen_output());
+        assert_eq!(pane.get_progress(), Progress::None);
+    }
+
+    #[test]
+    fn render_application_state_rejects_gap_stale_generation_and_wrong_pane() {
+        let connection_generation = 11;
+        let pane_id = 29;
+        let snapshot = test_render_application_update(
+            connection_generation,
+            pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            4,
+        );
+        let state = Mutex::new(ClientRenderApplicationState::default());
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation), pane_id, snapshot.identity),
+            ClientRenderApplicationBegin::Apply
+        ));
+        ClientRenderApplicationGuard::new(&state, snapshot.identity).acknowledge();
+
+        let gap = test_render_application_update(
+            connection_generation,
+            pane_id,
+            113,
+            1,
+            RenderApplicationKind::Delta,
+            Some(RenderStateIdentity {
+                render_generation: 101,
+                state_sequence: 6,
+            }),
+            7,
+        );
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation), pane_id, gap.identity),
+            ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::DetectedGap,
+                observed_state: RenderApplicationObservedState::Applied(
+                    RenderStateIdentity {
+                        render_generation: 101,
+                        state_sequence: 4,
+                    }
+                ),
+            }
+        ));
+
+        let stale = test_render_application_update(
+            connection_generation,
+            pane_id,
+            127,
+            1,
+            RenderApplicationKind::Delta,
+            Some(RenderStateIdentity {
+                render_generation: 101,
+                state_sequence: 3,
+            }),
+            5,
+        );
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation), pane_id, stale.identity),
+            ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::BaseMismatch,
+                observed_state: RenderApplicationObservedState::Applied(
+                    RenderStateIdentity {
+                        render_generation: 101,
+                        state_sequence: 4,
+                    }
+                ),
+            }
+        ));
+
+        let next = test_render_application_update(
+            connection_generation,
+            pane_id,
+            131,
+            1,
+            RenderApplicationKind::Delta,
+            Some(snapshot.identity.resulting_state),
+            5,
+        );
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation + 1), pane_id, next.identity),
+            ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::GenerationMismatch,
+                ..
+            }
+        ));
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation), pane_id + 1, next.identity),
+            ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::MalformedOrIncomplete {
+                    component: RenderApplicationComponent::Surface,
+                },
+                observed_state: RenderApplicationObservedState::NotApplicable,
+            }
+        ));
+
+        let reconnect_delta = test_render_application_update(
+            connection_generation + 1,
+            pane_id,
+            137,
+            1,
+            RenderApplicationKind::Delta,
+            Some(snapshot.identity.resulting_state),
+            5,
+        );
+        assert!(matches!(
+            state.lock().begin(
+                Some(connection_generation + 1),
+                pane_id,
+                reconnect_delta.identity,
+            ),
+            ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::GenerationMismatch,
+                observed_state: RenderApplicationObservedState::Applied(_),
+            }
+        ));
+
+        let reconnect_snapshot = test_render_application_update(
+            connection_generation + 1,
+            pane_id,
+            139,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            snapshot.identity.resulting_state.state_sequence,
+        );
+        assert!(matches!(
+            state.lock().begin(
+                Some(connection_generation + 1),
+                pane_id,
+                reconnect_snapshot.identity,
+            ),
+            ClientRenderApplicationBegin::Apply
+        ));
+    }
+
+    #[test]
+    fn render_application_in_progress_retry_is_coalesced_and_cancellation_safe() {
+        let connection_generation = 11;
+        let pane_id = 29;
+        let first = test_render_application_update(
+            connection_generation,
+            pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        let mut retry = first.clone();
+        retry.identity.token.attempt = 2;
+        retry.retry_budget.attempt_ordinal = 2;
+        let state = Mutex::new(ClientRenderApplicationState::default());
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation), pane_id, first.identity),
+            ClientRenderApplicationBegin::Apply
+        ));
+        let guard = ClientRenderApplicationGuard::new(&state, first.identity);
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation), pane_id, retry.identity),
+            ClientRenderApplicationBegin::DuplicateInProgress
+        ));
+        drop(guard);
+
+        {
+            let state = state.lock();
+            assert!(state.applying.is_none());
+            assert_eq!(state.counters.applications_started, 1);
+            assert_eq!(state.counters.duplicate_in_progress, 1);
+            assert_eq!(state.counters.cancelled_attempts, 1);
+        }
+        assert!(matches!(
+            state
+                .lock()
+                .begin(Some(connection_generation), pane_id, retry.identity),
+            ClientRenderApplicationBegin::Apply
+        ));
+    }
+
+    #[test]
+    fn render_application_resource_validation_is_typed_and_bounded() {
+        let update = test_render_application_update(
+            11,
+            29,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+
+        let title_limits = ClientRenderApplicationLimits {
+            title_bytes: 4,
+            ..ClientRenderApplicationLimits::default()
+        };
+        assert_eq!(
+            validate_render_application_resources(&update, title_limits),
+            Err(RenderApplicationNackReason::BoundedResourceRejected {
+                resource: RenderApplicationResource::Title,
+                requested: 18,
+                limit: 4,
+            })
+        );
+
+        let line_limits = ClientRenderApplicationLimits {
+            lines: 0,
+            ..ClientRenderApplicationLimits::default()
+        };
+        assert_eq!(
+            validate_render_application_resources(&update, line_limits),
+            Err(RenderApplicationNackReason::BoundedResourceRejected {
+                resource: RenderApplicationResource::Lines,
+                requested: 24,
+                limit: 0,
+            })
+        );
+
+        let mut incomplete = update.clone();
+        incomplete.surface.bonus_lines = SerializedLines::default();
+        assert_eq!(
+            validate_render_application_resources(
+                &incomplete,
+                ClientRenderApplicationLimits::default(),
+            ),
+            Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Lines,
+            })
+        );
+
+        let mut semantic = update.clone();
+        semantic.semantic_zones =
+            RenderComponentUpdate::Replace(GetSemanticZonesResponse {
+                pane_id: 29,
+                zones: vec![SemanticZone {
+                    start_y: 0,
+                    start_x: 0,
+                    end_y: 0,
+                    end_x: 5,
+                    semantic_type: SemanticType::Output,
+                }],
+                zone_texts: Vec::new(),
+                last_exit_code: None,
+            });
+        assert_eq!(
+            validate_render_application_resources(
+                &semantic,
+                ClientRenderApplicationLimits::default(),
+            ),
+            Err(RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::SemanticZones,
+            })
+        );
+
+        let mut alert = update;
+        alert.alerts.push(NotifyAlert {
+            pane_id: 29,
+            alert: Alert::OutputSinceFocusLost,
+        });
+        let alert_limits = ClientRenderApplicationLimits {
+            supports_alerts: false,
+            ..ClientRenderApplicationLimits::default()
+        };
+        assert_eq!(
+            validate_render_application_resources(&alert, alert_limits),
+            Err(RenderApplicationNackReason::UnsupportedResource {
+                resource: RenderApplicationResource::Alerts,
+            })
+        );
+
+        alert.alerts.clear();
+        alert.alerts.push(NotifyAlert {
+            pane_id: 29,
+            alert: Alert::WindowTitleChanged("oversize".to_string()),
+        });
+        let alert_limits = ClientRenderApplicationLimits {
+            alert_text_bytes: 4,
+            ..ClientRenderApplicationLimits::default()
+        };
+        assert_eq!(
+            validate_render_application_resources(&alert, alert_limits),
+            Err(RenderApplicationNackReason::BoundedResourceRejected {
+                resource: RenderApplicationResource::Alerts,
+                requested: 8,
+                limit: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn render_application_rejects_wrong_registration_without_mutating_either_pane() {
+        let scope = MuxTestScope::enter();
+        let mux = Arc::new(Mux::new(None));
+        scope.set_mux(&mux);
+        let inner = test_client_inner(17);
+        let pane_a = test_client_pane(&inner, 41, 29);
+        let pane_b = test_client_pane(&inner, 42, 30);
+        let pane_a_for_mux: Arc<dyn Pane> = pane_a.clone();
+        let pane_b_for_mux: Arc<dyn Pane> = pane_b.clone();
+        mux.add_pane(&pane_a_for_mux)
+            .expect("first render-application registration should bind");
+        mux.add_pane(&pane_b_for_mux)
+            .expect("second render-application registration should bind");
+        let pane_b_registration = mux
+            .capture_pane_registration(&pane_b_for_mux)
+            .expect("second pane should retain exact registration");
+        let rpc = inner.client.rpc_scope();
+        let connection_generation = rpc
+            .connection_generation()
+            .expect("test RPC scope should carry an exact generation")
+            .get();
+        let update = test_render_application_update(
+            connection_generation,
+            pane_a.remote_pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        let mut invalid_protocol = update.clone();
+        invalid_protocol.identity.protocol_version =
+            RENDER_APPLICATION_PROTOCOL_VERSION.saturating_add(1);
+        assert_eq!(
+            promise::spawn::block_on(pane_a.apply_render_application(
+                &pane_b_registration,
+                &rpc,
+                invalid_protocol,
+            )),
+            ClientRenderApplicationDisposition::ProtocolViolation(
+                RenderApplicationContractError::UnsupportedProtocolVersion,
+            )
+        );
+
+        let result = settlement(promise::spawn::block_on(
+            pane_a.apply_render_application(&pane_b_registration, &rpc, update.clone()),
+        ));
+        assert_eq!(
+            result.outcome,
+            RenderApplicationOutcome::Nack(RenderApplicationNack {
+                reason: RenderApplicationNackReason::ApplicationFailure {
+                    stage: RenderApplicationStage::Commit,
+                },
+                observed_state: RenderApplicationObservedState::NotApplicable,
+            })
+        );
+        result
+            .validate_for(&update)
+            .expect("wrong-registration NACK should retain exact attempt identity");
+        assert_eq!(pane_a.get_current_seqno(), 0);
+        assert_eq!(pane_a.get_title(), "shell");
+        assert_eq!(pane_b.get_current_seqno(), 0);
+        assert_eq!(pane_b.get_title(), "shell");
+        assert_eq!(
+            pane_a.render_application_counters(),
+            ClientRenderApplicationCounters {
+                applications_started: 1,
+                acknowledgements: 0,
+                duplicate_acknowledgements: 0,
+                duplicate_in_progress: 0,
+                nacks: 1,
+                cancelled_attempts: 0,
+            }
+        );
     }
 
     #[test]

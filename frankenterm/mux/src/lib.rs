@@ -1156,8 +1156,18 @@ mod pane_registration_handle {
             self.current.pane_id()
         }
 
+        pub fn is_same_pane_ref(&self, pane: &dyn Pane) -> bool {
+            self.current.is_same_pane_ref(pane)
+        }
+
         pub fn perform_actions(&self, actions: Vec<Action>) {
             self.current.pane.perform_actions(actions);
+        }
+
+        /// Dispatch an alert while retaining the same exact-generation output
+        /// authority that ordered the pane state mutation which produced it.
+        pub fn dispatch_alert(&self, alert: Alert) {
+            self.current.dispatch_alert(alert);
         }
     }
 

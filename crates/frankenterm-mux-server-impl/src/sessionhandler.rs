@@ -381,7 +381,12 @@ impl PerPane {
             pane.get_lines(cursor_position.y..cursor_position.y.saturating_add(1));
         if let Some(mut cursor_line) = lines.into_iter().next() {
             cursor_line.compress_for_scrollback();
-            bonus_lines.push((cursor_line_idx, cursor_line));
+            if bonus_lines
+                .binary_search_by_key(&cursor_line_idx, |(stable_row, _)| *stable_row)
+                .is_err()
+            {
+                bonus_lines.push((cursor_line_idx, cursor_line));
+            }
         }
 
         self.cursor_position = cursor_position;
@@ -1864,6 +1869,12 @@ impl SessionHandler {
                 })
                 .detach();
             }
+            Pdu::RenderApplicationResult(_) => {
+                send_response(Err(anyhow!(
+                    "render-application settlement received before the live delivery \
+                     coordinator was activated for this connection"
+                )));
+            }
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
@@ -1872,6 +1883,7 @@ impl SessionHandler {
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
             | Pdu::GetPaneRenderChangesResponse { .. }
+            | Pdu::RenderApplicationUpdate { .. }
             | Pdu::UnitResponse { .. }
             | Pdu::LivenessResponse { .. }
             | Pdu::GetPaneDirectionResponse { .. }
@@ -2108,6 +2120,7 @@ mod tests {
     struct FakePane {
         pane_id: PaneId,
         state: Mutex<FakePaneState>,
+        changed_lines: Mutex<RangeSet<StableRowIndex>>,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
         // Writer sink for the Pane::writer() trait obligation. FakePane
         // has no PTY; bytes written here are discarded. Keeping a real
@@ -2134,6 +2147,7 @@ mod tests {
                 callback_probe: None,
                 writer_sink: ParkingMutex::new(std::io::sink()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
+                changed_lines: Mutex::new(RangeSet::new()),
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
                         x: 4,
@@ -2143,7 +2157,7 @@ mod tests {
                     dimensions: RenderableDimensions {
                         cols: 80,
                         viewport_rows: 2,
-                        scrollback_rows: 12,
+                        scrollback_rows: 2,
                         physical_top: 0,
                         scrollback_top: 0,
                         dpi: 96,
@@ -2176,6 +2190,10 @@ mod tests {
         fn set_tiered_scrollback_status(&self, status: Option<PaneTieredScrollbackStatus>) {
             self.state.lock().unwrap().tiered_scrollback_status = status;
         }
+
+        fn set_changed_line(&self, stable_row: StableRowIndex) {
+            self.changed_lines.lock().unwrap().add(stable_row);
+        }
     }
 
     impl Pane for FakePane {
@@ -2200,7 +2218,7 @@ mod tests {
             _lines: Range<StableRowIndex>,
             _seqno: SequenceNo,
         ) -> RangeSet<StableRowIndex> {
-            RangeSet::new()
+            self.changed_lines.lock().unwrap().clone()
         }
 
         fn get_lines(&self, lines: Range<StableRowIndex>) -> (StableRowIndex, Vec<Line>) {
@@ -5424,6 +5442,28 @@ mod tests {
 
         assert!(bonus_lines.is_empty());
         assert_eq!(cursor_y, 99);
+    }
+
+    #[test]
+    fn compute_changes_deduplicates_dirty_cursor_row_in_bonus_lines() {
+        let pane = Arc::new(FakePane::new(None));
+        pane.set_changed_line(0);
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        let response = registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("dirty cursor row should produce a response");
+        let (bonus_lines, _images) = response
+            .bonus_lines
+            .extract_data_checked()
+            .expect("cursor row must appear exactly once");
+
+        assert_eq!(bonus_lines.len(), 1);
+        assert_eq!(bonus_lines[0].0, 0);
+        assert!(response.dirty_lines.is_empty());
     }
 
     /// Regression: FakePane::writer() previously panicked via

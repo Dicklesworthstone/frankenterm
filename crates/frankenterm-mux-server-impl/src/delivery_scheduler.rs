@@ -39,9 +39,15 @@ use crate::delivery_ledger::{
     DELIVERY_PRIORITY_BURST_LIMIT, DeliveryClaim, DeliveryLedgerInstance, DeliveryScope,
     PendingDeliveryWake,
 };
+use codec::{
+    RenderApplicationContractError, RenderApplicationIdentity, RenderApplicationKind,
+    RenderApplicationNackReason, RenderApplicationNackRecovery, RenderApplicationOutcome,
+    RenderApplicationResult, RenderApplicationUpdate,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::task::{Context, Poll, Waker};
 
 /// Stable identifier for this executable scheduler contract.
@@ -1307,18 +1313,77 @@ pub struct HardenedCounters {
     pub closed_resident_bytes: u64,
 }
 
+static NEXT_COORDINATOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local, never-reused identity for one delivery coordinator.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CoordinatorInstanceId(u64);
+
+impl CoordinatorInstanceId {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoordinatorInstanceExhausted;
+
+impl std::fmt::Display for CoordinatorInstanceExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "delivery-coordinator instance identity space is exhausted; refusing to wrap or reuse",
+        )
+    }
+}
+
+impl std::error::Error for CoordinatorInstanceExhausted {}
+
+fn allocate_coordinator_instance(
+    counter: &AtomicU64,
+) -> Result<CoordinatorInstanceId, CoordinatorInstanceExhausted> {
+    let mut current = counter.load(AtomicOrdering::Relaxed);
+    loop {
+        if current == 0 {
+            return Err(CoordinatorInstanceExhausted);
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or(CoordinatorInstanceExhausted)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => return Ok(CoordinatorInstanceId(current)),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-struct CoordinatorInstance(Arc<()>);
+struct CoordinatorInstance {
+    id: CoordinatorInstanceId,
+    marker: Arc<()>,
+}
 
 impl CoordinatorInstance {
-    fn new() -> Self {
-        Self(Arc::new(()))
+    fn try_new() -> Result<Self, CoordinatorInstanceExhausted> {
+        Ok(Self {
+            id: allocate_coordinator_instance(&NEXT_COORDINATOR_INSTANCE)?,
+            marker: Arc::new(()),
+        })
+    }
+
+    const fn id(&self) -> CoordinatorInstanceId {
+        self.id
     }
 }
 
 impl PartialEq for CoordinatorInstance {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        self.id == other.id && Arc::ptr_eq(&self.marker, &other.marker)
     }
 }
 
@@ -1354,6 +1419,11 @@ pub struct CoordinatorClaimToken {
 }
 
 impl CoordinatorClaimToken {
+    #[must_use]
+    pub const fn coordinator_instance(&self) -> CoordinatorInstanceId {
+        self.instance.id()
+    }
+
     #[must_use]
     pub const fn generation(&self) -> SchedulerGeneration {
         self.generation
@@ -1503,6 +1573,572 @@ pub enum CoordinatorCloseOutcome {
     AlreadyClosed,
 }
 
+/// Stable identifier for the exact post-application settlement model.
+pub const RENDER_APPLICATION_SETTLEMENT_CONTRACT_VERSION: &str =
+    "ft.render-application-settlement.v1";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderApplicationSettlementCounters {
+    pub applications_begun: u64,
+    pub begin_rejections: u64,
+    pub acknowledgements: u64,
+    pub retries: u64,
+    pub resync_requests: u64,
+    pub terminal_nacks: u64,
+    pub retry_exhaustions: u64,
+    pub deadline_expirations: u64,
+    pub stale_or_invalid_results: u64,
+    pub closes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderApplicationClaimMismatch {
+    CoordinatorInstance,
+    ConnectionGeneration,
+    SchedulerSequence,
+    Attempt,
+    MissingRenderEffect,
+    MultipleRenderEffects,
+    LedgerInstance,
+    RenderGeneration,
+    LedgerObligation,
+    Pane,
+    Kind,
+    SourceVersion,
+    GlobalResyncRequiresManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "a rejected render application must leave the coordinator claim explicitly owned"]
+pub enum RenderApplicationBeginError {
+    Contract(RenderApplicationContractError),
+    TrackerClosed,
+    ApplicationAlreadyPending,
+    ClaimMismatch(RenderApplicationClaimMismatch),
+    RetryMustStartAtOne,
+    RetryIdentityMismatch,
+    RetryOrdinalMismatch,
+    RetryDeadlineExpired,
+    RetryDeadlineExtended,
+    DeadlineOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "render application settlement must be handled so commit, retry, resync, and terminal outcomes stay explicit"]
+pub enum RenderApplicationSettleOutcome {
+    Acknowledged,
+    Retried,
+    AuthoritativeResyncScheduled {
+        reason: RenderApplicationNackReason,
+    },
+    FailedClosed {
+        reason: RenderApplicationNackReason,
+        coordinator: CoordinatorSettleOutcome,
+    },
+    RetryExhausted {
+        reason: RenderApplicationNackReason,
+        coordinator: CoordinatorSettleOutcome,
+    },
+    DeadlineExpired {
+        coordinator: CoordinatorSettleOutcome,
+    },
+    StaleOrDuplicate,
+    Rejected(RenderApplicationContractError),
+    CoordinatorDiverged(CoordinatorSettleOutcome),
+    TrackerClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderApplicationCloseOutcome {
+    Closed(CoordinatorCloseOutcome),
+    AlreadyClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderRetryIdentity {
+    connection_generation: u64,
+    coordinator_instance: u64,
+    scheduler_sequence: u64,
+    ledger_instance: u64,
+    render_generation: u64,
+    ledger_obligation: u64,
+    pane_id: u64,
+    base_state: Option<codec::RenderStateIdentity>,
+    resulting_state: codec::RenderStateIdentity,
+    kind: RenderApplicationKind,
+}
+
+impl RenderRetryIdentity {
+    fn from_identity(
+        identity: RenderApplicationIdentity,
+    ) -> Result<Self, RenderApplicationBeginError> {
+        Ok(Self {
+            connection_generation: identity.token.connection_generation,
+            coordinator_instance: identity.token.coordinator_instance,
+            scheduler_sequence: identity.token.scheduler_sequence,
+            ledger_instance: identity.token.ledger_instance,
+            render_generation: identity.token.render_generation,
+            ledger_obligation: identity.token.ledger_obligation,
+            pane_id: u64::try_from(identity.pane_id)
+                .map_err(|_| RenderApplicationBeginError::RetryIdentityMismatch)?,
+            base_state: identity.base_state,
+            resulting_state: identity.resulting_state,
+            kind: identity.kind,
+        })
+    }
+
+    fn authoritative_resync(
+        identity: RenderApplicationIdentity,
+    ) -> Result<Self, RenderApplicationBeginError> {
+        let mut retry = Self::from_identity(identity)?;
+        retry.base_state = None;
+        retry.kind = RenderApplicationKind::Snapshot;
+        Ok(retry)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderRetryContext {
+    identity: RenderRetryIdentity,
+    max_attempts: u16,
+    last_attempt_ordinal: u16,
+    deadline_millis: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRenderApplication {
+    identity: RenderApplicationIdentity,
+    claim: CoordinatorClaimToken,
+    max_attempts: u16,
+    attempt_ordinal: u16,
+    deadline_millis: u64,
+}
+
+/// Fixed-memory settlement authority for one coordinator consumer.
+///
+/// The hardened coordinator permits one in-flight plan, so this tracker stores
+/// at most one exact application identity and one fixed-size retry context. It
+/// never retains the render payload. A stale, duplicate, wrong-pane,
+/// wrong-generation, or wrong-attempt result cannot reach coordinator
+/// settlement. A resync-class NACK atomically returns the exact authority to
+/// the coordinator's ready lane and fences its next attempt to an authoritative
+/// snapshot, so there is no release-before-replacement gap.
+#[derive(Default)]
+pub struct RenderApplicationSettlementTracker {
+    pending: Option<PendingRenderApplication>,
+    retry: Option<RenderRetryContext>,
+    closed: bool,
+    counters: RenderApplicationSettlementCounters,
+}
+
+impl RenderApplicationSettlementTracker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> RenderApplicationSettlementCounters {
+        self.counters
+    }
+
+    #[must_use]
+    pub const fn pending_identity(&self) -> Option<RenderApplicationIdentity> {
+        match &self.pending {
+            Some(pending) => Some(pending.identity),
+            None => None,
+        }
+    }
+
+    /// Return the fixed monotonic deadline for pending or ready-to-retry work.
+    #[must_use]
+    pub const fn deadline_millis(&self) -> Option<u64> {
+        match &self.pending {
+            Some(pending) => Some(pending.deadline_millis),
+            None => match &self.retry {
+                Some(retry) => Some(retry.deadline_millis),
+                None => None,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Bind an application payload to the exact coordinator and ledger claim.
+    ///
+    /// `now_millis` is a connection-owner monotonic timestamp. The advertised
+    /// remaining duration may shorten an existing retry deadline but can never
+    /// extend it.
+    pub fn begin(
+        &mut self,
+        claim: &CoordinatorDeliveryClaim,
+        update: &RenderApplicationUpdate,
+        now_millis: u64,
+    ) -> Result<(), RenderApplicationBeginError> {
+        let result = self.begin_inner(claim, update, now_millis);
+        if result.is_err() {
+            increment(&mut self.counters.begin_rejections);
+        } else {
+            increment(&mut self.counters.applications_begun);
+        }
+        result
+    }
+
+    fn begin_inner(
+        &mut self,
+        claim: &CoordinatorDeliveryClaim,
+        update: &RenderApplicationUpdate,
+        now_millis: u64,
+    ) -> Result<(), RenderApplicationBeginError> {
+        if self.closed {
+            return Err(RenderApplicationBeginError::TrackerClosed);
+        }
+        if self.pending.is_some() {
+            return Err(RenderApplicationBeginError::ApplicationAlreadyPending);
+        }
+        update
+            .validate()
+            .map_err(RenderApplicationBeginError::Contract)?;
+        validate_render_claim_binding(
+            claim,
+            update,
+            self.retry.map(|retry| retry.identity.kind),
+        )?;
+
+        let advertised_deadline = now_millis
+            .checked_add(u64::from(update.retry_budget.remaining_millis))
+            .ok_or(RenderApplicationBeginError::DeadlineOverflow)?;
+        let retry_identity = RenderRetryIdentity::from_identity(update.identity)?;
+        let deadline_millis = match self.retry {
+            Some(retry) => {
+                if retry.identity != retry_identity
+                    || retry.max_attempts != update.retry_budget.max_attempts
+                {
+                    return Err(RenderApplicationBeginError::RetryIdentityMismatch);
+                }
+                if now_millis >= retry.deadline_millis {
+                    return Err(RenderApplicationBeginError::RetryDeadlineExpired);
+                }
+                let expected_ordinal = retry
+                    .last_attempt_ordinal
+                    .checked_add(1)
+                    .ok_or(RenderApplicationBeginError::RetryOrdinalMismatch)?;
+                if update.retry_budget.attempt_ordinal != expected_ordinal {
+                    return Err(RenderApplicationBeginError::RetryOrdinalMismatch);
+                }
+                if advertised_deadline > retry.deadline_millis {
+                    return Err(RenderApplicationBeginError::RetryDeadlineExtended);
+                }
+                retry.deadline_millis
+            }
+            None => {
+                if update.retry_budget.attempt_ordinal != 1 {
+                    return Err(RenderApplicationBeginError::RetryMustStartAtOne);
+                }
+                advertised_deadline
+            }
+        };
+
+        self.pending = Some(PendingRenderApplication {
+            identity: update.identity,
+            claim: claim.token.clone(),
+            max_attempts: update.retry_budget.max_attempts,
+            attempt_ordinal: update.retry_budget.attempt_ordinal,
+            deadline_millis,
+        });
+        Ok(())
+    }
+
+    pub fn settle(
+        &mut self,
+        coordinator: &mut DeliveryCoordinator,
+        result: RenderApplicationResult,
+        now_millis: u64,
+    ) -> RenderApplicationSettleOutcome {
+        if self.closed {
+            return RenderApplicationSettleOutcome::TrackerClosed;
+        }
+        if let Some(expired) = self.expire_deadline(coordinator, now_millis) {
+            return expired;
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            increment(&mut self.counters.stale_or_invalid_results);
+            return RenderApplicationSettleOutcome::StaleOrDuplicate;
+        };
+        if let Err(error) = result.validate_for_identity(pending.identity) {
+            increment(&mut self.counters.stale_or_invalid_results);
+            return RenderApplicationSettleOutcome::Rejected(error);
+        }
+
+        match result.outcome {
+            RenderApplicationOutcome::Applied { .. } => {
+                let pending = self
+                    .pending
+                    .take()
+                    .expect("validated application remains present");
+                let outcome = coordinator.acknowledge(&pending.claim);
+                if outcome == CoordinatorSettleOutcome::Acknowledged {
+                    self.retry = None;
+                    increment(&mut self.counters.acknowledgements);
+                    RenderApplicationSettleOutcome::Acknowledged
+                } else {
+                    self.retry = None;
+                    self.closed = true;
+                    close_same_instance_after_divergence(coordinator, outcome);
+                    RenderApplicationSettleOutcome::CoordinatorDiverged(outcome)
+                }
+            }
+            RenderApplicationOutcome::Nack(nack) => match nack.reason.recovery() {
+                RenderApplicationNackRecovery::AuthoritativeResync => {
+                    let pending = self
+                        .pending
+                        .take()
+                        .expect("validated application remains present");
+                    increment(&mut self.counters.resync_requests);
+                    if pending.attempt_ordinal >= pending.max_attempts {
+                        self.retry = None;
+                        self.closed = true;
+                        increment(&mut self.counters.retry_exhaustions);
+                        RenderApplicationSettleOutcome::RetryExhausted {
+                            reason: nack.reason,
+                            coordinator: nack_terminal_fail_closed(coordinator, &pending.claim),
+                        }
+                    } else {
+                        let retry = RenderRetryContext {
+                            identity: RenderRetryIdentity::authoritative_resync(pending.identity)
+                                .expect("validated pending identity remains wire-representable"),
+                            max_attempts: pending.max_attempts,
+                            last_attempt_ordinal: pending.attempt_ordinal,
+                            deadline_millis: pending.deadline_millis,
+                        };
+                        let outcome = coordinator.retry(&pending.claim);
+                        if outcome == CoordinatorSettleOutcome::Retried {
+                            self.retry = Some(retry);
+                            increment(&mut self.counters.retries);
+                            RenderApplicationSettleOutcome::AuthoritativeResyncScheduled {
+                                reason: nack.reason,
+                            }
+                        } else {
+                            self.retry = None;
+                            self.closed = true;
+                            close_same_instance_after_divergence(coordinator, outcome);
+                            RenderApplicationSettleOutcome::CoordinatorDiverged(outcome)
+                        }
+                    }
+                }
+                RenderApplicationNackRecovery::BoundedRetry => {
+                    let pending = self
+                        .pending
+                        .take()
+                        .expect("validated application remains present");
+                    if pending.attempt_ordinal >= pending.max_attempts {
+                        self.retry = None;
+                        self.closed = true;
+                        increment(&mut self.counters.retry_exhaustions);
+                        RenderApplicationSettleOutcome::RetryExhausted {
+                            reason: nack.reason,
+                            coordinator: nack_terminal_fail_closed(coordinator, &pending.claim),
+                        }
+                    } else {
+                        let retry = RenderRetryContext {
+                            identity: RenderRetryIdentity::from_identity(pending.identity)
+                                .expect("validated pending identity remains wire-representable"),
+                            max_attempts: pending.max_attempts,
+                            last_attempt_ordinal: pending.attempt_ordinal,
+                            deadline_millis: pending.deadline_millis,
+                        };
+                        let outcome = coordinator.retry(&pending.claim);
+                        if outcome == CoordinatorSettleOutcome::Retried {
+                            self.retry = Some(retry);
+                            increment(&mut self.counters.retries);
+                            RenderApplicationSettleOutcome::Retried
+                        } else {
+                            self.retry = None;
+                            self.closed = true;
+                            close_same_instance_after_divergence(coordinator, outcome);
+                            RenderApplicationSettleOutcome::CoordinatorDiverged(outcome)
+                        }
+                    }
+                }
+                RenderApplicationNackRecovery::Terminal => {
+                    let pending = self
+                        .pending
+                        .take()
+                        .expect("validated application remains present");
+                    self.retry = None;
+                    self.closed = true;
+                    increment(&mut self.counters.terminal_nacks);
+                    RenderApplicationSettleOutcome::FailedClosed {
+                        reason: nack.reason,
+                        coordinator: nack_terminal_fail_closed(coordinator, &pending.claim),
+                    }
+                }
+            },
+        }
+    }
+
+    /// Expire pending or ready-to-retry work without accepting a client result.
+    pub fn expire_deadline(
+        &mut self,
+        coordinator: &mut DeliveryCoordinator,
+        now_millis: u64,
+    ) -> Option<RenderApplicationSettleOutcome> {
+        if self.closed || now_millis < self.deadline_millis()? {
+            return None;
+        }
+        let coordinator = match self.pending.take() {
+            Some(pending) => nack_terminal_fail_closed(coordinator, &pending.claim),
+            None => coordinator_close_as_settlement(coordinator.close()),
+        };
+        self.retry = None;
+        self.closed = true;
+        increment(&mut self.counters.deadline_expirations);
+        Some(RenderApplicationSettleOutcome::DeadlineExpired {
+            coordinator,
+        })
+    }
+
+    /// Terminally close all admitted work on disconnect or shutdown.
+    pub fn close(
+        &mut self,
+        coordinator: &mut DeliveryCoordinator,
+    ) -> RenderApplicationCloseOutcome {
+        if self.closed {
+            return RenderApplicationCloseOutcome::AlreadyClosed;
+        }
+        self.pending = None;
+        self.retry = None;
+        self.closed = true;
+        increment(&mut self.counters.closes);
+        RenderApplicationCloseOutcome::Closed(coordinator.close())
+    }
+}
+
+const fn coordinator_close_as_settlement(
+    outcome: CoordinatorCloseOutcome,
+) -> CoordinatorSettleOutcome {
+    match outcome {
+        CoordinatorCloseOutcome::Closed(_) => CoordinatorSettleOutcome::FailedClosed,
+        CoordinatorCloseOutcome::AlreadyClosed => CoordinatorSettleOutcome::GenerationClosed,
+    }
+}
+
+fn nack_terminal_fail_closed(
+    coordinator: &mut DeliveryCoordinator,
+    claim: &CoordinatorClaimToken,
+) -> CoordinatorSettleOutcome {
+    let outcome = coordinator.nack_terminal(claim);
+    close_same_instance_after_divergence(coordinator, outcome);
+    outcome
+}
+
+fn close_same_instance_after_divergence(
+    coordinator: &mut DeliveryCoordinator,
+    outcome: CoordinatorSettleOutcome,
+) {
+    if outcome == CoordinatorSettleOutcome::StaleOrDuplicate {
+        let _ = coordinator.close();
+    }
+}
+
+fn validate_render_claim_binding(
+    claim: &CoordinatorDeliveryClaim,
+    update: &RenderApplicationUpdate,
+    retry_kind: Option<RenderApplicationKind>,
+) -> Result<(), RenderApplicationBeginError> {
+    let identity = update.identity;
+    let token = identity.token;
+    if token.coordinator_instance != claim.token.coordinator_instance().get() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::CoordinatorInstance,
+        ));
+    }
+    if token.connection_generation != claim.token.generation().get() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::ConnectionGeneration,
+        ));
+    }
+    if token.scheduler_sequence != claim.token.obligation_sequence() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::SchedulerSequence,
+        ));
+    }
+    if token.attempt != claim.token.attempt() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::Attempt,
+        ));
+    }
+
+    let mut render = None;
+    for effect in claim.plan.effects() {
+        let candidate = match effect {
+            PlannedEffect::RenderAuthority { claim, .. } => {
+                Some((*claim, RenderApplicationKind::Delta))
+            }
+            PlannedEffect::RenderResync { authority, .. } => {
+                Some((*authority, RenderApplicationKind::Snapshot))
+            }
+            _ => None,
+        };
+        if let Some(candidate) = candidate {
+            if render.replace(candidate).is_some() {
+                return Err(RenderApplicationBeginError::ClaimMismatch(
+                    RenderApplicationClaimMismatch::MultipleRenderEffects,
+                ));
+            }
+        }
+    }
+    let Some((authority, plan_kind)) = render else {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::MissingRenderEffect,
+        ));
+    };
+    if authority.ledger_scope() == DeliveryScope::ResyncAll {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::GlobalResyncRequiresManifest,
+        ));
+    }
+    let expected_kind = retry_kind.unwrap_or(plan_kind);
+    if token.ledger_instance != authority.ledger_instance().get() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::LedgerInstance,
+        ));
+    }
+    if token.render_generation != authority.ledger_generation() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::RenderGeneration,
+        ));
+    }
+    if token.ledger_obligation != authority.ledger_obligation() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::LedgerObligation,
+        ));
+    }
+    if identity.kind != expected_kind {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::Kind,
+        ));
+    }
+    match authority.ledger_scope() {
+        DeliveryScope::Pane(pane_id) if pane_id != identity.pane_id => {
+            return Err(RenderApplicationBeginError::ClaimMismatch(
+                RenderApplicationClaimMismatch::Pane,
+            ));
+        }
+        DeliveryScope::ResyncAll => unreachable!("global resync scope was rejected above"),
+        DeliveryScope::Pane(_) => {}
+    }
+    if authority.source_version() != identity.resulting_state.state_sequence {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::SourceVersion,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 enum CoordinatorEntryState {
     Reserved {
@@ -1548,10 +2184,12 @@ pub struct DeliveryCoordinator {
 }
 
 impl DeliveryCoordinator {
-    #[must_use]
-    pub fn new(generation: SchedulerGeneration, limits: HardenedSchedulerLimits) -> Self {
-        Self {
-            instance: CoordinatorInstance::new(),
+    pub fn try_new(
+        generation: SchedulerGeneration,
+        limits: HardenedSchedulerLimits,
+    ) -> Result<Self, CoordinatorInstanceExhausted> {
+        Ok(Self {
+            instance: CoordinatorInstance::try_new()?,
             generation,
             limits,
             queue: VecDeque::new(),
@@ -1564,7 +2202,18 @@ impl DeliveryCoordinator {
             pending_wake: None,
             counters: HardenedCounters::default(),
             last_close_report: None,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn new(generation: SchedulerGeneration, limits: HardenedSchedulerLimits) -> Self {
+        Self::try_new(generation, limits)
+            .expect("test delivery coordinator should have instance identity capacity")
+    }
+
+    #[must_use]
+    pub const fn instance_id(&self) -> CoordinatorInstanceId {
+        self.instance.id()
     }
 
     #[must_use]
@@ -3050,6 +3699,593 @@ mod hardened_tests {
             retained_bytes: 1,
         }])
         .expect("external render claim is a valid plan")
+    }
+
+    fn render_application_update(
+        claim: &CoordinatorDeliveryClaim,
+        attempt_ordinal: u16,
+        max_attempts: u16,
+        remaining_millis: u32,
+    ) -> RenderApplicationUpdate {
+        let (authority, kind) = match claim.plan().effects() {
+            [PlannedEffect::RenderAuthority { claim, .. }] => {
+                (*claim, RenderApplicationKind::Delta)
+            }
+            [PlannedEffect::RenderResync { authority, .. }] => {
+                (*authority, RenderApplicationKind::Snapshot)
+            }
+            _ => panic!("test render application requires exactly one render effect"),
+        };
+        let pane_id = match authority.ledger_scope() {
+            DeliveryScope::Pane(pane_id) => pane_id,
+            DeliveryScope::ResyncAll => 9,
+        };
+        let resulting_state = codec::RenderStateIdentity {
+            render_generation: authority.ledger_generation(),
+            state_sequence: authority.source_version(),
+        };
+        let base_state = (kind == RenderApplicationKind::Delta).then_some(
+            codec::RenderStateIdentity {
+                render_generation: authority.ledger_generation(),
+                state_sequence: authority.source_version().saturating_sub(1),
+            },
+        );
+        let surface_sequence = usize::try_from(resulting_state.state_sequence)
+            .expect("test render sequence should fit usize");
+        let bonus_lines = if kind == RenderApplicationKind::Snapshot {
+            codec::SerializedLines::from(
+                (0isize..24)
+                    .map(|row| (row, wezterm_term::Line::with_width(80, surface_sequence)))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            codec::SerializedLines::default()
+        };
+        RenderApplicationUpdate {
+            identity: RenderApplicationIdentity {
+                protocol_version: codec::RENDER_APPLICATION_PROTOCOL_VERSION,
+                token: codec::RenderApplicationToken {
+                    connection_generation: claim.token().generation().get(),
+                    coordinator_instance: claim.token().coordinator_instance().get(),
+                    scheduler_sequence: claim.token().obligation_sequence(),
+                    attempt: claim.token().attempt(),
+                    ledger_instance: authority.ledger_instance().get(),
+                    render_generation: authority.ledger_generation(),
+                    ledger_obligation: authority.ledger_obligation(),
+                },
+                pane_id,
+                base_state,
+                resulting_state,
+                kind,
+            },
+            retry_budget: codec::RenderApplicationRetryBudget {
+                attempt_ordinal,
+                max_attempts,
+                remaining_millis,
+            },
+            surface: codec::GetPaneRenderChangesResponse {
+                pane_id,
+                mouse_grabbed: false,
+                alt_screen_active: false,
+                cursor_position: mux::renderable::StableCursorPosition::default(),
+                dimensions: mux::renderable::RenderableDimensions {
+                    cols: 80,
+                    viewport_rows: 24,
+                    scrollback_rows: 24,
+                    physical_top: 0,
+                    scrollback_top: 0,
+                    dpi: 96,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    reverse_video: false,
+                },
+                tiered_scrollback_status: None,
+                dirty_lines: Vec::new(),
+                title: "render-application".to_string(),
+                working_dir: None,
+                bonus_lines,
+                input_serial: None,
+                seqno: surface_sequence,
+            },
+            semantic_zones: if kind == RenderApplicationKind::Snapshot {
+                codec::RenderComponentUpdate::Replace(codec::GetSemanticZonesResponse {
+                    pane_id,
+                    zones: Vec::new(),
+                    zone_texts: Vec::new(),
+                    last_exit_code: None,
+                })
+            } else {
+                codec::RenderComponentUpdate::Unchanged
+            },
+            palette: if kind == RenderApplicationKind::Snapshot {
+                codec::RenderComponentUpdate::Replace(codec::SetPalette {
+                    pane_id,
+                    palette: wezterm_term::color::ColorPalette::default(),
+                })
+            } else {
+                codec::RenderComponentUpdate::Unchanged
+            },
+            alerts: Vec::new(),
+        }
+    }
+
+    fn applied_result(update: &RenderApplicationUpdate) -> RenderApplicationResult {
+        RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Applied {
+                applied_state: update.identity.resulting_state,
+            },
+        }
+    }
+
+    fn nack_result(
+        update: &RenderApplicationUpdate,
+        reason: RenderApplicationNackReason,
+    ) -> RenderApplicationResult {
+        let observed_state = if matches!(
+            reason,
+            RenderApplicationNackReason::BaseMismatch
+                | RenderApplicationNackReason::GenerationMismatch
+                | RenderApplicationNackReason::DetectedGap
+        ) {
+            codec::RenderApplicationObservedState::Applied(codec::RenderStateIdentity {
+                render_generation: update.identity.resulting_state.render_generation,
+                state_sequence: update
+                    .identity
+                    .resulting_state
+                    .state_sequence
+                    .saturating_sub(1),
+            })
+        } else {
+            codec::RenderApplicationObservedState::NotApplicable
+        };
+        RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Nack(codec::RenderApplicationNack {
+                reason,
+                observed_state,
+            }),
+        }
+    }
+
+    fn claimed_render(
+        coordinator: &mut DeliveryCoordinator,
+        pane_id: u64,
+    ) -> CoordinatorDeliveryClaim {
+        assert!(matches!(
+            coordinator.admit_plan(render_plan(pane_id)),
+            PlanAdmission::Admitted { .. }
+        ));
+        coordinator
+            .claim_next()
+            .expect("test claim identity space remains available")
+            .expect("admitted render plan is claimable")
+    }
+
+    #[test]
+    fn coordinator_instance_allocation_fails_before_wrap_or_reuse() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_coordinator_instance(&counter),
+            Ok(CoordinatorInstanceId(u64::MAX - 1))
+        );
+        assert_eq!(
+            allocate_coordinator_instance(&counter),
+            Err(CoordinatorInstanceExhausted)
+        );
+        assert_eq!(
+            allocate_coordinator_instance(&counter),
+            Err(CoordinatorInstanceExhausted)
+        );
+    }
+
+    #[test]
+    fn application_ack_is_the_only_path_that_releases_the_exact_claim() {
+        let mut coordinator = coordinator();
+        let claim = claimed_render(&mut coordinator, 9);
+        let update = render_application_update(&claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&claim, &update, 1_000)
+            .expect("exact render claim should bind");
+
+        assert_eq!(coordinator.capacity().in_flight_plans, 1);
+        assert_eq!(
+            tracker.settle(&mut coordinator, applied_result(&update), 1_050),
+            RenderApplicationSettleOutcome::Acknowledged
+        );
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+        assert_eq!(
+            tracker.counters(),
+            RenderApplicationSettlementCounters {
+                applications_begun: 1,
+                acknowledgements: 1,
+                ..RenderApplicationSettlementCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn stale_or_wrong_attempt_ack_cannot_commit_live_work() {
+        let mut coordinator = coordinator();
+        let claim = claimed_render(&mut coordinator, 9);
+        let update = render_application_update(&claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&claim, &update, 1_000)
+            .expect("exact render claim should bind");
+
+        let mut stale = applied_result(&update);
+        stale.identity.token.attempt += 1;
+        assert_eq!(
+            tracker.settle(&mut coordinator, stale, 1_010),
+            RenderApplicationSettleOutcome::Rejected(
+                RenderApplicationContractError::SettlementIdentityMismatch
+            )
+        );
+        assert_eq!(coordinator.capacity().in_flight_plans, 1);
+        assert_eq!(
+            tracker.settle(&mut coordinator, applied_result(&update), 1_020),
+            RenderApplicationSettleOutcome::Acknowledged
+        );
+    }
+
+    #[test]
+    fn same_instance_coordinator_divergence_closes_the_generation() {
+        let mut coordinator = coordinator();
+        let claim = claimed_render(&mut coordinator, 9);
+        let update = render_application_update(&claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&claim, &update, 1_000)
+            .expect("exact render claim should bind");
+        assert_eq!(
+            coordinator.acknowledge(claim.token()),
+            CoordinatorSettleOutcome::Acknowledged
+        );
+        assert!(!coordinator.is_closed());
+
+        assert_eq!(
+            tracker.settle(
+                &mut coordinator,
+                nack_result(
+                    &update,
+                    RenderApplicationNackReason::ApplicationFailure {
+                        stage: codec::RenderApplicationStage::ApplySurface,
+                    },
+                ),
+                1_010,
+            ),
+            RenderApplicationSettleOutcome::CoordinatorDiverged(
+                CoordinatorSettleOutcome::StaleOrDuplicate
+            )
+        );
+        assert!(tracker.is_closed());
+        assert!(coordinator.is_closed());
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+    }
+
+    #[test]
+    fn application_failure_retries_with_a_new_attempt_without_extending_deadline() {
+        let mut coordinator = coordinator();
+        let first_claim = claimed_render(&mut coordinator, 9);
+        let first_update = render_application_update(&first_claim, 1, 3, 100);
+        let first_attempt = first_update.identity.token.attempt;
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&first_claim, &first_update, 1_000)
+            .expect("first application should bind");
+        assert_eq!(
+            tracker.settle(
+                &mut coordinator,
+                nack_result(
+                    &first_update,
+                    RenderApplicationNackReason::ApplicationFailure {
+                        stage: codec::RenderApplicationStage::ApplySurface,
+                    },
+                ),
+                1_010,
+            ),
+            RenderApplicationSettleOutcome::Retried
+        );
+
+        let second_claim = coordinator
+            .claim_next()
+            .expect("retry claim identity remains available")
+            .expect("retry returns the plan to ready");
+        let second_update = render_application_update(&second_claim, 2, 3, 89);
+        assert_ne!(second_update.identity.token.attempt, first_attempt);
+        tracker
+            .begin(&second_claim, &second_update, 1_011)
+            .expect("second attempt may shorten the original deadline");
+        assert_eq!(
+            tracker.settle(&mut coordinator, applied_result(&second_update), 1_050),
+            RenderApplicationSettleOutcome::Acknowledged
+        );
+        assert_eq!(tracker.counters().retries, 1);
+    }
+
+    #[test]
+    fn ready_retry_expires_at_the_original_deadline_and_reclaims_capacity() {
+        let mut coordinator = coordinator();
+        let first_claim = claimed_render(&mut coordinator, 9);
+        let first_update = render_application_update(&first_claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&first_claim, &first_update, 1_000)
+            .expect("first application should bind");
+        assert_eq!(
+            tracker.settle(
+                &mut coordinator,
+                nack_result(
+                    &first_update,
+                    RenderApplicationNackReason::ApplicationFailure {
+                        stage: codec::RenderApplicationStage::ApplySurface,
+                    },
+                ),
+                1_010,
+            ),
+            RenderApplicationSettleOutcome::Retried
+        );
+        assert_eq!(tracker.deadline_millis(), Some(1_100));
+        assert_eq!(coordinator.capacity().ready_plans, 1);
+        assert_eq!(
+            tracker.expire_deadline(&mut coordinator, 1_099),
+            None
+        );
+        assert_eq!(
+            tracker.expire_deadline(&mut coordinator, 1_100),
+            Some(RenderApplicationSettleOutcome::DeadlineExpired {
+                coordinator: CoordinatorSettleOutcome::FailedClosed,
+            })
+        );
+        assert!(tracker.is_closed());
+        assert!(coordinator.is_closed());
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+        assert_eq!(tracker.counters().deadline_expirations, 1);
+    }
+
+    #[test]
+    fn retry_cannot_reset_ordinal_or_extend_the_original_deadline() {
+        let mut coordinator = coordinator();
+        let first_claim = claimed_render(&mut coordinator, 9);
+        let first_update = render_application_update(&first_claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&first_claim, &first_update, 1_000)
+            .expect("first application should bind");
+        assert_eq!(
+            tracker.settle(
+                &mut coordinator,
+                nack_result(
+                    &first_update,
+                    RenderApplicationNackReason::ApplicationFailure {
+                        stage: codec::RenderApplicationStage::ApplySurface,
+                    },
+                ),
+                1_010,
+            ),
+            RenderApplicationSettleOutcome::Retried
+        );
+
+        let second_claim = coordinator
+            .claim_next()
+            .expect("retry claim identity remains available")
+            .expect("retry returns the plan to ready");
+        let extended = render_application_update(&second_claim, 2, 3, 100);
+        assert_eq!(
+            tracker.begin(&second_claim, &extended, 1_011),
+            Err(RenderApplicationBeginError::RetryDeadlineExtended)
+        );
+        assert_eq!(coordinator.capacity().in_flight_plans, 1);
+    }
+
+    #[test]
+    fn resync_nack_requeues_exact_authority_and_fences_next_attempt_to_snapshot() {
+        let mut coordinator = coordinator();
+        let claim = claimed_render(&mut coordinator, 9);
+        let update = render_application_update(&claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&claim, &update, 1_000)
+            .expect("exact render claim should bind");
+        let reason = RenderApplicationNackReason::BaseMismatch;
+        assert_eq!(
+            tracker.settle(&mut coordinator, nack_result(&update, reason), 1_010),
+            RenderApplicationSettleOutcome::AuthoritativeResyncScheduled { reason }
+        );
+        assert_eq!(coordinator.capacity().in_flight_plans, 0);
+        assert_eq!(coordinator.capacity().ready_plans, 1);
+        assert_eq!(tracker.pending_identity(), None);
+        assert_eq!(tracker.counters().resync_requests, 1);
+        assert_eq!(tracker.counters().retries, 1);
+
+        let snapshot_claim = coordinator
+            .claim_next()
+            .expect("resync claim identity remains available")
+            .expect("resync returns the exact authority to ready");
+        let mut snapshot = render_application_update(&snapshot_claim, 2, 3, 89);
+        snapshot.identity.kind = RenderApplicationKind::Snapshot;
+        snapshot.identity.base_state = None;
+        let snapshot_seqno = snapshot.surface.seqno;
+        snapshot.surface.bonus_lines = codec::SerializedLines::from(
+            (0isize..24)
+                .map(|row| (row, wezterm_term::Line::with_width(80, snapshot_seqno)))
+                .collect::<Vec<_>>(),
+        );
+        snapshot.semantic_zones =
+            codec::RenderComponentUpdate::Replace(codec::GetSemanticZonesResponse {
+                pane_id: snapshot.identity.pane_id,
+                zones: Vec::new(),
+                zone_texts: Vec::new(),
+                last_exit_code: None,
+            });
+        snapshot.palette = codec::RenderComponentUpdate::Replace(codec::SetPalette {
+            pane_id: snapshot.identity.pane_id,
+            palette: wezterm_term::color::ColorPalette::default(),
+        });
+        tracker
+            .begin(&snapshot_claim, &snapshot, 1_011)
+            .expect("the next exact attempt must accept an authoritative snapshot");
+        assert_eq!(
+            tracker.settle(&mut coordinator, applied_result(&snapshot), 1_050),
+            RenderApplicationSettleOutcome::Acknowledged
+        );
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+    }
+
+    #[test]
+    fn pane_scoped_application_cannot_settle_a_global_resync_manifest() {
+        let mut coordinator = coordinator();
+        let global_resync = DeliveryPlan::new(vec![PlannedEffect::RenderResync {
+            authority: ExternalRenderAuthority::new_for_test(
+                GENERATION,
+                1,
+                7,
+                1,
+                DeliveryScope::ResyncAll,
+                1,
+            ),
+            retained_bytes: 1,
+        }])
+        .expect("global resync authority is a valid coordinator plan");
+        assert!(matches!(
+            coordinator.admit_plan(global_resync),
+            PlanAdmission::Admitted { .. }
+        ));
+        let claim = coordinator
+            .claim_next()
+            .expect("global resync claim identity remains available")
+            .expect("global resync plan should be claimable");
+        let update = render_application_update(&claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        assert_eq!(
+            tracker.begin(&claim, &update, 1_000),
+            Err(RenderApplicationBeginError::ClaimMismatch(
+                RenderApplicationClaimMismatch::GlobalResyncRequiresManifest,
+            ))
+        );
+        assert_eq!(coordinator.capacity().in_flight_plans, 1);
+        assert!(matches!(
+            tracker.close(&mut coordinator),
+            RenderApplicationCloseOutcome::Closed(CoordinatorCloseOutcome::Closed(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_nack_retry_exhaustion_and_deadline_expiry_fail_closed() {
+        let mut terminal_coordinator = coordinator();
+        let terminal_claim = claimed_render(&mut terminal_coordinator, 9);
+        let terminal_update = render_application_update(&terminal_claim, 1, 3, 100);
+        let mut terminal_tracker = RenderApplicationSettlementTracker::new();
+        terminal_tracker
+            .begin(&terminal_claim, &terminal_update, 1_000)
+            .expect("terminal test application should bind");
+        let terminal_reason = RenderApplicationNackReason::UnsupportedResource {
+            resource: codec::RenderApplicationResource::Images,
+        };
+        assert_eq!(
+            terminal_tracker.settle(
+                &mut terminal_coordinator,
+                nack_result(&terminal_update, terminal_reason),
+                1_010,
+            ),
+            RenderApplicationSettleOutcome::FailedClosed {
+                reason: terminal_reason,
+                coordinator: CoordinatorSettleOutcome::FailedClosed,
+            }
+        );
+        assert!(terminal_coordinator.is_closed());
+
+        let mut exhausted_coordinator = coordinator();
+        let exhausted_claim = claimed_render(&mut exhausted_coordinator, 9);
+        let exhausted_update = render_application_update(&exhausted_claim, 1, 1, 100);
+        let mut exhausted_tracker = RenderApplicationSettlementTracker::new();
+        exhausted_tracker
+            .begin(&exhausted_claim, &exhausted_update, 1_000)
+            .expect("exhaustion test application should bind");
+        let retry_reason = RenderApplicationNackReason::ApplicationFailure {
+            stage: codec::RenderApplicationStage::ApplySurface,
+        };
+        assert_eq!(
+            exhausted_tracker.settle(
+                &mut exhausted_coordinator,
+                nack_result(&exhausted_update, retry_reason),
+                1_010,
+            ),
+            RenderApplicationSettleOutcome::RetryExhausted {
+                reason: retry_reason,
+                coordinator: CoordinatorSettleOutcome::FailedClosed,
+            }
+        );
+        assert!(exhausted_coordinator.is_closed());
+
+        let mut deadline_coordinator = coordinator();
+        let deadline_claim = claimed_render(&mut deadline_coordinator, 9);
+        let deadline_update = render_application_update(&deadline_claim, 1, 3, 10);
+        let mut deadline_tracker = RenderApplicationSettlementTracker::new();
+        deadline_tracker
+            .begin(&deadline_claim, &deadline_update, 1_000)
+            .expect("deadline test application should bind");
+        assert_eq!(
+            deadline_tracker.expire_deadline(&mut deadline_coordinator, 1_010),
+            Some(RenderApplicationSettleOutcome::DeadlineExpired {
+                coordinator: CoordinatorSettleOutcome::FailedClosed,
+            })
+        );
+        assert!(deadline_coordinator.is_closed());
+    }
+
+    #[test]
+    fn disconnect_closes_pending_application_and_reclaims_all_capacity() {
+        let mut coordinator = coordinator();
+        let claim = claimed_render(&mut coordinator, 9);
+        let update = render_application_update(&claim, 1, 3, 100);
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        tracker
+            .begin(&claim, &update, 1_000)
+            .expect("exact render claim should bind");
+        assert!(matches!(
+            tracker.close(&mut coordinator),
+            RenderApplicationCloseOutcome::Closed(CoordinatorCloseOutcome::Closed(_))
+        ));
+        assert!(tracker.is_closed());
+        assert!(coordinator.is_closed());
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+    }
+
+    proptest! {
+        #[test]
+        fn any_single_wire_identity_corruption_cannot_ack_live_work(field in 0u8..8) {
+            let mut coordinator = coordinator();
+            let claim = claimed_render(&mut coordinator, 9);
+            let update = render_application_update(&claim, 1, 3, 100);
+            let mut tracker = RenderApplicationSettlementTracker::new();
+            tracker
+                .begin(&claim, &update, 1_000)
+                .expect("exact render claim should bind");
+            let mut corrupted = applied_result(&update);
+            match field {
+                0 => corrupted.identity.token.connection_generation += 1,
+                1 => corrupted.identity.token.coordinator_instance += 1,
+                2 => corrupted.identity.token.scheduler_sequence += 1,
+                3 => corrupted.identity.token.attempt += 1,
+                4 => corrupted.identity.token.ledger_instance += 1,
+                5 => corrupted.identity.token.render_generation += 1,
+                6 => corrupted.identity.token.ledger_obligation += 1,
+                7 => corrupted.identity.pane_id += 1,
+                _ => unreachable!("generated field is constrained to 0..8"),
+            }
+            prop_assert!(matches!(
+                tracker.settle(&mut coordinator, corrupted, 1_010),
+                RenderApplicationSettleOutcome::Rejected(_)
+            ));
+            prop_assert_eq!(coordinator.capacity().in_flight_plans, 1);
+            prop_assert_eq!(
+                tracker.settle(&mut coordinator, applied_result(&update), 1_020),
+                RenderApplicationSettleOutcome::Acknowledged
+            );
+        }
     }
 
     #[test]

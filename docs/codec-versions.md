@@ -33,5 +33,6 @@ rollback procedure) and the rationale.
 
 | version | date       | kind     | change |
 | ------- | ---------- | -------- | ------ |
+| 48      | 2026-07-30 | additive | adds fail-closed `RenderApplicationUpdate` / `RenderApplicationResult` PDUs (79/80) with exact generation, scheduler, ledger, base/result-state, complete atomic surface components, hard resource bounds, original-deadline-bounded retry/resync, and typed ACK/NACK authority for ft-interactive-systems-performance-4tenz.5.5.5. |
 | 47      | 2026-06-07 | additive | adds `GetSemanticZones` / `GetSemanticZonesResponse` PDUs (77/78) carrying live SemanticZone coordinates, zone text, and retained OSC 133 exit status for ft-7h5da.2.1 robot DOM queries. |
 | 46      | 2026-02-10 | initial  | starting value at fork import from wezterm @ `05343b387085842b434d267f91b6b0ec157e4331`. See `frankenterm/PROVENANCE.md`. |

@@ -1089,6 +1089,14 @@ impl RpcGenerationScope {
         self.generation.is_some()
     }
 
+    #[allow(
+        dead_code,
+        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+    )]
+    pub(crate) const fn connection_generation(&self) -> Option<NonZeroU64> {
+        self.generation
+    }
+
     pub(crate) fn commit_sync<T>(
         &self,
         consumer: RpcConsumerKind,

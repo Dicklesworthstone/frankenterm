@@ -37,7 +37,7 @@ use smol::io::AsyncWriteExt;
 #[cfg(feature = "async-smol")]
 use smol::prelude::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::io::{Cursor, Read};
 use std::ops::Range;
@@ -1479,7 +1479,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 47;
+pub const CODEC_VERSION: usize = 48;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -1660,6 +1660,8 @@ pdu! {
     ListPanesTabStacksResponse: 76,
     GetSemanticZones: 77,
     GetSemanticZonesResponse: 78,
+    RenderApplicationUpdate: 79,
+    RenderApplicationResult: 80,
 }
 
 impl Pdu {
@@ -1752,6 +1754,14 @@ impl Pdu {
         match self {
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
             | Pdu::GetSemanticZonesResponse(GetSemanticZonesResponse { pane_id, .. })
+            | Pdu::RenderApplicationUpdate(RenderApplicationUpdate {
+                identity: RenderApplicationIdentity { pane_id, .. },
+                ..
+            })
+            | Pdu::RenderApplicationResult(RenderApplicationResult {
+                identity: RenderApplicationIdentity { pane_id, .. },
+                ..
+            })
             | Pdu::SetPalette(SetPalette { pane_id, .. })
             | Pdu::NotifyAlert(NotifyAlert { pane_id, .. })
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
@@ -2242,6 +2252,804 @@ pub struct GetPaneRenderChangesResponse {
     pub seqno: SequenceNo,
 }
 
+/// Stable identifier for the application-level render settlement protocol.
+///
+/// Transport enqueue, socket write, frame decode, and GUI scheduling are not
+/// application acknowledgement. A server may commit a prepared render
+/// baseline only after receiving a matching [`RenderApplicationResult`] whose
+/// outcome is [`RenderApplicationOutcome::Applied`].
+pub const RENDER_APPLICATION_PROTOCOL_VERSION: u16 = 1;
+
+/// Hard upper bound for application attempts retained for one render
+/// obligation. Live code may configure a lower limit, but never a higher one.
+pub const MAX_RENDER_APPLICATION_ATTEMPTS: u16 = 8;
+
+/// Hard upper bound for exact, event-like alerts carried by one atomic render
+/// application. State-like progress is represented by the latest retained
+/// value before an update is prepared; event-like occurrences stay explicit.
+pub const MAX_RENDER_APPLICATION_ALERTS: usize = 64;
+
+/// Hard wire bounds for one atomic render application. Receivers may advertise
+/// lower limits, but no sender may construct a v1 application above these
+/// ceilings.
+pub const MAX_RENDER_APPLICATION_DIRTY_RANGES: usize = 16_384;
+pub const MAX_RENDER_APPLICATION_LINES: usize = 16_384;
+pub const MAX_RENDER_APPLICATION_CELLS: usize = 4 * 1024 * 1024;
+pub const MAX_RENDER_APPLICATION_HYPERLINK_SPANS: usize = 65_536;
+pub const MAX_RENDER_APPLICATION_IMAGE_REFERENCES: usize = 4_096;
+pub const MAX_RENDER_APPLICATION_SEMANTIC_ZONES: usize = 16_384;
+pub const MAX_RENDER_APPLICATION_SEMANTIC_TEXT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES: usize = 1024 * 1024;
+pub const MAX_RENDER_APPLICATION_TITLE_BYTES: usize = 64 * 1024;
+pub const MAX_RENDER_APPLICATION_WORKING_DIR_BYTES: usize = 64 * 1024;
+pub const MAX_RENDER_APPLICATION_SCROLLBACK_ROWS: usize = 10_000_000;
+
+/// Wire-stable identity for one scheduler attempt and its underlying render
+/// ledger obligation.
+///
+/// Every numeric authority is non-zero and non-reusing within its owning
+/// process incarnation. The tuple is intentionally redundant: a matching
+/// scheduler sequence alone cannot prove a matching connection, coordinator,
+/// render generation, or external ledger obligation.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct RenderApplicationToken {
+    pub connection_generation: u64,
+    pub coordinator_instance: u64,
+    pub scheduler_sequence: u64,
+    pub attempt: u64,
+    pub ledger_instance: u64,
+    pub render_generation: u64,
+    pub ledger_obligation: u64,
+}
+
+impl RenderApplicationToken {
+    fn validate(self) -> Result<(), RenderApplicationContractError> {
+        if self.connection_generation == 0
+            || self.coordinator_instance == 0
+            || self.scheduler_sequence == 0
+            || self.attempt == 0
+            || self.ledger_instance == 0
+            || self.render_generation == 0
+            || self.ledger_obligation == 0
+        {
+            return Err(RenderApplicationContractError::ZeroAuthorityIdentity);
+        }
+        Ok(())
+    }
+}
+
+/// Never-reused identity of an authoritative client-visible render state.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct RenderStateIdentity {
+    pub render_generation: u64,
+    pub state_sequence: u64,
+}
+
+/// Whether an update advances an exact prior state or replaces it
+/// authoritatively.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationKind {
+    Delta,
+    Snapshot,
+}
+
+/// Exact identity repeated by both the server update and client settlement.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct RenderApplicationIdentity {
+    pub protocol_version: u16,
+    pub token: RenderApplicationToken,
+    pub pane_id: PaneId,
+    /// `Some` for a delta and `None` for an authoritative snapshot.
+    pub base_state: Option<RenderStateIdentity>,
+    pub resulting_state: RenderStateIdentity,
+    pub kind: RenderApplicationKind,
+}
+
+impl RenderApplicationIdentity {
+    /// Validate the closed identity contract without consulting ambient
+    /// connection or pane state.
+    pub fn validate(self) -> Result<(), RenderApplicationContractError> {
+        if self.protocol_version != RENDER_APPLICATION_PROTOCOL_VERSION {
+            return Err(RenderApplicationContractError::UnsupportedProtocolVersion);
+        }
+        self.token.validate()?;
+        if self.resulting_state.render_generation == 0 {
+            return Err(RenderApplicationContractError::ZeroStateIdentity);
+        }
+        if self.resulting_state.render_generation != self.token.render_generation {
+            return Err(RenderApplicationContractError::StateGenerationMismatch);
+        }
+        match (self.kind, self.base_state) {
+            (RenderApplicationKind::Delta, None) => {
+                Err(RenderApplicationContractError::DeltaMissingBase)
+            }
+            (RenderApplicationKind::Snapshot, Some(_)) => {
+                Err(RenderApplicationContractError::SnapshotHasBase)
+            }
+            (RenderApplicationKind::Snapshot, None) => Ok(()),
+            (RenderApplicationKind::Delta, Some(base)) => {
+                if base.render_generation != self.resulting_state.render_generation {
+                    return Err(RenderApplicationContractError::StateGenerationMismatch);
+                }
+                if base.state_sequence >= self.resulting_state.state_sequence {
+                    return Err(RenderApplicationContractError::NonAdvancingDelta);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Bounded retry and deadline information visible to the receiver.
+///
+/// `remaining_millis` is a duration, not a cross-machine wall-clock instant.
+/// The sender retains the authoritative monotonic deadline locally.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct RenderApplicationRetryBudget {
+    pub attempt_ordinal: u16,
+    pub max_attempts: u16,
+    pub remaining_millis: u32,
+}
+
+impl RenderApplicationRetryBudget {
+    fn validate(self) -> Result<(), RenderApplicationContractError> {
+        if self.max_attempts == 0
+            || self.max_attempts > MAX_RENDER_APPLICATION_ATTEMPTS
+            || self.attempt_ordinal == 0
+            || self.attempt_ordinal > self.max_attempts
+            || self.remaining_millis == 0
+        {
+            return Err(RenderApplicationContractError::InvalidRetryBudget);
+        }
+        Ok(())
+    }
+}
+
+/// Explicit state for an optional component of an atomic render application.
+///
+/// `Unchanged` is semantically different from a missing or truncated field:
+/// the enum tag must be present on the wire.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub enum RenderComponentUpdate<T> {
+    Unchanged,
+    Replace(T),
+}
+
+/// Complete application unit sent by the server.
+///
+/// Image payload hydration referenced by `surface.bonus_lines` is part of
+/// applying this unit; the client must not ACK while any referenced image,
+/// semantic-zone replacement, palette change, or alert remains unapplied.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct RenderApplicationUpdate {
+    pub identity: RenderApplicationIdentity,
+    pub retry_budget: RenderApplicationRetryBudget,
+    pub surface: GetPaneRenderChangesResponse,
+    pub semantic_zones: RenderComponentUpdate<GetSemanticZonesResponse>,
+    pub palette: RenderComponentUpdate<SetPalette>,
+    pub alerts: Vec<NotifyAlert>,
+}
+
+impl RenderApplicationUpdate {
+    /// Return the aggregate UTF-8 bytes retained by alert string fields.
+    #[must_use]
+    pub fn alert_text_bytes(&self) -> Option<usize> {
+        self.alerts.iter().try_fold(0usize, |total, alert| {
+            render_application_alert_text_bytes(&alert.alert)
+                .and_then(|bytes| total.checked_add(bytes))
+        })
+    }
+
+    /// Validate all fixed authority, pane, component, and bound invariants.
+    pub fn validate(&self) -> Result<(), RenderApplicationContractError> {
+        self.identity.validate()?;
+        self.retry_budget.validate()?;
+        let pane_id = self.identity.pane_id;
+        if self.surface.pane_id != pane_id {
+            return Err(RenderApplicationContractError::ComponentPaneMismatch);
+        }
+        let surface_sequence = u64::try_from(self.surface.seqno)
+            .map_err(|_| RenderApplicationContractError::StateSequenceOutOfRange)?;
+        if surface_sequence != self.identity.resulting_state.state_sequence {
+            return Err(RenderApplicationContractError::ResultingStateMismatch);
+        }
+        if matches!(
+            &self.semantic_zones,
+            RenderComponentUpdate::Replace(zones) if zones.pane_id != pane_id
+        ) || matches!(
+            &self.palette,
+            RenderComponentUpdate::Replace(palette) if palette.pane_id != pane_id
+        ) || self.alerts.iter().any(|alert| alert.pane_id != pane_id)
+        {
+            return Err(RenderApplicationContractError::ComponentPaneMismatch);
+        }
+        if self.identity.kind == RenderApplicationKind::Snapshot {
+            if matches!(&self.semantic_zones, RenderComponentUpdate::Unchanged) {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::SemanticZones,
+                });
+            }
+            if matches!(&self.palette, RenderComponentUpdate::Unchanged) {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::Palette,
+                });
+            }
+        }
+        if self.alerts.len() > MAX_RENDER_APPLICATION_ALERTS {
+            return Err(RenderApplicationContractError::TooManyAlerts);
+        }
+        let alert_text_bytes = self.alert_text_bytes();
+        let Some(alert_text_bytes) = alert_text_bytes else {
+            return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Alerts,
+                requested: u64::MAX,
+                limit: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES)
+                    .unwrap_or(u64::MAX),
+            });
+        };
+        if alert_text_bytes > MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES {
+            return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Alerts,
+                requested: u64::try_from(alert_text_bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES)
+                    .unwrap_or(u64::MAX),
+            });
+        }
+        let mut has_unseen_output = false;
+        let mut has_progress = false;
+        for alert in &self.alerts {
+            let duplicate_state_alert = match &alert.alert {
+                Alert::OutputSinceFocusLost => std::mem::replace(&mut has_unseen_output, true),
+                Alert::Progress(_) => std::mem::replace(&mut has_progress, true),
+                // Palette state is carried by the atomic component and the
+                // client emits exactly one notification after installing it.
+                // Accepting a wire alert here would either duplicate that
+                // notification or announce a change with no replacement.
+                Alert::PaletteChanged => true,
+                _ => false,
+            };
+            if duplicate_state_alert {
+                return Err(RenderApplicationContractError::DuplicateStateAlert);
+            }
+        }
+
+        if self.surface.dirty_lines.len() > MAX_RENDER_APPLICATION_DIRTY_RANGES {
+            return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Lines,
+                requested: u64::try_from(self.surface.dirty_lines.len()).unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_DIRTY_RANGES).unwrap_or(u64::MAX),
+            });
+        }
+        if self.surface.title.len() > MAX_RENDER_APPLICATION_TITLE_BYTES {
+            return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Title,
+                requested: u64::try_from(self.surface.title.len()).unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_TITLE_BYTES).unwrap_or(u64::MAX),
+            });
+        }
+        if let Some(working_dir) = &self.surface.working_dir {
+            let requested = working_dir.url.as_str().len();
+            if requested > MAX_RENDER_APPLICATION_WORKING_DIR_BYTES {
+                return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource: RenderApplicationResource::WorkingDirectory,
+                    requested: u64::try_from(requested).unwrap_or(u64::MAX),
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_WORKING_DIR_BYTES)
+                        .unwrap_or(u64::MAX),
+                });
+            }
+        }
+
+        let dimensions = self.surface.dimensions;
+        let viewport_cells = dimensions
+            .cols
+            .checked_mul(dimensions.viewport_rows)
+            .ok_or(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Dimensions,
+                requested: u64::MAX,
+                limit: u64::try_from(MAX_RENDER_APPLICATION_CELLS).unwrap_or(u64::MAX),
+            })?;
+        if viewport_cells > MAX_RENDER_APPLICATION_CELLS {
+            return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Dimensions,
+                requested: u64::try_from(viewport_cells).unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_CELLS).unwrap_or(u64::MAX),
+            });
+        }
+        if dimensions.scrollback_rows > MAX_RENDER_APPLICATION_SCROLLBACK_ROWS {
+            return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Lines,
+                requested: u64::try_from(dimensions.scrollback_rows).unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_SCROLLBACK_ROWS).unwrap_or(u64::MAX),
+            });
+        }
+        let history_rows = dimensions
+            .physical_top
+            .checked_sub(dimensions.scrollback_top)
+            .and_then(|rows| usize::try_from(rows).ok());
+        let viewport_end = isize::try_from(dimensions.viewport_rows)
+            .ok()
+            .and_then(|rows| dimensions.physical_top.checked_add(rows));
+        let Some(history_rows) = history_rows else {
+            return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Dimensions,
+            });
+        };
+        let Some(viewport_end) = viewport_end else {
+            return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Dimensions,
+            });
+        };
+        if dimensions.cols == 0
+            || dimensions.viewport_rows == 0
+            || dimensions.scrollback_rows < dimensions.viewport_rows
+            || history_rows.checked_add(dimensions.viewport_rows)
+                != Some(dimensions.scrollback_rows)
+            || self.surface.cursor_position.x > dimensions.cols
+            || self.surface.cursor_position.y < dimensions.physical_top
+            || self.surface.cursor_position.y >= viewport_end
+        {
+            return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Dimensions,
+            });
+        }
+
+        if self.surface.bonus_lines.line_count() > MAX_RENDER_APPLICATION_LINES {
+            return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Lines,
+                requested: u64::try_from(self.surface.bonus_lines.line_count())
+                    .unwrap_or(u64::MAX),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_LINES).unwrap_or(u64::MAX),
+            });
+        }
+        let line_counts = self
+            .surface
+            .bonus_lines
+            .validate_structure()
+            .map_err(|error| {
+                let component = match error {
+                    SerializedLinesStructureError::HyperlinkLineOutOfRange
+                    | SerializedLinesStructureError::HyperlinkCellRangeOutOfRange => {
+                        RenderApplicationComponent::Hyperlinks
+                    }
+                    SerializedLinesStructureError::ImageLineMissing
+                    | SerializedLinesStructureError::ImageCellOutOfRange => {
+                        RenderApplicationComponent::Images
+                    }
+                    SerializedLinesStructureError::DuplicateStableRow
+                    | SerializedLinesStructureError::CellCountOverflow => {
+                        RenderApplicationComponent::Lines
+                    }
+                };
+                RenderApplicationContractError::MalformedSurfaceComponent { component }
+            })?;
+        for (resource, requested, limit) in [
+            (
+                RenderApplicationResource::Lines,
+                line_counts.lines,
+                MAX_RENDER_APPLICATION_LINES,
+            ),
+            (
+                RenderApplicationResource::Cells,
+                line_counts.cells,
+                MAX_RENDER_APPLICATION_CELLS,
+            ),
+            (
+                RenderApplicationResource::Hyperlinks,
+                line_counts.hyperlink_spans,
+                MAX_RENDER_APPLICATION_HYPERLINK_SPANS,
+            ),
+            (
+                RenderApplicationResource::Images,
+                line_counts.images,
+                MAX_RENDER_APPLICATION_IMAGE_REFERENCES,
+            ),
+        ] {
+            if requested > limit {
+                return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource,
+                    requested: u64::try_from(requested).unwrap_or(u64::MAX),
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                });
+            }
+        }
+
+        let supplied_rows = if self.surface.dirty_lines.is_empty()
+            && self.identity.kind != RenderApplicationKind::Snapshot
+        {
+            None
+        } else {
+            Some(
+                self.surface
+                    .bonus_lines
+                    .stable_rows()
+                    .collect::<HashSet<_>>(),
+            )
+        };
+        if self.identity.kind == RenderApplicationKind::Snapshot {
+            if dimensions.viewport_rows > MAX_RENDER_APPLICATION_LINES {
+                return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource: RenderApplicationResource::Lines,
+                    requested: u64::try_from(dimensions.viewport_rows).unwrap_or(u64::MAX),
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_LINES).unwrap_or(u64::MAX),
+                });
+            }
+            if (dimensions.physical_top..viewport_end).any(|row| {
+                supplied_rows
+                    .as_ref()
+                    .is_none_or(|rows| !rows.contains(&row))
+            }) {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::Lines,
+                });
+            }
+        }
+        let mut dirty_rows = 0usize;
+        let mut prior_end = None;
+        for range in &self.surface.dirty_lines {
+            let Some(span) = range
+                .end
+                .checked_sub(range.start)
+                .and_then(|span| usize::try_from(span).ok())
+            else {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::Lines,
+                });
+            };
+            if range.is_empty()
+                || prior_end.is_some_and(|end| end > range.start)
+                || range.start < dimensions.scrollback_top
+                || range.end > viewport_end
+            {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::Lines,
+                });
+            }
+            dirty_rows = dirty_rows
+                .checked_add(span)
+                .ok_or(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource: RenderApplicationResource::Lines,
+                    requested: u64::MAX,
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_LINES).unwrap_or(u64::MAX),
+                })?;
+            if dirty_rows > MAX_RENDER_APPLICATION_LINES {
+                return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource: RenderApplicationResource::Lines,
+                    requested: u64::try_from(dirty_rows).unwrap_or(u64::MAX),
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_LINES).unwrap_or(u64::MAX),
+                });
+            }
+            if range.clone().any(|row| {
+                supplied_rows
+                    .as_ref()
+                    .is_none_or(|rows| !rows.contains(&row))
+            }) {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::Lines,
+                });
+            }
+            prior_end = Some(range.end);
+        }
+        if self.surface.bonus_lines.lines().any(|(row, line)| {
+            *row < dimensions.scrollback_top
+                || *row >= viewport_end
+                || u64::try_from(line.current_seqno())
+                    .map_or(true, |seqno| seqno > self.identity.resulting_state.state_sequence)
+        }) {
+            return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Lines,
+            });
+        }
+
+        if let RenderComponentUpdate::Replace(semantic) = &self.semantic_zones {
+            if semantic.zones.len() != semantic.zone_texts.len() {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::SemanticZones,
+                });
+            }
+            if semantic.zones.len() > MAX_RENDER_APPLICATION_SEMANTIC_ZONES {
+                return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource: RenderApplicationResource::SemanticZones,
+                    requested: u64::try_from(semantic.zones.len()).unwrap_or(u64::MAX),
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_SEMANTIC_ZONES)
+                        .unwrap_or(u64::MAX),
+                });
+            }
+            let semantic_text_bytes = semantic.zone_texts.iter().try_fold(
+                0usize,
+                |total, text| total.checked_add(text.len()),
+            );
+            let Some(semantic_text_bytes) = semantic_text_bytes else {
+                return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource: RenderApplicationResource::SemanticZones,
+                    requested: u64::MAX,
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_SEMANTIC_TEXT_BYTES)
+                        .unwrap_or(u64::MAX),
+                });
+            };
+            if semantic_text_bytes > MAX_RENDER_APPLICATION_SEMANTIC_TEXT_BYTES {
+                return Err(RenderApplicationContractError::ResourceLimitExceeded {
+                    resource: RenderApplicationResource::SemanticZones,
+                    requested: u64::try_from(semantic_text_bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(MAX_RENDER_APPLICATION_SEMANTIC_TEXT_BYTES)
+                        .unwrap_or(u64::MAX),
+                });
+            }
+            if semantic.zones.iter().any(|zone| {
+                zone.start_y < dimensions.scrollback_top
+                    || zone.end_y >= viewport_end
+                    || zone.start_x >= dimensions.cols
+                    || zone.end_x >= dimensions.cols
+                    || zone.start_y > zone.end_y
+                    || (zone.start_y == zone.end_y && zone.start_x > zone.end_x)
+            }) {
+                return Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                    component: RenderApplicationComponent::SemanticZones,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn render_application_alert_text_bytes(alert: &Alert) -> Option<usize> {
+    match alert {
+        Alert::ToastNotification { title, body, .. } => title
+            .as_ref()
+            .map_or(0, String::len)
+            .checked_add(body.len()),
+        Alert::IconTitleChanged(title) | Alert::TabTitleChanged(title) => {
+            Some(title.as_ref().map_or(0, String::len))
+        }
+        Alert::WindowTitleChanged(title) => Some(title.len()),
+        Alert::SetUserVar { name, value } => name.len().checked_add(value.len()),
+        Alert::SetProfileRequested { name } => Some(name.len()),
+        Alert::MouseShapeRequested { shape } => Some(shape.len()),
+        Alert::ImageAltText { text, .. } => Some(text.len()),
+        Alert::Bell
+        | Alert::CurrentWorkingDirectoryChanged
+        | Alert::PaletteChanged
+        | Alert::OutputSinceFocusLost
+        | Alert::Progress(_) => Some(0),
+    }
+}
+
+/// Component whose validation or application failed.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationComponent {
+    Surface,
+    Lines,
+    Hyperlinks,
+    Cursor,
+    Modes,
+    Dimensions,
+    Title,
+    SemanticZones,
+    Images,
+    Palette,
+    Alerts,
+}
+
+/// Resource class used by typed unsupported or bounded-rejection NACKs.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationResource {
+    Cells,
+    Lines,
+    Dimensions,
+    Images,
+    Hyperlinks,
+    SemanticZones,
+    Title,
+    WorkingDirectory,
+    Palette,
+    Alerts,
+}
+
+/// Stage at which an otherwise well-formed application failed.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationStage {
+    Hydrate,
+    Validate,
+    ApplySurface,
+    ApplySemanticZones,
+    ApplyImages,
+    ApplyPalette,
+    ApplyAlerts,
+    Commit,
+}
+
+/// Typed reason why the client could not apply a complete render unit.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationNackReason {
+    BaseMismatch,
+    GenerationMismatch,
+    MalformedOrIncomplete {
+        component: RenderApplicationComponent,
+    },
+    UnsupportedResource {
+        resource: RenderApplicationResource,
+    },
+    BoundedResourceRejected {
+        resource: RenderApplicationResource,
+        requested: u64,
+        limit: u64,
+    },
+    ApplicationFailure {
+        stage: RenderApplicationStage,
+    },
+    DetectedGap,
+}
+
+/// Closed recovery class for every NACK reason.
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationNackRecovery {
+    BoundedRetry,
+    AuthoritativeResync,
+    Terminal,
+}
+
+impl RenderApplicationNackReason {
+    #[must_use]
+    pub const fn recovery(self) -> RenderApplicationNackRecovery {
+        match self {
+            Self::BaseMismatch
+            | Self::GenerationMismatch
+            | Self::MalformedOrIncomplete { .. }
+            | Self::DetectedGap => RenderApplicationNackRecovery::AuthoritativeResync,
+            Self::ApplicationFailure { .. } => RenderApplicationNackRecovery::BoundedRetry,
+            Self::UnsupportedResource { .. } | Self::BoundedResourceRejected { .. } => {
+                RenderApplicationNackRecovery::Terminal
+            }
+        }
+    }
+
+    const fn requires_observed_state(self) -> bool {
+        matches!(
+            self,
+            Self::BaseMismatch | Self::GenerationMismatch | Self::DetectedGap
+        )
+    }
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct RenderApplicationNack {
+    pub reason: RenderApplicationNackReason,
+    pub observed_state: RenderApplicationObservedState,
+}
+
+/// Explicit client-side state observation carried by a NACK.
+///
+/// `Uninitialized` is distinct from `NotApplicable`: a delta received before
+/// any authoritative baseline is a real base mismatch, while an application
+/// failure does not claim that a state comparison failed.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationObservedState {
+    NotApplicable,
+    Uninitialized,
+    Applied(RenderStateIdentity),
+}
+
+impl RenderApplicationObservedState {
+    fn validate(self) -> Result<(), RenderApplicationContractError> {
+        if let Self::Applied(state) = self {
+            if state.render_generation == 0 {
+                return Err(RenderApplicationContractError::InvalidObservedState);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Client disposition emitted only after validation and complete application.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub enum RenderApplicationOutcome {
+    Applied {
+        applied_state: RenderStateIdentity,
+    },
+    Nack(RenderApplicationNack),
+}
+
+/// Application-level settlement sent from client to server.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct RenderApplicationResult {
+    pub identity: RenderApplicationIdentity,
+    pub outcome: RenderApplicationOutcome,
+}
+
+impl RenderApplicationResult {
+    /// Validate this settlement against exact retained identity metadata.
+    pub fn validate_for_identity(
+        self,
+        expected: RenderApplicationIdentity,
+    ) -> Result<(), RenderApplicationContractError> {
+        self.identity.validate()?;
+        if self.identity != expected {
+            return Err(RenderApplicationContractError::SettlementIdentityMismatch);
+        }
+        if let RenderApplicationOutcome::Nack(nack) = self.outcome {
+            nack.observed_state.validate()?;
+        }
+        match self.outcome {
+            RenderApplicationOutcome::Applied { applied_state }
+                if applied_state != self.identity.resulting_state =>
+            {
+                Err(RenderApplicationContractError::AppliedStateMismatch)
+            }
+            RenderApplicationOutcome::Nack(nack)
+                if nack.reason.requires_observed_state()
+                    && nack.observed_state == RenderApplicationObservedState::NotApplicable =>
+            {
+                Err(RenderApplicationContractError::NackMissingObservedState)
+            }
+            RenderApplicationOutcome::Nack(nack)
+                if !nack.reason.requires_observed_state()
+                    && nack.observed_state != RenderApplicationObservedState::NotApplicable =>
+            {
+                Err(RenderApplicationContractError::NackHasUnexpectedObservedState)
+            }
+            RenderApplicationOutcome::Applied { .. } | RenderApplicationOutcome::Nack(_) => Ok(()),
+        }
+    }
+
+    /// Validate this settlement against the exact update it purports to settle.
+    pub fn validate_for(
+        self,
+        update: &RenderApplicationUpdate,
+    ) -> Result<(), RenderApplicationContractError> {
+        update.validate()?;
+        self.validate_for_identity(update.identity)
+    }
+}
+
+#[derive(Error, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum RenderApplicationContractError {
+    #[error("unsupported render-application protocol version")]
+    UnsupportedProtocolVersion,
+    #[error("render-application authority identities must be non-zero")]
+    ZeroAuthorityIdentity,
+    #[error("render state generation identities must be non-zero")]
+    ZeroStateIdentity,
+    #[error("render state generation does not match the delivery token")]
+    StateGenerationMismatch,
+    #[error("a render delta requires an exact base state")]
+    DeltaMissingBase,
+    #[error("an authoritative render snapshot cannot require a base state")]
+    SnapshotHasBase,
+    #[error("a render delta must advance beyond its exact base state")]
+    NonAdvancingDelta,
+    #[error("invalid bounded render retry or deadline budget")]
+    InvalidRetryBudget,
+    #[error("a render component targets a different pane")]
+    ComponentPaneMismatch,
+    #[error("surface sequence cannot be represented in the wire state identity")]
+    StateSequenceOutOfRange,
+    #[error("surface sequence does not match the resulting state identity")]
+    ResultingStateMismatch,
+    #[error("render application carries too many exact alerts")]
+    TooManyAlerts,
+    #[error("render application repeats a latest-value state alert")]
+    DuplicateStateAlert,
+    #[error("render application exceeds a hard {resource:?} resource limit")]
+    ResourceLimitExceeded {
+        resource: RenderApplicationResource,
+        requested: u64,
+        limit: u64,
+    },
+    #[error("render application contains a malformed or incomplete {component:?} component")]
+    MalformedSurfaceComponent {
+        component: RenderApplicationComponent,
+    },
+    #[error("render settlement identity does not match the in-flight update")]
+    SettlementIdentityMismatch,
+    #[error("applied state does not match the update result identity")]
+    AppliedStateMismatch,
+    #[error("this NACK reason requires the client's observed state identity")]
+    NackMissingObservedState,
+    #[error("this NACK reason does not permit a client state observation")]
+    NackHasUnexpectedObservedState,
+    #[error("a reported client state observation must have a non-zero render generation")]
+    InvalidObservedState,
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetLines {
     pub pane_id: PaneId,
@@ -2292,7 +3100,106 @@ pub struct SerializedLines {
     images: Vec<SerializedImageCell>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SerializedLinesResourceCounts {
+    pub lines: usize,
+    pub cells: usize,
+    pub hyperlink_spans: usize,
+    pub images: usize,
+}
+
+/// Reconstituted line payload plus image references awaiting hydration.
+pub type ExtractedSerializedLines = (
+    Vec<(StableRowIndex, Line)>,
+    Vec<SerializedImageCell>,
+);
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SerializedLinesStructureError {
+    #[error("serialized lines contain a duplicate stable row")]
+    DuplicateStableRow,
+    #[error("serialized line cell accounting overflowed")]
+    CellCountOverflow,
+    #[error("serialized hyperlink references a missing line")]
+    HyperlinkLineOutOfRange,
+    #[error("serialized hyperlink references an invalid or empty cell range")]
+    HyperlinkCellRangeOutOfRange,
+    #[error("serialized image references a missing stable row")]
+    ImageLineMissing,
+    #[error("serialized image references a missing cell")]
+    ImageCellOutOfRange,
+}
+
 impl SerializedLines {
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn stable_rows(&self) -> impl Iterator<Item = StableRowIndex> + '_ {
+        self.lines.iter().map(|(row, _)| *row)
+    }
+
+    pub fn lines(&self) -> impl Iterator<Item = &(StableRowIndex, Line)> {
+        self.lines.iter()
+    }
+
+    /// Validate all internal line, hyperlink, and image references before any
+    /// state is mutated, and return fixed resource counts for receiver limits.
+    pub fn validate_structure(
+        &self,
+    ) -> Result<SerializedLinesResourceCounts, SerializedLinesStructureError> {
+        let mut line_lengths = HashMap::with_capacity(self.lines.len());
+        let mut cells = 0usize;
+        for (stable_row, line) in &self.lines {
+            if line_lengths.insert(*stable_row, line.len()).is_some() {
+                return Err(SerializedLinesStructureError::DuplicateStableRow);
+            }
+            cells = cells
+                .checked_add(line.len())
+                .ok_or(SerializedLinesStructureError::CellCountOverflow)?;
+        }
+
+        let mut hyperlink_spans = 0usize;
+        for hyperlink in &self.hyperlinks {
+            for coordinates in &hyperlink.coords {
+                let Some((_, line)) = self.lines.get(coordinates.line_idx) else {
+                    return Err(SerializedLinesStructureError::HyperlinkLineOutOfRange);
+                };
+                if coordinates.cols.is_empty() || coordinates.cols.end > line.len() {
+                    return Err(SerializedLinesStructureError::HyperlinkCellRangeOutOfRange);
+                }
+                hyperlink_spans = hyperlink_spans
+                    .checked_add(1)
+                    .ok_or(SerializedLinesStructureError::CellCountOverflow)?;
+            }
+        }
+
+        for image in &self.images {
+            let Some(line_len) = line_lengths.get(&image.line_idx) else {
+                return Err(SerializedLinesStructureError::ImageLineMissing);
+            };
+            if image.cell_idx >= *line_len {
+                return Err(SerializedLinesStructureError::ImageCellOutOfRange);
+            }
+        }
+
+        Ok(SerializedLinesResourceCounts {
+            lines: self.lines.len(),
+            cells,
+            hyperlink_spans,
+            images: self.images.len(),
+        })
+    }
+
+    /// Reconstitute a structurally validated line payload.
+    pub fn extract_data_checked(
+        self,
+    ) -> Result<ExtractedSerializedLines, SerializedLinesStructureError> {
+        self.validate_structure()?;
+        Ok(self.extract_data())
+    }
+
     /// Reconsitute hyperlinks or other attributes that were decomposed for
     /// serialization, and return the line data.
     pub fn extract_data(self) -> (Vec<(StableRowIndex, Line)>, Vec<SerializedImageCell>) {
@@ -3274,7 +4181,7 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 47);
+        assert_eq!(CODEC_VERSION, 48);
     }
 
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
@@ -3282,7 +4189,7 @@ mod test {
     #[test]
     fn check_compat_additive_window_keeps_min_supported() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(CODEC_VERSION, 47);
+        assert_eq!(CODEC_VERSION, 48);
     }
 
     #[test]
@@ -4236,6 +5143,475 @@ mod test {
             .expect("stream_decode should succeed");
         assert_eq!(stream_decoded.serial, 0x55);
         assert_eq!(stream_decoded.pdu, pdu);
+    }
+
+    fn sample_render_application_update() -> RenderApplicationUpdate {
+        let pane_id = 7;
+        RenderApplicationUpdate {
+            identity: RenderApplicationIdentity {
+                protocol_version: RENDER_APPLICATION_PROTOCOL_VERSION,
+                token: RenderApplicationToken {
+                    connection_generation: 11,
+                    coordinator_instance: 13,
+                    scheduler_sequence: 17,
+                    attempt: 19,
+                    ledger_instance: 23,
+                    render_generation: 29,
+                    ledger_obligation: 31,
+                },
+                pane_id,
+                base_state: Some(RenderStateIdentity {
+                    render_generation: 29,
+                    state_sequence: 40,
+                }),
+                resulting_state: RenderStateIdentity {
+                    render_generation: 29,
+                    state_sequence: 41,
+                },
+                kind: RenderApplicationKind::Delta,
+            },
+            retry_budget: RenderApplicationRetryBudget {
+                attempt_ordinal: 1,
+                max_attempts: 3,
+                remaining_millis: 250,
+            },
+            surface: GetPaneRenderChangesResponse {
+                pane_id,
+                mouse_grabbed: false,
+                alt_screen_active: false,
+                cursor_position: StableCursorPosition::default(),
+                dimensions: RenderableDimensions {
+                    cols: 80,
+                    viewport_rows: 24,
+                    scrollback_rows: 24,
+                    physical_top: 0,
+                    scrollback_top: 0,
+                    dpi: 96,
+                    pixel_width: 800,
+                    pixel_height: 480,
+                    reverse_video: false,
+                },
+                tiered_scrollback_status: None,
+                dirty_lines: Vec::new(),
+                title: "render-application".to_string(),
+                working_dir: None,
+                bonus_lines: SerializedLines::default(),
+                input_serial: None,
+                seqno: 41,
+            },
+            semantic_zones: RenderComponentUpdate::Unchanged,
+            palette: RenderComponentUpdate::Unchanged,
+            alerts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn render_application_update_and_result_roundtrip_exact_identity() {
+        let update = sample_render_application_update();
+        update.validate().expect("sample update is valid");
+        let update_pdu = Pdu::RenderApplicationUpdate(update.clone());
+        let mut encoded_update = Vec::new();
+        update_pdu
+            .encode(&mut encoded_update, 0)
+            .expect("render update encodes");
+        let decoded_update = Pdu::decode(encoded_update.as_slice()).expect("render update decodes");
+        assert_eq!(decoded_update.serial, 0);
+        assert_eq!(decoded_update.pdu.pane_id(), Some(7));
+        assert_eq!(decoded_update.pdu, update_pdu);
+
+        let result = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Applied {
+                applied_state: update.identity.resulting_state,
+            },
+        };
+        result
+            .validate_for(&update)
+            .expect("matching post-application ACK is valid");
+        let result_pdu = Pdu::RenderApplicationResult(result);
+        let mut encoded_result = Vec::new();
+        result_pdu
+            .encode(&mut encoded_result, 43)
+            .expect("render result encodes");
+        let decoded_result =
+            Pdu::decode(encoded_result.as_slice()).expect("render result decodes");
+        assert_eq!(decoded_result.serial, 43);
+        assert_eq!(decoded_result.pdu.pane_id(), Some(7));
+        assert_eq!(decoded_result.pdu, result_pdu);
+    }
+
+    #[test]
+    fn render_application_requires_complete_bounded_dirty_surface() {
+        let mut update = sample_render_application_update();
+        update.surface.dirty_lines = std::iter::once(0..1).collect();
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Lines,
+            })
+        );
+
+        let line = Line::from_text(
+            "complete",
+            &termwiz::cell::CellAttributes::default(),
+            update.surface.seqno,
+            None,
+        );
+        update.surface.bonus_lines = SerializedLines::from(vec![(0, line)]);
+        update
+            .validate()
+            .expect("every dirty row is carried in the atomic surface payload");
+
+        let over_limit = MAX_RENDER_APPLICATION_LINES + 1;
+        update.surface.dimensions.cols = 1;
+        update.surface.dimensions.viewport_rows = over_limit;
+        update.surface.dimensions.scrollback_rows = over_limit;
+        update.surface.dirty_lines =
+            std::iter::once(0..isize::try_from(over_limit).expect("test limit fits isize"))
+                .collect();
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Lines,
+                requested: u64::try_from(over_limit).expect("test limit fits u64"),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_LINES)
+                    .expect("test limit fits u64"),
+            })
+        );
+    }
+
+    #[test]
+    fn render_application_rejects_incoherent_dimensions_before_apply() {
+        let mut update = sample_render_application_update();
+        update.surface.dimensions.scrollback_rows += 1;
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Dimensions,
+            })
+        );
+    }
+
+    #[test]
+    fn render_application_snapshot_is_complete_before_ack() {
+        let mut snapshot = sample_render_application_update();
+        snapshot.identity.kind = RenderApplicationKind::Snapshot;
+        snapshot.identity.base_state = None;
+        assert_eq!(
+            snapshot.validate(),
+            Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::SemanticZones,
+            })
+        );
+
+        snapshot.semantic_zones =
+            RenderComponentUpdate::Replace(GetSemanticZonesResponse {
+                pane_id: snapshot.identity.pane_id,
+                zones: Vec::new(),
+                zone_texts: Vec::new(),
+                last_exit_code: None,
+            });
+        assert_eq!(
+            snapshot.validate(),
+            Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Palette,
+            })
+        );
+
+        snapshot.palette = RenderComponentUpdate::Replace(SetPalette {
+            pane_id: snapshot.identity.pane_id,
+            palette: ColorPalette::default(),
+        });
+        assert_eq!(
+            snapshot.validate(),
+            Err(RenderApplicationContractError::MalformedSurfaceComponent {
+                component: RenderApplicationComponent::Lines,
+            })
+        );
+
+        let snapshot_seqno = snapshot.surface.seqno;
+        snapshot.surface.bonus_lines = SerializedLines::from(
+            (0isize..24)
+                .map(|row| (row, Line::with_width(80, snapshot_seqno)))
+                .collect::<Vec<_>>(),
+        );
+        snapshot
+            .validate()
+            .expect("snapshot carries the complete viewport and authoritative components");
+    }
+
+    #[test]
+    fn render_application_bounds_aggregate_alert_text() {
+        let mut update = sample_render_application_update();
+        update.alerts.push(NotifyAlert {
+            pane_id: update.identity.pane_id,
+            alert: Alert::WindowTitleChanged(
+                "x".repeat(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES + 1),
+            ),
+        });
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::ResourceLimitExceeded {
+                resource: RenderApplicationResource::Alerts,
+                requested: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES + 1)
+                    .expect("test limit fits u64"),
+                limit: u64::try_from(MAX_RENDER_APPLICATION_ALERT_TEXT_BYTES)
+                    .expect("test limit fits u64"),
+            })
+        );
+    }
+
+    #[test]
+    fn render_application_contract_rejects_ambiguous_or_cross_pane_authority() {
+        let mut update = sample_render_application_update();
+        update.identity.token.coordinator_instance = 0;
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::ZeroAuthorityIdentity)
+        );
+
+        let mut update = sample_render_application_update();
+        update.surface.pane_id = 8;
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::ComponentPaneMismatch)
+        );
+
+        let mut update = sample_render_application_update();
+        update.identity.resulting_state.state_sequence = 40;
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::NonAdvancingDelta)
+        );
+
+        let mut update = sample_render_application_update();
+        update.identity.kind = RenderApplicationKind::Snapshot;
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::SnapshotHasBase)
+        );
+    }
+
+    #[test]
+    fn render_application_settlement_rejects_stale_ack_and_incomplete_nack() {
+        let update = sample_render_application_update();
+        let mut stale_identity = update.identity;
+        stale_identity.token.attempt += 1;
+        let stale = RenderApplicationResult {
+            identity: stale_identity,
+            outcome: RenderApplicationOutcome::Applied {
+                applied_state: stale_identity.resulting_state,
+            },
+        };
+        assert_eq!(
+            stale.validate_for(&update),
+            Err(RenderApplicationContractError::SettlementIdentityMismatch)
+        );
+
+        let wrong_state = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Applied {
+                applied_state: RenderStateIdentity {
+                    render_generation: update.identity.resulting_state.render_generation,
+                    state_sequence: update.identity.resulting_state.state_sequence + 1,
+                },
+            },
+        };
+        assert_eq!(
+            wrong_state.validate_for(&update),
+            Err(RenderApplicationContractError::AppliedStateMismatch)
+        );
+
+        let incomplete_nack = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Nack(RenderApplicationNack {
+                reason: RenderApplicationNackReason::BaseMismatch,
+                observed_state: RenderApplicationObservedState::NotApplicable,
+            }),
+        };
+        assert_eq!(
+            incomplete_nack.validate_for(&update),
+            Err(RenderApplicationContractError::NackMissingObservedState)
+        );
+    }
+
+    #[test]
+    fn render_application_nack_recovery_is_exhaustive_and_bounded() {
+        let resync = [
+            RenderApplicationNackReason::BaseMismatch,
+            RenderApplicationNackReason::GenerationMismatch,
+            RenderApplicationNackReason::MalformedOrIncomplete {
+                component: RenderApplicationComponent::Surface,
+            },
+            RenderApplicationNackReason::DetectedGap,
+        ];
+        assert!(resync.iter().copied().all(|reason| {
+            reason.recovery() == RenderApplicationNackRecovery::AuthoritativeResync
+        }));
+        assert_eq!(
+            RenderApplicationNackReason::ApplicationFailure {
+                stage: RenderApplicationStage::ApplySurface,
+            }
+            .recovery(),
+            RenderApplicationNackRecovery::BoundedRetry
+        );
+        assert_eq!(
+            RenderApplicationNackReason::UnsupportedResource {
+                resource: RenderApplicationResource::Images,
+            }
+            .recovery(),
+            RenderApplicationNackRecovery::Terminal
+        );
+        assert_eq!(
+            RenderApplicationNackReason::BoundedResourceRejected {
+                resource: RenderApplicationResource::Lines,
+                requested: 2,
+                limit: 1,
+            }
+            .recovery(),
+            RenderApplicationNackRecovery::Terminal
+        );
+
+        let mut update = sample_render_application_update();
+        update.alerts = (0..=MAX_RENDER_APPLICATION_ALERTS)
+            .map(|_| NotifyAlert {
+                pane_id: update.identity.pane_id,
+                alert: Alert::OutputSinceFocusLost,
+            })
+            .collect();
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::TooManyAlerts)
+        );
+
+        let mut update = sample_render_application_update();
+        update.alerts = vec![
+            NotifyAlert {
+                pane_id: update.identity.pane_id,
+                alert: Alert::Progress(frankenterm_term::Progress::Percentage(42)),
+            },
+            NotifyAlert {
+                pane_id: update.identity.pane_id,
+                alert: Alert::Progress(frankenterm_term::Progress::Percentage(64)),
+            },
+        ];
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::DuplicateStateAlert)
+        );
+    }
+
+    #[test]
+    fn render_application_serialized_lines_reject_corrupt_internal_references() {
+        let line = || {
+            Line::from_text(
+                "x",
+                &termwiz::cell::CellAttributes::default(),
+                1,
+                None,
+            )
+        };
+        let duplicate_row = SerializedLines {
+            lines: vec![(0, line()), (0, line())],
+            hyperlinks: Vec::new(),
+            images: Vec::new(),
+        };
+        assert_eq!(
+            duplicate_row.validate_structure(),
+            Err(SerializedLinesStructureError::DuplicateStableRow)
+        );
+
+        let missing_image_line = SerializedLines {
+            lines: vec![(0, line())],
+            hyperlinks: Vec::new(),
+            images: vec![SerializedImageCell {
+                line_idx: 1,
+                cell_idx: 0,
+                top_left: TextureCoordinate::new_f32(0.0, 0.0),
+                bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+                data_hash: [0x5a; 32],
+                z_index: 0,
+                padding_left: 0,
+                padding_top: 0,
+                padding_right: 0,
+                padding_bottom: 0,
+                image_id: None,
+                placement_id: None,
+            }],
+        };
+        assert_eq!(
+            missing_image_line.validate_structure(),
+            Err(SerializedLinesStructureError::ImageLineMissing)
+        );
+
+        let invalid_image_cell = SerializedLines {
+            lines: vec![(0, line())],
+            hyperlinks: Vec::new(),
+            images: vec![SerializedImageCell {
+                line_idx: 0,
+                cell_idx: 1,
+                top_left: TextureCoordinate::new_f32(0.0, 0.0),
+                bottom_right: TextureCoordinate::new_f32(1.0, 1.0),
+                data_hash: [0xa5; 32],
+                z_index: 0,
+                padding_left: 0,
+                padding_top: 0,
+                padding_right: 0,
+                padding_bottom: 0,
+                image_id: None,
+                placement_id: None,
+            }],
+        };
+        assert_eq!(
+            invalid_image_cell.validate_structure(),
+            Err(SerializedLinesStructureError::ImageCellOutOfRange)
+        );
+    }
+
+    #[test]
+    fn render_application_nack_observation_contract_is_fail_closed() {
+        let update = sample_render_application_update();
+        let base_mismatch = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Nack(RenderApplicationNack {
+                reason: RenderApplicationNackReason::BaseMismatch,
+                observed_state: RenderApplicationObservedState::Uninitialized,
+            }),
+        };
+        base_mismatch
+            .validate_for(&update)
+            .expect("uninitialized is an explicit base-mismatch observation");
+
+        let unexpected_observation = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Nack(RenderApplicationNack {
+                reason: RenderApplicationNackReason::ApplicationFailure {
+                    stage: RenderApplicationStage::Commit,
+                },
+                observed_state: RenderApplicationObservedState::Applied(
+                    update.identity.resulting_state,
+                ),
+            }),
+        };
+        assert_eq!(
+            unexpected_observation.validate_for(&update),
+            Err(RenderApplicationContractError::NackHasUnexpectedObservedState)
+        );
+
+        let invalid_observation = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Nack(RenderApplicationNack {
+                reason: RenderApplicationNackReason::DetectedGap,
+                observed_state: RenderApplicationObservedState::Applied(RenderStateIdentity {
+                    render_generation: 0,
+                    state_sequence: 1,
+                }),
+            }),
+        };
+        assert_eq!(
+            invalid_observation.validate_for(&update),
+            Err(RenderApplicationContractError::InvalidObservedState)
+        );
     }
 
     #[test]
