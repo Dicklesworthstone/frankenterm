@@ -945,9 +945,15 @@ impl TopologyStreamCoordinator {
                 let subscription = state
                     .subscription
                     .context("coherent mux snapshot completed before subscription binding")?;
-                if snapshot.session_incarnation != subscription.session_incarnation
-                    || snapshot.snapshot_revision < subscription.baseline_revision
-                    || snapshot.snapshot_revision.get() == u64::MAX
+                let wrong_session_incarnation =
+                    snapshot.session_incarnation != subscription.session_incarnation;
+                let snapshot_predates_subscription =
+                    snapshot.snapshot_revision < subscription.baseline_revision;
+                let revision_namespace_exhausted =
+                    snapshot.snapshot_revision.get() == u64::MAX;
+                if wrong_session_incarnation
+                    || snapshot_predates_subscription
+                    || revision_namespace_exhausted
                 {
                     self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
                     anyhow::bail!(
@@ -1052,10 +1058,7 @@ impl TopologyStreamCoordinator {
         &self,
         established: &mut EstablishedTopologyStream,
     ) -> anyhow::Result<()> {
-        loop {
-            let Some(next_revision) = established.next_revision else {
-                break;
-            };
+        while let Some(next_revision) = established.next_revision {
             let Some(event) = established.buffer.remove(next_revision)? else {
                 break;
             };
@@ -3785,6 +3788,48 @@ mod tests {
         };
         assert_eq!(event.revision, TopologyRevision::new(2));
         assert!(item_rx.is_empty());
+    }
+
+    #[test]
+    fn coherent_snapshot_cannot_predate_its_subscription_baseline() {
+        let (item_tx, item_rx) = bounded(DISPATCH_ITEM_QUEUE_CAPACITY);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let stream_id = TopologyStreamId::from_bytes([0x5b; 16]);
+        let session_incarnation = MuxSessionIncarnation::from_bytes([0xa6; 16]);
+        let coordinator = TopologyStreamCoordinator::new(item_tx, terminal, stream_id);
+        coordinator
+            .bind_subscription(session_incarnation, TopologyRevision::new(5))
+            .expect("bind topology subscription at revision five");
+        coordinator
+            .begin_fence(44, &fenced_snapshot_request())
+            .expect("begin coherent topology fence");
+
+        let error = coordinator
+            .queue_response(DecodedPdu {
+                serial: 44,
+                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                    stream_id,
+                    session_incarnation,
+                    TopologyRevision::new(4),
+                )),
+            })
+            .expect_err("a snapshot older than subscription admission must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not match the connection subscription")
+        );
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("pre-baseline snapshot must trip the connection"),
+            TOPOLOGY_PROTOCOL_FAILURE
+        );
+        assert!(
+            item_rx.is_empty(),
+            "an invalid snapshot must not become observable on the wire"
+        );
     }
 
     #[test]

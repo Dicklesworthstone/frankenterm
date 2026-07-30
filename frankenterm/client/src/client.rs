@@ -3150,18 +3150,11 @@ impl ClientTopologyCoordinator {
     ) -> anyhow::Result<Vec<DecodedPdu>> {
         let mut routed = Vec::new();
         let mut needs_resync = false;
-        loop {
-            let Some(next_revision) = established.next_revision else {
-                break;
-            };
+        while let Some(next_revision) = established.next_revision {
             let Some(event) = established.events.remove(next_revision)? else {
                 break;
             };
-            match topology_event_to_legacy_unilateral(event) {
-                TopologyEventDispatch::Unilateral(decoded) => routed.push(decoded),
-                TopologyEventDispatch::Resync => needs_resync = true,
-                TopologyEventDispatch::Noop => {}
-            }
+            needs_resync |= append_topology_event_to_legacy_unilaterals(event, &mut routed);
             metrics::counter!(
                 "mux.client.topology_fence.events.total",
                 "outcome" => "replayed"
@@ -3220,19 +3213,16 @@ fn is_legacy_topology_pdu(pdu: &Pdu) -> bool {
     )
 }
 
-enum TopologyEventDispatch {
-    Unilateral(DecodedPdu),
-    Resync,
-    Noop,
-}
-
-fn topology_event_to_legacy_unilateral(event: TopologyEvent) -> TopologyEventDispatch {
+fn append_topology_event_to_legacy_unilaterals(
+    event: TopologyEvent,
+    routed: &mut Vec<DecodedPdu>,
+) -> bool {
     let pdu = match event.event {
         TopologyEventKind::PaneAdded { .. }
         | TopologyEventKind::WindowCreated { .. }
         | TopologyEventKind::WindowRemoved { .. }
-        | TopologyEventKind::WindowInvalidated { .. } => return TopologyEventDispatch::Resync,
-        TopologyEventKind::Empty => return TopologyEventDispatch::Noop,
+        | TopologyEventKind::WindowInvalidated { .. } => return true,
+        TopologyEventKind::Empty => return false,
         TopologyEventKind::PaneRemoved { pane_id } => {
             Pdu::PaneRemoved(codec::PaneRemoved { pane_id })
         }
@@ -3247,7 +3237,7 @@ fn topology_event_to_legacy_unilateral(event: TopologyEvent) -> TopologyEventDis
             workspace: None, ..
         }
         | TopologyEventKind::TabAddedToWindow { .. }
-        | TopologyEventKind::TabResized { .. } => return TopologyEventDispatch::Resync,
+        | TopologyEventKind::TabResized { .. } => return true,
         TopologyEventKind::PaneFocused { pane_id } => {
             Pdu::PaneFocused(codec::PaneFocused { pane_id })
         }
@@ -3265,7 +3255,8 @@ fn topology_event_to_legacy_unilateral(event: TopologyEvent) -> TopologyEventDis
             new_workspace,
         }),
     };
-    TopologyEventDispatch::Unilateral(DecodedPdu { pdu, serial: 0 })
+    routed.push(DecodedPdu { pdu, serial: 0 });
+    false
 }
 
 #[derive(Default)]
@@ -9833,7 +9824,8 @@ mod tests {
                 .expect_err("reserved topology authority must be rejected");
             assert!(
                 error.to_string().contains(expected),
-                "unexpected malformed-event error: {error:#}",
+                "unexpected malformed-event error: {:#}",
+                error,
             );
         }
 
