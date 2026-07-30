@@ -1171,6 +1171,312 @@ mod pane_registration_handle {
         }
     }
 
+    /// Non-cloneable authority for one admitted pane operation.
+    ///
+    /// Unlike [`PaneRegistrationHandle`], this guard owns the exact pane and
+    /// mux for the complete operation and holds the generation lease until it
+    /// is dropped.  Retirement may remove the pane's numeric registry slot
+    /// after admission, but it cannot redirect this guard to a successor or
+    /// finish exact-generation cleanup while the operation is in flight.
+    pub struct PaneOperationGuard {
+        owner: Arc<Mux>,
+        pane: Arc<dyn Pane>,
+        generation: Arc<PaneRegistrationGeneration>,
+        retirement: Arc<PaneRetirementTracker>,
+        _operation: PaneRegistrationOperationLease,
+    }
+
+    impl std::fmt::Debug for PaneOperationGuard {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("PaneOperationGuard")
+                .field("pane_id", &self.generation.pane_id)
+                .field(
+                    "generation",
+                    &(Arc::as_ptr(&self.generation) as *const () as usize),
+                )
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl PaneOperationGuard {
+        pub fn pane_id(&self) -> PaneId {
+            self.generation.pane_id
+        }
+
+        pub fn same_registration(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.owner, &other.owner)
+                && Arc::ptr_eq(&self.pane, &other.pane)
+                && Arc::ptr_eq(&self.generation, &other.generation)
+                && Arc::ptr_eq(&self.retirement, &other.retirement)
+        }
+
+        pub fn belongs_to(&self, owner: &Arc<Mux>) -> bool {
+            Arc::ptr_eq(&self.owner, owner)
+        }
+
+        pub fn is_same_pane(&self, pane: &Arc<dyn Pane>) -> bool {
+            Arc::ptr_eq(&self.pane, pane)
+        }
+
+        /// Borrow the exact pane only for the duration of `f`.
+        ///
+        /// The closure cannot retain the pane `Arc`, so exact authority remains
+        /// scoped to this non-cloneable guard.
+        pub fn with_pane<R>(&self, f: impl FnOnce(&dyn Pane) -> R) -> R {
+            f(self.pane.as_ref())
+        }
+
+        pub fn registration(&self) -> PaneRegistrationHandle {
+            PaneRegistrationHandle::new(&self.pane, &self.generation)
+        }
+
+        pub(crate) fn owner(&self) -> &Arc<Mux> {
+            &self.owner
+        }
+
+        pub(crate) fn pane(&self) -> &Arc<dyn Pane> {
+            &self.pane
+        }
+
+        pub(crate) fn exact_location(&self) -> anyhow::Result<(DomainId, WindowId, Arc<Tab>)> {
+            let domain_id = self.pane.domain_id();
+            for window_id in self.owner.iter_windows() {
+                let Some(window) = self.owner.get_window(window_id) else {
+                    continue;
+                };
+                for tab in window.iter() {
+                    if tab
+                        .iter_all_panes()
+                        .iter()
+                        .any(|candidate| Arc::ptr_eq(candidate, &self.pane))
+                    {
+                        return Ok((domain_id, window_id, Arc::clone(tab)));
+                    }
+                }
+            }
+            Err(anyhow!(
+                "exact pane registration {} is not attached to a tab",
+                self.pane_id()
+            ))
+        }
+
+        pub fn capture_split_receipt(
+            &self,
+            pane: Arc<dyn Pane>,
+            tab: Arc<Tab>,
+            window_id: WindowId,
+            size: TerminalSize,
+        ) -> anyhow::Result<SplitCommitReceipt> {
+            anyhow::ensure!(
+                self.owner
+                    .get_window(window_id)
+                    .is_some_and(|window| window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))),
+                "window {window_id} does not contain exact split tab {}",
+                tab.tab_id()
+            );
+            let panes = tab.iter_all_panes();
+            anyhow::ensure!(
+                panes
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &self.pane)),
+                "split tab {} no longer contains exact target registration {}",
+                tab.tab_id(),
+                self.pane_id()
+            );
+            anyhow::ensure!(
+                panes
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &pane)),
+                "split tab {} does not contain exact committed pane {}",
+                tab.tab_id(),
+                pane.pane_id()
+            );
+            let registration = self
+                .owner
+                .capture_pane_registration(&pane)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "committed split pane {} has no exact mux registration",
+                        pane.pane_id()
+                    )
+                })?;
+            Ok(SplitCommitReceipt::from_exact_parts(
+                pane,
+                registration,
+                tab,
+                window_id,
+                size,
+            ))
+        }
+
+        pub fn capture_move_receipt(
+            &self,
+            tab: Arc<Tab>,
+            window_id: WindowId,
+        ) -> anyhow::Result<MoveCommitReceipt> {
+            anyhow::ensure!(
+                self.owner
+                    .get_window(window_id)
+                    .is_some_and(|window| window.iter().any(|candidate| Arc::ptr_eq(candidate, &tab))),
+                "window {window_id} does not contain exact moved tab {}",
+                tab.tab_id()
+            );
+            anyhow::ensure!(
+                tab.iter_all_panes()
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &self.pane)),
+                "moved tab {} does not contain exact pane registration {}",
+                tab.tab_id(),
+                self.pane_id()
+            );
+            Ok(MoveCommitReceipt::from_exact_parts(
+                Arc::clone(&self.pane),
+                self.registration(),
+                tab,
+                window_id,
+            ))
+        }
+    }
+
+    /// Exact local result of a committed split.
+    pub struct SplitCommitReceipt {
+        pane: Arc<dyn Pane>,
+        registration: PaneRegistrationHandle,
+        tab: Arc<Tab>,
+        window_id: WindowId,
+        size: TerminalSize,
+    }
+
+    impl std::fmt::Debug for SplitCommitReceipt {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("SplitCommitReceipt")
+                .field("pane_id", &self.pane_id())
+                .field("tab_id", &self.tab_id())
+                .field("window_id", &self.window_id)
+                .field("size", &self.size)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl SplitCommitReceipt {
+        pub(crate) fn from_exact_parts(
+            pane: Arc<dyn Pane>,
+            registration: PaneRegistrationHandle,
+            tab: Arc<Tab>,
+            window_id: WindowId,
+            size: TerminalSize,
+        ) -> Self {
+            debug_assert_eq!(pane.pane_id(), registration.pane_id());
+            Self {
+                pane,
+                registration,
+                tab,
+                window_id,
+                size,
+            }
+        }
+
+        pub fn pane_id(&self) -> PaneId {
+            self.registration.pane_id()
+        }
+
+        pub fn tab_id(&self) -> TabId {
+            self.tab.tab_id()
+        }
+
+        pub fn window_id(&self) -> WindowId {
+            self.window_id
+        }
+
+        pub fn size(&self) -> TerminalSize {
+            self.size
+        }
+
+        pub fn registration(&self) -> PaneRegistrationHandle {
+            self.registration.clone()
+        }
+
+        pub fn with_pane<R>(&self, f: impl FnOnce(&dyn Pane) -> R) -> R {
+            f(self.pane.as_ref())
+        }
+
+        pub(crate) fn into_legacy_parts(
+            self,
+        ) -> (Arc<dyn Pane>, TerminalSize, WindowId, TabId) {
+            (self.pane, self.size, self.window_id, self.tab.tab_id())
+        }
+    }
+
+    /// Exact local result of a committed move to a tab.
+    pub struct MoveCommitReceipt {
+        pane: Arc<dyn Pane>,
+        registration: PaneRegistrationHandle,
+        tab: Arc<Tab>,
+        window_id: WindowId,
+        size: TerminalSize,
+    }
+
+    impl std::fmt::Debug for MoveCommitReceipt {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("MoveCommitReceipt")
+                .field("pane_id", &self.pane_id())
+                .field("tab_id", &self.tab_id())
+                .field("window_id", &self.window_id)
+                .field("size", &self.size)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl MoveCommitReceipt {
+        pub(crate) fn from_exact_parts(
+            pane: Arc<dyn Pane>,
+            registration: PaneRegistrationHandle,
+            tab: Arc<Tab>,
+            window_id: WindowId,
+        ) -> Self {
+            debug_assert_eq!(pane.pane_id(), registration.pane_id());
+            let size = tab.get_size();
+            Self {
+                pane,
+                registration,
+                tab,
+                window_id,
+                size,
+            }
+        }
+
+        pub fn pane_id(&self) -> PaneId {
+            self.registration.pane_id()
+        }
+
+        pub fn tab_id(&self) -> TabId {
+            self.tab.tab_id()
+        }
+
+        pub fn window_id(&self) -> WindowId {
+            self.window_id
+        }
+
+        pub fn size(&self) -> TerminalSize {
+            self.size
+        }
+
+        pub fn registration(&self) -> PaneRegistrationHandle {
+            self.registration.clone()
+        }
+
+        pub fn with_pane<R>(&self, f: impl FnOnce(&dyn Pane) -> R) -> R {
+            f(self.pane.as_ref())
+        }
+
+        pub(crate) fn into_legacy_parts(self) -> (Arc<Tab>, WindowId) {
+            (self.tab, self.window_id)
+        }
+    }
+
     impl PaneRegistrationHandle {
         pub(super) fn new(
             pane: &Arc<dyn Pane>,
@@ -1189,6 +1495,38 @@ mod pane_registration_handle {
         pub fn same_registration(&self, other: &Self) -> bool {
             Weak::ptr_eq(&self.pane, &other.pane)
                 && Arc::ptr_eq(&self.generation, &other.generation)
+        }
+
+        /// Acquire non-cloneable exact authority for a complete pane operation.
+        pub fn operation_guard(&self, expected_owner: &Arc<Mux>) -> Option<PaneOperationGuard> {
+            let operation = self.generation.try_acquire()?;
+            let pane = self.pane.upgrade()?;
+            let owner = self.generation.owner.upgrade()?;
+            if !Arc::ptr_eq(&owner, expected_owner) {
+                return None;
+            }
+            let retirement = self.generation.retirement_tracker.upgrade()?;
+            if !Arc::ptr_eq(&retirement, &owner.pane_retirements) {
+                return None;
+            }
+            let is_current = {
+                let _registration = owner.pane_registration.lock();
+                owner
+                    .panes
+                    .read()
+                    .get(&self.generation.pane_id)
+                    .is_some_and(|registered| {
+                        Arc::ptr_eq(&registered.pane, &pane)
+                            && Arc::ptr_eq(&registered.generation, &self.generation)
+                    })
+            };
+            is_current.then_some(PaneOperationGuard {
+                owner,
+                pane,
+                generation: Arc::clone(&self.generation),
+                retirement,
+                _operation: operation,
+            })
         }
 
         /// Resolve the exact owner for mux-internal topology transactions.
@@ -1250,67 +1588,55 @@ mod pane_registration_handle {
             Some(result)
         }
 
-        /// Split this exact pane registration, optionally moving another exact
-        /// registered pane into the new split.
-        pub async fn split_if_current(
+        /// Spawn a split beside this exact pane registration.
+        pub async fn split_spawned_if_current(
             &self,
             expected_owner: &Arc<Mux>,
-            source_registration: Option<&Self>,
             request: SplitRequest,
-            source: SplitSource,
+            command: Option<CommandBuilder>,
+            command_dir: Option<String>,
             domain: config::keyassignment::SpawnTabDomain,
             client_id: Option<Arc<ClientId>>,
-        ) -> Option<anyhow::Result<(PaneId, TerminalSize, WindowId, TabId)>> {
-            let (operation, _pane, mux) = self.resolve_current()?;
-            if !Arc::ptr_eq(&mux, expected_owner) {
-                return None;
-            }
-            if matches!(
-                &source,
-                SplitSource::MovePane(source_id) if *source_id == self.pane_id()
-            ) {
-                return Some(Err(anyhow!(
-                    "cannot move pane {} into a split of itself",
-                    self.pane_id()
-                )));
-            }
-            let source_lease = match (&source, source_registration) {
-                (SplitSource::MovePane(source_id), Some(registration))
-                    if *source_id == registration.pane_id() =>
-                {
-                    let Some((operation, _pane, source_mux)) = registration.resolve_current()
-                    else {
-                        return Some(Err(anyhow!(
-                            "split source pane registration {source_id} is no longer current"
-                        )));
-                    };
-                    if !Arc::ptr_eq(&mux, &source_mux) {
-                        return Some(Err(anyhow!(
-                            "split source and target belong to different mux registrations"
-                        )));
-                    }
-                    Some((operation, source_mux))
-                }
-                (SplitSource::MovePane(source_id), _) => {
+        ) -> Option<anyhow::Result<SplitCommitReceipt>> {
+            let target = self.operation_guard(expected_owner)?;
+            Some(
+                expected_owner
+                    .split_pane_spawned(
+                        target,
+                        request,
+                        command,
+                        command_dir,
+                        domain,
+                        client_id,
+                    )
+                    .await,
+            )
+        }
+
+        /// Move another exact pane registration into a split beside this one.
+        pub async fn split_moved_if_current(
+            &self,
+            expected_owner: &Arc<Mux>,
+            source_registration: &Self,
+            request: SplitRequest,
+            domain: config::keyassignment::SpawnTabDomain,
+            client_id: Option<Arc<ClientId>>,
+        ) -> Option<anyhow::Result<SplitCommitReceipt>> {
+            let target = self.operation_guard(expected_owner)?;
+            let source = match source_registration.operation_guard(expected_owner) {
+                Some(source) => source,
+                None => {
                     return Some(Err(anyhow!(
-                        "missing exact registration for split source pane {source_id}"
-                    )));
-                }
-                (SplitSource::Spawn { .. }, None) => None,
-                (SplitSource::Spawn { .. }, Some(_)) => {
-                    return Some(Err(anyhow!(
-                        "unexpected pane registration for spawned split source"
+                        "split source pane registration {} is no longer current",
+                        source_registration.pane_id()
                     )));
                 }
             };
-            let result = mux
-                .split_pane(self.pane_id(), request, source, domain, client_id)
-                .await
-                .map(|(pane, size, window_id, tab_id)| (pane.pane_id(), size, window_id, tab_id));
-            drop(source_lease);
-            drop(mux);
-            drop(operation);
-            Some(result)
+            Some(
+                expected_owner
+                    .split_pane_moved(target, source, request, domain, client_id)
+                    .await,
+            )
         }
 
         /// Move only this exact pane registration to a new tab.
@@ -1320,24 +1646,18 @@ mod pane_registration_handle {
             window_id: Option<WindowId>,
             workspace_for_new_window: Option<String>,
             client_id: Option<Arc<ClientId>>,
-        ) -> Option<anyhow::Result<(TabId, WindowId)>> {
-            let (operation, _pane, mux) = self.resolve_current()?;
-            if !Arc::ptr_eq(&mux, expected_owner) {
-                return None;
-            }
-            if client_id
-                .as_ref()
-                .is_some_and(|client_id| !mux.client_registration_is_current(client_id))
-            {
-                return Some(Err(anyhow!("client registration is no longer current")));
-            }
-            let result = mux
-                .move_pane_to_new_tab(self.pane_id(), window_id, workspace_for_new_window)
-                .await
-                .map(|(tab, window_id)| (tab.tab_id(), window_id));
-            drop(mux);
-            drop(operation);
-            Some(result)
+        ) -> Option<anyhow::Result<MoveCommitReceipt>> {
+            let target = self.operation_guard(expected_owner)?;
+            Some(
+                expected_owner
+                    .move_pane_to_new_tab_guarded(
+                        target,
+                        window_id,
+                        workspace_for_new_window,
+                        client_id,
+                    )
+                    .await,
+            )
         }
 
         /// Reserve exact-generation output authority before mutating the pane.
@@ -1785,7 +2105,8 @@ mod pane_registration_handle {
 }
 
 pub use pane_registration_handle::{
-    CurrentPane, CurrentPaneOutput, PaneRegistrationHandle, PaneRegistrationSlot,
+    CurrentPane, CurrentPaneOutput, MoveCommitReceipt, PaneOperationGuard,
+    PaneRegistrationHandle, PaneRegistrationSlot, SplitCommitReceipt,
 };
 
 struct PanePreparation {
@@ -4620,6 +4941,18 @@ impl Mux {
             .map(|registered| PaneRegistrationHandle::new(&registered.pane, &registered.generation))
     }
 
+    /// Admit one complete operation against the exact current registration.
+    ///
+    /// The returned guard owns the pane and mux and cannot be cloned.  Callers
+    /// should capture it before scheduling or awaiting deferred mutation work.
+    pub fn capture_pane_operation(
+        self: &Arc<Self>,
+        pane_id: PaneId,
+    ) -> Option<PaneOperationGuard> {
+        self.capture_current_pane(pane_id)?
+            .operation_guard(self)
+    }
+
     #[cfg(test)]
     fn remove_pane_registration_if_same(&self, pane_id: PaneId, expected: &Arc<dyn Pane>) -> bool {
         let mut panes = self.panes.write();
@@ -6291,6 +6624,31 @@ impl Mux {
         Ok(domain)
     }
 
+    fn resolve_spawn_tab_domain_for_operation(
+        &self,
+        target: &PaneOperationGuard,
+        domain: &config::keyassignment::SpawnTabDomain,
+    ) -> anyhow::Result<Arc<dyn Domain>> {
+        if !std::ptr::eq(target.owner().as_ref(), self) {
+            anyhow::bail!(
+                "pane operation guard {} belongs to another mux",
+                target.pane_id()
+            );
+        }
+        match domain {
+            SpawnTabDomain::CurrentPaneDomain => {
+                let domain_id = target.with_pane(|pane| pane.domain_id());
+                self.get_domain(domain_id).ok_or_else(|| {
+                    anyhow!(
+                        "exact pane registration {} resolved to missing domain id {domain_id}",
+                        target.pane_id()
+                    )
+                })
+            }
+            _ => self.resolve_spawn_tab_domain(None, domain),
+        }
+    }
+
     fn resolve_cwd(
         &self,
         command_dir: Option<String>,
@@ -6332,24 +6690,58 @@ impl Mux {
         domain: config::keyassignment::SpawnTabDomain,
         owner_client_id: Option<Arc<ClientId>>,
     ) -> anyhow::Result<(Arc<dyn Pane>, TerminalSize, WindowId, TabId)> {
-        if matches!(
-            &source,
-            SplitSource::MovePane(move_pane_id) if *move_pane_id == source_pane_id
-        ) {
-            anyhow::bail!("cannot move pane {source_pane_id} into a split of itself");
-        }
+        let target = self
+            .capture_pane_operation(source_pane_id)
+            .ok_or_else(|| anyhow!("pane_id {source_pane_id} is not a current registration"))?;
+        let receipt = match source {
+            SplitSource::Spawn {
+                command,
+                command_dir,
+            } => {
+                self.split_pane_spawned(
+                    target,
+                    request,
+                    command,
+                    command_dir,
+                    domain,
+                    owner_client_id,
+                )
+                .await?
+            }
+            SplitSource::MovePane(move_pane_id) => {
+                let source = self.capture_pane_operation(move_pane_id).ok_or_else(|| {
+                    anyhow!("move pane_id {move_pane_id} is not a current registration")
+                })?;
+                self.split_pane_moved(target, source, request, domain, owner_client_id)
+                    .await?
+            }
+        };
+        Ok(receipt.into_legacy_parts())
+    }
+
+    pub async fn split_pane_spawned(
+        self: &Arc<Self>,
+        target: PaneOperationGuard,
+        request: SplitRequest,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+        domain: config::keyassignment::SpawnTabDomain,
+        owner_client_id: Option<Arc<ClientId>>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(self),
+            "split target registration {} belongs to another mux",
+            target.pane_id()
+        );
         if owner_client_id
             .as_ref()
             .is_some_and(|client_id| !self.client_registration_is_current(client_id))
         {
             anyhow::bail!("client registration is no longer current");
         }
-        let (_pane_domain_id, window_id, tab_id) = self
-            .resolve_pane_id(source_pane_id)
-            .ok_or_else(|| anyhow!("pane_id {} invalid", source_pane_id))?;
-
+        let (_pane_domain_id, window_id, _tab) = target.exact_location()?;
         let domain = self
-            .resolve_spawn_tab_domain(Some(source_pane_id), &domain)
+            .resolve_spawn_tab_domain_for_operation(&target, &domain)
             .context("resolve_spawn_tab_domain")?;
 
         if domain.state() == DomainState::Detached {
@@ -6358,45 +6750,52 @@ impl Mux {
                 .await?;
         }
 
-        let current_pane = self
-            .get_pane(source_pane_id)
-            .ok_or_else(|| anyhow!("pane_id {} is invalid", source_pane_id))?;
-        let term_config = current_pane.get_config();
+        let command_dir = self.resolve_cwd(
+            command_dir,
+            Some(Arc::clone(target.pane())),
+            domain.domain_id(),
+            CachePolicy::FetchImmediate,
+        );
+        domain
+            .split_pane_spawned(self, &target, request, command, command_dir)
+            .await
+    }
 
-        let source = match source {
-            SplitSource::Spawn {
-                command,
-                command_dir,
-            } => SplitSource::Spawn {
-                command,
-                command_dir: self.resolve_cwd(
-                    command_dir,
-                    Some(Arc::clone(&current_pane)),
-                    domain.domain_id(),
-                    CachePolicy::FetchImmediate,
-                ),
-            },
-            other => other,
-        };
-
-        let pane = domain
-            .split_pane(self, source, tab_id, source_pane_id, request)
-            .await?;
-        if let Some(config) = term_config {
-            pane.set_config(config);
+    pub async fn split_pane_moved(
+        self: &Arc<Self>,
+        target: PaneOperationGuard,
+        source: PaneOperationGuard,
+        request: SplitRequest,
+        domain: config::keyassignment::SpawnTabDomain,
+        owner_client_id: Option<Arc<ClientId>>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(self) && source.belongs_to(self),
+            "split source and target must belong to the originating mux"
+        );
+        anyhow::ensure!(
+            !target.same_registration(&source),
+            "cannot move pane {} into a split of itself",
+            target.pane_id()
+        );
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|client_id| !self.client_registration_is_current(client_id))
+        {
+            anyhow::bail!("client registration is no longer current");
         }
-
-        let dims = pane.get_dimensions();
-
-        let size = TerminalSize {
-            cols: dims.cols,
-            rows: dims.viewport_rows,
-            pixel_height: dims.pixel_height,
-            pixel_width: dims.pixel_width,
-            dpi: dims.dpi,
-        };
-
-        Ok((pane, size, window_id, tab_id))
+        let (_pane_domain_id, window_id, _tab) = target.exact_location()?;
+        let domain = self
+            .resolve_spawn_tab_domain_for_operation(&target, &domain)
+            .context("resolve_spawn_tab_domain")?;
+        if domain.state() == DomainState::Detached {
+            domain
+                .attach(self, owner_client_id, Some(window_id))
+                .await?;
+        }
+        domain
+            .split_pane_moved(self, &target, &source, request)
+            .await
     }
 
     pub async fn move_pane_to_new_tab(
@@ -6405,25 +6804,59 @@ impl Mux {
         window_id: Option<WindowId>,
         workspace_for_new_window: Option<String>,
     ) -> anyhow::Result<(Arc<Tab>, WindowId)> {
-        let (domain_id, _src_window, src_tab) = self
-            .resolve_pane_id(pane_id)
-            .ok_or_else(|| anyhow::anyhow!("pane {} not found", pane_id))?;
+        let target = self
+            .capture_pane_operation(pane_id)
+            .ok_or_else(|| anyhow!("pane {pane_id} is not a current registration"))?;
+        Ok(self
+            .move_pane_to_new_tab_guarded(
+                target,
+                window_id,
+                workspace_for_new_window,
+                None,
+            )
+            .await?
+            .into_legacy_parts())
+    }
 
+    pub async fn move_pane_to_new_tab_guarded(
+        self: &Arc<Self>,
+        target: PaneOperationGuard,
+        window_id: Option<WindowId>,
+        workspace_for_new_window: Option<String>,
+        owner_client_id: Option<Arc<ClientId>>,
+    ) -> anyhow::Result<MoveCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(self),
+            "move target registration {} belongs to another mux",
+            target.pane_id()
+        );
+        if owner_client_id
+            .as_ref()
+            .is_some_and(|client_id| !self.client_registration_is_current(client_id))
+        {
+            anyhow::bail!("client registration is no longer current");
+        }
+        let (domain_id, _src_window, src_tab) = target.exact_location()?;
         let domain = self
             .get_domain(domain_id)
-            .ok_or_else(|| anyhow::anyhow!("domain {domain_id} of pane {pane_id} not found"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "domain {domain_id} of exact pane registration {} not found",
+                    target.pane_id()
+                )
+            })?;
 
-        if let Some((tab, window_id)) = domain
-            .move_pane_to_new_tab(self, pane_id, window_id, workspace_for_new_window.clone())
+        if let Some(receipt) = domain
+            .move_pane_to_new_tab(
+                self,
+                &target,
+                window_id,
+                workspace_for_new_window.clone(),
+            )
             .await?
         {
-            return Ok((tab, window_id));
+            return Ok(receipt);
         }
-
-        let src_tab = match self.get_tab(src_tab) {
-            Some(t) => t,
-            None => anyhow::bail!("Invalid tab id {}", src_tab),
-        };
 
         let window_builder;
         let (window_id, size) = if let Some(window_id) = window_id {
@@ -6442,20 +6875,33 @@ impl Mux {
         };
 
         let pane = src_tab
-            .remove_pane(pane_id)
-            .ok_or_else(|| anyhow::anyhow!("pane {} wasn't in its containing tab!?", pane_id))?;
+            .remove_exact_pane_for_move(self, target.pane())
+            .ok_or_else(|| {
+                anyhow!(
+                    "exact pane registration {} was not in its containing tab",
+                    target.pane_id()
+                )
+            })?;
 
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
         pane.resize(size)?;
-        self.add_tab_and_active_pane(&tab)?;
+        // The pane already has exact operation authority. Its numeric registry
+        // slot may have been retired after admission, so committing the new
+        // tab must not attempt to re-register or re-authorize it.
+        self.add_tab_no_panes(&tab)?;
         self.add_tab_to_window(&tab, window_id)?;
 
         if src_tab.is_dead() {
             self.remove_tab(src_tab.tab_id());
         }
 
-        Ok((tab, window_id))
+        Ok(MoveCommitReceipt::from_exact_parts(
+            pane,
+            target.registration(),
+            tab,
+            window_id,
+        ))
     }
 
     pub async fn spawn_tab_or_window(
@@ -7039,6 +7485,66 @@ mod tests {
         }
     }
 
+    struct GuardedMutationTestDomain {
+        next_spawned_pane: Mutex<Option<Arc<dyn Pane>>>,
+    }
+
+    impl GuardedMutationTestDomain {
+        fn new(next_spawned_pane: Option<Arc<dyn Pane>>) -> Self {
+            Self {
+                next_spawned_pane: Mutex::new(next_spawned_pane),
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Domain for GuardedMutationTestDomain {
+        async fn spawn_pane(
+            &self,
+            mux: &Arc<Mux>,
+            _size: TerminalSize,
+            _command: Option<CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            let pane = self
+                .next_spawned_pane
+                .lock()
+                .take()
+                .ok_or_else(|| anyhow!("test domain has no prepared pane"))?;
+            mux.add_pane(&pane)?;
+            Ok(pane)
+        }
+
+        fn detachable(&self) -> bool {
+            false
+        }
+
+        fn domain_id(&self) -> DomainId {
+            1
+        }
+
+        fn domain_name(&self) -> &str {
+            "guarded-mutation-test"
+        }
+
+        async fn attach(
+            &self,
+            _mux: &Arc<Mux>,
+            _owner_client_id: Option<Arc<ClientId>>,
+            _window_id: Option<WindowId>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detach(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn state(&self) -> DomainState {
+            DomainState::Attached
+        }
+    }
+
     struct RegistrationObservingReader {
         mux: Arc<Mux>,
         pane_id: PaneId,
@@ -7102,6 +7608,21 @@ mod tests {
         mux.add_pane(&pane)
             .expect("test pane should register with mux");
         pane
+    }
+
+    fn register_attached_test_pane(
+        mux: &Arc<Mux>,
+        pane: &Arc<dyn Pane>,
+    ) -> (Arc<Tab>, WindowId) {
+        let tab = Arc::new(Tab::new(&test_size()));
+        tab.assign_pane(pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("test pane and tab should register atomically");
+        let window = mux.new_empty_window(None, None);
+        let window_id = *window;
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("test tab should attach to its exact window");
+        (tab, window_id)
     }
 
     fn pane_with_blocked_reader(
@@ -7862,11 +8383,10 @@ mod tests {
             raw_error,
         );
 
-        let error = promise::spawn::block_on(registration.split_if_current(
+        let error = promise::spawn::block_on(registration.split_moved_if_current(
             &mux,
-            Some(&registration),
+            &registration,
             SplitRequest::default(),
-            SplitSource::MovePane(159),
             SpawnTabDomain::CurrentPaneDomain,
             None,
         ))
@@ -7888,6 +8408,412 @@ mod tests {
             registration.try_with_current(|current| current.pane_id()),
             Some(159),
         );
+    }
+
+    #[test]
+    fn pane_operation_guard_fences_same_and_different_arc_replacements_after_retirement() {
+        for (pane_id, reuse_same_arc) in [(160, true), (161, false)] {
+            let mux = Arc::new(Mux::new(None));
+            let (pane, kills) = KillCountingPane::new(pane_id, test_size());
+            let (tab, window_id) = register_attached_test_pane(&mux, &pane);
+            let registration = mux
+                .capture_pane_registration(&pane)
+                .expect("attached pane should yield an exact registration");
+            let guard = registration
+                .operation_guard(&mux)
+                .expect("live registration should admit an operation guard");
+
+            assert!(
+                registration.retire_if_current(),
+                "retirement must remove the numeric registry mapping after admission"
+            );
+            assert!(mux.get_pane(pane_id).is_none());
+            assert_eq!(
+                kills.load(Ordering::SeqCst),
+                0,
+                "retirement cleanup must not overtake the admitted guard"
+            );
+            assert_eq!(registration.active_operation_count(), 1);
+
+            let (_domain_id, guarded_window_id, guarded_tab) = guard
+                .exact_location()
+                .expect("the guard must retain exact topology authority after registry removal");
+            assert_eq!(guarded_window_id, window_id);
+            assert!(Arc::ptr_eq(&guarded_tab, &tab));
+            guard.with_pane(|current| {
+                assert!(std::ptr::eq(current, pane.as_ref()));
+                assert!(mux.pane_registration.try_lock().is_some());
+                assert!(mux.panes.try_write().is_some());
+                assert!(mux.windows.try_write().is_some());
+                assert!(tab.topology_lock_is_available_for_test());
+            });
+
+            let (different_arc, different_kills) =
+                KillCountingPane::new(pane_id, test_size());
+            let replacement = if reuse_same_arc {
+                Arc::clone(&pane)
+            } else {
+                Arc::clone(&different_arc)
+            };
+            assert!(
+                mux.add_pane(&replacement).is_err(),
+                "same-ID replacement must remain fenced while the guard is live"
+            );
+
+            drop(guard);
+            assert_eq!(registration.active_operation_count(), 0);
+            assert_eq!(
+                kills.load(Ordering::SeqCst),
+                1,
+                "dropping the final guard must complete exact retirement"
+            );
+            mux.remove_tab(tab.tab_id());
+            mux.add_pane(&replacement)
+                .expect("replacement may register after the exact guard quiesces");
+            if !reuse_same_arc {
+                assert_eq!(
+                    different_kills.load(Ordering::SeqCst),
+                    0,
+                    "old-generation cleanup must not touch a different-Arc successor"
+                );
+                assert!(mux
+                    .get_pane(pane_id)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &different_arc)));
+            }
+        }
+    }
+
+    #[test]
+    fn pane_operation_guard_uses_origin_mux_after_global_swap_and_allows_reentrancy() {
+        let _global = global_test_lock();
+        Mux::shutdown();
+
+        let origin = Arc::new(Mux::new(None));
+        let replacement_mux = Arc::new(Mux::new(None));
+        let (origin_pane, origin_kills) = KillCountingPane::new(162, test_size());
+        let (replacement_pane, replacement_kills) = KillCountingPane::new(162, test_size());
+        let (origin_tab, origin_window_id) =
+            register_attached_test_pane(&origin, &origin_pane);
+        replacement_mux
+            .add_pane(&replacement_pane)
+            .expect("replacement mux may use the same numeric pane ID");
+        let registration = origin
+            .capture_pane_registration(&origin_pane)
+            .expect("origin registration");
+        let guard = registration
+            .operation_guard(&origin)
+            .expect("origin operation admission");
+
+        Mux::set_mux(&replacement_mux);
+        assert!(registration.retire_if_current());
+        guard.with_pane(|current| {
+            assert!(std::ptr::eq(current, origin_pane.as_ref()));
+            assert!(origin.pane_registration.try_lock().is_some());
+            assert!(origin.panes.try_write().is_some());
+            assert!(origin.windows.try_write().is_some());
+            assert!(origin_tab.topology_lock_is_available_for_test());
+        });
+        let (_domain_id, window_id, tab) = guard
+            .exact_location()
+            .expect("global mux replacement must not redirect exact topology");
+        assert_eq!(window_id, origin_window_id);
+        assert!(Arc::ptr_eq(&tab, &origin_tab));
+        assert!(guard.belongs_to(&origin));
+        assert!(!guard.belongs_to(&replacement_mux));
+        assert!(replacement_mux
+            .get_pane(162)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement_pane)));
+
+        drop(guard);
+        assert_eq!(origin_kills.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement_kills.load(Ordering::SeqCst), 0);
+        origin.remove_tab(origin_tab.tab_id());
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn cancelling_pending_operation_guard_future_releases_retirement_fence() {
+        let _global = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(163, test_size());
+        mux.add_pane(&pane).expect("guard cancellation registration");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("guard cancellation handle");
+        let guard = registration
+            .operation_guard(&mux)
+            .expect("guard cancellation admission");
+        let mut pending = Box::pin(async move {
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(pending.as_mut(), &mut context).is_pending());
+
+        assert!(registration.retire_if_current());
+        let (replacement, _) = KillCountingPane::new(163, test_size());
+        assert!(mux.add_pane(&replacement).is_err());
+        assert_eq!(registration.active_operation_count(), 1);
+
+        drop(pending);
+        executor.run_until(Duration::from_secs(5), || kills.load(Ordering::SeqCst) == 1);
+        assert_eq!(registration.active_operation_count(), 0);
+        mux.add_pane(&replacement)
+            .expect("future cancellation must release the replacement fence");
+    }
+
+    #[test]
+    fn panicking_operation_guard_scope_releases_retirement_fence() {
+        let _global = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(164, test_size());
+        mux.add_pane(&pane).expect("guard panic registration");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("guard panic handle");
+        let guard = registration
+            .operation_guard(&mux)
+            .expect("guard panic admission");
+        assert!(registration.retire_if_current());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            guard.with_pane::<()>(|_| panic!("intentional operation-guard panic"));
+        }));
+        assert!(result.is_err());
+        executor.run_until(Duration::from_secs(5), || kills.load(Ordering::SeqCst) == 1);
+        assert_eq!(registration.active_operation_count(), 0);
+
+        let (replacement, _) = KillCountingPane::new(164, test_size());
+        mux.add_pane(&replacement)
+            .expect("unwind must release the replacement fence");
+    }
+
+    #[test]
+    fn pane_operation_guard_retains_exact_objects_only_until_drop() {
+        let _global = global_test_lock();
+        let executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        let weak_mux = Arc::downgrade(&mux);
+        let (pane, kills) = KillCountingPane::new(165, test_size());
+        let weak_pane = Arc::downgrade(&pane);
+        let (tab, _window_id) = register_attached_test_pane(&mux, &pane);
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("collectability registration");
+        let guard = registration
+            .operation_guard(&mux)
+            .expect("collectability operation admission");
+        assert!(registration.retire_if_current());
+        mux.remove_tab(tab.tab_id());
+
+        drop(tab);
+        drop(pane);
+        drop(mux);
+        assert!(weak_mux.upgrade().is_some());
+        assert!(weak_pane.upgrade().is_some());
+
+        drop(guard);
+        executor.run_until(Duration::from_secs(5), || {
+            weak_mux.upgrade().is_none() && weak_pane.upgrade().is_none()
+        });
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert_eq!(registration.active_operation_count(), 0);
+    }
+
+    #[test]
+    fn prepared_split_pane_rolls_back_exact_registration_without_locks() {
+        let mux = Arc::new(Mux::new(None));
+        let weak_mux = Arc::downgrade(&mux);
+        let (pane, kills) =
+            KillCountingPane::new_with_kill_callback(166, test_size(), move || {
+                let mux = weak_mux
+                    .upgrade()
+                    .expect("rollback callback should observe the exact mux");
+                assert!(mux.pane_registration.try_lock().is_some());
+                assert!(mux.panes.try_write().is_some());
+                assert!(mux.pending_pane_lifecycle.try_lock().is_some());
+                assert!(mux.retiring_pane_ids.try_lock().is_some());
+            });
+        mux.add_pane(&pane).expect("prepared pane registration");
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("prepared pane handle");
+        let prepared =
+            domain::PreparedSplitPane::new(Arc::clone(&pane), registration.clone());
+
+        drop(prepared);
+
+        assert!(mux.get_pane(166).is_none());
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert_eq!(registration.active_operation_count(), 0);
+    }
+
+    #[test]
+    fn stale_prepared_split_rollback_preserves_exact_successor() {
+        let mux = Arc::new(Mux::new(None));
+        let (original, original_kills) = KillCountingPane::new(167, test_size());
+        let (replacement, replacement_kills) = KillCountingPane::new(167, test_size());
+        mux.add_pane(&original).expect("prepared original registration");
+        let registration = mux
+            .capture_pane_registration(&original)
+            .expect("prepared original handle");
+        let prepared =
+            domain::PreparedSplitPane::new(Arc::clone(&original), registration.clone());
+
+        assert!(registration.detach_local_if_current());
+        mux.add_pane(&replacement)
+            .expect("successor registration after exact local detach");
+        drop(prepared);
+
+        assert_eq!(original_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(replacement_kills.load(Ordering::SeqCst), 0);
+        assert!(mux
+            .get_pane(167)
+            .is_some_and(|pane| Arc::ptr_eq(&pane, &replacement)));
+    }
+
+    #[test]
+    fn guarded_spawned_split_survives_target_registry_detach_after_admission() {
+        let mux = Arc::new(Mux::new(None));
+        let (target, target_kills) = KillCountingPane::new(168, test_size());
+        let (spawned, spawned_kills) = KillCountingPane::new(169, test_size());
+        let (target_tab, target_window_id) = register_attached_test_pane(&mux, &target);
+        let domain: Arc<dyn Domain> =
+            Arc::new(GuardedMutationTestDomain::new(Some(Arc::clone(&spawned))));
+        mux.add_domain(&domain).expect("register test domain");
+
+        let target_registration = mux
+            .capture_pane_registration(&target)
+            .expect("target registration");
+        let target_guard = target_registration
+            .operation_guard(&mux)
+            .expect("target operation admission");
+        assert!(target_registration.detach_local_if_current());
+        assert!(mux.get_pane(target.pane_id()).is_none());
+
+        let receipt = promise::spawn::block_on(mux.split_pane_spawned(
+            target_guard,
+            SplitRequest::default(),
+            None,
+            None,
+            SpawnTabDomain::CurrentPaneDomain,
+            None,
+        ))
+        .expect("exact target authority must survive registry detach");
+
+        assert_eq!(receipt.pane_id(), spawned.pane_id());
+        assert_eq!(receipt.tab_id(), target_tab.tab_id());
+        assert_eq!(receipt.window_id(), target_window_id);
+        receipt.with_pane(|pane| assert!(std::ptr::eq(pane, spawned.as_ref())));
+        assert!(target_tab
+            .iter_all_panes()
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, &target)));
+        assert!(target_tab
+            .iter_all_panes()
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, &spawned)));
+        assert_eq!(target_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(spawned_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn guarded_moved_split_survives_both_registry_detaches_after_admission() {
+        let mux = Arc::new(Mux::new(None));
+        let (target, target_kills) = KillCountingPane::new(170, test_size());
+        let (source, source_kills) = KillCountingPane::new(171, test_size());
+        let (target_tab, target_window_id) = register_attached_test_pane(&mux, &target);
+        let (source_tab, _source_window_id) = register_attached_test_pane(&mux, &source);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain).expect("register test domain");
+
+        let target_registration = mux
+            .capture_pane_registration(&target)
+            .expect("target registration");
+        let source_registration = mux
+            .capture_pane_registration(&source)
+            .expect("source registration");
+        let target_guard = target_registration
+            .operation_guard(&mux)
+            .expect("target operation admission");
+        let source_guard = source_registration
+            .operation_guard(&mux)
+            .expect("source operation admission");
+        assert!(target_registration.detach_local_if_current());
+        assert!(source_registration.detach_local_if_current());
+
+        let receipt = promise::spawn::block_on(mux.split_pane_moved(
+            target_guard,
+            source_guard,
+            SplitRequest::default(),
+            SpawnTabDomain::CurrentPaneDomain,
+            None,
+        ))
+        .expect("exact source and target authority must survive registry detach");
+
+        assert_eq!(receipt.pane_id(), source.pane_id());
+        assert_eq!(receipt.tab_id(), target_tab.tab_id());
+        assert_eq!(receipt.window_id(), target_window_id);
+        assert!(receipt
+            .registration()
+            .same_registration(&source_registration));
+        receipt.with_pane(|pane| assert!(std::ptr::eq(pane, source.as_ref())));
+        assert!(mux.get_tab(source_tab.tab_id()).is_none());
+        assert!(target_tab
+            .iter_all_panes()
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, &target)));
+        assert!(target_tab
+            .iter_all_panes()
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, &source)));
+        assert_eq!(target_kills.load(Ordering::SeqCst), 0);
+        assert_eq!(source_kills.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn guarded_move_to_new_tab_never_reauthorizes_a_detached_registry_slot() {
+        let mux = Arc::new(Mux::new(None));
+        let (pane, kills) = KillCountingPane::new(172, test_size());
+        let (source_tab, _source_window_id) = register_attached_test_pane(&mux, &pane);
+        let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
+        mux.add_domain(&domain).expect("register test domain");
+
+        let registration = mux
+            .capture_pane_registration(&pane)
+            .expect("move registration");
+        let guard = registration
+            .operation_guard(&mux)
+            .expect("move operation admission");
+        assert!(registration.detach_local_if_current());
+        assert!(mux.get_pane(pane.pane_id()).is_none());
+
+        let receipt = promise::spawn::block_on(mux.move_pane_to_new_tab_guarded(
+            guard,
+            None,
+            Some("guarded-move-test".to_string()),
+            None,
+        ))
+        .expect("exact move authority must survive registry detach");
+
+        assert_eq!(receipt.pane_id(), pane.pane_id());
+        assert!(receipt.registration().same_registration(&registration));
+        receipt.with_pane(|current| assert!(std::ptr::eq(current, pane.as_ref())));
+        assert!(mux.get_tab(source_tab.tab_id()).is_none());
+        assert!(mux
+            .get_tab(receipt.tab_id())
+            .is_some_and(|tab| tab
+                .iter_all_panes()
+                .iter()
+                .any(|current| Arc::ptr_eq(current, &pane))));
+        assert!(
+            mux.get_pane(pane.pane_id()).is_none(),
+            "commit must not reconstruct registry authority from the raw pane ID"
+        );
+        assert_eq!(kills.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -8826,7 +9752,7 @@ mod tests {
     fn standalone_shared_mux_reader_delivers_output_and_exact_eof_cleanup() {
         let _guard = global_test_lock();
         Mux::shutdown();
-        let executor = promise::spawn::SimpleExecutor::new();
+        let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let reader = std::io::Cursor::new(b"x".to_vec());
         let (pane, _) =
@@ -8855,20 +9781,10 @@ mod tests {
 
         mux.add_pane(&pane)
             .expect("standalone shared mux should register a reader pane");
-        executor
-            .tick()
-            .expect("scheduled exact-owner output drain should run");
-        output_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("standalone mux must receive PaneOutput from its exact reader");
+        executor.run_until(Duration::from_secs(30), || output_rx.try_recv().is_ok());
         assert_eq!(actions.load(Ordering::SeqCst), 1);
 
-        executor
-            .tick()
-            .expect("scheduled exact-owner EOF cleanup should run");
-        removed_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("standalone mux must receive exact PaneRemoved at EOF");
+        executor.run_until(Duration::from_secs(30), || removed_rx.try_recv().is_ok());
         assert!(mux.get_pane(122).is_none());
         Mux::shutdown();
     }
@@ -8877,7 +9793,7 @@ mod tests {
     fn global_replacement_between_ready_and_release_cannot_redirect_reader() {
         let _guard = global_test_lock();
         Mux::shutdown();
-        let executor = promise::spawn::SimpleExecutor::new();
+        let executor = BoundedTestExecutor::new();
         let originating_mux = Arc::new(Mux::new(None));
         let replacement_mux = Arc::new(Mux::new(None));
         Mux::set_mux(&originating_mux);
@@ -8931,15 +9847,12 @@ mod tests {
             .expect("origin registration thread should not panic")
             .expect("origin registration should succeed");
 
-        executor
-            .tick()
-            .expect("originating exact-owner output drain should run");
-        origin_output_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("reader output must stay bound to originating mux");
-        executor
-            .tick()
-            .expect("originating exact-owner EOF cleanup should run");
+        executor.run_until(Duration::from_secs(30), || {
+            origin_output_rx.try_recv().is_ok()
+        });
+        executor.run_until(Duration::from_secs(30), || {
+            originating_mux.get_pane(123).is_none()
+        });
         assert!(originating_mux.get_pane(123).is_none());
         assert!(
             replacement_mux

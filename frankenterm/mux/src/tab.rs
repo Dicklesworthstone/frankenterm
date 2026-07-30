@@ -2446,6 +2446,36 @@ impl Tab {
         self.inner.lock().remove_pane(pane_id)
     }
 
+    /// Remove only the supplied pane allocation for an admitted move.
+    ///
+    /// The caller must hold the pane's operation guard. Structural mutation
+    /// happens under the tab lock, while pane resize/focus callbacks and mux
+    /// notifications are deferred until after that lock is released.
+    pub(crate) fn remove_exact_pane_for_move(
+        &self,
+        mux: &Mux,
+        expected: &Arc<dyn Pane>,
+    ) -> Option<Arc<dyn Pane>> {
+        let observed = Self::observe_panes(self.snapshot_panes_callback_free());
+        let candidate = observed.iter().find_map(|observed| {
+            observed
+                .pane_id
+                .filter(|_| Arc::ptr_eq(&observed.pane, expected))
+                .map(|pane_id| ExactPaneRemovalCandidate {
+                    pane: Arc::clone(&observed.pane),
+                    pane_id,
+                    expected_registration: None,
+                })
+        })?;
+        let callbacks = self
+            .inner
+            .lock()
+            .remove_exact_panes_callback_free(&observed, std::slice::from_ref(&candidate));
+        let removed = callbacks.removed.contains(&pane_identity(&candidate.pane));
+        callbacks.execute(Some(mux));
+        removed.then_some(candidate.pane)
+    }
+
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
         self.snapshot_panes_callback_free().into_iter().all(|pane| {
             match catch_unwind(AssertUnwindSafe(|| {
@@ -2523,6 +2553,11 @@ impl Tab {
             }
         }
         tree_active
+    }
+
+    #[cfg(test)]
+    pub(crate) fn topology_lock_is_available_for_test(&self) -> bool {
+        self.inner.try_lock().is_some()
     }
 
     #[allow(unused)]

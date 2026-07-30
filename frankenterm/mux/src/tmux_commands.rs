@@ -7,7 +7,7 @@ use crate::tmux::{
     TmuxPaneOutputState, TmuxRemotePane, TmuxTab,
 };
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
-use crate::{Mux, MuxNotification, Pane};
+use crate::{Mux, MuxNotification, Pane, PaneOperationGuard, SplitCommitReceipt};
 use anyhow::{anyhow, Context};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
@@ -445,23 +445,26 @@ impl TmuxDomainState {
     pub fn split_pane(
         &self,
         mux: &Arc<Mux>,
-        tab_id: TabId,
-        pane_id: PaneId,
+        target: &PaneOperationGuard,
         remote_id: TmuxPaneId,
         split_request: SplitRequest,
-    ) -> anyhow::Result<Arc<dyn Pane>> {
-        let tab = match mux.get_tab(tab_id) {
-            Some(t) => t,
-            None => anyhow::bail!("Invalid tab id {}", tab_id),
-        };
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(mux),
+            "tmux split target belongs to another mux registration"
+        );
+        let (_domain_id, local_window_id, tab) = target.exact_location()?;
 
         let pane_index = match tab
             .iter_panes_ignoring_zoom()
             .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
+            .find(|positioned| Arc::ptr_eq(&positioned.pane, target.pane()))
         {
             Some(p) => p.index,
-            None => anyhow::bail!("invalid pane id {}", pane_id),
+            None => anyhow::bail!(
+                "exact tmux split target registration {} is not tiled",
+                target.pane_id()
+            ),
         };
 
         let split_size = match tab.compute_split_size(pane_index, split_request) {
@@ -469,14 +472,19 @@ impl TmuxDomainState {
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
-        let window_id = match self.gui_tabs.lock().iter().find(|t| t.1.tab_id == tab_id) {
+        let remote_window_id = match self
+            .gui_tabs
+            .lock()
+            .iter()
+            .find(|entry| entry.1.tab_id == tab.tab_id())
+        {
             Some((_, tab)) => tab.tmux_window_id,
-            None => anyhow::bail!("No tab {}", tab_id),
+            None => anyhow::bail!("No tmux mirror for exact tab {}", tab.tab_id()),
         };
 
         let p = PaneItem {
             session_id: 0,
-            window_id: window_id,
+            window_id: remote_window_id,
             pane_id: remote_id,
             _pane_index: 0,
             cursor_x: 0,
@@ -491,6 +499,9 @@ impl TmuxDomainState {
         let pane = self.create_pane(&p).map_err(|err| {
             self.fail_local_mirror_publication(err.context("failed to create pane"))
         })?;
+        if let Some(config) = target.with_pane(|pane| pane.get_config()) {
+            pane.set_config(config);
+        }
         tab.split_and_insert(pane_index, split_request, Arc::clone(&pane))
             .map_err(|err| {
                 self.fail_local_mirror_publication(
@@ -498,7 +509,7 @@ impl TmuxDomainState {
                 )
             })?;
 
-        self.add_attached_pane(window_id, remote_id)
+        self.add_attached_pane(remote_window_id, remote_id)
             .map_err(|err| {
                 self.fail_local_mirror_publication(
                     err.context("failed to attach tmux pane to local window state"),
@@ -510,13 +521,25 @@ impl TmuxDomainState {
                 err.context("failed to publish tmux pane in local mux"),
             )
         })?;
+        let registration = mux.capture_pane_registration(&pane).ok_or_else(|| {
+            self.fail_local_mirror_publication(anyhow!(
+                "published tmux pane {} has no exact mux registration",
+                pane.pane_id()
+            ))
+        })?;
         self.finish_fresh_split(remote_id).map_err(|err| {
             self.fail_local_mirror_publication(
                 err.context("failed to commit split tmux pane initial output"),
             )
         })?;
 
-        Ok(pane)
+        Ok(SplitCommitReceipt::from_exact_parts(
+            pane,
+            registration,
+            tab,
+            local_window_id,
+            split_size.second,
+        ))
     }
 
     fn sync_pane_state(&self, panes: &[PaneItem]) -> anyhow::Result<()> {

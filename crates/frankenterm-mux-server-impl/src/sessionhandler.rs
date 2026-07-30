@@ -18,7 +18,6 @@ use codec::{
     WriteToPane,
 };
 use mux::client::ClientId;
-use mux::domain::SplitSource;
 use mux::pane::{CachePolicy, PaneId};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::{CurrentPane, Mux, PaneRegistrationHandle};
@@ -1953,37 +1952,43 @@ async fn split_pane(
 ) -> anyhow::Result<Pdu> {
     let session = authority.acquire()?;
 
-    let source = if let Some(move_pane_id) = split.move_pane_id {
-        SplitSource::MovePane(move_pane_id)
-    } else {
-        SplitSource::Spawn {
-            command: split.command,
-            command_dir: split.command_dir,
-        }
-    };
-
-    let (pane_id, size, window_id, tab_id) = registration
-        .split_if_current(
-            session.mux(),
-            move_registration.as_ref(),
-            split.split_request,
-            source,
-            split.domain,
-            client_id,
-        )
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "pane registration {} is no longer current",
-                registration.pane_id()
+    let receipt = if let Some(move_pane_id) = split.move_pane_id {
+        let move_registration = move_registration.as_ref().ok_or_else(|| {
+            anyhow!("move pane registration {move_pane_id} was not admitted for split")
+        })?;
+        registration
+            .split_moved_if_current(
+                session.mux(),
+                move_registration,
+                split.split_request,
+                split.domain,
+                client_id,
             )
-        })??;
+            .await
+    } else {
+        registration
+            .split_spawned_if_current(
+                session.mux(),
+                split.split_request,
+                split.command,
+                split.command_dir,
+                split.domain,
+                client_id,
+            )
+            .await
+    }
+    .ok_or_else(|| {
+        anyhow!(
+            "pane registration {} is no longer current",
+            registration.pane_id()
+        )
+    })??;
 
     Ok::<Pdu, anyhow::Error>(Pdu::SpawnResponse(SpawnResponse {
-        pane_id,
-        tab_id,
-        window_id,
-        size,
+        pane_id: receipt.pane_id(),
+        tab_id: receipt.tab_id(),
+        window_id: receipt.window_id(),
+        size: receipt.size(),
     }))
 }
 
@@ -2039,7 +2044,7 @@ async fn move_pane(
     client_id: Option<Arc<ClientId>>,
 ) -> anyhow::Result<Pdu> {
     let session = authority.acquire()?;
-    let (tab_id, window_id) = registration
+    let receipt = registration
         .move_to_new_tab_if_current(
             session.mux(),
             request.window_id,
@@ -2055,8 +2060,8 @@ async fn move_pane(
         })??;
 
     Ok::<Pdu, anyhow::Error>(Pdu::MovePaneToNewTabResponse(MovePaneToNewTabResponse {
-        tab_id,
-        window_id,
+        tab_id: receipt.tab_id(),
+        window_id: receipt.window_id(),
     }))
 }
 

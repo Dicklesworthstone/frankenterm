@@ -8,10 +8,10 @@
 use crate::client::ClientId;
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
-use crate::tab::{SplitRequest, Tab, TabId};
+use crate::tab::{SplitRequest, Tab};
 use crate::window::WindowId;
-use crate::Mux;
-use anyhow::{bail, Context, Error};
+use crate::{MoveCommitReceipt, Mux, PaneOperationGuard, PaneRegistrationHandle, SplitCommitReceipt};
+use anyhow::{anyhow, bail, Context, Error};
 use async_trait::async_trait;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{configuration, ExecDomain, SerialDomain, ValueOrFunc, WslDomain};
@@ -50,6 +50,64 @@ pub enum SplitSource {
     MovePane(PaneId),
 }
 
+pub(super) struct PreparedSplitPane {
+    pane: Arc<dyn Pane>,
+    registration: PaneRegistrationHandle,
+    armed: bool,
+}
+
+impl PreparedSplitPane {
+    pub(super) fn new(pane: Arc<dyn Pane>, registration: PaneRegistrationHandle) -> Self {
+        Self {
+            pane,
+            registration,
+            armed: true,
+        }
+    }
+
+    fn commit(
+        mut self,
+        tab: Arc<Tab>,
+        window_id: WindowId,
+        size: TerminalSize,
+    ) -> SplitCommitReceipt {
+        self.armed = false;
+        SplitCommitReceipt::from_exact_parts(
+            Arc::clone(&self.pane),
+            self.registration.clone(),
+            tab,
+            window_id,
+            size,
+        )
+    }
+}
+
+impl Drop for PreparedSplitPane {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let rollback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.registration.retire_if_current()
+        }));
+        match rollback {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!(
+                    "prepared split pane {} lost exact registration before rollback",
+                    self.registration.pane_id()
+                );
+            }
+            Err(_) => {
+                log::error!(
+                    "prepared split pane {} rollback panicked",
+                    self.registration.pane_id()
+                );
+            }
+        }
+    }
+}
+
 #[async_trait(?Send)]
 pub trait Domain: Downcast + Send + Sync {
     /// Spawn a new command within this domain on the exact originating mux.
@@ -75,27 +133,30 @@ pub trait Domain: Downcast + Send + Sync {
         Ok(tab)
     }
 
-    /// Split a pane on the exact mux that admitted the operation.
-    async fn split_pane(
+    /// Spawn a new pane and commit it beside the exact admitted target.
+    async fn split_pane_spawned(
         &self,
         mux: &Arc<Mux>,
-        source: SplitSource,
-        tab: TabId,
-        pane_id: PaneId,
+        target: &PaneOperationGuard,
         split_request: SplitRequest,
-    ) -> anyhow::Result<Arc<dyn Pane>> {
-        let tab = match mux.get_tab(tab) {
-            Some(t) => t,
-            None => anyhow::bail!("Invalid tab id {}", tab),
-        };
-
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(mux),
+            "split target belongs to another mux registration"
+        );
+        let (_domain_id, window_id, tab) = target.exact_location()?;
         let pane_index = match tab
             .iter_panes_ignoring_zoom()
             .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
+            .find(|positioned| Arc::ptr_eq(&positioned.pane, target.pane()))
         {
             Some(p) => p.index,
-            None => anyhow::bail!("invalid pane id {}", pane_id),
+            None => anyhow::bail!(
+                "exact split target registration {} is not tiled",
+                target.pane_id()
+            ),
         };
 
         let split_size = match tab.compute_split_size(pane_index, split_request) {
@@ -103,47 +164,95 @@ pub trait Domain: Downcast + Send + Sync {
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
-        let pane = match source {
-            SplitSource::Spawn {
-                command,
-                command_dir,
-            } => {
-                self.spawn_pane(mux, split_size.second, command, command_dir)
-                    .await?
-            }
-            SplitSource::MovePane(src_pane_id) => {
-                let (_domain, _window, src_tab) = mux
-                    .resolve_pane_id(src_pane_id)
-                    .ok_or_else(|| anyhow::anyhow!("pane {} not found", src_pane_id))?;
-                let src_tab = match mux.get_tab(src_tab) {
-                    Some(t) => t,
-                    None => anyhow::bail!("Invalid tab id {}", src_tab),
-                };
-
-                let pane = src_tab.remove_pane(src_pane_id).ok_or_else(|| {
-                    anyhow::anyhow!("pane {} not found in its containing tab!?", src_pane_id)
-                })?;
-
-                if src_tab.is_dead() {
-                    mux.remove_tab(src_tab.tab_id());
-                }
-
-                pane
-            }
+        let target_config = target.with_pane(|pane| pane.get_config());
+        let pane = self
+            .spawn_pane(mux, split_size.second, command, command_dir)
+            .await?;
+        let registration = mux.capture_pane_registration(&pane).ok_or_else(|| {
+            anyhow!(
+                "spawned pane {} has no exact registration before split commit",
+                pane.pane_id()
+            )
+        })?;
+        let prepared = PreparedSplitPane::new(Arc::clone(&pane), registration);
+        if let Some(config) = target_config {
+            pane.set_config(config);
+        }
+        let dims = pane.get_dimensions();
+        let size = TerminalSize {
+            cols: dims.cols,
+            rows: dims.viewport_rows,
+            pixel_height: dims.pixel_height,
+            pixel_width: dims.pixel_width,
+            dpi: dims.dpi,
         };
+        tab.split_and_insert(pane_index, split_request, pane)?;
+        Ok(prepared.commit(tab, window_id, size))
+    }
 
-        // pane_index may have changed if src_pane was also in the same tab
+    /// Move another exact registration into a split beside the target.
+    async fn split_pane_moved(
+        &self,
+        mux: &Arc<Mux>,
+        target: &PaneOperationGuard,
+        source: &PaneOperationGuard,
+        split_request: SplitRequest,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(mux) && source.belongs_to(mux),
+            "split source and target must belong to the originating mux"
+        );
+        anyhow::ensure!(
+            !target.same_registration(source),
+            "cannot move pane {} into a split of itself",
+            target.pane_id()
+        );
+        let (_target_domain, window_id, tab) = target.exact_location()?;
+        let (_source_domain, _source_window, source_tab) = source.exact_location()?;
+        let source_registration = source.registration();
+        let target_config = target.with_pane(|pane| pane.get_config());
+        let pane = source_tab
+            .remove_exact_pane_for_move(mux, source.pane())
+            .ok_or_else(|| {
+                anyhow!(
+                    "exact source pane registration {} was not in its containing tab",
+                    source.pane_id()
+                )
+            })?;
+        mux.remove_empty_tab_internal_if_same(&source_tab);
+
+        // The target index may shift when both registrations started in the
+        // same tab, so resolve it again by exact Arc identity.
         let final_pane_index = match tab
             .iter_panes_ignoring_zoom()
             .iter()
-            .find(|p| p.pane.pane_id() == pane_id)
+            .find(|positioned| Arc::ptr_eq(&positioned.pane, target.pane()))
         {
             Some(p) => p.index,
-            None => anyhow::bail!("invalid pane id {}", pane_id),
+            None => anyhow::bail!(
+                "exact split target registration {} left its tab before commit",
+                target.pane_id()
+            ),
         };
-
         tab.split_and_insert(final_pane_index, split_request, Arc::clone(&pane))?;
-        Ok(pane)
+        if let Some(config) = target_config {
+            pane.set_config(config);
+        }
+        let dims = pane.get_dimensions();
+        let size = TerminalSize {
+            cols: dims.cols,
+            rows: dims.viewport_rows,
+            pixel_height: dims.pixel_height,
+            pixel_width: dims.pixel_width,
+            dpi: dims.dpi,
+        };
+        Ok(SplitCommitReceipt::from_exact_parts(
+            pane,
+            source_registration,
+            tab,
+            window_id,
+            size,
+        ))
     }
 
     /// Spawn and register a pane on the exact originating mux.
@@ -163,10 +272,10 @@ pub trait Domain: Downcast + Send + Sync {
     async fn move_pane_to_new_tab(
         &self,
         _mux: &Arc<Mux>,
-        _pane_id: PaneId,
+        _pane: &PaneOperationGuard,
         _window_id: Option<WindowId>,
         _workspace_for_new_window: Option<String>,
-    ) -> anyhow::Result<Option<(Arc<Tab>, WindowId)>> {
+    ) -> anyhow::Result<Option<MoveCommitReceipt>> {
         Ok(None)
     }
 

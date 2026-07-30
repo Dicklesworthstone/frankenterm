@@ -10,11 +10,13 @@ use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::client::ClientId;
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use mux::pane::{reserve_pane_ids, Pane, PaneId};
 use mux::tab::{PaneNode, SplitRequest, Tab, TabId};
 use mux::window::WindowId;
-use mux::{CurrentPane, Mux, MuxNotification};
+use mux::{
+    CurrentPane, MoveCommitReceipt, Mux, MuxNotification, PaneOperationGuard, SplitCommitReceipt,
+};
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
@@ -1078,6 +1080,98 @@ impl ClientDomain {
         Ok((tab, pane, local_window_id))
     }
 
+    fn exact_remote_pane_id(
+        guard: &PaneOperationGuard,
+        inner: &Arc<ClientInner>,
+        role: &str,
+    ) -> anyhow::Result<PaneId> {
+        guard.with_pane(|pane| {
+            let pane = pane.downcast_ref::<ClientPane>().ok_or_else(|| {
+                anyhow!(
+                    "{role} pane_id {} is not a ClientPane",
+                    guard.pane_id()
+                )
+            })?;
+            if !pane.belongs_to_client(inner) {
+                bail!(
+                    "{role} pane_id {} belongs to a different client attachment",
+                    guard.pane_id()
+                );
+            }
+            Ok(pane.remote_pane_id())
+        })
+    }
+
+    async fn split_exact(
+        &self,
+        mux: &Arc<Mux>,
+        target: &PaneOperationGuard,
+        moved: Option<&PaneOperationGuard>,
+        split_request: SplitRequest,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(mux),
+            "split target belongs to another mux registration"
+        );
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        self.ensure_mux_owner(mux)?;
+
+        let remote_target = Self::exact_remote_pane_id(target, &inner, "target")?;
+        let remote_move = moved
+            .map(|source| {
+                anyhow::ensure!(
+                    source.belongs_to(mux),
+                    "split source belongs to another mux registration"
+                );
+                anyhow::ensure!(
+                    !target.same_registration(source),
+                    "cannot move pane {} into a split of itself",
+                    target.pane_id()
+                );
+                Self::exact_remote_pane_id(source, &inner, "move source")
+            })
+            .transpose()?;
+        let target_config = target.with_pane(|pane| pane.get_config());
+
+        let rpc = inner.client.rpc_scope();
+        let result = rpc
+            .split_pane(SplitPane {
+                domain: SpawnTabDomain::CurrentPaneDomain,
+                pane_id: remote_target,
+                split_request,
+                command,
+                command_dir,
+                move_pane_id: remote_move,
+            })
+            .await?;
+        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), &rpc, None)
+            .await?
+        {
+            bail!("client attachment retired while resolving split pane");
+        }
+
+        let size = result.size;
+        rpc.commit_sync(RpcConsumerKind::SplitResolution, || {
+            let (tab, pane, window_id) =
+                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            if let Some(source) = moved {
+                anyhow::ensure!(
+                    source.is_same_pane(&pane),
+                    "remote moved split resolved to a different local pane registration"
+                );
+            }
+            if let Some(config) = target_config {
+                pane.set_config(config);
+            }
+            target.capture_split_receipt(pane, tab, window_id, size)
+        })
+        .map_err(anyhow::Error::new)?
+    }
+
     fn process_pane_list(
         mux: &Arc<Mux>,
         inner: Arc<ClientInner>,
@@ -1629,27 +1723,20 @@ impl Domain for ClientDomain {
     async fn move_pane_to_new_tab(
         &self,
         mux: &Arc<Mux>,
-        pane_id: PaneId,
+        pane_guard: &PaneOperationGuard,
         window_id: Option<WindowId>,
         workspace_for_new_window: Option<String>,
-    ) -> anyhow::Result<Option<(Arc<Tab>, WindowId)>> {
+    ) -> anyhow::Result<Option<MoveCommitReceipt>> {
         let inner = self
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
         self.ensure_mux_owner(mux)?;
-        let local_pane = mux
-            .get_pane(pane_id)
-            .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
-        let pane = local_pane
-            .downcast_ref::<ClientPane>()
-            .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
-        if !pane.belongs_to_client(&inner) {
-            bail!(
-                "pane_id {} belongs to a different client attachment",
-                pane_id
-            );
-        }
+        anyhow::ensure!(
+            pane_guard.belongs_to(mux),
+            "move target belongs to another mux registration"
+        );
+        let remote_pane_id = Self::exact_remote_pane_id(pane_guard, &inner, "move target")?;
 
         let remote_window_id =
             window_id.and_then(|local_window| inner.local_to_remote_window(local_window));
@@ -1657,7 +1744,7 @@ impl Domain for ClientDomain {
         let rpc = inner.client.rpc_scope();
         let result = rpc
             .move_pane_to_new_tab(codec::MovePaneToNewTab {
-                pane_id: pane.remote_pane_id,
+                pane_id: remote_pane_id,
                 window_id: remote_window_id,
                 workspace_for_new_window,
             })
@@ -1689,7 +1776,9 @@ impl Domain for ClientDomain {
                 .get_tab(local_tab_id)
                 .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
 
-            Ok(Some((tab, local_win_id)))
+            pane_guard
+                .capture_move_receipt(tab, local_win_id)
+                .map(Some)
         })
         .map_err(anyhow::Error::new)?
     }
@@ -1739,76 +1828,41 @@ impl Domain for ClientDomain {
         .map_err(anyhow::Error::new)?
     }
 
-    async fn split_pane(
+    async fn split_pane_spawned(
         &self,
         mux: &Arc<Mux>,
-        source: SplitSource,
-        _tab_id: TabId,
-        pane_id: PaneId,
+        target: &PaneOperationGuard,
         split_request: SplitRequest,
-    ) -> anyhow::Result<Arc<dyn Pane>> {
-        let inner = self
-            .inner()
-            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        self.split_exact(
+            mux,
+            target,
+            None,
+            split_request,
+            command,
+            command_dir,
+        )
+        .await
+    }
 
-        self.ensure_mux_owner(mux)?;
-        let local_pane = mux
-            .get_pane(pane_id)
-            .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
-        let pane = local_pane
-            .downcast_ref::<ClientPane>()
-            .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
-        if !pane.belongs_to_client(&inner) {
-            bail!(
-                "pane_id {} belongs to a different client attachment",
-                pane_id
-            );
-        }
-
-        let (command, command_dir, move_pane_id) = match source {
-            SplitSource::Spawn {
-                command,
-                command_dir,
-            } => (command, command_dir, None),
-            SplitSource::MovePane(move_pane_id) => {
-                let move_pane = mux
-                    .get_pane(move_pane_id)
-                    .ok_or_else(|| anyhow!("move pane_id {} is invalid", move_pane_id))?;
-                let move_pane = move_pane
-                    .downcast_ref::<ClientPane>()
-                    .ok_or_else(|| anyhow!("move pane_id {} is not a ClientPane", move_pane_id))?;
-                if !move_pane.belongs_to_client(&inner) {
-                    bail!(
-                        "move pane_id {} belongs to a different client attachment",
-                        move_pane_id
-                    );
-                }
-                (None, None, Some(move_pane.remote_pane_id()))
-            }
-        };
-
-        let rpc = inner.client.rpc_scope();
-        let result = rpc
-            .split_pane(SplitPane {
-                domain: SpawnTabDomain::CurrentPaneDomain,
-                pane_id: pane.remote_pane_id,
-                split_request,
-                command,
-                command_dir,
-                move_pane_id,
-            })
-            .await?;
-        if !Self::sync_remote_topology(Arc::clone(mux), self, Arc::clone(&inner), &rpc, None)
-            .await?
-        {
-            bail!("client attachment retired while resolving split pane");
-        }
-        rpc.commit_sync(RpcConsumerKind::SplitResolution, || {
-            let (_tab, pane, _window_id) =
-                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
-            Ok(pane)
-        })
-        .map_err(anyhow::Error::new)?
+    async fn split_pane_moved(
+        &self,
+        mux: &Arc<Mux>,
+        target: &PaneOperationGuard,
+        source: &PaneOperationGuard,
+        split_request: SplitRequest,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        self.split_exact(
+            mux,
+            target,
+            Some(source),
+            split_request,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn attach(

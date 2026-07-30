@@ -1,12 +1,12 @@
 use crate::activity::Activity;
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
+use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use crate::localpane::LocalPane;
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand};
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
-use crate::{Mux, MuxWindowBuilder};
+use crate::{Mux, MuxWindowBuilder, PaneOperationGuard, SplitCommitReceipt};
 use anyhow::Context;
 use async_trait::async_trait;
 use config::configuration;
@@ -2052,11 +2052,16 @@ impl TmuxDomainState {
     /// split the tmux pane
     pub fn split_tmux_pane(
         &self,
-        _tab: TabId,
-        pane_id: PaneId,
+        target: &PaneOperationGuard,
         split_request: SplitRequest,
         request_id: u64,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            target.owner().get_domain(self.domain_id).is_some(),
+            "tmux split target belongs to a mux without domain {}",
+            self.domain_id
+        );
+        let pane_id = target.pane_id();
         let tmux_pane_id = self
             .remote_panes
             .lock()
@@ -2186,14 +2191,18 @@ impl Domain for TmuxDomain {
         Err(Self::spawn_unsupported("spawn"))
     }
 
-    async fn split_pane(
+    async fn split_pane_spawned(
         &self,
         mux: &Arc<Mux>,
-        _source: SplitSource,
-        tab: TabId,
-        pane_id: PaneId,
+        target: &PaneOperationGuard,
         split_request: SplitRequest,
-    ) -> anyhow::Result<Arc<dyn Pane>> {
+        _command: Option<CommandBuilder>,
+        _command_dir: Option<String>,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::ensure!(
+            target.belongs_to(mux),
+            "tmux split target belongs to another mux registration"
+        );
         let active_operation = self.inner.begin_active_operation().ok_or_else(|| {
             anyhow::anyhow!(
                 "cannot split pane in detached tmux domain {}",
@@ -2206,7 +2215,7 @@ impl Domain for TmuxDomain {
             {
                 let mut pending_splits = self.inner.pending_splits.lock();
                 self.inner
-                    .split_tmux_pane(tab, pane_id, split_request, request_id)?;
+                    .split_tmux_pane(target, split_request, request_id)?;
                 anyhow::ensure!(
                     pending_splits.insert(request_id, promise).is_none(),
                     "duplicate tmux split request id {request_id}"
@@ -2224,10 +2233,22 @@ impl Domain for TmuxDomain {
                     self.inner.domain_id
                 )
             })?;
-            return self.inner.split_pane(mux, tab, pane_id, id, split_request);
+            return self.inner.split_pane(mux, target, id, split_request);
         }
 
         anyhow::bail!("Split_pane failed");
+    }
+
+    async fn split_pane_moved(
+        &self,
+        _mux: &Arc<Mux>,
+        _target: &PaneOperationGuard,
+        _source: &PaneOperationGuard,
+        _split_request: SplitRequest,
+    ) -> anyhow::Result<SplitCommitReceipt> {
+        anyhow::bail!(
+            "moving an existing pane into a tmux control-mode split is unsupported"
+        )
     }
 
     async fn spawn_pane(
