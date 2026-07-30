@@ -4,7 +4,8 @@ use crate::localpane::LocalPane;
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
-    ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand, TmuxCommandClass,
+    DetachClient, ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand,
+    TmuxCommandClass,
 };
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
@@ -14,17 +15,20 @@ use crate::{
 use anyhow::Context;
 use async_trait::async_trait;
 use config::configuration;
+use crossbeam::channel::{bounded, Receiver, Sender, TrySendError};
 use filedescriptor::FileDescriptor;
-use frankenterm_term::{KeyCode, KeyModifiers, TerminalSize};
+use frankenterm_term::TerminalSize;
 use lru::LruCache;
 use parking_lot::Mutex;
 use portable_pty::CommandBuilder;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fmt;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use termwiz::tmux_cc::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -389,6 +393,17 @@ const CMD_QUEUE_INTENT_MAX_DEPTH: usize = 4_096;
 /// retained latest-intent resize/focus command is serviced after at most this
 /// many additional durable commands.
 const CMD_QUEUE_DURABLE_SERVICE_QUANTUM: usize = 32;
+
+/// A domain can retain at most one command/detach start, one matching
+/// completion signal, and one terminal signal while its I/O supervisor is
+/// between receive sites.
+const TMUX_IO_CONTROL_CAPACITY: usize = 3;
+
+/// The dedicated writer accepts only the supervisor's single current job.
+const TMUX_IO_WRITE_CAPACITY: usize = 1;
+
+/// A write publishes one started edge and one terminal result.
+const TMUX_IO_RESULT_CAPACITY: usize = 2;
 
 /// Events received after a guarded command response must wait for that
 /// response's main-thread mutation to commit. Bound the barrier so a stalled
@@ -1076,6 +1091,8 @@ pub(crate) struct TmuxCmdQueue {
     durable_since_intent: usize,
     payload_bytes: usize,
     closed: bool,
+    terminal_barrier: bool,
+    terminal_command_dispatched: bool,
     rejected_commands: u64,
     merged_commands: u64,
 }
@@ -1199,6 +1216,7 @@ impl TmuxProtocolBarrier {
 #[derive(Debug)]
 pub(crate) struct InFlightTmuxCommand {
     command: Box<dyn TmuxCommand>,
+    generation: u64,
     remaining_responses: usize,
     first_error: Option<Guarded>,
 }
@@ -1264,6 +1282,8 @@ impl TmuxCmdQueue {
             durable_since_intent: 0,
             payload_bytes: 0,
             closed: false,
+            terminal_barrier: false,
+            terminal_command_dispatched: false,
             rejected_commands: 0,
             merged_commands: 0,
         }
@@ -1273,7 +1293,7 @@ impl TmuxCmdQueue {
     /// share the same mutex, so stale PTY/writer handles cannot refill a queue
     /// after terminal cleanup.
     pub(crate) fn push_back(&mut self, cmd: Box<dyn TmuxCommand>) -> Result<(), TmuxEnqueueError> {
-        if self.closed {
+        if self.closed || self.terminal_barrier {
             return Err(TmuxEnqueueError::Closed);
         }
 
@@ -1337,6 +1357,70 @@ impl TmuxCmdQueue {
         Ok(())
     }
 
+    /// Installs the one-way explicit-detach barrier at the front of the
+    /// durable lane.
+    ///
+    /// An already preparing or in-flight command retains ownership of its
+    /// response. Once that command completes, detach is the next command
+    /// dispatched. No later producer may enqueue behind the terminal barrier,
+    /// and work that was already behind it is abandoned by terminal cleanup
+    /// after tmux emits `Exit`.
+    fn push_domain_detach(
+        &mut self,
+        command: Box<dyn TmuxCommand>,
+    ) -> Result<(), TmuxEnqueueError> {
+        if self.closed || self.terminal_barrier {
+            return Err(TmuxEnqueueError::Closed);
+        }
+        if command.mailbox_class() != TmuxCommandClass::TerminalControl
+            || !command.awaits_clean_exit()
+        {
+            self.rejected_commands = self.rejected_commands.saturating_add(1);
+            metrics::counter!(
+                "mux.tmux.command_mailbox.rejected",
+                "class" => TmuxCommandClass::TerminalControl.label(),
+                "reason" => "class_mismatch",
+            )
+            .increment(1);
+            return Err(TmuxEnqueueError::ClassMismatch);
+        }
+
+        let incoming_payload_bytes = command.mailbox_payload_bytes();
+        let Some(next_payload_bytes) = self.payload_bytes.checked_add(incoming_payload_bytes)
+        else {
+            return self.reject_full(
+                TmuxCommandClass::TerminalControl,
+                "detach payload byte accounting overflow",
+            );
+        };
+        if next_payload_bytes > CMD_QUEUE_MAX_PAYLOAD_BYTES {
+            return self.reject_full(
+                TmuxCommandClass::TerminalControl,
+                "detach payload byte cap",
+            );
+        }
+        if !self.can_admit_count(TmuxCommandClass::TerminalControl, 1) {
+            return self.reject_full(
+                TmuxCommandClass::TerminalControl,
+                "detach command count cap",
+            );
+        }
+
+        self.durable_entries.push_front(command);
+        self.retained_by_class[TmuxCommandClass::TerminalControl.index()] = self.retained_by_class
+            [TmuxCommandClass::TerminalControl.index()]
+        .saturating_add(1);
+        self.payload_bytes = next_payload_bytes;
+        self.terminal_barrier = true;
+        metrics::counter!(
+            "mux.tmux.command_mailbox.admitted",
+            "class" => TmuxCommandClass::TerminalControl.label(),
+            "disposition" => "terminal_barrier",
+        )
+        .increment(1);
+        Ok(())
+    }
+
     /// Admit a required control-plane batch atomically. Required topology
     /// synchronization must never report success after admitting only a
     /// prefix of the batch.
@@ -1344,7 +1428,7 @@ impl TmuxCmdQueue {
         &mut self,
         commands: Vec<Box<dyn TmuxCommand>>,
     ) -> Result<(), TmuxEnqueueError> {
-        if self.closed {
+        if self.closed || self.terminal_barrier {
             return Err(TmuxEnqueueError::Closed);
         }
         if commands.is_empty() {
@@ -1543,6 +1627,11 @@ impl TmuxCmdQueue {
             self.durable_since_intent = self.durable_since_intent.saturating_add(1);
             self.durable_entries.pop_front()?
         };
+        if command.awaits_clean_exit() {
+            debug_assert!(self.terminal_barrier);
+            debug_assert!(!self.terminal_command_dispatched);
+            self.terminal_command_dispatched = true;
+        }
         self.preparing = Some(PreparingTmuxCommand {
             class: command.mailbox_class(),
             payload_bytes: command.mailbox_payload_bytes(),
@@ -1565,7 +1654,7 @@ impl TmuxCmdQueue {
         }
     }
 
-    fn install_in_flight(&mut self, cmd: Box<dyn TmuxCommand>) -> bool {
+    fn install_in_flight(&mut self, cmd: Box<dyn TmuxCommand>, generation: u64) -> bool {
         if self.closed || self.in_flight.is_some() {
             self.release_prepared();
             false
@@ -1582,6 +1671,7 @@ impl TmuxCmdQueue {
             debug_assert!(remaining_responses > 0);
             self.in_flight = Some(InFlightTmuxCommand {
                 command: cmd,
+                generation,
                 remaining_responses,
                 first_error: None,
             });
@@ -1592,7 +1682,7 @@ impl TmuxCmdQueue {
     fn record_in_flight_response(
         &mut self,
         response: &Guarded,
-    ) -> Option<(Box<dyn TmuxCommand>, Guarded)> {
+    ) -> Option<(Box<dyn TmuxCommand>, Guarded, u64)> {
         let in_flight = self.in_flight.as_mut()?;
         if response.error && in_flight.first_error.is_none() {
             in_flight.first_error = Some(response.clone());
@@ -1613,17 +1703,747 @@ impl TmuxCmdQueue {
             .first_error
             .take()
             .unwrap_or_else(|| response.clone());
-        Some((in_flight.command, response))
+        Some((in_flight.command, response, in_flight.generation))
     }
 
     fn has_pending(&self) -> bool {
+        if self.terminal_barrier && self.terminal_command_dispatched {
+            return false;
+        }
         !self.durable_entries.is_empty() || !self.intent_entries.is_empty()
     }
 
+    fn has_domain_detach_pending(&self) -> bool {
+        self.terminal_barrier
+    }
+
     fn should_service_intent(&self) -> bool {
+        if self.terminal_barrier && !self.terminal_command_dispatched {
+            return false;
+        }
         !self.intent_entries.is_empty()
             && (self.durable_entries.is_empty()
                 || self.durable_since_intent >= CMD_QUEUE_DURABLE_SERVICE_QUANTUM)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxIoOperationKind {
+    Command,
+    Detach,
+}
+
+impl TmuxIoOperationKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::Detach => "detach",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxIoOperationPhase {
+    WaitingForResponse,
+    WaitingForCleanExit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TmuxIoOperationLease {
+    generation: u64,
+    kind: TmuxIoOperationKind,
+    phase: TmuxIoOperationPhase,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TmuxIoDeadlines {
+    start: Duration,
+    write: Duration,
+    response: Duration,
+}
+
+impl TmuxIoDeadlines {
+    fn current() -> Self {
+        let config = configuration();
+        Self {
+            start: Duration::from_millis(config.mux_tmux_io_start_timeout_ms),
+            write: Duration::from_millis(config.mux_tmux_io_write_timeout_ms),
+            response: Duration::from_millis(config.mux_tmux_response_timeout_ms),
+        }
+    }
+}
+
+struct TmuxIoStart {
+    generation: u64,
+    kind: TmuxIoOperationKind,
+    command: Option<String>,
+    admitted_at: Instant,
+    deadlines: TmuxIoDeadlines,
+    _operation: OwnedActiveTmuxOperation,
+}
+
+impl fmt::Debug for TmuxIoStart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TmuxIoStart")
+            .field("generation", &self.generation)
+            .field("kind", &self.kind)
+            .field(
+                "command_bytes",
+                &self.command.as_ref().map_or(0, String::len),
+            )
+            .field("admitted_at", &self.admitted_at)
+            .field("deadlines", &self.deadlines)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+enum TmuxIoControl {
+    Start(TmuxIoStart),
+    InitialGuardReady,
+    #[cfg(test)]
+    TestInitialGuardDeadline(Duration),
+    Response { generation: u64 },
+    Terminal { clean_exit: bool },
+}
+
+#[derive(Debug)]
+struct TmuxIoWriteJob {
+    generation: u64,
+    kind: TmuxIoOperationKind,
+    command: Option<String>,
+}
+
+#[derive(Debug)]
+enum TmuxIoWriteOutcome {
+    Succeeded,
+    OwnerGone,
+    RegistrationLost,
+    LauncherPaneGone,
+    LauncherBindingReplaced,
+    Io {
+        error_kind: std::io::ErrorKind,
+        message: String,
+    },
+    Panicked,
+}
+
+impl TmuxIoWriteOutcome {
+    const fn reason_label(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::OwnerGone => "owner_gone",
+            Self::RegistrationLost => "registration_lost",
+            Self::LauncherPaneGone => "launcher_pane_gone",
+            Self::LauncherBindingReplaced => "launcher_binding_replaced",
+            Self::Io { .. } => "io_error",
+            Self::Panicked => "panicked",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Io {
+                error_kind,
+                message,
+            } => format!("{error_kind:?}: {message}"),
+            other => other.reason_label().to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TmuxIoWriteProgress {
+    Started {
+        generation: u64,
+        kind: TmuxIoOperationKind,
+    },
+    Finished {
+        generation: u64,
+        kind: TmuxIoOperationKind,
+        outcome: TmuxIoWriteOutcome,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TmuxIoAdmissionError {
+    Unavailable,
+    Full,
+    Disconnected,
+}
+
+impl fmt::Display for TmuxIoAdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("tmux I/O supervisor is unavailable"),
+            Self::Full => f.write_str("tmux I/O supervisor control lane is full"),
+            Self::Disconnected => f.write_str("tmux I/O supervisor has disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for TmuxIoAdmissionError {}
+
+struct TmuxIoLane {
+    control: Sender<TmuxIoControl>,
+}
+
+impl TmuxIoLane {
+    fn new(
+        domain_id: DomainId,
+        owner: Weak<TmuxDomainState>,
+    ) -> std::io::Result<Self> {
+        let (control_tx, control_rx) = bounded(TMUX_IO_CONTROL_CAPACITY);
+        let thread_name = format!("tmux-io-supervisor-{domain_id}");
+        let failure_owner = owner.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_tmux_io_supervisor(owner, control_rx);
+                }));
+                if outcome.is_err() {
+                    log::error!("tmux I/O supervisor for domain {domain_id} panicked");
+                    if let Some(domain) = failure_owner.upgrade() {
+                        domain.fail_io_supervisor("supervisor_panicked");
+                    }
+                }
+            });
+        Self::from_spawn_result(domain_id, control_tx, spawn_result)
+    }
+
+    fn from_spawn_result(
+        domain_id: DomainId,
+        control: Sender<TmuxIoControl>,
+        spawn_result: std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> std::io::Result<Self> {
+        match spawn_result {
+            Ok(_) => Ok(Self { control }),
+            Err(err) => {
+                log::error!("failed to start tmux I/O supervisor for domain {domain_id}: {err:#}");
+                Err(err)
+            }
+        }
+    }
+
+    fn start(&self, start: TmuxIoStart) -> Result<(), TmuxIoAdmissionError> {
+        match self.control.try_send(TmuxIoControl::Start(start)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(TmuxIoAdmissionError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(TmuxIoAdmissionError::Disconnected),
+        }
+    }
+
+    fn signal_response(&self, generation: u64) -> Result<(), TmuxIoAdmissionError> {
+        match self
+            .control
+            .try_send(TmuxIoControl::Response { generation })
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(TmuxIoAdmissionError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(TmuxIoAdmissionError::Disconnected),
+        }
+    }
+
+    fn signal_initial_guard_ready(&self) -> Result<(), TmuxIoAdmissionError> {
+        match self.control.try_send(TmuxIoControl::InitialGuardReady) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(TmuxIoAdmissionError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(TmuxIoAdmissionError::Disconnected),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_test_initial_guard_deadline(
+        &self,
+        deadline: Duration,
+    ) -> Result<(), TmuxIoAdmissionError> {
+        match self
+            .control
+            .try_send(TmuxIoControl::TestInitialGuardDeadline(deadline))
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(TmuxIoAdmissionError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(TmuxIoAdmissionError::Disconnected),
+        }
+    }
+
+    fn signal_terminal(&self, clean_exit: bool) {
+        let _ = self
+            .control
+            .try_send(TmuxIoControl::Terminal { clean_exit });
+    }
+}
+
+struct TmuxIoWriter {
+    jobs: Sender<TmuxIoWriteJob>,
+    progress: Receiver<TmuxIoWriteProgress>,
+}
+
+fn start_tmux_io_writer(
+    domain_id: DomainId,
+    owner: Weak<TmuxDomainState>,
+) -> Result<TmuxIoWriter, String> {
+    let (job_tx, job_rx) = bounded(TMUX_IO_WRITE_CAPACITY);
+    let (progress_tx, progress_rx) = bounded(TMUX_IO_RESULT_CAPACITY);
+    let thread_name = format!("tmux-io-writer-{domain_id}");
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || run_tmux_io_writer(owner, job_rx, progress_tx))
+        .map_err(|err| format!("failed to start tmux I/O writer: {err}"))?;
+    Ok(TmuxIoWriter {
+        jobs: job_tx,
+        progress: progress_rx,
+    })
+}
+
+fn run_tmux_io_writer(
+    owner: Weak<TmuxDomainState>,
+    jobs: Receiver<TmuxIoWriteJob>,
+    progress: Sender<TmuxIoWriteProgress>,
+) {
+    while let Ok(job) = jobs.recv() {
+        if progress
+            .send(TmuxIoWriteProgress::Started {
+                generation: job.generation,
+                kind: job.kind,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_tmux_io_write(&owner, &job)
+        }))
+        .unwrap_or(TmuxIoWriteOutcome::Panicked);
+        if progress
+            .send(TmuxIoWriteProgress::Finished {
+                generation: job.generation,
+                kind: job.kind,
+                outcome,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn execute_tmux_io_write(
+    owner: &Weak<TmuxDomainState>,
+    job: &TmuxIoWriteJob,
+) -> TmuxIoWriteOutcome {
+    let Some(owner) = owner.upgrade() else {
+        return TmuxIoWriteOutcome::OwnerGone;
+    };
+    let Some(mux) = Mux::try_get() else {
+        return TmuxIoWriteOutcome::RegistrationLost;
+    };
+    let Some(domain) = mux.get_domain(owner.domain_id) else {
+        return TmuxIoWriteOutcome::RegistrationLost;
+    };
+    let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+        return TmuxIoWriteOutcome::RegistrationLost;
+    };
+    if !Arc::ptr_eq(&owner, &tmux_domain.inner) {
+        return TmuxIoWriteOutcome::RegistrationLost;
+    }
+    let Some(pane) = mux.get_pane(owner.pane_id) else {
+        return TmuxIoWriteOutcome::LauncherPaneGone;
+    };
+    let Some(command) = job.command.as_ref() else {
+        return TmuxIoWriteOutcome::Io {
+            error_kind: std::io::ErrorKind::InvalidInput,
+            message: format!(
+                "tmux {} I/O job had no command payload",
+                job.kind.label()
+            ),
+        };
+    };
+
+    let result: anyhow::Result<()> = match job.kind {
+        TmuxIoOperationKind::Command => pane
+            .writer()
+            .write_all(command.as_bytes())
+            .map_err(anyhow::Error::from),
+        TmuxIoOperationKind::Detach => {
+            if let Some(local_pane) = pane.downcast_ref::<LocalPane>() {
+                match local_pane.write_tmux_command_if_same(&owner, command) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => return TmuxIoWriteOutcome::LauncherBindingReplaced,
+                    Err(err) => Err(err),
+                }
+            } else {
+                if owner.is_terminal() {
+                    return TmuxIoWriteOutcome::RegistrationLost;
+                }
+                pane.writer()
+                    .write_all(command.as_bytes())
+                    .map_err(anyhow::Error::from)
+            }
+        }
+    };
+    match result {
+        Ok(()) => TmuxIoWriteOutcome::Succeeded,
+        Err(err) => TmuxIoWriteOutcome::Io {
+            error_kind: err
+                .downcast_ref::<std::io::Error>()
+                .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+            message: err.to_string(),
+        },
+    }
+}
+
+fn remaining_deadline(started: Instant, budget: Duration) -> Option<Duration> {
+    budget.checked_sub(started.elapsed())
+}
+
+fn recv_tmux_io_progress(
+    receiver: &Receiver<TmuxIoWriteProgress>,
+    timeout: Duration,
+) -> Option<TmuxIoWriteProgress> {
+    match receiver.recv_timeout(timeout) {
+        Ok(progress) => Some(progress),
+        Err(crossbeam::channel::RecvTimeoutError::Timeout) => receiver.try_recv().ok(),
+        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+fn run_tmux_io_supervisor(
+    owner: Weak<TmuxDomainState>,
+    control: Receiver<TmuxIoControl>,
+) {
+    let Some(initial_owner) = owner.upgrade() else {
+        return;
+    };
+    let initial_guard_budget = Cell::new(initial_owner.io_deadlines().response);
+    drop(initial_owner);
+
+    let initial_guard_started = Cell::new(Instant::now());
+    let mut awaiting_initial_guard = true;
+    let mut writer: Option<TmuxIoWriter> = None;
+    loop {
+        let message = if awaiting_initial_guard {
+            let Some(remaining) = remaining_deadline(
+                initial_guard_started.get(),
+                initial_guard_budget.get(),
+            )
+            else {
+                let Some(domain) = owner.upgrade() else {
+                    return;
+                };
+                let guard_is_pending = *domain.state.lock() == State::WaitForInitialGuard;
+                if guard_is_pending {
+                    domain.fail_initial_guard("response_timeout");
+                    return;
+                }
+                // The parser commits the state transition before publishing
+                // the readiness signal. If the deadline lands in that narrow
+                // interval, accept the committed state and let the late signal
+                // be treated as stale instead of tearing down a healthy
+                // domain.
+                awaiting_initial_guard = false;
+                continue;
+            };
+            match control.recv_timeout(remaining) {
+                Ok(message) => message,
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    let Some(domain) = owner.upgrade() else {
+                        return;
+                    };
+                    let guard_is_pending = *domain.state.lock() == State::WaitForInitialGuard;
+                    if guard_is_pending {
+                        domain.fail_initial_guard("response_timeout");
+                        return;
+                    }
+                    awaiting_initial_guard = false;
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            let Ok(message) = control.recv() else {
+                return;
+            };
+            message
+        };
+
+        match message {
+            TmuxIoControl::Start(mut start) => {
+                let Some(domain) = owner.upgrade() else {
+                    return;
+                };
+                if awaiting_initial_guard {
+                    let guard_is_pending = *domain.state.lock() == State::WaitForInitialGuard;
+                    if guard_is_pending {
+                        domain.fail_initial_guard("operation_before_initial_guard");
+                        return;
+                    }
+                    // Unit tests and recovery paths may establish an already
+                    // committed non-initial state directly. The operation
+                    // generation and state checks below remain authoritative.
+                    awaiting_initial_guard = false;
+                }
+                if !domain.io_operation_is_current(start.kind, start.generation) {
+                    continue;
+                }
+                if remaining_deadline(start.admitted_at, start.deadlines.start).is_none() {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "start_timeout",
+                    );
+                    return;
+                };
+                if writer.is_none() {
+                    match start_tmux_io_writer(domain.domain_id, Arc::downgrade(&domain)) {
+                        Ok(started) => writer = Some(started),
+                        Err(err) => {
+                            log::error!(
+                                "tmux domain {} could not start its bounded I/O writer: {err}",
+                                domain.domain_id
+                            );
+                            domain.fail_tmux_io_operation(
+                                start.kind,
+                                start.generation,
+                                "writer_unavailable",
+                            );
+                            return;
+                        }
+                    }
+                }
+                let Some(remaining_start) =
+                    remaining_deadline(start.admitted_at, start.deadlines.start)
+                else {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "start_timeout",
+                    );
+                    return;
+                };
+                let writer_ref = writer.as_ref().expect("tmux writer initialized");
+                let job = TmuxIoWriteJob {
+                    generation: start.generation,
+                    kind: start.kind,
+                    command: start.command.take(),
+                };
+                if writer_ref.jobs.try_send(job).is_err() {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "writer_backpressured",
+                    );
+                    return;
+                }
+                let Some(started) = recv_tmux_io_progress(&writer_ref.progress, remaining_start)
+                else {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "start_timeout",
+                    );
+                    return;
+                };
+                if !matches!(
+                    started,
+                    TmuxIoWriteProgress::Started { generation, kind }
+                        if generation == start.generation && kind == start.kind
+                ) {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "start_protocol_mismatch",
+                    );
+                    return;
+                }
+
+                let write_started = Instant::now();
+                let Some(finished) =
+                    recv_tmux_io_progress(&writer_ref.progress, start.deadlines.write)
+                else {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "write_timeout",
+                    );
+                    return;
+                };
+                let TmuxIoWriteProgress::Finished {
+                    generation,
+                    kind,
+                    outcome,
+                } = finished
+                else {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "write_protocol_mismatch",
+                    );
+                    return;
+                };
+                if generation != start.generation || kind != start.kind {
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        "write_protocol_mismatch",
+                    );
+                    return;
+                }
+                metrics::histogram!(
+                    "mux.tmux.io.write_seconds",
+                    "operation" => start.kind.label(),
+                )
+                .record(write_started.elapsed().as_secs_f64());
+                if !matches!(outcome, TmuxIoWriteOutcome::Succeeded) {
+                    log::error!(
+                        "tmux domain {} {} generation {} failed on its bounded I/O lane: {}",
+                        domain.domain_id,
+                        start.kind.label(),
+                        start.generation,
+                        outcome.detail()
+                    );
+                    domain.fail_tmux_io_operation(
+                        start.kind,
+                        start.generation,
+                        outcome.reason_label(),
+                    );
+                    return;
+                }
+                metrics::counter!(
+                    "mux.tmux.io.completed",
+                    "operation" => start.kind.label(),
+                    "outcome" => "write_succeeded",
+                )
+                .increment(1);
+
+                let kind = start.kind;
+                let generation = start.generation;
+                let response_budget = start.deadlines.response;
+                drop(start);
+                if domain.is_terminal() {
+                    return;
+                }
+
+                let response_started = Instant::now();
+                let mut guarded_response_received = false;
+                loop {
+                    let Some(remaining) = remaining_deadline(response_started, response_budget)
+                    else {
+                        if domain.io_operation_is_current(kind, generation) {
+                            domain.fail_tmux_io_operation(
+                                kind,
+                                generation,
+                                if guarded_response_received {
+                                    "clean_exit_timeout"
+                                } else {
+                                    "response_timeout"
+                                },
+                            );
+                        }
+                        return;
+                    };
+                    match control.recv_timeout(remaining) {
+                        Ok(TmuxIoControl::Response {
+                            generation: response_generation,
+                        }) if response_generation == generation && !guarded_response_received =>
+                        {
+                            metrics::histogram!(
+                                "mux.tmux.io.response_seconds",
+                                "operation" => kind.label(),
+                            )
+                            .record(response_started.elapsed().as_secs_f64());
+                            if kind == TmuxIoOperationKind::Command {
+                                break;
+                            }
+                            guarded_response_received = true;
+                        }
+                        Ok(TmuxIoControl::Terminal { clean_exit: true })
+                            if kind == TmuxIoOperationKind::Detach =>
+                        {
+                            metrics::histogram!(
+                                "mux.tmux.io.clean_exit_seconds",
+                            )
+                            .record(response_started.elapsed().as_secs_f64());
+                            return;
+                        }
+                        Ok(TmuxIoControl::Terminal { .. }) => return,
+                        Ok(TmuxIoControl::Response { .. }) => {
+                            metrics::counter!(
+                                "mux.tmux.io.stale_signal",
+                                "operation" => kind.label(),
+                            )
+                            .increment(1);
+                        }
+                        Ok(TmuxIoControl::Start(_)) => {
+                            domain.fail_tmux_io_operation(
+                                kind,
+                                generation,
+                                "overlapping_start",
+                            );
+                            return;
+                        }
+                        Ok(TmuxIoControl::InitialGuardReady) => {
+                            metrics::counter!(
+                                "mux.tmux.io.stale_signal",
+                                "operation" => kind.label(),
+                            )
+                            .increment(1);
+                        }
+                        #[cfg(test)]
+                        Ok(TmuxIoControl::TestInitialGuardDeadline(_)) => {
+                            metrics::counter!(
+                                "mux.tmux.io.stale_signal",
+                                "operation" => kind.label(),
+                            )
+                            .increment(1);
+                        }
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                            if domain.io_operation_is_current(kind, generation) {
+                                domain.fail_tmux_io_operation(
+                                    kind,
+                                    generation,
+                                    if guarded_response_received {
+                                        "clean_exit_timeout"
+                                    } else {
+                                        "response_timeout"
+                                    },
+                                );
+                            }
+                            return;
+                        }
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            }
+            TmuxIoControl::InitialGuardReady => {
+                if awaiting_initial_guard {
+                    awaiting_initial_guard = false;
+                    metrics::histogram!(
+                        "mux.tmux.io.response_seconds",
+                        "operation" => "initial_guard",
+                    )
+                    .record(initial_guard_started.get().elapsed().as_secs_f64());
+                } else {
+                    metrics::counter!(
+                        "mux.tmux.io.stale_signal",
+                        "operation" => "initial_guard",
+                    )
+                    .increment(1);
+                }
+            }
+            #[cfg(test)]
+            TmuxIoControl::TestInitialGuardDeadline(deadline) => {
+                if awaiting_initial_guard {
+                    initial_guard_budget.set(deadline);
+                    initial_guard_started.set(Instant::now());
+                }
+            }
+            TmuxIoControl::Response { .. } => {
+                metrics::counter!("mux.tmux.io.stale_signal", "operation" => "idle").increment(1);
+            }
+            TmuxIoControl::Terminal { .. } => return,
+        }
     }
 }
 
@@ -1636,6 +2456,8 @@ pub(crate) struct TmuxDomainState {
     clean_detach_completed: AtomicBool,
     detach_cleanup_scheduled: Arc<AtomicBool>,
     send_task_scheduled: Arc<AtomicBool>,
+    io_lane: OnceLock<TmuxIoLane>,
+    next_io_generation: AtomicU64,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
     protocol_ingress: Mutex<()>,
     protocol_barrier: Mutex<TmuxProtocolBarrier>,
@@ -1657,6 +2479,8 @@ pub(crate) struct TmuxDomainState {
     pending_splits: Mutex<HashMap<u64, promise::Promise<TmuxPaneId>>>,
     next_split_request_id: AtomicU64,
     pub backlog: Mutex<TmuxBacklog>,
+    #[cfg(test)]
+    test_io_deadlines: Mutex<Option<TmuxIoDeadlines>>,
 }
 
 pub struct TmuxDomain {
@@ -1667,6 +2491,7 @@ pub struct TmuxDomain {
 struct TmuxLifecycle {
     terminal: bool,
     clean_exit: bool,
+    io_operation: Option<TmuxIoOperationLease>,
     active_operations: usize,
     cleanup_in_progress: bool,
     resources_cleaned: bool,
@@ -1689,6 +2514,16 @@ struct ActiveTmuxOperation<'a> {
 }
 
 impl Drop for ActiveTmuxOperation<'_> {
+    fn drop(&mut self) {
+        self.owner.finish_active_operation();
+    }
+}
+
+struct OwnedActiveTmuxOperation {
+    owner: Arc<TmuxDomainState>,
+}
+
+impl Drop for OwnedActiveTmuxOperation {
     fn drop(&mut self) {
         self.owner.finish_active_operation();
     }
@@ -1774,28 +2609,36 @@ impl TmuxDomainState {
         self.request_terminal(true);
     }
 
-    fn request_terminal(&self, clean_exit: bool) {
-        if clean_exit {
-            self.clean_exit_requested.store(true, Ordering::Release);
-        }
-
-        let first_transition = {
+    fn request_terminal(&self, requested_clean_exit: bool) {
+        let (first_transition, authoritative_clean_exit) = {
             let mut lifecycle = self.lifecycle.lock();
-            let first_transition = !lifecycle.terminal;
-            lifecycle.terminal = true;
-            if clean_exit {
-                lifecycle.clean_exit = true;
-                if lifecycle.detach_disposition == TerminalDetachDisposition::Pending {
-                    lifecycle.detach_disposition = TerminalDetachDisposition::NotNeeded;
+            if lifecycle.terminal {
+                (false, lifecycle.clean_exit)
+            } else {
+                let mut state = self.state.lock();
+                lifecycle.terminal = true;
+                lifecycle.clean_exit = requested_clean_exit;
+                lifecycle.io_operation = None;
+                lifecycle.detach_disposition = if requested_clean_exit {
+                    TerminalDetachDisposition::NotNeeded
+                } else {
+                    TerminalDetachDisposition::Pending
+                };
+                *state = State::Exit;
+                if requested_clean_exit {
+                    self.clean_exit_requested.store(true, Ordering::Release);
                 }
-            } else if first_transition {
-                lifecycle.detach_disposition = TerminalDetachDisposition::Pending;
+                (true, requested_clean_exit)
             }
-
-            let mut state = self.state.lock();
-            *state = State::Exit;
-            first_transition
         };
+
+        self.publish_terminal_transition(first_transition, authoritative_clean_exit);
+    }
+
+    fn publish_terminal_transition(&self, first_transition: bool, clean_exit: bool) {
+        if let Some(io_lane) = self.io_lane.get() {
+            io_lane.signal_terminal(clean_exit);
+        }
 
         // Queue closure and unsubscription are immediate. More expensive
         // resource cleanup is deferred until operations admitted before the
@@ -1836,6 +2679,255 @@ impl TmuxDomainState {
         };
         lifecycle.active_operations = next;
         Some(ActiveTmuxOperation { owner: self })
+    }
+
+    fn begin_owned_operation(self: &Arc<Self>) -> Option<OwnedActiveTmuxOperation> {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.terminal {
+            return None;
+        }
+        let Some(next) = lifecycle.active_operations.checked_add(1) else {
+            log::error!(
+                "tmux domain {} active-operation counter overflow; rejecting owned work",
+                self.domain_id
+            );
+            return None;
+        };
+        lifecycle.active_operations = next;
+        Some(OwnedActiveTmuxOperation {
+            owner: Arc::clone(self),
+        })
+    }
+
+    fn alloc_io_generation(&self) -> anyhow::Result<u64> {
+        self.next_io_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "tmux domain {} exhausted its nonwrapping I/O generation space",
+                    self.domain_id
+                )
+            })
+    }
+
+    fn io_deadlines(&self) -> TmuxIoDeadlines {
+        #[cfg(test)]
+        if let Some(deadlines) = *self.test_io_deadlines.lock() {
+            return deadlines;
+        }
+        TmuxIoDeadlines::current()
+    }
+
+    fn io_operation_is_current(&self, kind: TmuxIoOperationKind, generation: u64) -> bool {
+        let lifecycle = self.lifecycle.lock();
+        !lifecycle.terminal
+            && lifecycle.io_operation.is_some_and(|operation| {
+                operation.kind == kind && operation.generation == generation
+            })
+    }
+
+    fn install_io_operation(
+        &self,
+        kind: TmuxIoOperationKind,
+        generation: u64,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.terminal || lifecycle.io_operation.is_some() {
+            return false;
+        }
+        lifecycle.io_operation = Some(TmuxIoOperationLease {
+            generation,
+            kind,
+            phase: TmuxIoOperationPhase::WaitingForResponse,
+        });
+        true
+    }
+
+    fn claim_io_response(
+        &self,
+        kind: TmuxIoOperationKind,
+        generation: u64,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        let Some(operation) = lifecycle.io_operation else {
+            return false;
+        };
+        if lifecycle.terminal
+            || operation.kind != kind
+            || operation.generation != generation
+            || operation.phase != TmuxIoOperationPhase::WaitingForResponse
+        {
+            return false;
+        }
+
+        let mut state = self.state.lock();
+        if *state != State::WaitingForResponse {
+            return false;
+        }
+        *state = State::ProcessingResponse;
+        if kind == TmuxIoOperationKind::Detach {
+            lifecycle.io_operation = Some(TmuxIoOperationLease {
+                phase: TmuxIoOperationPhase::WaitingForCleanExit,
+                ..operation
+            });
+        } else {
+            lifecycle.io_operation = None;
+        }
+        true
+    }
+
+    fn try_claim_failure_terminal(
+        &self,
+        predicate: impl FnOnce(&TmuxLifecycle, State) -> bool,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        if lifecycle.terminal {
+            return false;
+        }
+        let mut state = self.state.lock();
+        if !predicate(&lifecycle, *state) {
+            return false;
+        }
+        lifecycle.terminal = true;
+        lifecycle.clean_exit = false;
+        lifecycle.io_operation = None;
+        lifecycle.detach_disposition = TerminalDetachDisposition::Pending;
+        *state = State::Exit;
+        true
+    }
+
+    fn fail_tmux_io_operation(
+        &self,
+        kind: TmuxIoOperationKind,
+        generation: u64,
+        reason: &'static str,
+    ) {
+        let claimed = self.try_claim_failure_terminal(|lifecycle, _state| {
+            lifecycle.io_operation.is_some_and(|operation| {
+                operation.kind == kind && operation.generation == generation
+            })
+        });
+        if !claimed {
+            metrics::counter!(
+                "mux.tmux.io.stale_failure",
+                "operation" => kind.label(),
+            )
+            .increment(1);
+            return;
+        }
+        metrics::counter!(
+            "mux.tmux.io.completed",
+            "operation" => kind.label(),
+            "outcome" => reason,
+        )
+        .increment(1);
+        log::error!(
+            "tmux domain {} {} generation {} terminated on its bounded I/O lane: {reason}",
+            self.domain_id,
+            kind.label(),
+            generation
+        );
+        self.invalidate_launcher_after_io_failure(reason);
+        self.publish_terminal_transition(true, false);
+    }
+
+    fn fail_initial_guard(&self, reason: &'static str) {
+        if !self.try_claim_failure_terminal(|_lifecycle, state| {
+            state == State::WaitForInitialGuard
+        }) {
+            return;
+        }
+        metrics::counter!(
+            "mux.tmux.io.completed",
+            "operation" => "initial_guard",
+            "outcome" => reason,
+        )
+        .increment(1);
+        log::error!(
+            "tmux domain {} failed before its initial guarded boundary: {reason}",
+            self.domain_id,
+        );
+        self.invalidate_launcher_after_io_failure(reason);
+        self.publish_terminal_transition(true, false);
+    }
+
+    fn fail_io_supervisor(&self, reason: &'static str) {
+        if !self.try_claim_failure_terminal(|_lifecycle, _state| true) {
+            return;
+        }
+        metrics::counter!(
+            "mux.tmux.io.completed",
+            "operation" => "supervisor",
+            "outcome" => reason,
+        )
+        .increment(1);
+        log::error!(
+            "tmux domain {} lost its I/O supervisor: {reason}",
+            self.domain_id,
+        );
+        self.invalidate_launcher_after_io_failure(reason);
+        self.publish_terminal_transition(true, false);
+    }
+
+    fn invalidate_launcher_after_io_failure(&self, reason: &str) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let Some(domain) = mux.get_domain(self.domain_id) else {
+            return;
+        };
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            return;
+        };
+        if !std::ptr::eq(tmux_domain.inner.as_ref(), self) {
+            return;
+        }
+        let Some(pane) = mux.get_pane(self.pane_id) else {
+            return;
+        };
+        if let Some(local_pane) = pane.downcast_ref::<LocalPane>() {
+            let _ = local_pane.clear_tmux_domain_if(self);
+        }
+        log::error!(
+            "invalidating tmux launcher pane {} for domain {} after {reason}",
+            self.pane_id,
+            self.domain_id
+        );
+        pane.kill();
+    }
+
+    fn start_io_operation(&self, start: TmuxIoStart) -> Result<(), TmuxIoAdmissionError> {
+        self.io_lane
+            .get()
+            .ok_or(TmuxIoAdmissionError::Unavailable)?
+            .start(start)
+    }
+
+    fn signal_io_response(&self, generation: u64) -> Result<(), TmuxIoAdmissionError> {
+        self.io_lane
+            .get()
+            .ok_or(TmuxIoAdmissionError::Unavailable)?
+            .signal_response(generation)
+    }
+
+    fn signal_initial_guard_ready(&self) -> Result<(), TmuxIoAdmissionError> {
+        self.io_lane
+            .get()
+            .ok_or(TmuxIoAdmissionError::Unavailable)?
+            .signal_initial_guard_ready()
+    }
+
+    #[cfg(test)]
+    fn set_test_initial_guard_deadline(
+        &self,
+        deadline: Duration,
+    ) -> Result<(), TmuxIoAdmissionError> {
+        self.io_lane
+            .get()
+            .ok_or(TmuxIoAdmissionError::Unavailable)?
+            .set_test_initial_guard_deadline(deadline)
     }
 
     fn finish_active_operation(&self) {
@@ -2003,7 +3095,7 @@ impl TmuxDomainState {
         domain: &Arc<dyn Domain>,
         expected_inner: &Arc<Self>,
     ) {
-        let should_send_detach = {
+        let should_invalidate_launcher = {
             let mut lifecycle = expected_inner.lifecycle.lock();
             if !lifecycle.terminal
                 || !lifecycle.resources_cleaned
@@ -2022,7 +3114,7 @@ impl TmuxDomainState {
             }
         };
 
-        expected_inner.finalize_launcher_tmux_binding(mux, should_send_detach);
+        expected_inner.finalize_launcher_tmux_binding(mux, should_invalidate_launcher);
         let removed = mux.domain_was_detached_if_same(domain);
         let exact_instance_absent = removed
             || mux
@@ -2045,7 +3137,11 @@ impl TmuxDomainState {
         }
     }
 
-    fn finalize_launcher_tmux_binding(&self, mux: &Arc<Mux>, should_send_detach: bool) {
+    fn finalize_launcher_tmux_binding(
+        &self,
+        mux: &Arc<Mux>,
+        should_invalidate_launcher: bool,
+    ) {
         let Some(pane) = mux.get_pane(self.pane_id) else {
             log::error!(
                 "tmux terminal cleanup cannot find launcher pane {} for domain {}",
@@ -2056,35 +3152,28 @@ impl TmuxDomainState {
         };
 
         if let Some(local_pane) = pane.downcast_ref::<LocalPane>() {
-            if should_send_detach {
-                match local_pane.send_tmux_detach_if_same(self) {
-                    Ok(true) => {}
-                    Ok(false) => log::warn!(
-                        "tmux terminal cleanup found a replacement launcher binding for domain {}",
-                        self.domain_id
-                    ),
-                    Err(err) => log::error!(
-                        "failed to send fail-close detach for tmux domain {}: {err:#}",
-                        self.domain_id
-                    ),
-                }
+            let cleared = local_pane.clear_tmux_domain_if(self);
+            if !cleared {
+                log::warn!(
+                    "tmux terminal cleanup found a replacement launcher binding for domain {}",
+                    self.domain_id
+                );
+                return;
             }
-            let _ = local_pane.clear_tmux_domain_if(self);
-            return;
         }
 
-        if should_send_detach {
-            log::error!(
-                "cannot send exact fail-close detach for tmux domain {} through non-LocalPane \
-                 launcher {}",
+        if should_invalidate_launcher {
+            // A fail-close path must never perform another potentially
+            // blocking launcher write on the GUI/main lane. Invalidating the
+            // exact binding and terminating the control-mode client leaves the
+            // tmux server/session intact while making a late writer harmless.
+            log::warn!(
+                "terminating tmux launcher {} after fail-closed domain {} cleanup",
+                self.pane_id,
                 self.domain_id,
-                self.pane_id
             );
+            pane.kill();
         }
-        log::warn!(
-            "tmux terminal cleanup found non-LocalPane launcher {}",
-            self.pane_id
-        );
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
@@ -2254,17 +3343,48 @@ impl TmuxDomainState {
                         if !self.transition_state(State::WaitForInitialGuard, State::Idle) {
                             return None;
                         }
+                        if let Err(err) = self.signal_initial_guard_ready() {
+                            log::error!(
+                                "tmux domain {} could not cancel its initial-guard deadline: {err}",
+                                self.domain_id
+                            );
+                            self.transition_to_exit_and_schedule_detach();
+                            return None;
+                        }
                     }
                     State::WaitingForResponse => {
                         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                        if let Some((cmd, resp)) = cmd_queue.record_in_flight_response(response) {
-                            if !self.transition_state(
-                                State::WaitingForResponse,
-                                State::ProcessingResponse,
-                            ) {
+                        if let Some((cmd, resp, generation)) =
+                            cmd_queue.record_in_flight_response(response)
+                        {
+                            let io_kind = if cmd.awaits_clean_exit() {
+                                TmuxIoOperationKind::Detach
+                            } else {
+                                TmuxIoOperationKind::Command
+                            };
+                            if !self.claim_io_response(io_kind, generation) {
+                                drop(cmd_queue);
+                                if !self.is_terminal() {
+                                    log::error!(
+                                        "tmux domain {} could not claim guarded response for \
+                                         generation {generation}; detaching to preserve lease \
+                                         ownership",
+                                        self.domain_id
+                                    );
+                                    self.transition_to_exit_and_schedule_detach();
+                                }
                                 return None;
                             }
                             drop(cmd_queue);
+                            if let Err(err) = self.signal_io_response(generation) {
+                                log::error!(
+                                    "tmux domain {} could not cancel response deadline for \
+                                     generation {generation}: {err}",
+                                    self.domain_id
+                                );
+                                self.transition_to_exit_and_schedule_detach();
+                                return None;
+                            }
                             TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                             // The callback must commit before any event that
                             // follows its Guarded marker, including events
@@ -2725,7 +3845,7 @@ impl TmuxDomainState {
 
     /// send next command at the front of cmd_queue.
     /// must be called inside main thread
-    fn send_next_command(&self) {
+    fn send_next_command(self: &Arc<Self>) {
         if let Err(err) = self.send_next_command_inner() {
             log::error!(
                 "failed to transmit a tmux command for domain {}: {err:#}; detaching the domain",
@@ -2735,8 +3855,8 @@ impl TmuxDomainState {
         }
     }
 
-    fn send_next_command_inner(&self) -> anyhow::Result<()> {
-        let Some(_active_operation) = self.begin_active_operation() else {
+    fn send_next_command_inner(self: &Arc<Self>) -> anyhow::Result<()> {
+        let Some(active_operation) = self.begin_owned_operation() else {
             return Ok(());
         };
         if !self.transition_state(State::Idle, State::Sending) {
@@ -2774,6 +3894,12 @@ impl TmuxDomainState {
             TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
         };
 
+        let io_kind = if prepared_command.awaits_clean_exit() {
+            TmuxIoOperationKind::Detach
+        } else {
+            TmuxIoOperationKind::Command
+        };
+        let generation = self.alloc_io_generation()?;
         {
             let mut cmd_queue = self.cmd_queue.as_ref().lock();
             if !self.transition_state(State::Sending, State::WaitingForResponse) {
@@ -2782,23 +3908,44 @@ impl TmuxDomainState {
                 TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                 return Ok(());
             }
-            if !cmd_queue.install_in_flight(prepared_command) {
+            if !cmd_queue.install_in_flight(prepared_command, generation) {
                 anyhow::bail!(
                     "tmux command mailbox closed or already had an in-flight command during sender reservation"
                 );
             }
+            if !self.install_io_operation(io_kind, generation) {
+                anyhow::bail!(
+                    "tmux domain {} could not install the unique I/O lease for generation \
+                     {generation}",
+                    self.domain_id,
+                );
+            }
         }
 
-        log::debug!("sending cmd {command:?}");
-        let mux = Mux::try_get().context("active mux disappeared before tmux command write")?;
-        let pane = mux.get_pane(self.pane_id).with_context(|| {
+        let command_bytes = command.len();
+        let start = TmuxIoStart {
+            generation,
+            kind: io_kind,
+            command: Some(command),
+            admitted_at: Instant::now(),
+            deadlines: self.io_deadlines(),
+            _operation: active_operation,
+        };
+        self.start_io_operation(start).with_context(|| {
             format!(
-                "tmux launcher pane {} disappeared before command write",
-                self.pane_id
+                "admitting tmux command generation {generation} to the bounded I/O lane"
             )
         })?;
-        let mut writer = pane.writer();
-        write!(writer, "{command}").context("writing command to tmux launcher pane")?;
+        metrics::counter!(
+            "mux.tmux.io.admitted",
+            "operation" => io_kind.label(),
+        )
+        .increment(1);
+        metrics::histogram!(
+            "mux.tmux.io.command_bytes",
+            "operation" => io_kind.label(),
+        )
+        .record(command_bytes as f64);
         Ok(())
     }
 
@@ -2965,7 +4112,7 @@ impl TmuxDomainState {
 }
 
 impl TmuxDomain {
-    pub fn new(pane_id: PaneId) -> Self {
+    pub fn new(pane_id: PaneId) -> anyhow::Result<Self> {
         let domain_id = alloc_domain_id();
         let cmd_queue = TmuxCmdQueue::new();
         let inner = Arc::new(TmuxDomainState {
@@ -2978,6 +4125,8 @@ impl TmuxDomain {
             clean_detach_completed: AtomicBool::new(false),
             detach_cleanup_scheduled: Arc::new(AtomicBool::new(false)),
             send_task_scheduled: Arc::new(AtomicBool::new(false)),
+            io_lane: OnceLock::new(),
+            next_io_generation: AtomicU64::new(1),
             cmd_queue: Arc::new(Mutex::new(cmd_queue)),
             protocol_ingress: Mutex::new(()),
             protocol_barrier: Mutex::new(TmuxProtocolBarrier::default()),
@@ -2999,7 +4148,15 @@ impl TmuxDomain {
             pending_splits: Mutex::new(HashMap::default()),
             next_split_request_id: AtomicU64::new(1),
             backlog: Mutex::new(TmuxBacklog::default()),
+            #[cfg(test)]
+            test_io_deadlines: Mutex::new(None),
         });
+        let io_lane = TmuxIoLane::new(domain_id, Arc::downgrade(&inner))
+            .with_context(|| format!("cannot start tmux I/O supervisor for domain {domain_id}"))?;
+        inner
+            .io_lane
+            .set(io_lane)
+            .unwrap_or_else(|_| unreachable!("tmux I/O lane is initialized exactly once"));
         let weak_inner = Arc::downgrade(&inner);
         let config_reload_sub = config::subscribe_to_config_reload(move || {
             let Some(inner) = weak_inner.upgrade() else {
@@ -3040,7 +4197,7 @@ impl TmuxDomain {
         });
         *inner.config_reload_sub.lock() = Some(config_reload_sub);
 
-        Self { inner }
+        Ok(Self { inner })
     }
 
     fn spawn_unsupported(surface: &str) -> anyhow::Error {
@@ -3160,7 +4317,7 @@ impl Domain for TmuxDomain {
     }
 
     fn detach(&self) -> anyhow::Result<()> {
-        let Some(_detach_operation) = self.inner.begin_active_operation() else {
+        let Some(_detach_admission) = self.inner.begin_owned_operation() else {
             self.inner.finish_terminal_cleanup_if_ready();
             self.inner.schedule_detach_cleanup();
             return Ok(());
@@ -3174,13 +4331,45 @@ impl Domain for TmuxDomain {
                 self.inner.pane_id
             )
         })?;
+        let registered_domain = mux.get_domain(self.inner.domain_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot detach tmux domain {} because it is not registered",
+                self.inner.domain_id
+            )
+        })?;
+        let registered_tmux = registered_domain
+            .downcast_ref::<TmuxDomain>()
+            .context("registered detach target is not a tmux domain")?;
+        anyhow::ensure!(
+            Arc::ptr_eq(&registered_tmux.inner, &self.inner),
+            "registered tmux detach target is a replacement instance"
+        );
+        drop(pane);
 
         anyhow::ensure!(
             !self.inner.clean_exit_requested.load(Ordering::Acquire),
-            "cannot send detach key after tmux clean exit was requested"
+            "cannot enqueue detach after tmux clean exit was requested"
         );
-        pane.key_down(KeyCode::Char('q'), KeyModifiers::NONE)
-            .context("sending detach key to tmux launcher pane")
+
+        let enqueue_result = {
+            let mut queue = self.inner.cmd_queue.lock();
+            if queue.has_domain_detach_pending() {
+                return Ok(());
+            }
+            queue.push_domain_detach(Box::new(DetachClient))
+        };
+        if let Err(err) = enqueue_result {
+            if err == TmuxEnqueueError::Closed && self.inner.is_terminal() {
+                return Ok(());
+            }
+            self.inner.transition_to_exit_and_schedule_detach();
+            return Err(anyhow::anyhow!(
+                "cannot admit serialized detach for tmux domain {}: {err}",
+                self.inner.domain_id
+            ));
+        }
+        self.inner
+            .require_send_schedule("explicit tmux detach admission")
     }
 
     fn state(&self) -> DomainState {
@@ -3202,6 +4391,7 @@ mod tests {
         Resize, SendKeys, SplitPane, TmuxCommand, TmuxCommandClass,
     };
     use frankenterm_term::color::ColorPalette;
+    use frankenterm_term::{KeyCode, KeyModifiers};
     use parking_lot::{MappedMutexGuard, MutexGuard};
     use promise::spawn::{block_on, ScopedExecutor};
     use rangeset::RangeSet;
@@ -3215,6 +4405,121 @@ mod tests {
 
     fn mux_test_lock() -> &'static StdMutex<()> {
         &crate::MUX_TEST_LOCK
+    }
+
+    fn new_tmux_domain(pane_id: PaneId) -> TmuxDomain {
+        TmuxDomain::new(pane_id).expect("start tmux test domain I/O supervisor")
+    }
+
+    #[test]
+    fn tmux_io_lane_spawn_failure_is_propagated() {
+        let (control, _receiver) = bounded(TMUX_IO_CONTROL_CAPACITY);
+        let spawn_result: std::io::Result<std::thread::JoinHandle<()>> =
+            Err(std::io::Error::other("injected supervisor spawn failure"));
+
+        let result = TmuxIoLane::from_spawn_result(42, control, spawn_result);
+        let Err(err) = result else {
+            panic!("injected tmux I/O supervisor spawn failure must be rejected");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "injected supervisor spawn failure");
+    }
+
+    #[test]
+    fn tmux_initial_guard_commit_fences_a_late_deadline_claim() {
+        let tmux_domain = new_tmux_domain(180);
+        assert!(tmux_domain
+            .inner
+            .transition_state(State::WaitForInitialGuard, State::Idle));
+
+        tmux_domain.inner.fail_initial_guard("test_late_deadline");
+
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Idle);
+        assert!(!tmux_domain.inner.lifecycle.lock().terminal);
+    }
+
+    #[test]
+    fn tmux_guarded_response_claim_fences_a_late_command_deadline() {
+        let tmux_domain = new_tmux_domain(181);
+        *tmux_domain.inner.state.lock() = State::WaitingForResponse;
+        assert!(tmux_domain
+            .inner
+            .install_io_operation(TmuxIoOperationKind::Command, 41));
+        assert!(tmux_domain
+            .inner
+            .claim_io_response(TmuxIoOperationKind::Command, 41));
+
+        tmux_domain.inner.fail_tmux_io_operation(
+            TmuxIoOperationKind::Command,
+            41,
+            "test_late_deadline",
+        );
+
+        assert_eq!(
+            *tmux_domain.inner.state.lock(),
+            State::ProcessingResponse
+        );
+        let lifecycle = tmux_domain.inner.lifecycle.lock();
+        assert!(!lifecycle.terminal);
+        assert!(lifecycle.io_operation.is_none());
+    }
+
+    #[test]
+    fn tmux_detach_deadline_and_clean_exit_have_first_claim_authority() {
+        let clean_winner = new_tmux_domain(182);
+        *clean_winner.inner.state.lock() = State::WaitingForResponse;
+        assert!(clean_winner
+            .inner
+            .install_io_operation(TmuxIoOperationKind::Detach, 51));
+        assert!(clean_winner
+            .inner
+            .claim_io_response(TmuxIoOperationKind::Detach, 51));
+        clean_winner.inner.transition_to_clean_exit();
+        clean_winner.inner.fail_tmux_io_operation(
+            TmuxIoOperationKind::Detach,
+            51,
+            "test_late_deadline",
+        );
+        {
+            let lifecycle = clean_winner.inner.lifecycle.lock();
+            assert!(lifecycle.terminal);
+            assert!(lifecycle.clean_exit);
+            assert!(lifecycle.io_operation.is_none());
+        }
+
+        let deadline_winner = new_tmux_domain(183);
+        *deadline_winner.inner.state.lock() = State::WaitingForResponse;
+        assert!(deadline_winner
+            .inner
+            .install_io_operation(TmuxIoOperationKind::Detach, 52));
+        deadline_winner.inner.fail_tmux_io_operation(
+            TmuxIoOperationKind::Detach,
+            52,
+            "test_deadline",
+        );
+        deadline_winner.inner.transition_to_clean_exit();
+        let lifecycle = deadline_winner.inner.lifecycle.lock();
+        assert!(lifecycle.terminal);
+        assert!(!lifecycle.clean_exit);
+        assert!(lifecycle.io_operation.is_none());
+        assert!(!deadline_winner
+            .inner
+            .clean_exit_requested
+            .load(Ordering::Acquire));
+    }
+
+    fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(5))
+            .expect("test deadline should fit Instant");
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                label
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     struct ScopedMux {
@@ -3273,6 +4578,7 @@ mod tests {
 
     struct RecordingWriter {
         bytes: Vec<u8>,
+        write_threads: Vec<std::thread::ThreadId>,
         write_gate: Option<WriteGate>,
         write_error: Option<std::io::ErrorKind>,
     }
@@ -3291,6 +4597,11 @@ mod tests {
     struct AssertSessionUnsetCommand {
         owner: Weak<TmuxDomainState>,
         processed: Arc<AtomicBool>,
+    }
+
+    #[derive(Debug)]
+    struct TerminalizingPreparationCommand {
+        owner: Weak<TmuxDomainState>,
     }
 
     #[derive(Debug)]
@@ -3321,7 +4632,7 @@ mod tests {
         let command = queue
             .take_next_for_preparation()
             .expect("mailbox command should be ready");
-        assert!(queue.install_in_flight(command));
+        assert!(queue.install_in_flight(command, 1));
         let response = Guarded {
             error: false,
             timestamp: 0,
@@ -3358,6 +4669,28 @@ mod tests {
         }
     }
 
+    impl TmuxCommand for TerminalizingPreparationCommand {
+        fn mailbox_class(&self) -> TmuxCommandClass {
+            TmuxCommandClass::RequiredControl
+        }
+
+        fn get_command(&self, _domain_id: DomainId) -> String {
+            self.owner
+                .upgrade()
+                .expect("test tmux domain should remain alive")
+                .transition_to_exit_and_schedule_detach();
+            "terminalized-during-preparation\n".to_string()
+        }
+
+        fn process_result(
+            &self,
+            _domain_id: DomainId,
+            _result: &Guarded,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     impl TmuxCommand for CountingCommand {
         fn mailbox_class(&self) -> TmuxCommandClass {
             TmuxCommandClass::RequiredControl
@@ -3375,6 +4708,7 @@ mod tests {
 
     impl Write for RecordingWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_threads.push(std::thread::current().id());
             if let Some(mut gate) = self.write_gate.take() {
                 if let Some(entered) = gate.entered.take() {
                     entered.send(()).map_err(|_| {
@@ -3414,6 +4748,7 @@ mod tests {
                 keys: Mutex::new(Vec::new()),
                 writes: Mutex::new(RecordingWriter {
                     bytes: Vec::new(),
+                    write_threads: Vec::new(),
                     write_gate: None,
                     write_error: None,
                 }),
@@ -3433,6 +4768,7 @@ mod tests {
                 keys: Mutex::new(Vec::new()),
                 writes: Mutex::new(RecordingWriter {
                     bytes: Vec::new(),
+                    write_threads: Vec::new(),
                     write_gate: Some(WriteGate {
                         entered: Some(entered_tx),
                         release: release_rx,
@@ -3451,6 +4787,7 @@ mod tests {
                 keys: Mutex::new(Vec::new()),
                 writes: Mutex::new(RecordingWriter {
                     bytes: Vec::new(),
+                    write_threads: Vec::new(),
                     write_gate: None,
                     write_error: Some(std::io::ErrorKind::BrokenPipe),
                 }),
@@ -3464,6 +4801,10 @@ mod tests {
 
         fn recorded_writes(&self) -> Vec<u8> {
             self.writes.lock().bytes.clone()
+        }
+
+        fn recorded_write_threads(&self) -> Vec<std::thread::ThreadId> {
+            self.writes.lock().write_threads.clone()
         }
     }
 
@@ -3610,7 +4951,7 @@ mod tests {
     }
 
     #[test]
-    fn tmux_domain_detach_sends_detach_key_to_launcher_pane() {
+    fn tmux_domain_detach_serializes_one_control_command_and_clean_exit() {
         let default_domain: Arc<dyn Domain> =
             Arc::new(LocalDomain::new("tmux-detach-default").expect("local domain"));
         let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
@@ -3620,11 +4961,117 @@ mod tests {
         let launcher_dyn: Arc<dyn Pane> = launcher.clone();
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
-        let tmux_domain = TmuxDomain::new(77);
+        let tmux_domain = Arc::new(new_tmux_domain(77));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register tmux detach test domain");
         assert!(tmux_domain.detachable());
+        *tmux_domain.inner.state.lock() = State::Idle;
         tmux_domain.detach().expect("detach tmux domain");
+        tmux_domain
+            .detach()
+            .expect("duplicate detach request is idempotent");
+        // `ScopedExecutor` deliberately does not pump detached main-thread
+        // tasks in the background. Drive the sender edge directly while
+        // retaining the production admission and single-flight assertions.
+        tmux_domain.inner.send_next_command();
 
-        assert_eq!(launcher.recorded_keys(), vec!['q']);
+        wait_until("off-main serialized tmux detach write", || {
+            launcher.recorded_writes() == b"detach\n"
+        });
+        assert_eq!(launcher.recorded_writes(), b"detach\n".to_vec());
+        assert!(launcher.recorded_keys().is_empty());
+
+        let completed = tmux_domain
+            .inner
+            .process_protocol_events(vec![
+                Event::Guarded(successful_guarded_response()),
+                Event::Exit { reason: None },
+            ])
+            .expect("detach Guarded must own its clean-exit protocol tail");
+        tmux_domain
+            .inner
+            .complete_command_response(completed.0, &completed.1);
+        wait_until("serialized tmux detach clean exit", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
+        assert_eq!(
+            launcher.recorded_writes(),
+            b"detach\n".to_vec(),
+            "duplicate detach requests must share the terminal barrier"
+        );
+    }
+
+    #[test]
+    fn tmux_domain_detach_waits_for_in_flight_command_response() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-detach-order-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+
+        let launcher = RecordingPane::new(78, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+
+        let tmux_domain = Arc::new(new_tmux_domain(78));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register ordered tmux detach test domain");
+        *tmux_domain.inner.state.lock() = State::Idle;
+
+        let processed = Arc::new(AtomicUsize::new(0));
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(CountingCommand {
+                processed: Arc::clone(&processed),
+            }))
+            .expect("admit command ahead of detach");
+        tmux_domain.inner.send_next_command();
+        wait_until("ordinary command write before detach", || {
+            launcher.recorded_writes() == b"count\n"
+        });
+
+        tmux_domain
+            .detach()
+            .expect("admit detach behind in-flight command");
+        assert_eq!(
+            launcher.recorded_writes(),
+            b"count\n".to_vec(),
+            "detach must not overlap the response lease of the in-flight command"
+        );
+
+        let completed = tmux_domain
+            .inner
+            .process_protocol_events(vec![Event::Guarded(successful_guarded_response())])
+            .expect("ordinary command response must retain exact ownership");
+        tmux_domain
+            .inner
+            .complete_command_response(completed.0, &completed.1);
+        tmux_domain.inner.send_next_command();
+        wait_until("detach write after prior response", || {
+            launcher.recorded_writes() == b"count\ndetach\n"
+        });
+        assert_eq!(processed.load(Ordering::Acquire), 1);
+
+        let completed = tmux_domain
+            .inner
+            .process_protocol_events(vec![
+                Event::Guarded(successful_guarded_response()),
+                Event::Exit { reason: None },
+            ])
+            .expect("detach response must fence its clean-exit tail");
+        tmux_domain
+            .inner
+            .complete_command_response(completed.0, &completed.1);
+        wait_until("ordered tmux detach clean exit", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
+        assert_eq!(
+            launcher.recorded_writes(),
+            b"count\ndetach\n".to_vec()
+        );
     }
 
     #[test]
@@ -3632,7 +5079,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(mux);
 
-        let tmux_domain = TmuxDomain::new(1234);
+        let tmux_domain = new_tmux_domain(1234);
         let err = tmux_domain
             .detach()
             .expect_err("detach should fail without launcher pane");
@@ -3644,7 +5091,7 @@ mod tests {
     #[test]
     fn tmux_domain_spawn_is_explicitly_unsupported_without_queueing_side_effects() {
         let mux = Arc::new(Mux::new(None));
-        let tmux_domain = TmuxDomain::new(77);
+        let tmux_domain = new_tmux_domain(77);
         let err = match block_on(tmux_domain.spawn(&mux, TerminalSize::default(), None, None, 0)) {
             Ok(_) => panic!("tmux spawn should be unsupported"),
             Err(err) => err,
@@ -3658,7 +5105,7 @@ mod tests {
     #[test]
     fn tmux_domain_spawn_pane_is_explicitly_unsupported_without_queueing_side_effects() {
         let mux = Arc::new(Mux::new(None));
-        let tmux_domain = TmuxDomain::new(77);
+        let tmux_domain = new_tmux_domain(77);
         let err = match block_on(tmux_domain.spawn_pane(&mux, TerminalSize::default(), None, None))
         {
             Ok(_) => panic!("tmux spawn_pane should be unsupported"),
@@ -3691,7 +5138,10 @@ mod tests {
         let launcher_dyn: Arc<dyn Pane> = launcher.clone();
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
-        let tmux_domain = TmuxDomain::new(89);
+        let tmux_domain = Arc::new(new_tmux_domain(89));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register tmux blocked-write test domain");
         let inner = Arc::clone(&tmux_domain.inner);
         *inner.state.lock() = State::Idle;
         assert!(
@@ -3703,11 +5153,10 @@ mod tests {
             "live tmux mailbox must accept the test command"
         );
 
-        let sender_inner = Arc::clone(&inner);
-        let sender = std::thread::spawn(move || sender_inner.send_next_command());
+        let caller_thread = std::thread::current().id();
+        inner.send_next_command();
         if let Err(err) = write_entered.recv_timeout(Duration::from_secs(5)) {
             let _ = release_write.send(());
-            sender.join().expect("sender thread should finish");
             panic!("tmux command did not reach the blocking writer: {}", err);
         }
         assert_eq!(*inner.state.lock(), State::WaitingForResponse);
@@ -3745,9 +5194,11 @@ mod tests {
         release_write
             .send(())
             .expect("release blocked tmux command write");
-        sender.join().expect("sender thread should finish");
         exit_thread.join().expect("exit thread should finish");
 
+        wait_until("terminal cleanup after admitted tmux write", || {
+            inner.lifecycle.lock().active_operations == 0
+        });
         assert_eq!(*inner.state.lock(), State::Exit);
         {
             let lifecycle = inner.lifecycle.lock();
@@ -3760,6 +5211,13 @@ mod tests {
         assert!(
             !launcher.recorded_writes().is_empty(),
             "a command reserved before Exit may finish, but must not resurrect the domain"
+        );
+        assert!(
+            launcher
+                .recorded_write_threads()
+                .iter()
+                .all(|writer| writer != &caller_thread),
+            "launcher writer acquisition and write must stay off the caller/main lane"
         );
     }
 
@@ -3775,7 +5233,7 @@ mod tests {
         let launcher_dyn: Arc<dyn Pane> = launcher.clone();
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
-        let tmux_domain = Arc::new(TmuxDomain::new(98));
+        let tmux_domain = Arc::new(new_tmux_domain(98));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("test tmux domain should register");
@@ -3787,11 +5245,9 @@ mod tests {
             .push_back(Box::new(ListCommands))
             .is_ok());
 
-        let sender_inner = Arc::clone(&inner);
-        let sender = std::thread::spawn(move || sender_inner.send_next_command());
+        inner.send_next_command();
         if let Err(err) = write_entered.recv_timeout(Duration::from_secs(5)) {
             let _ = release_write.send(());
-            sender.join().expect("sender thread should finish");
             panic!("tmux command did not reach the blocking writer: {}", err);
         }
 
@@ -3822,9 +5278,12 @@ mod tests {
         release_write
             .send(())
             .expect("release blocked tmux command write");
-        sender.join().expect("sender thread should finish");
         exit_thread.join().expect("exit thread should finish");
 
+        wait_until("clean tmux cleanup after admitted write", || {
+            let lifecycle = inner.lifecycle.lock();
+            lifecycle.active_operations == 0 && lifecycle.resources_cleaned
+        });
         tmux_domain
             .detach()
             .expect("main-thread clean-removal retry");
@@ -3842,8 +5301,11 @@ mod tests {
     #[test]
     fn tmux_command_send_fails_closed_when_launcher_pane_disappears() {
         let mux = Arc::new(Mux::new(None));
-        let _guard = ScopedMux::install(mux);
-        let tmux_domain = TmuxDomain::new(90);
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(90));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register missing-launcher tmux domain");
         *tmux_domain.inner.state.lock() = State::Idle;
         assert!(tmux_domain
             .inner
@@ -3854,6 +5316,9 @@ mod tests {
 
         tmux_domain.inner.send_next_command();
 
+        wait_until("missing launcher pane terminal outcome", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         assert!(
             tmux_domain.inner.cmd_queue.lock().is_empty(),
@@ -3864,7 +5329,7 @@ mod tests {
     #[test]
     fn tmux_command_send_fails_closed_when_mux_disappears() {
         let _guard = ScopedMux::shutdown();
-        let tmux_domain = TmuxDomain::new(91);
+        let tmux_domain = new_tmux_domain(91);
         *tmux_domain.inner.state.lock() = State::Idle;
         assert!(tmux_domain
             .inner
@@ -3875,6 +5340,9 @@ mod tests {
 
         tmux_domain.inner.send_next_command();
 
+        wait_until("missing mux terminal outcome", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert!(queue.is_closed());
@@ -3892,7 +5360,10 @@ mod tests {
         let launcher_dyn: Arc<dyn Pane> = launcher;
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
-        let tmux_domain = TmuxDomain::new(92);
+        let tmux_domain = Arc::new(new_tmux_domain(92));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register failing-writer tmux domain");
         *tmux_domain.inner.state.lock() = State::Idle;
         assert!(tmux_domain
             .inner
@@ -3903,6 +5374,9 @@ mod tests {
 
         tmux_domain.inner.send_next_command();
 
+        wait_until("launcher write failure terminal outcome", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert!(queue.is_closed());
@@ -3910,10 +5384,259 @@ mod tests {
     }
 
     #[test]
+    fn tmux_initial_guard_deadline_terminalizes_silent_startup() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(119));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register initial-guard timeout tmux domain");
+        tmux_domain
+            .inner
+            .set_test_initial_guard_deadline(Duration::from_millis(25))
+            .expect("shorten initial-guard test deadline");
+
+        wait_until("silent tmux initial-guard terminal outcome", || {
+            let lifecycle = tmux_domain.inner.lifecycle.lock();
+            lifecycle.terminal && lifecycle.resources_cleaned
+        });
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        let lifecycle = tmux_domain.inner.lifecycle.lock();
+        assert!(lifecycle.terminal);
+        assert!(lifecycle.resources_cleaned);
+        drop(lifecycle);
+        assert!(tmux_domain.inner.cmd_queue.lock().is_closed());
+    }
+
+    #[test]
+    fn tmux_terminalization_during_command_preparation_cannot_strand_sending() {
+        let tmux_domain = new_tmux_domain(118);
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(TerminalizingPreparationCommand {
+                owner: Arc::downgrade(&tmux_domain.inner),
+            }))
+            .expect("preparation-cancellation command admission");
+
+        tmux_domain.inner.send_next_command();
+
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        let lifecycle = tmux_domain.inner.lifecycle.lock();
+        assert_eq!(lifecycle.active_operations, 0);
+        assert!(lifecycle.resources_cleaned);
+        drop(lifecycle);
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        assert!(queue.is_closed());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn dropped_tmux_result_dispatch_lease_terminalizes_protocol_barrier() {
+        let tmux_domain = new_tmux_domain(117);
+        *tmux_domain.inner.state.lock() = State::ProcessingResponse;
+        tmux_domain
+            .inner
+            .protocol_barrier
+            .lock()
+            .activate(128, vec![Event::SessionsChanged])
+            .expect("activate test response barrier");
+        let lost = ResponseBarrierLease {
+            owner: Arc::clone(&tmux_domain.inner),
+            completed: false,
+        };
+
+        drop(lost);
+
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        let barrier = tmux_domain.inner.protocol_barrier.lock();
+        assert!(!barrier.active);
+        assert!(barrier.events.is_empty());
+        assert_eq!(barrier.retained_bytes, 0);
+    }
+
+    #[test]
+    fn tmux_command_write_timeout_is_terminal_without_blocking_caller() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-write-timeout-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let (launcher, write_entered, release_write) =
+            RecordingPane::new_with_blocking_writer(120, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher;
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+        let tmux_domain = Arc::new(new_tmux_domain(120));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register write-timeout tmux domain");
+        *tmux_domain.inner.test_io_deadlines.lock() = Some(TmuxIoDeadlines {
+            start: Duration::from_secs(1),
+            write: Duration::from_millis(25),
+            response: Duration::from_secs(1),
+        });
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(ListCommands))
+            .expect("write-timeout command admission");
+
+        tmux_domain.inner.send_next_command();
+        write_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded writer should start");
+        wait_until("tmux write deadline terminal outcome", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
+        assert!(tmux_domain.inner.cmd_queue.lock().is_closed());
+
+        release_write
+            .send(())
+            .expect("release timed-out test writer");
+    }
+
+    #[test]
+    fn tmux_silent_peer_response_timeout_fences_late_guarded_response() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-response-timeout-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let launcher = RecordingPane::new(121, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+        let tmux_domain = Arc::new(new_tmux_domain(121));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register response-timeout tmux domain");
+        *tmux_domain.inner.test_io_deadlines.lock() = Some(TmuxIoDeadlines {
+            start: Duration::from_secs(1),
+            write: Duration::from_secs(1),
+            response: Duration::from_millis(25),
+        });
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(ListCommands))
+            .expect("response-timeout command admission");
+
+        tmux_domain.inner.send_next_command();
+        wait_until("tmux response deadline terminal outcome", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
+        assert_eq!(launcher.recorded_writes(), b"list-commands\n".to_vec());
+
+        tmux_domain
+            .inner
+            .advance(Box::new(vec![Event::Guarded(successful_guarded_response())]));
+        assert_eq!(
+            *tmux_domain.inner.state.lock(),
+            State::Exit,
+            "a late response must not resurrect or complete a newer generation"
+        );
+        assert!(tmux_domain.inner.cmd_queue.lock().is_closed());
+    }
+
+    #[test]
+    fn tmux_explicit_detach_has_a_clean_exit_deadline() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-detach-timeout-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let launcher = RecordingPane::new(122, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+        let tmux_domain = Arc::new(new_tmux_domain(122));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register detach-timeout tmux domain");
+        *tmux_domain.inner.test_io_deadlines.lock() = Some(TmuxIoDeadlines {
+            start: Duration::from_secs(1),
+            write: Duration::from_secs(1),
+            response: Duration::from_millis(25),
+        });
+        *tmux_domain.inner.state.lock() = State::Idle;
+
+        tmux_domain.detach().expect("admit explicit detach");
+        tmux_domain.inner.send_next_command();
+        wait_until("serialized tmux detach write", || {
+            launcher.recorded_writes() == b"detach\n"
+        });
+        let completed = tmux_domain
+            .inner
+            .process_protocol_events(vec![Event::Guarded(successful_guarded_response())])
+            .expect("detach Guarded must release only its response phase");
+        tmux_domain
+            .inner
+            .complete_command_response(completed.0, &completed.1);
+        wait_until("tmux detach clean-exit deadline", || {
+            *tmux_domain.inner.state.lock() == State::Exit
+        });
+        assert_eq!(launcher.recorded_writes(), b"detach\n".to_vec());
+        assert!(launcher.recorded_keys().is_empty());
+    }
+
+    #[test]
+    fn tmux_split_promise_has_the_command_generation_response_deadline() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-split-timeout-default").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let launcher = RecordingPane::new(123, default_domain.domain_id());
+        let launcher_dyn: Arc<dyn Pane> = launcher;
+        mux.add_pane(&launcher_dyn).expect("add launcher pane");
+        let tmux_domain = Arc::new(new_tmux_domain(123));
+        let domain: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&domain)
+            .expect("register split-timeout tmux domain");
+        *tmux_domain.inner.test_io_deadlines.lock() = Some(TmuxIoDeadlines {
+            start: Duration::from_secs(1),
+            write: Duration::from_secs(1),
+            response: Duration::from_millis(25),
+        });
+        *tmux_domain.inner.state.lock() = State::Idle;
+        let mut split_promise = promise::Promise::new();
+        let split_future = split_promise
+            .get_future()
+            .expect("create split-timeout future");
+        assert!(tmux_domain
+            .inner
+            .pending_splits
+            .lock()
+            .insert(44, split_promise)
+            .is_none());
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(SplitPane {
+                pane_id: 7,
+                direction: SplitDirection::Horizontal,
+                request_id: 44,
+            }))
+            .expect("split-timeout command admission");
+
+        tmux_domain.inner.send_next_command();
+        let err = block_on(split_future).expect_err("silent split must reach a terminal outcome");
+
+        assert!(
+            err.to_string().contains("split request 44"),
+            "unexpected split timeout error: {:#}",
+            err
+        );
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        assert!(tmux_domain.inner.pending_splits.lock().is_empty());
+    }
+
+    #[test]
     fn tmux_terminal_queue_rejects_stale_producers_and_session_events() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(mux);
-        let tmux_domain = TmuxDomain::new(93);
+        let tmux_domain = new_tmux_domain(93);
 
         tmux_domain.inner.transition_to_exit_and_schedule_detach();
         assert_eq!(
@@ -3942,7 +5665,7 @@ mod tests {
 
     #[test]
     fn tmux_terminal_lifecycle_discards_stale_command_results() {
-        let tmux_domain = TmuxDomain::new(94);
+        let tmux_domain = new_tmux_domain(94);
         let processed = Arc::new(AtomicUsize::new(0));
         tmux_domain.inner.transition_to_exit_and_schedule_detach();
 
@@ -3972,12 +5695,14 @@ mod tests {
                 owner: Arc::downgrade(inner),
                 processed,
             }),
+            generation: 1,
             remaining_responses: 1,
             first_error: None,
         });
         queue.retained_by_class[TmuxCommandClass::RequiredControl.index()] = 1;
         drop(queue);
         *inner.state.lock() = State::WaitingForResponse;
+        assert!(inner.install_io_operation(TmuxIoOperationKind::Command, 1));
     }
 
     fn successful_guarded_response() -> Guarded {
@@ -3994,7 +5719,7 @@ mod tests {
     fn guarded_callback_precedes_same_batch_protocol_tail() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
-        let tmux_domain = Arc::new(TmuxDomain::new(97));
+        let tmux_domain = Arc::new(new_tmux_domain(97));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain).expect("register tmux test domain");
         let processed = Arc::new(AtomicBool::new(false));
@@ -4031,7 +5756,7 @@ mod tests {
     fn guarded_callback_precedes_cross_batch_protocol_tail() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
-        let tmux_domain = Arc::new(TmuxDomain::new(98));
+        let tmux_domain = Arc::new(new_tmux_domain(98));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain).expect("register tmux test domain");
         let processed = Arc::new(AtomicBool::new(false));
@@ -4064,7 +5789,7 @@ mod tests {
     fn guarded_response_queued_behind_final_response_fails_closed() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
-        let tmux_domain = Arc::new(TmuxDomain::new(99));
+        let tmux_domain = Arc::new(new_tmux_domain(99));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain).expect("register tmux test domain");
         let processed = Arc::new(AtomicUsize::new(0));
@@ -4074,12 +5799,16 @@ mod tests {
                 command: Box::new(CountingCommand {
                     processed: Arc::clone(&processed),
                 }),
+                generation: 1,
                 remaining_responses: 1,
                 first_error: None,
             });
             queue.retained_by_class[TmuxCommandClass::RequiredControl.index()] = 1;
         }
         *tmux_domain.inner.state.lock() = State::WaitingForResponse;
+        assert!(tmux_domain
+            .inner
+            .install_io_operation(TmuxIoOperationKind::Command, 1));
 
         let completed = tmux_domain
             .inner
@@ -4174,7 +5903,7 @@ mod tests {
     fn tmux_clean_exit_closes_mailbox_releases_resources_and_removes_domain() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
-        let tmux_domain = Arc::new(TmuxDomain::new(95));
+        let tmux_domain = Arc::new(new_tmux_domain(95));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("test tmux domain should register");
@@ -4223,7 +5952,7 @@ mod tests {
     fn tmux_clean_exit_waits_for_admitted_operation_before_domain_removal() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
-        let tmux_domain = Arc::new(TmuxDomain::new(96));
+        let tmux_domain = Arc::new(new_tmux_domain(96));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("test tmux domain should register");
@@ -4252,7 +5981,7 @@ mod tests {
 
     #[test]
     fn tmux_terminal_transition_is_reentrant_from_active_callback() {
-        let tmux_domain = TmuxDomain::new(97);
+        let tmux_domain = new_tmux_domain(97);
         assert!(tmux_domain
             .inner
             .with_active_lifecycle(|| {
@@ -4269,7 +5998,7 @@ mod tests {
 
     #[test]
     fn tmux_send_schedule_is_single_flight_and_rearms_after_lease_drop() {
-        let tmux_domain = TmuxDomain::new(98);
+        let tmux_domain = new_tmux_domain(98);
         assert!(
             tmux_domain.inner.try_claim_send_schedule(),
             "first runnable must claim the scheduling edge"
@@ -4296,7 +6025,7 @@ mod tests {
 
     #[test]
     fn lost_tmux_sender_runnable_fails_durable_mailbox_closed() {
-        let tmux_domain = TmuxDomain::new(99);
+        let tmux_domain = new_tmux_domain(99);
         tmux_domain
             .inner
             .cmd_queue
@@ -4652,7 +6381,7 @@ mod tests {
 
     #[test]
     fn tmux_domain_state_reports_detached_after_exit() {
-        let tmux_domain = TmuxDomain::new(0);
+        let tmux_domain = new_tmux_domain(0);
         *tmux_domain.inner.state.lock() = State::Exit;
         assert_eq!(tmux_domain.state(), DomainState::Detached);
     }
@@ -4760,7 +6489,7 @@ mod tests {
         let launcher_dyn: Arc<dyn Pane> = launcher.clone();
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
-        let tmux_domain = TmuxDomain::new(99);
+        let tmux_domain = new_tmux_domain(99);
         // Required control retains terminal progress authority even if the
         // sender is stalled and never reaches a pop site.
         {
@@ -4792,6 +6521,63 @@ mod tests {
             assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH);
             assert_eq!(queue.rejected_commands, 101);
         }
+    }
+
+    #[test]
+    fn cmd_queue_detach_barrier_preempts_queued_work_and_rejects_later_producers() {
+        let mut queue = TmuxCmdQueue::new();
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::RequiredControl,
+                sequence: 1,
+            }))
+            .expect("admit work preceding detach request");
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::CoalescibleIntent,
+                sequence: 2,
+            }))
+            .expect("admit coalescible work preceding detach request");
+
+        queue
+            .push_domain_detach(Box::new(DetachClient))
+            .expect("terminal detach barrier admission");
+        assert!(queue.has_domain_detach_pending());
+        assert_eq!(
+            queue
+                .front()
+                .expect("detach barrier is serviceable")
+                .get_command(0),
+            "detach\n"
+        );
+        assert_eq!(
+            queue.push_back(Box::new(ListCommands)),
+            Err(TmuxEnqueueError::Closed),
+            "new work must not cross the terminal barrier"
+        );
+        assert_eq!(
+            queue.push_required_batch(vec![Box::new(ListCommands)]),
+            Err(TmuxEnqueueError::Closed),
+            "required batches must not cross the terminal barrier"
+        );
+        assert_eq!(
+            queue.push_domain_detach(Box::new(DetachClient)),
+            Err(TmuxEnqueueError::Closed),
+            "the explicit detach barrier is single-flight"
+        );
+
+        let completed = complete_next_mailbox_command(&mut queue);
+        assert!(completed.awaits_clean_exit());
+        assert_eq!(completed.get_command(0), "detach\n");
+        assert!(
+            !queue.has_pending(),
+            "work admitted before detach must await terminal cleanup, not run after it"
+        );
+        assert_eq!(
+            queue.len(),
+            2,
+            "pre-barrier work remains accounted until terminal cleanup"
+        );
     }
 
     #[test]
@@ -4860,7 +6646,7 @@ mod tests {
     fn required_admission_fails_closed_when_sender_cannot_be_registered() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(mux);
-        let tmux_domain = TmuxDomain::new(404);
+        let tmux_domain = new_tmux_domain(404);
 
         let err = tmux_domain
             .inner
@@ -5022,7 +6808,7 @@ mod tests {
         let resize = queue
             .take_next_for_preparation()
             .expect("resize should enter preparation");
-        assert!(queue.install_in_flight(resize));
+        assert!(queue.install_in_flight(resize, 1));
         queue
             .push_back(Box::new(ListCommands))
             .expect("following command should be admitted");
@@ -5052,9 +6838,10 @@ mod tests {
             flags: 0,
             output: String::new(),
         };
-        let (completed, retained_response) = queue
+        let (completed, retained_response, generation) = queue
             .record_in_flight_response(&second_success)
             .expect("the second response should complete the resize");
+        assert_eq!(generation, 1);
         assert!(completed.as_resize().is_some());
         assert!(
             retained_response.error,
@@ -5081,7 +6868,7 @@ mod tests {
         let launcher_dyn: Arc<dyn Pane> = launcher.clone();
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
-        let tmux_domain = TmuxDomain::new(777);
+        let tmux_domain = new_tmux_domain(777);
         let inner = Arc::clone(&tmux_domain.inner);
         let domain_id = inner.domain_id;
 
@@ -5109,7 +6896,7 @@ mod tests {
             let prepared = queue
                 .take_next_for_preparation()
                 .expect("the admitted sentinel must enter sender preparation");
-            assert!(queue.install_in_flight(prepared));
+            assert!(queue.install_in_flight(prepared, 1));
             assert_eq!(queue.len(), 1);
         }
 
@@ -5153,7 +6940,7 @@ mod tests {
         let launcher_dyn: Arc<dyn Pane> = launcher.clone();
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
-        let tmux_domain = TmuxDomain::new(778);
+        let tmux_domain = new_tmux_domain(778);
         let inner = Arc::clone(&tmux_domain.inner);
         let domain_id = inner.domain_id;
 
@@ -5205,7 +6992,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
 
-        let tmux_domain = Arc::new(TmuxDomain::new(0));
+        let tmux_domain = Arc::new(new_tmux_domain(0));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("test tmux domain should register");
@@ -5251,7 +7038,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
 
-        let tmux_domain = Arc::new(TmuxDomain::new(0));
+        let tmux_domain = Arc::new(new_tmux_domain(0));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("test tmux domain should register");
@@ -5281,7 +7068,7 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(Arc::clone(&mux));
 
-        let tmux_domain = Arc::new(TmuxDomain::new(0));
+        let tmux_domain = Arc::new(new_tmux_domain(0));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("test tmux domain should register");

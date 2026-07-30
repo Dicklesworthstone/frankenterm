@@ -67,6 +67,17 @@ pub(crate) trait TmuxCommand: Send + Debug {
     fn get_command(&self, domain_id: DomainId) -> String;
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
 
+    /// Whether a successful guarded response is only the first terminal
+    /// boundary for this command.
+    ///
+    /// `detach-client` is serialized through the ordinary command mailbox so
+    /// its guarded response cannot be confused with another command. The I/O
+    /// supervisor must then retain the same generation lease until tmux emits
+    /// its clean `Exit` event.
+    fn awaits_clean_exit(&self) -> bool {
+        false
+    }
+
     /// Number of tmux guarded responses emitted by `get_command`.
     ///
     /// Most mailbox items issue one tmux command. Multi-command items must
@@ -2213,6 +2224,37 @@ impl TmuxCommand for SelectPane {
     }
 }
 
+/// Explicitly detach this control-mode client.
+///
+/// tmux accepts `detach` as an alias of `detach-client`. Keeping this as a
+/// first-class mailbox command gives its guarded response exactly the same
+/// generation and ordering guarantees as every other control command.
+#[derive(Debug)]
+pub(crate) struct DetachClient;
+
+impl TmuxCommand for DetachClient {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::TerminalControl
+    }
+
+    fn get_command(&self, _domain_id: DomainId) -> String {
+        "detach\n".to_string()
+    }
+
+    fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
+        if result.error {
+            let error = format!("detach-client in domain={domain_id} failed: {result:#?}");
+            log::error!("{error}");
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
+
+    fn awaits_clean_exit(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct KillPane {
     pub pane_id: TmuxPaneId,
@@ -2321,7 +2363,8 @@ mod tests {
         let mux = Arc::new(Mux::new(None));
         let guard = ScopedMux::install(Arc::clone(&mux));
 
-        let tmux_domain = Arc::new(TmuxDomain::new(0));
+        let tmux_domain =
+            Arc::new(TmuxDomain::new(0).expect("start tmux test domain I/O supervisor"));
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain)
             .expect("test tmux domain should register");
@@ -3001,6 +3044,32 @@ mod tests {
             child_state: Arc::new(TmuxChildState::new()),
         };
         assert_eq!(cmd.get_command(0), "kill-pane -t %23\n");
+    }
+
+    #[test]
+    fn detach_client_is_a_terminal_command_that_awaits_clean_exit() {
+        let cmd = DetachClient;
+        assert_eq!(cmd.mailbox_class(), TmuxCommandClass::TerminalControl);
+        assert_eq!(cmd.get_command(0), "detach\n");
+        assert!(cmd.awaits_clean_exit());
+    }
+
+    #[test]
+    fn detach_client_preserves_guarded_failure_as_a_typed_error() {
+        let err = DetachClient
+            .process_result(
+                9,
+                &Guarded {
+                    error: true,
+                    timestamp: 0,
+                    number: 0,
+                    flags: 0,
+                    output: "session vanished".to_string(),
+                },
+            )
+            .expect_err("detach-client failure must be terminally distinguishable");
+        assert!(err.to_string().contains("detach-client"));
+        assert!(err.to_string().contains("domain=9"));
     }
 
     #[test]

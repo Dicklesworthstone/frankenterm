@@ -575,6 +575,22 @@ pub struct Config {
     #[dynamic(default = "default_mux_tmux_max_backlog_entries")]
     pub mux_tmux_max_backlog_entries: usize,
 
+    /// Maximum time, in milliseconds, for an admitted tmux launcher write
+    /// to start on its dedicated I/O lane. Default: 500ms.
+    #[dynamic(default = "default_mux_tmux_io_start_timeout_ms")]
+    pub mux_tmux_io_start_timeout_ms: u64,
+
+    /// Maximum time, in milliseconds, for one tmux launcher write after its
+    /// dedicated I/O worker starts it. Default: 2000ms.
+    #[dynamic(default = "default_mux_tmux_io_write_timeout_ms")]
+    pub mux_tmux_io_write_timeout_ms: u64,
+
+    /// Maximum time, in milliseconds, for tmux to produce the final guarded
+    /// response for a successfully written command, or to exit control mode
+    /// after an explicit detach request. Default: 10000ms.
+    #[dynamic(default = "default_mux_tmux_response_timeout_ms")]
+    pub mux_tmux_response_timeout_ms: u64,
+
     /// Number of panes in a tab above which resize operations are
     /// parallelized. Default: 8.
     #[dynamic(default = "default_resize_fanout_parallel_threshold")]
@@ -2075,6 +2091,18 @@ fn default_mux_tmux_max_backlog_bytes() -> usize {
 
 fn default_mux_tmux_max_backlog_entries() -> usize {
     1024
+}
+
+fn default_mux_tmux_io_start_timeout_ms() -> u64 {
+    500
+}
+
+fn default_mux_tmux_io_write_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_mux_tmux_response_timeout_ms() -> u64 {
+    10_000
 }
 
 fn default_ssh_initial_poll_delay_ms() -> u64 {

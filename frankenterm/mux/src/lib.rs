@@ -13986,7 +13986,8 @@ mod tests {
             Arc::new(domain::LocalDomain::new("default-domain-tmux-detach-test").unwrap());
         let mux = Mux::new(Some(default_domain));
 
-        let tmux_domain = Arc::new(TmuxDomain::new(0));
+        let tmux_domain =
+            Arc::new(TmuxDomain::new(0).expect("start tmux test domain I/O supervisor"));
         let tmux_domain_dyn: Arc<dyn Domain> = tmux_domain.clone();
         let tmux_domain_id = tmux_domain_dyn.domain_id();
         mux.add_domain(&tmux_domain_dyn)

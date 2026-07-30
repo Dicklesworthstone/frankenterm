@@ -452,7 +452,9 @@ mod tests {
     fn install_tmux_domain(pane_id: crate::pane::PaneId) -> (ScopedMux, StdArc<TmuxDomain>) {
         let mux = StdArc::new(Mux::new(None));
         let guard = ScopedMux::install(StdArc::clone(&mux));
-        let domain = StdArc::new(TmuxDomain::new(pane_id));
+        let domain = StdArc::new(
+            TmuxDomain::new(pane_id).expect("start tmux test domain I/O supervisor"),
+        );
         let registered: StdArc<dyn Domain> = domain.clone();
         mux.add_domain(&registered)
             .expect("register tmux test domain");

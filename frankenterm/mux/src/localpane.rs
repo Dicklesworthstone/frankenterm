@@ -1437,7 +1437,16 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                     log::info!("tmux -CC mode requested");
 
                     // Create a new domain to host these tmux tabs
-                    let domain = TmuxDomain::new(self.pane_id);
+                    let domain = match TmuxDomain::new(self.pane_id) {
+                        Ok(domain) => domain,
+                        Err(err) => {
+                            log::error!(
+                                "cannot initialize tmux control-mode domain for pane {}: {err:#}",
+                                self.pane_id
+                            );
+                            return;
+                        }
+                    };
                     let tmux_domain = Arc::clone(&domain.inner);
 
                     let domain: Arc<dyn Domain> = Arc::new(domain);
@@ -1467,6 +1476,27 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                             "cannot register tmux control-mode domain for pane {}: {err}",
                             self.pane_id
                         );
+                        return;
+                    }
+                    // Close the narrow race where the supervisor starts
+                    // successfully but panics between construction and
+                    // registration. Its panic handler marks the domain
+                    // terminal; once the exact domain and launcher binding are
+                    // registered, this retry makes terminal cleanup
+                    // authoritative instead of leaving a detached binding.
+                    if tmux_domain.is_terminal() {
+                        log::error!(
+                            "tmux control-mode domain for pane {} lost its I/O supervisor during \
+                             registration",
+                            self.pane_id
+                        );
+                        if let Err(err) = domain.detach() {
+                            log::error!(
+                                "cannot finalize failed tmux control-mode domain for pane {}: \
+                                 {err:#}",
+                                self.pane_id
+                            );
+                        }
                         return;
                     }
                     emit_output_for_pane(
@@ -1584,15 +1614,18 @@ fn split_child(
 }
 
 impl LocalPane {
-    pub(crate) fn send_tmux_detach_if_same(
+    pub(crate) fn write_tmux_command_if_same(
         &self,
         expected: &TmuxDomainState,
+        command: &str,
     ) -> Result<bool, Error> {
         // DCS parsing already holds the terminal lock before it installs or
         // clears a tmux binding. Preserve that lock order here so terminal
         // cleanup cannot deadlock parser-side terminal -> binding activity.
+        // The blocking write itself runs on the tmux domain's supervised I/O
+        // lane rather than the GUI/main lane.
         let mut terminal = self.locked_terminal();
-        let mut tmux_domain = self.tmux_domain.lock();
+        let tmux_domain = self.tmux_domain.lock();
         if !tmux_domain
             .as_ref()
             .is_some_and(|current| std::ptr::eq(current.as_ref(), expected))
@@ -1600,13 +1633,13 @@ impl LocalPane {
             return Ok(false);
         }
 
-        // Claim the exact binding while the terminal lock prevents a new DCS
-        // control-mode binding from being installed. The write no longer
-        // relies on key routing, so the binding can be cleared before we
-        // release its mutex without opening a replacement-instance window.
-        let _ = tmux_domain.take();
+        // The terminal lock prevents DCS exit/re-entry from replacing the
+        // validated binding before these bytes are submitted. Release the
+        // binding mutex before the potentially blocking writer call so a
+        // deadline supervisor can invalidate the binding and kill the
+        // launcher without waiting on external I/O.
         drop(tmux_domain);
-        terminal.send_paste("detach\n")?;
+        terminal.send_paste(command)?;
         Ok(true)
     }
 

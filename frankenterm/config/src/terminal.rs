@@ -515,6 +515,9 @@ mod tests {
         assert_eq!(handle.mux_tmux_max_backlog_bytes_per_pane, 1_048_576);
         assert_eq!(handle.mux_tmux_max_backlog_bytes, 32 * 1024 * 1024);
         assert_eq!(handle.mux_tmux_max_backlog_entries, 1024);
+        assert_eq!(handle.mux_tmux_io_start_timeout_ms, 500);
+        assert_eq!(handle.mux_tmux_io_write_timeout_ms, 2_000);
+        assert_eq!(handle.mux_tmux_response_timeout_ms, 10_000);
     }
 
     #[test]
