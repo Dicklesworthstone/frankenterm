@@ -559,9 +559,10 @@ pub struct Config {
     #[dynamic(default = "default_mux_max_synchronized_output_bytes")]
     pub mux_max_synchronized_output_bytes: usize,
 
-    /// Maximum backlog payload size per tmux pane, in bytes. Payloads
-    /// exceeding this are truncated to the tail bytes so the most recent
-    /// output is preserved. Default: 1MB (1048576).
+    /// Maximum queued output per tmux pane, in bytes, across pre-attach
+    /// backlog and the live nonblocking output lane. Exceeding this records a
+    /// gap and fails closed; an arbitrary terminal-stream suffix is never
+    /// replayed. Default: 1MB (1048576).
     #[dynamic(default = "default_mux_tmux_max_backlog_bytes_per_pane")]
     pub mux_tmux_max_backlog_bytes_per_pane: usize,
 
@@ -574,6 +575,27 @@ pub struct Config {
     /// retained output. Default: 1024.
     #[dynamic(default = "default_mux_tmux_max_backlog_entries")]
     pub mux_tmux_max_backlog_entries: usize,
+
+    /// Maximum aggregate number of owned output chunks retained for tmux
+    /// panes whose local mirrors have not materialized yet. Default: 16384.
+    #[dynamic(default = "default_mux_tmux_max_backlog_items")]
+    pub mux_tmux_max_backlog_items: usize,
+
+    /// Maximum age of output retained for an unknown tmux pane identity.
+    /// Expiry records a global resynchronization requirement rather than
+    /// silently forgetting terminal bytes. Default: 30000ms.
+    #[dynamic(default = "default_mux_tmux_backlog_expiry_ms")]
+    pub mux_tmux_backlog_expiry_ms: u64,
+
+    /// Maximum number of owned output chunks queued for one materialized tmux
+    /// pane. The byte cap above is enforced independently. Default: 1024.
+    #[dynamic(default = "default_mux_tmux_max_output_queue_items_per_pane")]
+    pub mux_tmux_max_output_queue_items_per_pane: usize,
+
+    /// Maximum bytes one tmux pane may write during a fair output-drain
+    /// quantum before another ready pane runs. Default: 256KB (262144).
+    #[dynamic(default = "default_mux_tmux_output_write_quantum_bytes")]
+    pub mux_tmux_output_write_quantum_bytes: usize,
 
     /// Maximum time, in milliseconds, for an admitted tmux launcher write
     /// to start on its dedicated I/O lane. Default: 500ms.
@@ -2091,6 +2113,22 @@ fn default_mux_tmux_max_backlog_bytes() -> usize {
 
 fn default_mux_tmux_max_backlog_entries() -> usize {
     1024
+}
+
+fn default_mux_tmux_max_backlog_items() -> usize {
+    16_384
+}
+
+fn default_mux_tmux_backlog_expiry_ms() -> u64 {
+    30_000
+}
+
+fn default_mux_tmux_max_output_queue_items_per_pane() -> usize {
+    1024
+}
+
+fn default_mux_tmux_output_write_quantum_bytes() -> usize {
+    256 * 1024
 }
 
 fn default_mux_tmux_io_start_timeout_ms() -> u64 {

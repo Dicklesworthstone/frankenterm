@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fmt;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use termwiz::tmux_cc::*;
@@ -36,6 +36,8 @@ pub(crate) struct TmuxBacklogLimits {
     per_pane_bytes: usize,
     total_bytes: usize,
     entries: usize,
+    items: usize,
+    expiry: Duration,
 }
 
 impl TmuxBacklogLimits {
@@ -45,6 +47,8 @@ impl TmuxBacklogLimits {
             per_pane_bytes: config.mux_tmux_max_backlog_bytes_per_pane,
             total_bytes: config.mux_tmux_max_backlog_bytes,
             entries: config.mux_tmux_max_backlog_entries,
+            items: config.mux_tmux_max_backlog_items,
+            expiry: Duration::from_millis(config.mux_tmux_backlog_expiry_ms),
         }
     }
 
@@ -54,19 +58,66 @@ impl TmuxBacklogLimits {
             per_pane_bytes,
             total_bytes,
             entries,
+            items: usize::MAX,
+            expiry: Duration::MAX,
         }
+    }
+
+    #[cfg(test)]
+    fn with_item_expiry(
+        per_pane_bytes: usize,
+        total_bytes: usize,
+        entries: usize,
+        items: usize,
+        expiry: Duration,
+    ) -> Self {
+        Self {
+            per_pane_bytes,
+            total_bytes,
+            entries,
+            items,
+            expiry,
+        }
+    }
+
+    fn disables_retention(self) -> bool {
+        self.per_pane_bytes == 0
+            || self.total_bytes == 0
+            || self.entries == 0
+            || self.items == 0
+            || self.expiry.is_zero()
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PaneBacklog {
-    bytes: VecDeque<u8>,
+    chunks: VecDeque<Vec<u8>>,
+    byte_len: usize,
+    updated_at: Instant,
     gapped: bool,
+}
+
+impl PaneBacklog {
+    fn new(updated_at: Instant) -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            byte_len: 0,
+            updated_at,
+            gapped: false,
+        }
+    }
+
+    fn clear_payload(&mut self) -> (usize, usize) {
+        let bytes = std::mem::take(&mut self.byte_len);
+        let items = self.chunks.len();
+        self.chunks = VecDeque::new();
+        (bytes, items)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TmuxBacklogDrain {
-    Bytes(VecDeque<u8>),
+    Bytes(VecDeque<Vec<u8>>),
     ResyncRequired,
 }
 
@@ -74,12 +125,16 @@ pub(crate) enum TmuxBacklogDrain {
 pub(crate) struct TmuxBacklog {
     entries: LruCache<TmuxPaneId, PaneBacklog>,
     total_bytes: usize,
+    total_items: usize,
+    gapped_entries: usize,
     limits: TmuxBacklogLimits,
     resync_all: bool,
     dropped_bytes: u64,
     evicted_entries: u64,
+    expired_entries: u64,
     reported_dropped_bytes: u64,
     reported_evicted_entries: u64,
+    reported_expired_entries: u64,
 }
 
 impl Default for TmuxBacklog {
@@ -87,29 +142,43 @@ impl Default for TmuxBacklog {
         Self {
             entries: LruCache::unbounded(),
             total_bytes: 0,
+            total_items: 0,
+            gapped_entries: 0,
             limits: TmuxBacklogLimits::default(),
             resync_all: false,
             dropped_bytes: 0,
             evicted_entries: 0,
+            expired_entries: 0,
             reported_dropped_bytes: 0,
             reported_evicted_entries: 0,
+            reported_expired_entries: 0,
         }
     }
 }
 
 impl TmuxBacklog {
-    pub(crate) fn append_with_limits(
+    pub(crate) fn append_owned_with_limits(
         &mut self,
         pane_id: TmuxPaneId,
-        payload: &[u8],
+        payload: Vec<u8>,
         limits: TmuxBacklogLimits,
     ) {
-        self.refresh_limits(limits);
+        self.append_owned_with_limits_at(pane_id, payload, limits, Instant::now());
+    }
+
+    fn append_owned_with_limits_at(
+        &mut self,
+        pane_id: TmuxPaneId,
+        payload: Vec<u8>,
+        limits: TmuxBacklogLimits,
+        now: Instant,
+    ) {
+        self.refresh_limits_at(limits, now);
         if payload.is_empty() {
             self.record_metrics();
             return;
         }
-        if limits.per_pane_bytes == 0 || limits.total_bytes == 0 || limits.entries == 0 {
+        if limits.disables_retention() {
             self.dropped_bytes = self
                 .dropped_bytes
                 .saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
@@ -126,16 +195,24 @@ impl TmuxBacklog {
         }
 
         let pane_cap = limits.per_pane_bytes.min(limits.total_bytes);
-        let mut entry = self.entries.pop(&pane_id).unwrap_or_default();
-        let old_len = entry.bytes.len();
+        let mut entry = self
+            .entries
+            .pop(&pane_id)
+            .unwrap_or_else(|| PaneBacklog::new(now));
+        let old_len = entry.byte_len;
+        let old_items = entry.chunks.len();
         self.total_bytes = self.total_bytes.saturating_sub(old_len);
+        self.total_items = self.total_items.saturating_sub(old_items);
 
         if entry.gapped {
             self.dropped_bytes = self
                 .dropped_bytes
                 .saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
-            entry.bytes = VecDeque::new();
-        } else if old_len.saturating_add(payload.len()) > pane_cap {
+            entry.clear_payload();
+        } else if old_len
+            .checked_add(payload.len())
+            .is_none_or(|combined| combined > pane_cap)
+        {
             // Never retain an arbitrary terminal-stream suffix. It could begin
             // inside UTF-8, CSI, OSC, or another stateful escape sequence.
             // Preserve a bounded marker and require an authoritative capture.
@@ -143,12 +220,16 @@ impl TmuxBacklog {
             self.dropped_bytes = self
                 .dropped_bytes
                 .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
-            entry.bytes = VecDeque::new();
+            entry.clear_payload();
             entry.gapped = true;
+            self.gapped_entries = self.gapped_entries.saturating_add(1);
         } else {
-            entry.bytes.extend(payload.iter().copied());
+            entry.byte_len += payload.len();
+            entry.chunks.push_back(payload);
         }
-        self.total_bytes = self.total_bytes.saturating_add(entry.bytes.len());
+        entry.updated_at = now;
+        self.total_bytes = self.total_bytes.saturating_add(entry.byte_len);
+        self.total_items = self.total_items.saturating_add(entry.chunks.len());
         self.entries.put(pane_id, entry);
 
         self.enforce_entry_and_aggregate_limits();
@@ -156,11 +237,13 @@ impl TmuxBacklog {
     }
 
     pub(crate) fn refresh_limits(&mut self, limits: TmuxBacklogLimits) {
-        if limits == self.limits {
-            return;
-        }
+        self.refresh_limits_at(limits, Instant::now());
+    }
+
+    fn refresh_limits_at(&mut self, limits: TmuxBacklogLimits, now: Instant) {
+        let limits_changed = self.limits != limits;
         self.limits = limits;
-        if limits.per_pane_bytes == 0 || limits.total_bytes == 0 || limits.entries == 0 {
+        if limits.disables_retention() {
             self.mark_global_resync();
             self.record_metrics();
             return;
@@ -170,43 +253,80 @@ impl TmuxBacklog {
             return;
         }
 
-        let pane_cap = limits.per_pane_bytes.min(limits.total_bytes);
-        let pane_ids = self
-            .entries
-            .iter()
-            .map(|(pane_id, _)| *pane_id)
-            .collect::<Vec<_>>();
-        for pane_id in pane_ids {
-            let Some(entry) = self.entries.peek_mut(&pane_id) else {
-                continue;
-            };
-            if entry.bytes.len() > pane_cap {
-                let dropped = entry.bytes.len();
-                entry.bytes = VecDeque::new();
-                entry.gapped = true;
-                self.total_bytes = self.total_bytes.saturating_sub(dropped);
-                self.dropped_bytes = self
-                    .dropped_bytes
-                    .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
-            }
-            if entry.bytes.capacity() > pane_cap.saturating_mul(2) {
-                entry.bytes.shrink_to_fit();
-            }
+        // Appends pop and reinsert their pane, so LRU order is also
+        // last-update order. The overwhelmingly common no-expiry path needs
+        // only the oldest entry check rather than a scan of every unknown pane.
+        let oldest_expired = self.entries.iter().next_back().is_some_and(|(_, entry)| {
+            now.saturating_duration_since(entry.updated_at) >= limits.expiry
+        });
+        if oldest_expired {
+            let expired = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    now.saturating_duration_since(entry.updated_at) >= limits.expiry
+                })
+                .count();
+            self.expired_entries = self
+                .expired_entries
+                .saturating_add(u64::try_from(expired).unwrap_or(u64::MAX));
+            self.mark_global_resync();
+            self.record_metrics();
+            return;
         }
-        self.enforce_entry_and_aggregate_limits();
+
+        // Per-pane entries already satisfied the previous limits. Only a hot
+        // contraction requires a full reconciliation scan; normal output
+        // admission enforces aggregate limits after adding its one new chunk.
+        if limits_changed {
+            let pane_cap = limits.per_pane_bytes.min(limits.total_bytes);
+            let pane_ids = self
+                .entries
+                .iter()
+                .map(|(pane_id, _)| *pane_id)
+                .collect::<Vec<_>>();
+            for pane_id in pane_ids {
+                let Some(entry) = self.entries.peek(&pane_id) else {
+                    continue;
+                };
+                if entry.byte_len > pane_cap {
+                    self.gap_entry(pane_id);
+                }
+            }
+            self.enforce_entry_and_aggregate_limits();
+        }
+        self.record_metrics();
+    }
+
+    fn gap_entry(&mut self, pane_id: TmuxPaneId) {
+        let Some(mut entry) = self.entries.pop(&pane_id) else {
+            return;
+        };
+        let (dropped, dropped_items) = entry.clear_payload();
+        if !entry.gapped {
+            entry.gapped = true;
+            self.gapped_entries = self.gapped_entries.saturating_add(1);
+        }
+        self.total_bytes = self.total_bytes.saturating_sub(dropped);
+        self.total_items = self.total_items.saturating_sub(dropped_items);
+        self.dropped_bytes = self
+            .dropped_bytes
+            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+        self.entries.put(pane_id, entry);
     }
 
     fn enforce_entry_and_aggregate_limits(&mut self) {
-        let overflow_entry = if self.entries.len() > self.limits.entries {
-            self.entries.pop_lru()
-        } else {
-            None
-        };
-        if let Some((_pane_id, entry)) = overflow_entry {
-            self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
+        if self.entries.len() > self.limits.entries {
+            let (_pane_id, mut entry) = self
+                .entries
+                .pop_lru()
+                .expect("tmux backlog entry count exceeded with no entry");
+            let (dropped, dropped_items) = entry.clear_payload();
+            self.total_bytes = self.total_bytes.saturating_sub(dropped);
+            self.total_items = self.total_items.saturating_sub(dropped_items);
             self.dropped_bytes = self
                 .dropped_bytes
-                .saturating_add(u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX));
+                .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
             self.evicted_entries = self.evicted_entries.saturating_add(1);
             // Losing the marker itself means we no longer know which pane is
             // incomplete. The only fail-closed bounded representation is one
@@ -215,39 +335,34 @@ impl TmuxBacklog {
             return;
         }
 
-        while self.total_bytes > self.limits.total_bytes {
+        while self.total_bytes > self.limits.total_bytes || self.total_items > self.limits.items {
             let Some(pane_id) = self
                 .entries
                 .iter()
-                .filter(|(_, entry)| !entry.bytes.is_empty())
+                .filter(|(_, entry)| !entry.chunks.is_empty())
                 .map(|(pane_id, _)| *pane_id)
                 .next_back()
             else {
                 self.total_bytes = 0;
+                self.total_items = 0;
                 break;
             };
-            let entry = self
-                .entries
-                .peek_mut(&pane_id)
-                .expect("selected tmux backlog entry disappeared");
-            let dropped = entry.bytes.len();
-            entry.bytes = VecDeque::new();
-            entry.gapped = true;
-            self.total_bytes = self.total_bytes.saturating_sub(dropped);
-            self.dropped_bytes = self
-                .dropped_bytes
-                .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+            self.gap_entry(pane_id);
         }
     }
 
     pub(crate) fn take(&mut self, pane_id: TmuxPaneId) -> Option<TmuxBacklogDrain> {
         let entry = self.entries.pop(&pane_id)?;
-        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
+        self.total_bytes = self.total_bytes.saturating_sub(entry.byte_len);
+        self.total_items = self.total_items.saturating_sub(entry.chunks.len());
+        if entry.gapped {
+            self.gapped_entries = self.gapped_entries.saturating_sub(1);
+        }
         self.record_metrics();
         if entry.gapped {
             Some(TmuxBacklogDrain::ResyncRequired)
         } else {
-            Some(TmuxBacklogDrain::Bytes(entry.bytes))
+            Some(TmuxBacklogDrain::Bytes(entry.chunks))
         }
     }
 
@@ -263,14 +378,18 @@ impl TmuxBacklog {
     }
 
     pub(crate) fn requires_recovery(&self) -> bool {
-        self.resync_all || self.entries.iter().any(|(_, entry)| entry.gapped)
+        self.resync_all || self.gapped_entries != 0
     }
 
     pub(crate) fn remove(&mut self, pane_id: TmuxPaneId) -> bool {
         let Some(entry) = self.entries.pop(&pane_id) else {
             return false;
         };
-        self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
+        self.total_bytes = self.total_bytes.saturating_sub(entry.byte_len);
+        self.total_items = self.total_items.saturating_sub(entry.chunks.len());
+        if entry.gapped {
+            self.gapped_entries = self.gapped_entries.saturating_sub(1);
+        }
         self.record_metrics();
         true
     }
@@ -304,6 +423,8 @@ impl TmuxBacklog {
         // bound resident memory after a gap or limit contraction.
         self.entries = LruCache::unbounded();
         self.total_bytes = 0;
+        self.total_items = 0;
+        self.gapped_entries = 0;
     }
 
     fn record_metrics(&mut self) {
@@ -321,7 +442,15 @@ impl TmuxBacklog {
             metrics::counter!("mux.tmux.backlog.evicted_entries").increment(newly_evicted);
             self.reported_evicted_entries = self.evicted_entries;
         }
+        let newly_expired = self
+            .expired_entries
+            .saturating_sub(self.reported_expired_entries);
+        if newly_expired > 0 {
+            metrics::counter!("mux.tmux.backlog.expired_entries").increment(newly_expired);
+            self.reported_expired_entries = self.expired_entries;
+        }
         metrics::histogram!("mux.tmux.backlog.entries").record(self.entries.len() as f64);
+        metrics::histogram!("mux.tmux.backlog.items").record(self.total_items as f64);
         metrics::histogram!("mux.tmux.backlog.bytes").record(self.total_bytes as f64);
     }
 
@@ -341,10 +470,19 @@ impl TmuxBacklog {
     }
 
     #[cfg(test)]
+    fn total_items(&self) -> usize {
+        self.total_items
+    }
+
+    #[cfg(test)]
     fn pane_bytes(&self, pane_id: TmuxPaneId) -> Option<Vec<u8>> {
-        self.entries
-            .peek(&pane_id)
-            .map(|entry| entry.bytes.iter().copied().collect())
+        self.entries.peek(&pane_id).map(|entry| {
+            entry
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.iter().copied())
+                .collect()
+        })
     }
 
     #[cfg(test)]
@@ -358,8 +496,14 @@ impl TmuxBacklog {
     fn retained_byte_capacity(&self) -> usize {
         self.entries
             .iter()
-            .map(|(_, entry)| entry.bytes.capacity())
-            .sum()
+            .map(|(_, entry)| {
+                entry
+                    .chunks
+                    .iter()
+                    .map(Vec::capacity)
+                    .fold(0_usize, usize::saturating_add)
+            })
+            .fold(0_usize, usize::saturating_add)
     }
 }
 
@@ -429,6 +573,12 @@ pub(crate) const NOTIFICATION_INTENT_MAX_REORDER_GAP: usize = 4_096;
 /// mistaken for pre-attach output for a future pane.
 pub(crate) const RETIRED_PANE_TOMBSTONE_LIMIT: usize = 65_536;
 
+/// Bound single-flight pane IDs retained by one domain output lane. This is
+/// deliberately independent of the much smaller unknown-pane backlog
+/// cardinality: a large, fully materialized agent fleet must not detach merely
+/// because more than 1024 panes become writable in one burst.
+const TMUX_OUTPUT_ACTIVE_PANE_LIMIT: usize = 16_384;
+
 // The closeable command mailbox owns a distinct externally in-flight request,
 // allowing cap enforcement and tail coalescing to preserve the exact command
 // whose Guarded response is still pending.
@@ -461,14 +611,160 @@ pub(crate) enum TmuxPaneOutputState {
     /// An existing remote terminal is waiting for its queued capture result.
     AwaitingCapture,
     /// The capture committed. Any output that raced after it remains in the
-    /// backlog and makes textual recovery unsafe.
+    /// ordered ingress queue and makes textual recovery unsafe.
     Captured,
     /// The initial stream/capture and cursor transaction committed; live
-    /// output may now write directly.
+    /// output may now enter the nonblocking drain lane.
     Ready,
     /// The remote pane was detached. Any producer that retained the pane gate
     /// must discard late output rather than resurrecting a backlog entry.
     Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TmuxPaneOutputLimits {
+    bytes_per_pane: usize,
+    items_per_pane: usize,
+    write_quantum_bytes: usize,
+}
+
+impl TmuxPaneOutputLimits {
+    pub(crate) fn current() -> Self {
+        let config = configuration();
+        Self {
+            bytes_per_pane: config.mux_tmux_max_backlog_bytes_per_pane,
+            items_per_pane: config.mux_tmux_max_output_queue_items_per_pane,
+            write_quantum_bytes: config.mux_tmux_output_write_quantum_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    fn new(
+        bytes_per_pane: usize,
+        items_per_pane: usize,
+        write_quantum_bytes: usize,
+    ) -> Self {
+        Self {
+            bytes_per_pane,
+            items_per_pane,
+            write_quantum_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TmuxPaneOutputGap {
+    ByteLimit,
+    ItemLimit,
+    ArithmeticOverflow,
+    BacklogRecoveryRequired,
+    DrainLaneCapacity,
+    DrainLaneClosed,
+    InvalidQuantum,
+    InvalidState,
+}
+
+impl TmuxPaneOutputGap {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ByteLimit => "byte_limit",
+            Self::ItemLimit => "item_limit",
+            Self::ArithmeticOverflow => "arithmetic_overflow",
+            Self::BacklogRecoveryRequired => "backlog_recovery_required",
+            Self::DrainLaneCapacity => "drain_lane_capacity",
+            Self::DrainLaneClosed => "drain_lane_closed",
+            Self::InvalidQuantum => "invalid_quantum",
+            Self::InvalidState => "invalid_state",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TmuxPaneOutputIngress {
+    chunks: VecDeque<Vec<u8>>,
+    front_offset: usize,
+    queued_bytes: usize,
+    drain_scheduled: bool,
+    capture_raced: bool,
+}
+
+impl TmuxPaneOutputIngress {
+    fn validate_addition(
+        &self,
+        added_bytes: usize,
+        added_items: usize,
+        limits: TmuxPaneOutputLimits,
+    ) -> Result<(), TmuxPaneOutputGap> {
+        let bytes = self
+            .queued_bytes
+            .checked_add(added_bytes)
+            .ok_or(TmuxPaneOutputGap::ArithmeticOverflow)?;
+        if bytes > limits.bytes_per_pane {
+            return Err(TmuxPaneOutputGap::ByteLimit);
+        }
+        let items = self
+            .chunks
+            .len()
+            .checked_add(added_items)
+            .ok_or(TmuxPaneOutputGap::ArithmeticOverflow)?;
+        if items > limits.items_per_pane {
+            return Err(TmuxPaneOutputGap::ItemLimit);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_back(
+        &mut self,
+        payload: Vec<u8>,
+        limits: TmuxPaneOutputLimits,
+    ) -> Result<(), TmuxPaneOutputGap> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        self.validate_addition(payload.len(), 1, limits)?;
+        self.queued_bytes += payload.len();
+        self.chunks.push_back(payload);
+        Ok(())
+    }
+
+    pub(crate) fn prepend(
+        &mut self,
+        mut chunks: VecDeque<Vec<u8>>,
+        limits: TmuxPaneOutputLimits,
+    ) -> Result<(), TmuxPaneOutputGap> {
+        if self.front_offset != 0 || self.drain_scheduled {
+            return Err(TmuxPaneOutputGap::InvalidState);
+        }
+        let added_bytes = chunks
+            .iter()
+            .try_fold(0_usize, |total, chunk| total.checked_add(chunk.len()))
+            .ok_or(TmuxPaneOutputGap::ArithmeticOverflow)?;
+        self.validate_addition(added_bytes, chunks.len(), limits)?;
+        chunks.append(&mut self.chunks);
+        self.chunks = chunks;
+        self.queued_bytes += added_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.chunks = VecDeque::new();
+        self.front_offset = 0;
+        self.queued_bytes = 0;
+        self.drain_scheduled = false;
+        self.capture_raced = false;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub(crate) fn queued_bytes(&self) -> usize {
+        self.queued_bytes
+    }
+
+    pub(crate) fn capture_raced(&self) -> bool {
+        self.capture_raced
+    }
 }
 
 #[allow(dead_code)]
@@ -489,9 +785,172 @@ pub(crate) struct TmuxRemotePane {
     pub pane_left: u64,
     pub pane_top: u64,
     pub output_state: TmuxPaneOutputState,
+    pub(crate) output_ingress: TmuxPaneOutputIngress,
 }
 
 pub(crate) type RefTmuxRemotePane = Arc<Mutex<TmuxRemotePane>>;
+
+#[derive(Debug)]
+struct TmuxPaneOutputLane {
+    ready: Sender<TmuxPaneId>,
+    active: Arc<AtomicUsize>,
+    capacity: usize,
+}
+
+impl TmuxPaneOutputLane {
+    fn new(
+        domain_id: DomainId,
+        owner: Weak<TmuxDomainState>,
+        capacity: usize,
+    ) -> anyhow::Result<Self> {
+        let (ready_tx, ready_rx) = bounded(capacity.max(1));
+        let active = Arc::new(AtomicUsize::new(0));
+        let worker_active = Arc::clone(&active);
+        let panic_owner = owner.clone();
+        std::thread::Builder::new()
+            .name(format!("tmux-output-{domain_id}"))
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_tmux_pane_output_lane(owner, ready_rx, &worker_active);
+                }));
+                if outcome.is_err() {
+                    if let Some(owner) = panic_owner.upgrade() {
+                        log::error!(
+                            "tmux domain {} output lane panicked; detaching",
+                            owner.domain_id
+                        );
+                        owner.transition_to_exit_and_schedule_detach();
+                    }
+                }
+            })
+            .with_context(|| {
+                format!("cannot start bounded tmux pane-output lane for domain {domain_id}")
+            })?;
+        Ok(Self {
+            ready: ready_tx,
+            active,
+            capacity,
+        })
+    }
+
+    fn schedule(&self, pane_id: TmuxPaneId) -> Result<(), TmuxPaneOutputGap> {
+        self.active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.capacity).then_some(active + 1)
+            })
+            .map_err(|_| TmuxPaneOutputGap::DrainLaneCapacity)?;
+        match self.ready.try_send(pane_id) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                Err(TmuxPaneOutputGap::DrainLaneCapacity)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                Err(TmuxPaneOutputGap::DrainLaneClosed)
+            }
+        }
+    }
+}
+
+enum TmuxPaneDrainDisposition {
+    Complete,
+    Ready,
+    Blocked,
+    Failed(std::io::Error),
+    Gap(TmuxPaneOutputGap),
+}
+
+fn run_tmux_pane_output_lane(
+    owner: Weak<TmuxDomainState>,
+    ready_rx: Receiver<TmuxPaneId>,
+    active: &AtomicUsize,
+) {
+    const BLOCKED_RETRY_QUANTA: usize = 64;
+    const BLOCKED_RETRY_BATCH: usize = 64;
+    const BLOCKED_RETRY_DELAY: Duration = Duration::from_millis(2);
+
+    let mut ready = VecDeque::new();
+    let mut blocked = VecDeque::new();
+    let mut ready_quanta_since_blocked_retry = 0_usize;
+    loop {
+        let Some(domain) = owner.upgrade() else {
+            return;
+        };
+        if domain.is_terminal() {
+            return;
+        }
+
+        while let Ok(pane_id) = ready_rx.try_recv() {
+            ready.push_back(pane_id);
+        }
+
+        if !blocked.is_empty() && ready_quanta_since_blocked_retry >= BLOCKED_RETRY_QUANTA {
+            if let Some(pane_id) = blocked.pop_front() {
+                ready.push_front(pane_id);
+                ready_quanta_since_blocked_retry = 0;
+            }
+        }
+
+        if ready.is_empty() {
+            if blocked.is_empty() {
+                match ready_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(pane_id) => ready.push_back(pane_id),
+                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => return,
+                }
+            } else {
+                match ready_rx.recv_timeout(BLOCKED_RETRY_DELAY) {
+                    Ok(pane_id) => {
+                        ready.push_back(pane_id);
+                        continue;
+                    }
+                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                        let retry_count = blocked.len().min(BLOCKED_RETRY_BATCH);
+                        for _ in 0..retry_count {
+                            if let Some(pane_id) = blocked.pop_front() {
+                                ready.push_back(pane_id);
+                            }
+                        }
+                        ready_quanta_since_blocked_retry = 0;
+                    }
+                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        }
+
+        let Some(pane_id) = ready.pop_front() else {
+            continue;
+        };
+        match domain.drain_pane_output_quantum(pane_id) {
+            TmuxPaneDrainDisposition::Complete => {
+                active.fetch_sub(1, Ordering::AcqRel);
+            }
+            TmuxPaneDrainDisposition::Ready => ready.push_back(pane_id),
+            TmuxPaneDrainDisposition::Blocked => blocked.push_back(pane_id),
+            TmuxPaneDrainDisposition::Failed(err) => {
+                active.fetch_sub(1, Ordering::AcqRel);
+                log::error!(
+                    "tmux pane {pane_id} output failed in domain {}: {err}",
+                    domain.domain_id
+                );
+                domain.transition_to_exit_and_schedule_detach();
+                return;
+            }
+            TmuxPaneDrainDisposition::Gap(gap) => {
+                active.fetch_sub(1, Ordering::AcqRel);
+                domain.fail_pane_output_gap(pane_id, gap);
+                return;
+            }
+        }
+        if blocked.is_empty() {
+            ready_quanta_since_blocked_retry = 0;
+        } else {
+            ready_quanta_since_blocked_retry =
+                ready_quanta_since_blocked_retry.saturating_add(1);
+        }
+    }
+}
 
 /// As a remote TmuxTab, keeping the TmuxPanes ID
 /// within the remote tab.
@@ -541,21 +1000,11 @@ impl TmuxMirrorIndex {
         &mut self,
         remote_pane_id: TmuxPaneId,
     ) -> anyhow::Result<Option<PaneId>> {
-        let Some(local_pane_id) = self.pane_by_remote.remove(&remote_pane_id) else {
-            anyhow::ensure!(
-                !self
-                    .pane_by_local
-                    .values()
-                    .any(|candidate| *candidate == remote_pane_id),
-                "remote tmux pane {remote_pane_id} has a one-sided local reverse-index entry"
-            );
+        let Some(local_pane_id) = self.checked_local_pane_for_remote(remote_pane_id)? else {
             return Ok(None);
         };
-        anyhow::ensure!(
-            self.pane_by_local.remove(&local_pane_id) == Some(remote_pane_id),
-            "tmux pane reverse index disagrees for local pane {local_pane_id} and remote pane \
-             {remote_pane_id}"
-        );
+        let _ = self.pane_by_remote.remove(&remote_pane_id);
+        let _ = self.pane_by_local.remove(&local_pane_id);
         Ok(Some(local_pane_id))
     }
 
@@ -583,7 +1032,11 @@ impl TmuxMirrorIndex {
         &mut self,
         remote_window_id: TmuxWindowId,
     ) -> anyhow::Result<Option<TabId>> {
-        let Some(local_tab_id) = self.tab_by_remote_window.remove(&remote_window_id) else {
+        let Some(local_tab_id) = self
+            .tab_by_remote_window
+            .get(&remote_window_id)
+            .copied()
+        else {
             anyhow::ensure!(
                 !self
                     .window_by_local_tab
@@ -594,15 +1047,39 @@ impl TmuxMirrorIndex {
             return Ok(None);
         };
         anyhow::ensure!(
-            self.window_by_local_tab.remove(&local_tab_id) == Some(remote_window_id),
+            self.window_by_local_tab.get(&local_tab_id) == Some(&remote_window_id),
             "tmux window reverse index disagrees for local tab {local_tab_id} and remote window \
              {remote_window_id}"
         );
+        let _ = self.tab_by_remote_window.remove(&remote_window_id);
+        let _ = self.window_by_local_tab.remove(&local_tab_id);
         Ok(Some(local_tab_id))
     }
 
     pub(crate) fn remote_pane_for_local(&self, local_pane_id: PaneId) -> Option<TmuxPaneId> {
         self.pane_by_local.get(&local_pane_id).copied()
+    }
+
+    pub(crate) fn checked_local_pane_for_remote(
+        &self,
+        remote_pane_id: TmuxPaneId,
+    ) -> anyhow::Result<Option<PaneId>> {
+        let Some(local_pane_id) = self.pane_by_remote.get(&remote_pane_id).copied() else {
+            anyhow::ensure!(
+                !self
+                    .pane_by_local
+                    .values()
+                    .any(|candidate| *candidate == remote_pane_id),
+                "remote tmux pane {remote_pane_id} has a one-sided local reverse-index entry"
+            );
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            self.pane_by_local.get(&local_pane_id) == Some(&remote_pane_id),
+            "tmux pane reverse index disagrees for local pane {local_pane_id} and remote pane \
+             {remote_pane_id}"
+        );
+        Ok(Some(local_pane_id))
     }
 
     pub(crate) fn remote_window_for_local_tab(
@@ -2457,6 +2934,7 @@ pub(crate) struct TmuxDomainState {
     detach_cleanup_scheduled: Arc<AtomicBool>,
     send_task_scheduled: Arc<AtomicBool>,
     io_lane: OnceLock<TmuxIoLane>,
+    output_lane: OnceLock<TmuxPaneOutputLane>,
     next_io_generation: AtomicU64,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
     protocol_ingress: Mutex<()>,
@@ -2467,7 +2945,7 @@ pub(crate) struct TmuxDomainState {
     pub(crate) mirror_index: Mutex<TmuxMirrorIndex>,
     pub(crate) notification_intents: Mutex<TmuxNotificationIntentState>,
     pub(crate) notification_intent_telemetry: TmuxNotificationIntentTelemetry,
-    pub(crate) pane_retirement: Mutex<()>,
+    pub(crate) pane_registry: Mutex<()>,
     pub(crate) retired_panes: Mutex<HashSet<TmuxPaneId>>,
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
@@ -2595,6 +3073,232 @@ impl TmuxDomainState {
             "registered tmux domain instance does not match pane owner"
         );
         Ok(Arc::downgrade(&tmux_domain.inner))
+    }
+
+    fn fail_pane_output_gap(&self, pane_id: TmuxPaneId, gap: TmuxPaneOutputGap) {
+        metrics::counter!(
+            "mux.tmux.output.gap",
+            "reason" => gap.label(),
+        )
+        .increment(1);
+        log::error!(
+            "tmux pane {pane_id} output in domain {} lost bounded stream authority \
+             ({}); detaching instead of replaying a partial terminal stream",
+            self.domain_id,
+            gap.label()
+        );
+        self.transition_to_exit_and_schedule_detach();
+    }
+
+    fn enqueue_materialized_pane_output(
+        &self,
+        pane_id: TmuxPaneId,
+        remote_pane: &RefTmuxRemotePane,
+        payload: Vec<u8>,
+    ) -> Result<(), TmuxPaneOutputGap> {
+        let limits = TmuxPaneOutputLimits::current();
+        let schedule = {
+            let mut pane = remote_pane.lock();
+            if pane.output_state == TmuxPaneOutputState::Retired {
+                return Ok(());
+            }
+            if matches!(
+                pane.output_state,
+                TmuxPaneOutputState::AwaitingCapture | TmuxPaneOutputState::Captured
+            ) {
+                pane.output_ingress.capture_raced = true;
+            }
+            pane.output_ingress.push_back(payload, limits)?;
+            metrics::histogram!("mux.tmux.output.pane_queue_bytes")
+                .record(pane.output_ingress.queued_bytes as f64);
+            metrics::histogram!("mux.tmux.output.pane_queue_items")
+                .record(pane.output_ingress.chunks.len() as f64);
+            if pane.output_state == TmuxPaneOutputState::Ready
+                && !pane.output_ingress.drain_scheduled
+                && !pane.output_ingress.chunks.is_empty()
+            {
+                pane.output_ingress.drain_scheduled = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        if !schedule {
+            return Ok(());
+        }
+        let result = self
+            .output_lane
+            .get()
+            .ok_or(TmuxPaneOutputGap::DrainLaneClosed)?
+            .schedule(pane_id);
+        if let Err(gap) = result {
+            remote_pane.lock().output_ingress.drain_scheduled = false;
+            return Err(gap);
+        }
+        metrics::counter!("mux.tmux.output.drain_scheduled").increment(1);
+        Ok(())
+    }
+
+    pub(crate) fn schedule_ready_pane_output(
+        &self,
+        pane_id: TmuxPaneId,
+        remote_pane: &RefTmuxRemotePane,
+    ) -> anyhow::Result<()> {
+        self.enqueue_materialized_pane_output(pane_id, remote_pane, Vec::new())
+            .map_err(|gap| {
+                anyhow::anyhow!(
+                    "tmux pane {pane_id} output drain admission failed: {}",
+                    gap.label()
+                )
+            })
+    }
+
+    fn enqueue_tmux_output(
+        &self,
+        pane_id: TmuxPaneId,
+        payload: Vec<u8>,
+    ) -> Result<(), TmuxPaneOutputGap> {
+        let remote_pane = {
+            let pane_map = self.remote_panes.lock();
+            pane_map.get(&pane_id).cloned()
+        };
+        if let Some(remote_pane) = remote_pane {
+            return self.enqueue_materialized_pane_output(pane_id, &remote_pane, payload);
+        }
+
+        // Serialize only the rare absent-pane decision with publication and
+        // retirement. The global pane map itself remains lookup-only and is
+        // never held while backlog storage or a pane gate is acquired.
+        let _registry = self.pane_registry.lock();
+        let remote_pane = {
+            let pane_map = self.remote_panes.lock();
+            pane_map.get(&pane_id).cloned()
+        };
+        if let Some(remote_pane) = remote_pane {
+            drop(_registry);
+            return self.enqueue_materialized_pane_output(pane_id, &remote_pane, payload);
+        }
+        if self.retired_panes.lock().contains(&pane_id) {
+            log::debug!("discarding late output for retired tmux pane {pane_id}");
+            return Ok(());
+        }
+
+        let _ = self.backlog_limits_dirty.swap(false, Ordering::AcqRel);
+        let limits = TmuxBacklogLimits::current();
+        let recovery_required = {
+            let mut backlog = self.backlog.lock();
+            backlog.append_owned_with_limits(pane_id, payload, limits);
+            backlog.requires_recovery()
+        };
+        if recovery_required {
+            return Err(TmuxPaneOutputGap::BacklogRecoveryRequired);
+        }
+        log::debug!("tmux pane {pane_id} has not been attached");
+        Ok(())
+    }
+
+    fn drain_pane_output_quantum(&self, pane_id: TmuxPaneId) -> TmuxPaneDrainDisposition {
+        const MAX_WRITES_PER_QUANTUM: usize = 16;
+
+        // Terminal cleanup drains the authoritative pane map and releases
+        // retained ingress storage. Enroll the complete lookup/write quantum
+        // in the lifecycle fence so cleanup cannot race between the terminal
+        // check and the nonblocking socket write.
+        let Some(_active_operation) = self.begin_active_operation() else {
+            return TmuxPaneDrainDisposition::Complete;
+        };
+        let limits = TmuxPaneOutputLimits::current();
+        if limits.write_quantum_bytes == 0 {
+            return TmuxPaneDrainDisposition::Gap(TmuxPaneOutputGap::InvalidQuantum);
+        }
+        let remote_pane = {
+            let pane_map = self.remote_panes.lock();
+            pane_map.get(&pane_id).cloned()
+        };
+        let Some(remote_pane) = remote_pane else {
+            return TmuxPaneDrainDisposition::Complete;
+        };
+        let mut pane = remote_pane.lock();
+        if !pane.output_ingress.drain_scheduled {
+            return TmuxPaneDrainDisposition::Complete;
+        }
+        if pane.output_state == TmuxPaneOutputState::Retired {
+            pane.output_ingress.clear();
+            pane.output_ingress.drain_scheduled = false;
+            return TmuxPaneDrainDisposition::Complete;
+        }
+        if pane.output_state != TmuxPaneOutputState::Ready {
+            pane.output_ingress.drain_scheduled = false;
+            return TmuxPaneDrainDisposition::Gap(TmuxPaneOutputGap::InvalidState);
+        }
+
+        let TmuxRemotePane {
+            output_write,
+            output_ingress,
+            ..
+        } = &mut *pane;
+        let mut drained = 0_usize;
+        let mut writes = 0_usize;
+        while drained < limits.write_quantum_bytes && writes < MAX_WRITES_PER_QUANTUM {
+            let Some(front) = output_ingress.chunks.front() else {
+                output_ingress.front_offset = 0;
+                output_ingress.drain_scheduled = false;
+                metrics::histogram!("mux.tmux.output.pane_queue_bytes").record(0.0);
+                metrics::histogram!("mux.tmux.output.pane_queue_items").record(0.0);
+                return TmuxPaneDrainDisposition::Complete;
+            };
+            let remaining_quantum = limits.write_quantum_bytes - drained;
+            let end = front
+                .len()
+                .min(output_ingress.front_offset.saturating_add(remaining_quantum));
+            let write_result = output_write.write(&front[output_ingress.front_offset..end]);
+            writes += 1;
+            match write_result {
+                Ok(0) => {
+                    return TmuxPaneDrainDisposition::Failed(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "tmux pane output socket accepted zero bytes",
+                    ));
+                }
+                Ok(written) => {
+                    output_ingress.front_offset += written;
+                    output_ingress.queued_bytes =
+                        output_ingress.queued_bytes.saturating_sub(written);
+                    drained += written;
+                    let front_complete = output_ingress
+                        .chunks
+                        .front()
+                        .is_some_and(|front| output_ingress.front_offset == front.len());
+                    if front_complete {
+                        output_ingress.chunks.pop_front();
+                        output_ingress.front_offset = 0;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    metrics::counter!("mux.tmux.output.would_block").increment(1);
+                    return TmuxPaneDrainDisposition::Blocked;
+                }
+                Err(err) => return TmuxPaneDrainDisposition::Failed(err),
+            }
+        }
+
+        if drained > 0 {
+            metrics::counter!("mux.tmux.output.drained_bytes")
+                .increment(u64::try_from(drained).unwrap_or(u64::MAX));
+        }
+        metrics::histogram!("mux.tmux.output.pane_queue_bytes")
+            .record(output_ingress.queued_bytes as f64);
+        metrics::histogram!("mux.tmux.output.pane_queue_items")
+            .record(output_ingress.chunks.len() as f64);
+        if output_ingress.chunks.is_empty() {
+            output_ingress.front_offset = 0;
+            output_ingress.drain_scheduled = false;
+            TmuxPaneDrainDisposition::Complete
+        } else {
+            TmuxPaneDrainDisposition::Ready
+        }
     }
 
     pub(crate) fn transition_to_exit_and_schedule_detach(&self) {
@@ -2972,8 +3676,10 @@ impl TmuxDomainState {
             .map(|(_, pane)| pane)
             .collect();
         for remote_pane in remote_panes {
+            let mut remote_pane = remote_pane.lock();
+            remote_pane.output_state = TmuxPaneOutputState::Retired;
+            remote_pane.output_ingress.clear();
             remote_pane
-                .lock()
                 .child_state
                 .mark_exited(portable_pty::ExitStatus::with_exit_code(0));
         }
@@ -3336,6 +4042,16 @@ impl TmuxDomainState {
             let _active_operation = self.begin_active_operation()?;
             let state = *self.state.lock();
             log::debug!("tmux: {:?} in state {:?}", event, state);
+            let event = match event {
+                Event::Output { pane, text } => {
+                    if let Err(gap) = self.enqueue_tmux_output(pane, text) {
+                        self.fail_pane_output_gap(pane, gap);
+                        return None;
+                    }
+                    continue;
+                }
+                event => event,
+            };
             match &event {
                 // Tmux generic events
                 Event::Guarded(response) => match state {
@@ -3451,84 +4167,6 @@ impl TmuxDomainState {
                     ) {
                         log::error!("{err:#}");
                         return None;
-                    }
-                }
-                Event::Output { pane, text } => {
-                    let remote_pane = {
-                        let pane_map = self.remote_panes.lock();
-                        if let Some(remote_pane) = pane_map.get(pane) {
-                            Some(Arc::clone(remote_pane))
-                        } else {
-                            let retired_panes = self.retired_panes.lock();
-                            if retired_panes.contains(pane) {
-                                // Tmux pane ids are lifetime-unique. Output
-                                // after retirement is stale protocol data, not
-                                // pre-attach data for a future pane.
-                                drop(retired_panes);
-                                drop(pane_map);
-                                log::debug!("discarding late output for retired tmux pane {pane}");
-                                continue;
-                            }
-                            // Keep the map locked through the append. This
-                            // closes the absent->insert->late-append race that
-                            // could otherwise strand bytes after publication.
-                            let _ = self.backlog_limits_dirty.swap(false, Ordering::AcqRel);
-                            let limits = TmuxBacklogLimits::current();
-                            let mut backlog = self.backlog.lock();
-                            backlog.append_with_limits(*pane, text, limits);
-                            let recovery_required = backlog.requires_recovery();
-                            drop(backlog);
-                            drop(retired_panes);
-                            drop(pane_map);
-                            if recovery_required {
-                                log::error!(
-                                    "tmux pane {pane} output exceeded the bounded pre-attach \
-                                     backlog; detaching rather than replaying a truncated terminal \
-                                     stream"
-                                );
-                                self.transition_to_exit_and_schedule_detach();
-                                return None;
-                            }
-                            log::debug!("Tmux pane {pane} has not been attached");
-                            None
-                        }
-                    };
-                    if let Some(ref_pane) = remote_pane {
-                        let mut tmux_pane = ref_pane.lock();
-                        if self.retired_panes.lock().contains(pane) {
-                            // Retirement publishes the tombstone before
-                            // removing the registry entry. Recheck after
-                            // acquiring a previously cloned pane gate so an
-                            // in-flight Output cannot write after retirement.
-                            continue;
-                        }
-                        if tmux_pane.output_state == TmuxPaneOutputState::Ready {
-                            if let Err(err) = tmux_pane.output_write.write_all(text) {
-                                log::error!("Failed to write tmux data to output: {err:#}");
-                                drop(tmux_pane);
-                                self.transition_to_exit_and_schedule_detach();
-                                return None;
-                            }
-                        } else if tmux_pane.output_state != TmuxPaneOutputState::Retired {
-                            // Pane state serializes this append with the
-                            // backlog drain and Fresh/Captured -> Ready commit.
-                            let _ = self.backlog_limits_dirty.swap(false, Ordering::AcqRel);
-                            let limits = TmuxBacklogLimits::current();
-                            let mut backlog = self.backlog.lock();
-                            backlog.append_with_limits(*pane, text, limits);
-                            let recovery_required = backlog.requires_recovery();
-                            drop(backlog);
-                            if recovery_required {
-                                log::error!(
-                                    "tmux pane {pane} output exceeded the bounded preparation \
-                                     backlog; detaching rather than replaying a truncated terminal \
-                                     stream"
-                                );
-                                drop(tmux_pane);
-                                self.transition_to_exit_and_schedule_detach();
-                                return None;
-                            }
-                        }
                     }
                 }
                 Event::SessionChanged { session, name: _ } => {
@@ -4126,6 +4764,7 @@ impl TmuxDomain {
             detach_cleanup_scheduled: Arc::new(AtomicBool::new(false)),
             send_task_scheduled: Arc::new(AtomicBool::new(false)),
             io_lane: OnceLock::new(),
+            output_lane: OnceLock::new(),
             next_io_generation: AtomicU64::new(1),
             cmd_queue: Arc::new(Mutex::new(cmd_queue)),
             protocol_ingress: Mutex::new(()),
@@ -4136,7 +4775,7 @@ impl TmuxDomain {
             mirror_index: Mutex::new(TmuxMirrorIndex::default()),
             notification_intents: Mutex::new(TmuxNotificationIntentState::default()),
             notification_intent_telemetry: TmuxNotificationIntentTelemetry::default(),
-            pane_retirement: Mutex::new(()),
+            pane_registry: Mutex::new(()),
             retired_panes: Mutex::new(HashSet::new()),
             tmux_session: Mutex::new(None),
             support_commands: Mutex::new(HashMap::default()),
@@ -4157,6 +4796,15 @@ impl TmuxDomain {
             .io_lane
             .set(io_lane)
             .unwrap_or_else(|_| unreachable!("tmux I/O lane is initialized exactly once"));
+        let output_lane = TmuxPaneOutputLane::new(
+            domain_id,
+            Arc::downgrade(&inner),
+            TMUX_OUTPUT_ACTIVE_PANE_LIMIT,
+        )?;
+        inner
+            .output_lane
+            .set(output_lane)
+            .unwrap_or_else(|_| unreachable!("tmux output lane is initialized exactly once"));
         let weak_inner = Arc::downgrade(&inner);
         let config_reload_sub = config::subscribe_to_config_reload(move || {
             let Some(inner) = weak_inner.upgrade() else {
@@ -4943,11 +5591,111 @@ mod tests {
     fn tmux_backlog_keeps_small_fragmented_payload_in_order() {
         let mut backlog = TmuxBacklog::default();
         let limits = TmuxBacklogLimits::new(32, 64, 4);
-        backlog.append_with_limits(1, b"hello ", limits);
-        backlog.append_with_limits(1, b"world", limits);
+        backlog.append_owned_with_limits(1, b"hello ".to_vec(), limits);
+        backlog.append_owned_with_limits(1, b"world".to_vec(), limits);
 
         assert_eq!(backlog.pane_bytes(1), Some(b"hello world".to_vec()));
         assert_eq!(backlog.total_bytes(), 11);
+    }
+
+    #[test]
+    fn tmux_backlog_item_cap_records_a_gap_without_retaining_a_suffix() {
+        let mut backlog = TmuxBacklog::default();
+        let limits =
+            TmuxBacklogLimits::with_item_expiry(32, 128, 8, 2, Duration::MAX);
+        backlog.append_owned_with_limits(1, b"A".to_vec(), limits);
+        backlog.append_owned_with_limits(1, b"B".to_vec(), limits);
+        backlog.append_owned_with_limits(2, b"C".to_vec(), limits);
+
+        assert!(backlog.pane_requires_resync(1));
+        assert_eq!(backlog.pane_bytes(1), Some(Vec::new()));
+        assert_eq!(backlog.pane_bytes(2), Some(b"C".to_vec()));
+        assert_eq!(backlog.total_items(), 1);
+        assert!(backlog.requires_recovery());
+        assert_eq!(
+            backlog.take(1),
+            Some(TmuxBacklogDrain::ResyncRequired),
+            "item pressure must preserve a typed gap instead of an arbitrary suffix",
+        );
+        assert!(!backlog.requires_recovery());
+    }
+
+    #[test]
+    fn tmux_backlog_expiry_promotes_to_global_authoritative_recovery() {
+        let mut backlog = TmuxBacklog::default();
+        let limits =
+            TmuxBacklogLimits::with_item_expiry(32, 128, 8, 8, Duration::from_millis(10));
+        let started = Instant::now();
+        backlog.append_owned_with_limits_at(1, b"old".to_vec(), limits, started);
+        backlog.append_owned_with_limits_at(
+            2,
+            b"new".to_vec(),
+            limits,
+            started + Duration::from_millis(5),
+        );
+
+        backlog.refresh_limits_at(limits, started + Duration::from_millis(10));
+
+        assert!(backlog.requires_global_resync());
+        assert_eq!(backlog.expired_entries, 1);
+        assert_eq!(backlog.len(), 0);
+        assert_eq!(backlog.total_bytes(), 0);
+        assert_eq!(backlog.total_items(), 0);
+        assert_eq!(backlog.retained_byte_capacity(), 0);
+    }
+
+    #[test]
+    fn tmux_materialized_output_ingress_enforces_atomic_byte_and_item_caps() {
+        let byte_limits = TmuxPaneOutputLimits::new(4, 8, 2);
+        let mut ingress = TmuxPaneOutputIngress::default();
+        ingress
+            .push_back(b"AB".to_vec(), byte_limits)
+            .expect("first bounded chunk");
+        assert_eq!(
+            ingress.push_back(b"CDE".to_vec(), byte_limits),
+            Err(TmuxPaneOutputGap::ByteLimit)
+        );
+        assert_eq!(ingress.queued_bytes(), 2);
+        assert_eq!(ingress.chunks.len(), 1);
+
+        let item_limits = TmuxPaneOutputLimits::new(32, 2, 2);
+        ingress
+            .push_back(b"C".to_vec(), item_limits)
+            .expect("second bounded chunk");
+        assert_eq!(
+            ingress.push_back(b"D".to_vec(), item_limits),
+            Err(TmuxPaneOutputGap::ItemLimit)
+        );
+        assert_eq!(ingress.queued_bytes(), 3);
+        assert_eq!(ingress.chunks.len(), 2);
+    }
+
+    #[test]
+    fn tmux_materialized_output_prepend_is_ordered_and_rejects_partial_drain() {
+        let limits = TmuxPaneOutputLimits::new(32, 8, 4);
+        let mut ingress = TmuxPaneOutputIngress::default();
+        ingress
+            .push_back(b"C".to_vec(), limits)
+            .expect("queue post-publication byte");
+        ingress
+            .prepend(
+                VecDeque::from([b"A".to_vec(), b"B".to_vec()]),
+                limits,
+            )
+            .expect("prepend complete pre-publication stream");
+        let ordered = ingress
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered, b"ABC");
+
+        ingress.front_offset = 1;
+        assert_eq!(
+            ingress.prepend(VecDeque::from([b"late".to_vec()]), limits),
+            Err(TmuxPaneOutputGap::InvalidState)
+        );
+        assert_eq!(ingress.queued_bytes(), 3);
     }
 
     #[test]
@@ -6355,6 +7103,23 @@ mod tests {
     }
 
     #[test]
+    fn tmux_mirror_index_rejects_corruption_without_half_unregistering() {
+        let mut index = TmuxMirrorIndex::default();
+        index.pane_by_remote.insert(101, 11);
+        index.pane_by_local.insert(11, 102);
+        index.tab_by_remote_window.insert(201, 21);
+        index.window_by_local_tab.insert(21, 202);
+
+        assert!(index.unregister_pane(101).is_err());
+        assert_eq!(index.pane_by_remote.get(&101), Some(&11));
+        assert_eq!(index.pane_by_local.get(&11), Some(&102));
+
+        assert!(index.unregister_window(201).is_err());
+        assert_eq!(index.tab_by_remote_window.get(&201), Some(&21));
+        assert_eq!(index.window_by_local_tab.get(&21), Some(&202));
+    }
+
+    #[test]
     fn notification_intent_telemetry_exposes_required_counters() {
         let telemetry = TmuxNotificationIntentTelemetry::default();
         telemetry.record_received();
@@ -6390,7 +7155,11 @@ mod tests {
     fn tmux_backlog_oversized_payload_requires_resync_instead_of_suffix_replay() {
         let mut backlog = TmuxBacklog::default();
         let limits = TmuxBacklogLimits::new(8, 32, 4);
-        backlog.append_with_limits(1, b"\x1b]8;;https://example.com\x1b\\text", limits);
+        backlog.append_owned_with_limits(
+            1,
+            b"\x1b]8;;https://example.com\x1b\\text".to_vec(),
+            limits,
+        );
 
         assert!(backlog.pane_requires_resync(1));
         assert_eq!(backlog.pane_bytes(1), Some(Vec::new()));
@@ -6411,15 +7180,15 @@ mod tests {
     fn tmux_backlog_enforces_aggregate_and_entry_lru_limits() {
         let mut backlog = TmuxBacklog::default();
         let limits = TmuxBacklogLimits::new(8, 10, 2);
-        backlog.append_with_limits(1, b"abcdef", limits);
-        backlog.append_with_limits(2, b"ghij", limits);
-        backlog.append_with_limits(1, b"k", limits);
+        backlog.append_owned_with_limits(1, b"abcdef".to_vec(), limits);
+        backlog.append_owned_with_limits(2, b"ghij".to_vec(), limits);
+        backlog.append_owned_with_limits(1, b"k".to_vec(), limits);
 
         assert_eq!(backlog.pane_bytes(1), Some(b"abcdefk".to_vec()));
         assert!(backlog.pane_requires_resync(2));
         assert_eq!(backlog.total_bytes(), 7);
 
-        backlog.append_with_limits(3, b"zz", limits);
+        backlog.append_owned_with_limits(3, b"zz".to_vec(), limits);
         assert!(
             backlog.requires_global_resync(),
             "evicting a bounded per-pane gap marker must promote to global resync",
@@ -6439,9 +7208,11 @@ mod tests {
             TmuxBacklogLimits::new(0, 32, 4),
             TmuxBacklogLimits::new(8, 0, 4),
             TmuxBacklogLimits::new(8, 32, 0),
+            TmuxBacklogLimits::with_item_expiry(8, 32, 4, 0, Duration::MAX),
+            TmuxBacklogLimits::with_item_expiry(8, 32, 4, 4, Duration::ZERO),
         ] {
             let mut backlog = TmuxBacklog::default();
-            backlog.append_with_limits(1, b"discarded", limits);
+            backlog.append_owned_with_limits(1, b"discarded".to_vec(), limits);
             assert_eq!(backlog.len(), 0);
             assert_eq!(backlog.total_bytes(), 0);
             assert!(
@@ -6455,12 +7226,12 @@ mod tests {
     fn tmux_backlog_take_remove_and_hot_limit_shrink_preserve_accounting() {
         let mut backlog = TmuxBacklog::default();
         let roomy = TmuxBacklogLimits::new(16, 32, 4);
-        backlog.append_with_limits(1, b"0123456789", roomy);
-        backlog.append_with_limits(2, b"abcdef", roomy);
+        backlog.append_owned_with_limits(1, b"0123456789".to_vec(), roomy);
+        backlog.append_owned_with_limits(2, b"abcdef".to_vec(), roomy);
         assert_eq!(backlog.total_bytes(), 16);
 
         let tight = TmuxBacklogLimits::new(4, 6, 4);
-        backlog.append_with_limits(2, b"", tight);
+        backlog.append_owned_with_limits(2, Vec::new(), tight);
         assert!(backlog.pane_requires_resync(1));
         assert!(backlog.pane_requires_resync(2));
         assert_eq!(backlog.total_bytes(), 0);

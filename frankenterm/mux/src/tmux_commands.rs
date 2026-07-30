@@ -5,8 +5,9 @@ use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{
     AttachState, TmuxBacklogDrain, TmuxBacklogLimits, TmuxDomain, TmuxDomainState,
     TmuxEnqueueError, TmuxNotificationIntent,
-    TmuxNotificationIntentRunDisposition, TmuxPaneOutputState, TmuxRemotePane, TmuxTab,
-    TmuxTopologyBarrierEvent, NOTIFICATION_INTENT_DRAIN_QUANTUM,
+    TmuxNotificationIntentRunDisposition, TmuxPaneOutputIngress, TmuxPaneOutputLimits,
+    TmuxPaneOutputState, TmuxRemotePane, TmuxTab, TmuxTopologyBarrierEvent,
+    NOTIFICATION_INTENT_DRAIN_QUANTUM,
 };
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{
@@ -20,7 +21,6 @@ use portable_pty::{ExitStatus, MasterPty, PtySize};
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Write};
-use std::io::Write as _;
 use std::sync::{Arc, OnceLock};
 use termwiz::tmux_cc::*;
 
@@ -279,7 +279,13 @@ impl TmuxDomainState {
         &self,
         pane_ids: &[TmuxPaneId],
     ) -> anyhow::Result<Vec<PaneId>> {
-        let _retirement = self.pane_retirement.lock();
+        let mut seen_pane_ids = HashSet::with_capacity(pane_ids.len());
+        let pane_ids = pane_ids
+            .iter()
+            .copied()
+            .filter(|pane_id| seen_pane_ids.insert(*pane_id))
+            .collect::<Vec<_>>();
+        let _retirement = self.pane_registry.lock();
         let removed_panes = {
             let mut remote_panes = self.remote_panes.lock();
             let mut retired_panes = self.retired_panes.lock();
@@ -297,11 +303,22 @@ impl TmuxDomainState {
                 super::tmux::RETIRED_PANE_TOMBSTONE_LIMIT
             );
 
+            for pane_id in &pane_ids {
+                let remote_present = remote_panes.contains_key(pane_id);
+                let indexed_present = mirror_index
+                    .checked_local_pane_for_remote(*pane_id)?
+                    .is_some();
+                anyhow::ensure!(
+                    remote_present == indexed_present,
+                    "tmux pane {pane_id} map and reverse index disagree before retirement"
+                );
+            }
+
             let mut removed = Vec::with_capacity(pane_ids.len());
-            for pane_id in pane_ids {
+            for pane_id in &pane_ids {
+                let indexed_local = mirror_index.unregister_pane(*pane_id)?;
                 retired_panes.insert(*pane_id);
                 let remote = remote_panes.remove(pane_id);
-                let indexed_local = mirror_index.unregister_pane(*pane_id)?;
                 match (remote, indexed_local) {
                     (Some(remote), Some(local_pane_id)) => {
                         removed.push((*pane_id, local_pane_id, remote));
@@ -336,6 +353,7 @@ impl TmuxDomainState {
                 remote.local_pane_id
             );
             remote.output_state = TmuxPaneOutputState::Retired;
+            remote.output_ingress.clear();
             remote
                 .child_state
                 .mark_exited(ExitStatus::with_exit_code(0));
@@ -344,7 +362,7 @@ impl TmuxDomainState {
 
         // Every producer admitted before the tombstone has completed, and all
         // later output is rejected, before backlog cleanup.
-        self.backlog.lock().remove_many(pane_ids);
+        self.backlog.lock().remove_many(&pane_ids);
         Ok(local_pane_ids)
     }
 
@@ -434,9 +452,11 @@ impl TmuxDomainState {
     }
 
     fn prepare_pane_capture(&self, pane_id: TmuxPaneId) -> anyhow::Result<bool> {
-        let pane_map = self.remote_panes.lock();
-        let pane = pane_map
+        let pane = self
+            .remote_panes
+            .lock()
             .get(&pane_id)
+            .cloned()
             .with_context(|| format!("cannot prepare capture for missing tmux pane {pane_id}"))?;
         let mut pane = pane.lock();
         match pane.output_state {
@@ -455,7 +475,10 @@ impl TmuxDomainState {
     fn create_pane(&self, pane: &PaneItem) -> anyhow::Result<Arc<dyn Pane>> {
         let local_pane_id = alloc_pane_id()?;
         let child_state = Arc::new(TmuxChildState::new());
-        let (output_read, output_write) = filedescriptor::socketpair()?;
+        let (output_read, mut output_write) = filedescriptor::socketpair()?;
+        output_write
+            .set_non_blocking(true)
+            .context("making tmux pane output socket nonblocking")?;
         let ref_pane = Arc::new(Mutex::new(TmuxRemotePane {
             local_pane_id,
             output_write,
@@ -470,6 +493,7 @@ impl TmuxDomainState {
             pane_left: pane.pane_left,
             pane_top: pane.pane_top,
             output_state: TmuxPaneOutputState::Fresh,
+            output_ingress: TmuxPaneOutputIngress::default(),
         }));
 
         let owner = self.registered_owner_weak()?;
@@ -523,7 +547,7 @@ impl TmuxDomainState {
             command_description,
         ));
 
-        let mut pane_map = self.remote_panes.lock();
+        let _registry = self.pane_registry.lock();
         if self.retired_panes.lock().contains(&pane.pane_id) {
             child_state.mark_exited(ExitStatus::with_signal(
                 "retired tmux remote pane identity reuse",
@@ -533,6 +557,7 @@ impl TmuxDomainState {
                 pane.pane_id
             );
         }
+        let mut pane_map = self.remote_panes.lock();
         if pane_map.contains_key(&pane.pane_id) {
             child_state.mark_exited(ExitStatus::with_signal(
                 "duplicate tmux remote pane identity",
@@ -559,14 +584,14 @@ impl TmuxDomainState {
     }
 
     fn finish_fresh_split(&self, pane_id: TmuxPaneId) -> anyhow::Result<()> {
-        let remote_pane = {
+        let remote_gate = {
             let pane_map = self.remote_panes.lock();
             pane_map
                 .get(&pane_id)
                 .cloned()
                 .with_context(|| format!("cannot finish missing split tmux pane {pane_id}"))?
         };
-        let mut remote_pane = remote_pane.lock();
+        let mut remote_pane = remote_gate.lock();
         anyhow::ensure!(
             remote_pane.output_state == TmuxPaneOutputState::Fresh,
             "split tmux pane {pane_id} reached {:?} before initial stream commit",
@@ -587,18 +612,22 @@ impl TmuxDomainState {
             Some(TmuxBacklogDrain::ResyncRequired) => {
                 anyhow::bail!("tmux split pane {pane_id} initial output is gapped")
             }
-            Some(TmuxBacklogDrain::Bytes(bytes)) => {
-                let (first, second) = bytes.as_slices();
+            Some(TmuxBacklogDrain::Bytes(chunks)) => {
                 remote_pane
-                    .output_write
-                    .write_all(first)
-                    .and_then(|()| remote_pane.output_write.write_all(second))
-                    .context("writing complete pre-publication split-pane stream")?;
+                    .output_ingress
+                    .prepend(chunks, TmuxPaneOutputLimits::current())
+                    .map_err(|gap| {
+                        anyhow!(
+                            "tmux split pane {pane_id} initial output exceeded its live queue: \
+                             {gap:?}"
+                        )
+                    })?;
             }
             None => {}
         }
         remote_pane.output_state = TmuxPaneOutputState::Ready;
-        Ok(())
+        drop(remote_pane);
+        self.schedule_ready_pane_output(pane_id, &remote_gate)
     }
 
     pub fn split_pane(
@@ -702,10 +731,15 @@ impl TmuxDomainState {
             return Ok(());
         };
         let mux = tmux_mux()?;
-        if self.backlog.lock().requires_global_resync() {
-            anyhow::bail!(
-                "tmux output backlog lost pane identity; refusing partial per-window recovery"
-            );
+        let backlog_limits = TmuxBacklogLimits::current();
+        {
+            let mut backlog = self.backlog.lock();
+            backlog.refresh_limits(backlog_limits);
+            if backlog.requires_global_resync() {
+                anyhow::bail!(
+                    "tmux output backlog lost pane identity; refusing partial per-window recovery"
+                );
+            }
         }
 
         for pane in panes.iter() {
@@ -715,7 +749,7 @@ impl TmuxDomainState {
                 continue;
             }
 
-            let remote_pane = {
+            let remote_gate = {
                 let pane_map = self.remote_panes.lock();
                 pane_map.get(&pane.pane_id).cloned().with_context(|| {
                     format!(
@@ -724,7 +758,7 @@ impl TmuxDomainState {
                     )
                 })?
             };
-            let mut remote_pane = remote_pane.lock();
+            let mut remote_pane = remote_gate.lock();
             let local_pane = mux.get_pane(remote_pane.local_pane_id).with_context(|| {
                 format!(
                     "tmux pane {} maps to missing local pane {}",
@@ -732,7 +766,16 @@ impl TmuxDomainState {
                 )
             })?;
 
-            let backlog_drain = self.backlog.lock().take(pane.pane_id);
+            let backlog_drain = {
+                let mut backlog = self.backlog.lock();
+                anyhow::ensure!(
+                    !backlog.requires_global_resync(),
+                    "tmux pane {} cannot recover from a global output gap",
+                    pane.pane_id
+                );
+                backlog.take(pane.pane_id)
+            };
+            let output_limits = TmuxPaneOutputLimits::current();
             let mut apply_snapshot_cursor = true;
             match (remote_pane.output_state, backlog_drain) {
                 (_, Some(TmuxBacklogDrain::ResyncRequired)) => {
@@ -741,27 +784,38 @@ impl TmuxDomainState {
                         pane.pane_id
                     );
                 }
-                (TmuxPaneOutputState::Fresh, Some(TmuxBacklogDrain::Bytes(text))) => {
-                    apply_snapshot_cursor = text.is_empty();
-                    let (first, second) = text.as_slices();
+                (TmuxPaneOutputState::Fresh, Some(TmuxBacklogDrain::Bytes(chunks))) => {
                     remote_pane
-                        .output_write
-                        .write_all(first)
-                        .and_then(|()| remote_pane.output_write.write_all(second))
-                        .context("writing complete pre-attach tmux stream to local pane")?;
+                        .output_ingress
+                        .prepend(chunks, output_limits)
+                        .map_err(|gap| {
+                            anyhow!(
+                                "tmux pane {} pre-attach stream exceeded its live queue: {gap:?}",
+                                pane.pane_id
+                            )
+                        })?;
+                    apply_snapshot_cursor = remote_pane.output_ingress.is_empty();
                 }
-                (TmuxPaneOutputState::Fresh, None) | (TmuxPaneOutputState::Captured, None) => {}
-                (TmuxPaneOutputState::Captured, Some(TmuxBacklogDrain::Bytes(text)))
-                    if !text.is_empty() =>
+                (TmuxPaneOutputState::Fresh, None) => {
+                    apply_snapshot_cursor = remote_pane.output_ingress.is_empty();
+                }
+                (TmuxPaneOutputState::Captured, None)
+                    if remote_pane.output_ingress.capture_raced() =>
                 {
                     anyhow::bail!(
                         "tmux pane {} produced {} bytes while capture publication was pending; \
                          refusing cursor-ambiguous textual replay",
                         pane.pane_id,
-                        text.len()
+                        remote_pane.output_ingress.queued_bytes()
                     );
                 }
-                (TmuxPaneOutputState::Captured, Some(TmuxBacklogDrain::Bytes(_))) => {}
+                (TmuxPaneOutputState::Captured, None) => {}
+                (TmuxPaneOutputState::Captured, Some(TmuxBacklogDrain::Bytes(_))) => {
+                    anyhow::bail!(
+                        "captured tmux pane {} retained an impossible unknown-pane backlog",
+                        pane.pane_id
+                    );
+                }
                 (TmuxPaneOutputState::AwaitingCapture, _) => {
                     anyhow::bail!(
                         "tmux pane {} list state overtook its required capture callback",
@@ -787,8 +841,15 @@ impl TmuxDomainState {
                 if apply_snapshot_cursor {
                     let row = pane.cursor_y.saturating_add(1);
                     let col = pane.cursor_x.saturating_add(1);
-                    write!(&mut remote_pane.output_write, "\u{1b}[{row};{col}H")
-                        .context("serializing tmux cursor after initial pane stream")?;
+                    remote_pane
+                        .output_ingress
+                        .push_back(format!("\u{1b}[{row};{col}H").into_bytes(), output_limits)
+                        .map_err(|gap| {
+                            anyhow!(
+                                "tmux pane {} cursor commit exceeded its live queue: {gap:?}",
+                                pane.pane_id
+                            )
+                        })?;
                 }
                 remote_pane.output_state = TmuxPaneOutputState::Ready;
             }
@@ -801,6 +862,7 @@ impl TmuxDomainState {
             remote_pane.pane_left = pane.pane_left;
             remote_pane.pane_top = pane.pane_top;
             drop(remote_pane);
+            self.schedule_ready_pane_output(pane.pane_id, &remote_gate)?;
 
             if pane.pane_active {
                 let gui_tabs = self.gui_tabs.lock();
@@ -997,11 +1059,15 @@ impl TmuxDomainState {
                             })?,
                         );
                     } else {
-                        let pane_map = self.remote_panes.lock();
-                        let local_pane_id = match pane_map.get(&p.pane_id) {
-                            Some(x) => x.lock().local_pane_id,
+                        let remote_pane = {
+                            let pane_map = self.remote_panes.lock();
+                            pane_map.get(&p.pane_id).cloned()
+                        };
+                        let remote_pane = match remote_pane {
+                            Some(remote_pane) => remote_pane,
                             None => anyhow::bail!("cannot find the local pane for {}", p.pane_id),
                         };
+                        let local_pane_id = remote_pane.lock().local_pane_id;
 
                         split_pane_index = match tab
                             .iter_panes_ignoring_zoom()
@@ -1812,22 +1878,23 @@ impl TmuxCommand for Resize {
             return "".to_string();
         }
 
-        let pane_map = tmux_domain.inner.remote_panes.lock();
+        let remote_pane = match tmux_domain
+            .inner
+            .remote_panes
+            .lock()
+            .get(&self.pane_id)
+            .cloned()
         {
-            let pane = match pane_map.get(&self.pane_id) {
-                Some(x) => x.lock(),
-                None => return "".to_string(),
-            };
-
+            Some(remote_pane) => remote_pane,
+            None => return "".to_string(),
+        };
+        let tmux_window_id = {
+            let pane = remote_pane.lock();
             if pane.pane_width == self.size.cols as u64 && pane.pane_height == self.size.rows as u64
             {
                 return "".to_string();
             }
-        }
-
-        let tmux_window_id = match pane_map.get(&self.pane_id) {
-            Some(x) => x.lock().window_id,
-            None => return "".to_string(),
+            pane.window_id
         };
 
         let gui_tabs = tmux_domain.inner.gui_tabs.lock();
@@ -1880,7 +1947,13 @@ impl TmuxCommand for Resize {
         let tmux_domain = domain
             .downcast_ref::<TmuxDomain>()
             .ok_or_else(|| anyhow!("Tmux domain lost"))?;
-        if let Some(pane) = tmux_domain.inner.remote_panes.lock().get(&self.pane_id) {
+        let pane = tmux_domain
+            .inner
+            .remote_panes
+            .lock()
+            .get(&self.pane_id)
+            .cloned();
+        if let Some(pane) = pane {
             let mut pane = pane.lock();
             pane.pane_width = self.size.cols as u64;
             pane.pane_height = self.size.rows as u64;
@@ -1948,8 +2021,11 @@ impl TmuxCommand for CapturePane {
         // capture-pane contents usually include a trailing newline from the guarded response.
         let unescaped = normalize_capture_pane_output(&unescaped);
 
-        let pane_map = tmux_domain.inner.remote_panes.lock();
-        let pane = pane_map.get(&self.pane_id).with_context(|| {
+        let pane = {
+            let pane_map = tmux_domain.inner.remote_panes.lock();
+            pane_map.get(&self.pane_id).cloned()
+        }
+        .with_context(|| {
             format!("capture result targeted missing tmux pane {}", self.pane_id)
         })?;
         let mut pane = pane.lock();
@@ -1960,9 +2036,20 @@ impl TmuxCommand for CapturePane {
                 pane.output_state
             );
         }
-        pane.output_write
-            .write_all(unescaped.as_bytes())
-            .context("writing capture pane result to output")?;
+        anyhow::ensure!(
+            !pane.output_ingress.capture_raced() && pane.output_ingress.is_empty(),
+            "tmux pane {} produced output while capture was in flight; capture-time stream \
+             authority is ambiguous",
+            self.pane_id
+        );
+        pane.output_ingress
+            .push_back(unescaped.into_bytes(), TmuxPaneOutputLimits::current())
+            .map_err(|gap| {
+                anyhow!(
+                    "capture for tmux pane {} exceeded its live output queue: {gap:?}",
+                    self.pane_id
+                )
+            })?;
         pane.output_state = TmuxPaneOutputState::Captured;
 
         Ok(())
@@ -2324,8 +2411,11 @@ impl TmuxCommand for AttachDone {
 mod tests {
     use super::*;
     use crate::domain::Domain;
+    use filedescriptor::{poll, pollfd, AsRawSocketDescriptor, FileDescriptor, POLLIN};
     use promise::spawn::ScopedExecutor;
+    use std::io::{Read as _, Write as _};
     use std::sync::MutexGuard as StdMutexGuard;
+    use std::time::{Duration, Instant};
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,
@@ -2377,7 +2467,13 @@ mod tests {
         remote_pane_id: TmuxPaneId,
         remote_pane: crate::tmux::RefTmuxRemotePane,
     ) {
-        let local_pane_id = remote_pane.lock().local_pane_id;
+        let local_pane_id = {
+            let mut pane = remote_pane.lock();
+            pane.output_write
+                .set_non_blocking(true)
+                .expect("make test tmux output socket nonblocking");
+            pane.local_pane_id
+        };
         tmux_domain
             .inner
             .mirror_index
@@ -2393,6 +2489,73 @@ mod tests {
                 .is_none(),
             "test remote pane identity must be unique"
         );
+    }
+
+    fn read_exact_with_timeout(
+        reader: &mut FileDescriptor,
+        expected_len: usize,
+    ) -> Vec<u8> {
+        reader
+            .set_non_blocking(true)
+            .expect("make test tmux output reader nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = vec![0_u8; expected_len];
+        let mut offset = 0;
+        while offset < expected_len {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out after reading {}/{} tmux output bytes",
+                offset,
+                expected_len
+            );
+            let mut readiness = [pollfd {
+                fd: reader.as_socket_descriptor(),
+                events: POLLIN,
+                revents: 0,
+            }];
+            let ready =
+                poll(&mut readiness, Some(remaining)).expect("poll tmux output test socket");
+            assert_eq!(
+                ready, 1,
+                "timed out after reading {}/{} tmux output bytes",
+                offset, expected_len
+            );
+            assert_ne!(
+                readiness[0].revents & POLLIN,
+                0,
+                "tmux output socket woke without readable data"
+            );
+            match reader.read(&mut observed[offset..]) {
+                Ok(0) => panic!("tmux output socket closed before the complete stream"),
+                Ok(read) => offset += read,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => panic!("reading tmux output test socket failed: {}", err),
+            }
+        }
+        observed
+    }
+
+    fn saturate_nonblocking_socket(writer: &mut FileDescriptor) -> usize {
+        const MAX_TEST_FILL_BYTES: usize = 64 * 1024 * 1024;
+
+        let payload = [0_u8; 64 * 1024];
+        let mut written = 0_usize;
+        loop {
+            assert!(
+                written < MAX_TEST_FILL_BYTES,
+                "test socket did not become backpressured within {} bytes",
+                MAX_TEST_FILL_BYTES
+            );
+            match writer.write(&payload) {
+                Ok(0) => panic!("test socket accepted a zero-byte saturation write"),
+                Ok(count) => written = written.saturating_add(count),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return written,
+                Err(err) => panic!("saturating test socket failed: {}", err),
+            }
+        }
     }
 
     #[test]
@@ -2419,6 +2582,7 @@ mod tests {
                 pane_left: 0,
                 pane_top: 0,
                 output_state: TmuxPaneOutputState::Ready,
+                output_ingress: TmuxPaneOutputIngress::default(),
             })),
         );
         let removed_gate = Arc::clone(
@@ -2446,20 +2610,21 @@ mod tests {
                 pane_left: 0,
                 pane_top: 0,
                 output_state: TmuxPaneOutputState::Ready,
+                output_ingress: TmuxPaneOutputIngress::default(),
             })),
         );
 
         let limits = crate::tmux::TmuxBacklogLimits::new(32, 128, 8);
         {
             let mut backlog = tmux_domain.inner.backlog.lock();
-            backlog.append_with_limits(11, b"pane-11", limits);
-            backlog.append_with_limits(22, b"pane-22", limits);
-            backlog.append_with_limits(33, b"pane-33", limits);
+            backlog.append_owned_with_limits(11, b"pane-11".to_vec(), limits);
+            backlog.append_owned_with_limits(22, b"pane-22".to_vec(), limits);
+            backlog.append_owned_with_limits(33, b"pane-33".to_vec(), limits);
         }
 
         let removed_local_ids = tmux_domain
             .inner
-            .retire_tmux_pane_state_entries(&[11, 33])
+            .retire_tmux_pane_state_entries(&[11, 11, 33])
             .expect("retire requested panes");
 
         assert_eq!(removed_local_ids, vec![101]);
@@ -2500,9 +2665,69 @@ mod tests {
     }
 
     #[test]
-    fn fresh_split_commit_preserves_prepublication_then_live_order() {
-        use std::io::Read as _;
+    fn pane_retirement_preflight_never_half_removes_a_valid_earlier_pane() {
+        let (_guard, tmux_domain) = install_tmux_domain();
+        let (_read_first, write_first) = filedescriptor::socketpair().expect("socketpair");
+        let (_read_second, write_second) = filedescriptor::socketpair().expect("socketpair");
+        for (remote_pane_id, local_pane_id, output_write) in
+            [(71, 171, write_first), (72, 172, write_second)]
+        {
+            insert_test_remote_pane(
+                &tmux_domain,
+                remote_pane_id,
+                Arc::new(Mutex::new(TmuxRemotePane {
+                    local_pane_id,
+                    output_write,
+                    child_state: Arc::new(TmuxChildState::new()),
+                    session_id: 1,
+                    window_id: 2,
+                    pane_id: remote_pane_id,
+                    cursor_x: 0,
+                    cursor_y: 0,
+                    pane_width: 80,
+                    pane_height: 24,
+                    pane_left: 0,
+                    pane_top: 0,
+                    output_state: TmuxPaneOutputState::Ready,
+                    output_ingress: TmuxPaneOutputIngress::default(),
+                })),
+            );
+        }
+        assert_eq!(
+            tmux_domain
+                .inner
+                .mirror_index
+                .lock()
+                .unregister_pane(72)
+                .expect("create a one-sided test mirror"),
+            Some(172)
+        );
 
+        let err = tmux_domain
+            .inner
+            .retire_tmux_pane_state_entries(&[71, 72])
+            .expect_err("corrupt second identity must reject the whole retirement batch");
+        assert!(err.to_string().contains("map and reverse index disagree"));
+        let pane_map = tmux_domain.inner.remote_panes.lock();
+        assert!(pane_map.contains_key(&71));
+        assert!(pane_map.contains_key(&72));
+        drop(pane_map);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .mirror_index
+                .lock()
+                .remote_pane_for_local(171),
+            Some(71),
+            "preflight failure must preserve an earlier valid reverse-index edge"
+        );
+        let retired = tmux_domain.inner.retired_panes.lock();
+        assert!(!retired.contains(&71));
+        assert!(!retired.contains(&72));
+    }
+
+    #[test]
+    fn fresh_split_commit_preserves_prepublication_then_live_order() {
         let (_guard, tmux_domain) = install_tmux_domain();
         let (mut output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
         insert_test_remote_pane(
@@ -2522,13 +2747,14 @@ mod tests {
                 pane_left: 0,
                 pane_top: 0,
                 output_state: TmuxPaneOutputState::Fresh,
+                output_ingress: TmuxPaneOutputIngress::default(),
             })),
         );
         {
             let mut backlog = tmux_domain.inner.backlog.lock();
             let limits = crate::tmux::TmuxBacklogLimits::new(32, 128, 8);
-            backlog.append_with_limits(31, b"A", limits);
-            backlog.append_with_limits(31, b"B", limits);
+            backlog.append_owned_with_limits(31, b"A".to_vec(), limits);
+            backlog.append_owned_with_limits(31, b"B".to_vec(), limits);
         }
 
         tmux_domain
@@ -2540,11 +2766,8 @@ mod tests {
             text: b"C".to_vec(),
         }]));
 
-        let mut observed = [0_u8; 3];
-        output_read
-            .read_exact(&mut observed)
-            .expect("read committed and live output");
-        assert_eq!(&observed, b"ABC");
+        let observed = read_exact_with_timeout(&mut output_read, 3);
+        assert_eq!(observed, b"ABC");
         assert_eq!(
             tmux_domain
                 .inner
@@ -2557,6 +2780,196 @@ mod tests {
             TmuxPaneOutputState::Ready
         );
         assert!(!tmux_domain.inner.backlog.lock().contains(31));
+    }
+
+    #[test]
+    fn backpressured_pane_does_not_stall_an_independent_ready_pane() {
+        let (_guard, tmux_domain) = install_tmux_domain();
+        let (slow_read, slow_write) = filedescriptor::socketpair().expect("slow socketpair");
+        let (mut fast_read, fast_write) =
+            filedescriptor::socketpair().expect("fast socketpair");
+        let slow_gate = Arc::new(Mutex::new(TmuxRemotePane {
+            local_pane_id: 151,
+            output_write: slow_write,
+            child_state: Arc::new(TmuxChildState::new()),
+            session_id: 1,
+            window_id: 2,
+            pane_id: 51,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            output_state: TmuxPaneOutputState::Ready,
+            output_ingress: TmuxPaneOutputIngress::default(),
+        }));
+        let fast_gate = Arc::new(Mutex::new(TmuxRemotePane {
+            local_pane_id: 152,
+            output_write: fast_write,
+            child_state: Arc::new(TmuxChildState::new()),
+            session_id: 1,
+            window_id: 2,
+            pane_id: 52,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            output_state: TmuxPaneOutputState::Ready,
+            output_ingress: TmuxPaneOutputIngress::default(),
+        }));
+        insert_test_remote_pane(&tmux_domain, 51, Arc::clone(&slow_gate));
+        insert_test_remote_pane(&tmux_domain, 52, Arc::clone(&fast_gate));
+
+        let saturated_bytes = {
+            let mut slow_pane = slow_gate.lock();
+            saturate_nonblocking_socket(&mut slow_pane.output_write)
+        };
+        assert!(saturated_bytes > 0);
+
+        tmux_domain.inner.advance(Box::new(vec![Event::Output {
+            pane: 51,
+            text: b"SLOW".to_vec(),
+        }]));
+        tmux_domain.inner.advance(Box::new(vec![Event::Output {
+            pane: 52,
+            text: b"FAST".to_vec(),
+        }]));
+
+        assert_eq!(
+            read_exact_with_timeout(&mut fast_read, 4),
+            b"FAST",
+            "a full pane socket must not block protocol progress for another pane"
+        );
+        assert!(
+            !tmux_domain.inner.is_terminal(),
+            "ordinary per-pane WouldBlock must remain recoverable"
+        );
+        assert_eq!(
+            slow_gate.lock().output_ingress.queued_bytes(),
+            4,
+            "the blocked pane must retain its complete ordered chunk"
+        );
+        drop(slow_read);
+    }
+
+    #[test]
+    fn many_ready_panes_each_drain_their_exact_stream_without_cross_pane_mixup() {
+        const PANE_COUNT: usize = 64;
+
+        let (_guard, tmux_domain) = install_tmux_domain();
+        let mut readers = Vec::with_capacity(PANE_COUNT);
+        let mut events = Vec::with_capacity(PANE_COUNT);
+        for index in 0..PANE_COUNT {
+            let remote_pane_id =
+                1_000 + u64::try_from(index).expect("test pane index fits u64");
+            let local_pane_id = 2_000 + index;
+            let (output_read, output_write) =
+                filedescriptor::socketpair().expect("many-pane socketpair");
+            let remote_gate = Arc::new(Mutex::new(TmuxRemotePane {
+                local_pane_id,
+                output_write,
+                child_state: Arc::new(TmuxChildState::new()),
+                session_id: 1,
+                window_id: 2,
+                pane_id: remote_pane_id,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+                output_state: TmuxPaneOutputState::Ready,
+                output_ingress: TmuxPaneOutputIngress::default(),
+            }));
+            insert_test_remote_pane(&tmux_domain, remote_pane_id, remote_gate);
+
+            let payload = format!("pane-{remote_pane_id}").into_bytes();
+            readers.push((output_read, payload.clone()));
+            events.push(Event::Output {
+                pane: remote_pane_id,
+                text: payload,
+            });
+        }
+
+        tmux_domain.inner.advance(Box::new(events));
+
+        for (mut reader, expected) in readers {
+            assert_eq!(
+                read_exact_with_timeout(&mut reader, expected.len()),
+                expected,
+                "each materialized pane must retain an independent ordered stream"
+            );
+        }
+        assert!(
+            !tmux_domain.inner.is_terminal(),
+            "a many-pane ready burst within the lane cap must remain healthy"
+        );
+    }
+
+    #[test]
+    fn capture_race_is_rejected_and_retirement_discards_queued_output() {
+        let (_guard, tmux_domain) = install_tmux_domain();
+        let (_output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
+        let pane_gate = Arc::new(Mutex::new(TmuxRemotePane {
+            local_pane_id: 161,
+            output_write,
+            child_state: Arc::new(TmuxChildState::new()),
+            session_id: 1,
+            window_id: 2,
+            pane_id: 61,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            output_state: TmuxPaneOutputState::AwaitingCapture,
+            output_ingress: TmuxPaneOutputIngress::default(),
+        }));
+        insert_test_remote_pane(&tmux_domain, 61, Arc::clone(&pane_gate));
+
+        tmux_domain.inner.advance(Box::new(vec![Event::Output {
+            pane: 61,
+            text: b"race".to_vec(),
+        }]));
+        let capture = CapturePane {
+            pane_id: 61,
+            history_limit: 100,
+        };
+        let err = capture
+            .process_result(
+                tmux_domain.domain_id(),
+                &Guarded {
+                    error: false,
+                    timestamp: 0,
+                    number: 0,
+                    flags: 0,
+                    output: "snapshot\n".to_string(),
+                },
+            )
+            .expect_err("capture/live-output race must fail closed");
+        assert!(err.to_string().contains("capture-time stream authority is ambiguous"));
+        {
+            let pane = pane_gate.lock();
+            assert!(pane.output_ingress.capture_raced());
+            assert_eq!(pane.output_ingress.queued_bytes(), 4);
+            assert_eq!(pane.output_state, TmuxPaneOutputState::AwaitingCapture);
+        }
+
+        assert_eq!(
+            tmux_domain
+                .inner
+                .retire_tmux_pane_state_entries(&[61])
+                .expect("retire capture-raced pane"),
+            vec![161]
+        );
+        let pane = pane_gate.lock();
+        assert_eq!(pane.output_state, TmuxPaneOutputState::Retired);
+        assert!(pane.output_ingress.is_empty());
+        assert_eq!(pane.output_ingress.queued_bytes(), 0);
     }
 
     #[test]
@@ -2580,13 +2993,18 @@ mod tests {
                 pane_left: 0,
                 pane_top: 0,
                 output_state: TmuxPaneOutputState::Fresh,
+                output_ingress: TmuxPaneOutputIngress::default(),
             })),
         );
-        tmux_domain.inner.backlog.lock().append_with_limits(
-            32,
-            b"AB",
-            crate::tmux::TmuxBacklogLimits::new(1, 8, 8),
-        );
+        tmux_domain
+            .inner
+            .backlog
+            .lock()
+            .append_owned_with_limits(
+                32,
+                b"AB".to_vec(),
+                crate::tmux::TmuxBacklogLimits::new(1, 8, 8),
+            );
 
         assert!(tmux_domain.inner.finish_fresh_split(32).is_err());
         assert_eq!(
@@ -2608,25 +3026,35 @@ mod tests {
         let (_guard, tmux_domain) = install_tmux_domain();
         let child_state = Arc::new(TmuxChildState::new());
         let (_output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
+        let remote_gate = Arc::new(Mutex::new(TmuxRemotePane {
+            local_pane_id: 141,
+            output_write,
+            child_state: Arc::clone(&child_state),
+            session_id: 1,
+            window_id: 2,
+            pane_id: 41,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            output_state: TmuxPaneOutputState::Ready,
+            output_ingress: TmuxPaneOutputIngress::default(),
+        }));
         insert_test_remote_pane(
             &tmux_domain,
             41,
-            Arc::new(Mutex::new(TmuxRemotePane {
-                local_pane_id: 141,
-                output_write,
-                child_state: Arc::clone(&child_state),
-                session_id: 1,
-                window_id: 2,
-                pane_id: 41,
-                cursor_x: 0,
-                cursor_y: 0,
-                pane_width: 80,
-                pane_height: 24,
-                pane_left: 0,
-                pane_top: 0,
-                output_state: TmuxPaneOutputState::Ready,
-            })),
+            Arc::clone(&remote_gate),
         );
+        remote_gate
+            .lock()
+            .output_ingress
+            .push_back(
+                b"retained until cleanup".to_vec(),
+                TmuxPaneOutputLimits::current(),
+            )
+            .expect("queue bounded output before terminal cleanup");
 
         let err = tmux_domain
             .inner
@@ -2642,6 +3070,13 @@ mod tests {
             tmux_domain.inner.remote_panes.lock().is_empty(),
             "terminal cleanup must remove the partial remote-pane mirror"
         );
+        let remote = remote_gate.lock();
+        assert_eq!(remote.output_state, TmuxPaneOutputState::Retired);
+        assert!(
+            remote.output_ingress.is_empty(),
+            "terminal cleanup must release pane output retained by surviving PTY references"
+        );
+        assert_eq!(remote.output_ingress.queued_bytes(), 0);
     }
 
     #[test]

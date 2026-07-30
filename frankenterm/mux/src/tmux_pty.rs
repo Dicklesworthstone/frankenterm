@@ -446,6 +446,7 @@ mod tests {
             pane_left: 0,
             pane_top: 0,
             output_state: TmuxPaneOutputState::Ready,
+            output_ingress: crate::tmux::TmuxPaneOutputIngress::default(),
         }))
     }
 
