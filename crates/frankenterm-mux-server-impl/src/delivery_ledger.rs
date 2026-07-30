@@ -91,7 +91,7 @@ use mux::client::ClientId;
 use mux::pane::PaneId;
 use mux::tab::TabId;
 use mux::window::WindowId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::task::{Context, Poll, Waker};
 
@@ -443,7 +443,9 @@ pub struct DeliveryCapacity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PaneEntry {
     state: DeliveryState,
-    queued: bool,
+    ready_epoch: Option<u64>,
+    ready_prev: Option<PaneId>,
+    ready_next: Option<PaneId>,
     close_ack: Option<PaneCloseAckToken>,
 }
 
@@ -458,7 +460,10 @@ pub struct DeliveryLedger {
     generation: DeliveryGeneration,
     pane_limit: usize,
     panes: HashMap<PaneId, PaneEntry>,
-    ready: VecDeque<PaneId>,
+    ready_head: Option<PaneId>,
+    ready_tail: Option<PaneId>,
+    ready_len: usize,
+    ready_epoch: u64,
     inflight_panes: usize,
     resync_all: DeliveryState,
     next_token_sequence: Option<u64>,
@@ -482,7 +487,10 @@ impl DeliveryLedger {
             // allocation request. Both collections grow only as obligations
             // are observed and remain bounded by `pane_limit`.
             panes: HashMap::new(),
-            ready: VecDeque::new(),
+            ready_head: None,
+            ready_tail: None,
+            ready_len: 0,
+            ready_epoch: 1,
             inflight_panes: 0,
             resync_all: DeliveryState::Clean,
             next_token_sequence: Some(1),
@@ -513,14 +521,16 @@ impl DeliveryLedger {
         DeliveryCapacity {
             pane_limit: self.pane_limit,
             tracked_panes: self.panes.len(),
-            ready_panes: self.ready.len(),
+            ready_panes: self.ready_len,
             generation_slots: 1,
         }
     }
 
     #[must_use]
     pub fn pane_state(&self, pane_id: PaneId) -> Option<DeliveryState> {
-        self.panes.get(&pane_id).map(|entry| entry.state)
+        self.panes
+            .get(&pane_id)
+            .map(|entry| self.effective_pane_state(entry))
     }
 
     #[must_use]
@@ -595,12 +605,11 @@ impl DeliveryLedger {
             DeliveryState::Clean => {}
         }
 
+        self.normalize_stale_dirty(pane_id);
         if let Some(entry) = self.panes.get_mut(&pane_id) {
-            return match entry.state {
+            let outcome = match entry.state {
                 DeliveryState::Clean => {
                     entry.state = DeliveryState::Dirty;
-                    entry.queued = true;
-                    self.ready.push_back(pane_id);
                     DirtyOutcome::BecameDirty
                 }
                 DeliveryState::Dirty => {
@@ -625,6 +634,10 @@ impl DeliveryLedger {
                 }
                 DeliveryState::Closed => DirtyOutcome::IgnoredClosed,
             };
+            if outcome == DirtyOutcome::BecameDirty {
+                self.push_ready(pane_id);
+            }
+            return outcome;
         }
 
         if self.panes.len() >= self.pane_limit {
@@ -637,11 +650,13 @@ impl DeliveryLedger {
             pane_id,
             PaneEntry {
                 state: DeliveryState::Dirty,
-                queued: true,
+                ready_epoch: None,
+                ready_prev: None,
+                ready_next: None,
                 close_ack: None,
             },
         );
-        self.ready.push_back(pane_id);
+        self.push_ready(pane_id);
         DirtyOutcome::BecameDirty
     }
 
@@ -687,21 +702,10 @@ impl DeliveryLedger {
             DeliveryState::Clean => {
                 DeliveryCounters::increment(&mut self.counters.resyncs);
                 self.resync_all = DeliveryState::Dirty;
-                self.ready.clear();
-                for entry in self.panes.values_mut() {
-                    entry.queued = false;
-                    match entry.state {
-                        DeliveryState::Dirty => entry.state = DeliveryState::Clean,
-                        DeliveryState::InFlight { token, .. } => {
-                            // A future authoritative snapshot covers any
-                            // redirty attached to this older in-flight claim.
-                            entry.state = DeliveryState::InFlight {
-                                redirtied: false,
-                                token,
-                            };
-                        }
-                        DeliveryState::Clean | DeliveryState::Closed => {}
-                    }
+                if !self.reset_ready_epoch() {
+                    DeliveryCounters::increment(&mut self.counters.terminal_failures);
+                    self.close_generation();
+                    return ResyncOutcome::IgnoredClosed;
                 }
                 ResyncOutcome::Requested
             }
@@ -743,27 +747,14 @@ impl DeliveryLedger {
             return Ok(None);
         }
 
-        while let Some(pane_id) = self.ready.pop_front() {
-            let Some(entry) = self.panes.get(&pane_id) else {
-                continue;
-            };
-            if entry.state != DeliveryState::Dirty {
-                if let Some(entry) = self.panes.get_mut(&pane_id) {
-                    entry.queued = false;
-                }
-                continue;
-            }
+        if let Some(pane_id) = self.pop_ready() {
             let token = self.issue_token()?;
             self.waiter = None;
             self.pending_wake = None;
-            let Some(entry) = self.panes.get_mut(&pane_id) else {
-                // The ledger is single-owner and token issuance cannot mutate
-                // the pane map. Keep this defensive branch non-panicking if a
-                // future implementation changes that assumption; a skipped
-                // token is safe because tokens are never reused.
-                continue;
-            };
-            entry.queued = false;
+            let entry = self
+                .panes
+                .get_mut(&pane_id)
+                .expect("ready-list head must reference a tracked pane");
             entry.state = DeliveryState::InFlight {
                 redirtied: false,
                 token,
@@ -881,20 +872,22 @@ impl DeliveryLedger {
 
         DeliveryCounters::increment(&mut self.counters.no_change_settlements);
         self.inflight_panes -= 1;
-        let outcome = if self.resync_all != DeliveryState::Clean {
+        let (outcome, requeue) = if self.resync_all != DeliveryState::Clean {
             entry.state = DeliveryState::Clean;
-            entry.queued = false;
-            SettleOutcome::SupersededByResyncAll
+            (SettleOutcome::SupersededByResyncAll, false)
         } else if redirtied {
             entry.state = DeliveryState::Dirty;
-            entry.queued = true;
-            self.ready.push_back(pane_id);
-            SettleOutcome::RequeuedDirty
+            (SettleOutcome::RequeuedDirty, true)
         } else {
             entry.state = DeliveryState::Clean;
-            entry.queued = false;
-            SettleOutcome::LocallySettledNoChange
+            (SettleOutcome::LocallySettledNoChange, false)
         };
+        entry.ready_epoch = None;
+        entry.ready_prev = None;
+        entry.ready_next = None;
+        if requeue {
+            self.push_ready(pane_id);
+        }
         self.wake_if_newly_claimable(was_claimable);
         outcome
     }
@@ -954,16 +947,20 @@ impl DeliveryLedger {
                 }
                 DeliveryCounters::increment(&mut self.counters.retries);
                 self.inflight_panes -= 1;
-                if self.resync_all == DeliveryState::Clean {
+                let (outcome, requeue) = if self.resync_all == DeliveryState::Clean {
                     entry.state = DeliveryState::Dirty;
-                    entry.queued = true;
-                    self.ready.push_back(pane_id);
-                    SettleOutcome::RequeuedDirty
+                    (SettleOutcome::RequeuedDirty, true)
                 } else {
                     entry.state = DeliveryState::Clean;
-                    entry.queued = false;
-                    SettleOutcome::SupersededByResyncAll
+                    (SettleOutcome::SupersededByResyncAll, false)
+                };
+                entry.ready_epoch = None;
+                entry.ready_prev = None;
+                entry.ready_next = None;
+                if requeue {
+                    self.push_ready(pane_id);
                 }
+                outcome
             }
         }
     }
@@ -999,7 +996,7 @@ impl DeliveryLedger {
             return ClosePaneOutcome::GenerationClosed;
         }
 
-        let Some(prior_state) = self.panes.get(&pane_id).map(|entry| entry.state) else {
+        let Some(prior_state) = self.pane_state(pane_id) else {
             // An all-pane snapshot inventories panes that never occupied a
             // bounded per-pane slot. Closing one of those panes can invalidate
             // an already-produced resync snapshot, so preserve the close as a
@@ -1042,6 +1039,7 @@ impl DeliveryLedger {
                 return ClosePaneOutcome::GenerationClosed;
             }
         };
+        self.unlink_ready(pane_id);
         let Some(entry) = self.panes.get_mut(&pane_id) else {
             // The ledger is single-owner and close-token issuance cannot
             // mutate the pane map. Preserve fail-closed behavior if a future
@@ -1051,9 +1049,10 @@ impl DeliveryLedger {
             return ClosePaneOutcome::GenerationClosed;
         };
         entry.state = DeliveryState::Closed;
-        entry.queued = false;
+        entry.ready_epoch = None;
+        entry.ready_prev = None;
+        entry.ready_next = None;
         entry.close_ack = Some(close_ack);
-        self.ready.retain(|queued| *queued != pane_id);
 
         // If an all-pane snapshot is already in flight, its inventory may
         // predate this close. Force a second authoritative pass.
@@ -1121,12 +1120,10 @@ impl DeliveryLedger {
     /// Terminally close this connection-local generation.
     pub fn close_generation(&mut self) {
         self.resync_all = DeliveryState::Closed;
-        self.ready.clear();
+        self.ready_head = None;
+        self.ready_tail = None;
+        self.ready_len = 0;
         self.inflight_panes = 0;
-        for entry in self.panes.values_mut() {
-            entry.state = DeliveryState::Closed;
-            entry.queued = false;
-        }
         self.defer_waiter_wake();
     }
 
@@ -1135,21 +1132,45 @@ impl DeliveryLedger {
         if self.panes.len() > self.pane_limit {
             return Err("tracked pane count exceeds configured capacity");
         }
-        if self.ready.len() > self.panes.len() {
+        if self.ready_len > self.panes.len() {
             return Err("ready queue exceeds tracked pane count");
         }
+        if (self.ready_len == 0) != (self.ready_head.is_none() && self.ready_tail.is_none()) {
+            return Err("ready-list endpoints disagree with its length");
+        }
 
-        let mut queued = HashSet::with_capacity(self.ready.len());
-        for pane_id in &self.ready {
-            if !queued.insert(*pane_id) {
+        let mut queued = HashSet::with_capacity(self.ready_len);
+        let mut cursor = self.ready_head;
+        let mut previous = None;
+        let mut traversed = 0usize;
+        while let Some(pane_id) = cursor {
+            if traversed == self.ready_len {
+                return Err("ready list contains a cycle or exceeds its charged length");
+            }
+            if !queued.insert(pane_id) {
                 return Err("ready queue contains a duplicate pane");
             }
-            let Some(entry) = self.panes.get(pane_id) else {
+            let Some(entry) = self.panes.get(&pane_id) else {
                 return Err("ready queue references an untracked pane");
             };
-            if entry.state != DeliveryState::Dirty || !entry.queued {
+            if entry.ready_epoch != Some(self.ready_epoch) {
+                return Err("ready list references a pane from a stale epoch");
+            }
+            if entry.ready_prev != previous {
+                return Err("ready-list predecessor link is inconsistent");
+            }
+            if self.effective_pane_state(entry) != DeliveryState::Dirty {
                 return Err("ready queue references a non-dirty pane");
             }
+            previous = Some(pane_id);
+            cursor = entry.ready_next;
+            traversed += 1;
+        }
+        if traversed != self.ready_len {
+            return Err("ready list is shorter than its charged length");
+        }
+        if previous != self.ready_tail {
+            return Err("ready-list tail disagrees with forward traversal");
         }
 
         let global_is_clean = self.resync_all == DeliveryState::Clean;
@@ -1157,16 +1178,19 @@ impl DeliveryLedger {
         let mut close_ack_sequences = HashSet::new();
         let mut observed_inflight_panes = 0usize;
         for (pane_id, entry) in &self.panes {
-            if entry.queued != queued.contains(pane_id) {
+            let state = self.effective_pane_state(entry);
+            let active_epoch_member =
+                !self.is_closed() && entry.ready_epoch == Some(self.ready_epoch);
+            if active_epoch_member != queued.contains(pane_id) {
                 return Err("pane queued bit disagrees with ready queue");
             }
-            if matches!(entry.state, DeliveryState::Dirty) != entry.queued {
+            if matches!(state, DeliveryState::Dirty) != active_epoch_member {
                 return Err("dirty pane must appear exactly once in ready queue");
             }
-            if !global_is_clean && entry.state == DeliveryState::Dirty {
+            if !global_is_clean && state == DeliveryState::Dirty {
                 return Err("resync-all must supersede queued pane dirties");
             }
-            match (entry.state, entry.close_ack) {
+            match (state, entry.close_ack) {
                 (DeliveryState::Closed, Some(close_ack)) => {
                     if close_ack.instance != self.instance
                         || close_ack.generation != self.generation
@@ -1193,7 +1217,7 @@ impl DeliveryLedger {
                     None,
                 ) => {}
             }
-            if let DeliveryState::InFlight { token, .. } = entry.state {
+            if let DeliveryState::InFlight { token, .. } = state {
                 observed_inflight_panes += 1;
                 if token.instance != self.instance || token.generation != self.generation {
                     return Err("pane token belongs to another generation");
@@ -1223,11 +1247,9 @@ impl DeliveryLedger {
             return Err("registered waiter coexists with an undelivered pending wake");
         }
         if self.is_closed()
-            && (self
-                .panes
-                .values()
-                .any(|entry| entry.state != DeliveryState::Closed)
-                || !self.ready.is_empty()
+            && (self.ready_head.is_some()
+                || self.ready_tail.is_some()
+                || self.ready_len != 0
                 || self.inflight_panes != 0
                 || self.waiter.is_some())
         {
@@ -1302,19 +1324,162 @@ impl DeliveryLedger {
         self.inflight_panes -= 1;
         if self.resync_all != DeliveryState::Clean {
             entry.state = DeliveryState::Clean;
-            entry.queued = false;
+            entry.ready_epoch = None;
+            entry.ready_prev = None;
+            entry.ready_next = None;
             return SettleOutcome::SupersededByResyncAll;
         }
         if redirtied {
             entry.state = DeliveryState::Dirty;
-            entry.queued = true;
-            self.ready.push_back(pane_id);
+            entry.ready_epoch = None;
+            entry.ready_prev = None;
+            entry.ready_next = None;
+            self.push_ready(pane_id);
             SettleOutcome::RequeuedDirty
         } else {
             entry.state = DeliveryState::Clean;
-            entry.queued = false;
+            entry.ready_epoch = None;
+            entry.ready_prev = None;
+            entry.ready_next = None;
             SettleOutcome::CommittedClean
         }
+    }
+
+    fn effective_pane_state(&self, entry: &PaneEntry) -> DeliveryState {
+        if self.is_closed() {
+            return DeliveryState::Closed;
+        }
+        match entry.state {
+            DeliveryState::Dirty if entry.ready_epoch != Some(self.ready_epoch) => {
+                DeliveryState::Clean
+            }
+            DeliveryState::InFlight { token, .. }
+                if self.resync_all == DeliveryState::Dirty =>
+            {
+                // Installing the fixed global obligation supersedes every
+                // redirty observed before that snapshot.  The physical bit can
+                // remain untouched because settlement is still fenced by the
+                // exact token and the dirty resync.
+                DeliveryState::InFlight {
+                    redirtied: false,
+                    token,
+                }
+            }
+            state => state,
+        }
+    }
+
+    fn normalize_stale_dirty(&mut self, pane_id: PaneId) {
+        let Some(entry) = self.panes.get_mut(&pane_id) else {
+            return;
+        };
+        if entry.state == DeliveryState::Dirty && entry.ready_epoch != Some(self.ready_epoch) {
+            entry.state = DeliveryState::Clean;
+            entry.ready_epoch = None;
+            entry.ready_prev = None;
+            entry.ready_next = None;
+        }
+    }
+
+    fn push_ready(&mut self, pane_id: PaneId) {
+        let epoch = self.ready_epoch;
+        let previous_tail = self.ready_tail;
+        {
+            let entry = self
+                .panes
+                .get_mut(&pane_id)
+                .expect("only tracked panes can enter the ready list");
+            debug_assert_eq!(entry.state, DeliveryState::Dirty);
+            debug_assert_ne!(entry.ready_epoch, Some(epoch));
+            entry.ready_epoch = Some(epoch);
+            entry.ready_prev = previous_tail;
+            entry.ready_next = None;
+        }
+
+        if let Some(tail) = previous_tail {
+            let tail_entry = self
+                .panes
+                .get_mut(&tail)
+                .expect("ready-list tail must remain tracked");
+            debug_assert_eq!(tail_entry.ready_epoch, Some(epoch));
+            debug_assert!(tail_entry.ready_next.is_none());
+            tail_entry.ready_next = Some(pane_id);
+        } else {
+            debug_assert!(self.ready_head.is_none());
+            self.ready_head = Some(pane_id);
+        }
+        self.ready_tail = Some(pane_id);
+        self.ready_len = self
+            .ready_len
+            .checked_add(1)
+            .expect("pane limit bounds ready-list length");
+    }
+
+    fn pop_ready(&mut self) -> Option<PaneId> {
+        let pane_id = self.ready_head?;
+        let removed = self.unlink_ready(pane_id);
+        debug_assert!(removed, "ready-list head must belong to the active epoch");
+        Some(pane_id)
+    }
+
+    fn unlink_ready(&mut self, pane_id: PaneId) -> bool {
+        let epoch = self.ready_epoch;
+        let Some(entry) = self.panes.get(&pane_id) else {
+            return false;
+        };
+        if entry.ready_epoch != Some(epoch) {
+            return false;
+        }
+        let previous = entry.ready_prev;
+        let next = entry.ready_next;
+
+        if let Some(previous) = previous {
+            let previous_entry = self
+                .panes
+                .get_mut(&previous)
+                .expect("ready predecessor must remain tracked");
+            debug_assert_eq!(previous_entry.ready_epoch, Some(epoch));
+            previous_entry.ready_next = next;
+        } else {
+            debug_assert_eq!(self.ready_head, Some(pane_id));
+            self.ready_head = next;
+        }
+
+        if let Some(next) = next {
+            let next_entry = self
+                .panes
+                .get_mut(&next)
+                .expect("ready successor must remain tracked");
+            debug_assert_eq!(next_entry.ready_epoch, Some(epoch));
+            next_entry.ready_prev = previous;
+        } else {
+            debug_assert_eq!(self.ready_tail, Some(pane_id));
+            self.ready_tail = previous;
+        }
+
+        let entry = self
+            .panes
+            .get_mut(&pane_id)
+            .expect("unlinked ready pane must remain tracked");
+        entry.ready_epoch = None;
+        entry.ready_prev = None;
+        entry.ready_next = None;
+        self.ready_len = self
+            .ready_len
+            .checked_sub(1)
+            .expect("active ready membership charges one list slot");
+        true
+    }
+
+    fn reset_ready_epoch(&mut self) -> bool {
+        let Some(next_epoch) = self.ready_epoch.checked_add(1) else {
+            return false;
+        };
+        self.ready_head = None;
+        self.ready_tail = None;
+        self.ready_len = 0;
+        self.ready_epoch = next_epoch;
+        true
     }
 
     fn redirty_inflight_resync(&mut self) -> bool {
@@ -1335,7 +1500,7 @@ impl DeliveryLedger {
 
     fn has_claimable_work(&self) -> bool {
         match self.resync_all {
-            DeliveryState::Clean => !self.ready.is_empty(),
+            DeliveryState::Clean => self.ready_len != 0,
             DeliveryState::Dirty => self.inflight_panes == 0,
             DeliveryState::InFlight { .. } | DeliveryState::Closed => false,
         }
@@ -1989,6 +2154,7 @@ pub fn notification_contract(notification: &MuxNotification) -> NotificationCont
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Wake;
@@ -2442,6 +2608,64 @@ mod tests {
         assert_eq!(ledger.commit(second), SettleOutcome::CommittedClean);
         assert_eq!(ledger.commit(third), SettleOutcome::CommittedClean);
         assert_eq!(claim(&mut ledger).scope(), DeliveryScope::Pane(1));
+        assert_eq!(ledger.check_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn large_ready_set_preserves_fifo_across_indexed_close_and_epoch_resync() {
+        const PANES: usize = 4096;
+        let mut ledger = ledger(PANES);
+        for pane_id in 0..PANES {
+            assert_eq!(ledger.mark_dirty(pane_id), DirtyOutcome::BecameDirty);
+        }
+        assert_eq!(ledger.ready_len, PANES);
+        assert_eq!(ledger.ready_head, Some(0));
+        assert_eq!(ledger.ready_tail, Some(PANES - 1));
+
+        let closed = [0, PANES / 2, PANES - 1];
+        let close_acks = closed.map(|pane_id| close_ack(ledger.close_pane(pane_id)));
+        assert_eq!(ledger.ready_len, PANES - closed.len());
+        assert_eq!(ledger.ready_head, Some(1));
+        assert_eq!(ledger.ready_tail, Some(PANES - 2));
+        assert_eq!(ledger.check_invariants(), Ok(()));
+
+        for expected in (0..PANES).filter(|pane_id| !closed.contains(pane_id)) {
+            let next = claim(&mut ledger);
+            assert_eq!(next.scope(), DeliveryScope::Pane(expected));
+            assert_eq!(ledger.commit(next), SettleOutcome::CommittedClean);
+        }
+        assert_eq!(ledger.claim_next(), Ok(None));
+
+        for (pane_id, close_ack) in closed.into_iter().zip(close_acks) {
+            assert_eq!(
+                ledger.acknowledge_pane_close(pane_id, close_ack),
+                ReclaimPaneOutcome::Reclaimed
+            );
+        }
+        assert_eq!(ledger.capacity().tracked_panes, PANES - closed.len());
+
+        for pane_id in (0..PANES).filter(|pane_id| !closed.contains(pane_id)) {
+            assert_eq!(ledger.mark_dirty(pane_id), DirtyOutcome::BecameDirty);
+        }
+        let ready_epoch_before_resync = ledger.ready_epoch;
+        assert_eq!(ledger.request_resync_all(), ResyncOutcome::Requested);
+        assert_eq!(
+            ledger.ready_epoch,
+            ready_epoch_before_resync + 1,
+            "resync must supersede the entire ready set with one epoch transition"
+        );
+        assert_eq!(ledger.ready_len, 0);
+        assert_eq!(ledger.ready_head, None);
+        assert_eq!(ledger.ready_tail, None);
+        assert_eq!(
+            ledger.capacity().tracked_panes,
+            PANES - closed.len(),
+            "logical resync must not scan away or grow stable pane storage"
+        );
+        assert_eq!(ledger.pane_state(1), Some(DeliveryState::Clean));
+        let resync = claim(&mut ledger);
+        assert_eq!(resync.scope(), DeliveryScope::ResyncAll);
+        assert_eq!(ledger.commit(resync), SettleOutcome::CommittedClean);
         assert_eq!(ledger.check_invariants(), Ok(()));
     }
 

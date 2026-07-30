@@ -323,10 +323,27 @@ fn add_usize(counter: &mut u64, amount: usize) {
 }
 
 #[derive(Clone, Debug)]
+struct KeyedSlot<K, V> {
+    key: K,
+    value: V,
+    epoch: u64,
+    previous: Option<usize>,
+    next: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
 struct KeyedLane<K, V> {
     limit: usize,
-    values: HashMap<K, V>,
-    order: VecDeque<K>,
+    by_key: HashMap<K, usize>,
+    slots: Vec<Option<KeyedSlot<K, V>>>,
+    free: Vec<usize>,
+    active_head: Option<usize>,
+    active_tail: Option<usize>,
+    active_len: usize,
+    retired_head: Option<usize>,
+    retired_tail: Option<usize>,
+    retired_len: usize,
+    active_epoch: u64,
     resync_pending: bool,
 }
 
@@ -337,8 +354,16 @@ where
     fn new(limit: usize) -> Self {
         Self {
             limit,
-            values: HashMap::new(),
-            order: VecDeque::new(),
+            by_key: HashMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            active_head: None,
+            active_tail: None,
+            active_len: 0,
+            retired_head: None,
+            retired_tail: None,
+            retired_len: 0,
+            active_epoch: 1,
             resync_pending: false,
         }
     }
@@ -348,15 +373,56 @@ where
             return AdmissionOutcome::Coalesced;
         }
 
-        if let Some(current) = self.values.get_mut(&key) {
-            *current = value;
-            return AdmissionOutcome::Coalesced;
+        if let Some(index) = self.by_key.get(&key).copied() {
+            let is_active = self.slots[index]
+                .as_ref()
+                .is_some_and(|slot| slot.epoch == self.active_epoch);
+            if is_active {
+                self.slots[index]
+                    .as_mut()
+                    .expect("key index must reference an occupied slot")
+                    .value = value;
+                return AdmissionOutcome::Coalesced;
+            }
+
+            self.unlink_retired(index);
+            {
+                let slot = self.slots[index]
+                    .as_mut()
+                    .expect("retired key index must reference an occupied slot");
+                slot.value = value;
+                slot.epoch = self.active_epoch;
+            }
+            self.append_active(index);
+            return AdmissionOutcome::Admitted;
         }
 
-        if self.values.len() < self.limit {
-            self.order.push_back(key.clone());
-            let replaced = self.values.insert(key, value);
+        if self.active_len < self.limit {
+            let index = if let Some(index) = self.free.pop() {
+                index
+            } else if let Some(index) = self.retired_head {
+                self.unlink_retired(index);
+                let retired = self.slots[index]
+                    .take()
+                    .expect("retired list must reference an occupied slot");
+                let removed = self.by_key.remove(&retired.key);
+                debug_assert_eq!(removed, Some(index));
+                index
+            } else {
+                let index = self.slots.len();
+                self.slots.push(None);
+                index
+            };
+            self.slots[index] = Some(KeyedSlot {
+                key: key.clone(),
+                value,
+                epoch: self.active_epoch,
+                previous: None,
+                next: None,
+            });
+            let replaced = self.by_key.insert(key, index);
             debug_assert!(replaced.is_none());
+            self.append_active(index);
             AdmissionOutcome::Admitted
         } else {
             self.resync_pending = true;
@@ -365,50 +431,270 @@ where
     }
 
     fn is_ready(&self) -> bool {
-        self.resync_pending || !self.order.is_empty()
+        self.resync_pending || self.active_len != 0
     }
 
     fn pop(&mut self) -> Option<KeyedPop<K, V>> {
         if self.resync_pending {
             self.resync_pending = false;
-            self.values.clear();
-            self.order.clear();
+            self.retire_active();
             return Some(KeyedPop::Resync);
         }
 
-        let key = self.order.pop_front()?;
-        let value = self
-            .values
-            .remove(&key)
-            .expect("keyed scheduler order and value map must agree");
-        Some(KeyedPop::Value { key, value })
+        let index = self.active_head?;
+        self.unlink_active(index);
+        let slot = self.slots[index]
+            .take()
+            .expect("active list must reference an occupied slot");
+        let removed = self.by_key.remove(&slot.key);
+        debug_assert_eq!(removed, Some(index));
+        self.free.push(index);
+        Some(KeyedPop::Value {
+            key: slot.key,
+            value: slot.value,
+        })
     }
 
     fn clear(&mut self) {
-        self.values.clear();
-        self.order.clear();
+        self.by_key.clear();
+        self.slots.clear();
+        self.free.clear();
+        self.active_head = None;
+        self.active_tail = None;
+        self.active_len = 0;
+        self.retired_head = None;
+        self.retired_tail = None;
+        self.retired_len = 0;
         self.resync_pending = false;
     }
 
-    fn check_invariants(&self) -> Result<(), &'static str> {
-        if self.values.len() > self.limit {
-            return Err("keyed lane exceeds its configured key limit");
+    fn len(&self) -> usize {
+        self.active_len
+    }
+
+    fn append_active(&mut self, index: usize) {
+        let previous_tail = self.active_tail;
+        {
+            let slot = self.slots[index]
+                .as_mut()
+                .expect("only occupied slots can enter the active list");
+            debug_assert_eq!(slot.epoch, self.active_epoch);
+            slot.previous = previous_tail;
+            slot.next = None;
         }
-        if self.order.len() != self.values.len() {
-            return Err("keyed lane order and value counts disagree");
+        if let Some(tail) = previous_tail {
+            self.slots[tail]
+                .as_mut()
+                .expect("active tail must remain occupied")
+                .next = Some(index);
+        } else {
+            debug_assert!(self.active_head.is_none());
+            self.active_head = Some(index);
+        }
+        self.active_tail = Some(index);
+        self.active_len += 1;
+    }
+
+    fn unlink_active(&mut self, index: usize) {
+        let slot = self.slots[index]
+            .as_ref()
+            .expect("active index must reference an occupied slot");
+        debug_assert_eq!(slot.epoch, self.active_epoch);
+        let previous = slot.previous;
+        let next = slot.next;
+        self.relink_neighbors(previous, next, true);
+        let slot = self.slots[index]
+            .as_mut()
+            .expect("unlinked active slot must remain occupied");
+        slot.previous = None;
+        slot.next = None;
+        self.active_len = self
+            .active_len
+            .checked_sub(1)
+            .expect("active membership charges one slot");
+    }
+
+    fn unlink_retired(&mut self, index: usize) {
+        let slot = self.slots[index]
+            .as_ref()
+            .expect("retired index must reference an occupied slot");
+        debug_assert_ne!(slot.epoch, self.active_epoch);
+        let previous = slot.previous;
+        let next = slot.next;
+        self.relink_neighbors(previous, next, false);
+        let slot = self.slots[index]
+            .as_mut()
+            .expect("unlinked retired slot must remain occupied");
+        slot.previous = None;
+        slot.next = None;
+        self.retired_len = self
+            .retired_len
+            .checked_sub(1)
+            .expect("retired membership charges one slot");
+    }
+
+    fn relink_neighbors(
+        &mut self,
+        previous: Option<usize>,
+        next: Option<usize>,
+        active: bool,
+    ) {
+        if let Some(previous) = previous {
+            self.slots[previous]
+                .as_mut()
+                .expect("list predecessor must remain occupied")
+                .next = next;
+        } else if active {
+            self.active_head = next;
+        } else {
+            self.retired_head = next;
         }
 
-        let mut seen = HashSet::with_capacity(self.order.len());
-        for key in &self.order {
-            if !seen.insert(key) {
-                return Err("keyed lane order contains a duplicate stable key");
+        if let Some(next) = next {
+            self.slots[next]
+                .as_mut()
+                .expect("list successor must remain occupied")
+                .previous = previous;
+        } else if active {
+            self.active_tail = previous;
+        } else {
+            self.retired_tail = previous;
+        }
+    }
+
+    fn retire_active(&mut self) {
+        let Some(active_head) = self.active_head else {
+            self.advance_epoch();
+            return;
+        };
+        if let Some(retired_tail) = self.retired_tail {
+            self.slots[retired_tail]
+                .as_mut()
+                .expect("retired tail must remain occupied")
+                .next = Some(active_head);
+            self.slots[active_head]
+                .as_mut()
+                .expect("active head must remain occupied")
+                .previous = Some(retired_tail);
+        } else {
+            self.retired_head = Some(active_head);
+        }
+        self.retired_tail = self.active_tail;
+        self.retired_len = self
+            .retired_len
+            .checked_add(self.active_len)
+            .expect("key limit bounds retired-slot count");
+        self.active_head = None;
+        self.active_tail = None;
+        self.active_len = 0;
+        self.advance_epoch();
+    }
+
+    fn advance_epoch(&mut self) {
+        if let Some(next) = self.active_epoch.checked_add(1) {
+            self.active_epoch = next;
+            return;
+        }
+
+        // Rebase only after 2^64 resync generations.  This cold exhaustion
+        // repair preserves correctness without wraparound aliasing; ordinary
+        // resync remains an O(1) list splice.
+        for slot in self.slots.iter_mut().flatten() {
+            slot.epoch = 0;
+        }
+        self.active_epoch = 1;
+    }
+
+    fn check_invariants(&self) -> Result<(), &'static str> {
+        if self.active_len > self.limit
+            || self.by_key.len() > self.limit
+            || self.slots.len() > self.limit
+        {
+            return Err("keyed lane exceeds its configured key limit");
+        }
+        if self.active_len.checked_add(self.retired_len) != Some(self.by_key.len()) {
+            return Err("keyed lane list and key-index counts disagree");
+        }
+        if self.by_key.len().checked_add(self.free.len()) != Some(self.slots.len()) {
+            return Err("keyed lane occupied and free slot counts disagree");
+        }
+        if (self.active_len == 0) != (self.active_head.is_none() && self.active_tail.is_none()) {
+            return Err("active keyed-list endpoints disagree with its length");
+        }
+        if (self.retired_len == 0) != (self.retired_head.is_none() && self.retired_tail.is_none()) {
+            return Err("retired keyed-list endpoints disagree with its length");
+        }
+
+        let mut seen = HashSet::with_capacity(self.by_key.len());
+        let mut cursor = self.active_head;
+        let mut previous = None;
+        let mut traversed = 0usize;
+        while let Some(index) = cursor {
+            if traversed == self.active_len || !seen.insert(index) {
+                return Err("active keyed list contains a cycle");
             }
-            if !self.values.contains_key(key) {
-                return Err("keyed lane order references a missing value");
+            let slot = self
+                .slots
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or("active keyed list references a vacant slot")?;
+            if slot.epoch != self.active_epoch || slot.previous != previous {
+                return Err("active keyed-list metadata is inconsistent");
+            }
+            previous = Some(index);
+            cursor = slot.next;
+            traversed += 1;
+        }
+        if traversed != self.active_len || previous != self.active_tail {
+            return Err("active keyed-list traversal disagrees with its bounds");
+        }
+
+        cursor = self.retired_head;
+        previous = None;
+        traversed = 0;
+        while let Some(index) = cursor {
+            if traversed == self.retired_len || !seen.insert(index) {
+                return Err("retired keyed list contains a cycle or overlap");
+            }
+            let slot = self
+                .slots
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or("retired keyed list references a vacant slot")?;
+            if slot.epoch == self.active_epoch || slot.previous != previous {
+                return Err("retired keyed-list metadata is inconsistent");
+            }
+            previous = Some(index);
+            cursor = slot.next;
+            traversed += 1;
+        }
+        if traversed != self.retired_len || previous != self.retired_tail {
+            return Err("retired keyed-list traversal disagrees with its bounds");
+        }
+
+        for (key, index) in &self.by_key {
+            let slot = self
+                .slots
+                .get(*index)
+                .and_then(Option::as_ref)
+                .ok_or("key index references a vacant slot")?;
+            if &slot.key != key || !seen.contains(index) {
+                return Err("key index disagrees with stable-slot authority");
             }
         }
-        if seen.len() != self.values.len() {
-            return Err("keyed lane value map contains an unordered key");
+        let mut free = HashSet::with_capacity(self.free.len());
+        for index in &self.free {
+            if *index >= self.slots.len()
+                || self.slots[*index].is_some()
+                || !free.insert(*index)
+            {
+                return Err("free list references an occupied, absent, or duplicate slot");
+            }
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            if slot.is_some() != seen.contains(&index) || slot.is_none() != free.contains(&index) {
+                return Err("keyed slot is disconnected from list and free-list authority");
+            }
         }
         Ok(())
     }
@@ -483,7 +769,7 @@ where
         };
         let state_keys = LaneCapacity {
             limit: self.limits.state_keys,
-            used: self.state.values.len(),
+            used: self.state.len(),
         };
         let state_resync = LaneCapacity {
             limit: 1,
@@ -491,7 +777,7 @@ where
         };
         let render_keys = LaneCapacity {
             limit: self.limits.render_keys,
-            used: self.render.values.len(),
+            used: self.render.len(),
         };
         let render_resync = LaneCapacity {
             limit: 1,
@@ -2159,6 +2445,8 @@ struct CoordinatorEntry {
     epoch: u64,
     footprint: PlanFootprint,
     state: CoordinatorEntryState,
+    previous: Option<usize>,
+    next: Option<usize>,
 }
 
 /// Hardened, non-wired authority coordinator.
@@ -2171,7 +2459,12 @@ pub struct DeliveryCoordinator {
     instance: CoordinatorInstance,
     generation: SchedulerGeneration,
     limits: HardenedSchedulerLimits,
-    queue: VecDeque<CoordinatorEntry>,
+    queue: Vec<Option<CoordinatorEntry>>,
+    queue_free: Vec<usize>,
+    queue_head: Option<usize>,
+    queue_tail: Option<usize>,
+    queue_len: usize,
+    reservations: HashMap<u64, usize>,
     capacity: HardenedCapacity,
     next_sequence: Option<u64>,
     next_attempt: Option<u64>,
@@ -2192,7 +2485,12 @@ impl DeliveryCoordinator {
             instance: CoordinatorInstance::try_new()?,
             generation,
             limits,
-            queue: VecDeque::new(),
+            queue: Vec::new(),
+            queue_free: Vec::new(),
+            queue_head: None,
+            queue_tail: None,
+            queue_len: 0,
+            reservations: HashMap::new(),
             capacity: HardenedCapacity::default(),
             next_sequence: Some(1),
             next_attempt: Some(1),
@@ -2247,7 +2545,7 @@ impl DeliveryCoordinator {
 
     fn recompute_capacity(&self) -> HardenedCapacity {
         let mut capacity = HardenedCapacity::default();
-        for entry in &self.queue {
+        for entry in self.queue.iter().flatten() {
             for (used, entry_used) in capacity
                 .lane_slots_used
                 .iter_mut()
@@ -2275,6 +2573,99 @@ impl DeliveryCoordinator {
             }
         }
         capacity
+    }
+
+    fn queue_push_back(&mut self, mut entry: CoordinatorEntry) -> usize {
+        let previous_tail = self.queue_tail;
+        entry.previous = previous_tail;
+        entry.next = None;
+        let sequence = entry.sequence;
+        let is_reservation = matches!(&entry.state, CoordinatorEntryState::Reserved { .. });
+        let index = if let Some(index) = self.queue_free.pop() {
+            self.queue[index] = Some(entry);
+            index
+        } else {
+            let index = self.queue.len();
+            self.queue.push(Some(entry));
+            index
+        };
+
+        if let Some(tail) = previous_tail {
+            self.queue[tail]
+                .as_mut()
+                .expect("coordinator tail must remain occupied")
+                .next = Some(index);
+        } else {
+            debug_assert!(self.queue_head.is_none());
+            self.queue_head = Some(index);
+        }
+        self.queue_tail = Some(index);
+        self.queue_len = self
+            .queue_len
+            .checked_add(1)
+            .expect("pending-plan limit bounds coordinator queue length");
+        if is_reservation {
+            let replaced = self.reservations.insert(sequence, index);
+            debug_assert!(replaced.is_none());
+        }
+        index
+    }
+
+    fn queue_remove(&mut self, index: usize) -> CoordinatorEntry {
+        let entry = self.queue[index]
+            .as_ref()
+            .expect("removed coordinator index must be occupied");
+        let previous = entry.previous;
+        let next = entry.next;
+
+        if let Some(previous) = previous {
+            self.queue[previous]
+                .as_mut()
+                .expect("coordinator predecessor must remain occupied")
+                .next = next;
+        } else {
+            debug_assert_eq!(self.queue_head, Some(index));
+            self.queue_head = next;
+        }
+        if let Some(next) = next {
+            self.queue[next]
+                .as_mut()
+                .expect("coordinator successor must remain occupied")
+                .previous = previous;
+        } else {
+            debug_assert_eq!(self.queue_tail, Some(index));
+            self.queue_tail = previous;
+        }
+
+        let entry = self.queue[index]
+            .take()
+            .expect("unlinked coordinator entry must remain occupied");
+        if matches!(&entry.state, CoordinatorEntryState::Reserved { .. }) {
+            let removed = self.reservations.remove(&entry.sequence);
+            debug_assert_eq!(removed, Some(index));
+        }
+        self.queue_free.push(index);
+        self.queue_len = self
+            .queue_len
+            .checked_sub(1)
+            .expect("occupied coordinator entry charges one queue slot");
+        entry
+    }
+
+    fn queue_pop_front(&mut self) -> Option<CoordinatorEntry> {
+        let index = self.queue_head?;
+        Some(self.queue_remove(index))
+    }
+
+    fn queue_front(&self) -> Option<&CoordinatorEntry> {
+        self.queue_head
+            .and_then(|index| self.queue.get(index))
+            .and_then(Option::as_ref)
+    }
+
+    fn queue_front_mut(&mut self) -> Option<&mut CoordinatorEntry> {
+        let index = self.queue_head?;
+        self.queue.get_mut(index).and_then(Option::as_mut)
     }
 
     fn charge_footprint(&mut self, footprint: PlanFootprint) {
@@ -2450,11 +2841,13 @@ impl DeliveryCoordinator {
             return PlanAdmission::Closed { plan };
         };
         let epoch = self.current_epoch;
-        self.queue.push_back(CoordinatorEntry {
+        self.queue_push_back(CoordinatorEntry {
             sequence,
             epoch,
             footprint,
             state: CoordinatorEntryState::Ready { plan },
+            previous: None,
+            next: None,
         });
         self.charge_ready_plan(footprint);
         if footprint.barrier_count == 1 {
@@ -2499,13 +2892,15 @@ impl DeliveryCoordinator {
             sequence,
         };
         let epoch = self.current_epoch;
-        self.queue.push_back(CoordinatorEntry {
+        self.queue_push_back(CoordinatorEntry {
             sequence,
             epoch,
             footprint,
             state: CoordinatorEntryState::Reserved {
                 token: token.clone(),
             },
+            previous: None,
+            next: None,
         });
         self.charge_reservation(footprint);
         if footprint.barrier_count == 1 {
@@ -2537,28 +2932,21 @@ impl DeliveryCoordinator {
             increment(&mut self.counters.stale_reservations);
             return ReservationCommit::Stale { plan };
         }
-        let position = self
-            .queue
-            .back()
-            .filter(|entry| {
-                matches!(
-                    &entry.state,
-                    CoordinatorEntryState::Reserved { token: queued } if queued == &token
-                )
-            })
-            .map(|_| self.queue.len() - 1)
-            .or_else(|| {
-                self.queue.iter().position(|entry| {
-                    matches!(
-                        &entry.state,
-                        CoordinatorEntryState::Reserved { token: queued } if queued == &token
-                    )
-                })
-            });
-        let Some(position) = position else {
+        let Some(index) = self.reservations.get(&token.sequence).copied() else {
             increment(&mut self.counters.stale_reservations);
             return ReservationCommit::Stale { plan };
         };
+        let Some(reserved) = self.queue.get(index).and_then(Option::as_ref) else {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCommit::Stale { plan };
+        };
+        if !matches!(
+            &reserved.state,
+            CoordinatorEntryState::Reserved { token: queued } if queued == &token
+        ) {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCommit::Stale { plan };
+        }
         let footprint = match self.validate_plan(&plan) {
             Ok(footprint) => footprint,
             Err(reason) => {
@@ -2570,7 +2958,7 @@ impl DeliveryCoordinator {
                 };
             }
         };
-        if self.queue[position].footprint != footprint {
+        if reserved.footprint != footprint {
             increment(&mut self.counters.reservation_commit_rejections);
             return ReservationCommit::Rejected {
                 token,
@@ -2578,9 +2966,14 @@ impl DeliveryCoordinator {
                 plan,
             };
         }
-        let sequence = self.queue[position].sequence;
-        let epoch = self.queue[position].epoch;
-        self.queue[position].state = CoordinatorEntryState::Ready { plan };
+        let sequence = reserved.sequence;
+        let epoch = reserved.epoch;
+        self.queue[index]
+            .as_mut()
+            .expect("indexed reservation must remain occupied")
+            .state = CoordinatorEntryState::Ready { plan };
+        let removed = self.reservations.remove(&sequence);
+        debug_assert_eq!(removed, Some(index));
         self.commit_reserved_capacity(footprint);
         increment(&mut self.counters.reservations_committed);
         self.wake_waiter_if_claimable();
@@ -2605,43 +2998,27 @@ impl DeliveryCoordinator {
             increment(&mut self.counters.stale_reservations);
             return ReservationCancel::Stale;
         }
-        let position = self
-            .queue
-            .back()
-            .filter(|entry| {
-                matches!(
-                    &entry.state,
-                    CoordinatorEntryState::Reserved { token: queued } if queued == &token
-                )
-            })
-            .map(|_| self.queue.len() - 1)
-            .or_else(|| {
-                self.queue.iter().position(|entry| {
-                    matches!(
-                        &entry.state,
-                        CoordinatorEntryState::Reserved { token: queued } if queued == &token
-                    )
-                })
-            });
-        let Some(position) = position else {
+        let Some(index) = self.reservations.get(&token.sequence).copied() else {
             increment(&mut self.counters.stale_reservations);
             return ReservationCancel::Stale;
         };
-        let reserved = &self.queue[position];
-        if reserved.footprint.barrier_count == 1 && position + 1 != self.queue.len() {
+        let Some(reserved) = self.queue.get(index).and_then(Option::as_ref) else {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCancel::Stale;
+        };
+        if !matches!(
+            &reserved.state,
+            CoordinatorEntryState::Reserved { token: queued } if queued == &token
+        ) {
+            increment(&mut self.counters.stale_reservations);
+            return ReservationCancel::Stale;
+        }
+        if reserved.footprint.barrier_count == 1 && self.queue_tail != Some(index) {
             increment(&mut self.counters.reservation_cancel_rejections);
             return ReservationCancel::CausalDependents { token };
         }
         let rolled_back_epoch = (reserved.footprint.barrier_count == 1).then_some(reserved.epoch);
-        let removed = if position + 1 == self.queue.len() {
-            self.queue
-                .pop_back()
-                .expect("located tail reservation remains present during exclusive cancellation")
-        } else {
-            self.queue
-                .remove(position)
-                .expect("located reservation remains present during exclusive cancellation")
-        };
+        let removed = self.queue_remove(index);
         self.release_reservation(removed.footprint);
         if let Some(epoch) = rolled_back_epoch {
             debug_assert_eq!(self.current_epoch, epoch + 1);
@@ -2663,7 +3040,7 @@ impl DeliveryCoordinator {
         if self.closed {
             return Ok(None);
         }
-        let Some(front) = self.queue.front() else {
+        let Some(front) = self.queue_front() else {
             return Ok(None);
         };
         let CoordinatorEntryState::Ready { .. } = &front.state else {
@@ -2682,8 +3059,7 @@ impl DeliveryCoordinator {
             attempt,
         };
         let front = self
-            .queue
-            .front_mut()
+            .queue_front_mut()
             .expect("ready front remains present during token issuance");
         let CoordinatorEntryState::Ready { plan } = &front.state else {
             unreachable!("ready front cannot change during exclusive claim")
@@ -2761,7 +3137,7 @@ impl DeliveryCoordinator {
             increment(&mut self.counters.stale_settlements);
             return CoordinatorSettleOutcome::StaleOrDuplicate;
         }
-        let Some(acknowledged) = self.queue.pop_front() else {
+        let Some(acknowledged) = self.queue_pop_front() else {
             unreachable!("matching claim remains present during exclusive acknowledgement")
         };
         self.release_in_flight(acknowledged.footprint);
@@ -2783,8 +3159,7 @@ impl DeliveryCoordinator {
             return CoordinatorSettleOutcome::StaleOrDuplicate;
         }
         let front = self
-            .queue
-            .front_mut()
+            .queue_front_mut()
             .expect("matching claim requires a front entry");
         let CoordinatorEntryState::InFlight { plan, .. } = &front.state else {
             unreachable!("matching claim requires in-flight state")
@@ -2826,8 +3201,14 @@ impl DeliveryCoordinator {
         if capacity != self.recompute_capacity() {
             return Err("incremental capacity accounting diverged from queue truth");
         }
-        if self.queue.len() > self.limits.pending_plans {
+        if self.queue_len > self.limits.pending_plans {
             return Err("pending plan count exceeds configured limit");
+        }
+        if self.queue_len + self.queue_free.len() != self.queue.len() {
+            return Err("coordinator occupied and free slot counts disagree");
+        }
+        if (self.queue_len == 0) != (self.queue_head.is_none() && self.queue_tail.is_none()) {
+            return Err("coordinator queue endpoints disagree with its length");
         }
         if capacity.charged_slots > self.limits.total_slots {
             return Err("charged slots exceed configured aggregate limit");
@@ -2844,7 +3225,24 @@ impl DeliveryCoordinator {
         let mut prior_sequence = None;
         let mut prior_epoch = None;
         let mut in_flight = 0usize;
-        for (position, entry) in self.queue.iter().enumerate() {
+        let mut semantic_effects = 0usize;
+        let mut seen = HashSet::with_capacity(self.queue_len);
+        let mut seen_reservations = HashSet::with_capacity(self.reservations.len());
+        let mut cursor = self.queue_head;
+        let mut previous = None;
+        let mut position = 0usize;
+        while let Some(index) = cursor {
+            if position == self.queue_len || !seen.insert(index) {
+                return Err("coordinator queue contains a cycle");
+            }
+            let entry = self
+                .queue
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or("coordinator queue references a vacant or absent slot")?;
+            if entry.previous != previous {
+                return Err("coordinator predecessor link is inconsistent");
+            }
             if prior_sequence.is_some_and(|prior| entry.sequence <= prior) {
                 return Err("ingress sequences are not strictly increasing");
             }
@@ -2861,8 +3259,16 @@ impl DeliveryCoordinator {
                     {
                         return Err("reservation token does not identify its entry");
                     }
+                    if self.reservations.get(&entry.sequence) != Some(&index)
+                        || !seen_reservations.insert(entry.sequence)
+                    {
+                        return Err("reservation index does not identify its queue entry");
+                    }
                 }
                 CoordinatorEntryState::Ready { plan } => {
+                    semantic_effects = semantic_effects
+                        .checked_add(entry.footprint.semantic_effects)
+                        .ok_or("semantic effect accounting overflowed")?;
                     if self.validate_plan(plan).ok() != Some(entry.footprint) {
                         return Err("ready plan footprint or authority is invalid");
                     }
@@ -2872,6 +3278,9 @@ impl DeliveryCoordinator {
                     if position != 0 {
                         return Err("only the causal head may be in flight");
                     }
+                    semantic_effects = semantic_effects
+                        .checked_add(entry.footprint.semantic_effects)
+                        .ok_or("semantic effect accounting overflowed")?;
                     let token_obligation_sequence = token.obligation_sequence;
                     let entry_sequence = entry.sequence;
                     let token_identifies_entry = token.instance == self.instance
@@ -2885,28 +3294,41 @@ impl DeliveryCoordinator {
                     }
                 }
             }
+            previous = Some(index);
+            cursor = entry.next;
+            position += 1;
+        }
+        if position != self.queue_len || previous != self.queue_tail {
+            return Err("coordinator queue traversal disagrees with its bounds");
+        }
+        if seen_reservations.len() != self.reservations.len() {
+            return Err("reservation index retains an unordered entry");
+        }
+        let mut free = HashSet::with_capacity(self.queue_free.len());
+        for index in &self.queue_free {
+            if *index >= self.queue.len()
+                || self.queue[*index].is_some()
+                || !free.insert(*index)
+            {
+                return Err(
+                    "coordinator free list references an occupied, absent, or duplicate slot",
+                );
+            }
+        }
+        for (index, slot) in self.queue.iter().enumerate() {
+            if slot.is_some() != seen.contains(&index) || slot.is_none() != free.contains(&index) {
+                return Err("coordinator slot is disconnected from queue and free-list authority");
+            }
         }
         if in_flight > 1 || in_flight != capacity.in_flight_plans {
             return Err("in-flight accounting is inconsistent");
         }
-        // The turbofish is load-bearing: under the GUI bundle build the
-        // feature-unified dep graph brings num_bigint/writeable Sum impls
-        // into candidacy and bare `.sum()` fails E0283 inference there,
-        // even though `cargo check -p` on this crate alone compiles.
-        if capacity.semantic_effects
-            != self
-                .queue
-                .iter()
-                .filter(|entry| !matches!(&entry.state, CoordinatorEntryState::Reserved { .. }))
-                .map(|entry| entry.footprint.semantic_effects)
-                .sum::<usize>()
-        {
+        if capacity.semantic_effects != semantic_effects {
             return Err("semantic effect accounting is inconsistent");
         }
         if self.waiter.is_some()
             && self
-                .queue
-                .front()
+                .queue_front()
                 .is_some_and(|entry| matches!(&entry.state, CoordinatorEntryState::Ready { .. }))
         {
             return Err("registered waiter coexists with an eligible claim");
@@ -2914,7 +3336,7 @@ impl DeliveryCoordinator {
         if self.waiter.is_some() && self.pending_wake.is_some() {
             return Err("registered waiter coexists with an undelivered pending wake");
         }
-        if self.closed && (!self.queue.is_empty() || self.waiter.is_some()) {
+        if self.closed && (self.queue_len != 0 || self.waiter.is_some()) {
             return Err("closed generation retains scheduler-owned authority");
         }
         Ok(())
@@ -3007,7 +3429,7 @@ impl DeliveryCoordinator {
 
     fn preflight(&self, footprint: PlanFootprint) -> Result<(), PlanRejectReason> {
         let capacity = self.capacity;
-        if self.queue.len() >= self.limits.pending_plans {
+        if self.queue_len >= self.limits.pending_plans {
             return Err(PlanRejectReason::Capacity);
         }
         let footprint_slots = footprint.total_slots().ok_or(PlanRejectReason::Capacity)?;
@@ -3040,7 +3462,7 @@ impl DeliveryCoordinator {
         if token.generation != self.generation {
             return false;
         }
-        self.queue.front().is_some_and(|front| {
+        self.queue_front().is_some_and(|front| {
             matches!(
                 &front.state,
                 CoordinatorEntryState::InFlight { token: current, .. } if current == token
@@ -3074,6 +3496,11 @@ impl DeliveryCoordinator {
             charged_resident_bytes: capacity.charged_resident_bytes,
         };
         self.queue.clear();
+        self.queue_free.clear();
+        self.queue_head = None;
+        self.queue_tail = None;
+        self.queue_len = 0;
+        self.reservations.clear();
         self.capacity = HardenedCapacity::default();
         self.closed = true;
         self.last_close_report = Some(report);
@@ -3106,8 +3533,7 @@ impl DeliveryCoordinator {
 
     fn wake_waiter_if_claimable(&mut self) {
         if self
-            .queue
-            .front()
+            .queue_front()
             .is_some_and(|entry| matches!(&entry.state, CoordinatorEntryState::Ready { .. }))
         {
             self.defer_waiter_wake();
@@ -3256,6 +3682,52 @@ mod tests {
         assert_eq!(scheduler.pop_next(), None);
         assert_eq!(scheduler.counters().state.escalated, 1);
         assert_eq!(scheduler.counters().render.escalated, 1);
+    }
+
+    #[test]
+    fn large_keyed_resync_splices_and_reuses_bounded_stable_slots() {
+        const KEYS: usize = 4096;
+        let mut lane = KeyedLane::new(KEYS);
+        for key in 0..KEYS {
+            assert_eq!(lane.admit(key, key * 10), AdmissionOutcome::Admitted);
+        }
+        assert_eq!(lane.slots.len(), KEYS);
+        assert_eq!(lane.active_len, KEYS);
+        assert_eq!(lane.retired_len, 0);
+        assert_eq!(lane.check_invariants(), Ok(()));
+
+        assert_eq!(lane.admit(KEYS, KEYS * 10), AdmissionOutcome::Escalated);
+        assert!(matches!(lane.pop(), Some(KeyedPop::Resync)));
+        assert_eq!(lane.active_len, 0);
+        assert_eq!(lane.retired_len, KEYS);
+        assert_eq!(lane.slots.len(), KEYS);
+        assert_eq!(lane.check_invariants(), Ok(()));
+
+        for key in KEYS..KEYS * 2 {
+            assert_eq!(lane.admit(key, key * 10), AdmissionOutcome::Admitted);
+        }
+        assert_eq!(lane.active_len, KEYS);
+        assert_eq!(lane.retired_len, 0);
+        assert_eq!(
+            lane.slots.len(),
+            KEYS,
+            "post-resync admission must reuse retired storage without growth"
+        );
+        assert_eq!(lane.check_invariants(), Ok(()));
+
+        for expected_key in KEYS..KEYS * 2 {
+            match lane.pop() {
+                Some(KeyedPop::Value { key, value }) => {
+                    assert_eq!((key, value), (expected_key, expected_key * 10));
+                }
+                Some(KeyedPop::Resync) => panic!("unexpected second resync"),
+                None => panic!("large keyed lane lost an admitted value"),
+            }
+        }
+        assert!(lane.pop().is_none());
+        assert_eq!(lane.slots.len(), KEYS);
+        assert_eq!(lane.free.len(), KEYS);
+        assert_eq!(lane.check_invariants(), Ok(()));
     }
 
     #[test]
@@ -4609,6 +5081,103 @@ mod hardened_tests {
                 epoch: 0
             }
         ));
+    }
+
+    #[test]
+    fn large_reservation_set_supports_indexed_cancel_commit_and_slot_reuse() {
+        const PLANS: usize = 4096;
+        let resident_bytes_per_plan = plan_resident_bytes(1, 1);
+        let limits = HardenedSchedulerLimits::new(
+            [PLANS; HARDENED_DELIVERY_LANE_COUNT],
+            PLANS,
+            resident_bytes_per_plan
+                .checked_mul(PLANS)
+                .expect("large test resident-byte limit is representable"),
+            1,
+            1,
+            PLANS,
+        )
+        .expect("large indexed-reservation limits are valid");
+        let mut coordinator = DeliveryCoordinator::new(GENERATION, limits);
+        let mut tokens = Vec::with_capacity(PLANS);
+
+        for index in 0..PLANS {
+            let plan = event_plan(u64::try_from(index).expect("test index is representable"), 1);
+            let token = match coordinator.reserve_plan(&plan) {
+                ReservationAdmission::Reserved(token) => token,
+                other => panic!("expected large reservation admission, got {other:?}"),
+            };
+            tokens.push(Some(token));
+        }
+        assert_eq!(coordinator.queue.len(), PLANS);
+        assert_eq!(coordinator.queue_len, PLANS);
+        assert_eq!(coordinator.reservations.len(), PLANS);
+        assert_eq!(coordinator.check_invariants(), Ok(()));
+
+        for index in (1..PLANS).step_by(2) {
+            let token = tokens[index]
+                .take()
+                .expect("odd reservation token remains available");
+            assert_eq!(
+                coordinator.cancel_reservation(token),
+                ReservationCancel::Cancelled
+            );
+        }
+        assert_eq!(coordinator.queue_len, PLANS / 2);
+        assert_eq!(coordinator.queue_free.len(), PLANS / 2);
+        assert_eq!(coordinator.check_invariants(), Ok(()));
+
+        for index in (0..PLANS / 2).rev().map(|position| position * 2) {
+            let token = tokens[index]
+                .take()
+                .expect("even reservation token remains available");
+            let plan = event_plan(u64::try_from(index).expect("test index is representable"), 1);
+            assert!(matches!(
+                coordinator.commit_reservation(token, plan),
+                ReservationCommit::Committed { .. }
+            ));
+        }
+        assert!(coordinator.reservations.is_empty());
+        assert_eq!(coordinator.check_invariants(), Ok(()));
+
+        for index in (0..PLANS).step_by(2) {
+            let next = claim(&mut coordinator);
+            assert_eq!(
+                next.sequence(),
+                u64::try_from(index + 1).expect("test sequence is representable")
+            );
+            assert_eq!(
+                coordinator.acknowledge(next.token()),
+                CoordinatorSettleOutcome::Acknowledged
+            );
+        }
+        assert_eq!(coordinator.queue_len, 0);
+        assert_eq!(coordinator.queue.len(), PLANS);
+        assert_eq!(coordinator.queue_free.len(), PLANS);
+
+        for index in 0..PLANS {
+            assert!(matches!(
+                coordinator.admit_plan(event_plan(
+                    u64::try_from(PLANS + index).expect("test id is representable"),
+                    1,
+                )),
+                PlanAdmission::Admitted { .. }
+            ));
+        }
+        assert_eq!(
+            coordinator.queue.len(),
+            PLANS,
+            "re-admission must reuse stable slots instead of growing storage"
+        );
+        for _ in 0..PLANS {
+            let next = claim(&mut coordinator);
+            assert_eq!(
+                coordinator.acknowledge(next.token()),
+                CoordinatorSettleOutcome::Acknowledged
+            );
+        }
+        assert_eq!(coordinator.capacity(), HardenedCapacity::default());
+        assert_eq!(coordinator.check_invariants(), Ok(()));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Criterion benchmark: mux dispatch UnixStream fast-path throughput.
+//! Criterion benchmarks for mux dispatch and bounded delivery hot paths.
 //!
 //! wa-283h4.18: measures Ping→Pong roundtrip throughput through
 //! `process_with_config` across every `DispatchIoPreference`, using a
@@ -6,13 +6,28 @@
 //! handshake cost). A write-batching counter exposes the syscall-reduction
 //! signal that the io_uring fast path in wa-283h4.17 is expected to improve.
 //!
-//! This bench intentionally does **not** exercise AsyncSslStream — TLS
+//! ft-interactive-systems-performance-4tenz.5.5.11 measures the delivery
+//! ledger and keyed scheduler at 1, 16, 256, 4,096, and 16,384 tracked keys.
+//! Setup, snapshot construction, and destruction are outside the timed region,
+//! isolating publish, close, retry, reclaim, resync selection, and next-ready
+//! bookkeeping. These microbenchmarks do **not** prove end-to-end keypress,
+//! renderer, wire, snapshot-build, or application-ACK latency; target-class
+//! M4/M5 and Threadripper artifacts remain separate campaign gates.
+//!
+//! The dispatch bench intentionally does **not** exercise AsyncSslStream — TLS
 //! amortizes through a different read/write path and would conflate the
 //! fast-path signal.
 
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use codec::{Pdu, Ping};
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use frankenterm_mux_server_impl::delivery_ledger::{
+    ClosePaneOutcome, DeliveryClaim, DeliveryGeneration, DeliveryLedger, DirtyOutcome,
+    PaneCloseAckToken, SettleOutcome,
+};
+use frankenterm_mux_server_impl::delivery_scheduler::{
+    AdmissionOutcome, DeliveryScheduler, ScheduledItem, SchedulerLimits,
+};
 use frankenterm_mux_server_impl::dispatch::{
     self, DispatchIoPreference, DispatchRuntimeConfig, DispatchStream, DispatchStreamKind,
 };
@@ -206,5 +221,225 @@ fn bench_flush_amortization(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_throughput, bench_flush_amortization);
+const DELIVERY_SCALE_COUNTS: &[usize] = &[1, 16, 256, 4096, 16_384];
+
+type BenchDeliveryScheduler = DeliveryScheduler<usize, usize, usize, usize, usize, usize>;
+
+fn dirty_delivery_ledger(panes: usize) -> DeliveryLedger {
+    let mut ledger = DeliveryLedger::new(DeliveryGeneration::new(1), panes)
+        .expect("delivery benchmark ledger identity must be available");
+    for pane_id in 0..panes {
+        assert_eq!(ledger.mark_dirty(pane_id), DirtyOutcome::BecameDirty);
+    }
+    ledger
+}
+
+fn settled_delivery_ledger(panes: usize) -> DeliveryLedger {
+    let mut ledger = dirty_delivery_ledger(panes);
+    for _ in 0..panes {
+        let claim = ledger
+            .claim_next()
+            .expect("delivery benchmark token must be available")
+            .expect("dirty benchmark pane must be claimable");
+        assert_eq!(ledger.commit(claim), SettleOutcome::CommittedClean);
+    }
+    ledger
+}
+
+fn close_dirty_middle(panes: usize) -> (DeliveryLedger, usize, PaneCloseAckToken) {
+    let mut ledger = dirty_delivery_ledger(panes);
+    let pane_id = panes / 2;
+    let close_ack = match ledger.close_pane(pane_id) {
+        ClosePaneOutcome::ClosedDirty { close_ack } => close_ack,
+        outcome => panic!("expected dirty benchmark close, got {outcome:?}"),
+    };
+    (ledger, pane_id, close_ack)
+}
+
+fn claimed_dirty_head(panes: usize) -> (DeliveryLedger, DeliveryClaim) {
+    let mut ledger = dirty_delivery_ledger(panes);
+    let claim = ledger
+        .claim_next()
+        .expect("delivery benchmark token must be available")
+        .expect("dirty benchmark head must be claimable");
+    (ledger, claim)
+}
+
+fn populated_render_scheduler(keys: usize) -> BenchDeliveryScheduler {
+    let mut scheduler = DeliveryScheduler::new(SchedulerLimits::new(0, 0, keys, 0))
+        .expect("delivery benchmark capacities must be representable");
+    for key in 0..keys {
+        assert_eq!(
+            scheduler.admit_render(key, key).outcome(),
+            AdmissionOutcome::Admitted
+        );
+    }
+    scheduler
+}
+
+fn render_resync_scheduler(keys: usize) -> BenchDeliveryScheduler {
+    let mut scheduler = populated_render_scheduler(keys);
+    assert_eq!(
+        scheduler.admit_render(keys, keys).outcome(),
+        AdmissionOutcome::Escalated
+    );
+    scheduler
+}
+
+fn retired_render_scheduler(keys: usize) -> BenchDeliveryScheduler {
+    let mut scheduler = render_resync_scheduler(keys);
+    assert!(matches!(
+        scheduler.pop_next(),
+        Some(ScheduledItem::RenderResync)
+    ));
+    scheduler
+}
+
+fn bench_delivery_ledger_hot_paths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mux_delivery_ledger_hot_paths");
+    group.throughput(Throughput::Elements(1));
+
+    for &panes in DELIVERY_SCALE_COUNTS {
+        group.bench_with_input(
+            BenchmarkId::new("dirty_claim_commit", panes),
+            &panes,
+            |b, &panes| {
+                let mut ledger = settled_delivery_ledger(panes);
+                let pane_id = panes / 2;
+                b.iter(|| {
+                    let dirty = ledger.mark_dirty(pane_id);
+                    let claim = ledger
+                        .claim_next()
+                        .expect("benchmark token must be available")
+                        .expect("published benchmark pane must be claimable");
+                    let settled = ledger.commit(claim);
+                    assert_eq!(dirty, DirtyOutcome::BecameDirty);
+                    assert_eq!(settled, SettleOutcome::CommittedClean);
+                    black_box(());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("close_middle", panes),
+            &panes,
+            |b, &panes| {
+                b.iter_batched_ref(
+                    || dirty_delivery_ledger(panes),
+                    |ledger| ledger.close_pane(panes / 2),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("ack_reclaim_middle", panes),
+            &panes,
+            |b, &panes| {
+                b.iter_batched_ref(
+                    || close_dirty_middle(panes),
+                    |(ledger, pane_id, close_ack)| {
+                        ledger.acknowledge_pane_close(*pane_id, *close_ack)
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("retry_requeue", panes),
+            &panes,
+            |b, &panes| {
+                b.iter_batched_ref(
+                    || claimed_dirty_head(panes),
+                    |(ledger, claim)| ledger.retry(*claim),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("next_ready", panes),
+            &panes,
+            |b, &panes| {
+                b.iter_batched_ref(
+                    || dirty_delivery_ledger(panes),
+                    |ledger| ledger.claim_next(),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("resync_select", panes),
+            &panes,
+            |b, &panes| {
+                b.iter_batched_ref(
+                    || dirty_delivery_ledger(panes),
+                    |ledger| {
+                        let request = ledger.request_resync_all();
+                        let claim = ledger.claim_next();
+                        black_box((request, claim))
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_delivery_scheduler_hot_paths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mux_delivery_scheduler_hot_paths");
+    group.throughput(Throughput::Elements(1));
+
+    for &keys in DELIVERY_SCALE_COUNTS {
+        group.bench_with_input(
+            BenchmarkId::new("stable_key_replace", keys),
+            &keys,
+            |b, &keys| {
+                let mut scheduler = populated_render_scheduler(keys);
+                let key = keys / 2;
+                b.iter(|| black_box(scheduler.admit_render(key, key)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("next_ready", keys),
+            &keys,
+            |b, &keys| {
+                b.iter_batched_ref(
+                    || populated_render_scheduler(keys),
+                    |scheduler| scheduler.pop_next(),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("resync_select", keys),
+            &keys,
+            |b, &keys| {
+                b.iter_batched_ref(
+                    || render_resync_scheduler(keys),
+                    |scheduler| scheduler.pop_next(),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("reactivate_retired_key", keys),
+            &keys,
+            |b, &keys| {
+                b.iter_batched_ref(
+                    || retired_render_scheduler(keys),
+                    |scheduler| scheduler.admit_render(keys / 2, keys),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_throughput,
+    bench_flush_amortization,
+    bench_delivery_ledger_hot_paths,
+    bench_delivery_scheduler_hot_paths
+);
 criterion_main!(benches);
