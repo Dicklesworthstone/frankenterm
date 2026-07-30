@@ -25,9 +25,7 @@ use std::io::{self, ErrorKind};
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use std::task::{Context as TaskContext, Waker};
@@ -41,6 +39,40 @@ const TMUX_CONTROL_MAX_LINE_BYTES: usize = 16 * 1024;
 const OUTBOUND_WRITE_QUANTUM_FRAMES: usize = 32;
 const OUTBOUND_WRITE_QUANTUM_BYTES: usize = 64 * 1024;
 static DROPPED_NOTIFICATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+const NOTIFICATION_QUEUE_OVERFLOW: &str =
+    "mux notification queue overflowed; topology delivery is no longer lossless";
+const RESPONSE_QUEUE_FAILURE: &str =
+    "mux response queue rejected a frame; request/response delivery is no longer lossless";
+
+#[derive(Clone)]
+struct DispatchTerminal {
+    tripped: Arc<AtomicBool>,
+    tx: Sender<&'static str>,
+}
+
+impl DispatchTerminal {
+    fn channel() -> (Self, Receiver<&'static str>) {
+        let (tx, rx) = bounded(1);
+        (
+            Self {
+                tripped: Arc::new(AtomicBool::new(false)),
+                tx,
+            },
+            rx,
+        )
+    }
+
+    fn trip(&self, reason: &'static str) {
+        if self
+            .tripped
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.tx.try_send(reason);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchIoBackend {
@@ -550,7 +582,23 @@ fn queue_pdu(item_tx: &Sender<Item>, pdu: Pdu, serial: u64) -> anyhow::Result<()
     }
 }
 
-fn queue_notification(item_tx: &Sender<Item>, notification: MuxNotification) -> bool {
+fn queue_response_pdu(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    pdu: Pdu,
+    serial: u64,
+) -> anyhow::Result<()> {
+    queue_pdu(item_tx, pdu, serial).inspect_err(|_| {
+        metrics::counter!("mux.dispatch.response_enqueue_failure").increment(1);
+        terminal.trip(RESPONSE_QUEUE_FAILURE);
+    })
+}
+
+fn queue_notification(
+    item_tx: &Sender<Item>,
+    terminal: &DispatchTerminal,
+    notification: MuxNotification,
+) -> bool {
     match item_tx.try_send(Item::Notif(notification)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
@@ -564,14 +612,28 @@ fn queue_notification(item_tx: &Sender<Item>, notification: MuxNotification) -> 
             if dropped.is_power_of_two() {
                 log::warn!(
                     "mux dispatch notification queue is full (capacity \
-                     {DISPATCH_ITEM_QUEUE_CAPACITY}); dropped {dropped} notification(s) since \
-                     process start"
+                     {DISPATCH_ITEM_QUEUE_CAPACITY}); terminating the affected connection after \
+                     {dropped} overflow(s) since process start"
                 );
             }
-            true
+            terminal.trip(NOTIFICATION_QUEUE_OVERFLOW);
+            false
         }
         Err(TrySendError::Closed(_)) => false,
     }
+}
+
+fn prepare_unilateral_pdu(
+    pdu: Pdu,
+    item_rx: &Receiver<Item>,
+    deferred_item: &mut Option<Item>,
+) -> anyhow::Result<PendingOutboundBatch> {
+    prepare_pending_outbound_batch(
+        Box::new(DecodedPdu { pdu, serial: 0 }),
+        item_rx,
+        deferred_item,
+        codec::CompressionMode::Auto,
+    )
 }
 
 fn is_clean_disconnect(err: &anyhow::Error) -> bool {
@@ -1911,6 +1973,7 @@ where
     }
 
     let (item_tx, item_rx) = bounded::<Item>(DISPATCH_ITEM_QUEUE_CAPACITY);
+    let (terminal, terminal_rx) = DispatchTerminal::channel();
     let mut deferred_item = None;
     let mut pending_outbound = None;
     let mut prefer_read = true;
@@ -1924,17 +1987,19 @@ where
     let mux = Arc::clone(owner.mux());
     let pdu_sender = PduSender::new({
         let item_tx = item_tx.clone();
-        move |pdu| queue_pdu(&item_tx, pdu.pdu, pdu.serial)
+        let terminal = terminal.clone();
+        move |pdu| queue_response_pdu(&item_tx, &terminal, pdu.pdu, pdu.serial)
     });
     let mut handler = SessionHandler::new_for_session(pdu_sender, owner);
 
     {
         let tx = item_tx.clone();
+        let notification_terminal = terminal.clone();
         let notification_authority = authority.clone();
         let sub_id = mux
             .subscribe(move |n| {
                 notification_authority
-                    .try_run(|| queue_notification(&tx, n))
+                    .try_run(|| queue_notification(&tx, &notification_terminal, n))
                     .unwrap_or(false)
             })
             .context("allocate mux dispatch subscription")?;
@@ -1942,9 +2007,25 @@ where
 
         loop {
             let next_item = if let Some(pending) = pending_outbound.as_mut() {
-                match service_pending_outbound(&mut stream, pending, io_uring_runtime.as_ref())
-                    .await
-                {
+                let outbound_result = {
+                    let terminal_event = terminal_rx.recv();
+                    let outbound =
+                        service_pending_outbound(&mut stream, pending, io_uring_runtime.as_ref());
+                    pin_mut!(terminal_event);
+                    pin_mut!(outbound);
+                    match select(terminal_event, outbound).await {
+                        Either::Left((Ok(reason), _)) => {
+                            return Err(anyhow::anyhow!("mux dispatch terminated: {reason}"));
+                        }
+                        Either::Left((Err(_), _)) => {
+                            return Err(anyhow::anyhow!(
+                                "mux dispatch terminal channel closed unexpectedly"
+                            ));
+                        }
+                        Either::Right((result, _)) => result,
+                    }
+                };
+                match outbound_result {
                     Ok(OutboundService::Readable) => Ok(Item::Readable),
                     Ok(OutboundService::Progress) => continue,
                     Ok(OutboundService::Complete) => {
@@ -1954,14 +2035,27 @@ where
                     Err(err) => Err(err),
                 }
             } else {
-                next_dispatch_item(
+                let terminal_event = terminal_rx.recv();
+                let dispatch_item = next_dispatch_item(
                     &stream,
                     &item_rx,
                     &mut deferred_item,
                     io_uring_runtime.as_ref(),
                     &mut prefer_read,
-                )
-                .await
+                );
+                pin_mut!(terminal_event);
+                pin_mut!(dispatch_item);
+                match select(terminal_event, dispatch_item).await {
+                    Either::Left((Ok(reason), _)) => {
+                        return Err(anyhow::anyhow!("mux dispatch terminated: {reason}"));
+                    }
+                    Either::Left((Err(_), _)) => {
+                        return Err(anyhow::anyhow!(
+                            "mux dispatch terminal channel closed unexpectedly"
+                        ));
+                    }
+                    Either::Right((result, _)) => result,
+                }
             };
 
             match next_item {
@@ -1997,11 +2091,11 @@ where
                 Ok(Item::Notif(MuxNotification::PaneAdded(_pane_id))) => {}
                 Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
                     handler.remove_per_pane(pane_id);
-                    queue_pdu(
-                        &item_tx,
+                    pending_outbound = Some(prepare_unilateral_pdu(
                         Pdu::PaneRemoved(codec::PaneRemoved { pane_id }),
-                        0,
-                    )?;
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::Alert { pane_id, alert })) => {
                     // ft-12e8l: use the non-inserting accessor. If the pane
@@ -2028,22 +2122,22 @@ where
                     selection,
                     clipboard,
                 })) => {
-                    queue_pdu(
-                        &item_tx,
+                    pending_outbound = Some(prepare_unilateral_pdu(
                         Pdu::SetClipboard(codec::SetClipboard {
                             pane_id,
                             clipboard,
                             selection,
                         }),
-                        0,
-                    )?;
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::TabAddedToWindow { tab_id, window_id })) => {
-                    queue_pdu(
-                        &item_tx,
+                    pending_outbound = Some(prepare_unilateral_pdu(
                         Pdu::TabAddedToWindow(codec::TabAddedToWindow { tab_id, window_id }),
-                        0,
-                    )?;
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::WindowRemoved(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
@@ -2053,52 +2147,56 @@ where
                         .get_window(window_id)
                         .map(|w| w.get_workspace().to_string());
                     if let Some(workspace) = workspace {
-                        queue_pdu(
-                            &item_tx,
+                        pending_outbound = Some(prepare_unilateral_pdu(
                             Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
                                 window_id,
                                 workspace,
                             }),
-                            0,
-                        )?;
+                            &item_rx,
+                            &mut deferred_item,
+                        )?);
                     }
                 }
                 Ok(Item::Notif(MuxNotification::PaneFocused(pane_id))) => {
-                    queue_pdu(
-                        &item_tx,
+                    pending_outbound = Some(prepare_unilateral_pdu(
                         Pdu::PaneFocused(codec::PaneFocused { pane_id }),
-                        0,
-                    )?;
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::TabResized(tab_id))) => {
-                    queue_pdu(&item_tx, Pdu::TabResized(codec::TabResized { tab_id }), 0)?;
+                    pending_outbound = Some(prepare_unilateral_pdu(
+                        Pdu::TabResized(codec::TabResized { tab_id }),
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::TabTitleChanged { tab_id, title })) => {
-                    queue_pdu(
-                        &item_tx,
+                    pending_outbound = Some(prepare_unilateral_pdu(
                         Pdu::TabTitleChanged(codec::TabTitleChanged { tab_id, title }),
-                        0,
-                    )?;
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::WindowTitleChanged { window_id, title })) => {
-                    queue_pdu(
-                        &item_tx,
+                    pending_outbound = Some(prepare_unilateral_pdu(
                         Pdu::WindowTitleChanged(codec::WindowTitleChanged { window_id, title }),
-                        0,
-                    )?;
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::WorkspaceRenamed {
                     old_workspace,
                     new_workspace,
                 })) => {
-                    queue_pdu(
-                        &item_tx,
+                    pending_outbound = Some(prepare_unilateral_pdu(
                         Pdu::RenameWorkspace(codec::RenameWorkspace {
                             old_workspace,
                             new_workspace,
                         }),
-                        0,
-                    )?;
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::SynchronizedOutput { .. })) => {}
                 Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
@@ -4059,45 +4157,58 @@ mod tests {
             let notification = notification.into_notification();
 
             let (full_tx, full_rx) = bounded(1);
+            let (full_terminal, full_terminal_rx) = DispatchTerminal::channel();
             full_tx
                 .try_send(Item::Readable)
                 .expect("fill dispatch notification queue");
             prop_assert!(
-                queue_notification(&full_tx, notification.clone()),
-                "full notification queue should report a live subscription"
+                !queue_notification(&full_tx, &full_terminal, notification.clone()),
+                "full notification queue must terminate the subscription"
             );
             prop_assert!(
                 matches!(full_rx.try_recv(), Ok(Item::Readable)),
-                "dropped notification must not displace the older queued item"
+                "terminal overflow must not displace the older queued item"
             );
             prop_assert!(
                 matches!(full_rx.try_recv(), Err(TryRecvError::Empty)),
-                "full queue path should drop only the new notification"
+                "full queue path must not enqueue the unrepresentable notification"
+            );
+            prop_assert_eq!(
+                full_terminal_rx.try_recv().ok(),
+                Some(NOTIFICATION_QUEUE_OVERFLOW),
+                "notification loss must publish one terminal reason"
             );
 
             let mux = Mux::new(None);
             let full_calls = Arc::new(AtomicUsize::new(0));
             let full_calls_for_subscriber = Arc::clone(&full_calls);
+            let (subscriber_terminal, subscriber_terminal_rx) = DispatchTerminal::channel();
             full_tx
                 .try_send(Item::Readable)
                 .expect("refill dispatch notification queue");
             mux.subscribe(move |notification| {
                 full_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
-                queue_notification(&full_tx, notification)
+                queue_notification(&full_tx, &subscriber_terminal, notification)
             })
             .expect("test mux subscription should allocate an identifier");
             mux.notify(notification.clone());
             mux.notify(notification.clone());
             prop_assert_eq!(
                 full_calls.load(Ordering::Relaxed),
-                2,
-                "backpressure-only notification failures must not unsubscribe the mux subscriber"
+                1,
+                "the first lossy enqueue must unsubscribe the mux subscriber"
+            );
+            prop_assert_eq!(
+                subscriber_terminal_rx.try_recv().ok(),
+                Some(NOTIFICATION_QUEUE_OVERFLOW),
+                "subscriber overflow must trip the connection terminal"
             );
 
             let (closed_tx, closed_rx) = bounded(1);
+            let (closed_terminal, _closed_terminal_rx) = DispatchTerminal::channel();
             drop(closed_rx);
             prop_assert!(
-                !queue_notification(&closed_tx, notification.clone()),
+                !queue_notification(&closed_tx, &closed_terminal, notification.clone()),
                 "closed notification queue should report a dead subscription"
             );
 
@@ -4106,7 +4217,7 @@ mod tests {
             let closed_calls_for_subscriber = Arc::clone(&closed_calls);
             mux.subscribe(move |notification| {
                 closed_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
-                queue_notification(&closed_tx, notification)
+                queue_notification(&closed_tx, &closed_terminal, notification)
             })
             .expect("test mux subscription should allocate an identifier");
             mux.notify(notification.clone());
@@ -4466,19 +4577,96 @@ mod tests {
     }
 
     #[test]
-    fn full_notification_queue_keeps_mux_subscriber_alive() {
+    fn response_enqueue_failure_trips_connection_terminal() {
         let (item_tx, item_rx) = bounded(1);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        item_tx
+            .try_send(Item::Readable)
+            .expect("fill dispatch queue");
+
+        let err = queue_response_pdu(&item_tx, &terminal, Pdu::Pong(Pong {}), 41)
+            .expect_err("response enqueue into a full queue must fail");
+        assert!(
+            format!("{err:#}").contains("mux dispatch item queue is full"),
+            "response enqueue should retain the queue failure"
+        );
+        assert_eq!(
+            terminal_rx.try_recv().ok(),
+            Some(RESPONSE_QUEUE_FAILURE),
+            "a rejected response must terminate the affected connection"
+        );
+        assert!(
+            matches!(item_rx.try_recv(), Ok(Item::Readable)),
+            "terminal response failure must not displace the older queued item"
+        );
+    }
+
+    #[test]
+    fn unilateral_conversion_preserves_notification_before_later_response() {
+        let (item_tx, item_rx) = unbounded();
+        item_tx
+            .try_send(Item::WritePdu(Box::new(DecodedPdu {
+                pdu: Pdu::Pong(Pong {}),
+                serial: 77,
+            })))
+            .expect("queue later response");
+        let mut deferred_item = None;
+
+        let pending = prepare_unilateral_pdu(
+            Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 19 }),
+            &item_rx,
+            &mut deferred_item,
+        )
+        .expect("notification and response should encode");
+
+        let mut cursor = Cursor::new(pending.bytes.as_slice());
+        let before = Pdu::decode(&mut cursor).expect("decode unilateral frame");
+        let after = Pdu::decode(&mut cursor).expect("decode response frame");
+        assert!(matches!(
+            before,
+            DecodedPdu {
+                pdu: Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 19 }),
+                serial: 0,
+            }
+        ));
+        assert!(matches!(
+            after,
+            DecodedPdu {
+                pdu: Pdu::Pong(Pong {}),
+                serial: 77,
+            }
+        ));
+        assert_eq!(
+            cursor.position() as usize,
+            pending.bytes.len(),
+            "the batch should contain exactly the notification and response"
+        );
+        assert!(
+            deferred_item.is_none(),
+            "the contiguous response should remain in the same ordered batch"
+        );
+    }
+
+    #[test]
+    fn full_notification_queue_terminates_mux_subscriber() {
+        let (item_tx, item_rx) = bounded(1);
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
         item_tx
             .try_send(Item::Readable)
             .expect("fill dispatch queue");
 
         assert!(
-            queue_notification(&item_tx, MuxNotification::Empty),
-            "full notification queues should drop the notification without unsubscribing"
+            !queue_notification(&item_tx, &terminal, MuxNotification::Empty),
+            "full notification queues must terminate the subscriber"
         );
         assert!(
             matches!(item_rx.try_recv(), Ok(Item::Readable)),
-            "dropped notification must not displace an older queued item"
+            "terminal overflow must not displace an older queued item"
+        );
+        assert_eq!(
+            terminal_rx.try_recv().ok(),
+            Some(NOTIFICATION_QUEUE_OVERFLOW),
+            "notification loss must publish one terminal reason"
         );
     }
 
