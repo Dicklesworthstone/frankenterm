@@ -6,7 +6,9 @@ use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand};
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
-use crate::{Mux, MuxWindowBuilder, PaneOperationGuard, SplitCommitReceipt};
+use crate::{
+    Mux, MuxWindowBuilder, PaneOperationGuard, SplitCommitReceipt, TopologyRevision,
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use config::configuration;
@@ -376,6 +378,17 @@ const PROTOCOL_BARRIER_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PROTOCOL_BARRIER_DRAIN_EVENT_QUANTUM: usize = 256;
 const PROTOCOL_BARRIER_DRAIN_BYTE_QUANTUM: usize = 512 * 1024;
 
+/// Bound one main-thread notification-intent runnable so a continuously
+/// mutating UI cannot monopolize the event loop. Each drain step consumes at
+/// most two latest-wins intents, so keep this an even number.
+pub(crate) const NOTIFICATION_INTENT_DRAIN_QUANTUM: usize = 32;
+
+/// Post-fence topology callbacks can be delivered out of revision order by
+/// independent internal queues. Retain a bounded gap window so a later
+/// focus/window event never overtakes an earlier one. Exceeding the window is
+/// a fail-closed ordering failure, not permission to guess.
+pub(crate) const NOTIFICATION_INTENT_MAX_REORDER_GAP: usize = 4_096;
+
 /// Tmux pane identifiers are unique for the lifetime of a server. Retaining a
 /// bounded tombstone prevents late output for a detached pane from being
 /// mistaken for pre-attach output for a future pane.
@@ -453,6 +466,584 @@ pub(crate) struct TmuxTab {
     pub tmux_window_id: TmuxWindowId,
     pub layout_csum: String,
     pub panes: HashSet<TmuxPaneId>, // tmux panes within tmux window
+}
+
+/// Bidirectional identity indexes for the local tmux mirror.
+///
+/// Notification callbacks start with local mux identifiers while tmux
+/// commands require remote identifiers. Keeping the reverse edges beside the
+/// authoritative remote-keyed maps turns focus/resize storms from repeated
+/// O(panes + tabs) scans into bounded O(1) lookups. Callers mutate an
+/// authoritative map and this index under the map -> index lock order.
+#[derive(Debug, Default)]
+pub(crate) struct TmuxMirrorIndex {
+    pane_by_local: HashMap<PaneId, TmuxPaneId>,
+    pane_by_remote: HashMap<TmuxPaneId, PaneId>,
+    window_by_local_tab: HashMap<TabId, TmuxWindowId>,
+    tab_by_remote_window: HashMap<TmuxWindowId, TabId>,
+}
+
+impl TmuxMirrorIndex {
+    pub(crate) fn register_pane(
+        &mut self,
+        local_pane_id: PaneId,
+        remote_pane_id: TmuxPaneId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.pane_by_local.contains_key(&local_pane_id),
+            "local pane {local_pane_id} already has a tmux reverse-index entry"
+        );
+        anyhow::ensure!(
+            !self.pane_by_remote.contains_key(&remote_pane_id),
+            "remote tmux pane {remote_pane_id} already has a local reverse-index entry"
+        );
+        self.pane_by_local.insert(local_pane_id, remote_pane_id);
+        self.pane_by_remote.insert(remote_pane_id, local_pane_id);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_pane(
+        &mut self,
+        remote_pane_id: TmuxPaneId,
+    ) -> anyhow::Result<Option<PaneId>> {
+        let Some(local_pane_id) = self.pane_by_remote.remove(&remote_pane_id) else {
+            anyhow::ensure!(
+                !self
+                    .pane_by_local
+                    .values()
+                    .any(|candidate| *candidate == remote_pane_id),
+                "remote tmux pane {remote_pane_id} has a one-sided local reverse-index entry"
+            );
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            self.pane_by_local.remove(&local_pane_id) == Some(remote_pane_id),
+            "tmux pane reverse index disagrees for local pane {local_pane_id} and remote pane \
+             {remote_pane_id}"
+        );
+        Ok(Some(local_pane_id))
+    }
+
+    pub(crate) fn register_window(
+        &mut self,
+        local_tab_id: TabId,
+        remote_window_id: TmuxWindowId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.window_by_local_tab.contains_key(&local_tab_id),
+            "local tab {local_tab_id} already has a tmux reverse-index entry"
+        );
+        anyhow::ensure!(
+            !self.tab_by_remote_window.contains_key(&remote_window_id),
+            "remote tmux window {remote_window_id} already has a local reverse-index entry"
+        );
+        self.window_by_local_tab
+            .insert(local_tab_id, remote_window_id);
+        self.tab_by_remote_window
+            .insert(remote_window_id, local_tab_id);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_window(
+        &mut self,
+        remote_window_id: TmuxWindowId,
+    ) -> anyhow::Result<Option<TabId>> {
+        let Some(local_tab_id) = self.tab_by_remote_window.remove(&remote_window_id) else {
+            anyhow::ensure!(
+                !self
+                    .window_by_local_tab
+                    .values()
+                    .any(|candidate| *candidate == remote_window_id),
+                "remote tmux window {remote_window_id} has a one-sided local reverse-index entry"
+            );
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            self.window_by_local_tab.remove(&local_tab_id) == Some(remote_window_id),
+            "tmux window reverse index disagrees for local tab {local_tab_id} and remote window \
+             {remote_window_id}"
+        );
+        Ok(Some(local_tab_id))
+    }
+
+    pub(crate) fn remote_pane_for_local(&self, local_pane_id: PaneId) -> Option<TmuxPaneId> {
+        self.pane_by_local.get(&local_pane_id).copied()
+    }
+
+    pub(crate) fn remote_window_for_local_tab(
+        &self,
+        local_tab_id: TabId,
+    ) -> Option<TmuxWindowId> {
+        self.window_by_local_tab.get(&local_tab_id).copied()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.pane_by_local.clear();
+        self.pane_by_remote.clear();
+        self.window_by_local_tab.clear();
+        self.tab_by_remote_window.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TmuxNotificationIntent {
+    PaneFocused(PaneId),
+    WindowInvalidated(WindowId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SequencedTmuxNotificationIntent {
+    pub(crate) revision: TopologyRevision,
+    pub(crate) intent: TmuxNotificationIntent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TmuxNotificationIntentOffer {
+    pub(crate) schedule: bool,
+    pub(crate) coalesced: bool,
+    pub(crate) closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TmuxNotificationIntentRunDisposition {
+    Idle,
+    Reschedule,
+    WaitingForCapacity,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TmuxTopologyBarrierEvent {
+    Barrier,
+    Intent(TmuxNotificationIntent),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TmuxTopologyObservation {
+    pub(crate) schedule: bool,
+    pub(crate) coalesced: u64,
+    pub(crate) stale: bool,
+    pub(crate) closed: bool,
+}
+
+/// At most one latest pane-focus and one latest window-invalidation intent are
+/// retained per tmux domain. Authoritative mux topology revisions provide the
+/// cross-kind ordering barrier and reject delayed callbacks that would
+/// otherwise regress the final remote selection.
+#[derive(Debug, Default)]
+pub(crate) struct TmuxNotificationIntentState {
+    pending_pane_focus: Option<SequencedTmuxNotificationIntent>,
+    pending_window_invalidation: Option<SequencedTmuxNotificationIntent>,
+    latest_pane_focus_revision: Option<TopologyRevision>,
+    latest_window_invalidation_revision: Option<TopologyRevision>,
+    next_topology_revision: Option<TopologyRevision>,
+    topology_reorder: VecDeque<Option<TmuxTopologyBarrierEvent>>,
+    runnable_scheduled: bool,
+    waiting_for_capacity: bool,
+    closed: bool,
+}
+
+impl TmuxNotificationIntentState {
+    pub(crate) fn initialize_topology_order(
+        &mut self,
+        baseline_revision: TopologyRevision,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.closed,
+            "tmux notification topology coordinator is closed"
+        );
+        anyhow::ensure!(
+            self.next_topology_revision.is_none() && self.topology_reorder.is_empty(),
+            "tmux notification topology coordinator was initialized more than once"
+        );
+        let next = baseline_revision
+            .get()
+            .checked_add(1)
+            .map(TopologyRevision::new)
+            .context("tmux notification topology baseline is exhausted")?;
+        self.next_topology_revision = Some(next);
+        Ok(())
+    }
+
+    pub(crate) fn observe_topology_event(
+        &mut self,
+        revision: TopologyRevision,
+        event: TmuxTopologyBarrierEvent,
+    ) -> anyhow::Result<TmuxTopologyObservation> {
+        if self.closed {
+            return Ok(TmuxTopologyObservation {
+                closed: true,
+                ..TmuxTopologyObservation::default()
+            });
+        }
+        let next_revision = self
+            .next_topology_revision
+            .context("tmux notification topology coordinator is not initialized")?;
+        if revision < next_revision {
+            return Ok(TmuxTopologyObservation {
+                stale: true,
+                ..TmuxTopologyObservation::default()
+            });
+        }
+
+        let offset_u64 = revision
+            .get()
+            .checked_sub(next_revision.get())
+            .context("tmux notification topology revision subtraction underflow")?;
+        let offset = usize::try_from(offset_u64)
+            .context("tmux notification topology gap does not fit usize")?;
+        anyhow::ensure!(
+            offset < NOTIFICATION_INTENT_MAX_REORDER_GAP,
+            "tmux notification topology gap {offset} exceeds bounded window {}",
+            NOTIFICATION_INTENT_MAX_REORDER_GAP
+        );
+        if self.topology_reorder.len() <= offset {
+            self.topology_reorder.resize(offset.saturating_add(1), None);
+        }
+        anyhow::ensure!(
+            self.topology_reorder[offset].is_none(),
+            "duplicate tmux notification topology revision {}",
+            revision.get()
+        );
+        self.topology_reorder[offset] = Some(event);
+        if offset > 0 {
+            metrics::counter!("mux.tmux.notification_intent.reordered").increment(1);
+        }
+        metrics::histogram!("mux.tmux.notification_intent.reorder_buffer_depth")
+            .record(self.topology_reorder.len() as f64);
+
+        let mut observation = TmuxTopologyObservation::default();
+        while let Some(Some(event)) = self.topology_reorder.front().copied() {
+            let current_revision = self
+                .next_topology_revision
+                .context("tmux notification topology revision exhausted with retained events")?;
+            let _ = self.topology_reorder.pop_front();
+            self.next_topology_revision = current_revision
+                .get()
+                .checked_add(1)
+                .map(TopologyRevision::new);
+
+            if let TmuxTopologyBarrierEvent::Intent(intent) = event {
+                let offer = self.offer(SequencedTmuxNotificationIntent {
+                    revision: current_revision,
+                    intent,
+                });
+                observation.schedule |= offer.schedule;
+                observation.coalesced = observation
+                    .coalesced
+                    .saturating_add(u64::from(offer.coalesced));
+                observation.closed |= offer.closed;
+            }
+        }
+        anyhow::ensure!(
+            self.next_topology_revision.is_some() || self.topology_reorder.is_empty(),
+            "tmux notification topology revision exhausted before buffered events drained"
+        );
+        Ok(observation)
+    }
+
+    fn slot_mut(
+        &mut self,
+        intent: TmuxNotificationIntent,
+    ) -> (
+        &mut Option<SequencedTmuxNotificationIntent>,
+        &mut Option<TopologyRevision>,
+    ) {
+        match intent {
+            TmuxNotificationIntent::PaneFocused(_) => (
+                &mut self.pending_pane_focus,
+                &mut self.latest_pane_focus_revision,
+            ),
+            TmuxNotificationIntent::WindowInvalidated(_) => (
+                &mut self.pending_window_invalidation,
+                &mut self.latest_window_invalidation_revision,
+            ),
+        }
+    }
+
+    pub(crate) fn offer(
+        &mut self,
+        sequenced: SequencedTmuxNotificationIntent,
+    ) -> TmuxNotificationIntentOffer {
+        if self.closed {
+            return TmuxNotificationIntentOffer {
+                closed: true,
+                ..TmuxNotificationIntentOffer::default()
+            };
+        }
+
+        let (slot, latest_revision) = self.slot_mut(sequenced.intent);
+        if latest_revision.is_some_and(|latest| latest >= sequenced.revision) {
+            return TmuxNotificationIntentOffer {
+                coalesced: true,
+                ..TmuxNotificationIntentOffer::default()
+            };
+        }
+
+        *latest_revision = Some(sequenced.revision);
+        let coalesced = slot.replace(sequenced).is_some();
+        let schedule = !self.runnable_scheduled && !self.waiting_for_capacity;
+        if schedule {
+            self.runnable_scheduled = true;
+        }
+        TmuxNotificationIntentOffer {
+            schedule,
+            coalesced,
+            closed: false,
+        }
+    }
+
+    pub(crate) fn take_ordered_batch(
+        &mut self,
+    ) -> [Option<SequencedTmuxNotificationIntent>; 2] {
+        debug_assert!(self.runnable_scheduled);
+        debug_assert!(!self.waiting_for_capacity);
+        let mut batch = [
+            self.pending_pane_focus.take(),
+            self.pending_window_invalidation.take(),
+        ];
+        if matches!(
+            batch,
+            [Some(first), Some(second)] if first.revision > second.revision
+        ) {
+            batch.swap(0, 1);
+        }
+        batch
+    }
+
+    pub(crate) fn is_current(&self, sequenced: SequencedTmuxNotificationIntent) -> bool {
+        match sequenced.intent {
+            TmuxNotificationIntent::PaneFocused(_) => {
+                self.latest_pane_focus_revision == Some(sequenced.revision)
+            }
+            TmuxNotificationIntent::WindowInvalidated(_) => {
+                self.latest_window_invalidation_revision == Some(sequenced.revision)
+            }
+        }
+    }
+
+    fn restore_if_current(&mut self, sequenced: SequencedTmuxNotificationIntent) -> bool {
+        if !self.is_current(sequenced) {
+            return false;
+        }
+        let (slot, _) = self.slot_mut(sequenced.intent);
+        if slot.is_none() {
+            *slot = Some(sequenced);
+        }
+        true
+    }
+
+    /// Re-publish an unadmitted batch while the command mailbox mutex is still
+    /// held. A consumer cannot free capacity before the waiting edge becomes
+    /// visible, closing the otherwise subtle full->free lost-wakeup race.
+    pub(crate) fn wait_for_capacity(
+        &mut self,
+        failed: SequencedTmuxNotificationIntent,
+        remaining: Option<SequencedTmuxNotificationIntent>,
+    ) -> u64 {
+        if self.closed {
+            self.runnable_scheduled = false;
+            self.waiting_for_capacity = false;
+            return 1u64.saturating_add(u64::from(remaining.is_some()));
+        }
+        let mut superseded = u64::from(!self.restore_if_current(failed));
+        if let Some(remaining) = remaining {
+            superseded =
+                superseded.saturating_add(u64::from(!self.restore_if_current(remaining)));
+        }
+        self.runnable_scheduled = false;
+        self.waiting_for_capacity =
+            self.pending_pane_focus.is_some() || self.pending_window_invalidation.is_some();
+        superseded
+    }
+
+    pub(crate) fn capacity_available(&mut self) -> bool {
+        if self.closed || !self.waiting_for_capacity {
+            return false;
+        }
+        self.waiting_for_capacity = false;
+        if self.pending_pane_focus.is_none() && self.pending_window_invalidation.is_none() {
+            return false;
+        }
+        debug_assert!(!self.runnable_scheduled);
+        self.runnable_scheduled = true;
+        true
+    }
+
+    pub(crate) fn finish_quantum(&mut self) -> TmuxNotificationIntentRunDisposition {
+        if self.closed {
+            self.runnable_scheduled = false;
+            self.waiting_for_capacity = false;
+            return TmuxNotificationIntentRunDisposition::Closed;
+        }
+        if self.waiting_for_capacity {
+            self.runnable_scheduled = false;
+            return TmuxNotificationIntentRunDisposition::WaitingForCapacity;
+        }
+        if self.pending_pane_focus.is_some() || self.pending_window_invalidation.is_some() {
+            debug_assert!(self.runnable_scheduled);
+            TmuxNotificationIntentRunDisposition::Reschedule
+        } else {
+            self.runnable_scheduled = false;
+            TmuxNotificationIntentRunDisposition::Idle
+        }
+    }
+
+    pub(crate) fn cancel_scheduled_runnable(&mut self) -> bool {
+        self.runnable_scheduled = false;
+        !self.closed
+            && (self.pending_pane_focus.is_some()
+                || self.pending_window_invalidation.is_some())
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.pending_pane_focus = None;
+        self.pending_window_invalidation = None;
+        self.latest_pane_focus_revision = None;
+        self.latest_window_invalidation_revision = None;
+        self.next_topology_revision = None;
+        self.topology_reorder.clear();
+        self.runnable_scheduled = false;
+        self.waiting_for_capacity = false;
+        self.closed = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        usize::from(self.pending_pane_focus.is_some())
+            + usize::from(self.pending_window_invalidation.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_waiting_for_capacity(&self) -> bool {
+        self.waiting_for_capacity
+    }
+}
+
+pub(crate) struct TmuxNotificationIntentTelemetry {
+    received: metrics::Counter,
+    prefiltered: metrics::Counter,
+    coalesced: metrics::Counter,
+    scheduled: metrics::Counter,
+    applied: metrics::Counter,
+    dropped_stale: metrics::Counter,
+    backpressured: metrics::Counter,
+    #[cfg(test)]
+    test_received: AtomicU64,
+    #[cfg(test)]
+    test_prefiltered: AtomicU64,
+    #[cfg(test)]
+    test_coalesced: AtomicU64,
+    #[cfg(test)]
+    test_scheduled: AtomicU64,
+    #[cfg(test)]
+    test_applied: AtomicU64,
+    #[cfg(test)]
+    test_dropped_stale: AtomicU64,
+    #[cfg(test)]
+    test_backpressured: AtomicU64,
+}
+
+impl Default for TmuxNotificationIntentTelemetry {
+    fn default() -> Self {
+        Self {
+            // Register once per domain. The storm path then increments cached
+            // handles instead of resolving seven metric keys per callback.
+            received: metrics::counter!("mux.tmux.notification_intent.received"),
+            prefiltered: metrics::counter!("mux.tmux.notification_intent.prefiltered"),
+            coalesced: metrics::counter!("mux.tmux.notification_intent.coalesced"),
+            scheduled: metrics::counter!("mux.tmux.notification_intent.scheduled"),
+            applied: metrics::counter!("mux.tmux.notification_intent.applied"),
+            dropped_stale: metrics::counter!("mux.tmux.notification_intent.dropped_stale"),
+            backpressured: metrics::counter!("mux.tmux.notification_intent.backpressured"),
+            #[cfg(test)]
+            test_received: AtomicU64::new(0),
+            #[cfg(test)]
+            test_prefiltered: AtomicU64::new(0),
+            #[cfg(test)]
+            test_coalesced: AtomicU64::new(0),
+            #[cfg(test)]
+            test_scheduled: AtomicU64::new(0),
+            #[cfg(test)]
+            test_applied: AtomicU64::new(0),
+            #[cfg(test)]
+            test_dropped_stale: AtomicU64::new(0),
+            #[cfg(test)]
+            test_backpressured: AtomicU64::new(0),
+        }
+    }
+}
+
+impl TmuxNotificationIntentTelemetry {
+    pub(crate) fn record_received(&self) {
+        #[cfg(test)]
+        self.test_received.fetch_add(1, Ordering::Relaxed);
+        self.received.increment(1);
+    }
+
+    pub(crate) fn record_prefiltered(&self) {
+        #[cfg(test)]
+        self.test_prefiltered.fetch_add(1, Ordering::Relaxed);
+        self.prefiltered.increment(1);
+    }
+
+    pub(crate) fn record_coalesced(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        #[cfg(test)]
+        self.test_coalesced.fetch_add(count, Ordering::Relaxed);
+        self.coalesced.increment(count);
+    }
+
+    pub(crate) fn record_scheduled(&self) {
+        #[cfg(test)]
+        self.test_scheduled.fetch_add(1, Ordering::Relaxed);
+        self.scheduled.increment(1);
+    }
+
+    pub(crate) fn record_applied(&self) {
+        #[cfg(test)]
+        self.test_applied.fetch_add(1, Ordering::Relaxed);
+        self.applied.increment(1);
+    }
+
+    pub(crate) fn record_dropped_stale(&self) {
+        #[cfg(test)]
+        self.test_dropped_stale.fetch_add(1, Ordering::Relaxed);
+        self.dropped_stale.increment(1);
+    }
+
+    pub(crate) fn record_backpressured(&self) {
+        #[cfg(test)]
+        self.test_backpressured.fetch_add(1, Ordering::Relaxed);
+        self.backpressured.increment(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> TmuxNotificationIntentTelemetrySnapshot {
+        TmuxNotificationIntentTelemetrySnapshot {
+            received: self.test_received.load(Ordering::Relaxed),
+            prefiltered: self.test_prefiltered.load(Ordering::Relaxed),
+            coalesced: self.test_coalesced.load(Ordering::Relaxed),
+            scheduled: self.test_scheduled.load(Ordering::Relaxed),
+            applied: self.test_applied.load(Ordering::Relaxed),
+            dropped_stale: self.test_dropped_stale.load(Ordering::Relaxed),
+            backpressured: self.test_backpressured.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TmuxNotificationIntentTelemetrySnapshot {
+    pub(crate) received: u64,
+    pub(crate) prefiltered: u64,
+    pub(crate) coalesced: u64,
+    pub(crate) scheduled: u64,
+    pub(crate) applied: u64,
+    pub(crate) dropped_stale: u64,
+    pub(crate) backpressured: u64,
 }
 
 #[derive(Debug)]
@@ -827,11 +1418,15 @@ pub(crate) struct TmuxDomainState {
     pub gui_window: Mutex<Option<MuxWindowBuilder>>,
     pub gui_tabs: Mutex<HashMap<TmuxWindowId, TmuxTab>>,
     pub remote_panes: Mutex<HashMap<TmuxPaneId, RefTmuxRemotePane>>,
+    pub(crate) mirror_index: Mutex<TmuxMirrorIndex>,
+    pub(crate) notification_intents: Mutex<TmuxNotificationIntentState>,
+    pub(crate) notification_intent_telemetry: TmuxNotificationIntentTelemetry,
     pub(crate) pane_retirement: Mutex<()>,
     pub(crate) retired_panes: Mutex<HashSet<TmuxPaneId>>,
     pub tmux_session: Mutex<Option<TmuxSessionId>>,
     pub support_commands: Mutex<HashMap<String, String>>,
     pub attach_state: Mutex<AttachState>,
+    pub(crate) notification_subscription_gate: Mutex<()>,
     pub notification_sub_id: Mutex<Option<usize>>,
     config_reload_sub: Mutex<Option<config::ConfigSubscription>>,
     backlog_limits_dirty: AtomicBool,
@@ -970,6 +1565,7 @@ impl TmuxDomainState {
         // Queue closure and unsubscription are immediate. More expensive
         // resource cleanup is deferred until operations admitted before the
         // terminal transition have drained.
+        self.notification_intents.lock().close();
         let abandoned_commands = { self.cmd_queue.lock().close() };
         // Command destructors can release large paste buffers (and may grow
         // richer in the future); never run them while producers need the
@@ -1065,6 +1661,7 @@ impl TmuxDomainState {
         self.backlog.lock().clear();
         self.retired_panes.lock().clear();
         self.gui_tabs.lock().clear();
+        self.mirror_index.lock().clear();
         let pending_splits: Vec<_> = self.pending_splits.lock().drain().collect();
         let _ = self.tmux_session.lock().take();
         self.support_commands.lock().clear();
@@ -1433,6 +2030,7 @@ impl TmuxDomainState {
                                 return None;
                             }
                             drop(cmd_queue);
+                            TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                             // The callback must commit before any event that
                             // follows its Guarded marker, including events
                             // arriving in later parser batches. Activate the
@@ -1938,12 +2536,15 @@ impl TmuxDomainState {
                 break (command, prepared_command);
             }
             self.cmd_queue.lock().release_prepared();
+            TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
         };
 
         {
             let mut cmd_queue = self.cmd_queue.as_ref().lock();
             if !self.transition_state(State::Sending, State::WaitingForResponse) {
                 cmd_queue.release_prepared();
+                drop(cmd_queue);
+                TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
                 return Ok(());
             }
             if !cmd_queue.install_in_flight(prepared_command) {
@@ -2063,11 +2664,9 @@ impl TmuxDomainState {
         );
         let pane_id = target.pane_id();
         let tmux_pane_id = self
-            .remote_panes
+            .mirror_index
             .lock()
-            .iter()
-            .find(|(_, ref_pane)| ref_pane.lock().local_pane_id == pane_id)
-            .map(|p| p.1.lock().pane_id);
+            .remote_pane_for_local(pane_id);
 
         if let Some(id) = tmux_pane_id {
             let enqueued = {
@@ -2111,11 +2710,15 @@ impl TmuxDomain {
             gui_window: Mutex::new(None),
             gui_tabs: Mutex::new(HashMap::default()),
             remote_panes: Mutex::new(HashMap::default()),
+            mirror_index: Mutex::new(TmuxMirrorIndex::default()),
+            notification_intents: Mutex::new(TmuxNotificationIntentState::default()),
+            notification_intent_telemetry: TmuxNotificationIntentTelemetry::default(),
             pane_retirement: Mutex::new(()),
             retired_panes: Mutex::new(HashSet::new()),
             tmux_session: Mutex::new(None),
             support_commands: Mutex::new(HashMap::default()),
             attach_state: Mutex::new(AttachState::Init),
+            notification_subscription_gate: Mutex::new(()),
             notification_sub_id: Mutex::new(None),
             config_reload_sub: Mutex::new(None),
             backlog_limits_dirty: AtomicBool::new(false),
@@ -3343,6 +3946,339 @@ mod tests {
         assert!(
             tmux_domain.inner.try_claim_send_schedule().is_some(),
             "dropping or cancelling the runnable must rearm scheduling"
+        );
+    }
+
+    #[test]
+    fn notification_intent_storm_schedules_once_per_domain_and_stays_two_slot_bounded() {
+        const DOMAINS: usize = 32;
+        const EVENTS_PER_DOMAIN: u64 = 4_096;
+        let mut scheduled = 0usize;
+        let mut coalesced = 0u64;
+
+        for domain_offset in 0..DOMAINS {
+            let mut state = TmuxNotificationIntentState::default();
+            for revision in 1..=EVENTS_PER_DOMAIN {
+                let intent = if revision % 2 == 0 {
+                    TmuxNotificationIntent::WindowInvalidated(domain_offset)
+                } else {
+                    TmuxNotificationIntent::PaneFocused(domain_offset)
+                };
+                let offer = state.offer(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(revision),
+                    intent,
+                });
+                scheduled += usize::from(offer.schedule);
+                coalesced = coalesced.saturating_add(u64::from(offer.coalesced));
+                assert!(
+                    state.pending_len() <= 2,
+                    "a notification storm must never retain more than one intent per kind"
+                );
+            }
+
+            let batch = state.take_ordered_batch();
+            assert_eq!(
+                batch[0].map(|intent| intent.revision),
+                Some(TopologyRevision::new(EVENTS_PER_DOMAIN - 1))
+            );
+            assert_eq!(
+                batch[1].map(|intent| intent.revision),
+                Some(TopologyRevision::new(EVENTS_PER_DOMAIN))
+            );
+            assert_eq!(
+                state.finish_quantum(),
+                TmuxNotificationIntentRunDisposition::Idle
+            );
+        }
+
+        assert_eq!(
+            scheduled, DOMAINS,
+            "runnable growth must follow active domains, not notification count"
+        );
+        assert_eq!(
+            coalesced,
+            (DOMAINS as u64).saturating_mul(EVENTS_PER_DOMAIN - 2),
+            "all but the first pending intent of each kind should coalesce"
+        );
+    }
+
+    #[test]
+    fn notification_intents_preserve_cross_kind_revision_order_and_reject_delayed_regressions() {
+        let mut state = TmuxNotificationIntentState::default();
+        assert!(
+            state
+                .offer(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(8),
+                    intent: TmuxNotificationIntent::WindowInvalidated(80),
+                })
+                .schedule
+        );
+        assert!(
+            !state
+                .offer(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(7),
+                    intent: TmuxNotificationIntent::PaneFocused(70),
+                })
+                .schedule
+        );
+
+        let batch = state.take_ordered_batch();
+        assert_eq!(
+            batch,
+            [
+                Some(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(7),
+                    intent: TmuxNotificationIntent::PaneFocused(70),
+                }),
+                Some(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(8),
+                    intent: TmuxNotificationIntent::WindowInvalidated(80),
+                }),
+            ]
+        );
+
+        let delayed = state.offer(SequencedTmuxNotificationIntent {
+            revision: TopologyRevision::new(6),
+            intent: TmuxNotificationIntent::PaneFocused(60),
+        });
+        assert!(delayed.coalesced);
+        assert!(!delayed.schedule);
+        assert_eq!(state.pending_len(), 0);
+        assert_eq!(
+            state.finish_quantum(),
+            TmuxNotificationIntentRunDisposition::Idle
+        );
+    }
+
+    #[test]
+    fn notification_topology_barrier_holds_newer_cross_kind_intent_until_gap_arrives() {
+        let mut state = TmuxNotificationIntentState::default();
+        state
+            .initialize_topology_order(TopologyRevision::INITIAL)
+            .expect("initialize topology ordering");
+
+        let newer = state
+            .observe_topology_event(
+                TopologyRevision::new(2),
+                TmuxTopologyBarrierEvent::Intent(
+                    TmuxNotificationIntent::WindowInvalidated(20),
+                ),
+            )
+            .expect("buffer newer revision");
+        assert!(!newer.schedule);
+        assert_eq!(state.pending_len(), 0);
+
+        let contiguous = state
+            .observe_topology_event(
+                TopologyRevision::new(1),
+                TmuxTopologyBarrierEvent::Intent(TmuxNotificationIntent::PaneFocused(10)),
+            )
+            .expect("close revision gap");
+        assert!(contiguous.schedule);
+        let batch = state.take_ordered_batch();
+        assert_eq!(
+            batch,
+            [
+                Some(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(1),
+                    intent: TmuxNotificationIntent::PaneFocused(10),
+                }),
+                Some(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(2),
+                    intent: TmuxNotificationIntent::WindowInvalidated(20),
+                }),
+            ],
+            "a newer window intent must never overtake an older pane intent"
+        );
+    }
+
+    #[test]
+    fn notification_topology_barriers_advance_irrelevant_revisions_and_reject_duplicates() {
+        let mut state = TmuxNotificationIntentState::default();
+        state
+            .initialize_topology_order(TopologyRevision::new(4))
+            .expect("initialize topology ordering");
+
+        let buffered = state
+            .observe_topology_event(
+                TopologyRevision::new(6),
+                TmuxTopologyBarrierEvent::Intent(TmuxNotificationIntent::PaneFocused(60)),
+            )
+            .expect("buffer revision six");
+        assert!(!buffered.schedule);
+        assert!(
+            state
+                .observe_topology_event(
+                    TopologyRevision::new(6),
+                    TmuxTopologyBarrierEvent::Barrier,
+                )
+                .is_err(),
+            "duplicate authority must fail closed instead of replacing retained work"
+        );
+
+        let advanced = state
+            .observe_topology_event(
+                TopologyRevision::new(5),
+                TmuxTopologyBarrierEvent::Barrier,
+            )
+            .expect("irrelevant revision closes the gap");
+        assert!(advanced.schedule);
+        assert_eq!(
+            state.take_ordered_batch()[0],
+            Some(SequencedTmuxNotificationIntent {
+                revision: TopologyRevision::new(6),
+                intent: TmuxNotificationIntent::PaneFocused(60),
+            })
+        );
+    }
+
+    #[test]
+    fn notification_topology_reorder_gap_is_bounded_and_fails_closed() {
+        let mut state = TmuxNotificationIntentState::default();
+        state
+            .initialize_topology_order(TopologyRevision::INITIAL)
+            .expect("initialize topology ordering");
+        let first_rejected_revision = u64::try_from(NOTIFICATION_INTENT_MAX_REORDER_GAP)
+            .expect("reorder cap fits u64")
+            .saturating_add(1);
+
+        let err = state
+            .observe_topology_event(
+                TopologyRevision::new(first_rejected_revision),
+                TmuxTopologyBarrierEvent::Barrier,
+            )
+            .expect_err("an unbounded topology gap must fail closed");
+
+        assert!(
+            err.to_string().contains("exceeds bounded window"),
+            "gap rejection should retain a diagnosable reason: {:#}",
+            err
+        );
+        assert!(state.topology_reorder.is_empty());
+        assert_eq!(state.pending_len(), 0);
+    }
+
+    #[test]
+    fn notification_intent_capacity_wait_rearms_without_losing_newer_final_state() {
+        let mut state = TmuxNotificationIntentState::default();
+        assert!(
+            state
+                .offer(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(1),
+                    intent: TmuxNotificationIntent::PaneFocused(10),
+                })
+                .schedule
+        );
+        let batch = state.take_ordered_batch();
+        let first = batch[0].expect("one pending pane intent");
+        assert_eq!(state.wait_for_capacity(first, None), 0);
+        assert!(state.is_waiting_for_capacity());
+
+        let replacement = state.offer(SequencedTmuxNotificationIntent {
+            revision: TopologyRevision::new(2),
+            intent: TmuxNotificationIntent::PaneFocused(20),
+        });
+        assert!(replacement.coalesced);
+        assert!(!replacement.schedule);
+        assert_eq!(state.pending_len(), 1);
+
+        assert!(
+            state.capacity_available(),
+            "the first capacity edge must claim exactly one retry runnable"
+        );
+        assert!(!state.capacity_available());
+        let retried = state.take_ordered_batch();
+        assert_eq!(
+            retried[0],
+            Some(SequencedTmuxNotificationIntent {
+                revision: TopologyRevision::new(2),
+                intent: TmuxNotificationIntent::PaneFocused(20),
+            })
+        );
+        assert_eq!(
+            state.finish_quantum(),
+            TmuxNotificationIntentRunDisposition::Idle
+        );
+    }
+
+    #[test]
+    fn notification_intent_close_absorbs_capacity_requeue_and_reinitialization() {
+        let mut state = TmuxNotificationIntentState::default();
+        assert!(
+            state
+                .offer(SequencedTmuxNotificationIntent {
+                    revision: TopologyRevision::new(1),
+                    intent: TmuxNotificationIntent::PaneFocused(10),
+                })
+                .schedule
+        );
+        let failed = state.take_ordered_batch()[0].expect("one pending pane intent");
+
+        state.close();
+
+        assert_eq!(
+            state.wait_for_capacity(failed, None),
+            1,
+            "terminal closure must count and discard the unadmitted intent"
+        );
+        assert_eq!(state.pending_len(), 0);
+        assert!(!state.is_waiting_for_capacity());
+        assert_eq!(
+            state.finish_quantum(),
+            TmuxNotificationIntentRunDisposition::Closed
+        );
+        assert!(
+            state
+                .initialize_topology_order(TopologyRevision::INITIAL)
+                .is_err(),
+            "closed topology coordination must remain absorbing"
+        );
+    }
+
+    #[test]
+    fn tmux_mirror_index_is_bidirectional_and_rejects_identity_aliases() {
+        let mut index = TmuxMirrorIndex::default();
+        index.register_pane(11, 101).expect("register pane");
+        index.register_window(22, 202).expect("register window");
+        assert_eq!(index.remote_pane_for_local(11), Some(101));
+        assert_eq!(index.remote_window_for_local_tab(22), Some(202));
+
+        assert!(index.register_pane(11, 102).is_err());
+        assert!(index.register_pane(12, 101).is_err());
+        assert!(index.register_window(22, 203).is_err());
+        assert!(index.register_window(23, 202).is_err());
+
+        assert_eq!(index.unregister_pane(101).expect("unregister pane"), Some(11));
+        assert_eq!(
+            index.unregister_window(202).expect("unregister window"),
+            Some(22)
+        );
+        assert_eq!(index.remote_pane_for_local(11), None);
+        assert_eq!(index.remote_window_for_local_tab(22), None);
+    }
+
+    #[test]
+    fn notification_intent_telemetry_exposes_required_counters() {
+        let telemetry = TmuxNotificationIntentTelemetry::default();
+        telemetry.record_received();
+        telemetry.record_prefiltered();
+        telemetry.record_coalesced(3);
+        telemetry.record_scheduled();
+        telemetry.record_applied();
+        telemetry.record_dropped_stale();
+        telemetry.record_backpressured();
+
+        assert_eq!(
+            telemetry.snapshot(),
+            TmuxNotificationIntentTelemetrySnapshot {
+                received: 1,
+                prefiltered: 1,
+                coalesced: 3,
+                scheduled: 1,
+                applied: 1,
+                dropped_stale: 1,
+                backpressured: 1,
+            }
         );
     }
 

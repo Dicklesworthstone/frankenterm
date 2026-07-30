@@ -4,10 +4,15 @@ use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{
     AttachState, TmuxBacklogDrain, TmuxBacklogLimits, TmuxDomain, TmuxDomainState,
-    TmuxPaneOutputState, TmuxRemotePane, TmuxTab,
+    TmuxEnqueueError, TmuxNotificationIntent,
+    TmuxNotificationIntentRunDisposition, TmuxPaneOutputState, TmuxRemotePane, TmuxTab,
+    TmuxTopologyBarrierEvent, NOTIFICATION_INTENT_DRAIN_QUANTUM,
 };
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
-use crate::{Mux, MuxNotification, Pane, PaneOperationGuard, SplitCommitReceipt};
+use crate::{
+    Mux, MuxNotification, MuxNotificationEnvelope, MuxTopologyStamp, Pane, PaneOperationGuard,
+    SplitCommitReceipt,
+};
 use anyhow::{anyhow, Context};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
@@ -16,7 +21,7 @@ use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use termwiz::tmux_cc::*;
 
 /// Maximum payload retained in a single `SendKeys` command after queue merging.
@@ -48,6 +53,14 @@ pub(crate) trait TmuxCommand: Send + Debug {
     }
 
     fn as_resize(&self) -> Option<(TmuxPaneId, PtySize)> {
+        None
+    }
+
+    fn as_select_window(&self) -> Option<TmuxWindowId> {
+        None
+    }
+
+    fn as_select_pane(&self) -> Option<TmuxPaneId> {
         None
     }
 }
@@ -95,6 +108,32 @@ struct WindowItem {
     layout: Vec<WindowLayout>,
     layout_csum: String,
     history_limit: isize,
+}
+
+struct TmuxNotificationIntentRunnableLease {
+    owner: Arc<TmuxDomainState>,
+    completed: bool,
+}
+
+impl Drop for TmuxNotificationIntentRunnableLease {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let _had_pending = self
+            .owner
+            .notification_intents
+            .lock()
+            .cancel_scheduled_runnable();
+        if !self.owner.is_terminal() {
+            log::error!(
+                "tmux domain {} lost its notification-intent runnable; detaching rather than \
+                 silently losing the authoritative final selection",
+                self.owner.domain_id
+            );
+            self.owner.transition_to_exit_and_schedule_detach();
+        }
+    }
 }
 
 impl TmuxDomainState {
@@ -160,18 +199,32 @@ impl TmuxDomainState {
 
     fn add_attached_window(&self, target: &WindowItem, tab_id: &TabId) -> anyhow::Result<()> {
         let mut gui_tabs = self.gui_tabs.lock();
-        if !gui_tabs.contains_key(&target.window_id) {
-            gui_tabs.insert(
-                target.window_id,
-                TmuxTab {
-                    tab_id: *tab_id,
-                    tmux_window_id: target.window_id,
-                    layout_csum: target.layout_csum.clone(),
-                    panes: HashSet::new(),
-                },
+        if let Some(existing) = gui_tabs.get(&target.window_id) {
+            anyhow::ensure!(
+                existing.tab_id == *tab_id
+                    && self
+                        .mirror_index
+                        .lock()
+                        .remote_window_for_local_tab(*tab_id)
+                        == Some(target.window_id),
+                "tmux window {} was attached to conflicting local tab identities",
+                target.window_id
             );
+            return Ok(());
         }
 
+        self.mirror_index
+            .lock()
+            .register_window(*tab_id, target.window_id)?;
+        gui_tabs.insert(
+            target.window_id,
+            TmuxTab {
+                tab_id: *tab_id,
+                tmux_window_id: target.window_id,
+                layout_csum: target.layout_csum.clone(),
+                panes: HashSet::new(),
+            },
+        );
         Ok(())
     }
 
@@ -183,6 +236,7 @@ impl TmuxDomainState {
         let removed_panes = {
             let mut remote_panes = self.remote_panes.lock();
             let mut retired_panes = self.retired_panes.lock();
+            let mut mirror_index = self.mirror_index.lock();
             let new_tombstones = pane_ids
                 .iter()
                 .filter(|pane_id| !retired_panes.contains(pane_id))
@@ -196,23 +250,44 @@ impl TmuxDomainState {
                 super::tmux::RETIRED_PANE_TOMBSTONE_LIMIT
             );
 
-            pane_ids
-                .iter()
-                .filter_map(|pane_id| {
-                    retired_panes.insert(*pane_id);
-                    remote_panes
-                        .remove(pane_id)
-                        .map(|remote| (*pane_id, remote))
-                })
-                .collect::<Vec<_>>()
+            let mut removed = Vec::with_capacity(pane_ids.len());
+            for pane_id in pane_ids {
+                retired_panes.insert(*pane_id);
+                let remote = remote_panes.remove(pane_id);
+                let indexed_local = mirror_index.unregister_pane(*pane_id)?;
+                match (remote, indexed_local) {
+                    (Some(remote), Some(local_pane_id)) => {
+                        removed.push((*pane_id, local_pane_id, remote));
+                    }
+                    (None, None) => {}
+                    (Some(_), None) => {
+                        anyhow::bail!(
+                            "tmux pane {pane_id} existed without a reverse-index identity"
+                        );
+                    }
+                    (None, Some(local_pane_id)) => {
+                        anyhow::bail!(
+                            "tmux pane {pane_id} reverse index pointed at missing local pane \
+                             {local_pane_id}"
+                        );
+                    }
+                }
+            }
+            removed
         };
 
         let mut local_pane_ids = Vec::with_capacity(removed_panes.len());
-        for (_pane_id, remote) in removed_panes {
+        for (pane_id, indexed_local_pane_id, remote) in removed_panes {
             // Tombstone publication is the admission cutoff. A producer that
             // passed its per-pane tombstone check first linearizes before
             // retirement; this lock waits for it, then publishes Retired.
             let mut remote = remote.lock();
+            anyhow::ensure!(
+                remote.local_pane_id == indexed_local_pane_id,
+                "tmux pane {pane_id} reverse index named local pane {} but the mirror named {}",
+                indexed_local_pane_id,
+                remote.local_pane_id
+            );
             remote.output_state = TmuxPaneOutputState::Retired;
             remote
                 .child_state
@@ -246,7 +321,15 @@ impl TmuxDomainState {
 
             let tab_empty = panes.is_empty();
             if tab_empty {
-                gui_tabs.remove(&window_id);
+                let removed = gui_tabs
+                    .remove(&window_id)
+                    .context("empty tmux tab disappeared during retirement")?;
+                let indexed_tab = self.mirror_index.lock().unregister_window(window_id)?;
+                anyhow::ensure!(
+                    indexed_tab == Some(removed.tab_id),
+                    "tmux window {window_id} reverse index did not name retired local tab {}",
+                    removed.tab_id
+                );
             }
 
             (tab_id, to_remove, tab_empty)
@@ -269,8 +352,25 @@ impl TmuxDomainState {
         let tab = {
             let mut gui_tabs = self.gui_tabs.lock();
             match gui_tabs.remove(&window_id) {
-                Some(tab) => tab,
-                None => return Ok(()),
+                Some(tab) => {
+                    let indexed_tab = self.mirror_index.lock().unregister_window(window_id)?;
+                    anyhow::ensure!(
+                        indexed_tab == Some(tab.tab_id),
+                        "tmux window {window_id} reverse index did not name retired local tab {}",
+                        tab.tab_id
+                    );
+                    tab
+                }
+                None => {
+                    anyhow::ensure!(
+                        self.mirror_index
+                            .lock()
+                            .unregister_window(window_id)?
+                            .is_none(),
+                        "tmux window {window_id} had a reverse index without an attached tab"
+                    );
+                    return Ok(());
+                }
             }
         };
 
@@ -393,6 +493,16 @@ impl TmuxDomainState {
                 pane.pane_id
             );
         }
+        if let Err(err) = self
+            .mirror_index
+            .lock()
+            .register_pane(local_pane_id, pane.pane_id)
+        {
+            child_state.mark_exited(ExitStatus::with_signal(
+                "conflicting tmux pane reverse-index identity",
+            ));
+            return Err(err.context("failed to register tmux pane reverse index"));
+        }
         pane_map.insert(pane.pane_id, ref_pane);
         drop(pane_map);
 
@@ -472,15 +582,11 @@ impl TmuxDomainState {
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
-        let remote_window_id = match self
-            .gui_tabs
+        let remote_window_id = self
+            .mirror_index
             .lock()
-            .iter()
-            .find(|entry| entry.1.tab_id == tab.tab_id())
-        {
-            Some((_, tab)) => tab.tmux_window_id,
-            None => anyhow::bail!("No tmux mirror for exact tab {}", tab.tab_id()),
-        };
+            .remote_window_for_local_tab(tab.tab_id())
+            .with_context(|| format!("No tmux mirror for exact tab {}", tab.tab_id()))?;
 
         let p = PaneItem {
             session_id: 0,
@@ -925,110 +1031,358 @@ impl TmuxDomainState {
         self.enqueue_required_batch(required_commands, "window-state synchronization")
     }
 
+    fn notification_targets_domain(&self, intent: TmuxNotificationIntent) -> bool {
+        if *self.attach_state.lock() == AttachState::Init {
+            return false;
+        }
+        match intent {
+            TmuxNotificationIntent::PaneFocused(local_pane_id) => self
+                .mirror_index
+                .lock()
+                .remote_pane_for_local(local_pane_id)
+                .is_some(),
+            TmuxNotificationIntent::WindowInvalidated(local_window_id) => self
+                .gui_window
+                .lock()
+                .as_ref()
+                .is_some_and(|window| window.window_id == local_window_id),
+        }
+    }
+
+    fn ingest_mux_notification(
+        self: &Arc<Self>,
+        envelope: MuxNotificationEnvelope,
+    ) -> bool {
+        self.notification_intent_telemetry.record_received();
+        let MuxNotificationEnvelope {
+            notification,
+            topology,
+        } = envelope;
+        let is_topology = notification.is_topology();
+        let event = match notification {
+            MuxNotification::PaneFocused(pane_id) => {
+                let intent = TmuxNotificationIntent::PaneFocused(pane_id);
+                if self.notification_targets_domain(intent) {
+                    TmuxTopologyBarrierEvent::Intent(intent)
+                } else {
+                    TmuxTopologyBarrierEvent::Barrier
+                }
+            }
+            MuxNotification::WindowInvalidated(window_id) => {
+                let intent = TmuxNotificationIntent::WindowInvalidated(window_id);
+                if self.notification_targets_domain(intent) {
+                    TmuxTopologyBarrierEvent::Intent(intent)
+                } else {
+                    TmuxTopologyBarrierEvent::Barrier
+                }
+            }
+            _ => TmuxTopologyBarrierEvent::Barrier,
+        };
+
+        if self.is_terminal() {
+            return false;
+        }
+        match topology {
+            MuxTopologyStamp::NonTopology => {
+                if is_topology {
+                    log::error!(
+                        "tmux domain {} received a topology notification without a revision; \
+                         detaching instead of guessing event order",
+                        self.domain_id
+                    );
+                    self.transition_to_exit_and_schedule_detach();
+                    return false;
+                }
+                self.notification_intent_telemetry.record_prefiltered();
+            }
+            MuxTopologyStamp::Exhausted => {
+                log::error!(
+                    "tmux domain {} observed exhausted mux topology authority; detaching instead \
+                     of accepting unordered selection work",
+                    self.domain_id
+                );
+                self.transition_to_exit_and_schedule_detach();
+                return false;
+            }
+            MuxTopologyStamp::Revision(revision) => {
+                if !is_topology {
+                    log::error!(
+                        "tmux domain {} received a non-topology notification carrying revision \
+                         {}; detaching",
+                        self.domain_id,
+                        revision.get()
+                    );
+                    self.transition_to_exit_and_schedule_detach();
+                    return false;
+                }
+                let prefiltered = event == TmuxTopologyBarrierEvent::Barrier;
+                let observation = match self
+                    .notification_intents
+                    .lock()
+                    .observe_topology_event(revision, event)
+                {
+                    Ok(observation) => observation,
+                    Err(err) => {
+                        metrics::counter!(
+                            "mux.tmux.notification_intent.ordering_failures"
+                        )
+                        .increment(1);
+                        log::error!(
+                            "tmux domain {} failed to order mux topology revision {}: {err:#}; \
+                             detaching",
+                            self.domain_id,
+                            revision.get()
+                        );
+                        self.transition_to_exit_and_schedule_detach();
+                        return false;
+                    }
+                };
+                if prefiltered || observation.stale {
+                    self.notification_intent_telemetry.record_prefiltered();
+                }
+                self.notification_intent_telemetry
+                    .record_coalesced(observation.coalesced);
+                if observation.closed {
+                    return false;
+                }
+                if observation.schedule {
+                    if !promise::spawn::is_scheduler_configured() {
+                        log::error!(
+                            "tmux domain {} cannot schedule authoritative selection intent at \
+                             topology revision {} because the main-thread scheduler is \
+                             unavailable; detaching",
+                            self.domain_id,
+                            revision.get()
+                        );
+                        self.transition_to_exit_and_schedule_detach();
+                        return false;
+                    }
+                    self.spawn_claimed_notification_intent_runnable();
+                }
+            }
+        }
+        true
+    }
+
+    fn spawn_claimed_notification_intent_runnable(self: &Arc<Self>) {
+        self.notification_intent_telemetry.record_scheduled();
+        let owner = Arc::clone(self);
+        let lease = TmuxNotificationIntentRunnableLease {
+            owner: Arc::clone(self),
+            completed: false,
+        };
+        promise::spawn::spawn_into_main_thread(async move {
+            let mut lease = lease;
+            let disposition = owner.run_notification_intent_runnable();
+            lease.completed = true;
+            if disposition == TmuxNotificationIntentRunDisposition::Reschedule {
+                owner.spawn_claimed_notification_intent_runnable();
+            }
+        })
+        .detach();
+    }
+
+    fn run_notification_intent_runnable(
+        self: &Arc<Self>,
+    ) -> TmuxNotificationIntentRunDisposition {
+        let Some(mux) = Mux::try_get() else {
+            self.transition_to_exit_and_schedule_detach();
+            return TmuxNotificationIntentRunDisposition::Closed;
+        };
+        let Some(domain) = mux.get_domain(self.domain_id) else {
+            self.transition_to_exit_and_schedule_detach();
+            return TmuxNotificationIntentRunDisposition::Closed;
+        };
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            self.transition_to_exit_and_schedule_detach();
+            return TmuxNotificationIntentRunDisposition::Closed;
+        };
+        if !Arc::ptr_eq(self, &tmux_domain.inner) {
+            self.transition_to_exit_and_schedule_detach();
+            return TmuxNotificationIntentRunDisposition::Closed;
+        }
+
+        self.with_active_lifecycle(|| self.drain_notification_intents(&mux))
+            .unwrap_or_else(|| {
+                self.notification_intents.lock().close();
+                TmuxNotificationIntentRunDisposition::Closed
+            })
+    }
+
+    fn resolve_notification_intent_command(
+        &self,
+        mux: &Arc<Mux>,
+        intent: TmuxNotificationIntent,
+    ) -> Option<Box<dyn TmuxCommand>> {
+        match intent {
+            TmuxNotificationIntent::PaneFocused(local_pane_id) => {
+                let remote_pane_id = self
+                    .mirror_index
+                    .lock()
+                    .remote_pane_for_local(local_pane_id)?;
+                Some(Box::new(SelectPane {
+                    pane_id: remote_pane_id,
+                }))
+            }
+            TmuxNotificationIntent::WindowInvalidated(local_window_id) => {
+                let owns_window = self
+                    .gui_window
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|window| window.window_id == local_window_id);
+                if !owns_window {
+                    return None;
+                }
+                let window = mux.get_window(local_window_id)?;
+                let active_tab = window.get_active()?;
+                let remote_window_id = self
+                    .mirror_index
+                    .lock()
+                    .remote_window_for_local_tab(active_tab.tab_id())?;
+                Some(Box::new(SelectWindow {
+                    window_id: remote_window_id,
+                }))
+            }
+        }
+    }
+
+    fn drain_notification_intents(
+        &self,
+        mux: &Arc<Mux>,
+    ) -> TmuxNotificationIntentRunDisposition {
+        let mut consumed = 0usize;
+        while consumed < NOTIFICATION_INTENT_DRAIN_QUANTUM {
+            let batch = self.notification_intents.lock().take_ordered_batch();
+            if batch.iter().all(Option::is_none) {
+                return self.notification_intents.lock().finish_quantum();
+            }
+
+            for index in 0..batch.len() {
+                let Some(sequenced) = batch[index] else {
+                    continue;
+                };
+                consumed = consumed.saturating_add(1);
+                if !self.notification_intents.lock().is_current(sequenced) {
+                    self.notification_intent_telemetry.record_coalesced(1);
+                    continue;
+                }
+
+                let Some(command) =
+                    self.resolve_notification_intent_command(mux, sequenced.intent)
+                else {
+                    self.notification_intent_telemetry.record_dropped_stale();
+                    continue;
+                };
+
+                // Resolution may have crossed a newer callback. Do not admit
+                // an already superseded selection ahead of its final intent.
+                if !self.notification_intents.lock().is_current(sequenced) {
+                    self.notification_intent_telemetry.record_coalesced(1);
+                    continue;
+                }
+
+                let remaining = if index == 0 { batch[1] } else { None };
+                let (enqueue_result, superseded) = {
+                    let mut cmd_queue = self.cmd_queue.lock();
+                    let enqueue_result = cmd_queue.push_back(command);
+                    let superseded = if enqueue_result == Err(TmuxEnqueueError::Full) {
+                        self.notification_intents
+                            .lock()
+                            .wait_for_capacity(sequenced, remaining)
+                    } else {
+                        0
+                    };
+                    (enqueue_result, superseded)
+                };
+                self.notification_intent_telemetry
+                    .record_coalesced(superseded);
+
+                match enqueue_result {
+                    Ok(()) => {
+                        self.notification_intent_telemetry.record_applied();
+                        TmuxDomainState::schedule_send_next_command(self.domain_id);
+                    }
+                    Err(TmuxEnqueueError::Full) => {
+                        self.notification_intent_telemetry.record_backpressured();
+                        return self.notification_intents.lock().finish_quantum();
+                    }
+                    Err(TmuxEnqueueError::Closed) => {
+                        self.notification_intents.lock().close();
+                        return TmuxNotificationIntentRunDisposition::Closed;
+                    }
+                }
+            }
+        }
+
+        self.notification_intents.lock().finish_quantum()
+    }
+
+    pub(crate) fn wake_notification_intent_capacity(domain_id: DomainId) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let Some(domain) = mux.get_domain(domain_id) else {
+            return;
+        };
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            return;
+        };
+        let owner = Arc::clone(&tmux_domain.inner);
+        if !owner.notification_intents.lock().capacity_available() {
+            return;
+        }
+        if !promise::spawn::is_scheduler_configured() {
+            log::error!(
+                "tmux domain {domain_id} regained command capacity without a main-thread \
+                 scheduler; detaching instead of stranding its final selection intent"
+            );
+            owner.transition_to_exit_and_schedule_detach();
+            return;
+        }
+        owner.spawn_claimed_notification_intent_runnable();
+    }
+
     pub fn subscribe_notification(&self) -> anyhow::Result<()> {
+        let _subscription_gate = self.notification_subscription_gate.lock();
         if self.notification_sub_id.lock().is_some() {
             return Ok(());
         }
 
         let mux =
             Mux::try_get().context("cannot subscribe tmux notifications without active mux")?;
-        let domain_id = self.domain_id;
-        let sub_id = mux.subscribe(move |n| {
-            // Domain lifetimes can outlive tmux sessions and a stale callback
-            // would otherwise accumulate forever in mux subscribers.
-            let Some(mux) = Mux::try_get() else {
-                return false;
-            };
-            let Some(domain) = mux.get_domain(domain_id) else {
-                return false;
-            };
-            let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
-                return false;
-            };
-            if tmux_domain.inner.is_terminal() {
-                return false;
-            }
-
-            if !promise::spawn::is_scheduler_configured() {
-                return true;
-            }
-
-            promise::spawn::spawn_into_main_thread(async move {
-                let Some(mux) = Mux::try_get() else {
-                    return;
+        let owner = self.registered_owner_weak()?;
+        let baseline_gate = Arc::new(OnceLock::<bool>::new());
+        let callback_baseline = Arc::clone(&baseline_gate);
+        let (sub_id, _session_incarnation, baseline_revision) = mux
+            .subscribe_with_topology_fence(move |envelope| {
+                // A concurrently dispatched post-baseline event waits for
+                // the one-time coordinator handoff instead of being dropped.
+                // After publication, wait observes an initialized one-shot
+                // latch; PaneOutput storms no longer contend on a handoff
+                // mutex.
+                if !*callback_baseline.wait() {
+                    return false;
+                }
+                let Some(owner) = owner.upgrade() else {
+                    return false;
                 };
-                let Some(domain) = mux.get_domain(domain_id) else {
-                    return;
-                };
-                let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
-                    return;
-                };
-
-                let _ = tmux_domain.inner.with_active_lifecycle(|| {
-                    if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
-                        return;
-                    }
-
-                    match n {
-                        MuxNotification::PaneFocused(pane_id) => {
-                            let tmux_pane_id = match tmux_domain
-                                .inner
-                                .remote_panes
-                                .lock()
-                                .iter()
-                                .find(|(_, p)| p.lock().local_pane_id == pane_id)
-                            {
-                                Some((_, p)) => Some(p.lock().pane_id),
-                                None => None,
-                            };
-
-                            if let Some(pane_id) = tmux_pane_id {
-                                let accepted = {
-                                    let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
-                                    cmd_queue
-                                        .push_back(Box::new(SelectPane { pane_id }))
-                                        .is_ok()
-                                };
-                                if accepted {
-                                    TmuxDomainState::schedule_send_next_command(domain_id);
-                                }
-                            }
-                        }
-                        MuxNotification::WindowInvalidated(window_id) => {
-                            if let Some(window) = mux.get_window(window_id) {
-                                let Some(tab) = window.get_active() else {
-                                    return;
-                                };
-                                let tmux_window_id = match tmux_domain
-                                    .inner
-                                    .gui_tabs
-                                    .lock()
-                                    .iter()
-                                    .find(|(_, t)| t.tab_id == tab.tab_id())
-                                {
-                                    Some((_, t)) => Some(t.tmux_window_id),
-                                    None => None,
-                                };
-                                if let Some(window_id) = tmux_window_id {
-                                    let accepted = {
-                                        let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
-                                        cmd_queue
-                                            .push_back(Box::new(SelectWindow { window_id }))
-                                            .is_ok()
-                                    };
-                                    if accepted {
-                                        TmuxDomainState::schedule_send_next_command(domain_id);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                });
+                owner.ingest_mux_notification(envelope)
             })
-            .detach();
-            true
-        })?;
+            .context("cannot allocate fenced tmux notification subscription")?;
+        if let Err(err) = self
+            .notification_intents
+            .lock()
+            .initialize_topology_order(baseline_revision)
+        {
+            let _ = mux.unsubscribe(sub_id);
+            let _ = baseline_gate.set(false);
+            return Err(err.context("cannot initialize tmux notification topology ordering"));
+        }
+        if baseline_gate.set(true).is_err() {
+            let _ = mux.unsubscribe(sub_id);
+            anyhow::bail!("tmux notification subscription handoff was published more than once");
+        }
+
         match self.publish_notification_subscription(sub_id) {
             Ok(true) => Ok(()),
             Ok(false) => {
@@ -1724,6 +2078,18 @@ impl TmuxCommand for SelectWindow {
         }
         Ok(())
     }
+
+    fn try_merge_newer(&mut self, newer: &dyn TmuxCommand) -> bool {
+        let Some(window_id) = newer.as_select_window() else {
+            return false;
+        };
+        self.window_id = window_id;
+        true
+    }
+
+    fn as_select_window(&self) -> Option<TmuxWindowId> {
+        Some(self.window_id)
+    }
 }
 
 #[derive(Debug)]
@@ -1743,6 +2109,18 @@ impl TmuxCommand for SelectPane {
             anyhow::bail!("{error}");
         }
         Ok(())
+    }
+
+    fn try_merge_newer(&mut self, newer: &dyn TmuxCommand) -> bool {
+        let Some(pane_id) = newer.as_select_pane() else {
+            return false;
+        };
+        self.pane_id = pane_id;
+        true
+    }
+
+    fn as_select_pane(&self) -> Option<TmuxPaneId> {
+        Some(self.pane_id)
     }
 }
 
@@ -1849,6 +2227,29 @@ mod tests {
         (guard, tmux_domain)
     }
 
+    fn insert_test_remote_pane(
+        tmux_domain: &TmuxDomain,
+        remote_pane_id: TmuxPaneId,
+        remote_pane: crate::tmux::RefTmuxRemotePane,
+    ) {
+        let local_pane_id = remote_pane.lock().local_pane_id;
+        tmux_domain
+            .inner
+            .mirror_index
+            .lock()
+            .register_pane(local_pane_id, remote_pane_id)
+            .expect("register test pane reverse index");
+        assert!(
+            tmux_domain
+                .inner
+                .remote_panes
+                .lock()
+                .insert(remote_pane_id, remote_pane)
+                .is_none(),
+            "test remote pane identity must be unique"
+        );
+    }
+
     #[test]
     fn remove_tmux_pane_state_entries_removes_requested_ids_only() {
         let (_guard, tmux_domain) = install_tmux_domain();
@@ -1856,7 +2257,8 @@ mod tests {
         let retained_child_state = Arc::new(TmuxChildState::new());
         let (_read_removed, write_removed) = filedescriptor::socketpair().expect("socketpair");
         let (_read_retained, write_retained) = filedescriptor::socketpair().expect("socketpair");
-        tmux_domain.inner.remote_panes.lock().insert(
+        insert_test_remote_pane(
+            &tmux_domain,
             11,
             Arc::new(Mutex::new(TmuxRemotePane {
                 local_pane_id: 101,
@@ -1882,7 +2284,8 @@ mod tests {
                 .get(&11)
                 .expect("removed pane gate"),
         );
-        tmux_domain.inner.remote_panes.lock().insert(
+        insert_test_remote_pane(
+            &tmux_domain,
             22,
             Arc::new(Mutex::new(TmuxRemotePane {
                 local_pane_id: 202,
@@ -1957,7 +2360,8 @@ mod tests {
 
         let (_guard, tmux_domain) = install_tmux_domain();
         let (mut output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
-        tmux_domain.inner.remote_panes.lock().insert(
+        insert_test_remote_pane(
+            &tmux_domain,
             31,
             Arc::new(Mutex::new(TmuxRemotePane {
                 local_pane_id: 131,
@@ -2014,7 +2418,8 @@ mod tests {
     fn gapped_fresh_split_never_becomes_ready() {
         let (_guard, tmux_domain) = install_tmux_domain();
         let (_output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
-        tmux_domain.inner.remote_panes.lock().insert(
+        insert_test_remote_pane(
+            &tmux_domain,
             32,
             Arc::new(Mutex::new(TmuxRemotePane {
                 local_pane_id: 132,
@@ -2058,7 +2463,8 @@ mod tests {
         let (_guard, tmux_domain) = install_tmux_domain();
         let child_state = Arc::new(TmuxChildState::new());
         let (_output_read, output_write) = filedescriptor::socketpair().expect("socketpair");
-        tmux_domain.inner.remote_panes.lock().insert(
+        insert_test_remote_pane(
+            &tmux_domain,
             41,
             Arc::new(Mutex::new(TmuxRemotePane {
                 local_pane_id: 141,
@@ -2091,6 +2497,56 @@ mod tests {
             tmux_domain.inner.remote_panes.lock().is_empty(),
             "terminal cleanup must remove the partial remote-pane mirror"
         );
+    }
+
+    #[test]
+    fn selection_commands_merge_latest_same_kind_without_crossing_kind_barriers() {
+        let mut queue = crate::tmux::TmuxCmdQueue::new();
+        queue
+            .push_back(Box::new(SelectPane { pane_id: 1 }))
+            .expect("first pane selection");
+        queue
+            .push_back(Box::new(SelectPane { pane_id: 2 }))
+            .expect("newer pane selection");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.front().and_then(|command| command.as_select_pane()),
+            Some(2)
+        );
+
+        queue
+            .push_back(Box::new(SelectWindow { window_id: 3 }))
+            .expect("window ordering barrier");
+        queue
+            .push_back(Box::new(SelectWindow { window_id: 4 }))
+            .expect("newer window selection");
+        assert_eq!(
+            queue.len(),
+            2,
+            "same-kind latest-wins merging must not cross a pane/window ordering barrier"
+        );
+    }
+
+    #[test]
+    fn pane_output_storm_is_prefiltered_before_any_notification_runnable() {
+        let (_guard, tmux_domain) = install_tmux_domain();
+        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+
+        for _ in 0..10_000 {
+            assert!(tmux_domain.inner.ingest_mux_notification(
+                MuxNotificationEnvelope {
+                    notification: MuxNotification::PaneOutput(77),
+                    topology: MuxTopologyStamp::NonTopology,
+                }
+            ));
+        }
+
+        let telemetry = tmux_domain.inner.notification_intent_telemetry.snapshot();
+        assert_eq!(telemetry.received, 10_000);
+        assert_eq!(telemetry.prefiltered, 10_000);
+        assert_eq!(telemetry.scheduled, 0);
+        assert_eq!(telemetry.applied, 0);
+        assert_eq!(tmux_domain.inner.notification_intents.lock().pending_len(), 0);
     }
 
     #[test]
