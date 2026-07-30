@@ -2333,9 +2333,35 @@ impl Tab {
                     }
                 }
             } else {
+                let detached_operation_in_flight =
+                    match catch_unwind(AssertUnwindSafe(|| {
+                        observed
+                            .pane
+                            .mux_registration_slot()
+                            .load()
+                            .is_some_and(|registration| {
+                                registration.guards_detached_topology(mux, &observed.pane)
+                            })
+                    })) {
+                        Ok(in_flight) => in_flight,
+                        Err(_) => {
+                            log::error!(
+                                "pane registration lookup panicked for pane {pane_id}; \
+                                 retaining its detached topology conservatively"
+                            );
+                            true
+                        }
+                    };
+                if detached_operation_in_flight {
+                    log::trace!(
+                        "prune_dead_panes: pane_id={pane_id} retained by admitted detached operation"
+                    );
+                    continue;
+                }
                 // A topology entry that is not the exact pane registered in
-                // the mux is stale regardless of its self-reported liveness.
-                // Final authorization below rechecks absence while holding the
+                // the mux and is not fenced by an admitted exact operation is
+                // stale regardless of its self-reported liveness. Final
+                // authorization below rechecks absence while holding the
                 // registration lock, so a concurrent exact re-registration is
                 // never removed.
                 log::trace!("prune_dead_panes: pane_id={pane_id} dead=not-queried in_mux=false");

@@ -1542,6 +1542,29 @@ mod pane_registration_handle {
                 && self.generation.cleanup_complete.load(Ordering::Acquire)
         }
 
+        pub(crate) fn guards_detached_topology(
+            &self,
+            expected_owner: &Mux,
+            expected_pane: &Arc<dyn Pane>,
+        ) -> bool {
+            let state = self.generation.operation_state.load(Ordering::Acquire);
+            if state & PANE_REGISTRATION_RETIRED == 0
+                || state & PANE_REGISTRATION_OPERATION_MASK == 0
+            {
+                return false;
+            }
+            let Some(pane) = self.pane.upgrade() else {
+                return false;
+            };
+            if !Arc::ptr_eq(&pane, expected_pane) {
+                return false;
+            }
+            self.generation
+                .owner
+                .upgrade()
+                .is_some_and(|owner| std::ptr::eq(owner.as_ref(), expected_owner))
+        }
+
         #[cfg(test)]
         pub(super) fn active_operation_count(&self) -> usize {
             self.generation.operation_state.load(Ordering::Acquire)
@@ -8434,10 +8457,11 @@ mod tests {
                 "retirement cleanup must not overtake the admitted guard"
             );
             assert_eq!(registration.active_operation_count(), 1);
+            mux.prune_dead_windows();
 
             let (_domain_id, guarded_window_id, guarded_tab) = guard
                 .exact_location()
-                .expect("the guard must retain exact topology authority after registry removal");
+                .expect("pruning must retain exact topology authority for an admitted guard");
             assert_eq!(guarded_window_id, window_id);
             assert!(Arc::ptr_eq(&guarded_tab, &tab));
             guard.with_pane(|current| {
@@ -8790,6 +8814,14 @@ mod tests {
             .expect("move operation admission");
         assert!(registration.detach_local_if_current());
         assert!(mux.get_pane(pane.pane_id()).is_none());
+        mux.prune_dead_windows();
+        assert!(
+            source_tab
+                .iter_all_panes()
+                .iter()
+                .any(|current| Arc::ptr_eq(current, &pane)),
+            "pruning must retain the detached pane while its move guard is live"
+        );
 
         let receipt = promise::spawn::block_on(mux.move_pane_to_new_tab_guarded(
             guard,
@@ -11627,7 +11659,7 @@ mod tests {
         let replacement_notifications_for_subscriber = Arc::clone(&replacement_notifications);
         replacement
             .subscribe(move |notification| {
-                if matches!(notification, MuxNotification::PaneFocused(_)) {
+                if matches!(notification, MuxNotification::PaneFocused(784)) {
                     replacement_notifications_for_subscriber.fetch_add(1, Ordering::SeqCst);
                 }
                 true
@@ -11879,14 +11911,12 @@ mod tests {
         })
         .expect("test mux subscription should allocate an identifier");
 
-        Mux::set_mux(&mux);
         mux.enqueue_pane_output_notification(7);
         let weak_mux = Arc::downgrade(&mux);
-        Mux::shutdown();
         assert_eq!(
             Arc::strong_count(&mux),
             1,
-            "only the test's local owner may retain a mux after singleton shutdown",
+            "a deferred pane-output drain must retain only a weak mux owner",
         );
         drop(mux);
         assert!(
