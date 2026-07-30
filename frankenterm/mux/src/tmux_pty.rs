@@ -18,6 +18,7 @@ pub(crate) struct TmuxPty {
     pub master_pane: RefTmuxRemotePane,
     pub reader: FileDescriptor,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
+    pub owner: Weak<TmuxDomainState>,
 }
 
 fn u64_to_u16_saturating(value: u64) -> u16 {
@@ -28,6 +29,28 @@ struct TmuxPtyWriter {
     domain_id: DomainId,
     master_pane: RefTmuxRemotePane,
     cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
+    owner: Weak<TmuxDomainState>,
+}
+
+fn schedule_admitted_command(
+    owner: &Weak<TmuxDomainState>,
+    cmd_queue: &Arc<Mutex<TmuxCmdQueue>>,
+    domain_id: DomainId,
+    context: &str,
+) -> std::io::Result<()> {
+    let Some(owner) = owner.upgrade() else {
+        let abandoned = { cmd_queue.lock().close() };
+        drop(abandoned);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!(
+                "tmux domain {domain_id} disappeared after durable admission during {context}"
+            ),
+        ));
+    };
+    owner
+        .require_send_schedule(context)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))
 }
 
 impl Write for TmuxPtyWriter {
@@ -51,7 +74,12 @@ impl Write for TmuxPtyWriter {
         };
         match enqueue_result {
             Ok(()) => {
-                TmuxDomainState::schedule_send_next_command(self.domain_id);
+                schedule_admitted_command(
+                    &self.owner,
+                    &self.cmd_queue,
+                    self.domain_id,
+                    "PTY writer input",
+                )?;
                 Ok(accepted_len)
             }
             Err(TmuxEnqueueError::Closed) => Err(std::io::Error::new(
@@ -62,6 +90,15 @@ impl Write for TmuxPtyWriter {
                 std::io::ErrorKind::WouldBlock,
                 TmuxEnqueueError::Full,
             )),
+            Err(TmuxEnqueueError::ClassMismatch) => {
+                if let Some(owner) = self.owner.upgrade() {
+                    owner.transition_to_exit_and_schedule_detach();
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    TmuxEnqueueError::ClassMismatch,
+                ))
+            }
         }
     }
 
@@ -91,7 +128,12 @@ impl Write for TmuxPty {
         };
         match enqueue_result {
             Ok(()) => {
-                TmuxDomainState::schedule_send_next_command(self.domain_id);
+                schedule_admitted_command(
+                    &self.owner,
+                    &self.cmd_queue,
+                    self.domain_id,
+                    "PTY input",
+                )?;
                 Ok(accepted_len)
             }
             Err(TmuxEnqueueError::Closed) => Err(std::io::Error::new(
@@ -102,6 +144,15 @@ impl Write for TmuxPty {
                 std::io::ErrorKind::WouldBlock,
                 TmuxEnqueueError::Full,
             )),
+            Err(TmuxEnqueueError::ClassMismatch) => {
+                if let Some(owner) = self.owner.upgrade() {
+                    owner.transition_to_exit_and_schedule_detach();
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    TmuxEnqueueError::ClassMismatch,
+                ))
+            }
         }
     }
 
@@ -212,13 +263,22 @@ impl ChildKiller for TmuxChildKiller {
             let mut cmd_queue = self.cmd_queue.lock();
             cmd_queue.push_back(Box::new(KillPane {
                 pane_id: self.pane_id,
+                child_state: Arc::clone(&self.child_state),
             }))
         };
         match enqueue_result {
             Ok(()) => {
-                TmuxDomainState::schedule_send_next_command(self.domain_id);
-                self.child_state
-                    .mark_exited(ExitStatus::with_signal("tmux kill-pane"));
+                if let Err(err) = schedule_admitted_command(
+                    &self.owner,
+                    &self.cmd_queue,
+                    self.domain_id,
+                    "kill-pane control",
+                ) {
+                    self.child_state.mark_exited(ExitStatus::with_signal(
+                        "tmux kill-pane scheduling failed",
+                    ));
+                    return Err(err);
+                }
                 Ok(())
             }
             Err(TmuxEnqueueError::Closed) => {
@@ -226,7 +286,7 @@ impl ChildKiller for TmuxChildKiller {
                     .mark_exited(ExitStatus::with_signal("tmux domain detached"));
                 Ok(())
             }
-            Err(TmuxEnqueueError::Full) => {
+            Err(TmuxEnqueueError::Full | TmuxEnqueueError::ClassMismatch) => {
                 let Some(owner) = self.owner.upgrade() else {
                     self.child_state.mark_exited(ExitStatus::with_signal(
                         "tmux domain unavailable during kill",
@@ -271,8 +331,13 @@ impl MasterPty for TmuxPty {
         };
         match enqueue_result {
             Ok(()) => {
-                TmuxDomainState::schedule_send_next_command(self.domain_id);
-                Ok(())
+                schedule_admitted_command(
+                    &self.owner,
+                    &self.cmd_queue,
+                    self.domain_id,
+                    "PTY resize intent",
+                )
+                .map_err(anyhow::Error::from)
             }
             Err(err) => Err(anyhow::anyhow!(
                 "cannot resize pane in tmux domain {}: {}",
@@ -301,6 +366,7 @@ impl MasterPty for TmuxPty {
             domain_id: self.domain_id,
             master_pane: self.master_pane.clone(),
             cmd_queue: self.cmd_queue.clone(),
+            owner: self.owner.clone(),
         }))
     }
 
@@ -323,11 +389,13 @@ impl MasterPty for TmuxPty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Domain;
     use crate::tmux::{TmuxDomain, TmuxPaneOutputState, TmuxRemotePane, CMD_QUEUE_MAX_DEPTH};
     use crate::tmux_commands::ListCommands;
     use crate::Mux;
     use promise::spawn::ScopedExecutor;
     use std::sync::{Arc as StdArc, MutexGuard as StdMutexGuard};
+    use termwiz::tmux_cc::Guarded;
 
     struct ScopedMux {
         prior: Option<StdArc<Mux>>,
@@ -381,6 +449,16 @@ mod tests {
         }))
     }
 
+    fn install_tmux_domain(pane_id: crate::pane::PaneId) -> (ScopedMux, StdArc<TmuxDomain>) {
+        let mux = StdArc::new(Mux::new(None));
+        let guard = ScopedMux::install(StdArc::clone(&mux));
+        let domain = StdArc::new(TmuxDomain::new(pane_id));
+        let registered: StdArc<dyn Domain> = domain.clone();
+        mux.add_domain(&registered)
+            .expect("register tmux test domain");
+        (guard, domain)
+    }
+
     #[test]
     fn tmux_child_try_wait_is_pending_until_signaled() {
         let child_state = Arc::new(TmuxChildState::new());
@@ -410,20 +488,47 @@ mod tests {
     }
 
     #[test]
-    fn tmux_child_kill_enqueues_remote_kill_and_marks_signal_status() {
-        let _mux = ScopedMux::install(StdArc::new(Mux::new(None)));
+    fn tmux_child_kill_waits_for_matching_remote_success() {
+        let (_mux, domain) = install_tmux_domain(99);
         let child_state = Arc::new(TmuxChildState::new());
-        let cmd_queue = Arc::new(Mutex::new(TmuxCmdQueue::new()));
-        let mut child = TmuxChild::new(7, 99, cmd_queue.clone(), child_state.clone(), Weak::new());
+        let cmd_queue = Arc::clone(&domain.inner.cmd_queue);
+        let mut child = TmuxChild::new(
+            domain.inner.domain_id,
+            99,
+            Arc::clone(&cmd_queue),
+            Arc::clone(&child_state),
+            Arc::downgrade(&domain.inner),
+        );
 
         child.kill().expect("kill");
 
         let queued = cmd_queue.lock();
         assert_eq!(queued.len(), 1);
         assert_eq!(
-            queued.front().expect("queued command").get_command(7),
+            queued
+                .front()
+                .expect("queued command")
+                .get_command(domain.inner.domain_id),
             "kill-pane -t %99\n"
         );
+        assert!(
+            child_state.try_wait().is_none(),
+            "durable admission is not remote kill confirmation"
+        );
+        queued
+            .front()
+            .expect("queued command")
+            .process_result(
+                domain.inner.domain_id,
+                &Guarded {
+                    error: false,
+                    timestamp: 0,
+                    number: 0,
+                    flags: 0,
+                    output: String::new(),
+                },
+            )
+            .expect("matching kill response");
         drop(queued);
 
         let status = child_state.try_wait().expect("child marked exited");
@@ -432,15 +537,21 @@ mod tests {
 
     #[test]
     fn tmux_child_kill_fails_domain_closed_when_mailbox_is_full() {
-        let _mux = ScopedMux::install(StdArc::new(Mux::new(None)));
-        let domain = TmuxDomain::new(99);
+        let (_mux, domain) = install_tmux_domain(99);
         {
             let mut queue = domain.inner.cmd_queue.lock();
-            for _ in 0..CMD_QUEUE_MAX_DEPTH {
-                queue
-                    .push_back(Box::new(ListCommands))
-                    .expect("test setup should fill the mailbox exactly");
+            while queue.push_back(Box::new(ListCommands)).is_ok() {}
+            loop {
+                let result = queue.push_back(Box::new(KillPane {
+                    pane_id: 1,
+                    child_state: Arc::new(TmuxChildState::new()),
+                }));
+                if result == Err(TmuxEnqueueError::Full) {
+                    break;
+                }
+                result.expect("terminal reserve should accept only terminal control");
             }
+            assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH);
         }
         let child_state = Arc::new(TmuxChildState::new());
         let mut child = TmuxChild::new(
@@ -470,12 +581,13 @@ mod tests {
 
     #[test]
     fn tmux_pty_writer_reports_consumed_bytes_and_preserves_send_keys() {
-        let _mux = ScopedMux::install(StdArc::new(Mux::new(None)));
-        let cmd_queue = Arc::new(Mutex::new(TmuxCmdQueue::new()));
+        let (_mux, domain) = install_tmux_domain(100);
+        let cmd_queue = Arc::clone(&domain.inner.cmd_queue);
         let mut writer = TmuxPtyWriter {
-            domain_id: 7,
+            domain_id: domain.inner.domain_id,
             master_pane: remote_pane(99),
             cmd_queue: Arc::clone(&cmd_queue),
+            owner: Arc::downgrade(&domain.inner),
         };
 
         assert_eq!(writer.write(b"ab").expect("accepted tmux write"), 2);
@@ -491,12 +603,13 @@ mod tests {
 
     #[test]
     fn tmux_pty_writer_chunks_large_paste_before_mailbox_allocation() {
-        let _mux = ScopedMux::install(StdArc::new(Mux::new(None)));
-        let cmd_queue = Arc::new(Mutex::new(TmuxCmdQueue::new()));
+        let (_mux, domain) = install_tmux_domain(101);
+        let cmd_queue = Arc::clone(&domain.inner.cmd_queue);
         let mut writer = TmuxPtyWriter {
-            domain_id: 7,
+            domain_id: domain.inner.domain_id,
             master_pane: remote_pane(99),
             cmd_queue: Arc::clone(&cmd_queue),
+            owner: Arc::downgrade(&domain.inner),
         };
         let paste = vec![b'x'; TMUX_WRITE_CHUNK_BYTES + 1];
 
@@ -525,6 +638,7 @@ mod tests {
             master_pane,
             reader,
             cmd_queue,
+            owner: Weak::new(),
         };
 
         let write_err = pty.write(b"x").expect_err("closed write must fail");

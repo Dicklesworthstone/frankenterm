@@ -3,7 +3,9 @@ use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use crate::localpane::LocalPane;
 use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
-use crate::tmux_commands::{ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand};
+use crate::tmux_commands::{
+    ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand, TmuxCommandClass,
+};
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
 use crate::{
@@ -369,6 +371,24 @@ pub(crate) const CMD_QUEUE_MAX_DEPTH: usize = 50_000;
 /// Aggregate retained `SendKeys` payload across queued, preparing, and
 /// in-flight commands. The count cap alone cannot bound a single paste.
 pub(crate) const CMD_QUEUE_MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Non-control work may consume at most this many retained command slots.
+/// The remainder is progress authority reserved for required and terminal
+/// control, even when key input and resize/focus storms arrive concurrently.
+const CMD_QUEUE_CONTROL_RESERVED_SLOTS: usize = 4_096;
+
+/// Required non-terminal control may not consume these final slots. A remote
+/// pane can therefore always admit bounded terminal control after saturation.
+const CMD_QUEUE_TERMINAL_RESERVED_SLOTS: usize = 64;
+
+/// Coalescible intents have their own bounded lane. This is deliberately
+/// smaller than the aggregate queue and independent of lossless input.
+const CMD_QUEUE_INTENT_MAX_DEPTH: usize = 4_096;
+
+/// Preserve FIFO order within the durable lane while guaranteeing that a
+/// retained latest-intent resize/focus command is serviced after at most this
+/// many additional durable commands.
+const CMD_QUEUE_DURABLE_SERVICE_QUANTUM: usize = 32;
 
 /// Events received after a guarded command response must wait for that
 /// response's main-thread mutation to commit. Bound the barrier so a stalled
@@ -1048,13 +1068,22 @@ pub(crate) struct TmuxNotificationIntentTelemetrySnapshot {
 
 #[derive(Debug)]
 pub(crate) struct TmuxCmdQueue {
-    entries: VecDeque<Box<dyn TmuxCommand>>,
+    durable_entries: VecDeque<Box<dyn TmuxCommand>>,
+    intent_entries: VecDeque<Box<dyn TmuxCommand>>,
     in_flight: Option<InFlightTmuxCommand>,
-    preparing_payload_bytes: Option<usize>,
+    preparing: Option<PreparingTmuxCommand>,
+    retained_by_class: [usize; TmuxCommandClass::COUNT],
+    durable_since_intent: usize,
     payload_bytes: usize,
     closed: bool,
     rejected_commands: u64,
     merged_commands: u64,
+}
+
+#[derive(Debug)]
+struct PreparingTmuxCommand {
+    class: TmuxCommandClass,
+    payload_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1178,6 +1207,7 @@ pub(crate) struct InFlightTmuxCommand {
 pub(crate) enum TmuxEnqueueError {
     Closed,
     Full,
+    ClassMismatch,
 }
 
 impl fmt::Display for TmuxEnqueueError {
@@ -1185,18 +1215,53 @@ impl fmt::Display for TmuxEnqueueError {
         match self {
             Self::Closed => f.write_str("tmux command mailbox is closed"),
             Self::Full => f.write_str("tmux command mailbox is full"),
+            Self::ClassMismatch => {
+                f.write_str("tmux command does not belong to the required admission class")
+            }
         }
     }
 }
 
 impl std::error::Error for TmuxEnqueueError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TmuxScheduleError {
+    SchedulerUnavailable,
+    MuxUnavailable,
+    DomainUnavailable,
+    WrongDomainType,
+    ReplacedDomain,
+}
+
+impl fmt::Display for TmuxScheduleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SchedulerUnavailable => {
+                f.write_str("the main-thread scheduler is unavailable")
+            }
+            Self::MuxUnavailable => f.write_str("the active mux is unavailable"),
+            Self::DomainUnavailable => f.write_str("the tmux domain is not registered"),
+            Self::WrongDomainType => {
+                f.write_str("the registered domain is not a tmux domain")
+            }
+            Self::ReplacedDomain => {
+                f.write_str("the registered tmux domain is a replacement instance")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TmuxScheduleError {}
+
 impl TmuxCmdQueue {
     pub(crate) fn new() -> Self {
         Self {
-            entries: VecDeque::new(),
+            durable_entries: VecDeque::new(),
+            intent_entries: VecDeque::new(),
             in_flight: None,
-            preparing_payload_bytes: None,
+            preparing: None,
+            retained_by_class: [0; TmuxCommandClass::COUNT],
+            durable_since_intent: 0,
             payload_bytes: 0,
             closed: false,
             rejected_commands: 0,
@@ -1212,29 +1277,57 @@ impl TmuxCmdQueue {
             return Err(TmuxEnqueueError::Closed);
         }
 
+        let class = cmd.mailbox_class();
         let incoming_payload_bytes = cmd.mailbox_payload_bytes();
         let Some(next_payload_bytes) = self.payload_bytes.checked_add(incoming_payload_bytes)
         else {
-            return self.reject_full("payload byte accounting overflow");
+            return self.reject_full(class, "payload byte accounting overflow");
         };
         if next_payload_bytes > CMD_QUEUE_MAX_PAYLOAD_BYTES {
-            return self.reject_full("payload byte cap");
+            return self.reject_full(class, "payload byte cap");
         }
 
-        if let Some(last) = self.entries.back_mut() {
-            if last.try_merge_newer(cmd.as_ref()) {
-                self.payload_bytes = next_payload_bytes;
-                self.merged_commands = self.merged_commands.saturating_add(1);
-                return Ok(());
-            }
+        let merged = {
+            let lane = match class {
+                TmuxCommandClass::CoalescibleIntent => &mut self.intent_entries,
+                TmuxCommandClass::LosslessInput
+                | TmuxCommandClass::RequiredControl
+                | TmuxCommandClass::TerminalControl => &mut self.durable_entries,
+            };
+            lane.back_mut()
+                .is_some_and(|last| last.try_merge_newer(cmd.as_ref()))
+        };
+        if merged {
+            self.payload_bytes = next_payload_bytes;
+            self.merged_commands = self.merged_commands.saturating_add(1);
+            metrics::counter!(
+                "mux.tmux.command_mailbox.admitted",
+                "class" => class.label(),
+                "disposition" => "merged",
+            )
+            .increment(1);
+            return Ok(());
         }
 
-        if self.len() >= CMD_QUEUE_MAX_DEPTH {
-            return self.reject_full("command count cap");
+        if !self.can_admit_count(class, 1) {
+            return self.reject_full(class, "semantic class command count cap");
         }
 
-        self.entries.push_back(cmd);
+        match class {
+            TmuxCommandClass::CoalescibleIntent => self.intent_entries.push_back(cmd),
+            TmuxCommandClass::LosslessInput
+            | TmuxCommandClass::RequiredControl
+            | TmuxCommandClass::TerminalControl => self.durable_entries.push_back(cmd),
+        }
+        self.retained_by_class[class.index()] =
+            self.retained_by_class[class.index()].saturating_add(1);
         self.payload_bytes = next_payload_bytes;
+        metrics::counter!(
+            "mux.tmux.command_mailbox.admitted",
+            "class" => class.label(),
+            "disposition" => "queued",
+        )
+        .increment(1);
         if self.len() == CMD_QUEUE_WARNING_DEPTH.saturating_add(1) {
             log::warn!(
                 "tmux command queue depth exceeds {} threshold; possible protocol churn",
@@ -1257,31 +1350,64 @@ impl TmuxCmdQueue {
         if commands.is_empty() {
             return Ok(());
         }
+        if commands
+            .iter()
+            .any(|command| command.mailbox_class() != TmuxCommandClass::RequiredControl)
+        {
+            self.rejected_commands = self.rejected_commands.saturating_add(1);
+            metrics::counter!(
+                "mux.tmux.command_mailbox.rejected",
+                "class" => TmuxCommandClass::RequiredControl.label(),
+                "reason" => "class_mismatch",
+            )
+            .increment(1);
+            return Err(TmuxEnqueueError::ClassMismatch);
+        }
 
         let incoming_payload_bytes = commands.iter().try_fold(0usize, |total, command| {
             total.checked_add(command.mailbox_payload_bytes())
         });
         let Some(incoming_payload_bytes) = incoming_payload_bytes else {
-            return self.reject_full("required batch payload accounting overflow");
+            return self.reject_full(
+                TmuxCommandClass::RequiredControl,
+                "required batch payload accounting overflow",
+            );
         };
         let Some(next_payload_bytes) = self.payload_bytes.checked_add(incoming_payload_bytes)
         else {
-            return self.reject_full("required batch aggregate payload accounting overflow");
+            return self.reject_full(
+                TmuxCommandClass::RequiredControl,
+                "required batch aggregate payload accounting overflow",
+            );
         };
         if next_payload_bytes > CMD_QUEUE_MAX_PAYLOAD_BYTES {
-            return self.reject_full("required batch payload byte cap");
+            return self.reject_full(
+                TmuxCommandClass::RequiredControl,
+                "required batch payload byte cap",
+            );
         }
-        let Some(next_depth) = self.len().checked_add(commands.len()) else {
-            return self.reject_full("required batch command count accounting overflow");
-        };
-        if next_depth > CMD_QUEUE_MAX_DEPTH {
-            return self.reject_full("required batch command count cap");
+        if !self.can_admit_count(TmuxCommandClass::RequiredControl, commands.len()) {
+            return self.reject_full(
+                TmuxCommandClass::RequiredControl,
+                "required batch command count cap",
+            );
         }
 
+        let next_depth = self.len().saturating_add(commands.len());
         let crossed_warning_threshold =
             self.len() <= CMD_QUEUE_WARNING_DEPTH && next_depth > CMD_QUEUE_WARNING_DEPTH;
-        self.entries.extend(commands);
+        let incoming_count = commands.len();
+        self.durable_entries.extend(commands);
+        self.retained_by_class[TmuxCommandClass::RequiredControl.index()] = self.retained_by_class
+            [TmuxCommandClass::RequiredControl.index()]
+        .saturating_add(incoming_count);
         self.payload_bytes = next_payload_bytes;
+        metrics::counter!(
+            "mux.tmux.command_mailbox.admitted",
+            "class" => TmuxCommandClass::RequiredControl.label(),
+            "disposition" => "required_batch",
+        )
+        .increment(u64::try_from(incoming_count).unwrap_or(u64::MAX));
         if crossed_warning_threshold {
             log::warn!(
                 "tmux command queue depth exceeds {} threshold; possible protocol churn",
@@ -1291,12 +1417,67 @@ impl TmuxCmdQueue {
         Ok(())
     }
 
-    fn reject_full(&mut self, reason: &str) -> Result<(), TmuxEnqueueError> {
+    fn can_admit_count(&self, class: TmuxCommandClass, incoming: usize) -> bool {
+        let Some(next_total) = self.len().checked_add(incoming) else {
+            return false;
+        };
+        if next_total > CMD_QUEUE_MAX_DEPTH {
+            return false;
+        }
+
+        let terminal = self.retained_by_class[TmuxCommandClass::TerminalControl.index()];
+        let Some(non_terminal) = self.len().checked_sub(terminal) else {
+            return false;
+        };
+        let lossless = self.retained_by_class[TmuxCommandClass::LosslessInput.index()];
+        let intent = self.retained_by_class[TmuxCommandClass::CoalescibleIntent.index()];
+        let Some(non_control) = lossless.checked_add(intent) else {
+            return false;
+        };
+        let non_terminal_capacity = non_terminal
+            .checked_add(incoming)
+            .is_some_and(|next| next <= CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS);
+
+        match class {
+            TmuxCommandClass::TerminalControl => true,
+            TmuxCommandClass::RequiredControl => non_terminal_capacity,
+            TmuxCommandClass::LosslessInput => {
+                non_terminal_capacity
+                    && non_control.checked_add(incoming).is_some_and(|next| {
+                        next <= CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_CONTROL_RESERVED_SLOTS
+                    })
+            }
+            TmuxCommandClass::CoalescibleIntent => {
+                let class_count =
+                    self.retained_by_class[TmuxCommandClass::CoalescibleIntent.index()];
+                non_terminal_capacity
+                    && class_count
+                        .checked_add(incoming)
+                        .is_some_and(|next| next <= CMD_QUEUE_INTENT_MAX_DEPTH)
+                    && non_control.checked_add(incoming).is_some_and(|next| {
+                        next <= CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_CONTROL_RESERVED_SLOTS
+                    })
+            }
+        }
+    }
+
+    fn reject_full(
+        &mut self,
+        class: TmuxCommandClass,
+        reason: &str,
+    ) -> Result<(), TmuxEnqueueError> {
         self.rejected_commands = self.rejected_commands.saturating_add(1);
+        metrics::counter!(
+            "mux.tmux.command_mailbox.rejected",
+            "class" => class.label(),
+            "reason" => "capacity",
+        )
+        .increment(1);
         if self.rejected_commands.is_power_of_two() {
             log::error!(
-                "tmux command queue rejected work at {reason}; depth={}, payload_bytes={}, \
+                "tmux command queue rejected {} work at {reason}; depth={}, payload_bytes={}, \
                  rejected={} in this queue lifetime",
+                class.label(),
                 self.len(),
                 self.payload_bytes,
                 self.rejected_commands
@@ -1309,9 +1490,13 @@ impl TmuxCmdQueue {
         &mut self,
     ) -> (VecDeque<Box<dyn TmuxCommand>>, Option<InFlightTmuxCommand>) {
         self.closed = true;
-        self.preparing_payload_bytes = None;
+        self.preparing = None;
+        self.retained_by_class = [0; TmuxCommandClass::COUNT];
+        self.durable_since_intent = 0;
         self.payload_bytes = 0;
-        (std::mem::take(&mut self.entries), self.in_flight.take())
+        let mut abandoned = std::mem::take(&mut self.durable_entries);
+        abandoned.extend(std::mem::take(&mut self.intent_entries));
+        (abandoned, self.in_flight.take())
     }
 
     #[cfg(test)]
@@ -1320,16 +1505,18 @@ impl TmuxCmdQueue {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-            + usize::from(self.in_flight.is_some())
-            + usize::from(self.preparing_payload_bytes.is_some())
+        self.retained_by_class
+            .iter()
+            .copied()
+            .fold(0usize, usize::saturating_add)
     }
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.durable_entries.is_empty()
+            && self.intent_entries.is_empty()
             && self.in_flight.is_none()
-            && self.preparing_payload_bytes.is_none()
+            && self.preparing.is_none()
     }
 
     #[cfg(test)]
@@ -1337,19 +1524,44 @@ impl TmuxCmdQueue {
         self.in_flight
             .as_ref()
             .map(|in_flight| in_flight.command.as_ref())
-            .or_else(|| self.entries.front().map(Box::as_ref))
+            .or_else(|| {
+                if self.should_service_intent() {
+                    self.intent_entries.front().map(Box::as_ref)
+                } else {
+                    self.durable_entries.front().map(Box::as_ref)
+                }
+            })
     }
 
     fn take_next_for_preparation(&mut self) -> Option<Box<dyn TmuxCommand>> {
-        debug_assert!(self.preparing_payload_bytes.is_none());
-        let command = self.entries.pop_front()?;
-        self.preparing_payload_bytes = Some(command.mailbox_payload_bytes());
+        debug_assert!(self.preparing.is_none());
+        let service_intent = self.should_service_intent();
+        let command = if service_intent {
+            self.durable_since_intent = 0;
+            self.intent_entries.pop_front()?
+        } else {
+            self.durable_since_intent = self.durable_since_intent.saturating_add(1);
+            self.durable_entries.pop_front()?
+        };
+        self.preparing = Some(PreparingTmuxCommand {
+            class: command.mailbox_class(),
+            payload_bytes: command.mailbox_payload_bytes(),
+        });
+        metrics::counter!(
+            "mux.tmux.command_mailbox.serviced",
+            "class" => command.mailbox_class().label(),
+        )
+        .increment(1);
         Some(command)
     }
 
     fn release_prepared(&mut self) {
-        if let Some(payload_bytes) = self.preparing_payload_bytes.take() {
-            self.payload_bytes = self.payload_bytes.saturating_sub(payload_bytes);
+        if let Some(preparing) = self.preparing.take() {
+            self.payload_bytes = self
+                .payload_bytes
+                .saturating_sub(preparing.payload_bytes);
+            self.retained_by_class[preparing.class.index()] =
+                self.retained_by_class[preparing.class.index()].saturating_sub(1);
         }
     }
 
@@ -1359,10 +1571,13 @@ impl TmuxCmdQueue {
             false
         } else {
             debug_assert_eq!(
-                self.preparing_payload_bytes,
-                Some(cmd.mailbox_payload_bytes())
+                self.preparing.as_ref().map(|preparing| (
+                    preparing.class,
+                    preparing.payload_bytes
+                )),
+                Some((cmd.mailbox_class(), cmd.mailbox_payload_bytes()))
             );
-            self.preparing_payload_bytes = None;
+            self.preparing = None;
             let remaining_responses = cmd.expected_responses();
             debug_assert!(remaining_responses > 0);
             self.in_flight = Some(InFlightTmuxCommand {
@@ -1388,6 +1603,9 @@ impl TmuxCmdQueue {
         }
 
         let mut in_flight = self.in_flight.take()?;
+        let class = in_flight.command.mailbox_class();
+        self.retained_by_class[class.index()] =
+            self.retained_by_class[class.index()].saturating_sub(1);
         self.payload_bytes = self
             .payload_bytes
             .saturating_sub(in_flight.command.mailbox_payload_bytes());
@@ -1399,7 +1617,13 @@ impl TmuxCmdQueue {
     }
 
     fn has_pending(&self) -> bool {
-        !self.entries.is_empty()
+        !self.durable_entries.is_empty() || !self.intent_entries.is_empty()
+    }
+
+    fn should_service_intent(&self) -> bool {
+        !self.intent_entries.is_empty()
+            && (self.durable_entries.is_empty()
+                || self.durable_since_intent >= CMD_QUEUE_DURABLE_SERVICE_QUANTUM)
     }
 }
 
@@ -1484,12 +1708,23 @@ impl Drop for DetachScheduleLease {
 }
 
 struct SendScheduleLease {
-    scheduled: Arc<AtomicBool>,
+    owner: Arc<TmuxDomainState>,
+    completed: bool,
 }
 
 impl Drop for SendScheduleLease {
     fn drop(&mut self) {
-        self.scheduled.store(false, Ordering::Release);
+        self.owner
+            .send_task_scheduled
+            .store(false, Ordering::Release);
+        if !self.completed && !self.owner.is_terminal() {
+            log::error!(
+                "tmux domain {} lost its scheduled sender runnable; detaching instead of \
+                 stranding durably admitted commands",
+                self.owner.domain_id
+            );
+            self.owner.transition_to_exit_and_schedule_detach();
+        }
     }
 }
 
@@ -1953,16 +2188,16 @@ impl TmuxDomainState {
             queue.push_required_batch(commands)
         };
         match enqueue_result {
-            Ok(()) => {
-                Self::schedule_send_next_command(self.domain_id);
-                Ok(())
-            }
+            Ok(()) => self.require_send_schedule(context),
             Err(err) => {
                 let error = anyhow::anyhow!(
                     "required tmux command admission failed for domain {} during {context}: {err}",
                     self.domain_id
                 );
-                if matches!(err, TmuxEnqueueError::Full) {
+                if matches!(
+                    err,
+                    TmuxEnqueueError::Full | TmuxEnqueueError::ClassMismatch
+                ) {
                     self.transition_to_exit_and_schedule_detach();
                 }
                 Err(error)
@@ -2272,7 +2507,7 @@ impl TmuxDomainState {
             *self.state.lock() == State::Idle && cmd_queue.has_pending()
         };
         if should_schedule {
-            TmuxDomainState::schedule_send_next_command(self.domain_id);
+            let _ = self.require_send_schedule("protocol ingress completion");
         }
         None
     }
@@ -2473,7 +2708,7 @@ impl TmuxDomainState {
                 }
                 return;
             }
-            TmuxDomainState::schedule_send_next_command(self.domain_id);
+            let _ = self.require_send_schedule("protocol response barrier drain");
             return;
         }
     }
@@ -2484,7 +2719,7 @@ impl TmuxDomainState {
             return;
         }
         if self.transition_state(State::ProcessingResponse, State::Idle) {
-            TmuxDomainState::schedule_send_next_command(self.domain_id);
+            let _ = self.require_send_schedule("test command-result completion");
         }
     }
 
@@ -2572,13 +2807,28 @@ impl TmuxDomainState {
         *self.state.lock() == State::Idle && cmd_queue.has_pending()
     }
 
-    fn try_claim_send_schedule(&self) -> Option<SendScheduleLease> {
+    fn try_claim_send_schedule(&self) -> bool {
         self.send_task_scheduled
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        Some(SendScheduleLease {
-            scheduled: Arc::clone(&self.send_task_scheduled),
-        })
+            .is_ok()
+    }
+
+    pub(crate) fn require_send_schedule(&self, context: &str) -> anyhow::Result<()> {
+        match self.schedule_send_next_command() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                log::error!(
+                    "tmux domain {} cannot schedule durably admitted work during {context}: \
+                     {err}; detaching",
+                    self.domain_id
+                );
+                self.transition_to_exit_and_schedule_detach();
+                Err(anyhow::anyhow!(
+                    "tmux sender scheduling failed for domain {} during {context}: {err}",
+                    self.domain_id
+                ))
+            }
+        }
     }
 
     /// Edge-trigger one main-thread sender runnable per tmux domain.
@@ -2586,41 +2836,65 @@ impl TmuxDomainState {
     /// The runnable releases its scheduling lease before checking for more
     /// work. An enqueue racing that boundary therefore either schedules its
     /// own runnable or is observed by the lost-wakeup recheck below.
-    pub fn schedule_send_next_command(domain_id: usize) {
+    pub fn schedule_send_next_command(&self) -> Result<(), TmuxScheduleError> {
         if !promise::spawn::is_scheduler_configured() {
-            return;
+            return Err(TmuxScheduleError::SchedulerUnavailable);
         }
-        let Some(mux) = Mux::try_get() else {
-            return;
-        };
-        let Some(domain) = mux.get_domain(domain_id) else {
-            return;
-        };
-        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
-            return;
-        };
-        let Some(schedule_lease) = tmux_domain.inner.try_claim_send_schedule() else {
-            return;
-        };
-
+        let mux = Mux::try_get().ok_or(TmuxScheduleError::MuxUnavailable)?;
+        let domain = mux
+            .get_domain(self.domain_id)
+            .ok_or(TmuxScheduleError::DomainUnavailable)?;
+        let tmux_domain = domain
+            .downcast_ref::<TmuxDomain>()
+            .ok_or(TmuxScheduleError::WrongDomainType)?;
+        if !std::ptr::eq(tmux_domain.inner.as_ref(), self) {
+            return Err(TmuxScheduleError::ReplacedDomain);
+        }
         let scheduled_inner = Arc::clone(&tmux_domain.inner);
+        if !scheduled_inner.try_claim_send_schedule() {
+            return Ok(());
+        }
+        let schedule_lease = SendScheduleLease {
+            owner: Arc::clone(&scheduled_inner),
+            completed: false,
+        };
         promise::spawn::spawn_into_main_thread(async move {
-            if let Some(mux) = Mux::try_get() {
-                if let Some(domain) = mux.get_domain(domain_id) {
-                    if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                        if Arc::ptr_eq(&scheduled_inner, &tmux_domain.inner) {
-                            tmux_domain.send_next_command();
-                        }
-                    }
-                }
+            let mut schedule_lease = schedule_lease;
+            let exact_registration = Mux::try_get()
+                .and_then(|mux| mux.get_domain(scheduled_inner.domain_id))
+                .and_then(|domain| {
+                    domain
+                        .downcast_ref::<TmuxDomain>()
+                        .map(|tmux_domain| Arc::ptr_eq(&scheduled_inner, &tmux_domain.inner))
+                })
+                .unwrap_or(false);
+            if !exact_registration {
+                log::error!(
+                    "tmux domain {} lost its exact registration before its sender runnable; \
+                     detaching the stale instance",
+                    scheduled_inner.domain_id
+                );
+                scheduled_inner.transition_to_exit_and_schedule_detach();
+                schedule_lease.completed = true;
+                return;
             }
 
+            scheduled_inner.send_next_command();
+            schedule_lease.completed = true;
             drop(schedule_lease);
             if scheduled_inner.should_schedule_send() {
-                TmuxDomainState::schedule_send_next_command(domain_id);
+                if let Err(err) = scheduled_inner.schedule_send_next_command() {
+                    log::error!(
+                        "tmux domain {} lost sender progress while rechecking its mailbox: {err}; \
+                         detaching",
+                        scheduled_inner.domain_id
+                    );
+                    scheduled_inner.transition_to_exit_and_schedule_detach();
+                }
             }
         })
         .detach();
+        Ok(())
     }
 
     /// create a standalone window for tmux tabs
@@ -2776,9 +3050,6 @@ impl TmuxDomain {
         )
     }
 
-    fn send_next_command(&self) {
-        self.inner.send_next_command();
-    }
 }
 
 #[async_trait(?Send)]
@@ -2824,7 +3095,8 @@ impl Domain for TmuxDomain {
                     "duplicate tmux split request id {request_id}"
                 );
             }
-            TmuxDomainState::schedule_send_next_command(self.inner.domain_id);
+            self.inner
+                .require_send_schedule("split-pane command admission")?;
             drop(active_operation);
 
             let id = future
@@ -2926,10 +3198,12 @@ mod tests {
     use crate::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use crate::renderable::{RenderableDimensions, StableCursorPosition};
     use crate::tab::SplitDirection;
-    use crate::tmux_commands::{Resize, SendKeys, SplitPane, TmuxCommand};
+    use crate::tmux_commands::{
+        Resize, SendKeys, SplitPane, TmuxCommand, TmuxCommandClass,
+    };
     use frankenterm_term::color::ColorPalette;
     use parking_lot::{MappedMutexGuard, MutexGuard};
-    use promise::spawn::block_on;
+    use promise::spawn::{block_on, ScopedExecutor};
     use rangeset::RangeSet;
     use std::ops::Range;
     use std::sync::atomic::AtomicUsize;
@@ -2945,6 +3219,7 @@ mod tests {
 
     struct ScopedMux {
         prior: Option<Arc<Mux>>,
+        _executor: ScopedExecutor,
         _guard: StdMutexGuard<'static, ()>,
     }
 
@@ -2953,10 +3228,12 @@ mod tests {
             let guard = mux_test_lock()
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
+            let executor = ScopedExecutor::new();
             let prior = Mux::try_get();
             Mux::set_mux(&mux);
             Self {
                 prior,
+                _executor: executor,
                 _guard: guard,
             }
         }
@@ -2965,10 +3242,12 @@ mod tests {
             let guard = mux_test_lock()
                 .lock()
                 .unwrap_or_else(|err| err.into_inner());
+            let executor = ScopedExecutor::new();
             let prior = Mux::try_get();
             Mux::shutdown();
             Self {
                 prior,
+                _executor: executor,
                 _guard: guard,
             }
         }
@@ -3014,7 +3293,53 @@ mod tests {
         processed: Arc<AtomicBool>,
     }
 
+    #[derive(Debug)]
+    struct ClassedTestCommand {
+        class: TmuxCommandClass,
+        sequence: usize,
+    }
+
+    impl TmuxCommand for ClassedTestCommand {
+        fn mailbox_class(&self) -> TmuxCommandClass {
+            self.class
+        }
+
+        fn get_command(&self, _domain_id: DomainId) -> String {
+            format!("test-{}\n", self.sequence)
+        }
+
+        fn process_result(
+            &self,
+            _domain_id: DomainId,
+            _result: &Guarded,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn complete_next_mailbox_command(queue: &mut TmuxCmdQueue) -> Box<dyn TmuxCommand> {
+        let command = queue
+            .take_next_for_preparation()
+            .expect("mailbox command should be ready");
+        assert!(queue.install_in_flight(command));
+        let response = Guarded {
+            error: false,
+            timestamp: 0,
+            number: 0,
+            flags: 0,
+            output: String::new(),
+        };
+        queue
+            .record_in_flight_response(&response)
+            .expect("single-response test command should complete")
+            .0
+    }
+
     impl TmuxCommand for AssertSessionUnsetCommand {
+        fn mailbox_class(&self) -> TmuxCommandClass {
+            TmuxCommandClass::RequiredControl
+        }
+
         fn get_command(&self, _domain_id: DomainId) -> String {
             "assert-session-order\n".to_string()
         }
@@ -3034,6 +3359,10 @@ mod tests {
     }
 
     impl TmuxCommand for CountingCommand {
+        fn mailbox_class(&self) -> TmuxCommandClass {
+            TmuxCommandClass::RequiredControl
+        }
+
         fn get_command(&self, _domain_id: DomainId) -> String {
             "count\n".to_string()
         }
@@ -3637,7 +3966,8 @@ mod tests {
         inner: &Arc<TmuxDomainState>,
         processed: Arc<AtomicBool>,
     ) {
-        inner.cmd_queue.lock().in_flight = Some(InFlightTmuxCommand {
+        let mut queue = inner.cmd_queue.lock();
+        queue.in_flight = Some(InFlightTmuxCommand {
             command: Box::new(AssertSessionUnsetCommand {
                 owner: Arc::downgrade(inner),
                 processed,
@@ -3645,6 +3975,8 @@ mod tests {
             remaining_responses: 1,
             first_error: None,
         });
+        queue.retained_by_class[TmuxCommandClass::RequiredControl.index()] = 1;
+        drop(queue);
         *inner.state.lock() = State::WaitingForResponse;
     }
 
@@ -3736,13 +4068,17 @@ mod tests {
         let domain: Arc<dyn Domain> = tmux_domain.clone();
         mux.add_domain(&domain).expect("register tmux test domain");
         let processed = Arc::new(AtomicUsize::new(0));
-        tmux_domain.inner.cmd_queue.lock().in_flight = Some(InFlightTmuxCommand {
-            command: Box::new(CountingCommand {
-                processed: Arc::clone(&processed),
-            }),
-            remaining_responses: 1,
-            first_error: None,
-        });
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            queue.in_flight = Some(InFlightTmuxCommand {
+                command: Box::new(CountingCommand {
+                    processed: Arc::clone(&processed),
+                }),
+                remaining_responses: 1,
+                first_error: None,
+            });
+            queue.retained_by_class[TmuxCommandClass::RequiredControl.index()] = 1;
+        }
         *tmux_domain.inner.state.lock() = State::WaitingForResponse;
 
         let completed = tmux_domain
@@ -3934,19 +4270,51 @@ mod tests {
     #[test]
     fn tmux_send_schedule_is_single_flight_and_rearms_after_lease_drop() {
         let tmux_domain = TmuxDomain::new(98);
-        let first = tmux_domain
-            .inner
-            .try_claim_send_schedule()
-            .expect("first runnable must claim the scheduling edge");
         assert!(
-            tmux_domain.inner.try_claim_send_schedule().is_none(),
+            tmux_domain.inner.try_claim_send_schedule(),
+            "first runnable must claim the scheduling edge"
+        );
+        let first = SendScheduleLease {
+            owner: Arc::clone(&tmux_domain.inner),
+            completed: true,
+        };
+        assert!(
+            !tmux_domain.inner.try_claim_send_schedule(),
             "a producer burst must not allocate a second sender runnable"
         );
         drop(first);
         assert!(
-            tmux_domain.inner.try_claim_send_schedule().is_some(),
+            tmux_domain.inner.try_claim_send_schedule(),
             "dropping or cancelling the runnable must rearm scheduling"
         );
+        let rearmed = SendScheduleLease {
+            owner: Arc::clone(&tmux_domain.inner),
+            completed: true,
+        };
+        drop(rearmed);
+    }
+
+    #[test]
+    fn lost_tmux_sender_runnable_fails_durable_mailbox_closed() {
+        let tmux_domain = TmuxDomain::new(99);
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(ListCommands))
+            .expect("required control admission");
+        assert!(tmux_domain.inner.try_claim_send_schedule());
+        let lost = SendScheduleLease {
+            owner: Arc::clone(&tmux_domain.inner),
+            completed: false,
+        };
+
+        drop(lost);
+
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        assert!(queue.is_closed());
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -4393,11 +4761,11 @@ mod tests {
         mux.add_pane(&launcher_dyn).expect("add launcher pane");
 
         let tmux_domain = TmuxDomain::new(99);
-        // Every producer shares this mailbox, so it must enforce the cap even
-        // if the sender is stalled and never reaches a pop site.
+        // Required control retains terminal progress authority even if the
+        // sender is stalled and never reaches a pop site.
         {
             let mut queue = tmux_domain.inner.cmd_queue.lock();
-            for _ in 0..CMD_QUEUE_MAX_DEPTH {
+            for _ in 0..CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS {
                 assert!(queue.push_back(Box::new(ListCommands)).is_ok());
             }
             for _ in 0..100 {
@@ -4406,8 +4774,23 @@ mod tests {
                     Err(TmuxEnqueueError::Full)
                 );
             }
+            for sequence in 0..CMD_QUEUE_TERMINAL_RESERVED_SLOTS {
+                assert!(queue
+                    .push_back(Box::new(ClassedTestCommand {
+                        class: TmuxCommandClass::TerminalControl,
+                        sequence,
+                    }))
+                    .is_ok());
+            }
+            assert_eq!(
+                queue.push_back(Box::new(ClassedTestCommand {
+                    class: TmuxCommandClass::TerminalControl,
+                    sequence: CMD_QUEUE_TERMINAL_RESERVED_SLOTS,
+                })),
+                Err(TmuxEnqueueError::Full)
+            );
             assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH);
-            assert_eq!(queue.rejected_commands, 100);
+            assert_eq!(queue.rejected_commands, 101);
         }
     }
 
@@ -4442,7 +4825,7 @@ mod tests {
     #[test]
     fn required_batch_admission_is_atomic_at_command_cap() {
         let mut queue = TmuxCmdQueue::new();
-        for _ in 0..CMD_QUEUE_MAX_DEPTH - 1 {
+        for _ in 0..CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS - 1 {
             queue
                 .push_back(Box::new(ListCommands))
                 .expect("test setup should leave one mailbox slot");
@@ -4474,6 +4857,155 @@ mod tests {
     }
 
     #[test]
+    fn required_admission_fails_closed_when_sender_cannot_be_registered() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(mux);
+        let tmux_domain = TmuxDomain::new(404);
+
+        let err = tmux_domain
+            .inner
+            .enqueue_required(Box::new(ListCommands), "missing-domain test")
+            .expect_err("unregistered sender must not acknowledge required work");
+
+        assert!(err.to_string().contains("scheduling failed"));
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        assert!(queue.is_closed());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn semantic_capacity_reserves_control_and_terminal_progress_at_saturation() {
+        let mut queue = TmuxCmdQueue::new();
+        let non_control_limit = CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_CONTROL_RESERVED_SLOTS;
+        for sequence in 0..non_control_limit {
+            queue
+                .push_back(Box::new(ClassedTestCommand {
+                    class: TmuxCommandClass::LosslessInput,
+                    sequence,
+                }))
+                .expect("lossless input should fill only its bounded non-control capacity");
+        }
+        assert_eq!(
+            queue.push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::LosslessInput,
+                sequence: non_control_limit,
+            })),
+            Err(TmuxEnqueueError::Full),
+            "bulk input must not consume required-control progress authority",
+        );
+
+        let required_count =
+            CMD_QUEUE_CONTROL_RESERVED_SLOTS - CMD_QUEUE_TERMINAL_RESERVED_SLOTS;
+        let required_batch: Vec<Box<dyn TmuxCommand>> = (0..required_count)
+            .map(|sequence| {
+                Box::new(ClassedTestCommand {
+                    class: TmuxCommandClass::RequiredControl,
+                    sequence,
+                }) as Box<dyn TmuxCommand>
+            })
+            .collect();
+        queue
+            .push_required_batch(required_batch)
+            .expect("required initialization must terminate admission under input saturation");
+
+        for sequence in 0..CMD_QUEUE_TERMINAL_RESERVED_SLOTS {
+            queue
+                .push_back(Box::new(ClassedTestCommand {
+                    class: TmuxCommandClass::TerminalControl,
+                    sequence,
+                }))
+                .expect("terminal control must retain its final progress authority");
+        }
+        assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH);
+        assert_eq!(
+            queue.retained_by_class[TmuxCommandClass::LosslessInput.index()],
+            non_control_limit
+        );
+        assert_eq!(
+            queue.retained_by_class[TmuxCommandClass::RequiredControl.index()],
+            required_count
+        );
+        assert_eq!(
+            queue.retained_by_class[TmuxCommandClass::TerminalControl.index()],
+            CMD_QUEUE_TERMINAL_RESERVED_SLOTS
+        );
+    }
+
+    #[test]
+    fn required_batch_rejects_misclassified_commands_atomically() {
+        let mut queue = TmuxCmdQueue::new();
+        assert_eq!(
+            queue.push_required_batch(vec![Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::LosslessInput,
+                sequence: 1,
+            })]),
+            Err(TmuxEnqueueError::ClassMismatch),
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn coalescible_lane_meets_bounded_service_without_reordering_lossless_input() {
+        let mut queue = TmuxCmdQueue::new();
+        for sequence in 0..=CMD_QUEUE_DURABLE_SERVICE_QUANTUM {
+            queue
+                .push_back(Box::new(ClassedTestCommand {
+                    class: TmuxCommandClass::LosslessInput,
+                    sequence,
+                }))
+                .expect("durable test command");
+        }
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::CoalescibleIntent,
+                sequence: usize::MAX,
+            }))
+            .expect("coalescible intent");
+
+        for expected in 0..CMD_QUEUE_DURABLE_SERVICE_QUANTUM {
+            let completed = complete_next_mailbox_command(&mut queue);
+            assert_eq!(completed.mailbox_class(), TmuxCommandClass::LosslessInput);
+            assert_eq!(completed.get_command(0), format!("test-{expected}\n"));
+        }
+        let serviced_intent = complete_next_mailbox_command(&mut queue);
+        assert_eq!(
+            serviced_intent.mailbox_class(),
+            TmuxCommandClass::CoalescibleIntent,
+            "one latest-intent command must run after the bounded durable quantum",
+        );
+        let next_lossless = complete_next_mailbox_command(&mut queue);
+        assert_eq!(next_lossless.get_command(0), format!(
+            "test-{}\n",
+            CMD_QUEUE_DURABLE_SERVICE_QUANTUM
+        ));
+    }
+
+    #[test]
+    fn lossless_key_bytes_preserve_cross_pane_admission_order() {
+        let mut queue = TmuxCmdQueue::new();
+        for (pane, keys) in [(1, b"a".as_slice()), (2, b"b"), (1, b"c")] {
+            queue
+                .push_back(Box::new(SendKeys {
+                    pane,
+                    keys: keys.to_vec(),
+                }))
+                .expect("lossless key command");
+        }
+
+        let mut observed = Vec::new();
+        while !queue.is_empty() {
+            let completed = complete_next_mailbox_command(&mut queue);
+            let (pane, keys) = completed.as_send_keys().expect("send-keys command");
+            observed.push((pane, keys.to_vec()));
+        }
+        assert_eq!(
+            observed,
+            vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (1, b"c".to_vec())]
+        );
+    }
+
+    #[test]
     fn resize_remains_in_flight_until_both_guarded_responses_arrive() {
         let mut queue = TmuxCmdQueue::new();
         queue
@@ -4487,13 +5019,13 @@ mod tests {
                 },
             }))
             .expect("resize should be admitted");
-        queue
-            .push_back(Box::new(ListCommands))
-            .expect("following command should be admitted");
         let resize = queue
             .take_next_for_preparation()
             .expect("resize should enter preparation");
         assert!(queue.install_in_flight(resize));
+        queue
+            .push_back(Box::new(ListCommands))
+            .expect("following command should be admitted");
 
         let first_error = Guarded {
             error: true,
@@ -4583,7 +5115,7 @@ mod tests {
 
         *inner.state.lock() = State::WaitingForResponse;
 
-        for _ in 0..CMD_QUEUE_MAX_DEPTH - 1 {
+        for _ in 0..CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS - 1 {
             let mut queue = inner.cmd_queue.lock();
             assert!(inner
                 .push_command_capped(&mut queue, Box::new(ListCommands))
@@ -4596,7 +5128,10 @@ mod tests {
 
         let queue = inner.cmd_queue.lock();
 
-        assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH);
+        assert_eq!(
+            queue.len(),
+            CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS
+        );
         let head = queue
             .front()
             .expect("in-flight request must remain present");
@@ -4638,7 +5173,7 @@ mod tests {
         // set explicitly).
         *inner.state.lock() = State::Idle;
 
-        for _ in 0..CMD_QUEUE_MAX_DEPTH - 1 {
+        for _ in 0..CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS - 1 {
             let mut queue = inner.cmd_queue.lock();
             assert!(inner
                 .push_command_capped(&mut queue, Box::new(ListCommands))
@@ -4651,7 +5186,10 @@ mod tests {
 
         let queue = inner.cmd_queue.lock();
 
-        assert_eq!(queue.len(), CMD_QUEUE_MAX_DEPTH);
+        assert_eq!(
+            queue.len(),
+            CMD_QUEUE_MAX_DEPTH - CMD_QUEUE_TERMINAL_RESERVED_SLOTS
+        );
         let head = queue
             .front()
             .expect("queue must be non-empty after cap enforcement");

@@ -3,7 +3,8 @@ use async_executor::Executor;
 use flume::{bounded, unbounded, Receiver};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::ThreadId;
 
 pub use async_task::{Runnable, Task};
 pub type SpawnFunc = Box<dyn FnOnce() + Send>;
@@ -19,7 +20,9 @@ lazy_static::lazy_static! {
         Mutex::new(Arc::new(no_scheduler_configured));
     static ref ON_MAIN_THREAD_LOW_PRI: Mutex<SharedScheduleFunc> =
         Mutex::new(Arc::new(no_scheduler_configured));
-    static ref SCOPED_EXECUTOR: Mutex<Option<Arc<Executor<'static>>>> = Mutex::new(None);
+    static ref SCOPED_EXECUTOR: Mutex<ScopedExecutorRegistry> =
+        Mutex::new(ScopedExecutorRegistry::default());
+    static ref SCOPED_EXECUTOR_AVAILABLE: Condvar = Condvar::new();
 }
 
 static SCHEDULER_CONFIGURED: AtomicBool = AtomicBool::new(false);
@@ -127,6 +130,7 @@ fn schedule_runnable(runnable: Runnable, high_pri: bool) {
 
 pub fn is_scheduler_configured() -> bool {
     SCHEDULER_CONFIGURED.load(Ordering::Relaxed)
+        || lock_or_recover(&SCOPED_EXECUTOR).executor.is_some()
 }
 
 /// Set callbacks for scheduling normal and low priority futures.
@@ -176,7 +180,10 @@ where
 }
 
 fn get_scoped() -> Option<Arc<Executor<'static>>> {
-    lock_or_recover(&SCOPED_EXECUTOR).as_ref().map(Arc::clone)
+    lock_or_recover(&SCOPED_EXECUTOR)
+        .executor
+        .as_ref()
+        .map(Arc::clone)
 }
 
 /// Spawn a future into the main thread; it will be polled in the
@@ -370,7 +377,17 @@ impl SimpleExecutor {
     }
 }
 
-pub struct ScopedExecutor {}
+#[derive(Default)]
+struct ScopedExecutorRegistry {
+    executor: Option<Arc<Executor<'static>>>,
+    owner: Option<ThreadId>,
+    depth: usize,
+}
+
+pub struct ScopedExecutor {
+    executor: Option<Arc<Executor<'static>>>,
+    owner: ThreadId,
+}
 
 impl Default for ScopedExecutor {
     fn default() -> Self {
@@ -380,14 +397,50 @@ impl Default for ScopedExecutor {
 
 impl ScopedExecutor {
     pub fn new() -> Self {
-        lock_or_recover(&SCOPED_EXECUTOR).replace(Arc::new(Executor::new()));
-
-        Self {}
+        let owner = std::thread::current().id();
+        let mut registry = lock_or_recover(&SCOPED_EXECUTOR);
+        loop {
+            match (&registry.executor, registry.owner.as_ref()) {
+                (Some(executor), Some(current_owner)) if current_owner == &owner => {
+                    let executor = Arc::clone(executor);
+                    registry.depth = registry
+                        .depth
+                        .checked_add(1)
+                        .expect("scoped executor nesting depth overflow");
+                    return Self {
+                        executor: Some(executor),
+                        owner,
+                    };
+                }
+                (Some(_), Some(_)) => {
+                    registry = SCOPED_EXECUTOR_AVAILABLE
+                        .wait(registry)
+                        .unwrap_or_else(|poisoned| {
+                            SCOPED_EXECUTOR.clear_poison();
+                            poisoned.into_inner()
+                        });
+                }
+                (None, None) => {
+                    let executor = Arc::new(Executor::new());
+                    registry.executor = Some(Arc::clone(&executor));
+                    registry.owner = Some(owner);
+                    registry.depth = 1;
+                    return Self {
+                        executor: Some(executor),
+                        owner,
+                    };
+                }
+                _ => {
+                    panic!("scoped executor registry entered an inconsistent state");
+                }
+            }
+        }
     }
 
     pub async fn run<T>(&self, future: impl Future<Output = T>) -> T {
-        get_scoped()
-            .expect("SCOPED_EXECUTOR to be alive as long as ScopedExecutor")
+        self.executor
+            .as_ref()
+            .expect("ScopedExecutor::run called after executor release")
             .run(future)
             .await
     }
@@ -395,14 +448,52 @@ impl ScopedExecutor {
 
 impl Drop for ScopedExecutor {
     fn drop(&mut self) {
-        lock_or_recover(&SCOPED_EXECUTOR).take();
+        let Some(executor) = self.executor.take() else {
+            return;
+        };
+        let registered = {
+            let mut registry = lock_or_recover(&SCOPED_EXECUTOR);
+            assert_eq!(
+                registry.owner.as_ref(),
+                Some(&self.owner),
+                "scoped executor dropped without owning the registry"
+            );
+            assert!(
+                registry
+                    .executor
+                    .as_ref()
+                    .is_some_and(|registered| Arc::ptr_eq(registered, &executor)),
+                "scoped executor dropped after its registry entry was replaced"
+            );
+            registry.depth = registry
+                .depth
+                .checked_sub(1)
+                .expect("scoped executor nesting depth underflow");
+            if registry.depth == 0 {
+                registry.owner = None;
+                registry.executor.take()
+            } else {
+                None
+            }
+        };
+
+        // The executor owns detached futures whose destructors may query this
+        // registry. Drop every final reference outside the mutex, and only then
+        // admit another thread's scope; otherwise a destructor could dispatch
+        // into an unrelated replacement executor.
+        let released_registry = registered.is_some();
+        drop(registered);
+        drop(executor);
+        if released_registry {
+            SCOPED_EXECUTOR_AVAILABLE.notify_one();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
+    use std::sync::{Barrier, Mutex as StdMutex};
     use std::time::{Duration, Instant};
 
     // Serialize spawn tests that touch global scheduler state
@@ -496,6 +587,81 @@ mod tests {
         let result = block_on(exec.run(task));
         assert_eq!(result, 789);
         drop(exec);
+    }
+
+    #[test]
+    fn scoped_executor_is_a_configured_scheduler() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let globally_configured = SCHEDULER_CONFIGURED.swap(false, Ordering::Relaxed);
+        let exec = ScopedExecutor::new();
+
+        assert!(is_scheduler_configured());
+
+        drop(exec);
+        SCHEDULER_CONFIGURED.store(globally_configured, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn scoped_executor_releases_registry_before_dropping_futures() {
+        struct RegistryLockProbe(Arc<AtomicBool>);
+
+        impl Drop for RegistryLockProbe {
+            fn drop(&mut self) {
+                self.0
+                    .store(SCOPED_EXECUTOR.try_lock().is_ok(), Ordering::Release);
+            }
+        }
+
+        let _lock = TEST_LOCK.lock().unwrap();
+        let observed_unlocked_registry = Arc::new(AtomicBool::new(false));
+        let probe = RegistryLockProbe(Arc::clone(&observed_unlocked_registry));
+        let exec = ScopedExecutor::new();
+        spawn_into_main_thread(async move {
+            let _probe = probe;
+            std::future::pending::<()>().await;
+        })
+        .detach();
+
+        drop(exec);
+
+        assert!(
+            observed_unlocked_registry.load(Ordering::Acquire),
+            "detached future destructors must run after the scoped-executor registry unlocks"
+        );
+    }
+
+    #[test]
+    fn concurrent_scoped_executors_do_not_replace_each_other() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let first = ScopedExecutor::new();
+        let first_task = spawn_into_main_thread(async { 11 });
+        let start = Arc::new(Barrier::new(2));
+        let worker_start = Arc::clone(&start);
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            let second = ScopedExecutor::new();
+            acquired_tx
+                .send(())
+                .expect("test should observe the second scoped executor");
+            let second_task = spawn_into_main_thread(async { 22 });
+            let result = block_on(second.run(second_task));
+            drop(second);
+            result
+        });
+
+        start.wait();
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a concurrent scope must wait instead of replacing the active executor"
+        );
+        assert_eq!(block_on(first.run(first_task)), 11);
+        drop(first);
+
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second scope should acquire the registry after release");
+        assert_eq!(worker.join().expect("scoped-executor worker"), 22);
     }
 
     #[test]
@@ -709,8 +875,10 @@ mod tests {
     #[test]
     fn get_scoped_none_without_executor() {
         let _lock = TEST_LOCK.lock().unwrap();
-        // Ensure no scoped executor is active
-        SCOPED_EXECUTOR.lock().unwrap().take();
+        assert!(
+            lock_or_recover(&SCOPED_EXECUTOR).executor.is_none(),
+            "serialized promise tests must not inherit an active scoped executor"
+        );
         assert!(get_scoped().is_none());
     }
 

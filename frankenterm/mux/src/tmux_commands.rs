@@ -27,7 +27,43 @@ use termwiz::tmux_cc::*;
 /// Maximum payload retained in a single `SendKeys` command after queue merging.
 const SEND_KEYS_MERGE_MAX_BYTES: usize = 16 * 1024;
 
+/// Semantic admission and service class for a tmux control-mode command.
+///
+/// These classes are intentionally finite and explicit: mailbox capacity,
+/// ordering, and scheduling policy must never depend on command text or a
+/// best-effort downcast at the point where the queue is already saturated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TmuxCommandClass {
+    LosslessInput,
+    RequiredControl,
+    TerminalControl,
+    CoalescibleIntent,
+}
+
+impl TmuxCommandClass {
+    pub(crate) const COUNT: usize = 4;
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::LosslessInput => 0,
+            Self::RequiredControl => 1,
+            Self::TerminalControl => 2,
+            Self::CoalescibleIntent => 3,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::LosslessInput => "lossless_input",
+            Self::RequiredControl => "required_control",
+            Self::TerminalControl => "terminal_control",
+            Self::CoalescibleIntent => "coalescible_intent",
+        }
+    }
+}
+
 pub(crate) trait TmuxCommand: Send + Debug {
+    fn mailbox_class(&self) -> TmuxCommandClass;
     fn get_command(&self, domain_id: DomainId) -> String;
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
 
@@ -425,11 +461,13 @@ impl TmuxDomainState {
             output_state: TmuxPaneOutputState::Fresh,
         }));
 
+        let owner = self.registered_owner_weak()?;
         let pane_pty = TmuxPty {
             domain_id: self.domain_id,
             reader: output_read,
             cmd_queue: Arc::clone(&self.cmd_queue),
             master_pane: Arc::clone(&ref_pane),
+            owner: owner.clone(),
         };
 
         let writer = WriterWrapper::new(pane_pty.take_writer()?);
@@ -447,7 +485,7 @@ impl TmuxDomainState {
             pane.pane_id,
             self.cmd_queue.clone(),
             Arc::clone(&child_state),
-            self.registered_owner_weak()?,
+            owner,
         );
 
         let command_description = "tmux pane".to_string();
@@ -1300,7 +1338,13 @@ impl TmuxDomainState {
                 match enqueue_result {
                     Ok(()) => {
                         self.notification_intent_telemetry.record_applied();
-                        TmuxDomainState::schedule_send_next_command(self.domain_id);
+                        if let Err(err) =
+                            self.require_send_schedule("notification-intent admission")
+                        {
+                            log::error!("{err:#}");
+                            self.notification_intents.lock().close();
+                            return TmuxNotificationIntentRunDisposition::Closed;
+                        }
                     }
                     Err(TmuxEnqueueError::Full) => {
                         self.notification_intent_telemetry.record_backpressured();
@@ -1308,6 +1352,15 @@ impl TmuxDomainState {
                     }
                     Err(TmuxEnqueueError::Closed) => {
                         self.notification_intents.lock().close();
+                        return TmuxNotificationIntentRunDisposition::Closed;
+                    }
+                    Err(TmuxEnqueueError::ClassMismatch) => {
+                        log::error!(
+                            "tmux domain {} classified a notification intent outside the \
+                             coalescible mailbox lane; detaching",
+                            self.domain_id
+                        );
+                        self.transition_to_exit_and_schedule_detach();
                         return TmuxNotificationIntentRunDisposition::Closed;
                     }
                 }
@@ -1579,6 +1632,10 @@ pub(crate) struct ListAllPanes {
 }
 
 impl TmuxCommand for ListAllPanes {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::RequiredControl
+    }
+
     fn get_command(&self, domain_id: DomainId) -> String {
         let Some(mux) = Mux::try_get() else {
             return "".to_string();
@@ -1655,6 +1712,10 @@ pub(crate) struct ListAllWindows {
 }
 
 impl TmuxCommand for ListAllWindows {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::RequiredControl
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
             concat!(
@@ -1717,6 +1778,10 @@ pub(crate) struct Resize {
 }
 
 impl TmuxCommand for Resize {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::CoalescibleIntent
+    }
+
     fn get_command(&self, domain_id: DomainId) -> String {
         let Some(mux) = Mux::try_get() else {
             return "".to_string();
@@ -1840,6 +1905,10 @@ pub(crate) struct CapturePane {
 }
 
 impl TmuxCommand for CapturePane {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::RequiredControl
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!(
             "capture-pane -p -t %{} -e -C -S {}\n",
@@ -1895,6 +1964,10 @@ pub(crate) struct SendKeys {
     pub pane: TmuxPaneId,
 }
 impl TmuxCommand for SendKeys {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::LosslessInput
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         let mut s = String::new();
         for &byte in self.keys.iter() {
@@ -1943,6 +2016,10 @@ impl TmuxCommand for SendKeys {
 #[derive(Debug)]
 pub(crate) struct ListCommands;
 impl TmuxCommand for ListCommands {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::RequiredControl
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         "list-commands\n".to_owned()
     }
@@ -1996,6 +2073,10 @@ pub(crate) struct SplitPane {
 }
 
 impl TmuxCommand for SplitPane {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::RequiredControl
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         if self.direction == SplitDirection::Horizontal {
             format!(
@@ -2066,6 +2147,10 @@ pub(crate) struct SelectWindow {
 }
 
 impl TmuxCommand for SelectWindow {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::CoalescibleIntent
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!("select-window -t @{}\n", self.window_id)
     }
@@ -2098,6 +2183,10 @@ pub(crate) struct SelectPane {
 }
 
 impl TmuxCommand for SelectPane {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::CoalescibleIntent
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!("select-pane -t %{}\n", self.pane_id)
     }
@@ -2127,9 +2216,14 @@ impl TmuxCommand for SelectPane {
 #[derive(Debug)]
 pub(crate) struct KillPane {
     pub pane_id: TmuxPaneId,
+    pub child_state: Arc<TmuxChildState>,
 }
 
 impl TmuxCommand for KillPane {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::TerminalControl
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         format!("kill-pane -t %{}\n", self.pane_id)
     }
@@ -2137,9 +2231,13 @@ impl TmuxCommand for KillPane {
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
         if result.error {
             let error = format!("kill-pane in domain={domain_id} failed: {result:#?}");
+            self.child_state
+                .mark_exited(ExitStatus::with_signal("tmux kill-pane failed"));
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
+        self.child_state
+            .mark_exited(ExitStatus::with_signal("tmux kill-pane"));
         Ok(())
     }
 }
@@ -2149,6 +2247,10 @@ impl TmuxCommand for KillPane {
 #[derive(Debug)]
 pub(crate) struct AttachDone;
 impl TmuxCommand for AttachDone {
+    fn mailbox_class(&self) -> TmuxCommandClass {
+        TmuxCommandClass::RequiredControl
+    }
+
     fn get_command(&self, _domain_id: DomainId) -> String {
         // The command doesn't matter, just give a legal simple command to let process_result called.
         "list-session\n".to_string()
@@ -2894,8 +2996,40 @@ mod tests {
 
     #[test]
     fn kill_pane_get_command() {
-        let cmd = KillPane { pane_id: 23 };
+        let cmd = KillPane {
+            pane_id: 23,
+            child_state: Arc::new(TmuxChildState::new()),
+        };
         assert_eq!(cmd.get_command(0), "kill-pane -t %23\n");
+    }
+
+    #[test]
+    fn kill_pane_failure_never_reports_matching_remote_success() {
+        let child_state = Arc::new(TmuxChildState::new());
+        let cmd = KillPane {
+            pane_id: 23,
+            child_state: Arc::clone(&child_state),
+        };
+        let err = cmd
+            .process_result(
+                9,
+                &Guarded {
+                    error: true,
+                    timestamp: 0,
+                    number: 0,
+                    flags: 0,
+                    output: "no such pane".to_string(),
+                },
+            )
+            .expect_err("remote kill failure must remain terminally distinguishable");
+        assert!(err.to_string().contains("kill-pane"));
+        assert_eq!(
+            child_state
+                .try_wait()
+                .expect("failed remote kill should terminalize the local child")
+                .signal(),
+            Some("tmux kill-pane failed")
+        );
     }
 
     #[test]
