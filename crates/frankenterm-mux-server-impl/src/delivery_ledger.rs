@@ -2033,7 +2033,7 @@ pub fn notification_effects(notification: &MuxNotification) -> NotificationEffec
             topology: NotificationTopologyEffect::WindowLayout(*window_id),
             ..effects(state_contract())
         },
-        MuxNotification::WindowWorkspaceChanged(window_id) => NotificationEffects {
+        MuxNotification::WindowWorkspaceChanged { window_id, .. } => NotificationEffects {
             state_keys: [
                 Some(NotificationStateKey::WindowWorkspace(*window_id)),
                 None,

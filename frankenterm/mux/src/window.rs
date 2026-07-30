@@ -99,7 +99,10 @@ impl Window {
             return;
         }
         self.workspace = workspace.to_string();
-        self.notify(MuxNotification::WindowWorkspaceChanged(self.id));
+        self.notify(MuxNotification::WindowWorkspaceChanged {
+            window_id: self.id,
+            workspace: self.workspace.clone(),
+        });
     }
 
     pub fn window_id(&self) -> WindowId {

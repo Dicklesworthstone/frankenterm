@@ -249,7 +249,12 @@ pub enum MuxNotification {
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
     WindowInvalidated(WindowId),
-    WindowWorkspaceChanged(WindowId),
+    /// Workspace payload frozen at the same mutation point as its topology
+    /// revision; delayed subscribers must never re-read a later window state.
+    WindowWorkspaceChanged {
+        window_id: WindowId,
+        workspace: String,
+    },
     ActiveWorkspaceChanged(Arc<ClientId>),
     Alert {
         pane_id: PaneId,
@@ -296,7 +301,7 @@ impl MuxNotification {
                 | Self::WindowCreated(_)
                 | Self::WindowRemoved(_)
                 | Self::WindowInvalidated(_)
-                | Self::WindowWorkspaceChanged(_)
+                | Self::WindowWorkspaceChanged { .. }
                 | Self::Empty
                 | Self::TabAddedToWindow { .. }
                 | Self::PaneFocused(_)
@@ -4056,20 +4061,21 @@ impl Mux {
         if old_workspace == new_workspace {
             return;
         }
-        self.notify(MuxNotification::WorkspaceRenamed {
-            old_workspace: old_workspace.to_string(),
-            new_workspace: new_workspace.to_string(),
-        });
 
-        {
+        let rename_notification = {
             let mut windows = self.windows.write();
             for window in windows.values_mut() {
                 if window.get_workspace() == old_workspace {
                     window.set_workspace(new_workspace);
                 }
             }
-        }
+            self.envelope_notification(MuxNotification::WorkspaceRenamed {
+                old_workspace: old_workspace.to_string(),
+                new_workspace: new_workspace.to_string(),
+            })
+        };
         self.flush_window_notifications();
+        self.dispatch_notification_envelope(rename_notification);
         self.recompute_pane_count();
         let changed_clients = {
             let mut clients = self.clients.write();
@@ -4204,7 +4210,17 @@ impl Mux {
         self.topology.lock().snapshot()
     }
 
-    fn envelope_notification(&self, notification: MuxNotification) -> MuxNotificationEnvelope {
+    /// Reserve the authoritative topology stamp for `notification`.
+    ///
+    /// Topology mutations that must defer subscriber callbacks call this while
+    /// their state lock is still held, then dispatch the returned envelope
+    /// after releasing that lock. This keeps the revision reservation before
+    /// state visibility without permitting callback re-entry into the
+    /// mutation's critical section.
+    pub(crate) fn envelope_notification(
+        &self,
+        notification: MuxNotification,
+    ) -> MuxNotificationEnvelope {
         let topology = if notification.is_topology() {
             match self.topology.lock().reserve_revision() {
                 Ok(revision) => MuxTopologyStamp::Revision(revision),
@@ -4488,7 +4504,7 @@ impl Mux {
     // Callbacks are invoked without holding the subscribers lock. A callback
     // removed concurrently may still observe the current notification if it
     // was present in the snapshot; removals only affect future notifications.
-    fn dispatch_notification_envelope(&self, envelope: MuxNotificationEnvelope) {
+    pub(crate) fn dispatch_notification_envelope(&self, envelope: MuxNotificationEnvelope) {
         let subscribers = self
             .subscribers
             .read()
@@ -6130,7 +6146,7 @@ impl Mux {
         let (removed, was_provisional) = {
             let mut windows = self.windows.write();
             let mut provisional_windows = self.provisional_windows.lock();
-            if provisional_windows.contains(&window_id) {
+            let outcome = if provisional_windows.contains(&window_id) {
                 // Only the exact MuxWindowBuilder cancellation/publication
                 // transaction may retire an unpublished window. An activity
                 // count is an admission hint, not a topology lock; a prune
@@ -6146,12 +6162,14 @@ impl Mux {
                 (removed, was_provisional)
             } else {
                 (false, false)
-            }
-        };
-        if removed {
-            if !was_provisional {
+            };
+            if outcome.0 && !outcome.1 {
                 self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
             }
+            outcome
+        };
+        if removed {
+            debug_assert!(!was_provisional);
             self.recompute_pane_count();
             self.flush_window_notifications();
         }
@@ -6190,11 +6208,14 @@ impl Mux {
             return;
         }
 
-        let (window, was_provisional) = {
+        let window = {
             let mut windows = self.windows.write();
             let window = windows.remove(&window_id);
             let was_provisional = self.provisional_windows.lock().remove(&window_id);
-            (window, was_provisional)
+            if window.is_some() && !was_provisional {
+                self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
+            }
+            window
         };
         if let Some(window) = window {
             // Gather all the domains referenced by this window
@@ -6222,9 +6243,6 @@ impl Mux {
             let tabs = window.iter().cloned().collect::<Vec<_>>();
             for tab in tabs {
                 self.remove_tab_internal_if_same(&tab);
-            }
-            if !was_provisional {
-                self.queue_window_notification(MuxNotification::WindowRemoved(window_id));
             }
         }
         self.recompute_pane_count();
@@ -6371,9 +6389,8 @@ impl Mux {
             self.remove_window_if_empty_internal(window_id);
         }
 
-        if self.is_empty() {
+        if self.notify_empty_if_current() {
             log::trace!("prune_dead_windows: is_empty, send MuxNotification::Empty");
-            self.notify(MuxNotification::Empty);
         } else {
             log::trace!("prune_dead_windows: not empty");
         }
@@ -6436,12 +6453,9 @@ impl Mux {
         let Some(tab) = self.get_tab(tab_id) else {
             return false;
         };
-        let changed = tab.set_title_without_notify(title);
-        if changed {
-            self.notify(MuxNotification::TabTitleChanged {
-                tab_id,
-                title: title.to_string(),
-            });
+        let (changed, notification) = tab.set_title_for_mux(title, Some(self));
+        if let Some(notification) = notification {
+            self.dispatch_notification_envelope(notification);
         }
         changed
     }
@@ -6711,6 +6725,22 @@ impl Mux {
 
     pub fn is_empty(&self) -> bool {
         self.panes.read().is_empty()
+    }
+
+    /// Publish `Empty` only if the pane registry is still empty, reserving the
+    /// topology revision before a new pane can acquire the registry write
+    /// lock. Dispatch remains outside the registry lock so subscribers may
+    /// safely re-enter mux state.
+    fn notify_empty_if_current(&self) -> bool {
+        let notification = {
+            let panes = self.panes.read();
+            if !panes.is_empty() {
+                return false;
+            }
+            self.envelope_notification(MuxNotification::Empty)
+        };
+        self.dispatch_notification_envelope(notification);
+        true
     }
 
     pub fn is_workspace_empty(&self, workspace: &str) -> bool {
@@ -7851,6 +7881,61 @@ mod tests {
         }
 
         fn detach(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn state(&self) -> DomainState {
+            DomainState::Attached
+        }
+    }
+
+    struct BlockingDetachTestDomain {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Domain for BlockingDetachTestDomain {
+        async fn spawn_pane(
+            &self,
+            _mux: &Arc<Mux>,
+            _size: TerminalSize,
+            _command: Option<CommandBuilder>,
+            _command_dir: Option<String>,
+        ) -> anyhow::Result<Arc<dyn Pane>> {
+            Err(anyhow!("blocking detach test domain cannot spawn panes"))
+        }
+
+        fn detachable(&self) -> bool {
+            true
+        }
+
+        fn domain_id(&self) -> DomainId {
+            1
+        }
+
+        fn domain_name(&self) -> &str {
+            "blocking-detach-test"
+        }
+
+        async fn attach(
+            &self,
+            _mux: &Arc<Mux>,
+            _owner_client_id: Option<Arc<ClientId>>,
+            _window_id: Option<WindowId>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn detach(&self) -> anyhow::Result<()> {
+            self.entered
+                .send(())
+                .map_err(|_| anyhow!("window-removal test stopped observing detach"))?;
+            self.release
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|err| anyhow!("window-removal test did not release detach: {err}"))?;
             Ok(())
         }
 
@@ -11320,6 +11405,191 @@ mod tests {
     }
 
     #[test]
+    fn tab_title_reserves_revision_before_changed_state_becomes_dispatchable() {
+        let mux = Arc::new(Mux::new(None));
+        let tab = Arc::new(Tab::new(&test_size()));
+        mux.add_tab_no_panes(&tab)
+            .expect("test tab should register");
+        let before = mux
+            .topology_snapshot_authority()
+            .expect("topology authority should be live")
+            .1;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        mux.subscribe_with_topology(move |envelope| {
+            observed_for_subscriber
+                .lock()
+                .push((envelope.notification, envelope.topology));
+            true
+        })
+        .expect("test topology subscription should allocate an identifier");
+
+        let (changed, notification) = tab.set_title_for_mux("reserved", Some(&mux));
+        assert!(changed);
+        assert_eq!(tab.get_title(), "reserved");
+        assert!(
+            observed.lock().is_empty(),
+            "reservation must not invoke subscribers while the mutation owns its state lock",
+        );
+        let after_reservation = mux
+            .topology_snapshot_authority()
+            .expect("topology authority should remain live")
+            .1;
+        assert_eq!(after_reservation.get(), before.get() + 1);
+
+        mux.dispatch_notification_envelope(
+            notification.expect("a changed title on an exact mux reserves one envelope"),
+        );
+        assert!(matches!(
+            observed.lock().as_slice(),
+            [(
+                MuxNotification::TabTitleChanged { tab_id, title },
+                MuxTopologyStamp::Revision(revision),
+            )] if *tab_id == tab.tab_id()
+                && title == "reserved"
+                && *revision == after_reservation
+        ));
+    }
+
+    #[test]
+    fn workspace_rename_dispatches_only_after_new_window_state_is_visible() {
+        let mux = Arc::new(Mux::new(None));
+        let window_builder =
+            mux.new_empty_window(Some("old-workspace".to_string()), None);
+        let window_id = *window_builder;
+        drop(window_builder);
+        let before = mux
+            .topology_snapshot_authority()
+            .expect("topology authority should be live")
+            .1;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_subscriber = Arc::clone(&observed);
+        let mux_for_subscriber = Arc::clone(&mux);
+        mux.subscribe_with_topology(move |envelope| {
+            let kind = match envelope.notification {
+                MuxNotification::WindowWorkspaceChanged {
+                    window_id: id,
+                    workspace,
+                } if id == window_id && workspace == "new-workspace" => {
+                    Some("window")
+                }
+                MuxNotification::WorkspaceRenamed { .. } => Some("rename"),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let workspace = mux_for_subscriber
+                    .get_window(window_id)
+                    .expect("renamed window must remain registered")
+                    .get_workspace()
+                    .to_string();
+                observed_for_subscriber
+                    .lock()
+                    .push((kind, envelope.topology, workspace));
+            }
+            true
+        })
+        .expect("test topology subscription should allocate an identifier");
+
+        mux.rename_workspace("old-workspace", "new-workspace");
+
+        assert_eq!(
+            observed.lock().as_slice(),
+            &[
+                (
+                    "window",
+                    MuxTopologyStamp::Revision(TopologyRevision::new(before.get() + 1)),
+                    "new-workspace".to_string(),
+                ),
+                (
+                    "rename",
+                    MuxTopologyStamp::Revision(TopologyRevision::new(before.get() + 2)),
+                    "new-workspace".to_string(),
+                ),
+            ],
+            "both reserved events must observe the fully committed workspace mutation",
+        );
+    }
+
+    #[test]
+    fn window_removal_reserves_revision_before_detachable_domain_callback() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let (detach_entered_tx, detach_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (detach_release_tx, detach_release_rx) = std::sync::mpsc::sync_channel(1);
+        let domain: Arc<dyn Domain> = Arc::new(BlockingDetachTestDomain {
+            entered: detach_entered_tx,
+            release: StdMutex::new(detach_release_rx),
+        });
+        mux.add_domain(&domain).expect("register blocking test domain");
+
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+        let tab = Arc::new(Tab::new(&test_size()));
+        let (pane, _) = KillCountingPane::new(211, test_size());
+        tab.assign_pane(&pane);
+        mux.add_tab_and_active_pane(&tab)
+            .expect("test tab and pane should register");
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("test tab should attach to its window");
+        drop(window_builder);
+        let before = mux
+            .topology_snapshot_authority()
+            .expect("topology authority should be live")
+            .1;
+
+        let mux_for_removal = Arc::clone(&mux);
+        let remover = std::thread::spawn(move || mux_for_removal.kill_window(window_id));
+        detach_entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("window removal should enter the detachable domain callback");
+
+        let window_was_removed = mux.get_window(window_id).is_none();
+        let during_callback = mux
+            .topology_snapshot_authority()
+            .expect("topology authority should remain live")
+            .1;
+        let removal_revision = mux
+            .pending_window_notifications
+            .lock()
+            .queue
+            .iter()
+            .find_map(|action| match action {
+                PendingWindowAction::Notification {
+                    envelope:
+                        MuxNotificationEnvelope {
+                            notification: MuxNotification::WindowRemoved(id),
+                            topology: MuxTopologyStamp::Revision(revision),
+                        },
+                    ..
+                } if *id == window_id => Some(*revision),
+                _ => None,
+            });
+
+        detach_release_tx
+            .send(())
+            .expect("release detachable-domain callback");
+        remover.join().expect("window removal should complete");
+        assert!(
+            window_was_removed,
+            "the window registry mutation precedes the detachable-domain callback",
+        );
+        let removal_revision =
+            removal_revision.expect("WindowRemoved must be queued before the callback starts");
+        assert!(
+            removal_revision > before && removal_revision <= during_callback,
+            "WindowRemoved revision {} must be reserved after the pre-removal snapshot {} and \
+             before the callback-visible authority {}",
+            removal_revision.get(),
+            before.get(),
+            during_callback.get(),
+        );
+        Mux::shutdown();
+    }
+
+    #[test]
     fn topology_revision_exhaustion_is_terminal_and_never_wraps() {
         let mux = Mux::new(None);
         mux.topology.lock().revision = TopologyRevision(u64::MAX);
@@ -12938,7 +13208,10 @@ mod tests {
                 MuxNotification::TabAddedToWindow { window_id: id, .. } if id == window_id => {
                     events_for_subscriber.lock().push("tab-added")
                 }
-                MuxNotification::WindowWorkspaceChanged(id) if id == window_id => {
+                MuxNotification::WindowWorkspaceChanged {
+                    window_id: id,
+                    workspace,
+                } if id == window_id && workspace == "reentrant-workspace" => {
                     events_for_subscriber.lock().push("workspace-changed");
                 }
                 _ => {}
@@ -12963,6 +13236,65 @@ mod tests {
                 .expect("test window should remain registered")
                 .get_workspace(),
             "reentrant-workspace",
+        );
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn deferred_workspace_notifications_retain_each_mutation_payload() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let executor = BoundedTestExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+
+        let workspaces = Arc::new(Mutex::new(Vec::new()));
+        let workspaces_for_subscriber = Arc::clone(&workspaces);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::WindowWorkspaceChanged {
+                window_id: id,
+                workspace,
+            } = notification
+            {
+                if id == window_id {
+                    workspaces_for_subscriber.lock().push(workspace);
+                }
+            }
+            true
+        })
+        .expect("test mux subscription should allocate an identifier");
+
+        let mux_for_thread = Arc::clone(&mux);
+        std::thread::spawn(move || {
+            mux_for_thread
+                .get_window_mut(window_id)
+                .expect("test window should remain registered")
+                .set_workspace("first-workspace");
+            mux_for_thread
+                .get_window_mut(window_id)
+                .expect("test window should remain registered")
+                .set_workspace("second-workspace");
+        })
+        .join()
+        .expect("off-main workspace mutations should not panic");
+
+        assert!(
+            workspaces.lock().is_empty(),
+            "the bounded executor must retain both callbacks before dispatch",
+        );
+        executor.run_until(Duration::from_secs(5), || workspaces.lock().len() == 2);
+        assert_eq!(
+            workspaces.lock().as_slice(),
+            &[
+                "first-workspace".to_string(),
+                "second-workspace".to_string(),
+            ],
+            "each queued revision must retain the workspace written at its own mutation point",
         );
 
         drop(window_builder);

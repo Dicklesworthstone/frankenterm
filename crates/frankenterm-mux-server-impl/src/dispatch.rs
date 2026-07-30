@@ -812,8 +812,18 @@ impl TopologyStreamCoordinator {
         if !negotiated.contains(TopologyCapabilities::FENCED_SNAPSHOT_V1)
             || !negotiated.contains(request.required)
         {
+            metrics::counter!(
+                "mux.dispatch.topology_fence.negotiation.total",
+                "outcome" => "unsupported"
+            )
+            .increment(1);
             return Ok(());
         }
+        metrics::counter!(
+            "mux.dispatch.topology_fence.negotiation.total",
+            "outcome" => "admitted"
+        )
+        .increment(1);
 
         let mut state = self.state.lock();
         if state.subscription.is_none() {
@@ -859,35 +869,38 @@ impl TopologyStreamCoordinator {
         let DecodedPdu { pdu, serial } = decoded;
         let mut state = self.state.lock();
         match pdu {
-            Pdu::ListPanesCoherentResponse(response) => {
-                self.complete_fence_response(&mut state, serial, response)
-            }
+            Pdu::ListPanesCoherentResponse(response) => self
+                .complete_fence_response(&mut state, serial, response)
+                .inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE)),
             other => {
                 let phase =
                     std::mem::replace(&mut state.phase, TopologyStreamPhase::Exhausted);
-                match phase {
-                    TopologyStreamPhase::Fencing(in_flight)
-                        if in_flight.serial == serial =>
-                    {
-                        queue_response_pdu(
-                            &self.item_tx,
-                            &self.terminal,
-                            other,
-                            serial,
-                        )?;
-                        state.phase = self.restore_prior(in_flight)?;
+                let result = (|| {
+                    match phase {
+                        TopologyStreamPhase::Fencing(in_flight)
+                            if in_flight.serial == serial =>
+                        {
+                            queue_response_pdu(
+                                &self.item_tx,
+                                &self.terminal,
+                                other,
+                                serial,
+                            )?;
+                            state.phase = self.restore_prior(in_flight)?;
+                        }
+                        phase => {
+                            state.phase = phase;
+                            queue_response_pdu(
+                                &self.item_tx,
+                                &self.terminal,
+                                other,
+                                serial,
+                            )?;
+                        }
                     }
-                    phase => {
-                        state.phase = phase;
-                        queue_response_pdu(
-                            &self.item_tx,
-                            &self.terminal,
-                            other,
-                            serial,
-                        )?;
-                    }
-                }
-                Ok(())
+                    Ok(())
+                })();
+                result.inspect_err(|_| self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE))
             }
         }
     }
@@ -959,7 +972,15 @@ impl TopologyStreamCoordinator {
                 };
                 for event in in_flight.buffer.take_all() {
                     if event.revision > snapshot.snapshot_revision {
-                        established.buffer.insert(event)?;
+                        established.buffer.insert(event).inspect_err(|_| {
+                            self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
+                        })?;
+                    } else {
+                        metrics::counter!(
+                            "mux.dispatch.topology_fence.events.total",
+                            "outcome" => "snapshot_subsumed"
+                        )
+                        .increment(1);
                     }
                 }
                 self.drain_established(&mut established)?;
@@ -1039,6 +1060,11 @@ impl TopologyStreamCoordinator {
                 break;
             };
             self.queue_stamped_event(event)?;
+            metrics::counter!(
+                "mux.dispatch.topology_fence.events.total",
+                "outcome" => "replayed"
+            )
+            .increment(1);
             established.next_revision = next_revision
                 .get()
                 .checked_add(1)
@@ -1060,7 +1086,7 @@ impl TopologyStreamCoordinator {
         )
     }
 
-    fn on_notification(&self, mux: &Mux, envelope: MuxNotificationEnvelope) -> bool {
+    fn on_notification(&self, _mux: &Mux, envelope: MuxNotificationEnvelope) -> bool {
         let revision = match envelope.topology {
             MuxTopologyStamp::NonTopology => {
                 if envelope.notification.is_topology() {
@@ -1087,16 +1113,22 @@ impl TopologyStreamCoordinator {
         };
 
         let notification = envelope.notification;
-        let use_legacy_fast_path = {
+        {
             let state = self.state.lock();
-            state.subscription.is_some()
+            if state.subscription.is_some()
                 && matches!(&state.phase, TopologyStreamPhase::Legacy)
-        };
-        if use_legacy_fast_path {
-            return queue_notification(&self.item_tx, &self.terminal, notification);
+            {
+                // Keep the coordinator lock through enqueue. Otherwise this
+                // callback can observe Legacy, lose the lock to begin_fence,
+                // and append an unstamped notification after the fence has
+                // begun. Whichever side acquires this lock first now defines
+                // whether the event is a predecessor legacy frame or a
+                // retained stamped successor.
+                return queue_notification(&self.item_tx, &self.terminal, notification);
+            }
         }
 
-        let event = match retained_topology_event(mux, notification, revision) {
+        let event = match retained_topology_event(notification, revision) {
             Ok(event) => event,
             Err(err) => {
                 log::error!("failed to retain mux topology event: {err:#}");
@@ -1158,6 +1190,12 @@ impl TopologyStreamCoordinator {
                     log::error!("failed to retain gapped mux topology event: {err:#}");
                     self.terminal.trip(TOPOLOGY_BUFFER_OVERFLOW);
                     return false;
+                } else {
+                    metrics::counter!(
+                        "mux.dispatch.topology_fence.events.total",
+                        "outcome" => "gap_buffered"
+                    )
+                    .increment(1);
                 }
                 true
             }
@@ -1170,7 +1208,6 @@ impl TopologyStreamCoordinator {
 }
 
 fn retained_topology_event(
-    mux: &Mux,
     notification: MuxNotification,
     revision: TopologyRevision,
 ) -> anyhow::Result<RetainedTopologyEvent> {
@@ -1190,12 +1227,13 @@ fn retained_topology_event(
         MuxNotification::WindowInvalidated(window_id) => TopologyEventKind::WindowInvalidated {
             window_id: *window_id,
         },
-        MuxNotification::WindowWorkspaceChanged(window_id) => {
+        MuxNotification::WindowWorkspaceChanged {
+            window_id,
+            workspace,
+        } => {
             TopologyEventKind::WindowWorkspaceChanged {
                 window_id: *window_id,
-                workspace: mux
-                    .get_window(*window_id)
-                    .map(|window| window.get_workspace().to_string()),
+                workspace: Some(workspace.clone()),
             }
         }
         MuxNotification::Empty => TopologyEventKind::Empty,
@@ -2813,20 +2851,18 @@ where
                 Ok(Item::Notif(MuxNotification::WindowRemoved(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowInvalidated(_window_id))) => {}
-                Ok(Item::Notif(MuxNotification::WindowWorkspaceChanged(window_id))) => {
-                    let workspace = mux
-                        .get_window(window_id)
-                        .map(|w| w.get_workspace().to_string());
-                    if let Some(workspace) = workspace {
-                        pending_outbound = Some(prepare_unilateral_pdu(
-                            Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
-                                window_id,
-                                workspace,
-                            }),
-                            &item_rx,
-                            &mut deferred_item,
-                        )?);
-                    }
+                Ok(Item::Notif(MuxNotification::WindowWorkspaceChanged {
+                    window_id,
+                    workspace,
+                })) => {
+                    pending_outbound = Some(prepare_unilateral_pdu(
+                        Pdu::WindowWorkspaceChanged(codec::WindowWorkspaceChanged {
+                            window_id,
+                            workspace,
+                        }),
+                        &item_rx,
+                        &mut deferred_item,
+                    )?);
                 }
                 Ok(Item::Notif(MuxNotification::PaneFocused(pane_id))) => {
                     pending_outbound = Some(prepare_unilateral_pdu(
@@ -3182,6 +3218,27 @@ mod tests {
             notification,
             topology: MuxTopologyStamp::Revision(TopologyRevision::new(revision)),
         }
+    }
+
+    #[test]
+    fn retained_workspace_event_uses_its_mutation_point_payload() {
+        let retained = retained_topology_event(
+            MuxNotification::WindowWorkspaceChanged {
+                window_id: 17,
+                workspace: "workspace-at-revision".to_string(),
+            },
+            TopologyRevision::new(9),
+        )
+        .expect("workspace notification should retain without live mux lookup");
+
+        assert_eq!(retained.revision, TopologyRevision::new(9));
+        assert!(matches!(
+            retained.event,
+            TopologyEventKind::WindowWorkspaceChanged {
+                window_id: 17,
+                workspace: Some(ref workspace),
+            } if workspace == "workspace-at-revision"
+        ));
     }
 
     fn take_written_pdu(item_rx: &Receiver<Item>) -> DecodedPdu {

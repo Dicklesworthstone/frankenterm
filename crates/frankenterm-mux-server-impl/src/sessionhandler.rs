@@ -530,12 +530,24 @@ fn collect_coherent_list_panes_snapshot(
     let mut first_revision = None;
     let mut last_revision = None;
 
-    for _ in 0..COHERENT_SNAPSHOT_ATTEMPTS {
+    for attempt in 1..=COHERENT_SNAPSHOT_ATTEMPTS {
         let (before_session, before_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
-            Err(_) => return Ok(ListPanesCoherentOutcome::RevisionExhausted),
+            Err(_) => {
+                metrics::counter!(
+                    "mux.server.coherent_snapshot.total",
+                    "outcome" => "revision_exhausted"
+                )
+                .increment(1);
+                return Ok(ListPanesCoherentOutcome::RevisionExhausted);
+            }
         };
         if before_revision.get() == u64::MAX {
+            metrics::counter!(
+                "mux.server.coherent_snapshot.total",
+                "outcome" => "revision_exhausted"
+            )
+            .increment(1);
             return Ok(ListPanesCoherentOutcome::RevisionExhausted);
         }
 
@@ -543,14 +555,32 @@ fn collect_coherent_list_panes_snapshot(
 
         let (after_session, after_revision) = match mux.topology_snapshot_authority() {
             Ok(authority) => authority,
-            Err(_) => return Ok(ListPanesCoherentOutcome::RevisionExhausted),
+            Err(_) => {
+                metrics::counter!(
+                    "mux.server.coherent_snapshot.total",
+                    "outcome" => "revision_exhausted"
+                )
+                .increment(1);
+                return Ok(ListPanesCoherentOutcome::RevisionExhausted);
+            }
         };
         if before_session != after_session {
+            metrics::counter!(
+                "mux.server.coherent_snapshot.total",
+                "outcome" => "session_changed"
+            )
+            .increment(1);
             return Err(anyhow!(
                 "mux session incarnation changed while constructing a coherent pane snapshot"
             ));
         }
         if before_revision == after_revision {
+            metrics::histogram!("mux.server.coherent_snapshot.attempts").record(attempt as f64);
+            metrics::counter!(
+                "mux.server.coherent_snapshot.total",
+                "outcome" => "snapshot"
+            )
+            .increment(1);
             return Ok(ListPanesCoherentOutcome::Snapshot(CoherentPaneSnapshot {
                 session_incarnation: after_session,
                 snapshot_revision: after_revision,
@@ -560,8 +590,20 @@ fn collect_coherent_list_panes_snapshot(
 
         first_revision.get_or_insert(before_revision);
         last_revision = Some(after_revision);
+        metrics::counter!(
+            "mux.server.coherent_snapshot.total",
+            "outcome" => "retry"
+        )
+        .increment(1);
     }
 
+    metrics::histogram!("mux.server.coherent_snapshot.attempts")
+        .record(COHERENT_SNAPSHOT_ATTEMPTS as f64);
+    metrics::counter!(
+        "mux.server.coherent_snapshot.total",
+        "outcome" => "contended"
+    )
+    .increment(1);
     Ok(ListPanesCoherentOutcome::Contended {
         attempts: COHERENT_SNAPSHOT_ATTEMPTS,
         first_revision: first_revision

@@ -2,7 +2,9 @@ use crate::domain::DomainId;
 use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
-use crate::{Mux, MuxNotification, PaneRegistrationHandle, WindowId};
+use crate::{
+    Mux, MuxNotification, MuxNotificationEnvelope, PaneRegistrationHandle, WindowId,
+};
 use bintree::PathBranch;
 use config::configuration;
 use config::keyassignment::PaneDirection;
@@ -374,39 +376,81 @@ struct DeferredTabCallbacks {
     prior_focus: Option<Arc<dyn Pane>>,
     current_focus: Option<Arc<dyn Pane>>,
     current_focus_id: Option<PaneId>,
+    topology_notifications: Vec<MuxNotificationEnvelope>,
 }
 
 impl DeferredTabCallbacks {
-    fn execute(self, mux: Option<&Mux>) {
-        execute_pane_resize_work(self.resize_work);
+    fn focus_changed(&self) -> bool {
+        match (&self.prior_focus, &self.current_focus) {
+            (Some(prior), Some(current)) => !Arc::ptr_eq(prior, current),
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+        }
+    }
 
-        let focus_changed = match (&self.prior_focus, &self.current_focus) {
+    /// Reserve topology revisions before the tab lock that protects the
+    /// structural mutation is released. Subscriber callbacks remain deferred,
+    /// but a coherent snapshot can no longer observe the new tree or focus
+    /// under an older revision.
+    fn reserve_topology_notifications(&mut self, mux: &Mux, tab_id: TabId) {
+        if !self.changed {
+            return;
+        }
+        self.topology_notifications.push(
+            mux.envelope_notification(MuxNotification::TabResized(tab_id)),
+        );
+        if self.focus_changed() {
+            if let Some(pane_id) = self.current_focus_id {
+                self.topology_notifications.push(
+                    mux.envelope_notification(MuxNotification::PaneFocused(pane_id)),
+                );
+            }
+        }
+    }
+
+    fn execute(self, mux: Option<&Mux>) {
+        let DeferredTabCallbacks {
+            resize_work,
+            prior_focus,
+            current_focus,
+            topology_notifications,
+            ..
+        } = self;
+        execute_pane_resize_work(resize_work);
+
+        let focus_changed = match (&prior_focus, &current_focus) {
             (Some(prior), Some(current)) => !Arc::ptr_eq(prior, current),
             (None, None) => false,
             (Some(_), None) | (None, Some(_)) => true,
         };
-        if !focus_changed {
-            return;
+        if focus_changed {
+            if let Some(prior) = prior_focus {
+                if catch_unwind(AssertUnwindSafe(|| prior.focus_changed(false))).is_err() {
+                    log::error!(
+                        "pane focus-loss callback panicked for exact pane identity {:p}",
+                        Arc::as_ptr(&prior)
+                    );
+                }
+            }
+            if let Some(current) = current_focus {
+                if catch_unwind(AssertUnwindSafe(|| current.focus_changed(true))).is_err() {
+                    log::error!(
+                        "pane focus-gain callback panicked for exact pane identity {:p}",
+                        Arc::as_ptr(&current)
+                    );
+                }
+            }
         }
 
-        if let Some(prior) = self.prior_focus {
-            if catch_unwind(AssertUnwindSafe(|| prior.focus_changed(false))).is_err() {
-                log::error!(
-                    "pane focus-loss callback panicked for exact pane identity {:p}",
-                    Arc::as_ptr(&prior)
-                );
+        if let Some(mux) = mux {
+            for envelope in topology_notifications {
+                mux.dispatch_notification_envelope(envelope);
             }
-        }
-        if let Some(current) = self.current_focus {
-            if catch_unwind(AssertUnwindSafe(|| current.focus_changed(true))).is_err() {
-                log::error!(
-                    "pane focus-gain callback panicked for exact pane identity {:p}",
-                    Arc::as_ptr(&current)
-                );
-            }
-            if let (Some(mux), Some(pane_id)) = (mux, self.current_focus_id) {
-                mux.notify(MuxNotification::PaneFocused(pane_id));
-            }
+        } else {
+            debug_assert!(
+                topology_notifications.is_empty(),
+                "ownerless deferred tab callbacks must not retain topology authority"
+            );
         }
     }
 }
@@ -1808,24 +1852,31 @@ impl Tab {
     }
 
     pub fn set_title(&self, title: &str) {
-        if self.set_title_without_notify(title) {
-            let tab_id = self.tab_id;
-            Mux::try_get().map(|mux| {
-                mux.notify(MuxNotification::TabTitleChanged {
-                    tab_id,
-                    title: title.to_string(),
-                })
-            });
+        let mux = Mux::try_get();
+        let (_, notification) = self.set_title_for_mux(title, mux.as_deref());
+        if let (Some(mux), Some(notification)) = (mux, notification) {
+            mux.dispatch_notification_envelope(notification);
         }
     }
 
-    pub(crate) fn set_title_without_notify(&self, title: &str) -> bool {
+    pub(crate) fn set_title_for_mux(
+        &self,
+        title: &str,
+        mux: Option<&Mux>,
+    ) -> (bool, Option<MuxNotificationEnvelope>) {
         let mut inner = self.inner.lock();
         if inner.title == title {
-            return false;
+            return (false, None);
         }
-        inner.title = title.to_string();
-        true
+        let title = title.to_string();
+        inner.title = title.clone();
+        let notification = mux.map(|mux| {
+            mux.envelope_notification(MuxNotification::TabTitleChanged {
+                tab_id: self.tab_id,
+                title,
+            })
+        });
+        (true, notification)
     }
 
     /// Called by the multiplexer client when building a local tab to
@@ -2254,10 +2305,10 @@ impl Tab {
                 .cloned()
                 .collect::<Vec<_>>();
 
-            let callbacks = self
-                .inner
-                .lock()
-                .remove_exact_panes_callback_free(observed, &authorized);
+            let mut inner = self.inner.lock();
+            let mut callbacks =
+                inner.remove_exact_panes_callback_free(observed, &authorized);
+            callbacks.reserve_topology_notifications(mux, self.tab_id);
             let registrations = authorized
                 .iter()
                 .filter(|candidate| callbacks.removed.contains(&pane_identity(&candidate.pane)))
@@ -2493,10 +2544,11 @@ impl Tab {
                     expected_registration: None,
                 })
         })?;
-        let callbacks = self
-            .inner
-            .lock()
-            .remove_exact_panes_callback_free(&observed, std::slice::from_ref(&candidate));
+        let mut inner = self.inner.lock();
+        let mut callbacks =
+            inner.remove_exact_panes_callback_free(&observed, std::slice::from_ref(&candidate));
+        callbacks.reserve_topology_notifications(mux, self.tab_id);
+        drop(inner);
         let removed = callbacks.removed.contains(&pane_identity(&candidate.pane));
         callbacks.execute(Some(mux));
         removed.then_some(candidate.pane)

@@ -73,7 +73,7 @@ impl GuiFrontEnd {
                         }
                     }
                 }
-                MuxNotification::WindowWorkspaceChanged(_)
+                MuxNotification::WindowWorkspaceChanged { .. }
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::WindowCreated(_)
                 | MuxNotification::WindowRemoved(_) => {
