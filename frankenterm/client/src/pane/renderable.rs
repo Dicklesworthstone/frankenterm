@@ -1,4 +1,4 @@
-use crate::client::RpcGenerationScope;
+use crate::client::{RpcConsumerKind, RpcGenerationScope};
 use crate::domain::ClientInner;
 use codec::*;
 use config::{configuration, ConfigHandle};
@@ -104,15 +104,37 @@ fn render_line_cache_capacity_for_values(
 }
 
 #[derive(Debug)]
+struct FetchIdentity {
+    started_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct FetchToken(Arc<FetchIdentity>);
+
+impl FetchToken {
+    fn new(started_at: Instant) -> Self {
+        Self(Arc::new(FetchIdentity { started_at }))
+    }
+
+    fn started_at(&self) -> Instant {
+        self.0.started_at
+    }
+
+    fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Debug)]
 enum LineEntry {
     // Up to date wrt. server and has been rendered at least once
     Line(Line),
     // Currently being downloaded from the server
-    Fetching(Instant),
+    Fetching(FetchToken),
     // We have a version of the line locally and are treating it
     // as needing rendering because we are also in the process of
     // downloading a newer version from the server
-    LineAndFetching(Line, Instant),
+    LineAndFetching(Line, FetchToken),
     // We have a local copy but it is stale and will need to be
     // fetched again
     Stale(Line),
@@ -122,8 +144,10 @@ impl LineEntry {
     fn kind(&self) -> (&'static str, Option<Instant>) {
         match self {
             Self::Line(_) => ("Line", None),
-            Self::Fetching(since) => ("Fetching", Some(*since)),
-            Self::LineAndFetching(_, since) => ("LineAndFetching", Some(*since)),
+            Self::Fetching(token) => ("Fetching", Some(token.started_at())),
+            Self::LineAndFetching(_, token) => {
+                ("LineAndFetching", Some(token.started_at()))
+            }
             Self::Stale(_) => ("Stale", None),
         }
     }
@@ -669,6 +693,7 @@ impl RenderableInner {
         }
 
         let mut to_fetch = RangeSet::new();
+        let mut fetch_token = None;
         log::trace!("dirty as of seq {} -> {:?}", delta.seqno, dirty);
         for r in dirty.iter() {
             for stable_row in r.clone() {
@@ -680,16 +705,23 @@ impl RenderableInner {
                 let prior = self.lines.pop(&stable_row);
                 let prior_kind = prior.as_ref().map(|e| e.kind());
                 if !fetchable {
-                    log::trace!("make {} stale bcos not fetchable", stable_row);
-                    self.make_stale(stable_row);
+                    log::trace!(
+                        "evict {} because it is outside the fetchable viewport",
+                        stable_row
+                    );
                     continue;
                 }
                 to_fetch.add(stable_row);
+                let fetch_token = fetch_token
+                    .get_or_insert_with(|| FetchToken::new(now))
+                    .clone();
                 let entry = match prior {
-                    Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(now),
+                    Some(LineEntry::Fetching(_)) | None => LineEntry::Fetching(fetch_token),
                     Some(LineEntry::LineAndFetching(old, ..))
                     | Some(LineEntry::Stale(old))
-                    | Some(LineEntry::Line(old)) => LineEntry::LineAndFetching(old, now),
+                    | Some(LineEntry::Line(old)) => {
+                        LineEntry::LineAndFetching(old, fetch_token)
+                    }
                 };
                 log::trace!(
                     "row {} {:?} -> {:?} due to dirty and IN viewport",
@@ -702,7 +734,10 @@ impl RenderableInner {
         }
         if !to_fetch.is_empty() {
             if self.fetch_limiter.non_blocking_admittance_check(1) {
-                self.schedule_fetch_lines(to_fetch, now);
+                self.schedule_fetch_lines(
+                    to_fetch,
+                    fetch_token.expect("a non-empty fetch batch has an exact token"),
+                );
             } else {
                 log::warn!(
                     "exceeded fetch throttle, drop {:?} and mark stale",
@@ -740,19 +775,20 @@ impl RenderableInner {
         stable_row: StableRowIndex,
         mut line: Line,
         config: &ConfigHandle,
-        fetch_start: Option<Instant>,
+        fetch_token: Option<&FetchToken>,
     ) {
         line.scan_and_create_hyperlinks(&config.hyperlink_rules);
 
-        let entry = if let Some(fetch_start) = fetch_start {
+        let entry = if let Some(fetch_token) = fetch_token {
             // If we're completing a fetch, only replace entries that were
             // set to fetching as part of our fetch.  If they are now longer
             // tagged that way, then someone came along after us and changed
             // the state, so we should leave it alone
 
             match self.lines.pop(&stable_row) {
-                Some(LineEntry::LineAndFetching(_, then)) | Some(LineEntry::Fetching(then))
-                    if fetch_start == then =>
+                Some(LineEntry::LineAndFetching(_, current))
+                | Some(LineEntry::Fetching(current))
+                    if fetch_token.same_request(&current) =>
                 {
                     log::trace!(
                         "row {} fetch done -> Line seq={} vs self.seq={}",
@@ -769,7 +805,7 @@ impl RenderableInner {
                         "row {} {:?} changed since fetch started at {:?}, so leave it be",
                         stable_row,
                         e.kind(),
-                        fetch_start
+                        fetch_token.started_at()
                     );
                     self.lines.put(stable_row, e);
                     return;
@@ -782,7 +818,11 @@ impl RenderableInner {
         self.lines.put(stable_row, entry);
     }
 
-    fn schedule_fetch_lines(&mut self, to_fetch: RangeSet<StableRowIndex>, now: Instant) {
+    fn schedule_fetch_lines(
+        &mut self,
+        to_fetch: RangeSet<StableRowIndex>,
+        fetch_token: FetchToken,
+    ) {
         if to_fetch.is_empty() || self.dead {
             return;
         }
@@ -808,7 +848,7 @@ impl RenderableInner {
             "will fetch lines {:?} for remote tab id {} at {:?}",
             to_fetch,
             self.remote_pane_id,
-            now,
+            fetch_token.started_at(),
         );
 
         let client = Arc::clone(&self.client);
@@ -833,9 +873,10 @@ impl RenderableInner {
                 registration,
                 renderable,
                 local_pane_id,
+                rpc,
                 result,
                 to_fetch,
-                now,
+                fetch_token,
             )
         })
         .detach();
@@ -845,47 +886,70 @@ impl RenderableInner {
         registration: PaneRegistrationHandle,
         renderable: Arc<parking_lot::Mutex<RenderableState>>,
         local_pane_id: PaneId,
+        rpc: RpcGenerationScope,
         result: anyhow::Result<Vec<(StableRowIndex, Line)>>,
         to_fetch: RangeSet<StableRowIndex>,
-        now: Instant,
+        fetch_token: FetchToken,
     ) -> anyhow::Result<()> {
-        let applied = registration.try_with_current_output(|_| {
-            let renderable = renderable.lock();
-            let mut inner = renderable.inner.borrow_mut();
+        // Fetch cleanup is intentionally allowed after this RPC generation has
+        // retired: it releases only the exact reservation created by this
+        // request. Pointer identity, rather than timestamp equality, prevents a
+        // stale G1 completion from clearing a successor request that happened
+        // to start at the same clock instant.
+        let clear_exact_fetch_markers = || {
+            registration.try_with_current_output(|_| {
+                let renderable = renderable.lock();
+                let mut inner = renderable.inner.borrow_mut();
+                for range in to_fetch.iter() {
+                    for stable_row in range.clone() {
+                        let entry = match inner.lines.pop(&stable_row) {
+                            Some(LineEntry::Fetching(current))
+                                if fetch_token.same_request(&current) =>
+                            {
+                                continue;
+                            }
+                            Some(LineEntry::LineAndFetching(line, current))
+                                if fetch_token.same_request(&current) =>
+                            {
+                                LineEntry::Line(line)
+                            }
+                            Some(entry) => entry,
+                            None => continue,
+                        };
+                        inner.lines.put(stable_row, entry);
+                    }
+                }
+            })
+        };
 
-            match result {
-                Ok(lines) => {
+        let applied = match result {
+            Ok(lines) => match rpc.commit_sync(RpcConsumerKind::FetchedLines, || {
+                registration.try_with_current_output(|_| {
+                    let renderable = renderable.lock();
+                    let mut inner = renderable.inner.borrow_mut();
                     let config = configuration();
 
-                    log::trace!("fetch complete for {:?} at {:?}", to_fetch, now);
+                    log::trace!(
+                        "fetch complete for {:?} at {:?}",
+                        to_fetch,
+                        fetch_token.started_at()
+                    );
                     for (stable_row, line) in lines.into_iter() {
-                        inner.put_line(stable_row, line, &config, Some(now));
+                        inner.put_line(stable_row, line, &config, Some(&fetch_token));
                     }
+                })
+            }) {
+                Ok(applied) => applied,
+                Err(error) => {
+                    let _ = clear_exact_fetch_markers();
+                    return Err(anyhow::Error::new(error));
                 }
-                Err(err) => {
-                    log::error!("get_lines failed: {}", err);
-                    for r in to_fetch.iter() {
-                        for stable_row in r.clone() {
-                            let entry = match inner.lines.pop(&stable_row) {
-                                Some(LineEntry::Fetching(then)) if then == now => {
-                                    // leave it popped
-                                    continue;
-                                }
-                                Some(LineEntry::LineAndFetching(line, then)) if then == now => {
-                                    // revert to just a line
-                                    LineEntry::Line(line)
-                                }
-                                Some(entry) => entry,
-                                None => continue,
-                            };
-                            inner.lines.put(stable_row, entry);
-                        }
-                    }
-                }
+            },
+            Err(err) => {
+                log::error!("get_lines failed: {}", err);
+                clear_exact_fetch_markers()
             }
-            drop(inner);
-            drop(renderable);
-        });
+        };
         if applied.is_none() {
             log::trace!(
                 "discarding fetched lines for stale client pane registration {}",
@@ -930,29 +994,45 @@ impl RenderableInner {
         let remote_pane_id = self.remote_pane_id;
         let local_pane_id = self.local_pane_id;
         let client = Arc::clone(&self.client);
-        let request = client.client.get_pane_render_changes(GetPaneRenderChanges {
+        let rpc = client.client.rpc_scope();
+        let request = rpc.get_pane_render_changes(GetPaneRenderChanges {
             pane_id: remote_pane_id,
         });
         promise::spawn::spawn(async move {
-            let alive = match request.await {
-                Ok(resp) => resp.is_alive,
-                // if we got a timeout on a reconnectable, don't
-                // consider the tab to be dead; that helps to
-                // avoid having a tab get shuffled around
-                Err(_) => client.client.is_reconnectable,
-            };
-
-            let updated = registration.try_with_current(|_| {
+            let response = request.await;
+            let cleared = registration.try_with_current(|_| {
                 let renderable = renderable.lock();
-                let mut inner = renderable.inner.borrow_mut();
-
-                inner.dead = !alive;
-                inner.last_recv_time = Instant::now();
+                let inner = renderable.inner.borrow();
                 inner.poll_in_progress.store(false, Ordering::SeqCst);
             });
-            if updated.is_none() {
+            if cleared.is_none() {
                 log::trace!(
                     "discarding liveness poll completion for stale client pane registration {}",
+                    local_pane_id
+                );
+            }
+            let alive = match response {
+                Ok(response) => response.is_alive,
+                // Preserve the established liveness policy: a transient
+                // transport failure cannot declare a reconnectable pane dead,
+                // while a non-reconnectable pane has no successor that could
+                // revive it. The generation commit below still prevents a G1
+                // result from mutating state after G2 publication.
+                Err(_) => client.client.is_reconnectable,
+            };
+            let updated = rpc
+                .commit_sync(RpcConsumerKind::Liveness, || {
+                    registration.try_with_current(|_| {
+                        let renderable = renderable.lock();
+                        let mut inner = renderable.inner.borrow_mut();
+                        inner.dead = !alive;
+                        inner.last_recv_time = Instant::now();
+                    })
+                })
+                .map_err(anyhow::Error::new)?;
+            if updated.is_none() {
+                log::trace!(
+                    "discarding liveness state update for stale client pane registration {}",
                     local_pane_id
                 );
             }
@@ -1131,6 +1211,7 @@ impl RenderableState {
         let mut result = vec![];
         let mut to_fetch = RangeSet::new();
         let now = Instant::now();
+        let mut fetch_token = None;
 
         for idx in lines.clone() {
             let entry = match inner.lines.pop(&idx) {
@@ -1138,7 +1219,10 @@ impl RenderableState {
                     result.push(line.clone());
                     if line.changed_since(inner.seqno) {
                         to_fetch.add(idx);
-                        LineEntry::Stale(line)
+                        let token = fetch_token
+                            .get_or_insert_with(|| FetchToken::new(now))
+                            .clone();
+                        LineEntry::LineAndFetching(line, token)
                     } else {
                         LineEntry::Line(line)
                     }
@@ -1154,12 +1238,18 @@ impl RenderableState {
                 Some(LineEntry::Stale(line)) => {
                     result.push(line.clone());
                     to_fetch.add(idx);
-                    LineEntry::LineAndFetching(line, now)
+                    let token = fetch_token
+                        .get_or_insert_with(|| FetchToken::new(now))
+                        .clone();
+                    LineEntry::LineAndFetching(line, token)
                 }
                 None => {
                     result.push(Line::with_width(inner.dimensions.cols, SEQ_ZERO));
                     to_fetch.add(idx);
-                    LineEntry::Fetching(now)
+                    let token = fetch_token
+                        .get_or_insert_with(|| FetchToken::new(now))
+                        .clone();
+                    LineEntry::Fetching(token)
                 }
             };
 
@@ -1250,14 +1340,24 @@ impl RenderableState {
                     Some(LineEntry::Line(line)) => {
                         if line.changed_since(inner.seqno) {
                             to_fetch.add(idx);
-                            inner.lines.put(idx, LineEntry::LineAndFetching(line, now));
+                            let token = fetch_token
+                                .get_or_insert_with(|| FetchToken::new(now))
+                                .clone();
+                            inner
+                                .lines
+                                .put(idx, LineEntry::LineAndFetching(line, token));
                         } else {
                             inner.lines.put(idx, LineEntry::Line(line));
                         }
                     }
                     Some(LineEntry::Stale(line)) => {
                         to_fetch.add(idx);
-                        inner.lines.put(idx, LineEntry::LineAndFetching(line, now));
+                        let token = fetch_token
+                            .get_or_insert_with(|| FetchToken::new(now))
+                            .clone();
+                        inner
+                            .lines
+                            .put(idx, LineEntry::LineAndFetching(line, token));
                     }
                     // Already in flight (Fetching / LineAndFetching): dedupe -> leave.
                     Some(other) => {
@@ -1265,7 +1365,10 @@ impl RenderableState {
                     }
                     None => {
                         to_fetch.add(idx);
-                        inner.lines.put(idx, LineEntry::Fetching(now));
+                        let token = fetch_token
+                            .get_or_insert_with(|| FetchToken::new(now))
+                            .clone();
+                        inner.lines.put(idx, LineEntry::Fetching(token));
                     }
                 }
             }
@@ -1278,7 +1381,11 @@ impl RenderableState {
             to_fetch
         );
 
-        inner.schedule_fetch_lines(to_fetch, now);
+        if let Some(fetch_token) = fetch_token {
+            inner.schedule_fetch_lines(to_fetch, fetch_token);
+        } else {
+            debug_assert!(to_fetch.is_empty());
+        }
         (lines.start, result)
     }
 
@@ -1351,7 +1458,8 @@ impl RenderableState {
 mod tests {
     use super::{
         base_poll_interval, initial_last_poll, rebuild_cache_as_stale,
-        render_line_cache_capacity_for_values, should_apply_unilateral_delta, ImageLru, LineEntry,
+        render_line_cache_capacity_for_values, should_apply_unilateral_delta, FetchToken, ImageLru,
+        LineEntry,
     };
     use lru::LruCache;
     use std::num::NonZeroUsize;
@@ -1384,6 +1492,18 @@ mod tests {
         assert!(should_apply_unilateral_delta(current, 10));
         assert!(should_apply_unilateral_delta(current, 11));
         assert!(!should_apply_unilateral_delta(current, 9));
+    }
+
+    #[test]
+    fn fetch_tokens_use_request_identity_even_at_the_same_clock_instant() {
+        let started_at = Instant::now();
+        let first = FetchToken::new(started_at);
+        let first_clone = first.clone();
+        let successor = FetchToken::new(started_at);
+
+        assert!(first.same_request(&first_clone));
+        assert!(!first.same_request(&successor));
+        assert_eq!(first.started_at(), successor.started_at());
     }
 
     #[test]

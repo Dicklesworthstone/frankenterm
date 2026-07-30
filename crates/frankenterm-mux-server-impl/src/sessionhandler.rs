@@ -909,7 +909,12 @@ impl SessionHandler {
                                     tab_titles.push(tab.get_title());
                                 }
                             }
-                            log::trace!("ListPanes {tabs:#?} {tab_titles:?}");
+                            log::trace!(
+                                "ListPanes snapshot has {} tab trees, {} tab titles, and {} windows",
+                                tabs.len(),
+                                tab_titles.len(),
+                                window_titles.len()
+                            );
                             Ok(Pdu::ListPanesResponse(ListPanesResponse {
                                 tabs,
                                 tab_titles,

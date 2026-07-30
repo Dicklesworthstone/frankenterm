@@ -1,4 +1,7 @@
-use crate::client::{with_mux_rpc_bootstrap_timeout, Client, RpcGenerationScope};
+use crate::client::{
+    with_mux_rpc_bootstrap_timeout, Client, RpcConsumerKind, RpcGenerationAbortGuard,
+    RpcGenerationScope,
+};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -411,6 +414,12 @@ struct InitialAttachmentClaim<'a> {
     pending: &'a AtomicBool,
 }
 
+struct InitialAttachmentRequest {
+    panes: ListPanesResponse,
+    owner_client_id: Option<Arc<ClientId>>,
+    primary_window_id: Option<WindowId>,
+}
+
 impl Drop for InitialAttachmentClaim<'_> {
     fn drop(&mut self) {
         self.pending.store(false, Ordering::Release);
@@ -429,33 +438,43 @@ impl InitialAttachmentCleanup {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn cleanup_if_current(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+
+        let mux = Arc::clone(&self.mux);
+        let domain_registration = Arc::clone(&self.domain_registration);
+        let inner = Arc::clone(&self.inner);
+        let rpc = self.rpc.clone();
+        let _ = rpc.commit_sync(RpcConsumerKind::InitialAttachmentCleanup, || {
+            let _ = inner.client.abort_rpc_transport_generation(
+                &rpc,
+                "initial attachment preparation failed or was cancelled",
+            );
+            inner.mark_detached();
+
+            let Some(domain) = domain_registration.downcast_ref::<ClientDomain>() else {
+                return;
+            };
+            if domain.perform_detach_if_current(&inner) {
+                return;
+            }
+            let attachment_slot_is_empty =
+                lock_or_recover(&domain.inner, "client_domain_inner").is_none();
+            if attachment_slot_is_empty {
+                domain.retired.store(true, Ordering::Release);
+                let _ = mux.domain_was_detached_if_same(&domain_registration);
+            }
+        });
+    }
 }
 
 impl Drop for InitialAttachmentCleanup {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let _ = self.inner.client.abort_rpc_transport_generation(
-            &self.rpc,
-            "initial attachment preparation failed or was cancelled",
-        );
-        self.inner.mark_detached();
-
-        let Some(domain) = self.domain_registration.downcast_ref::<ClientDomain>() else {
-            return;
-        };
-        if domain.perform_detach_if_current(&self.inner) {
-            return;
-        }
-        let attachment_slot_is_empty =
-            lock_or_recover(&domain.inner, "client_domain_inner").is_none();
-        if attachment_slot_is_empty {
-            domain.retired.store(true, Ordering::Release);
-            let _ = self
-                .mux
-                .domain_was_detached_if_same(&self.domain_registration);
-        }
+        self.cleanup_if_current();
     }
 }
 
@@ -839,7 +858,12 @@ impl ClientDomain {
         let mut abort_guard =
             rpc.abort_guard("successor mux RPC bootstrap failed, timed out, or was cancelled")?;
         let result = with_mux_rpc_bootstrap_timeout(Self::reattach_if_current_inner(
-            mux, domain, expected, rpc, ui,
+            mux,
+            domain,
+            expected,
+            rpc,
+            &abort_guard,
+            ui,
         ))
         .await;
         if result.is_ok() {
@@ -853,6 +877,7 @@ impl ClientDomain {
         domain: Arc<dyn Domain>,
         expected: Arc<ClientInner>,
         rpc: RpcGenerationScope,
+        readiness_guard: &RpcGenerationAbortGuard,
         ui: ConnectionUI,
     ) -> anyhow::Result<()> {
         let domain_id = domain.domain_id();
@@ -937,7 +962,10 @@ impl ClientDomain {
             return Ok(());
         }
 
-        expected.client.publish_rpc_transport_ready(&rpc).await?;
+        expected
+            .client
+            .publish_rpc_transport_ready(&rpc, readiness_guard)
+            .await?;
         ui.close();
         Ok(())
     }
@@ -981,8 +1009,14 @@ impl ClientDomain {
         if !incarnation_is_current() {
             return Ok(false);
         }
-        Self::process_pane_list(&mux, Arc::clone(&inner), panes, primary_window_id)?;
-        Ok(incarnation_is_current())
+        rpc.commit_sync(RpcConsumerKind::TopologySnapshot, || {
+            if !incarnation_is_current() {
+                return Ok(false);
+            }
+            Self::process_pane_list(&mux, Arc::clone(&inner), panes, primary_window_id)?;
+            Ok(incarnation_is_current())
+        })
+        .map_err(anyhow::Error::new)?
     }
 
     fn resolve_remote_spawn_entities(
@@ -1059,9 +1093,10 @@ impl ClientDomain {
             );
         }
         log::debug!(
-            "domain {}: ListPanes result {:#?}",
+            "domain {}: ListPanes snapshot has {} tab trees and {} tab titles",
             inner.local_domain_id,
-            panes
+            panes.tabs.len(),
+            panes.tab_titles.len()
         );
 
         // Check out one fallback local identifier for every unique remote pane
@@ -1410,10 +1445,14 @@ impl ClientDomain {
         domain_id: DomainId,
         client: Client,
         rpc: RpcGenerationScope,
-        panes: ListPanesResponse,
-        owner_client_id: Option<Arc<ClientId>>,
-        primary_window_id: Option<WindowId>,
+        readiness_guard: &RpcGenerationAbortGuard,
+        request: InitialAttachmentRequest,
     ) -> anyhow::Result<()> {
+        let InitialAttachmentRequest {
+            panes,
+            owner_client_id,
+            primary_window_id,
+        } = request;
         let domain_registration = mux
             .get_domain(domain_id)
             .ok_or_else(|| anyhow!("invalid domain id {}", domain_id))?;
@@ -1466,40 +1505,51 @@ impl ClientDomain {
             armed: true,
         };
 
-        // Process the pane list BEFORE publishing inner to the domain.
-        // This prevents concurrent operations from seeing a partially
-        // attached domain with incomplete pane mappings. The pending claim
-        // rejects a second initial attachment without holding a callback-
-        // reentrant mutex across mux topology mutation.
-        Self::process_pane_list(mux, Arc::clone(&inner), panes, primary_window_id)?;
+        rpc.commit_sync(RpcConsumerKind::InitialAttachment, || {
+            // Process the pane list BEFORE publishing inner to the domain.
+            // This prevents concurrent operations from seeing a partially
+            // attached domain with incomplete pane mappings. The pending claim
+            // rejects a second initial attachment without holding a callback-
+            // reentrant mutex across mux topology mutation.
+            let result = (|| {
+                Self::process_pane_list(mux, Arc::clone(&inner), panes, primary_window_id)?;
 
-        {
-            let mut published = lock_or_recover(&domain.inner, "client_domain_inner");
-            if domain.retired.load(Ordering::Acquire)
-                || !mux
-                    .get_domain(domain_id)
-                    .is_some_and(|current| Arc::ptr_eq(&current, &domain_registration))
-            {
-                inner.mark_detached();
-                bail!("client domain {domain_id} retired during attachment preparation");
+                let mut published = lock_or_recover(&domain.inner, "client_domain_inner");
+                if domain.retired.load(Ordering::Acquire)
+                    || !mux
+                        .get_domain(domain_id)
+                        .is_some_and(|current| Arc::ptr_eq(&current, &domain_registration))
+                {
+                    inner.mark_detached();
+                    bail!("client domain {domain_id} retired during attachment preparation");
+                }
+                if published.is_some() {
+                    inner.mark_detached();
+                    bail!("client domain {domain_id} gained an attachment during preparation");
+                }
+                if inner
+                    .owner_client_id
+                    .as_ref()
+                    .is_some_and(|owner| !mux.client_registration_is_current(owner))
+                {
+                    inner.mark_detached();
+                    bail!(
+                        "client domain {domain_id} owner client registration retired during \
+                         attachment preparation"
+                    );
+                }
+                *published = Some(Arc::clone(&inner));
+                anyhow::Result::<()>::Ok(())
+            })();
+            if result.is_err() {
+                // Run cleanup while the outer generation lease is still held.
+                // A nested cleanup lease is deliberately supported and prevents
+                // G2 publication between partial topology mutation and rollback.
+                cleanup.cleanup_if_current();
             }
-            if published.is_some() {
-                inner.mark_detached();
-                bail!("client domain {domain_id} gained an attachment during preparation");
-            }
-            if inner
-                .owner_client_id
-                .as_ref()
-                .is_some_and(|owner| !mux.client_registration_is_current(owner))
-            {
-                inner.mark_detached();
-                bail!(
-                    "client domain {domain_id} owner client registration retired during attachment \
-                     preparation"
-                );
-            }
-            *published = Some(Arc::clone(&inner));
-        }
+            result
+        })
+        .map_err(anyhow::Error::new)??;
 
         let bootstrap_result = async {
             if let Some(request) = current_active_workspace_sync(&inner, mux) {
@@ -1509,14 +1559,12 @@ impl ClientDomain {
             }
             inner
                 .client
-                .publish_rpc_transport_ready(&rpc)
+                .publish_rpc_transport_ready(&rpc, readiness_guard)
                 .await
                 .context("publishing initial mux RPC readiness")
         }
         .await;
-        if let Err(error) = bootstrap_result {
-            return Err(error);
-        }
+        bootstrap_result?;
         cleanup.disarm();
 
         Ok(())
@@ -1567,8 +1615,12 @@ impl Domain for ClientDomain {
         {
             bail!("client attachment retired while resolving spawned pane");
         }
-        let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
-        Ok(pane)
+        rpc.commit_sync(RpcConsumerKind::SpawnResolution, || {
+            let (_tab, pane, _window_id) =
+                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            Ok(pane)
+        })
+        .map_err(anyhow::Error::new)?
     }
 
     /// Forward the request to the remote; we need to translate the local ids
@@ -1617,24 +1669,29 @@ impl Domain for ClientDomain {
             bail!("client attachment retired while moving pane");
         }
 
-        let local_tab_id = inner
-            .remote_to_local_tab_id(result.tab_id)
-            .ok_or_else(|| anyhow!("remote tab {} didn't resolve after resync", result.tab_id))?;
+        rpc.commit_sync(RpcConsumerKind::MoveResolution, || {
+            let local_tab_id = inner
+                .remote_to_local_tab_id(result.tab_id)
+                .ok_or_else(|| {
+                    anyhow!("remote tab {} didn't resolve after resync", result.tab_id)
+                })?;
 
-        let local_win_id = inner
-            .remote_to_local_window(result.window_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "remote window {} didn't resolve after resync",
-                    result.window_id
-                )
-            })?;
+            let local_win_id = inner
+                .remote_to_local_window(result.window_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "remote window {} didn't resolve after resync",
+                        result.window_id
+                    )
+                })?;
 
-        let tab = mux
-            .get_tab(local_tab_id)
-            .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
+            let tab = mux
+                .get_tab(local_tab_id)
+                .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
 
-        Ok(Some((tab, local_win_id)))
+            Ok(Some((tab, local_win_id)))
+        })
+        .map_err(anyhow::Error::new)?
     }
 
     async fn spawn(
@@ -1674,8 +1731,12 @@ impl Domain for ClientDomain {
         {
             bail!("client attachment retired while resolving spawned tab");
         }
-        let (tab, _pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
-        Ok(tab)
+        rpc.commit_sync(RpcConsumerKind::SpawnResolution, || {
+            let (tab, _pane, _window_id) =
+                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            Ok(tab)
+        })
+        .map_err(anyhow::Error::new)?
     }
 
     async fn split_pane(
@@ -1742,8 +1803,12 @@ impl Domain for ClientDomain {
         {
             bail!("client attachment retired while resolving split pane");
         }
-        let (_tab, pane, _window_id) = Self::resolve_remote_spawn_entities(mux, &inner, result)?;
-        Ok(pane)
+        rpc.commit_sync(RpcConsumerKind::SplitResolution, || {
+            let (_tab, pane, _window_id) =
+                Self::resolve_remote_spawn_entities(mux, &inner, result)?;
+            Ok(pane)
+        })
+        .map_err(anyhow::Error::new)?
     }
 
     async fn attach(
@@ -1818,9 +1883,12 @@ impl Domain for ClientDomain {
                         domain_id,
                         client,
                         rpc,
-                        panes,
-                        owner_client_id,
-                        window_id,
+                        &abort_guard,
+                        InitialAttachmentRequest {
+                            panes,
+                            owner_client_id,
+                            primary_window_id: window_id,
+                        },
                     )
                     .await
                 })

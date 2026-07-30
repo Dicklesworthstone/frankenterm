@@ -1,4 +1,4 @@
-use crate::client::RpcGenerationScope;
+use crate::client::{RpcConsumerKind, RpcGenerationScope};
 use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{
@@ -168,21 +168,25 @@ impl ClientPane {
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
                 let bonus_lines = hydrate_lines(rpc, delta.pane_id, bonus_lines).await;
 
-                let applied = registration
-                    .try_with_current_output(|_| {
-                        let applied = self
-                            .renderable
-                            .lock()
-                            .inner
-                            .borrow_mut()
-                            .apply_changes_to_surface(delta, bonus_lines);
-                        if applied {
-                            *self.mouse_grabbed.lock() = mouse_grabbed;
-                            *self.alt_screen_active.lock() = alt_screen_active;
-                        }
-                        applied
+                let applied = rpc
+                    .commit_sync(RpcConsumerKind::PaneUnilateral, || {
+                        registration
+                            .try_with_current_output(|_| {
+                                let applied = self
+                                    .renderable
+                                    .lock()
+                                    .inner
+                                    .borrow_mut()
+                                    .apply_changes_to_surface(delta, bonus_lines);
+                                if applied {
+                                    *self.mouse_grabbed.lock() = mouse_grabbed;
+                                    *self.alt_screen_active.lock() = alt_screen_active;
+                                }
+                                applied
+                            })
+                            .unwrap_or(false)
                     })
-                    .unwrap_or(false);
+                    .map_err(anyhow::Error::new)?;
                 if !applied {
                     log::trace!(
                         "discarding render delta for stale client pane registration {}",
@@ -195,66 +199,81 @@ impl ClientPane {
                 selection,
                 ..
             }) => {
-                if let Some(result) = registration.try_with_current(|current| {
-                    if !current.is_same_pane_ref(self) {
-                        return Ok(());
-                    }
-                    let clipboard_handler = { self.clipboard.lock().clone() };
-                    match clipboard_handler {
-                        Some(clip) => {
-                            log::debug!(
-                                "Pdu::SetClipboard pane={} remote={} {:?} {:?}",
-                                self.local_pane_id,
-                                self.remote_pane_id,
-                                selection,
-                                clipboard
-                            );
-                            clip.set_contents(selection, clipboard)
-                        }
-                        None => {
-                            log::error!(
-                                "ClientPane: Ignoring SetClipboard request {:?}",
-                                clipboard
-                            );
-                            Ok(())
-                        }
-                    }
-                }) {
+                let result = rpc
+                    .commit_sync(RpcConsumerKind::PaneUnilateral, || {
+                        registration.try_with_current(|current| {
+                            if !current.is_same_pane_ref(self) {
+                                return Ok(());
+                            }
+                            let clipboard_handler = { self.clipboard.lock().clone() };
+                            match clipboard_handler {
+                                Some(clip) => {
+                                    log::debug!(
+                                        "Pdu::SetClipboard pane={} remote={} {:?} {:?}",
+                                        self.local_pane_id,
+                                        self.remote_pane_id,
+                                        selection,
+                                        clipboard
+                                    );
+                                    clip.set_contents(selection, clipboard)
+                                }
+                                None => {
+                                    log::error!(
+                                        "ClientPane: Ignoring SetClipboard request {:?}",
+                                        clipboard
+                                    );
+                                    Ok(())
+                                }
+                            }
+                        })
+                    })
+                    .map_err(anyhow::Error::new)?;
+                if let Some(result) = result {
                     result?;
                 }
             }
             Pdu::SetPalette(SetPalette { palette, .. }) => {
-                let _ = registration.try_with_current(|current| {
-                    *self.application_palette.lock() = palette != *self.configured_palette.lock();
-                    *self.palette.lock() = palette;
-                    self.renderable.lock().inner.borrow_mut().make_all_stale();
-                    current.dispatch_alert(Alert::PaletteChanged);
-                });
+                rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
+                    let _ = registration.try_with_current(|current| {
+                        *self.application_palette.lock() =
+                            palette != *self.configured_palette.lock();
+                        *self.palette.lock() = palette;
+                        self.renderable.lock().inner.borrow_mut().make_all_stale();
+                        current.dispatch_alert(Alert::PaletteChanged);
+                    });
+                })
+                .map_err(anyhow::Error::new)?;
             }
             Pdu::NotifyAlert(NotifyAlert { alert, .. }) => {
-                let _ = registration.try_with_current(|current| {
-                    match &alert {
-                        Alert::SetUserVar { name, value } => {
-                            self.user_vars.lock().insert(name.clone(), value.clone());
+                rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
+                    let _ = registration.try_with_current(|current| {
+                        match &alert {
+                            Alert::SetUserVar { name, value } => {
+                                self.user_vars.lock().insert(name.clone(), value.clone());
+                            }
+                            Alert::OutputSinceFocusLost => {
+                                *self.unseen_output.lock() = true;
+                            }
+                            Alert::Progress(progress) => {
+                                *self.progress.lock() = progress.clone();
+                            }
+                            _ => {}
                         }
-                        Alert::OutputSinceFocusLost => {
-                            *self.unseen_output.lock() = true;
-                        }
-                        Alert::Progress(progress) => {
-                            *self.progress.lock() = progress.clone();
-                        }
-                        _ => {}
-                    }
-                    current.dispatch_alert(alert);
-                });
+                        current.dispatch_alert(alert);
+                    });
+                })
+                .map_err(anyhow::Error::new)?;
             }
             Pdu::PaneRemoved(PaneRemoved { pane_id }) => {
                 log::trace!("remote pane {} has been removed", pane_id);
-                let _ = registration.try_with_current(|current| {
-                    self.renderable.lock().inner.borrow_mut().dead = true;
-                    current.prune_dead_windows();
-                    self.client.expire_stale_mappings(&current);
-                });
+                rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
+                    let _ = registration.try_with_current(|current| {
+                        self.renderable.lock().inner.borrow_mut().dead = true;
+                        current.prune_dead_windows();
+                        self.client.expire_stale_mappings(&current);
+                    });
+                })
+                .map_err(anyhow::Error::new)?;
             }
             Pdu::PaneFocused(PaneFocused { pane_id }) => {
                 // We get here whenever the pane focus is changed on the
@@ -268,11 +287,16 @@ impl ClientPane {
                 // it here.
                 log::trace!("advised of remote pane focus: {pane_id}");
 
-                let _ = registration.try_with_current(|current| {
-                    if let Err(err) = current.focus_pane_and_containing_tab() {
-                        log::error!("Error reconciling remote PaneFocused notification: {err:#}");
-                    }
-                });
+                rpc.commit_sync(RpcConsumerKind::PaneUnilateral, || {
+                    let _ = registration.try_with_current(|current| {
+                        if let Err(err) = current.focus_pane_and_containing_tab() {
+                            log::error!(
+                                "Error reconciling remote PaneFocused notification: {err:#}"
+                            );
+                        }
+                    });
+                })
+                .map_err(anyhow::Error::new)?;
             }
             _ => bail!("unhandled unilateral pdu: {:?}", pdu),
         };
@@ -517,9 +541,8 @@ impl Pane for ClientPane {
         range: Range<StableRowIndex>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        match self
-            .client
-            .client
+        let rpc = self.client.client.rpc_scope();
+        match rpc
             .search_scrollback(SearchScrollbackRequest {
                 pane_id: self.remote_pane_id,
                 pattern,
@@ -528,7 +551,9 @@ impl Pane for ClientPane {
             })
             .await
         {
-            Ok(SearchScrollbackResponse { results }) => Ok(results),
+            Ok(SearchScrollbackResponse { results }) => rpc
+                .commit_sync(RpcConsumerKind::Search, || results)
+                .map_err(anyhow::Error::new),
             Err(e) => Err(e),
         }
     }
