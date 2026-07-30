@@ -6334,6 +6334,10 @@ impl Mux {
     /// between the windows' ordered tab lists. No pane is killed and no
     /// `Pdu::KillPane` is sent -- this is the mechanism the window-unify
     /// feature uses to relocate non-duplicate tabs onto the canonical window.
+    /// Existing destination active identity is preserved; an empty destination
+    /// activates the moved tab. Same-window reorders preserve active identity
+    /// and tab-stack membership without transient focus loss. An explicit
+    /// `idx` outside the final-index range fails before either window mutates.
     ///
     /// Window-lifecycle decisions (closing a now-empty source window) are left
     /// to the caller; this primitive does not prune. Workspace policy
@@ -6344,9 +6348,8 @@ impl Mux {
         dst_window: WindowId,
         idx: Option<usize>,
     ) -> anyhow::Result<()> {
-        let tab = self
-            .tabs
-            .read()
+        let tabs = self.tabs.read();
+        let tab = tabs
             .get(&tab_id)
             .map(Arc::clone)
             .ok_or_else(|| anyhow!("move_tab_between_windows: tab {tab_id} not found in mux"))?;
@@ -6368,11 +6371,45 @@ impl Mux {
         );
         let src_window = source_windows[0];
 
-        {
+        let changed = {
             let mut windows = self.windows.write();
+            let source = windows.get(&src_window).ok_or_else(|| {
+                anyhow!("move_tab_between_windows: source window {src_window} not found")
+            })?;
+            let source_index = source
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, &tab))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "move_tab_between_windows: exact tab {tab_id} left source window \
+                         {src_window}"
+                    )
+                })?;
+            let source_len = source.len();
             let destination = windows.get(&dst_window).ok_or_else(|| {
                 anyhow!("move_tab_between_windows: destination window {dst_window} not found")
             })?;
+            let destination_len = destination.len();
+            let pos = match (src_window == dst_window, idx) {
+                (true, Some(pos)) => {
+                    anyhow::ensure!(
+                        pos < source_len,
+                        "move_tab_between_windows: destination index {pos} is out of range for \
+                         window {dst_window} with {source_len} tabs"
+                    );
+                    pos
+                }
+                (true, None) => source_len - 1,
+                (false, Some(pos)) => {
+                    anyhow::ensure!(
+                        pos <= destination_len,
+                        "move_tab_between_windows: destination index {pos} is out of range for \
+                         window {dst_window} with {destination_len} tabs"
+                    );
+                    pos
+                }
+                (false, None) => destination_len,
+            };
             if src_window != dst_window {
                 anyhow::ensure!(
                     !destination
@@ -6387,33 +6424,59 @@ impl Mux {
                      tab id {tab_id}"
                 );
             }
-            // Detach from the source window's ordered tab list first. When
-            // src == dst this also lets us re-insert at `idx` (a reorder).
-            // `Window::remove_by_id` only touches window-local bookkeeping; it
-            // does NOT kill panes or remove the tab from `self.tabs`.
-            let removed = windows
-                .get_mut(&src_window)
-                .is_some_and(|window| window.remove_tab_if_same(&tab));
-            if !removed {
-                return Err(anyhow!(
-                    "move_tab_between_windows: exact tab {tab_id} left source window {src_window}"
-                ));
+
+            let changed = if src_window == dst_window && source_index == pos {
+                false
+            } else if src_window == dst_window {
+                let reordered = windows
+                    .get_mut(&src_window)
+                    .expect("source window presence checked above")
+                    .reorder_tab_if_same(&tab, source_index, pos)?;
+                if !reordered {
+                    return Err(anyhow!(
+                        "move_tab_between_windows: exact tab {tab_id} left source window \
+                         {src_window}"
+                    ));
+                }
+                true
+            } else {
+                // All fallible validation is complete while both window
+                // vectors remain unchanged. The write lock prevents either
+                // length or membership from changing between detach and the
+                // prevalidated insertion.
+                let removed = windows
+                    .get_mut(&src_window)
+                    .expect("source window presence checked above")
+                    .remove_tab_if_same(&tab);
+                if !removed {
+                    return Err(anyhow!(
+                        "move_tab_between_windows: exact tab {tab_id} left source window \
+                         {src_window}"
+                    ));
+                }
+                let dst = windows
+                    .get_mut(&dst_window)
+                    .expect("destination window presence checked above");
+                dst.insert(pos, &tab)
+                    .expect("destination index and membership were validated before detach");
+                true
+            };
+            if changed {
+                self.queue_window_notification(MuxNotification::TabAddedToWindow {
+                    tab_id,
+                    window_id: dst_window,
+                });
             }
-            let dst = windows
-                .get_mut(&dst_window)
-                .expect("destination window presence checked above");
-            let pos = idx.map(|i| i.min(dst.len())).unwrap_or_else(|| dst.len());
-            dst.insert(pos, &tab);
-            self.queue_window_notification(MuxNotification::TabAddedToWindow {
-                tab_id,
-                window_id: dst_window,
-            });
-        }
+            changed
+        };
+        drop(tabs);
 
         // Pane count is unchanged for a within-workspace move; recompute keeps
         // the per-workspace tallies correct if a caller ever moves across
         // workspaces.
-        self.recompute_pane_count();
+        if changed && src_window != dst_window {
+            self.recompute_pane_count();
+        }
         self.flush_window_notifications();
         Ok(())
     }
@@ -12769,6 +12832,301 @@ mod tests {
 
         drop(dst_window);
         drop(src_window);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn same_window_tab_move_preserves_exact_active_and_stack_identity() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(Some("same-window-order".to_string()), None);
+        let window_id = *window_builder;
+        let first = Arc::new(Tab::new(&test_size()));
+        let active = Arc::new(Tab::new(&test_size()));
+        let third = Arc::new(Tab::new(&test_size()));
+        let stack_id = crate::tab::TabStackId(83);
+
+        for tab in [&first, &active, &third] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+            mux.add_tab_to_window(tab, window_id)
+                .expect("attach exact tab");
+        }
+        {
+            let mut window = mux
+                .get_window_mut(window_id)
+                .expect("window should remain registered");
+            window.set_active_without_saving(1);
+            window
+                .create_tab_stack(
+                    stack_id,
+                    vec![first.tab_id(), active.tab_id(), third.tab_id()],
+                )
+                .expect("create stack before reorder");
+        }
+        let active_id = active.tab_id();
+        let move_events = Arc::new(AtomicUsize::new(0));
+        let move_events_for_subscriber = Arc::clone(&move_events);
+        mux.subscribe(move |notification| {
+            if matches!(
+                notification,
+                MuxNotification::TabAddedToWindow {
+                    tab_id,
+                    window_id: notified_window,
+                } if tab_id == active_id && notified_window == window_id
+            ) {
+                move_events_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        })
+        .expect("subscribe to exact reorder event");
+
+        mux.move_tab_between_windows(active_id, window_id, Some(1))
+            .expect("same-index move is a successful no-op");
+        assert_eq!(
+            move_events.load(Ordering::SeqCst),
+            0,
+            "same-index move must not publish a false topology mutation",
+        );
+
+        mux.move_tab_between_windows(first.tab_id(), window_id, Some(2))
+            .expect("move inactive tab right");
+        {
+            let window = mux
+                .get_window(window_id)
+                .expect("window should remain registered");
+            assert_eq!(
+                window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+                vec![
+                    Arc::as_ptr(&active),
+                    Arc::as_ptr(&third),
+                    Arc::as_ptr(&first),
+                ],
+            );
+            assert!(window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+        }
+
+        mux.move_tab_between_windows(active_id, window_id, Some(2))
+            .expect("move active tab right");
+        mux.move_tab_between_windows(active_id, window_id, Some(0))
+            .expect("move active tab left");
+        {
+            let window = mux
+                .get_window(window_id)
+                .expect("window should remain registered");
+            assert_eq!(
+                window.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+                vec![
+                    Arc::as_ptr(&active),
+                    Arc::as_ptr(&third),
+                    Arc::as_ptr(&first),
+                ],
+            );
+            assert_eq!(window.get_active_idx(), 0);
+            assert!(window
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &active)));
+            for tab in [&first, &active, &third] {
+                assert_eq!(
+                    window.tab_stack_for_tab(tab.tab_id()),
+                    Some(stack_id),
+                    "same-window reorder must retain stack membership",
+                );
+            }
+        }
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn cross_window_tab_move_preserves_both_active_identities() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source_builder = mux.new_empty_window(Some("cross-window-order".to_string()), None);
+        let source_id = *source_builder;
+        let destination_builder =
+            mux.new_empty_window(Some("cross-window-order".to_string()), None);
+        let destination_id = *destination_builder;
+        let empty_builder = mux.new_empty_window(Some("cross-window-order".to_string()), None);
+        let empty_id = *empty_builder;
+        let left_fallback_builder =
+            mux.new_empty_window(Some("cross-window-order".to_string()), None);
+        let left_fallback_id = *left_fallback_builder;
+
+        let first = Arc::new(Tab::new(&test_size()));
+        let source_active = Arc::new(Tab::new(&test_size()));
+        let source_right = Arc::new(Tab::new(&test_size()));
+        let destination_first = Arc::new(Tab::new(&test_size()));
+        let destination_active = Arc::new(Tab::new(&test_size()));
+        let source_left = Arc::new(Tab::new(&test_size()));
+        let source_last_active = Arc::new(Tab::new(&test_size()));
+        for tab in [
+            &first,
+            &source_active,
+            &source_right,
+            &destination_first,
+            &destination_active,
+            &source_left,
+            &source_last_active,
+        ] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+        }
+        for tab in [&first, &source_active, &source_right] {
+            mux.add_tab_to_window(tab, source_id)
+                .expect("attach source tab");
+        }
+        for tab in [&destination_first, &destination_active] {
+            mux.add_tab_to_window(tab, destination_id)
+                .expect("attach destination tab");
+        }
+        for tab in [&source_left, &source_last_active] {
+            mux.add_tab_to_window(tab, left_fallback_id)
+                .expect("attach left-fallback source tab");
+        }
+        mux.get_window_mut(source_id)
+            .expect("source window")
+            .set_active_without_saving(1);
+        mux.get_window_mut(destination_id)
+            .expect("destination window")
+            .set_active_without_saving(1);
+        mux.get_window_mut(left_fallback_id)
+            .expect("left-fallback source window")
+            .set_active_without_saving(1);
+
+        mux.move_tab_between_windows(first.tab_id(), destination_id, Some(0))
+            .expect("insert before destination active");
+        {
+            let source = mux.get_window(source_id).expect("source window");
+            let destination = mux
+                .get_window(destination_id)
+                .expect("destination window");
+            assert!(source
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &source_active)));
+            assert!(destination
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &destination_active)));
+            assert_eq!(
+                destination.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+                vec![
+                    Arc::as_ptr(&first),
+                    Arc::as_ptr(&destination_first),
+                    Arc::as_ptr(&destination_active),
+                ],
+            );
+        }
+
+        mux.move_tab_between_windows(source_active.tab_id(), empty_id, None)
+            .expect("move active source tab into empty destination");
+        {
+            let source = mux.get_window(source_id).expect("source window");
+            let empty = mux.get_window(empty_id).expect("empty destination");
+            assert!(source
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &source_right)));
+            assert!(empty
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &source_active)));
+        }
+
+        mux.move_tab_between_windows(source_last_active.tab_id(), destination_id, None)
+            .expect("move last active source tab into nonempty destination");
+        {
+            let source = mux
+                .get_window(left_fallback_id)
+                .expect("left-fallback source window");
+            let destination = mux
+                .get_window(destination_id)
+                .expect("destination window");
+            assert!(source
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &source_left)));
+            assert!(destination
+                .get_active()
+                .is_some_and(|tab| Arc::ptr_eq(tab, &destination_active)));
+        }
+
+        drop(left_fallback_builder);
+        drop(empty_builder);
+        drop(destination_builder);
+        drop(source_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn invalid_tab_move_indices_fail_before_either_window_mutates() {
+        let _guard = global_test_lock();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let source_builder = mux.new_empty_window(Some("move-atomicity".to_string()), None);
+        let source_id = *source_builder;
+        let destination_builder = mux.new_empty_window(Some("move-atomicity".to_string()), None);
+        let destination_id = *destination_builder;
+        let source_tab = Arc::new(Tab::new(&test_size()));
+        let destination_tab = Arc::new(Tab::new(&test_size()));
+        for tab in [&source_tab, &destination_tab] {
+            mux.add_tab_no_panes(tab).expect("register exact tab");
+        }
+        mux.add_tab_to_window(&source_tab, source_id)
+            .expect("attach source tab");
+        mux.add_tab_to_window(&destination_tab, destination_id)
+            .expect("attach destination tab");
+
+        let source_before = mux
+            .get_window(source_id)
+            .expect("source window")
+            .iter()
+            .map(Arc::as_ptr)
+            .collect::<Vec<_>>();
+        let destination_before = mux
+            .get_window(destination_id)
+            .expect("destination window")
+            .iter()
+            .map(Arc::as_ptr)
+            .collect::<Vec<_>>();
+
+        let cross_error = mux
+            .move_tab_between_windows(source_tab.tab_id(), destination_id, Some(2))
+            .expect_err("cross-window index beyond append must fail");
+        assert!(cross_error.to_string().contains("out of range"));
+        let same_error = mux
+            .move_tab_between_windows(source_tab.tab_id(), source_id, Some(1))
+            .expect_err("same-window index equal to length must fail");
+        assert!(same_error.to_string().contains("out of range"));
+
+        let source = mux.get_window(source_id).expect("source window");
+        let destination = mux
+            .get_window(destination_id)
+            .expect("destination window");
+        assert_eq!(
+            source.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            source_before,
+        );
+        assert_eq!(
+            destination.iter().map(Arc::as_ptr).collect::<Vec<_>>(),
+            destination_before,
+        );
+        assert!(source
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &source_tab)));
+        assert!(destination
+            .get_active()
+            .is_some_and(|tab| Arc::ptr_eq(tab, &destination_tab)));
+
+        drop(destination);
+        drop(source);
+        drop(destination_builder);
+        drop(source_builder);
         Mux::shutdown();
     }
 

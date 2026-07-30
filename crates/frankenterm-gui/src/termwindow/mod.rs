@@ -4205,22 +4205,22 @@ impl TermWindow {
 
     fn move_tab(&mut self, tab_idx: usize) -> anyhow::Result<()> {
         let mux = self.mux_or_err("move tab")?;
-        let mut window = mux
-            .get_window_mut(self.mux_window_id)
+        let window = mux
+            .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
 
         let max = window.len();
         ensure!(max > 0, "no more tabs");
 
         let active = window.get_active_idx();
-
         ensure!(tab_idx < max, "cannot move a tab out of range");
-
-        let tab_inst = window.remove_by_idx(active);
-        window.insert(tab_idx, &tab_inst);
-        window.set_active_without_saving(tab_idx);
-
+        let tab_id = window
+            .get_by_idx(active)
+            .ok_or_else(|| anyhow!("active tab index is out of range"))?
+            .tab_id();
         drop(window);
+
+        mux.move_tab_between_windows(tab_id, self.mux_window_id, Some(tab_idx))?;
         self.update_title();
         self.update_scrollbar();
 
