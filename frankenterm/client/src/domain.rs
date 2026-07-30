@@ -20,7 +20,7 @@ use mux::{
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use wezterm_term::TerminalSize;
 
@@ -36,7 +36,6 @@ pub struct ClientInner {
     spare_local_pane_ids: Mutex<Vec<PaneId>>,
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
     detached: AtomicBool,
-    topology_request_epoch: AtomicU64,
 }
 
 pub(crate) fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
@@ -375,7 +374,6 @@ impl ClientInner {
             spare_local_pane_ids: Mutex::new(Vec::new()),
             focused_remote_pane_id: Mutex::new(None),
             detached: AtomicBool::new(false),
-            topology_request_epoch: AtomicU64::new(0),
         }
     }
 
@@ -387,18 +385,6 @@ impl ClientInner {
         self.detached.store(true, Ordering::Release);
     }
 
-    fn begin_topology_request(&self) -> anyhow::Result<u64> {
-        self.topology_request_epoch
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map(|prior| prior + 1)
-            .map_err(|_| anyhow!("client topology request epoch exhausted"))
-    }
-
-    fn topology_request_is_current(&self, epoch: u64) -> bool {
-        self.topology_request_epoch.load(Ordering::Acquire) == epoch
-    }
 }
 
 pub struct ClientDomain {
@@ -417,7 +403,6 @@ struct InitialAttachmentClaim<'a> {
 }
 
 struct InitialAttachmentRequest {
-    panes: ListPanesResponse,
     owner_client_id: Option<Arc<ClientId>>,
     primary_window_id: Option<WindowId>,
 }
@@ -611,10 +596,13 @@ fn mux_notify_client_domain(
                 }
             }
         }
-        MuxNotification::WindowWorkspaceChanged(window_id) => {
-            // Mux::get_window() may trigger a borrow error if called
-            // immediately; defer the bulk of this work.
-            // <https://github.com/wezterm/wezterm/issues/2638>
+        MuxNotification::WindowWorkspaceChanged {
+            window_id,
+            workspace,
+        } => {
+            // Defer the RPC so the notification callback never performs
+            // domain lookup or transport work while the originating mux
+            // mutation is still unwinding.
             let mux = Arc::clone(&mux);
             let domain = Arc::clone(&domain);
             promise::spawn::spawn_into_main_thread(async move {
@@ -629,22 +617,17 @@ fn mux_notify_client_domain(
                     None => return,
                 };
                 if let Some(remote_window_id) = client_domain.local_to_remote_window_id(window_id) {
-                    if let Some(workspace) = mux
-                        .get_window(window_id)
-                        .map(|w| w.get_workspace().to_string())
-                    {
-                        let Some(inner) = client_domain.inner() else {
-                            return;
-                        };
-                        if !client_inner_is_current(&mux, &domain, &inner) {
-                            return;
-                        }
-                        let request = codec::SetWindowWorkspace {
-                            window_id: remote_window_id,
-                            workspace,
-                        };
-                        let _ = update_remote_workspace(inner, request).await;
+                    let Some(inner) = client_domain.inner() else {
+                        return;
+                    };
+                    if !client_inner_is_current(&mux, &domain, &inner) {
+                        return;
                     }
+                    let request = codec::SetWindowWorkspace {
+                        window_id: remote_window_id,
+                        workspace,
+                    };
+                    let _ = update_remote_workspace(inner, request).await;
                 } else {
                     log::debug!(
                         "local window id {window_id} has no known remote window \
@@ -895,6 +878,19 @@ impl ClientDomain {
         let client_domain = domain
             .downcast_ref::<Self>()
             .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", domain_id))?;
+        if client_domain
+            .initial_attachment_pending
+            .load(Ordering::Acquire)
+        {
+            let _ = expected.client.abort_rpc_transport_generation(
+                &rpc,
+                "successor arrived before initial attachment transaction retired",
+            );
+            bail!(
+                "client domain {domain_id} cannot publish a successor while its initial \
+                 attachment transaction is still pending"
+            );
+        }
         if !client_domain.inner_is_current(&expected) {
             let _ = expected
                 .client
@@ -991,10 +987,8 @@ impl ClientDomain {
         rpc: &RpcGenerationScope,
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<bool> {
-        let request_epoch = inner.begin_topology_request()?;
         let incarnation_is_current = || {
             !inner.is_detached()
-                && inner.topology_request_is_current(request_epoch)
                 && domain.inner_is_current(&inner)
                 && mux
                     .get_domain(domain.local_domain_id)
@@ -1007,18 +1001,17 @@ impl ClientDomain {
         if !incarnation_is_current() {
             return Ok(false);
         }
-        let panes = rpc.list_panes().await?;
-        if !incarnation_is_current() {
-            return Ok(false);
-        }
-        rpc.commit_sync(RpcConsumerKind::TopologySnapshot, || {
+        rpc.with_coherent_topology_snapshot(RpcConsumerKind::TopologySnapshot, |panes| {
             if !incarnation_is_current() {
-                return Ok(false);
+                bail!("client attachment retired before coherent topology application");
             }
             Self::process_pane_list(&mux, Arc::clone(&inner), panes, primary_window_id)?;
-            Ok(incarnation_is_current())
+            if !incarnation_is_current() {
+                bail!("client attachment retired during coherent topology application");
+            }
+            Ok(true)
         })
-        .map_err(anyhow::Error::new)?
+        .await
     }
 
     fn resolve_remote_spawn_entities(
@@ -1543,7 +1536,6 @@ impl ClientDomain {
         request: InitialAttachmentRequest,
     ) -> anyhow::Result<()> {
         let InitialAttachmentRequest {
-            panes,
             owner_client_id,
             primary_window_id,
         } = request;
@@ -1599,7 +1591,7 @@ impl ClientDomain {
             armed: true,
         };
 
-        rpc.commit_sync(RpcConsumerKind::InitialAttachment, || {
+        rpc.with_coherent_topology_snapshot(RpcConsumerKind::InitialAttachment, |panes| {
             // Process the pane list BEFORE publishing inner to the domain.
             // This prevents concurrent operations from seeing a partially
             // attached domain with incomplete pane mappings. The pending claim
@@ -1636,14 +1628,14 @@ impl ClientDomain {
                 anyhow::Result::<()>::Ok(())
             })();
             if result.is_err() {
-                // Run cleanup while the outer generation lease is still held.
-                // A nested cleanup lease is deliberately supported and prevents
-                // G2 publication between partial topology mutation and rollback.
+                // Run cleanup while the exact generation's consumer lease is
+                // still held. This prevents successor publication between a
+                // partial topology mutation and its rollback.
                 cleanup.cleanup_if_current();
             }
             result
         })
-        .map_err(anyhow::Error::new)??;
+        .await?;
 
         let bootstrap_result = async {
             if let Some(request) = current_active_workspace_sync(&inner, mux) {
@@ -1926,12 +1918,9 @@ impl Domain for ClientDomain {
                 let result = with_mux_rpc_bootstrap_timeout(async {
                     client.verify_version_compat_with_scope(&ui, &rpc).await?;
 
-                    ui.output_str("Version check OK!  Requesting pane list...\n");
-                    let panes = rpc.list_panes().await?;
-                    ui.output_str(&format!(
-                        "Server has {} tabs.  Attaching to local UI...\n",
-                        panes.tabs.len()
-                    ));
+                    ui.output_str(
+                        "Version check OK!  Requesting coherent topology snapshot...\n",
+                    );
                     ClientDomain::finish_attach(
                         &mux,
                         domain_id,
@@ -1939,7 +1928,6 @@ impl Domain for ClientDomain {
                         rpc,
                         &abort_guard,
                         InitialAttachmentRequest {
-                            panes,
                             owner_client_id,
                             primary_window_id: window_id,
                         },
