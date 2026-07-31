@@ -234,7 +234,8 @@ fn bench_throughput(c: &mut Criterion) {
 /// dominant case):
 ///   - `tail_overlap` — `detect_with_context` (tail re-scan active, prod path)
 ///   - `no_tail`      — `detect` (no cross-segment tail; counterfactual floor)
-/// across a small (128 B, worst-case *relative* overhead since the 2048 B tail
+///
+/// Across a small (128 B, worst-case *relative* overhead since the 2048 B tail
 /// dwarfs the segment) and large (8 KiB, typical bulk) segment regime. The
 /// wall-clock ratio between the arms is the tail-overlap overhead.
 fn chatty_no_match_stream(seg_bytes: usize, count: usize) -> Vec<String> {
