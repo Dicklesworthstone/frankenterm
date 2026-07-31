@@ -121,7 +121,7 @@ fn spawn_in_window(_runtime: &RuntimeFixture, client: &WeztermClient, window_id:
 fn spawn_in_first_window(runtime: &RuntimeFixture, client: &WeztermClient) -> u64 {
     let panes = block_on_owned_mux_operation("list_panes before targeted spawn", {
         let client = client.clone();
-        async move { client.list_panes().await }
+        async move { Box::pin(client.list_panes()).await }
     });
     let window_id = panes
         .first()
@@ -190,7 +190,7 @@ fn one_pane_listing_carries_basic_metadata() {
     let panes =
         block_on_owned_mux_operation(
             "one_pane list_panes",
-            async move { client.list_panes().await },
+            async move { Box::pin(client.list_panes()).await },
         );
 
     log(
@@ -234,7 +234,7 @@ fn spawn_second_pane_increments_listing() {
 
     let initial = block_on_owned_mux_operation("initial list_panes", {
         let client = client.clone();
-        async move { client.list_panes().await }
+        async move { Box::pin(client.list_panes()).await }
     });
     log(
         "two_pane",
@@ -252,7 +252,7 @@ fn spawn_second_pane_increments_listing() {
 
     let after = block_on_owned_mux_operation("post-spawn list_panes", {
         let client = client.clone();
-        async move { client.list_panes().await }
+        async move { Box::pin(client.list_panes()).await }
     });
     log(
         "two_pane",
@@ -293,7 +293,7 @@ fn pane_listing_serializes_and_roundtrips() {
     spawn_in_first_window(&runtime, &client);
     let panes = block_on_owned_mux_operation("roundtrip list_panes", {
         let client = client.clone();
-        async move { client.list_panes().await }
+        async move { Box::pin(client.list_panes()).await }
     });
 
     let json = serde_json::to_string(&panes).expect("serialize Vec<PaneInfo>");
@@ -344,7 +344,7 @@ fn restart_fixture_yields_independent_pane_state() {
         spawn_in_first_window(&runtime, &client);
         let panes = block_on_owned_mux_operation("restart fixture A list_panes", {
             let client = client.clone();
-            async move { client.list_panes().await }
+            async move { Box::pin(client.list_panes()).await }
         });
         log(
             "restart",
@@ -376,7 +376,7 @@ fn restart_fixture_yields_independent_pane_state() {
     );
     let panes_b = block_on_owned_mux_operation("restart fixture B list_panes", {
         let client = fixture_b.client();
-        async move { client.list_panes().await }
+        async move { Box::pin(client.list_panes()).await }
     });
     log(
         "restart",
@@ -441,7 +441,7 @@ fn wait_until_pane_count_observes_async_spawn() {
         loop {
             let panes = block_on_owned_mux_operation("list_panes during wait", {
                 let client = client.clone();
-                async move { client.list_panes().await }
+                async move { Box::pin(client.list_panes()).await }
             });
             if panes.len() >= target {
                 log(
@@ -505,7 +505,7 @@ fn no_mock_spawn_send_resize_read_loopback() {
 
     let initial = block_on_owned_mux_operation("initial list_panes", {
         let client = client.clone();
-        async move { client.list_panes().await }
+        async move { Box::pin(client.list_panes()).await }
     });
     assert_eq!(initial.len(), 1, "cat fixture should start with one pane");
     let source = initial[0].clone();
@@ -527,14 +527,18 @@ fn no_mock_spawn_send_resize_read_loopback() {
     let split_pane_id = block_on_owned_mux_operation("split source pane", {
         let client = client.clone();
         async move {
-            client
-                .split_pane(source.pane_id, SplitDirection::Right, None, Some(40))
-                .await
+            Box::pin(client.split_pane(
+                source.pane_id,
+                SplitDirection::Right,
+                None,
+                Some(40),
+            ))
+            .await
         }
     });
     let after_spawn = block_on_owned_mux_operation("post-spawn list_panes", {
         let client = client.clone();
-        async move { client.list_panes().await }
+        async move { Box::pin(client.list_panes()).await }
     });
     let ids: Vec<u64> = after_spawn.iter().map(|pane| pane.pane_id).collect();
     log(
@@ -606,9 +610,8 @@ fn no_mock_spawn_send_resize_read_loopback() {
         let client = client.clone();
         let token = token.clone();
         async move {
-            client
-                .send_text_with_options(source.pane_id, &format!("{token}\n"), true, true)
-                .await
+            let line = format!("{token}\n");
+            Box::pin(client.send_text_with_options(source.pane_id, &line, true, true)).await
         }
     });
     let text = wait_until_text_contains(
