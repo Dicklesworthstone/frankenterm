@@ -27,7 +27,7 @@ pub const RENDERER_SCENARIO_SOURCE_BEAD_ID: &str =
     "ft-interactive-systems-performance-4tenz.3.1";
 
 /// Maximum raw JSON document accepted by the bounded decoder.
-pub const MAX_RENDERER_SCENARIO_CATALOG_BYTES: usize = 1024 * 1024;
+pub const MAX_RENDERER_SCENARIO_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 
 /// Exact decimal-byte rate used by the output-overlap resize gesture.
 pub const OUTPUT_OVERLAP_BYTES_PER_SECOND: u64 = 1_000_000;
@@ -931,6 +931,36 @@ pub struct RendererPaneContentBinding {
     pub pane_id: String,
     /// Non-empty exact terminal-content inputs for this pane.
     pub content_corpus_ids: Vec<String>,
+    /// Full pane surface state at this phase.
+    pub surface_state: RendererSurfaceState,
+    /// Exact pixel geometry within the owning window.
+    pub surface_rect: RendererPixelRect,
+    /// Active deterministic stream identity, if any.
+    pub active_output_stream_id: Option<String>,
+    /// Exact active per-pane output rate; zero when no stream is active.
+    pub output_bytes_per_second: u64,
+}
+
+/// Split-tree direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererSplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+/// Fully typed binary split tree; every leaf names exactly one tab pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RendererSplitNode {
+    Pane { pane_id: String },
+    Split {
+        direction: RendererSplitDirection,
+        ratio_milli: u16,
+        divider_rect: RendererPixelRect,
+        first: Box<RendererSplitNode>,
+        second: Box<RendererSplitNode>,
+    },
 }
 
 /// Ordered tab identity within one window manifest.
@@ -943,6 +973,8 @@ pub struct RendererOrderedTabManifest {
     pub tab_ordinal: u16,
     /// Pane identities/content owned by this tab, in deterministic traversal order.
     pub panes: Vec<RendererPaneContentBinding>,
+    /// Complete typed split tree for `panes`.
+    pub split_root: RendererSplitNode,
 }
 
 /// Ordered window and tab inventory at one exact phase/event.
@@ -981,14 +1013,6 @@ pub struct RendererPhaseManifestBinding {
     pub windows: Vec<RendererOrderedWindowManifest>,
     /// Exact canonical feature union derived from every pane content binding.
     pub terminal_feature_union: Vec<RendererTerminalFeature>,
-    /// Complete deterministic topology manifest.
-    pub topology_ref: String,
-    /// Complete deterministic split-tree and geometry manifest.
-    pub split_geometry_ref: String,
-    /// Complete per-pane terminal-state/output manifest.
-    pub pane_state_manifest_ref: String,
-    /// Exact focused-surface state manifest for this phase.
-    pub focused_surface_state_ref: String,
 }
 
 /// Visual checkpoint bound to state, bitmap, and accessibility oracles.
@@ -1170,8 +1194,8 @@ pub struct RendererWorkloadDefinition {
     pub tab_count: u16,
     /// Exact window count for the bound fleet point.
     pub window_count: u16,
-    /// Complete workload layout/topology identity.
-    pub layout_manifest_ref: String,
+    /// Stable workload layout/topology profile identity.
+    pub layout_profile_id: String,
     /// Exact renderer configuration identity.
     pub renderer_config_ref: String,
     /// Exact effective font/cell-metric derivation identity.
@@ -1729,6 +1753,7 @@ pub enum RendererCachePrecondition {
 pub struct RendererPreconditioningProfile {
     pub profile_id: RendererPreconditioningProfileId,
     pub session_age_us: u64,
+    pub scrollback_age_us: u64,
     pub scrollback_lines_per_pane: u32,
     pub glyph_cache: RendererCachePrecondition,
     pub atlas: RendererCachePrecondition,
@@ -1830,6 +1855,7 @@ pub enum RendererMeasurementBinding {
         key_event_id: String,
         key_action_event_ordinal: u32,
         target_presented_frame_predicate_ref: String,
+        expected_terminal_effect_oracle_ref: String,
         stage_metrics_contract_ref: String,
         required_stage_ids: Vec<RendererKeypressTraceStage>,
         presentation_target_profile_ids: Vec<RendererPresentationTargetProfileId>,
