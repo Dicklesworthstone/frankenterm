@@ -519,7 +519,8 @@ or an anonymous count.
 ## Production-stage and metric contract
 
 Every scenario binds measurement contract
-`ft.renderer.measurement-contract.v1`. Its closed, ordered stage IDs are:
+`ft.renderer.measurement-contract.v1`. Its closed, ordered renderer/resize
+stage IDs are:
 
 1. `native_gesture_callback`
 2. `main_thread_return`
@@ -534,6 +535,30 @@ Every scenario binds measurement contract
 11. `metal_drawable`
 12. `software_present`
 13. `display_presented`
+
+Output-overlap scenarios additionally bind this distinct closed K0-through-K13
+keypress sequence; `native_gesture_callback` cannot impersonate key receipt:
+
+1. `key_appkit_receipt`
+2. `key_mapping_complete`
+3. `key_client_rpc_enqueue`
+4. `key_client_encode_socket_flush`
+5. `key_server_read_decode`
+6. `key_server_dispatch_mux_wait`
+7. `key_terminal_lock_pty_write`
+8. `key_pty_read_parser_apply`
+9. `key_server_delta_compute`
+10. `key_client_receive_apply`
+11. `key_gui_invalidation`
+12. `key_paint_shape_atlas`
+13. `key_gpu_drawable_request`
+14. `key_display_completion`
+
+Their receipt payloads retain the queue depth/oldest age, socket boundary,
+terminal-lock timing, PTY write/flush and causally downstream read/application,
+delta rows/bytes/clone/compress work, prediction result, paints/frames, and
+drawable/display boundary details required by the campaign's corresponding
+K-stage. Remote-domain receipts cannot be inferred from a local resize event.
 
 Each stage receipt records scenario/event/correlation IDs, producer identity,
 clock-domain ID, thread ID, path class, begin/end or marker timestamps, and its
@@ -590,7 +615,11 @@ and mapping, client/server queue and transport, mux dispatch, terminal-lock and
 PTY write, causally downstream PTY read/parser application, delta/client apply,
 GUI invalidation, paint, GPU/drawable request, and actual display completion.
 The key identity and correlation token must remain identical across receipts;
-cross-host intervals require the campaign's retained calibration authority.
+the binding also freezes the key's expected terminal-state mutation and
+resulting terminal/renderer generation oracle. Its target is the first actually
+presented frame satisfying that semantic effect, never a later generic resize
+or settle checkpoint relabeled as key response. Cross-host intervals require
+the campaign's retained calibration authority.
 This related responsiveness binding does not qualify RQ-S6 unless every exact
 RQ-S6 predicate and authority requirement is independently met.
 
