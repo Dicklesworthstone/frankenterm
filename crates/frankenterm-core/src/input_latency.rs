@@ -1209,15 +1209,6 @@ pub struct BudgetCheckDetail {
     measured_us: u64,
     /// Whether this check passed.
     passed: bool,
-    /// Ratio of measured/raw budget (1.0 = exactly at the raw target).
-    ///
-    /// A zero budget has no finite ratio and is represented as `None`.
-    raw_budget_ratio: Option<f64>,
-    /// Ratio of measured/effective budget (1.0 = the actual gate boundary).
-    ///
-    /// A zero effective budget has no finite ratio and is represented as
-    /// `None`.
-    effective_budget_ratio: Option<f64>,
     /// Reason code.
     reason_code: String,
 }
@@ -1257,18 +1248,6 @@ impl BudgetCheckDetail {
     #[must_use]
     pub const fn passed(&self) -> bool {
         self.passed
-    }
-
-    /// Return measured/raw-budget, or `None` for a zero raw budget.
-    #[must_use]
-    pub const fn raw_budget_ratio(&self) -> Option<f64> {
-        self.raw_budget_ratio
-    }
-
-    /// Return measured/effective-budget, or `None` for a zero gate boundary.
-    #[must_use]
-    pub const fn effective_budget_ratio(&self) -> Option<f64> {
-        self.effective_budget_ratio
     }
 
     /// Return the stable detail reason code.
@@ -1439,11 +1418,6 @@ pub fn evaluate_budget(
             }
         };
         let passed = measured_us <= effective_budget;
-        let raw_budget_ratio =
-            (budget_us > 0).then(|| measured_us as f64 / budget_us as f64);
-        let effective_budget_ratio = (effective_budget > 0)
-            .then(|| measured_us as f64 / effective_budget as f64);
-
         if !passed {
             all_passed = false;
         }
@@ -1455,8 +1429,6 @@ pub fn evaluate_budget(
             effective_budget_us: effective_budget,
             measured_us,
             passed,
-            raw_budget_ratio,
-            effective_budget_ratio,
             reason_code: if passed {
                 format!("BUDGET_OK_AGGREGATE_{percentile}")
             } else {
@@ -1494,11 +1466,6 @@ pub fn evaluate_budget(
                     }
                 };
             let passed = measured_us <= effective_budget;
-            let raw_budget_ratio =
-                (budget_us > 0).then(|| measured_us as f64 / budget_us as f64);
-            let effective_budget_ratio = (effective_budget > 0)
-                .then(|| measured_us as f64 / effective_budget as f64);
-
             if !passed {
                 all_passed = false;
             }
@@ -1510,8 +1477,6 @@ pub fn evaluate_budget(
                 effective_budget_us: effective_budget,
                 measured_us,
                 passed,
-                raw_budget_ratio,
-                effective_budget_ratio,
                 reason_code: if passed {
                     format!("BUDGET_OK_{}_{percentile}", stage_budget.stage.label())
                 } else {
@@ -1659,7 +1624,7 @@ pub fn generate_report(
     budget: Option<&InputLatencyBudget>,
 ) -> InputLatencyReport {
     let mut evidence_error = collector.validate_evidence().err();
-    let percentiles = if evidence_error.is_none() {
+    let mut percentiles = if evidence_error.is_none() {
         match collector.total_latency_summary() {
             Ok(summary) => summary,
             Err(error) => {
@@ -1684,6 +1649,7 @@ pub fn generate_report(
                 }
                 Err(error) => {
                     evidence_error = Some(error);
+                    percentiles.clear();
                     stage_breakdown_p50.clear();
                     break;
                 }
@@ -2060,8 +2026,7 @@ mod tests {
         assert_eq!(p50.budget_us, 2000);
         assert_eq!(p50.effective_budget_us, 3000);
         assert_eq!(p50.measured_us, 2500);
-        assert_eq!(p50.raw_budget_ratio, Some(1.25));
-        assert_eq!(p50.effective_budget_ratio, Some(2500.0 / 3000.0));
+        assert!(p50.passed);
     }
 
     #[test]
@@ -2090,12 +2055,20 @@ mod tests {
     fn exact_scaling_handles_binary_fractions_limits_and_invalid_inputs() {
         assert_eq!(effective_budget_us(3, 0.5), Ok(1));
         assert_eq!(effective_budget_us(3, 1.5), Ok(4));
+        assert_eq!(effective_budget_us(u64::MAX, f64::from_bits(1)), Ok(0));
         assert_eq!(effective_budget_us(u64::MAX, 1.0), Ok(u64::MAX));
         assert!(matches!(
             effective_budget_us(u64::MAX, 2.0),
             Err(InputLatencyBudgetError::EffectiveBudgetOverflow { .. })
         ));
-        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+        for threshold in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+        ] {
             assert!(matches!(
                 effective_budget_us(1, threshold),
                 Err(InputLatencyBudgetError::InvalidRegressionThreshold { value_bits })
@@ -2109,7 +2082,14 @@ mod tests {
         let mut collector = InputLatencyCollector::new(1);
         record_measurement(&mut collector, 1000, 100);
 
-        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+        for threshold in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+        ] {
             let budget = InputLatencyBudget {
                 regression_threshold: threshold,
                 ..Default::default()

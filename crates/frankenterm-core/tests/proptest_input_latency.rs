@@ -195,7 +195,7 @@ proptest! {
     }
 
     #[test]
-    fn generated_budget_check_details_serialize_all_fields(
+    fn generated_budget_check_details_serialize_exact_gate_fields(
         count in 1..10usize,
         total_us in 0..20_000u64,
     ) {
@@ -213,8 +213,8 @@ proptest! {
             prop_assert!(value.get("effective_budget_us").is_some());
             prop_assert!(value.get("measured_us").is_some());
             prop_assert!(value.get("passed").is_some());
-            prop_assert!(value.get("raw_budget_ratio").is_some());
-            prop_assert!(value.get("effective_budget_ratio").is_some());
+            prop_assert!(value.get("raw_budget_ratio").is_none());
+            prop_assert!(value.get("effective_budget_ratio").is_none());
             prop_assert!(value.get("ratio").is_none());
             prop_assert!(value.get("reason_code").is_some());
         }

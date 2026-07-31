@@ -52,14 +52,14 @@ In particular:
   long-session stability remain unproven until their named target runs exist.
 - A software call to `present()` is a submit/presentation request. It is not a
   measured display or photon boundary.
-- The legacy `input_latency` proxy gate (budget-check schema v1) and report
-  (schema v3) now fail closed on empty or incomplete sample windows, duplicate
-  `record_stage`/wire-map keys, duplicate
-  measurement IDs within the retained window, unrelated or regressing asserted
-  clock labels, invalid budgets, and an attempted allocation at the exhausted
-  sequence boundary. Those repairs prevent false green proxy verdicts; they do
-  not promote the framework into the production AppKit/mux/PTY/presentation
-  trace required by `.2`.
+- The legacy `input_latency` proxy path—collector (schema v1), standalone budget
+  verdict (schema v1), and report (schema v3)—now fails closed on empty or
+  incomplete sample windows, duplicate `record_stage`/wire-map keys, duplicate
+  measurement IDs within the retained window, mismatched asserted clock-domain
+  labels, regressing timestamps, invalid budgets, and an attempted allocation
+  at the exhausted sequence boundary. Those repairs prevent false green proxy
+  verdicts; they do not promote the framework into the production
+  AppKit/mux/PTY/presentation trace required by `.2`.
 - `InputLatencyReport` and its budget verdict are serialize-only derived
   summaries. A report alone is not replay-verifiable: retained proxy evidence
   must include the serialized source collector, exact budget, and an external
