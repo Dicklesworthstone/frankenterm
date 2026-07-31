@@ -148,13 +148,13 @@ where
 }
 
 /// Schema version for serialized legacy input-latency reports.
-pub const INPUT_LATENCY_REPORT_SCHEMA_VERSION: u32 = 3;
+pub const INPUT_LATENCY_REPORT_SCHEMA_VERSION: u32 = 4;
 
 /// Schema version for serialized legacy input-latency collectors.
 pub const INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION: u32 = 1;
 
 /// Schema version for standalone serialized legacy budget verdicts.
-pub const INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION: u32 = 1;
+pub const INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum samples retained or decoded by the legacy proxy collector.
 pub const MAX_INPUT_LATENCY_EVIDENCE_WINDOW: usize = 65_536;

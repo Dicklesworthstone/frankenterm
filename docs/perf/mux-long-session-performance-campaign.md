@@ -53,7 +53,7 @@ In particular:
 - A software call to `present()` is a submit/presentation request. It is not a
   measured display or photon boundary.
 - The legacy `input_latency` proxy path—collector (schema v1), standalone budget
-  verdict (schema v1), and report (schema v3)—now fails closed on empty or
+  verdict (schema v2), and report (schema v4)—now fails closed on empty or
   incomplete sample windows, duplicate `record_stage`/wire-map keys, duplicate
   measurement IDs within the retained window, mismatched asserted clock-domain
   labels, regressing timestamps, invalid budgets, and an attempted allocation
