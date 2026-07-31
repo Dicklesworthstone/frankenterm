@@ -473,19 +473,18 @@ struct VerdictRow {
     threshold_note: &'static str,
 }
 
-fn pct(dist: &Option<Distribution>, q: f64) -> f64 {
-    dist.as_ref()
-        .and_then(|d| {
-            d.percentiles
-                .iter()
-                .find(|p| (p.q - q).abs() < 1e-9)
-                .map(|p| p.value)
-        })
+fn pct(dist: Option<&Distribution>, q: f64) -> f64 {
+    dist.and_then(|d| {
+        d.percentiles
+            .iter()
+            .find(|p| (p.q - q).abs() < 1e-9)
+            .map(|p| p.value)
+    })
         .unwrap_or(f64::NAN)
 }
 
-fn max_of(dist: &Option<Distribution>) -> f64 {
-    dist.as_ref().map(|d| d.max).unwrap_or(f64::NAN)
+fn max_of(dist: Option<&Distribution>) -> f64 {
+    dist.map(|d| d.max).unwrap_or(f64::NAN)
 }
 
 fn emit_evidence(rows: &[EvidenceRow]) {
@@ -511,8 +510,8 @@ fn emit_evidence(rows: &[EvidenceRow]) {
                 continue;
             };
 
-            let base_wait_p95 = pct(&base.reader_lock_wait_ns, 0.95);
-            let cont_wait_p95 = pct(&cont.reader_lock_wait_ns, 0.95);
+            let base_wait_p95 = pct(base.reader_lock_wait_ns.as_ref(), 0.95);
+            let cont_wait_p95 = pct(cont.reader_lock_wait_ns.as_ref(), 0.95);
             let ratio = if base_wait_p95 > 0.0 {
                 cont_wait_p95 / base_wait_p95
             } else {
@@ -528,9 +527,9 @@ fn emit_evidence(rows: &[EvidenceRow]) {
                 baseline_wait_p95_ns: base_wait_p95,
                 contended_wait_p95_ns: cont_wait_p95,
                 wait_p95_ratio: ratio,
-                contended_wait_max_ns: max_of(&cont.reader_lock_wait_ns),
-                baseline_hold_p95_ns: pct(&base.reader_lock_hold_ns, 0.95),
-                contended_hold_p95_ns: pct(&cont.reader_lock_hold_ns, 0.95),
+                contended_wait_max_ns: max_of(cont.reader_lock_wait_ns.as_ref()),
+                baseline_hold_p95_ns: pct(base.reader_lock_hold_ns.as_ref(), 0.95),
+                contended_hold_p95_ns: pct(cont.reader_lock_hold_ns.as_ref(), 0.95),
                 above_noise,
                 threshold_note: "above_noise = contended p95 wait >= 3x baseline p95 AND >= 50us (advisory)",
             };
