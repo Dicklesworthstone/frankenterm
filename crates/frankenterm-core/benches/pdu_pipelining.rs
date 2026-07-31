@@ -157,7 +157,7 @@ async fn setup_client(
     }));
 
     let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-    let client = DirectMuxClient::connect(config)
+    let client = Box::pin(DirectMuxClient::connect(config))
         .await
         .expect("connect client");
     (client, temp_dir)

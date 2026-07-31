@@ -188,7 +188,9 @@ async fn spawn_mock_mux_server(
 }
 
 async fn connect_client(socket_path: &Path) -> DirectMuxClient {
-    DirectMuxClient::connect(DirectMuxClientConfig::default().with_socket_path(socket_path))
+    Box::pin(DirectMuxClient::connect(
+        DirectMuxClientConfig::default().with_socket_path(socket_path),
+    ))
         .await
         .expect("connect DirectMuxClient")
 }
@@ -356,7 +358,7 @@ fn bench_subscription_setup(c: &mut Criterion) {
             let cfg = client_config.clone();
             let subscription_cfg = sub_config.clone();
             compat_rt.block_on(async {
-                let client = DirectMuxClient::connect(cfg)
+                let client = Box::pin(DirectMuxClient::connect(cfg))
                     .await
                     .expect("connect for subscription");
                 let sub = subscribe_pane_output(client, 42, subscription_cfg);

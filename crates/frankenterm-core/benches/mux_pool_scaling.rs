@@ -316,7 +316,7 @@ fn bench_connection_factory_overhead(c: &mut Criterion) {
         b.iter(|| {
             let config = config.clone();
             rt.block_on(async move {
-                let client = DirectMuxClient::connect(config)
+                let client = Box::pin(DirectMuxClient::connect(config))
                     .await
                     .expect("direct mux connect");
                 black_box(client);
