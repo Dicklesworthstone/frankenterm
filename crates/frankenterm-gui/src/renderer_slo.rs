@@ -19,7 +19,7 @@ pub use frankenterm_core::render_quality::{
 pub mod headless {
     use super::{
         InputToPhotonInputClass, InputToPhotonTrace,
-        classified_input_proxy_trace_from_stage_durations,
+        classified_input_proxy_trace_from_stage_durations, headless_render_duration_us,
     };
     use crate::headless_render::{HeadlessFixtureInput, HeadlessFrame, smoketest_input};
 
