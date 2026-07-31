@@ -992,7 +992,69 @@ pub struct InputLatencyBudget {
     pub aggregate: BTreeMap<Percentile, u64>,
     /// Regression threshold: if measured latency exceeds budget by this fraction,
     /// the check fails. 1.0 = exactly at budget, 1.1 = 10% over budget.
+    ///
+    /// The wire field is the canonical `0x`-prefixed, 16-lowercase-hex-digit
+    /// IEEE-754 payload `regression_threshold_bits`. A decimal JSON number can
+    /// move by one ULP in a decoder and thereby change an exact gate boundary.
+    #[serde(
+        rename = "regression_threshold_bits",
+        serialize_with = "serialize_regression_threshold_bits"
+    )]
     pub regression_threshold: f64,
+}
+
+fn serialize_regression_threshold_bits<S>(
+    value: &f64,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_str(&format_args!("0x{:016x}", value.to_bits()))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegressionThresholdBits(u64);
+
+impl<'de> Deserialize<'de> for RegressionThresholdBits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RegressionThresholdBitsVisitor;
+
+        impl de::Visitor<'_> for RegressionThresholdBitsVisitor {
+            type Value = RegressionThresholdBits;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "an IEEE-754 payload encoded as 0x followed by 16 lowercase hex digits",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let bytes = value.as_bytes();
+                if bytes.len() != 18
+                    || !value.starts_with("0x")
+                    || !bytes[2..]
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+                {
+                    return Err(E::custom(format_args!(
+                        "non-canonical regression threshold bits {value:?}"
+                    )));
+                }
+                u64::from_str_radix(&value[2..], 16)
+                    .map(RegressionThresholdBits)
+                    .map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(RegressionThresholdBitsVisitor)
+    }
 }
 
 #[derive(Deserialize)]
@@ -1000,7 +1062,7 @@ pub struct InputLatencyBudget {
 struct InputLatencyBudgetWire {
     stages: BoundedVec<StageBudget, MAX_INPUT_LATENCY_STAGE_BUDGETS>,
     aggregate: DuplicateRejectingMap<Percentile, u64>,
-    regression_threshold: f64,
+    regression_threshold_bits: RegressionThresholdBits,
 }
 
 impl<'de> Deserialize<'de> for InputLatencyBudget {
@@ -1012,7 +1074,7 @@ impl<'de> Deserialize<'de> for InputLatencyBudget {
         Ok(Self {
             stages: wire.stages.0,
             aggregate: wire.aggregate.0,
-            regression_threshold: wire.regression_threshold,
+            regression_threshold: f64::from_bits(wire.regression_threshold_bits.0),
         })
     }
 }
@@ -2437,9 +2499,10 @@ mod tests {
 
     #[test]
     fn budget_serde_roundtrip() {
-        // The non-default value is a retained regression for a one-ULP drift
-        // exposed by the property suite when serde_json's exact float parser
-        // was not enabled. A changed bit can move an exact budget boundary.
+        // The first non-default value is a retained regression for a one-ULP
+        // drift exposed by the property suite. Invalid values are included
+        // because their exact bits must survive replay until validation emits
+        // the authoritative typed failure.
         for regression_threshold in [
             1.0,
             0.908_841_146_302_401_9,
@@ -2447,10 +2510,23 @@ mod tests {
             f64::MIN_POSITIVE,
             f64::from_bits(1),
             f64::MAX,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_1234),
         ] {
             let mut budget = InputLatencyBudget::default();
             budget.regression_threshold = regression_threshold;
             let json = serde_json::to_string(&budget).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                value["regression_threshold_bits"],
+                serde_json::json!(format!(
+                    "0x{:016x}",
+                    regression_threshold.to_bits()
+                ))
+            );
+            assert!(value.get("regression_threshold").is_none());
             let back: InputLatencyBudget = serde_json::from_str(&json).unwrap();
             assert_eq!(back.aggregate, budget.aggregate);
             assert_eq!(
@@ -2466,7 +2542,7 @@ mod tests {
         let aggregate = r#"{
             "stages": [],
             "aggregate": {"p50": 100, "p50": 200},
-            "regression_threshold": 1.0
+            "regression_threshold_bits": "0x3ff0000000000000"
         }"#;
         assert!(serde_json::from_str::<InputLatencyBudget>(aggregate).is_err());
 
@@ -2483,9 +2559,39 @@ mod tests {
         let oversized_stages = serde_json::json!({
             "stages": vec![stage_value; MAX_INPUT_LATENCY_STAGE_BUDGETS + 1],
             "aggregate": {"p50": 1000},
-            "regression_threshold": 1.0
+            "regression_threshold_bits": "0x3ff0000000000000"
         });
         assert!(serde_json::from_value::<InputLatencyBudget>(oversized_stages).is_err());
+    }
+
+    #[test]
+    fn budget_serde_rejects_ambiguous_or_noncanonical_threshold_wire_values() {
+        for invalid_field in [
+            serde_json::json!({"regression_threshold": 1.0}),
+            serde_json::json!({"regression_threshold_bits": 4_607_182_418_800_017_408_u64}),
+            serde_json::json!({"regression_threshold_bits": "3ff0000000000000"}),
+            serde_json::json!({"regression_threshold_bits": "0X3ff0000000000000"}),
+            serde_json::json!({"regression_threshold_bits": "0x3FF0000000000000"}),
+            serde_json::json!({"regression_threshold_bits": "0x3ff000000000000"}),
+            serde_json::json!({"regression_threshold_bits": "0x3ff00000000000000"}),
+            serde_json::json!({"regression_threshold_bits": "0x3fg0000000000000"}),
+        ] {
+            let mut value = serde_json::json!({
+                "stages": [],
+                "aggregate": {"p50": 1000}
+            });
+            value.as_object_mut().unwrap().extend(
+                invalid_field
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            assert!(
+                serde_json::from_value::<InputLatencyBudget>(value).is_err(),
+                "ambiguous threshold wire value must fail closed: {invalid_field}"
+            );
+        }
     }
 
     #[test]
