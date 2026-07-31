@@ -11,9 +11,10 @@ use proptest::prelude::*;
 use frankenterm_core::input_latency::{
     BudgetCheckDetail, BudgetCheckResult, INPUT_LATENCY_REPORT_SCHEMA_VERSION,
     InputLatencyBudget, InputLatencyClockDomainId, InputLatencyCollector,
-    InputLatencyEvidenceClass, InputLatencyEvidenceStatus, InputLatencyMeasurement,
-    InputLatencyProducerId, InputLatencyReport, InputLatencyStage, InputLatencyTimestamp,
-    Percentile, StageBudget, evaluate_budget, generate_report, percentile_nearest_rank,
+    InputLatencyCollectorError, InputLatencyEvidenceClass, InputLatencyEvidenceStatus,
+    InputLatencyMeasurement, InputLatencyMeasurementError, InputLatencyProducerId,
+    InputLatencyReport, InputLatencyStage, InputLatencyTimestamp, Percentile, StageBudget,
+    evaluate_budget, generate_report, percentile_nearest_rank,
 };
 
 // =============================================================================
@@ -313,6 +314,112 @@ proptest! {
         let m = complete_measurement(id, start, delta);
         let total = m.total_latency_us();
         prop_assert_eq!(total, Ok(delta));
+    }
+
+    #[test]
+    fn duplicate_stage_write_preserves_original_and_taints_measurement(
+        id in 1..10_000u64,
+        stage in arb_stage(),
+        original_us in 0..1_000_000u64,
+        replacement_us in 0..1_000_000u64,
+    ) {
+        let mut measurement = InputLatencyMeasurement::new(id);
+        let original = proxy_timestamp(original_us);
+        measurement.record_stage(stage, original).unwrap();
+
+        let error = measurement
+            .record_stage(stage, proxy_timestamp(replacement_us))
+            .unwrap_err();
+
+        prop_assert_eq!(measurement.stage_timestamp(stage), Some(original));
+        prop_assert_eq!(
+            error,
+            InputLatencyMeasurementError::DuplicateStage { stage }
+        );
+        prop_assert!(matches!(
+            measurement.validate_complete(),
+            Err(InputLatencyMeasurementError::DuplicateStage { stage: failed_stage })
+                if failed_stage == stage
+        ));
+    }
+
+    #[test]
+    fn one_unrelated_clock_domain_invalidates_complete_measurement(
+        id in 1..10_000u64,
+        mismatched_stage in arb_stage(),
+        start in 0..500_000u64,
+        step in 0..10_000u64,
+    ) {
+        let stages = InputLatencyStage::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, &stage)| {
+                let clock_domain_id = if stage == mismatched_stage { 2 } else { 1 };
+                (
+                    stage,
+                    InputLatencyTimestamp::new(
+                        start.saturating_add(step.saturating_mul(index as u64)),
+                        InputLatencyProducerId::new(index as u64 + 1).unwrap(),
+                        InputLatencyClockDomainId::new(clock_domain_id).unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        let measurement = InputLatencyMeasurement::from_stages(id, stages);
+
+        prop_assert!(matches!(
+            measurement.validate_complete(),
+            Err(InputLatencyMeasurementError::ClockDomainMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn one_regressing_stage_invalidates_complete_measurement(
+        id in 1..10_000u64,
+        regression_index in 1usize..InputLatencyStage::ALL.len(),
+        start in 1..500_000u64,
+        step in 1..10_000u64,
+    ) {
+        let stages = InputLatencyStage::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, &stage)| {
+                let timestamp_us = if index == regression_index {
+                    start
+                        .saturating_add(step.saturating_mul((index - 1) as u64))
+                        .saturating_sub(1)
+                } else {
+                    start.saturating_add(step.saturating_mul(index as u64))
+                };
+                (stage, proxy_timestamp(timestamp_us))
+            })
+            .collect();
+        let measurement = InputLatencyMeasurement::from_stages(id, stages);
+
+        prop_assert!(matches!(
+            measurement.validate_complete(),
+            Err(InputLatencyMeasurementError::TimestampRegression { .. })
+        ));
+    }
+
+    #[test]
+    fn terminal_measurement_id_boundary_is_sticky_fail_closed(capacity in 1..50usize) {
+        let collector = InputLatencyCollector::new(capacity);
+        let mut encoded = serde_json::to_value(collector).unwrap();
+        encoded["next_id"] = serde_json::json!(u64::MAX);
+        let mut exhausted: InputLatencyCollector = serde_json::from_value(encoded).unwrap();
+
+        prop_assert!(matches!(
+            exhausted.begin_measurement(),
+            Err(InputLatencyCollectorError::MeasurementIdExhausted)
+        ));
+        let result = evaluate_budget(&exhausted, &InputLatencyBudget::default());
+        prop_assert!(!result.passed);
+        prop_assert_eq!(result.reason_code, "EVIDENCE_ID_EXHAUSTED");
+        prop_assert!(matches!(
+            exhausted.begin_measurement(),
+            Err(InputLatencyCollectorError::MeasurementIdExhausted)
+        ));
     }
 
     #[test]

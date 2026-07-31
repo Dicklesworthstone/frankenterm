@@ -1,4 +1,4 @@
-//! Integration test: input latency → adaptive watchdog → resize scheduler.
+//! Synthetic integration test: proxy latency → adaptive watchdog → resize scheduler.
 //!
 //! Exercises the performance-monitoring pipeline:
 //!
@@ -7,10 +7,9 @@
 //!       → AdaptiveWatchdog.check_health(now_ms) → HealthStatus
 //!         → ResizeScheduler.schedule_frame() (adapt frame budget)
 //!
-//! This mirrors the real render loop: input latency measurements track
-//! per-keystroke responsiveness, the watchdog classifies component health
-//! from heartbeat intervals, and the resize scheduler adapts its frame
-//! budget based on system health (e.g., fewer resize units when degraded).
+//! This validates DTO and control-flow composition only. The legacy latency
+//! collector is not wired into the production input, mux, PTY, renderer, or
+//! presentation path, so this test cannot establish real per-keypress latency.
 
 use frankenterm_core::input_latency::{
     InputLatencyClockDomainId, InputLatencyCollector, InputLatencyProducerId, InputLatencyStage,
@@ -71,7 +70,7 @@ fn record_full_measurement(collector: &mut InputLatencyCollector, base_us: u64, 
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
-/// Input latency tracking produces percentiles, watchdog classifies
+/// Proxy latency tracking produces percentiles, watchdog classifies
 /// health from heartbeat intervals, and both inform scheduling decisions.
 #[test]
 fn latency_and_watchdog_inform_scheduling() {
@@ -175,7 +174,7 @@ fn degraded_watchdog_triggers_conservative_scheduling() {
     assert_eq!(frame.requested_frame_budget_units, degraded_budget);
 }
 
-/// Input latency spike detection: when P95 latency exceeds a threshold,
+/// Synthetic proxy spike detection: when P95 exceeds a threshold,
 /// the system should reduce resize work to preserve input responsiveness.
 #[test]
 fn latency_spike_reduces_resize_budget() {

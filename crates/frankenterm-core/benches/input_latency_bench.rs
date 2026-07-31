@@ -1,4 +1,4 @@
-//! Benchmarks for input-to-display latency measurement framework (ft-1memj.25).
+//! Benchmarks for the legacy proxy-only latency framework (ft-1memj.25).
 //!
 //! Performance budgets:
 //! - Measurement recording: **< 100ns** per stage timestamp
@@ -6,8 +6,9 @@
 //! - Budget evaluation (1000 samples): **< 1ms**
 //! - Report generation (1000 samples): **< 2ms**
 //!
-//! These benchmarks validate the measurement infrastructure itself is fast enough
-//! to not introduce observable latency when instrumenting the input pipeline.
+//! These benchmarks measure synthetic DTO/framework overhead only. They neither
+//! exercise production instrumentation nor establish production input-to-present
+//! latency or observer effect.
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use frankenterm_core::input_latency::{
@@ -81,14 +82,11 @@ fn bench_record_stage(c: &mut Criterion) {
                 (InputLatencyMeasurement::new(1), ts)
             },
             |(mut measurement, timestamp_us)| {
-                black_box(
-                    measurement
-                        .record_stage(
-                            InputLatencyStage::KeyEvent,
-                            timestamp(black_box(timestamp_us)),
-                        )
-                        .expect("fresh benchmark measurement accepts its first stage"),
-                );
+                black_box(measurement.record_stage(
+                    InputLatencyStage::KeyEvent,
+                    timestamp(black_box(timestamp_us)),
+                ))
+                .expect("fresh benchmark measurement accepts its first stage");
             },
             BatchSize::SmallInput,
         );
