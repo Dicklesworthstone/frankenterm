@@ -47,6 +47,10 @@ fn input_to_photon_proxy_summary_reports_percentiles_without_target_verdict() {
     assert_eq!(evidence.state, InputToPhotonState::Measured);
     assert_eq!(evidence.sample_count, 3);
     assert_eq!(evidence.target_p95_us, Some(MACOS_P95_TARGET_US));
+    assert_eq!(
+        evidence.gpu_adapter.as_deref(),
+        Some("deterministic-test-adapter")
+    );
     assert_eq!(evidence.p50_us, Some(3400));
     assert_eq!(evidence.p95_us, Some(4800));
     assert_eq!(evidence.p99_us, Some(4800));
@@ -64,7 +68,7 @@ fn excessive_instrumentation_overhead_degrades_the_evidence_state() {
         0,
         InputToPhotonInputClass::PrintableText,
         1,
-        "linux",
+        "wayland",
         [100, 100, 100, 100, 1_000],
         100,
         1,
@@ -72,7 +76,7 @@ fn excessive_instrumentation_overhead_degrades_the_evidence_state() {
     )
     .expect("valid proxy trace");
 
-    let evidence = summarize_input_to_photon_traces("linux", &[trace]);
+    let evidence = summarize_input_to_photon_traces("wayland", &[trace]);
 
     assert_eq!(
         evidence.state,
@@ -90,17 +94,21 @@ fn excessive_instrumentation_overhead_degrades_the_evidence_state() {
 
 #[test]
 fn unavailable_proxy_evidence_does_not_claim_a_target_result() {
-    let evidence = unavailable_proxy_evidence("linux", "no GPU access on runner");
+    let evidence = unavailable_proxy_evidence("wayland", "no GPU access on runner");
 
     assert_eq!(evidence.sample_count, 0);
     assert_eq!(evidence.p95_us, None);
     assert_eq!(evidence.within_target, None);
-    assert_eq!(evidence.target_p95_us, target_p95_us_for_platform("linux"));
+    assert_eq!(evidence.gpu_adapter, None);
+    assert_eq!(
+        evidence.target_p95_us,
+        target_p95_us_for_platform("wayland")
+    );
 }
 
 #[test]
 fn empty_trace_summary_is_degraded_not_measured() {
-    let evidence = summarize_input_to_photon_traces("linux", &[]);
+    let evidence = summarize_input_to_photon_traces("wayland", &[]);
 
     assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
     assert_eq!(evidence.sample_count, 0);
@@ -167,12 +175,17 @@ fn headless_trace_preserves_measured_present_duration() {
     assert_eq!(render_submit.duration_us, 250);
     assert_eq!(gpu_present.duration_us, 42_000);
     assert_eq!(trace.total_latency_us, Some(43_650));
+    assert_eq!(
+        trace.gpu_adapter.as_deref(),
+        Some("deterministic-test-adapter")
+    );
 }
 
 #[test]
 fn target_mapping_preserves_platform_specific_slo() {
     assert_eq!(target_p95_us_for_platform("macos"), Some(16_000));
-    assert_eq!(target_p95_us_for_platform("linux"), Some(20_000));
+    assert_eq!(target_p95_us_for_platform("wayland"), Some(20_000));
+    assert_eq!(target_p95_us_for_platform("linux"), None);
     assert_eq!(target_p95_us_for_platform("freebsd"), None);
     assert_eq!(
         format!("{}", InputToPhotonStage::RenderSubmit),

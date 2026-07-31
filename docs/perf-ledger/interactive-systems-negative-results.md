@@ -67,11 +67,12 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Evidence-authority hardening:** new rows use
   `ft.renderer.input-to-photon.v2`, carry the closed `proxy_only` claim scope,
   retain only a closed input class and encoded byte count, and cannot serialize
-  raw key content. Mixed schema/claim/workload/platform identity, duplicate
-  sample IDs, incomplete proxy metadata, or any invalid member invalidate the
-  entire summary. Proxy percentiles remain available for regression diagnosis,
-  but `within_target` is always absent. The retained 2026-07-16 v1 row remains
-  immutable historical negative evidence; it is not reinterpreted as v2.
+  raw key content. Mixed schema/claim/workload/platform/GPU-adapter identity,
+  duplicate sample IDs, incomplete proxy metadata, or any invalid member
+  invalidate the entire summary. Proxy percentiles remain available for
+  regression diagnosis, but `within_target` is always absent. The retained
+  2026-07-16 v1 row remains immutable historical negative evidence; it is not
+  reinterpreted as v2.
 - **Primary retry condition:**
   > Do not retry from a cold read; use the correlated NSEvent-to-LAN-to-PTY-to-CAMetalDrawable trace and physical/display timing in `ft-interactive-systems-performance-4tenz.2` instead.
 

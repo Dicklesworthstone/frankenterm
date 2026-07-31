@@ -694,7 +694,7 @@ pub fn renderer_slos_doctor_report() -> RendererSloDoctorReport {
                 "instrumentation_overhead_exceeded".to_string(),
                 "invalid_trace".to_string(),
             ],
-            pending_reason: "deterministic known-key stage telemetry substrate is wired; retained target-run empirical p95/p99 remains pending"
+            pending_reason: "deterministic classified-input proxy telemetry substrate is wired; retained target-run empirical p95/p99 remains pending"
                 .to_string(),
         },
         ssim_parity: RendererSsimParitySloStatus {
@@ -1353,6 +1353,10 @@ mod tests {
         assert_eq!(evidence.state, InputToPhotonState::Measured);
         assert_eq!(evidence.sample_count, 3);
         assert_eq!(evidence.target_p95_us, Some(MACOS_P95_TARGET_US));
+        assert_eq!(
+            evidence.gpu_adapter.as_deref(),
+            Some("deterministic-test-adapter")
+        );
         assert_eq!(evidence.p50_us, Some(3400));
         assert_eq!(evidence.p95_us, Some(4800));
         assert_eq!(evidence.p99_us, Some(4800));
@@ -1370,7 +1374,7 @@ mod tests {
             0,
             InputToPhotonInputClass::PrintableText,
             1,
-            "linux",
+            "wayland",
             [100, 100, 100, 100, 1_000],
             100,
             1,
@@ -1378,7 +1382,7 @@ mod tests {
         )
         .expect("valid proxy trace");
 
-        let evidence = summarize_input_to_photon_traces("linux", &[trace]);
+        let evidence = summarize_input_to_photon_traces("wayland", &[trace]);
 
         assert_eq!(
             evidence.state,
@@ -1396,7 +1400,7 @@ mod tests {
 
     #[test]
     fn empty_input_to_photon_summary_is_degraded_not_measured() {
-        let evidence = summarize_input_to_photon_traces("linux", &[]);
+        let evidence = summarize_input_to_photon_traces("wayland", &[]);
 
         assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
         assert_eq!(evidence.sample_count, 0);
@@ -1457,7 +1461,7 @@ mod tests {
         );
         assert!(
             comparison.deviation_pct().unwrap_or(f64::INFINITY) <= 1.0,
-            "deterministic known-key trace should be nearly exact"
+            "deterministic classified-input proxy trace should be nearly exact"
         );
     }
 

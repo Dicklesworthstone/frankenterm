@@ -25,11 +25,6 @@ pub const MAX_INSTRUMENTATION_OVERHEAD_PCT: f64 = 5.0;
 pub const MAX_INPUT_BYTE_COUNT: u32 = 64;
 
 /// Closed, content-free classification of the input that triggered a proxy trace.
-/// Ordered stage labels in the deterministic proxy model.
-///
-/// The pre-render durations are synthetic workload inputs; these variants do
-/// not assert that a native event, mux/PTY hop, display presentation, or photon
-/// was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputToPhotonInputClass {
@@ -76,6 +71,11 @@ impl InputToPhotonClaimScope {
     }
 }
 
+/// Ordered stage labels in the deterministic proxy model.
+///
+/// The pre-render durations are synthetic workload inputs; these variants do
+/// not assert that a native event, mux/PTY hop, display presentation, or photon
+/// was observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputToPhotonStage {
@@ -165,6 +165,7 @@ pub struct InputToPhotonEvidence {
     pub claim_scope: InputToPhotonClaimScope,
     pub generated_at_ms: u64,
     pub platform: String,
+    pub gpu_adapter: Option<String>,
     pub input_class: Option<InputToPhotonInputClass>,
     pub min_input_byte_count: Option<u32>,
     pub max_input_byte_count: Option<u32>,
@@ -186,7 +187,7 @@ pub struct InputToPhotonEvidence {
 pub fn target_p95_us_for_platform(platform: &str) -> Option<u64> {
     match platform {
         "macos" => Some(MACOS_P95_TARGET_US),
-        "linux" => Some(WAYLAND_P95_TARGET_US),
+        "wayland" => Some(WAYLAND_P95_TARGET_US),
         _ => None,
     }
 }
@@ -194,10 +195,7 @@ pub fn target_p95_us_for_platform(platform: &str) -> Option<u64> {
 /// Converts the headless renderer's millisecond timer into the proxy stage unit.
 #[must_use]
 pub fn headless_render_duration_us(render_ms: u128) -> u64 {
-    u64::try_from(render_ms)
-        .unwrap_or(u64::MAX / 1_000)
-        .saturating_mul(1_000)
-        .max(1)
+    u64::try_from(render_ms.saturating_mul(1_000)).unwrap_or(u64::MAX)
 }
 
 /// Builds and validates one content-free proxy trace.
@@ -294,6 +292,7 @@ fn empty_evidence(
         generated_at_ms: now_ms(),
         target_p95_us: target_p95_us_for_platform(&platform),
         platform,
+        gpu_adapter: None,
         input_class: None,
         min_input_byte_count: None,
         max_input_byte_count: None,
@@ -328,6 +327,7 @@ pub fn summarize_input_to_photon_traces(
     let mut total_latencies = Vec::with_capacity(traces.len());
     let mut stage_breakdowns: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let mut sample_ids = BTreeSet::new();
+    let mut gpu_adapter = None;
     let mut input_class = None;
     let mut min_input_byte_count = u32::MAX;
     let mut max_input_byte_count = 0_u32;
@@ -347,6 +347,29 @@ pub fn summarize_input_to_photon_traces(
                 InputToPhotonState::InvalidTrace,
                 format!("sample_id {} is invalid: {reason}", trace.sample_id),
             );
+        }
+        let Some(trace_gpu_adapter) = trace.gpu_adapter.as_deref() else {
+            return empty_evidence(
+                platform,
+                InputToPhotonState::InvalidTrace,
+                format!(
+                    "sample_id {} is missing gpu_adapter identity after validation",
+                    trace.sample_id
+                ),
+            );
+        };
+        if let Some(expected) = gpu_adapter.as_deref() {
+            if expected != trace_gpu_adapter {
+                return empty_evidence(
+                    platform,
+                    InputToPhotonState::InvalidTrace,
+                    format!(
+                        "mixed gpu_adapter identities: expected {expected:?}, got {trace_gpu_adapter:?}"
+                    ),
+                );
+            }
+        } else {
+            gpu_adapter = Some(trace_gpu_adapter.to_string());
         }
         if trace.state != InputToPhotonState::Measured {
             let mut evidence = empty_evidence(
@@ -397,6 +420,7 @@ pub fn summarize_input_to_photon_traces(
         claim_scope: InputToPhotonClaimScope::ProxyOnly,
         generated_at_ms: now_ms(),
         platform,
+        gpu_adapter,
         input_class,
         min_input_byte_count: Some(min_input_byte_count),
         max_input_byte_count: Some(max_input_byte_count),
@@ -677,6 +701,10 @@ mod tests {
         assert_eq!(evidence.sample_count, 3);
         assert_eq!(evidence.claim_scope, InputToPhotonClaimScope::ProxyOnly);
         assert_eq!(
+            evidence.gpu_adapter.as_deref(),
+            Some("deterministic-test-adapter")
+        );
+        assert_eq!(
             evidence.input_class,
             Some(InputToPhotonInputClass::PrintableText)
         );
@@ -699,14 +727,14 @@ mod tests {
     fn excessive_instrumentation_overhead_degrades_evidence() {
         let trace = proxy_trace(
             0,
-            "linux",
+            "wayland",
             InputToPhotonInputClass::Control,
             1,
             [100, 100, 100, 100, 1_000],
             100,
         );
 
-        let evidence = summarize_input_to_photon_traces("linux", &[trace]);
+        let evidence = summarize_input_to_photon_traces("wayland", &[trace]);
 
         assert_eq!(
             evidence.state,
@@ -724,7 +752,7 @@ mod tests {
 
     #[test]
     fn empty_summary_is_degraded_not_measured() {
-        let evidence = summarize_input_to_photon_traces("linux", &[]);
+        let evidence = summarize_input_to_photon_traces("wayland", &[]);
 
         assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
         assert_eq!(evidence.sample_count, 0);
@@ -743,7 +771,7 @@ mod tests {
     fn invalid_stage_order_degrades_summary() {
         let mut trace = proxy_trace(
             0,
-            "linux",
+            "wayland",
             InputToPhotonInputClass::Navigation,
             3,
             [100, 100, 100, 100, 1_000],
@@ -751,7 +779,7 @@ mod tests {
         );
         trace.stages.swap(1, 2);
 
-        let evidence = summarize_input_to_photon_traces("linux", &[trace]);
+        let evidence = summarize_input_to_photon_traces("wayland", &[trace]);
 
         assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
         assert!(
@@ -850,10 +878,17 @@ mod tests {
     }
 
     #[test]
+    fn headless_timer_conversion_has_no_invented_sub_millisecond_precision() {
+        assert_eq!(headless_render_duration_us(0), 0);
+        assert_eq!(headless_render_duration_us(42), 42_000);
+        assert_eq!(headless_render_duration_us(u128::MAX), u64::MAX);
+    }
+
+    #[test]
     fn duplicate_sample_ids_fail_closed_without_partial_percentiles() {
         let trace = proxy_trace(
             42,
-            "linux",
+            "wayland",
             InputToPhotonInputClass::Function,
             1,
             [100, 200, 300, 400, 1_000],
@@ -861,7 +896,7 @@ mod tests {
         );
 
         let evidence =
-            summarize_input_to_photon_traces("linux", &[trace.clone(), trace]);
+            summarize_input_to_photon_traces("wayland", &[trace.clone(), trace]);
 
         assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
         assert_eq!(evidence.sample_count, 0);
@@ -877,6 +912,40 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn mixed_gpu_adapters_fail_closed_without_partial_percentiles() {
+        let first = proxy_trace(
+            0,
+            "wayland",
+            InputToPhotonInputClass::PrintableText,
+            1,
+            [100, 200, 300, 400, 1_000],
+            1,
+        );
+        let mut second = first.clone();
+        second.sample_id = 1;
+        second.gpu_adapter = Some("different-test-adapter".to_string());
+
+        let evidence = summarize_input_to_photon_traces("wayland", &[first, second]);
+
+        assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
+        assert_eq!(evidence.sample_count, 0);
+        assert_eq!(evidence.gpu_adapter, None);
+        assert_eq!(evidence.p50_us, None);
+        assert_eq!(evidence.p95_us, None);
+        assert_eq!(evidence.p99_us, None);
+        assert_eq!(evidence.p999_us, None);
+        assert_eq!(evidence.within_target, None);
+        assert!(evidence.stage_breakdown_p50.is_empty());
+        assert!(
+            evidence
+                .degradation_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gpu_adapter")
         );
     }
 
@@ -931,14 +1000,14 @@ mod tests {
         for (sample_id, invalid_count) in [(0, 0), (1, MAX_INPUT_BYTE_COUNT + 1)] {
             let mut trace = proxy_trace(
                 sample_id,
-                "linux",
+                "wayland",
                 InputToPhotonInputClass::Keypad,
                 1,
                 [100, 200, 300, 400, 1_000],
                 1,
             );
             trace.input_byte_count = invalid_count;
-            let evidence = summarize_input_to_photon_traces("linux", &[trace]);
+            let evidence = summarize_input_to_photon_traces("wayland", &[trace]);
 
             assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
             assert_eq!(evidence.sample_count, 0);
@@ -957,7 +1026,7 @@ mod tests {
     fn incomplete_proxy_metadata_fails_closed() {
         let valid = proxy_trace(
             0,
-            "linux",
+            "wayland",
             InputToPhotonInputClass::Control,
             1,
             [100, 200, 300, 400, 1_000],
@@ -978,7 +1047,7 @@ mod tests {
             blank_gpu_identity,
             inconsistent_render_duration,
         ] {
-            let evidence = summarize_input_to_photon_traces("linux", &[invalid]);
+            let evidence = summarize_input_to_photon_traces("wayland", &[invalid]);
             assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
             assert_eq!(evidence.sample_count, 0);
             assert_eq!(evidence.p95_us, None);
@@ -990,7 +1059,7 @@ mod tests {
         assert_eq!(target_p95_us_for_platform("freebsd"), None);
         let mut trace = proxy_trace(
             0,
-            "linux",
+            "wayland",
             InputToPhotonInputClass::PrintableText,
             1,
             [100, 200, 300, 400, 1_000],
@@ -1009,7 +1078,7 @@ mod tests {
 
     #[test]
     fn unavailable_proxy_helper_cannot_emit_a_measured_state() {
-        let evidence = unavailable_proxy_evidence("linux", "headless renderer unavailable");
+        let evidence = unavailable_proxy_evidence("wayland", "headless renderer unavailable");
 
         assert_eq!(
             evidence.state,
@@ -1018,5 +1087,6 @@ mod tests {
         assert_eq!(evidence.sample_count, 0);
         assert_eq!(evidence.p95_us, None);
         assert_eq!(evidence.within_target, None);
+        assert_eq!(evidence.gpu_adapter, None);
     }
 }

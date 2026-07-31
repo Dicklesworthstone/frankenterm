@@ -858,7 +858,7 @@ fn bench_config() -> Criterion {
 }
 
 fn emit_evidence_row() {
-    let platform = std::env::consts::OS.to_string();
+    let platform = proxy_target_platform_for_runner_os(std::env::consts::OS).to_string();
     let input = classified_input_headless_fixture();
     let evidence = match render_headless(&input) {
         Ok(frame) => {
@@ -904,6 +904,8 @@ fn emit_evidence_row() {
         "tags": {
             "trace_schema_version": INPUT_TO_PHOTON_SCHEMA_VERSION,
             "claim_scope": evidence.claim_scope.label(),
+            "platform": evidence.platform.as_str(),
+            "gpu_adapter": evidence.gpu_adapter.as_deref(),
             "input_class": evidence.input_class.map(InputToPhotonInputClass::label),
             "min_input_byte_count": evidence.min_input_byte_count,
             "max_input_byte_count": evidence.max_input_byte_count,
@@ -931,14 +933,17 @@ fn emit_evidence_row() {
 }
 
 fn evidence_path(platform: &str) -> PathBuf {
-    let suffix = match platform {
+    PathBuf::from(format!(
+        "target/criterion/slo-input_to_photon_{platform}.jsonl"
+    ))
+}
+
+fn proxy_target_platform_for_runner_os(runner_os: &str) -> &str {
+    match runner_os {
         "macos" => "macos",
         "linux" => "wayland",
         other => other,
-    };
-    PathBuf::from(format!(
-        "target/criterion/slo-input_to_photon_{suffix}.jsonl"
-    ))
+    }
 }
 
 fn state_tag(state: InputToPhotonState) -> &'static str {

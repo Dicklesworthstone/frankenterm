@@ -38,6 +38,10 @@ fn input_to_photon_empirical_p99_agrees_with_lindley_bound() {
     )
     .expect("valid proxy trace");
     let evidence = summarize_input_to_photon_traces("macos", std::slice::from_ref(&trace));
+    assert_eq!(
+        evidence.gpu_adapter.as_deref(),
+        Some("deterministic-test-adapter")
+    );
     let empirical_p99_ms = evidence.p99_us.expect("p99 present") as f64 / 1_000.0;
 
     let arrival = ArrivalCurve::new(0.0, 1.0);
@@ -56,6 +60,6 @@ fn input_to_photon_empirical_p99_agrees_with_lindley_bound() {
     );
     assert!(
         comparison.deviation_pct().unwrap_or(f64::INFINITY) <= 1.0,
-        "deterministic known-key trace should be nearly exact"
+        "deterministic classified-input proxy trace should be nearly exact"
     );
 }
