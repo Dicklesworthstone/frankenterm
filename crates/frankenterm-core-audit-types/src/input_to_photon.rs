@@ -206,7 +206,6 @@ pub fn headless_render_duration_us(render_ms: u128) -> u64 {
 ///
 /// Returns an error when any supplied identity, byte count, timing, overhead,
 /// or proxy-render metadata violates the v2 contract.
-#[must_use]
 pub fn classified_input_proxy_trace_from_stage_durations(
     sample_id: u64,
     input_class: InputToPhotonInputClass,
