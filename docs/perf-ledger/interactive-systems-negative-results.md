@@ -350,6 +350,267 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Reclassify a protocol marker as PTY/application echo only after it is emitted from a causally downstream PTY-read/parser/application boundary, is retained in a stage trace, and passes delayed, no-echo, reordered, reconnect, and boundedness regressions.
 
+### IS-N016 — Legacy `InputLatency` summaries are caller-labelled proxy diagnostics, not replayable production latency evidence
+
+- **Classification:** wrong-evidence-pipeline and false-green-gate rejection
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.9`
+- **Baseline revision:** `c286309f5fe3c450158155e49b92d38b6c98c42a`
+- **Semantic candidate revision:**
+  `9fb37eb5bd8448042587e68bb4abbfa05f6b5a57`
+- **Clippy-corrected implementation revision:**
+  `1cfb2212b89c67f26588841e4faf833084233f75`
+- **Latest source descendant under warnings-denied proof:**
+  `91dc37aaf73f0c9cdaa762d32273728047dba77e`. Later source changes repair
+  warnings in documentation, PID evidence, benchmarks, profiling/test paths,
+  an unrelated production mux row-range request, and unrelated compile-only
+  integration-test targets. The only later `input_latency` edits are
+  `#[cfg(test)]` singleton-budget constructors in
+  `1856d87fbdbd62b7c4f93302b05b6b96278be5c5`; its production implementation is
+  unchanged from the Clippy-corrected candidate.
+- **Rejected inference:** a green legacy `InputLatencyReport` or
+  `BudgetCheckResult` was treated as replayable production
+  keypress-to-present evidence. This framework is not wired into the live
+  AppKit, mux transport, remote PTY, parser, renderer, drawable, display, or
+  photon path. Its producer and clock-domain IDs are caller assertions, not
+  verified identity or synchronization.
+- **Rejected false-green paths:** the prior surface could admit an empty
+  collector through zero summaries, silently overwrite duplicate stages,
+  collapse duplicate wire-map keys, filter invalid samples, compute partial
+  spans, retain duplicate IDs, normalize zero capacity, advance an unchecked
+  sequence through exhaustion, accept empty or ambiguous budgets, ignore stage
+  budgets, expose mutable or deserializable derived verdicts, and round an
+  authority-bearing `f64` threshold into a different gate. Approximate ratios
+  could also display `1.0` while the exact integer comparison failed.
+- **Authority correction:** every report and verdict is permanently
+  `proxy_only`. `PtyRead` denotes a PTY master/reader read boundary and does not
+  by itself establish causal application echo. `GpuPresent` is a
+  caller-recorded operation marker, not scanout or photons. Producer and clock
+  labels require future external authority; no registry, evidence-bundle
+  schema/content binding, or clock calibration is implemented or verified by
+  this module. Cross-host calibration and production authority remain trace-v2
+  responsibilities.
+- **Structural correction:** every admitted measurement contains all six unique
+  stages under one asserted clock-domain label with non-regressing adjacent
+  timestamps; the retained ring separately requires unique non-reserved
+  measurement IDs. This is per-measurement label consistency, not cross-sample
+  clock calibration. Partial measurements remain available as diagnostics but
+  are not admitted as complete latency evidence. Duplicate writes preserve the
+  original and leave a sticky fault. Unknown fields in collector, measurement,
+  timestamp, stage-budget, and budget wire structs; duplicate authority-bearing
+  map keys; unsupported collector schema versions; invalid capacities;
+  malformed allocator frontiers; reserved/unallocated IDs; and oversized
+  sequences are rejected. Decoding retains at most 65,536 samples and five
+  adjacent stage budgets; element `MAX + 1` is probed with `IgnoredAny` rather
+  than materialized as an unbounded value.
+- **Gate correction:** ID zero and `u64::MAX` are reserved,
+  `u64::MAX - 1` is last usable, and an attempted terminal allocation
+  permanently taints the collector. Empty, incomplete, duplicate,
+  clock-mismatched, regressing, invalid-capacity, or exhausted evidence yields
+  zero admitted samples, no percentile summaries, and a non-pass verdict. A
+  malformed or noncanonical budget wire is rejected before a verdict exists. A
+  decoded or in-memory semantically inadmissible budget produces a non-pass
+  verdict with a typed budget error but does not erase summaries derived from
+  otherwise valid evidence. A late stage-breakdown failure clears aggregate
+  and stage summaries.
+  `InputLatencyReport`, `BudgetCheckResult`, and
+  `BudgetCheckDetail` are public DTO types whose derived fields are
+  private/getter-only; they implement `Serialize`, not `Deserialize`. Only
+  report/verdict envelopes carry `proxy_only`; a standalone detail is not
+  authority.
+- **Numeric and replay correction:** retained property jobs
+  `j-29955720610840590` and `j-29955720610840593` each passed all four
+  synthetic latency-watchdog integration tests but failed
+  `budget_serde_roundtrip` after 40 of 41 properties because decimal JSON moved
+  the threshold `0.9088411463024019` by one ULP, from bits
+  `4606361332840929359` to `4606361332840929360`. Enabling `serde_json`'s
+  `float_roundtrip` feature did not repair that authority failure. The budget
+  wire now requires canonical `0x` plus 16
+  lowercase hexadecimal IEEE-754 digits; decimal, numeric, uppercase, and
+  malformed encodings fail closed, while canonically encoded but semantically
+  inadmissible IEEE-754 payloads retain their bits until typed validation.
+  Positive finite thresholds are scaled with exact
+  significand-and-exponent integer arithmetic, preventing false passes above
+  `2^53`; non-positive, negative-zero, NaN, infinity, subnormal, and overflow
+  cases are handled explicitly. Approximate ratio fields were removed.
+- **Canonical focused proof:** strict-remote job
+  `j-29955720610840594` on `yto` tested the semantic candidate with
+  `cargo test -p frankenterm-core --test proptest_input_latency --test integration_latency_watchdog_scheduler`:
+  41/41 property tests and 4/4 synthetic integration tests passed. Job
+  `j-29955720610840596` on `yto` passed 52/52 library tests selected by
+  `cargo test -p frankenterm-core --lib input_latency`, and job
+  `j-29955720610840601` on `yto` passed all four compile-fail doctests selected
+  by `cargo test -p frankenterm-core --doc input_latency`. All exited zero
+  through an identified remote worker; none is a local Cargo result. At source
+  descendant `045bfc65c989ecb8964fdcf6c668540b41b52c90`, job
+  `j-29955720610840622` on `hz2` reconfirmed 52/52 library tests, job
+  `j-29955720610840625` on `vmi1152480` reconfirmed 41/41 property tests and
+  4/4 synthetic integration tests, and job `j-29955720610840623` on
+  `vmi1149989` passed package-scoped `cargo check -p frankenterm-core
+  --all-targets`. These were also strict remote executions with no local
+  fallback.
+- **Warnings-denied proof trail:** job `j-29955720610840606` found two
+  `input_latency` Clippy diagnostics at the Serde adapter/lifetime boundary;
+  `1cfb2212b89c67f26588841e4faf833084233f75` corrected them without changing
+  behavior. Job `j-29955720610840607` then progressed beyond `input_latency`
+  and found an unrelated lazy-continuation documentation lint, corrected in
+  `bb4abef4c`. Job `j-29955720610840608` progressed farther and found fourteen
+  diagnostics in the unrelated fleet-memory PID certificate. After that repair,
+  job `j-29955720610840610` reached four `large_futures` diagnostics in the
+  unrelated `compression_bypass` benchmark. Revision
+  `351b05410f8334a0396ed27eeffa3213e5a862d5` boxes the two oversized mux-connect
+  futures at their source; strict-remote job `j-29955720610840611` on `yto`
+  passed
+  `cargo clippy -p frankenterm-core --bench compression_bypass -- -D warnings`.
+  Package-scoped all-target retry `j-29955720610840612` on `yto`, running
+  `cargo clippy -p frankenterm-core --all-targets -- -D warnings`, progressed
+  past those repairs and found two `ref_option` diagnostics in
+  `m6_search_while_streaming`; revision
+  `22ae0a04e2ea97c0bd05994c67f7d27a814dfc61` changes the helpers to
+  `Option<&Distribution>` without changing their lookup or NaN fallback.
+  Strict-remote job `j-29955720610840613` on `hz1` passed
+  `cargo clippy -p frankenterm-core --bench m6_search_while_streaming -- -D warnings`.
+  A static same-pattern sweep then found four remaining compile-reachable
+  oversized `DirectMuxClient::connect` calls; revision
+  `4cfd6f4a770f9fa286339901ef3ea7b15ec2b540` boxes those source futures in the
+  PDU-pipelining, mux-client-operations, and mux-pool-scaling benchmarks.
+  Strict-remote job `j-29955720610840614` on `hz2` passed warnings-denied
+  Clippy for all three repaired benchmarks. Package-scoped all-target retry
+  `j-29955720610840615` on `hz1`, running the same command, then reached a
+  `needless_collect` diagnostic in `round6_profile_realistic_workloads`; revision
+  `04ca88652f79741a5d9d7f3b5f1e602e508014f3` preserves its fail-closed gate
+  assertion with `Iterator::any` and removes the unnecessary allocation. The
+  parallel package-scoped all-target retry `j-29955720610840616` on `hz2`,
+  running the same command, independently reached three
+  `doc_lazy_continuation` diagnostics in the pattern-detection benchmark.
+  Revision `e888301408731f06ef6fc705df25904a9e24ac83` inserts the missing
+  paragraph boundary without changing its evidence explanation.
+  Strict-remote job `j-29955720610840617` on `hz2` then passed the focused
+  round-six test target with `-D warnings`, and job `j-29955720610840619` on
+  `vmi1149989` passed the focused pattern-detection benchmark target with
+  `-D warnings`. The longer-running all-target jobs continued to provide useful
+  negative evidence: `j-29955720610840615` on `hz1` exposed seven singleton-map
+  constructors in the `input_latency` test module plus explicit-match,
+  visibility, range, duration, and singleton-range diagnostics in unrelated
+  test paths; `j-29955720610840618` on `vmi1152480` exposed two remaining
+  similar-name diagnostics in the PID certificate; and
+  `j-29955720610840620` on `vmi1153651` reached a manual `Result` fallback in
+  the round-five pattern benchmark. Revisions
+  `966962cebf61aa14d62de09d234b9b21ef73454f`,
+  `1856d87fbdbd62b7c4f93302b05b6b96278be5c5`,
+  `43a7f709558743f86b5fa43f4f69145ce267b134`, and
+  `045bfc65c989ecb8964fdcf6c668540b41b52c90` remove the diagnosed and
+  same-pattern test allocations/lints without changing production
+  `input_latency` behavior. Revision
+  `9422312e71a80fb2b8aeee9fa937aaa52fd32fa5` replaces the final manual fallback
+  with its exact standard-library equivalent. Static same-pattern sweeps found
+  no remaining high-confidence instances of the previously diagnosed
+  count-only or manual-fallback patterns. All-target job
+  `j-29955720610840621` on `hz1` at revision
+  `045bfc65c989ecb8964fdcf6c668540b41b52c90`, all-target job
+  `j-29955720610840633` on `vmi1153651` at revision
+  `9422312e71a80fb2b8aeee9fa937aaa52fd32fa5` (exit 101), and focused-benchmark
+  job `j-29955720610840632` on `yto` at the same `9422312e7` revision then
+  proved that `Vec::from([range])` did not escape
+  `single_range_in_vec_init`: each stopped at the production
+  `get_lines_with_cx` request before later targets could be credited. Revision
+  `590336e38d1667b0235d0655ac88a8ff42bdbe27` uses
+  `std::iter::once(range).collect()` at all 17 same-pattern production/test
+  sites, preserving a vector with exactly one range rather than enumerating the
+  range's scalar values. Strict-remote job `j-29955720610840634` on `yto`
+  passed warnings-denied library Clippy at that revision. All-target job
+  `j-29955720610840635` on `vmi1149989` then progressed beyond the range repair
+  and found five diagnostics in the unrelated round-seven RSS harness. Revisions
+  `d344ae2dafdef4d3682fe0b450ab95d9e9eaa3db` and
+  `059b735db64cdfaf24446b9acc88678cf9bb9abc` preserve the harness calculations
+  while repairing its documentation, checked division, option predicate, and
+  equality assertion. Focused strict-remote job `j-29955720610840636` on
+  `vmi1149989` passed warnings-denied Clippy for that test target, and job
+  `j-29955720610840638` on `vmi1152480` passed both round-seven tests. Exact
+  `059b735db64cdfaf24446b9acc88678cf9bb9abc` job
+  `j-29955720610840640` on `vmi1149989` independently passed the same two
+  tests. Exact
+  `059b735db64cdfaf24446b9acc88678cf9bb9abc` all-target job
+  `j-29955720610840639` on `yto` then exposed nine over-indented Rustdoc lines
+  in the unrelated operator-cockpit harness and one oversized future in the
+  compile-only subprocess-smoke target. Revision
+  `91dc37aaf73f0c9cdaa762d32273728047dba77e` rewrites that prose without a
+  Markdown list and boxes the named future at its source; it neither changes
+  production `input_latency` nor executes the subprocess fixture. Focused
+  strict-remote job `j-29955720610840643` on `vmi1152480` passed
+  warnings-denied Clippy for both repaired test targets. The earlier parallel
+  all-target job `j-29955720610840637` on `vmi1153651` then exposed five more
+  oversized `MuxPool::list_panes` futures in the socket-disappearance test and
+  three manual `repeat().take()` constructions in the delta-extraction bench.
+  Revision `3a0838e1e4b8fadc2a54fc54470acd830c5cce45` boxes the five futures and
+  uses `repeat_n` in that benchmark plus two exact same-pattern property-test
+  generators. Focused jobs `j-29955720610840647` and
+  `j-29955720610840649` failed before Cargo because workers `vmi1227854` and
+  `vmi1293453` could not create their remote target directories; they are
+  infrastructure non-proof. Exact `91dc37aaf73f0c9cdaa762d32273728047dba77e`
+  all-target job `j-29955720610840641` on `hz2` independently progressed to
+  twelve additional oversized real-mux snapshot-test futures. Revision
+  `5d9cd3db79dae96a61c8d545f8f3bef5737a5b38` boxes every diagnosed
+  `list_panes`, `split_pane`, and `send_text_with_options` future at its source;
+  this compile-only repair does not execute or contact a mux process.
+  <!-- IS-N016-CLIPPY-RESULT -->
+- **Adjacent false-green evidence repaired:** investigation of the PID
+  diagnostics proved that its gain-margin phase detector was unreachable, its
+  synthetic plant-identification wording overclaimed authority, its closed-loop
+  test reimplemented rather than exercised the shipped controller, and several
+  stall, missing-plan, invalid-input, reset, and byte-identity checks could pass
+  incorrectly. Revision `405a667459051710849ac1a3523011f1a2807c95` repairs
+  those defects. Strict-remote job `j-29955720610840609` on `yto` passed all
+  9/9 focused `fleet_memory_pid_dampening_cert` tests. This adjacent repair is
+  required repository hygiene, not latency evidence.
+- **Broad-proof boundary:** workspace check job `j-29955720610840602` and
+  workspace Clippy job `j-29955720610840603` failed on `hz2` because
+  `xcb-util.pc` was unavailable; job `j-29955720610840604` failed on `yto`
+  because `x11-xcb.pc` was unavailable; and automatic retry
+  `j-29955720610840605` failed on `fmd` for lack of disk space. Those are
+  retained remote-environment failures, not successful workspace proof and not
+  behavioral failures in this candidate.
+- **Earlier retained diagnostics and infrastructure failures:** job
+  `j-29953507796713904` completed an earlier check with warnings and was
+  superseded. Job `j-29955676990078977` exposed malformed property-test
+  diagnostics. Jobs `j-29955676990078978` and
+  `j-29955676990078979` failed before Cargo because their remote target
+  directories were not writable. Jobs `j-29955676990078981` and
+  `j-29955676990078982` passed earlier revisions and are superseded. Job
+  `j-29955720610840577` was cancelled after static audit superseded its
+  revision. Job `j-29955720610840578` exposed test-only dead code, six malformed
+  format strings, and an invalid `Result` equality assertion; it was cancelled
+  after repair. Job `j-29955720610840580` exposed two missing type annotations
+  and was cancelled after repair. A pinned `hz1` attempt failed closed before
+  job creation with `RCH-I002` (`disk_critical_without_fresh_telemetry`). Job
+  `j-29955720610840582` targeted a superseded candidate. None of these runs is
+  promoted into canonical proof. Later all-target jobs
+  `j-29955720610840626`/`j-29955720610840629` on `vmi1227854` and focused jobs
+  `j-29955720610840628`/`j-29955720610840631` on `vmi1293453` failed before
+  Cargo because their remote target directories could not be created. A pinned
+  `yto` attempt was refused before job creation with `RCH-I005` active-project
+  exclusion; a final-candidate pinned `hz1` attempt was refused with `RCH-I002`
+  `memory_pressure_critical`. Both refused local fallback as required. These
+  infrastructure outcomes are retained non-proof, not behavioral failures.
+- **Workload and claim boundary:** this was a static correctness and evidence
+  repair, not a performance experiment. No performance workload, measurement
+  build profile/configuration, runtime topology/transport, or performance
+  sample count existed. It collected no live Mac-to-trj keypresses and no
+  AppKit, transport, PTY, application-echo, terminal-update, render, drawable,
+  display, photon, observer-effect, distribution, confidence/noise, `cv_pct`,
+  or visual-equivalence evidence. No active FrankenTerm session was used as a
+  qualification rig.
+- **Formatting boundary:** RCH rejected remote `cargo fmt --check` as a
+  non-compilation command (`RCH-E301`). Final `git diff --check` passed; no
+  local formatter or local Cargo command was run, and no remote formatting
+  proof is claimed.
+- **Decision:** keep the fail-closed proxy repair because it removes real
+  false-green diagnostics, but reject every attempt to promote these summaries
+  into production input-to-present evidence. This change cannot replace the
+  isolated live `.2.7` matrix, cannot by itself unblock `.2.8`, and does not
+  supersede trace v2 as production authority.
+- **Primary retry condition:**
+  > Do not retry from a cold read; use the trace-v2 identity/clock bundle and isolated live Mac-to-trj input rig in .2.1–.2.8 instead.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

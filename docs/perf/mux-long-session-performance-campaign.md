@@ -52,20 +52,45 @@ In particular:
   long-session stability remain unproven until their named target runs exist.
 - A software call to `present()` is a submit/presentation request. It is not a
   measured display or photon boundary.
-- The legacy `input_latency` proxy path—collector (schema v1), standalone budget
-  verdict (schema v2), and report (schema v4)—now fails closed on empty or
-  incomplete sample windows, duplicate `record_stage`/wire-map keys, duplicate
-  measurement IDs within the retained window, mismatched asserted clock-domain
-  labels, regressing timestamps, invalid budgets, and an attempted allocation
-  at the exhausted sequence boundary. Those repairs prevent false green proxy
-  verdicts; they do not promote the framework into the production
-  AppKit/mux/PTY/presentation trace required by `.2`.
-- `InputLatencyReport` and its budget verdict are serialize-only derived
-  summaries. A report alone is not replay-verifiable: retained proxy evidence
-  must include the serialized source collector, exact budget, and an external
-  registry content-bound to both inputs that binds their caller-supplied
-  producer and clock labels. Defining that bundle binding and any cross-host
-  calibration remain trace-v2 responsibilities.
+- The legacy `input_latency` path is permanently `proxy_only`: its
+  caller-labelled stages are not wired into the production
+  AppKit/mux/network/PTY/parser/renderer/presentation path. `PtyRead` denotes a
+  PTY master/reader read boundary and does not by itself establish causal
+  application echo; `GpuPresent` is a caller-recorded operation marker, not
+  display scanout or photons. Producer and clock-domain IDs remain unverified
+  labels. This module implements no registry, evidence-bundle schema/content
+  binding, or clock calibration that could establish their identity.
+- The collector and report evidence path (schema v1/schema v4) now fails closed
+  on empty or incomplete windows, duplicate stage writes or authority-bearing
+  wire keys, duplicate/reserved/unallocated measurement IDs, mismatched
+  asserted clock domains within a measurement, regressing timestamps, invalid
+  or oversized capacities, and sticky ID exhaustion. Invalid evidence produces
+  all-or-zero summaries rather than filtering bad samples into a pass. The
+  budget wire rejects malformed or noncanonical encodings before a verdict
+  exists. A decoded or in-memory semantically inadmissible budget produces a
+  typed non-pass verdict without erasing summaries derived from otherwise valid
+  evidence. Decoding is bounded to 65,536 samples and five adjacent stage
+  budgets.
+- `InputLatencyBudget.regression_threshold` is serialized as a canonical
+  `0x`-prefixed 16-lowercase-hex-digit IEEE-754 payload. Decimal, numeric,
+  uppercase, and malformed encodings are rejected; canonically encoded but
+  semantically inadmissible IEEE-754 payloads retain their exact bits until
+  typed validation. Effective budgets are
+  computed by exact integer scaling of the represented finite value, so
+  decimal round-trip drift or `f64` rounding above `2^53` cannot mint a
+  one-microsecond false pass. Approximate ratio fields were removed.
+  `serde_json`'s `float_roundtrip` feature remains defense in depth only; it is
+  not gate or evidence authority.
+- `InputLatencyReport`, `BudgetCheckResult`, and `BudgetCheckDetail` are public
+  DTO types whose derived fields are private/getter-only; they implement
+  `Serialize`, not `Deserialize`. Only report/verdict envelopes carry
+  `proxy_only`; a standalone detail has no authority. A report alone is not
+  replay-verifiable: retained proxy evidence must include the serialized source
+  collector, exact budget, and a future external registry content-bound to both
+  inputs. These repairs prevent false-green proxy diagnostics; they do not
+  establish live keypress latency, observer effect, cross-host clock
+  calibration, presentation, or physical display timing. Those remain trace-v2
+  and isolated-target-run responsibilities under `.2.1`–`.2.8`.
 
 ## 2. Code-grounded architecture
 
