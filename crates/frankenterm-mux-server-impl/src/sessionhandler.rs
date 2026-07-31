@@ -249,8 +249,8 @@ impl Drop for SessionOwner {
     }
 }
 
-#[derive(Default, Debug)]
-pub(crate) struct PerPane {
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PaneRenderBaseline {
     cursor_position: StableCursorPosition,
     title: String,
     working_dir: Option<Url>,
@@ -261,7 +261,127 @@ pub(crate) struct PerPane {
     sent_initial_palette: bool,
     seqno: SequenceNo,
     config_generation: usize,
+    committed_input_epoch: u64,
+}
+
+/// Local ownership identity for an immutable render candidate.
+///
+/// This is not delivery, scheduler, wire, or application-ACK authority. Live
+/// integration under ft-interactive-systems-performance-4tenz.5.5.10 must
+/// bind each candidate one-to-one to the exact `DeliveryClaim` and
+/// coordinator claim from `ft.render-delivery-ledger.v1`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PaneRenderAttemptToken {
+    pane_id: PaneId,
+    render_generation: u64,
+    attempt: u64,
+    input_epoch: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPaneRenderCommit {
+    token: PaneRenderAttemptToken,
+    baseline: PaneRenderBaseline,
+    covered_notifications: Vec<Alert>,
+}
+
+#[derive(Debug, Default)]
+enum PaneRenderTransactionPhase {
+    #[default]
+    Idle,
+    Preparing {
+        token: PaneRenderAttemptToken,
+        redirtied: bool,
+    },
+    InFlight {
+        pending: Box<PendingPaneRenderCommit>,
+        redirtied: bool,
+    },
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneRenderSettlement {
+    AcknowledgedClean,
+    AcknowledgedRedirtied,
+    SettledNoChangeClean,
+    SettledNoChangeRedirtied,
+    Retried,
+    StaleOrDuplicate,
+    Closed,
+    FailedClosed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneRenderPreparationError {
+    Busy,
+    Closed,
+    AttemptIdentityExhausted,
+    InputIdentityExhausted,
+    SourceChanged,
+    TerminalSequenceExhausted,
+    StaleAttempt,
+    NotificationPrefixChanged,
+    SnapshotFailed,
+    StateLockPoisoned,
+}
+
+impl std::fmt::Display for PaneRenderPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Busy => "another pane render preparation is already active",
+            Self::Closed => "pane render transaction state is closed",
+            Self::AttemptIdentityExhausted => {
+                "pane render attempt identity exhausted before wrap or reuse"
+            }
+            Self::InputIdentityExhausted => {
+                "pane render input identity exhausted before wrap or reuse"
+            }
+            Self::SourceChanged => "pane render source changed during snapshot preparation",
+            Self::TerminalSequenceExhausted => {
+                "terminal sequence saturated; a fresh render generation is required"
+            }
+            Self::StaleAttempt => "pane render attempt no longer owns the transaction",
+            Self::NotificationPrefixChanged => {
+                "pane notification prefix changed during transaction preparation"
+            }
+            Self::SnapshotFailed => "pane semantic snapshot preparation failed",
+            Self::StateLockPoisoned => "pane render transaction state lock is poisoned",
+        })
+    }
+}
+
+impl std::error::Error for PaneRenderPreparationError {}
+
+#[derive(Debug)]
+pub(crate) struct PerPane {
+    baseline: PaneRenderBaseline,
+    // Candidate ownership protects the baseline and retained effects. It is
+    // deliberately subordinate to the delivery ledger and must never become
+    // an independent source of scheduling or convergence truth.
+    transaction_phase: PaneRenderTransactionPhase,
+    // Shadow observation used to prove candidate redirty behavior before live
+    // ledger wiring. The authoritative durable dirty bit remains in
+    // `DeliveryLedger`.
+    transactional_dirty: bool,
+    render_generation: u64,
+    next_render_attempt: Option<u64>,
+    next_input_epoch: Option<u64>,
     pub(crate) notifications: Vec<Alert>,
+}
+
+impl Default for PerPane {
+    fn default() -> Self {
+        Self {
+            baseline: PaneRenderBaseline::default(),
+            transaction_phase: PaneRenderTransactionPhase::Idle,
+            transactional_dirty: true,
+            render_generation: 1,
+            next_render_attempt: Some(1),
+            next_input_epoch: Some(1),
+            notifications: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -305,12 +425,31 @@ fn stable_row_range_from_signed_len(
     stable_row_range_from_len(start, len)
 }
 
-impl PerPane {
-    fn compute_changes(
-        &mut self,
+#[derive(Clone, Debug)]
+struct PreparedSurfaceChanges {
+    response: GetPaneRenderChangesResponse,
+    baseline: PaneRenderBaseline,
+    source_start: SequenceNo,
+    source_end: SequenceNo,
+}
+
+#[derive(Clone, Debug)]
+enum SurfacePreparation {
+    NoChange {
+        source_start: SequenceNo,
+        source_end: SequenceNo,
+    },
+    Changes(Box<PreparedSurfaceChanges>),
+}
+
+impl PaneRenderBaseline {
+    fn prepare_surface_changes(
+        &self,
         pane: &CurrentPane<'_>,
         force_with_input_serial: Option<InputSerial>,
-    ) -> Option<GetPaneRenderChangesResponse> {
+        force_for_atomic_effects: bool,
+    ) -> SurfacePreparation {
+        let source_start = pane.get_current_seqno();
         let mut changed = false;
         let mouse_grabbed = pane.is_mouse_grabbed();
         if mouse_grabbed != self.mouse_grabbed {
@@ -346,7 +485,6 @@ impl PerPane {
         }
 
         let old_seqno = self.seqno;
-        self.seqno = pane.get_current_seqno();
         let viewport_range = stable_row_range_from_len(dims.physical_top, dims.viewport_rows)
             .unwrap_or(dims.physical_top..dims.physical_top);
         let mut all_dirty_lines = pane.get_changed_since(viewport_range.clone(), old_seqno);
@@ -354,8 +492,11 @@ impl PerPane {
             changed = true;
         }
 
-        if !changed && !force_with_input_serial.is_some() {
-            return None;
+        if !changed && force_with_input_serial.is_none() && !force_for_atomic_effects {
+            return SurfacePreparation::NoChange {
+                source_start,
+                source_end: pane.get_current_seqno(),
+            };
         }
 
         // Figure out what we're going to send as dirty lines vs bonus lines
@@ -389,29 +530,663 @@ impl PerPane {
             }
         }
 
-        self.cursor_position = cursor_position;
-        self.title.clone_from(&title);
-        self.working_dir.clone_from(&working_dir);
-        self.dimensions = dims;
-        self.tiered_scrollback_status = tiered_scrollback_status;
-        self.mouse_grabbed = mouse_grabbed;
-        self.alt_screen_active = alt_screen_active;
+        let source_end = pane.get_current_seqno();
+        let mut baseline = self.clone();
+        baseline.cursor_position = cursor_position;
+        baseline.title.clone_from(&title);
+        baseline.working_dir.clone_from(&working_dir);
+        baseline.dimensions = dims;
+        baseline.tiered_scrollback_status = tiered_scrollback_status;
+        baseline.mouse_grabbed = mouse_grabbed;
+        baseline.alt_screen_active = alt_screen_active;
+        baseline.seqno = source_start;
 
         let bonus_lines = bonus_lines.into();
-        Some(GetPaneRenderChangesResponse {
-            pane_id: pane.pane_id(),
-            mouse_grabbed,
-            alt_screen_active,
-            dirty_lines: all_dirty_lines.iter().cloned().collect(),
-            dimensions: dims,
-            tiered_scrollback_status,
-            cursor_position,
-            title,
-            bonus_lines,
-            working_dir: working_dir.map(Into::into),
-            input_serial: force_with_input_serial,
-            seqno: self.seqno,
+        SurfacePreparation::Changes(Box::new(PreparedSurfaceChanges {
+            response: GetPaneRenderChangesResponse {
+                pane_id: pane.pane_id(),
+                mouse_grabbed,
+                alt_screen_active,
+                dirty_lines: all_dirty_lines.iter().cloned().collect(),
+                dimensions: dims,
+                tiered_scrollback_status,
+                cursor_position,
+                title,
+                bonus_lines,
+                working_dir: working_dir.map(Into::into),
+                input_serial: force_with_input_serial,
+                seqno: source_start,
+            },
+            baseline,
+            source_start,
+            source_end,
+        }))
+    }
+}
+
+impl PerPane {
+    fn compute_changes(
+        &mut self,
+        pane: &CurrentPane<'_>,
+        force_with_input_serial: Option<InputSerial>,
+    ) -> Option<GetPaneRenderChangesResponse> {
+        match self.baseline.prepare_surface_changes(
+            pane,
+            force_with_input_serial,
+            false,
+        ) {
+            SurfacePreparation::NoChange { source_start, .. } => {
+                // The legacy transport has no application ACK. Preserve its
+                // established behavior and avoid rescanning an ever-growing
+                // no-visible-change interval while the transactional path
+                // remains dormant.
+                self.baseline.seqno = source_start;
+                None
+            }
+            SurfacePreparation::Changes(prepared) => {
+                let PreparedSurfaceChanges {
+                    response, baseline, ..
+                } = *prepared;
+                self.baseline = baseline;
+                Some(response)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+struct PaneRenderBeginSnapshot {
+    token: PaneRenderAttemptToken,
+    baseline: PaneRenderBaseline,
+    covered_notifications: Vec<Alert>,
+    has_uncovered_notifications: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+impl PerPane {
+    fn mark_transactional_dirty(&mut self) {
+        self.transactional_dirty = true;
+        match &mut self.transaction_phase {
+            PaneRenderTransactionPhase::Preparing { redirtied, .. }
+            | PaneRenderTransactionPhase::InFlight { redirtied, .. } => {
+                *redirtied = true;
+            }
+            PaneRenderTransactionPhase::Idle | PaneRenderTransactionPhase::Closed => {}
+        }
+    }
+
+    pub(crate) fn push_notification(&mut self, alert: Alert) {
+        self.notifications.push(alert);
+        self.mark_transactional_dirty();
+    }
+
+    fn begin_transactional_preparation(
+        &mut self,
+        pane_id: PaneId,
+        force_with_input_serial: Option<InputSerial>,
+    ) -> Result<PaneRenderBeginSnapshot, PaneRenderPreparationError> {
+        match self.transaction_phase {
+            PaneRenderTransactionPhase::Idle => {}
+            PaneRenderTransactionPhase::Preparing { .. }
+            | PaneRenderTransactionPhase::InFlight { .. } => {
+                self.mark_transactional_dirty();
+                return Err(PaneRenderPreparationError::Busy);
+            }
+            PaneRenderTransactionPhase::Closed => {
+                return Err(PaneRenderPreparationError::Closed);
+            }
+        }
+
+        let attempt = self
+            .next_render_attempt
+            .and_then(|attempt| attempt.checked_add(1).map(|next| (attempt, next)));
+        let Some((attempt, next_attempt)) = attempt else {
+            self.transaction_phase = PaneRenderTransactionPhase::Closed;
+            self.transactional_dirty = true;
+            return Err(PaneRenderPreparationError::AttemptIdentityExhausted);
+        };
+
+        let input_epoch = if force_with_input_serial.is_some() {
+            let next = self
+                .next_input_epoch
+                .and_then(|epoch| epoch.checked_add(1).map(|next| (epoch, next)));
+            let Some((epoch, next_epoch)) = next else {
+                self.transaction_phase = PaneRenderTransactionPhase::Closed;
+                self.transactional_dirty = true;
+                return Err(PaneRenderPreparationError::InputIdentityExhausted);
+            };
+            self.next_input_epoch = Some(next_epoch);
+            Some(epoch)
+        } else {
+            None
+        };
+
+        self.next_render_attempt = Some(next_attempt);
+        let token = PaneRenderAttemptToken {
+            pane_id,
+            render_generation: self.render_generation,
+            attempt,
+            input_epoch,
+        };
+        let covered_notifications = self
+            .notifications
+            .iter()
+            .take(codec::MAX_RENDER_APPLICATION_ALERTS)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_uncovered_notifications =
+            covered_notifications.len() < self.notifications.len();
+        self.transactional_dirty = false;
+        self.transaction_phase = PaneRenderTransactionPhase::Preparing {
+            token,
+            redirtied: false,
+        };
+        Ok(PaneRenderBeginSnapshot {
+            token,
+            baseline: self.baseline.clone(),
+            covered_notifications,
+            has_uncovered_notifications,
         })
+    }
+
+    fn cancel_preparation(&mut self, token: PaneRenderAttemptToken) -> PaneRenderSettlement {
+        let matches = matches!(
+            self.transaction_phase,
+            PaneRenderTransactionPhase::Preparing {
+                token: active,
+                ..
+            } if active == token
+        );
+        if !matches {
+            return if matches!(self.transaction_phase, PaneRenderTransactionPhase::Closed) {
+                PaneRenderSettlement::Closed
+            } else {
+                PaneRenderSettlement::StaleOrDuplicate
+            };
+        }
+        self.transaction_phase = PaneRenderTransactionPhase::Idle;
+        self.transactional_dirty = true;
+        PaneRenderSettlement::Retried
+    }
+
+    fn close_exhausted_preparation(
+        &mut self,
+        token: PaneRenderAttemptToken,
+    ) -> PaneRenderSettlement {
+        let matches = matches!(
+            self.transaction_phase,
+            PaneRenderTransactionPhase::Preparing {
+                token: active,
+                ..
+            } if active == token
+        );
+        if !matches {
+            return if matches!(self.transaction_phase, PaneRenderTransactionPhase::Closed) {
+                PaneRenderSettlement::Closed
+            } else {
+                PaneRenderSettlement::StaleOrDuplicate
+            };
+        }
+        self.transaction_phase = PaneRenderTransactionPhase::Closed;
+        self.transactional_dirty = true;
+        PaneRenderSettlement::Closed
+    }
+
+    fn settle_no_change(
+        &mut self,
+        token: PaneRenderAttemptToken,
+    ) -> PaneRenderSettlement {
+        let phase = std::mem::replace(
+            &mut self.transaction_phase,
+            PaneRenderTransactionPhase::Closed,
+        );
+        let PaneRenderTransactionPhase::Preparing {
+            token: active,
+            redirtied,
+        } = phase
+        else {
+            self.transaction_phase = phase;
+            return if matches!(self.transaction_phase, PaneRenderTransactionPhase::Closed) {
+                PaneRenderSettlement::Closed
+            } else {
+                PaneRenderSettlement::StaleOrDuplicate
+            };
+        };
+        if active != token {
+            self.transaction_phase = PaneRenderTransactionPhase::Preparing {
+                token: active,
+                redirtied,
+            };
+            return PaneRenderSettlement::StaleOrDuplicate;
+        }
+
+        self.transaction_phase = PaneRenderTransactionPhase::Idle;
+        self.transactional_dirty = redirtied;
+        if redirtied {
+            PaneRenderSettlement::SettledNoChangeRedirtied
+        } else {
+            PaneRenderSettlement::SettledNoChangeClean
+        }
+    }
+
+    fn install_prepared(
+        &mut self,
+        snapshot: &PaneRenderBeginSnapshot,
+        baseline: PaneRenderBaseline,
+        redirtied_after_snapshot: bool,
+    ) -> Result<(), PaneRenderPreparationError> {
+        let phase = std::mem::replace(
+            &mut self.transaction_phase,
+            PaneRenderTransactionPhase::Closed,
+        );
+        let PaneRenderTransactionPhase::Preparing { token, redirtied } = phase else {
+            self.transaction_phase = phase;
+            return Err(PaneRenderPreparationError::StaleAttempt);
+        };
+        if token != snapshot.token || self.baseline != snapshot.baseline {
+            self.transaction_phase =
+                PaneRenderTransactionPhase::Preparing { token, redirtied };
+            return Err(PaneRenderPreparationError::StaleAttempt);
+        }
+        if self
+            .notifications
+            .get(..snapshot.covered_notifications.len())
+            != Some(snapshot.covered_notifications.as_slice())
+        {
+            self.transaction_phase = PaneRenderTransactionPhase::Closed;
+            self.transactional_dirty = true;
+            return Err(PaneRenderPreparationError::NotificationPrefixChanged);
+        }
+
+        let redirtied = redirtied
+            || redirtied_after_snapshot
+            || snapshot.has_uncovered_notifications
+            || self.notifications.len() > snapshot.covered_notifications.len();
+        self.transaction_phase = PaneRenderTransactionPhase::InFlight {
+            pending: Box::new(PendingPaneRenderCommit {
+                token,
+                baseline,
+                covered_notifications: snapshot.covered_notifications.clone(),
+            }),
+            redirtied,
+        };
+        self.transactional_dirty = redirtied;
+        Ok(())
+    }
+
+    fn acknowledge_prepared(
+        &mut self,
+        token: PaneRenderAttemptToken,
+    ) -> PaneRenderSettlement {
+        let phase = std::mem::replace(
+            &mut self.transaction_phase,
+            PaneRenderTransactionPhase::Closed,
+        );
+        let PaneRenderTransactionPhase::InFlight {
+            pending,
+            redirtied,
+        } = phase
+        else {
+            self.transaction_phase = phase;
+            return if matches!(self.transaction_phase, PaneRenderTransactionPhase::Closed) {
+                PaneRenderSettlement::Closed
+            } else {
+                PaneRenderSettlement::StaleOrDuplicate
+            };
+        };
+        if pending.token != token {
+            self.transaction_phase =
+                PaneRenderTransactionPhase::InFlight { pending, redirtied };
+            return PaneRenderSettlement::StaleOrDuplicate;
+        }
+        if self
+            .notifications
+            .get(..pending.covered_notifications.len())
+            != Some(pending.covered_notifications.as_slice())
+        {
+            self.transaction_phase = PaneRenderTransactionPhase::Closed;
+            self.transactional_dirty = true;
+            return PaneRenderSettlement::FailedClosed;
+        }
+
+        let PendingPaneRenderCommit {
+            baseline,
+            covered_notifications,
+            ..
+        } = *pending;
+        self.notifications.drain(..covered_notifications.len());
+        self.baseline = baseline;
+        self.transaction_phase = PaneRenderTransactionPhase::Idle;
+        self.transactional_dirty = redirtied || !self.notifications.is_empty();
+        if self.transactional_dirty {
+            PaneRenderSettlement::AcknowledgedRedirtied
+        } else {
+            PaneRenderSettlement::AcknowledgedClean
+        }
+    }
+
+    fn retry_prepared(&mut self, token: PaneRenderAttemptToken) -> PaneRenderSettlement {
+        let matches = matches!(
+            &self.transaction_phase,
+            PaneRenderTransactionPhase::InFlight { pending, .. } if pending.token == token
+        );
+        if !matches {
+            return if matches!(self.transaction_phase, PaneRenderTransactionPhase::Closed) {
+                PaneRenderSettlement::Closed
+            } else {
+                PaneRenderSettlement::StaleOrDuplicate
+            };
+        }
+        self.transaction_phase = PaneRenderTransactionPhase::Idle;
+        self.transactional_dirty = true;
+        PaneRenderSettlement::Retried
+    }
+
+    fn close_transaction(&mut self) {
+        self.transaction_phase = PaneRenderTransactionPhase::Closed;
+        self.transactional_dirty = true;
+    }
+}
+
+#[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+enum PaneRenderPreparationOutcome {
+    NoChange(PaneRenderSettlement),
+    Prepared(Box<PreparedPaneRender>),
+}
+
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+struct PaneRenderPreparation {
+    state: Arc<Mutex<PerPane>>,
+    snapshot: PaneRenderBeginSnapshot,
+    force_with_input_serial: Option<InputSerial>,
+    armed: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+struct PreparedPaneRender {
+    state: Arc<Mutex<PerPane>>,
+    token: PaneRenderAttemptToken,
+    surface: GetPaneRenderChangesResponse,
+    semantic_zones: GetSemanticZonesResponse,
+    palette: Option<SetPalette>,
+    alerts: Vec<NotifyAlert>,
+    armed: bool,
+}
+
+impl std::fmt::Debug for PreparedPaneRender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedPaneRender")
+            .field("token", &self.token)
+            .field("surface", &self.surface)
+            .field("semantic_zones", &self.semantic_zones)
+            .field("palette", &self.palette)
+            .field("alerts", &self.alerts)
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+fn normalize_prepared_alerts(
+    pane_id: PaneId,
+    notifications: &[Alert],
+) -> (bool, Vec<NotifyAlert>) {
+    let mut palette_changed = false;
+    let mut unseen_output = false;
+    let mut latest_progress = None;
+    let mut alerts = Vec::with_capacity(notifications.len());
+
+    for alert in notifications {
+        match alert {
+            Alert::PaletteChanged => palette_changed = true,
+            Alert::OutputSinceFocusLost => unseen_output = true,
+            Alert::Progress(progress) => latest_progress = Some(progress.clone()),
+            event => alerts.push(NotifyAlert {
+                pane_id,
+                alert: event.clone(),
+            }),
+        }
+    }
+    if unseen_output {
+        alerts.push(NotifyAlert {
+            pane_id,
+            alert: Alert::OutputSinceFocusLost,
+        });
+    }
+    if let Some(progress) = latest_progress {
+        alerts.push(NotifyAlert {
+            pane_id,
+            alert: Alert::Progress(progress),
+        });
+    }
+    debug_assert!(alerts.len() <= codec::MAX_RENDER_APPLICATION_ALERTS);
+    (palette_changed, alerts)
+}
+
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+fn begin_transactional_pane_render(
+    state: Arc<Mutex<PerPane>>,
+    pane_id: PaneId,
+    force_with_input_serial: Option<InputSerial>,
+) -> Result<PaneRenderPreparation, PaneRenderPreparationError> {
+    let snapshot = state
+        .lock()
+        .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
+        .begin_transactional_preparation(pane_id, force_with_input_serial)?;
+    Ok(PaneRenderPreparation {
+        state,
+        snapshot,
+        force_with_input_serial,
+        armed: true,
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+impl PaneRenderPreparation {
+    fn token(&self) -> PaneRenderAttemptToken {
+        self.snapshot.token
+    }
+
+    fn prepare(
+        mut self,
+        pane: &CurrentPane<'_>,
+    ) -> Result<PaneRenderPreparationOutcome, PaneRenderPreparationError> {
+        let pane_id = pane.pane_id();
+        if pane_id != self.snapshot.token.pane_id {
+            return Err(PaneRenderPreparationError::StaleAttempt);
+        }
+
+        let (palette_alerted, alerts) =
+            normalize_prepared_alerts(pane_id, &self.snapshot.covered_notifications);
+        let config_before = config::configuration();
+        let config_generation = config_before.generation();
+        let needs_palette = palette_alerted
+            || !self.snapshot.baseline.sent_initial_palette
+            || self.snapshot.baseline.config_generation != config_generation;
+        let force_for_atomic_effects = needs_palette || !alerts.is_empty();
+        let surface = self.snapshot.baseline.prepare_surface_changes(
+            pane,
+            self.force_with_input_serial,
+            force_for_atomic_effects,
+        );
+
+        let (source_start, source_end) = match &surface {
+            SurfacePreparation::NoChange {
+                source_start,
+                source_end,
+            } => (*source_start, *source_end),
+            SurfacePreparation::Changes(prepared) => {
+                (prepared.source_start, prepared.source_end)
+            }
+        };
+        if source_start == SequenceNo::MAX || source_end == SequenceNo::MAX {
+            let outcome = self
+                .state
+                .lock()
+                .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
+                .close_exhausted_preparation(self.snapshot.token);
+            self.armed = false;
+            debug_assert!(matches!(
+                outcome,
+                PaneRenderSettlement::Closed | PaneRenderSettlement::StaleOrDuplicate
+            ));
+            return Err(PaneRenderPreparationError::TerminalSequenceExhausted);
+        }
+        if source_start != source_end {
+            return Err(PaneRenderPreparationError::SourceChanged);
+        }
+
+        let SurfacePreparation::Changes(mut surface) = surface else {
+            let outcome = self
+                .state
+                .lock()
+                .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
+                .settle_no_change(self.snapshot.token);
+            self.armed = false;
+            return Ok(PaneRenderPreparationOutcome::NoChange(outcome));
+        };
+
+        let (zones, zone_texts, last_exit_code) = pane.semantic_snapshot().map_err(|err| {
+            log::warn!(
+                "failed to prepare transactional semantic snapshot for pane {pane_id}: {err:#}"
+            );
+            PaneRenderPreparationError::SnapshotFailed
+        })?;
+        let semantic_zones = GetSemanticZonesResponse {
+            pane_id,
+            zones,
+            zone_texts,
+            last_exit_code,
+        };
+        let palette = needs_palette.then(|| SetPalette {
+            pane_id,
+            palette: pane.palette(),
+        });
+        let source_after_effects = pane.get_current_seqno();
+        if source_after_effects != source_start {
+            return Err(PaneRenderPreparationError::SourceChanged);
+        }
+
+        let config_after_generation = config::configuration().generation();
+        let redirtied_after_snapshot = config_after_generation != config_generation;
+        if needs_palette {
+            surface.baseline.sent_initial_palette = true;
+            surface.baseline.config_generation = config_generation;
+        }
+        if let Some(input_epoch) = self.snapshot.token.input_epoch {
+            surface.baseline.committed_input_epoch = input_epoch;
+        }
+
+        let PreparedSurfaceChanges {
+            response, baseline, ..
+        } = *surface;
+        self.state
+            .lock()
+            .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
+            .install_prepared(
+                &self.snapshot,
+                baseline,
+                redirtied_after_snapshot,
+            )?;
+        self.armed = false;
+        Ok(PaneRenderPreparationOutcome::Prepared(
+            Box::new(PreparedPaneRender {
+                state: Arc::clone(&self.state),
+                token: self.snapshot.token,
+                surface: response,
+                semantic_zones,
+                palette,
+                alerts,
+                armed: true,
+            }),
+        ))
+    }
+}
+
+impl Drop for PaneRenderPreparation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.state.lock() {
+            Ok(mut state) => {
+                let _ = state.cancel_preparation(self.snapshot.token);
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to recover cancelled pane render preparation after lock poison: {err}"
+                );
+            }
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "live ownership transfers to the delivery coordinator under ft-interactive-systems-performance-4tenz.5.5.10"
+)]
+impl PreparedPaneRender {
+    fn token(&self) -> PaneRenderAttemptToken {
+        self.token
+    }
+
+    fn acknowledge(mut self) -> PaneRenderSettlement {
+        let outcome = match self.state.lock() {
+            Ok(mut state) => state.acknowledge_prepared(self.token),
+            Err(_) => PaneRenderSettlement::FailedClosed,
+        };
+        self.armed = false;
+        outcome
+    }
+
+    fn nack(mut self) -> PaneRenderSettlement {
+        let outcome = match self.state.lock() {
+            Ok(mut state) => state.retry_prepared(self.token),
+            Err(_) => PaneRenderSettlement::FailedClosed,
+        };
+        self.armed = false;
+        outcome
+    }
+}
+
+impl Drop for PreparedPaneRender {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.state.lock() {
+            Ok(mut state) => {
+                let _ = state.retry_prepared(self.token);
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to recover abandoned pane render application after lock poison: {err}"
+                );
+            }
+        }
     }
 }
 
@@ -438,19 +1213,19 @@ fn maybe_push_pane_changes(
             .lock()
             .map_err(|err| anyhow!("per-pane state lock poisoned: {err}"))?;
         let config = config::configuration();
-        if per_pane.config_generation != config.generation() {
-            per_pane.config_generation = config.generation();
+        if per_pane.baseline.config_generation != config.generation() {
+            per_pane.baseline.config_generation = config.generation();
             // If the config changed, it may have changed colors
             // in the palette that we need to push down, so we
             // synthesize a palette change notification to let
             // the client know
             per_pane.notifications.push(Alert::PaletteChanged);
-            per_pane.sent_initial_palette = true;
+            per_pane.baseline.sent_initial_palette = true;
         }
 
-        if !per_pane.sent_initial_palette {
+        if !per_pane.baseline.sent_initial_palette {
             per_pane.notifications.push(Alert::PaletteChanged);
-            per_pane.sent_initial_palette = true;
+            per_pane.baseline.sent_initial_palette = true;
         }
         std::mem::take(&mut per_pane.notifications)
     };
@@ -2228,6 +3003,7 @@ mod tests {
     use std::thread;
     use termwiz::surface::Line;
     use wezterm_term::color::ColorPalette;
+    use wezterm_term::terminal::Progress;
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
 
     struct ScopedMux(Option<Arc<Mux>>);
@@ -2273,6 +3049,7 @@ mod tests {
         state: Mutex<FakePaneState>,
         changed_lines: Mutex<RangeSet<StableRowIndex>>,
         callback_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+        seqno_on_dimensions: Option<SequenceNo>,
         // Writer sink for the Pane::writer() trait obligation. FakePane
         // has no PTY; bytes written here are discarded. Keeping a real
         // writable buffer behind a parking_lot mutex (rather than
@@ -2296,6 +3073,7 @@ mod tests {
             Self {
                 pane_id,
                 callback_probe: None,
+                seqno_on_dimensions: None,
                 writer_sink: ParkingMutex::new(std::io::sink()),
                 mux_registration: Arc::new(mux::PaneRegistrationSlot::default()),
                 changed_lines: Mutex::new(RangeSet::new()),
@@ -2406,7 +3184,11 @@ mod tests {
             if let Some(probe) = &self.callback_probe {
                 probe();
             }
-            self.state.lock().unwrap().dimensions
+            let mut state = self.state.lock().unwrap();
+            if let Some(seqno) = self.seqno_on_dimensions {
+                state.seqno = seqno;
+            }
+            state.dimensions
         }
 
         fn get_tiered_scrollback_status(&self) -> Option<PaneTieredScrollbackStatus> {
@@ -2529,6 +3311,30 @@ mod tests {
         (mux, registration)
     }
 
+    fn prepare_transactional_for_registration(
+        state: Arc<Mutex<PerPane>>,
+        registration: &PaneRegistrationHandle,
+        force_with_input_serial: Option<InputSerial>,
+    ) -> Result<PaneRenderPreparationOutcome, PaneRenderPreparationError> {
+        let preparation = begin_transactional_pane_render(
+            state,
+            registration.pane_id(),
+            force_with_input_serial,
+        )?;
+        registration
+            .try_with_current(move |pane| preparation.prepare(&pane))
+            .expect("test pane registration remains current")
+    }
+
+    fn expect_prepared(outcome: PaneRenderPreparationOutcome) -> PreparedPaneRender {
+        match outcome {
+            PaneRenderPreparationOutcome::Prepared(prepared) => *prepared,
+            PaneRenderPreparationOutcome::NoChange(settlement) => {
+                panic!("expected prepared render application, got {settlement:?}")
+            }
+        }
+    }
+
     /// Extract the single response PDU from the captured list.
     fn take_response(captured: &Arc<Mutex<Vec<DecodedPdu>>>) -> DecodedPdu {
         let mut v = captured.lock().unwrap();
@@ -2623,12 +3429,12 @@ mod tests {
         let mut handler = SessionHandler::new(sender);
         let pp = handler.per_pane(1);
         let guard = pp.lock().unwrap();
-        assert_eq!(guard.seqno, 0);
-        assert_eq!(guard.title, "");
-        assert!(!guard.mouse_grabbed);
-        assert!(!guard.sent_initial_palette);
+        assert_eq!(guard.baseline.seqno, 0);
+        assert_eq!(guard.baseline.title, "");
+        assert!(!guard.baseline.mouse_grabbed);
+        assert!(!guard.baseline.sent_initial_palette);
         assert!(guard.notifications.is_empty());
-        assert!(guard.working_dir.is_none());
+        assert!(guard.baseline.working_dir.is_none());
     }
 
     #[test]
@@ -2731,6 +3537,62 @@ mod tests {
         assert!(
             Arc::ptr_eq(&replacement_state, &retained_state),
             "stale exact and raw removals must not clear replacement state"
+        );
+    }
+
+    #[test]
+    fn old_registration_candidate_ack_cannot_commit_replacement_state() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let mux = Arc::new(Mux::new(None));
+        let pane_id = 7_002;
+        let original: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&original).expect("register original pane");
+        let (sender, _captured) = capturing_sender();
+        let mut handler =
+            SessionHandler::new_for_session(sender, SessionOwner::new(Arc::clone(&mux)));
+        let original_registration = handler
+            .owner
+            .authority()
+            .capture_current_pane(pane_id)
+            .expect("capture original registration");
+        let original_state = handler.per_pane_for_registration(&original_registration);
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&original_state),
+                &original_registration,
+                None,
+            )
+            .expect("prepare original registration candidate"),
+        );
+
+        assert!(original_registration.retire_if_current());
+        let replacement: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+        mux.add_pane(&replacement)
+            .expect("register replacement pane");
+        let replacement_registration = handler
+            .owner
+            .authority()
+            .capture_current_pane(pane_id)
+            .expect("capture replacement registration");
+        let replacement_state = handler.per_pane_for_registration(&replacement_registration);
+
+        assert!(
+            !Arc::ptr_eq(&original_state, &replacement_state),
+            "replacement registration must own an independent transaction state"
+        );
+        assert_eq!(
+            prepared.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+        assert_eq!(
+            original_state.lock().unwrap().baseline.seqno,
+            11,
+            "the exact original transaction may commit only its own state"
+        );
+        assert_eq!(
+            replacement_state.lock().unwrap().baseline,
+            PaneRenderBaseline::default(),
+            "an old registration ACK must not mutate same-numeric-id replacement state"
         );
     }
 
@@ -5592,8 +6454,8 @@ mod tests {
         let pp2 = handler.per_pane(20);
 
         // Modify one, verify the other is unaffected
-        pp1.lock().unwrap().seqno = 42;
-        assert_eq!(pp2.lock().unwrap().seqno, 0);
+        pp1.lock().unwrap().baseline.seqno = 42;
+        assert_eq!(pp2.lock().unwrap().baseline.seqno, 0);
     }
 
     #[test]
@@ -5628,6 +6490,471 @@ mod tests {
     }
 
     #[test]
+    fn transactional_render_prepares_without_lock_and_commits_only_on_exact_ack() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane
+            .lock()
+            .unwrap()
+            .push_notification(Alert::Bell);
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_callback_probe(77, {
+            let per_pane = Arc::clone(&per_pane);
+            let callback_count = Arc::clone(&callback_count);
+            Arc::new(move || {
+                let mut state = per_pane
+                    .try_lock()
+                    .expect("pane callback must run without the per-pane state lock");
+                assert_eq!(state.baseline.seqno, 0);
+                assert_eq!(state.notifications, vec![Alert::Bell]);
+                state.mark_transactional_dirty();
+                callback_count.fetch_add(1, Ordering::Relaxed);
+            })
+        }));
+        let (_mux, registration) = register_test_pane(&pane);
+
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .expect("transactional render preparation"),
+        );
+        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+        assert_eq!(prepared.surface.seqno, 11);
+        assert_eq!(prepared.surface.title, "tiered-pane");
+        assert_eq!(prepared.surface.cursor_position.x, 4);
+        assert_eq!(prepared.surface.dimensions.cols, 80);
+        assert!(prepared.semantic_zones.zones.is_empty());
+        assert!(prepared.palette.is_some());
+        assert_eq!(prepared.alerts.len(), 1);
+
+        {
+            let state = per_pane.lock().unwrap();
+            assert_eq!(
+                state.baseline,
+                PaneRenderBaseline::default(),
+                "preparation must not advance the authoritative baseline"
+            );
+            assert_eq!(
+                state.notifications,
+                vec![Alert::Bell],
+                "preparation must not drain application effects"
+            );
+        }
+
+        assert_eq!(
+            prepared.acknowledge(),
+            PaneRenderSettlement::AcknowledgedRedirtied
+        );
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.seqno, 11);
+        assert_eq!(state.baseline.title, "tiered-pane");
+        assert!(state.baseline.sent_initial_palette);
+        assert!(state.notifications.is_empty());
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn transactional_render_rejects_wrong_and_duplicate_ack_and_drop_retries() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap(),
+        );
+        let token = prepared.token();
+        let wrong = PaneRenderAttemptToken {
+            pane_id: token.pane_id + 1,
+            ..token
+        };
+        assert_eq!(
+            per_pane.lock().unwrap().acknowledge_prepared(wrong),
+            PaneRenderSettlement::StaleOrDuplicate
+        );
+        assert_eq!(per_pane.lock().unwrap().baseline.seqno, 0);
+        assert_eq!(
+            prepared.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+        assert_eq!(
+            per_pane.lock().unwrap().acknowledge_prepared(token),
+            PaneRenderSettlement::StaleOrDuplicate
+        );
+
+        {
+            let mut pane_state = pane.state.lock().unwrap();
+            pane_state.title = "candidate-must-not-commit".to_string();
+            pane_state.seqno = 12;
+        }
+        per_pane.lock().unwrap().mark_transactional_dirty();
+        let abandoned = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap(),
+        );
+        let abandoned_token = abandoned.token();
+        assert_eq!(
+            per_pane.lock().unwrap().baseline.title,
+            "tiered-pane",
+            "an in-flight candidate is not yet authoritative"
+        );
+        drop(abandoned);
+
+        let mut state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline.title, "tiered-pane");
+        assert!(state.transactional_dirty);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Idle
+        ));
+        assert_eq!(
+            state.acknowledge_prepared(abandoned_token),
+            PaneRenderSettlement::StaleOrDuplicate
+        );
+    }
+
+    #[test]
+    fn transactional_alerts_are_exact_events_or_coalesced_state_until_ack() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        {
+            let mut state = per_pane.lock().unwrap();
+            for alert in [
+                Alert::Bell,
+                Alert::OutputSinceFocusLost,
+                Alert::OutputSinceFocusLost,
+                Alert::Progress(Progress::Percentage(25)),
+                Alert::Progress(Progress::Percentage(50)),
+                Alert::PaletteChanged,
+            ] {
+                state.push_notification(alert);
+            }
+        }
+
+        let first = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(first.palette.is_some());
+        assert_eq!(
+            first
+                .alerts
+                .iter()
+                .filter(|alert| alert.alert == Alert::Bell)
+                .count(),
+            1
+        );
+        assert_eq!(
+            first
+                .alerts
+                .iter()
+                .filter(|alert| alert.alert == Alert::OutputSinceFocusLost)
+                .count(),
+            1
+        );
+        assert!(first.alerts.iter().any(|alert| {
+            alert.alert == Alert::Progress(Progress::Percentage(50))
+        }));
+        assert!(!first.alerts.iter().any(|alert| {
+            alert.alert == Alert::Progress(Progress::Percentage(25))
+        }));
+        assert_eq!(first.nack(), PaneRenderSettlement::Retried);
+        assert_eq!(per_pane.lock().unwrap().notifications.len(), 6);
+
+        let retry = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap(),
+        );
+        per_pane
+            .lock()
+            .unwrap()
+            .push_notification(Alert::Bell);
+        assert_eq!(
+            retry.acknowledge(),
+            PaneRenderSettlement::AcknowledgedRedirtied
+        );
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.notifications, vec![Alert::Bell]);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn transactional_alert_batch_is_bounded_and_retains_unsent_suffix() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        {
+            let mut state = per_pane.lock().unwrap();
+            for _ in 0..=codec::MAX_RENDER_APPLICATION_ALERTS {
+                state.push_notification(Alert::Bell);
+            }
+        }
+
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            prepared.alerts.len(),
+            codec::MAX_RENDER_APPLICATION_ALERTS
+        );
+        assert_eq!(
+            prepared.acknowledge(),
+            PaneRenderSettlement::AcknowledgedRedirtied
+        );
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.notifications, vec![Alert::Bell]);
+        assert!(state.transactional_dirty);
+    }
+
+    #[test]
+    fn equal_input_serials_receive_distinct_internal_epochs() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let serial = InputSerial::empty();
+
+        let first = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                Some(serial),
+            )
+            .unwrap(),
+        );
+        let first_token = first.token();
+        assert_eq!(first.surface.input_serial, Some(serial));
+        assert_eq!(
+            first.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+
+        per_pane.lock().unwrap().mark_transactional_dirty();
+        let second = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                Some(serial),
+            )
+            .unwrap(),
+        );
+        let second_token = second.token();
+        assert_eq!(second.surface.input_serial, Some(serial));
+        assert_ne!(first_token, second_token);
+        assert_eq!(first_token.input_epoch, Some(1));
+        assert_eq!(second_token.input_epoch, Some(2));
+        assert_eq!(
+            second.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+        assert_eq!(per_pane.lock().unwrap().baseline.committed_input_epoch, 2);
+    }
+
+    #[test]
+    fn no_change_settlement_keeps_committed_sequence_baseline() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        let initial = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            initial.acknowledge(),
+            PaneRenderSettlement::AcknowledgedClean
+        );
+        pane.state.lock().unwrap().seqno = 12;
+        per_pane.lock().unwrap().mark_transactional_dirty();
+
+        let outcome = prepare_transactional_for_registration(
+            Arc::clone(&per_pane),
+            &registration,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            PaneRenderPreparationOutcome::NoChange(
+                PaneRenderSettlement::SettledNoChangeClean
+            )
+        ));
+        let state = per_pane.lock().unwrap();
+        assert_eq!(
+            state.baseline.seqno, 11,
+            "a pure no-effect settlement cannot advance the client baseline"
+        );
+        assert!(!state.transactional_dirty);
+    }
+
+    #[test]
+    fn source_change_and_preparation_drop_restore_dirty_obligation() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let mut fake = FakePane::new(None);
+        fake.seqno_on_dimensions = Some(12);
+        let pane: Arc<dyn Pane> = Arc::new(fake);
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        assert_eq!(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap_err(),
+            PaneRenderPreparationError::SourceChanged
+        );
+        let state = per_pane.lock().unwrap();
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+        assert!(state.transactional_dirty);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Idle
+        ));
+    }
+
+    #[test]
+    fn terminal_sequence_saturation_closes_before_ambiguous_identity() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane = Arc::new(FakePane::new(None));
+        pane.state.lock().unwrap().seqno = SequenceNo::MAX;
+        let pane_dyn: Arc<dyn Pane> = pane;
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+
+        assert_eq!(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap_err(),
+            PaneRenderPreparationError::TerminalSequenceExhausted
+        );
+        assert!(matches!(
+            per_pane.lock().unwrap().transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert!(matches!(
+            begin_transactional_pane_render(per_pane, registration.pane_id(), None),
+            Err(PaneRenderPreparationError::Closed)
+        ));
+    }
+
+    #[test]
+    fn transactional_identity_exhaustion_and_competing_preparer_fail_closed() {
+        let mut attempt_exhausted = PerPane {
+            next_render_attempt: Some(u64::MAX),
+            ..PerPane::default()
+        };
+        assert!(matches!(
+            attempt_exhausted.begin_transactional_preparation(1, None),
+            Err(PaneRenderPreparationError::AttemptIdentityExhausted)
+        ));
+        assert!(matches!(
+            attempt_exhausted.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+
+        let mut input_exhausted = PerPane {
+            next_input_epoch: Some(u64::MAX),
+            ..PerPane::default()
+        };
+        assert!(matches!(
+            input_exhausted.begin_transactional_preparation(
+                1,
+                Some(InputSerial::empty())
+            ),
+            Err(PaneRenderPreparationError::InputIdentityExhausted)
+        ));
+        assert!(matches!(
+            input_exhausted.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+
+        let state = Arc::new(Mutex::new(PerPane::default()));
+        let first = begin_transactional_pane_render(Arc::clone(&state), 1, None)
+            .expect("first preparer owns the pane");
+        assert!(matches!(
+            begin_transactional_pane_render(Arc::clone(&state), 1, None),
+            Err(PaneRenderPreparationError::Busy)
+        ));
+        drop(first);
+        let state = state.lock().unwrap();
+        assert!(state.transactional_dirty);
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Idle
+        ));
+    }
+
+    #[test]
+    fn pane_close_invalidates_in_flight_transaction_without_resurrection() {
+        let _global = crate::GLOBAL_STATE_TEST_LOCK.lock().unwrap();
+        let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
+        let (_mux, registration) = register_test_pane(&pane);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let prepared = expect_prepared(
+            prepare_transactional_for_registration(
+                Arc::clone(&per_pane),
+                &registration,
+                None,
+            )
+            .unwrap(),
+        );
+        let token = prepared.token();
+        per_pane.lock().unwrap().close_transaction();
+        drop(prepared);
+
+        let mut state = per_pane.lock().unwrap();
+        assert!(matches!(
+            state.transaction_phase,
+            PaneRenderTransactionPhase::Closed
+        ));
+        assert_eq!(
+            state.acknowledge_prepared(token),
+            PaneRenderSettlement::Closed
+        );
+        assert_eq!(state.baseline, PaneRenderBaseline::default());
+    }
+
+    #[test]
     fn compute_changes_includes_initial_tiered_scrollback_status_snapshot() {
         let pane = Arc::new(FakePane::new(Some(sample_tiered_scrollback_status(12))));
         let pane_dyn: Arc<dyn Pane> = pane;
@@ -5644,7 +6971,7 @@ mod tests {
             Some(sample_tiered_scrollback_status(12))
         );
         assert_eq!(
-            per_pane.tiered_scrollback_status,
+            per_pane.baseline.tiered_scrollback_status,
             Some(sample_tiered_scrollback_status(12))
         );
     }
@@ -5680,7 +7007,34 @@ mod tests {
 
         assert!(response.dirty_lines.is_empty());
         assert_eq!(response.tiered_scrollback_status, None);
-        assert_eq!(per_pane.tiered_scrollback_status, None);
+        assert_eq!(per_pane.baseline.tiered_scrollback_status, None);
+    }
+
+    #[test]
+    fn legacy_compute_changes_advances_no_effect_sequence_baseline() {
+        let pane = Arc::new(FakePane::new(None));
+        let pane_dyn: Arc<dyn Pane> = pane.clone();
+        let (_mux, registration) = register_test_pane(&pane_dyn);
+        let mut per_pane = PerPane::default();
+
+        registration
+            .try_with_current(|current| per_pane.compute_changes(&current, None))
+            .expect("test pane registration remains current")
+            .expect("initial pane snapshot should produce a response");
+        assert_eq!(per_pane.baseline.seqno, 11);
+
+        pane.state.lock().unwrap().seqno = 12;
+        assert!(
+            registration
+                .try_with_current(|current| per_pane.compute_changes(&current, None))
+                .expect("test pane registration remains current")
+                .is_none(),
+            "a sequence-only change has no legacy wire effect"
+        );
+        assert_eq!(
+            per_pane.baseline.seqno, 12,
+            "legacy delivery must not repeatedly rescan a settled no-effect interval"
+        );
     }
 
     #[test]
@@ -5713,7 +7067,7 @@ mod tests {
             .expect("alt-screen transition should produce a response");
 
         assert!(response.alt_screen_active);
-        assert!(per_pane.alt_screen_active);
+        assert!(per_pane.baseline.alt_screen_active);
     }
 
     #[test]
