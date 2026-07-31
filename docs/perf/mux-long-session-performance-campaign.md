@@ -356,6 +356,13 @@ Existing frozen release SLOs remain in force:
 Those numbers are not changed here. The campaign adds the following admission
 and diagnostic contracts:
 
+The current classified-input headless renderer harness is only a
+`proxy_only` regression substrate. Its v2 evidence contract must never set a
+physical target verdict, and the retained v1 macOS result remains negative
+evidence rather than a baseline upgrade. RQ-S2/RQ-S3 admission still requires
+the correlated native-event, mux/PTY, production-window, presentation, and
+display/physical timing path defined by this campaign.
+
 ### Input
 
 - zero key loss, duplication, or reordering;

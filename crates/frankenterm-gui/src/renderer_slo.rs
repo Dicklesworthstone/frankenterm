@@ -5,51 +5,62 @@
 
 pub use frankenterm_core::render_quality::{
     INPUT_TO_PHOTON_CLAIM_ID, INPUT_TO_PHOTON_SCHEMA_VERSION, INPUT_TO_PHOTON_WORKLOAD_CLASS,
-    InputToPhotonEvidence, InputToPhotonStage, InputToPhotonStageTrace, InputToPhotonState,
-    InputToPhotonTrace, MACOS_P95_TARGET_US, MAX_INSTRUMENTATION_OVERHEAD_PCT,
-    RENDERER_SSIM_PARITY_CURRENT_DEGRADATION,
+    InputToPhotonClaimScope, InputToPhotonEvidence, InputToPhotonInputClass, InputToPhotonStage,
+    InputToPhotonStageTrace, InputToPhotonState, InputToPhotonTrace, MACOS_P95_TARGET_US,
+    MAX_INPUT_BYTE_COUNT, MAX_INSTRUMENTATION_OVERHEAD_PCT, RENDERER_SSIM_PARITY_CURRENT_DEGRADATION,
     RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM,
     RENDERER_SSIM_PARITY_DEFAULT_MAX_L_INF, RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM,
     RENDERER_SSIM_PARITY_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_STATUS, WAYLAND_P95_TARGET_US,
-    known_key_trace_from_stage_durations, summarize_input_to_photon_traces,
-    target_p95_us_for_platform, unavailable_evidence,
+    classified_input_proxy_trace_from_stage_durations, summarize_input_to_photon_traces,
+    target_p95_us_for_platform, unavailable_proxy_evidence,
 };
 
 #[cfg(feature = "headless-render")]
 pub mod headless {
-    use super::{InputToPhotonTrace, known_key_trace_from_stage_durations};
+    use super::{
+        InputToPhotonInputClass, InputToPhotonTrace,
+        classified_input_proxy_trace_from_stage_durations,
+    };
     use crate::headless_render::{HeadlessFixtureInput, HeadlessFrame, smoketest_input};
 
-    pub fn known_key_headless_input() -> HeadlessFixtureInput {
+    pub fn classified_input_headless_fixture() -> HeadlessFixtureInput {
         let mut input = smoketest_input(800, 480, 96.0);
         input.lines = vec![
-            "input-to-photon known-key fixture".to_string(),
-            "key=a stage=term_update render=headless".to_string(),
+            "input-to-photon classified-input proxy fixture".to_string(),
+            "input_class=printable_text input_bytes=1 claim_scope=proxy_only".to_string(),
             "deterministic frame flush path".to_string(),
         ];
         input
     }
 
+    /// Converts a completed headless frame into a validated proxy trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the classified input metadata, platform, timing, or
+    /// GPU adapter identity cannot satisfy the proxy evidence contract.
     pub fn trace_from_headless_frame(
         sample_id: u64,
-        key: impl Into<String>,
+        input_class: InputToPhotonInputClass,
+        input_byte_count: u32,
         platform: impl Into<String>,
         frame: &HeadlessFrame,
         instrumentation_overhead_us: u64,
-    ) -> InputToPhotonTrace {
+    ) -> Result<InputToPhotonTrace, String> {
         let render_us = u64::try_from(frame.render_ms)
             .unwrap_or(u64::MAX / 1_000)
             .saturating_mul(1_000)
             .max(1);
         let platform = platform.into();
-        known_key_trace_from_stage_durations(
+        classified_input_proxy_trace_from_stage_durations(
             sample_id,
-            key,
+            input_class,
+            input_byte_count,
             platform,
             [250, 400, 750, 250, render_us],
             instrumentation_overhead_us,
-            Some(frame.render_ms),
-            Some(frame.gpu.adapter_name.clone()),
+            frame.render_ms,
+            frame.gpu.adapter_name.clone(),
         )
     }
 }

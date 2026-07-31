@@ -3,7 +3,9 @@ use frankenterm_core::network_calculus_bound::{
     pipeline_delay_bound,
 };
 use frankenterm_gui::renderer_slo::{
-    InputToPhotonTrace, known_key_trace_from_stage_durations, summarize_input_to_photon_traces,
+    InputToPhotonInputClass, InputToPhotonTrace,
+    classified_input_proxy_trace_from_stage_durations,
+    summarize_input_to_photon_traces,
 };
 
 fn lindley_stages_from_trace(trace: &InputToPhotonTrace) -> Vec<StageModel> {
@@ -24,15 +26,17 @@ fn lindley_stages_from_trace(trace: &InputToPhotonTrace) -> Vec<StageModel> {
 
 #[test]
 fn input_to_photon_empirical_p99_agrees_with_lindley_bound() {
-    let trace = known_key_trace_from_stage_durations(
+    let trace = classified_input_proxy_trace_from_stage_durations(
         0,
-        "a",
+        InputToPhotonInputClass::PrintableText,
+        1,
         "macos",
         [250, 400, 750, 600, 250],
         20,
-        Some(1),
-        Some("deterministic-test-adapter".to_string()),
-    );
+        1,
+        "deterministic-test-adapter",
+    )
+    .expect("valid proxy trace");
     let evidence = summarize_input_to_photon_traces("macos", std::slice::from_ref(&trace));
     let empirical_p99_ms = evidence.p99_us.expect("p99 present") as f64 / 1_000.0;
 

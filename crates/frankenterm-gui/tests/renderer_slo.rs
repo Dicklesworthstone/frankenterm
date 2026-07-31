@@ -1,50 +1,56 @@
 use frankenterm_gui::renderer_slo::{
-    InputToPhotonStage, InputToPhotonState, MACOS_P95_TARGET_US,
-    known_key_trace_from_stage_durations, summarize_input_to_photon_traces,
-    target_p95_us_for_platform, unavailable_evidence,
+    InputToPhotonInputClass, InputToPhotonStage, InputToPhotonState, MACOS_P95_TARGET_US,
+    classified_input_proxy_trace_from_stage_durations, summarize_input_to_photon_traces,
+    target_p95_us_for_platform, unavailable_proxy_evidence,
 };
 
 #[test]
-fn input_to_photon_summary_reports_percentiles_and_target() {
+fn input_to_photon_proxy_summary_reports_percentiles_without_target_verdict() {
     let traces = [
-        known_key_trace_from_stage_durations(
+        classified_input_proxy_trace_from_stage_durations(
             0,
-            "a",
+            InputToPhotonInputClass::PrintableText,
+            1,
             "macos",
             [100, 200, 300, 400, 100],
             20,
-            None,
-            None,
-        ),
-        known_key_trace_from_stage_durations(
             1,
-            "a",
+            "deterministic-test-adapter",
+        )
+        .expect("valid proxy trace"),
+        classified_input_proxy_trace_from_stage_durations(
+            1,
+            InputToPhotonInputClass::PrintableText,
+            1,
             "macos",
             [200, 300, 400, 500, 200],
             25,
-            None,
-            None,
-        ),
-        known_key_trace_from_stage_durations(
+            1,
+            "deterministic-test-adapter",
+        )
+        .expect("valid proxy trace"),
+        classified_input_proxy_trace_from_stage_durations(
             2,
-            "a",
+            InputToPhotonInputClass::PrintableText,
+            1,
             "macos",
             [300, 400, 500, 600, 300],
             30,
-            None,
-            None,
-        ),
+            1,
+            "deterministic-test-adapter",
+        )
+        .expect("valid proxy trace"),
     ];
 
     let evidence = summarize_input_to_photon_traces("macos", &traces);
 
     assert_eq!(evidence.state, InputToPhotonState::Measured);
     assert_eq!(evidence.sample_count, 3);
-    assert_eq!(evidence.target_p95_us, MACOS_P95_TARGET_US);
+    assert_eq!(evidence.target_p95_us, Some(MACOS_P95_TARGET_US));
     assert_eq!(evidence.p50_us, Some(1600));
     assert_eq!(evidence.p95_us, Some(2100));
     assert_eq!(evidence.p99_us, Some(2100));
-    assert_eq!(evidence.within_target, Some(true));
+    assert_eq!(evidence.within_target, None);
     assert!(
         evidence
             .stage_breakdown_p50
@@ -54,15 +60,17 @@ fn input_to_photon_summary_reports_percentiles_and_target() {
 
 #[test]
 fn excessive_instrumentation_overhead_degrades_the_evidence_state() {
-    let trace = known_key_trace_from_stage_durations(
+    let trace = classified_input_proxy_trace_from_stage_durations(
         0,
-        "a",
+        InputToPhotonInputClass::PrintableText,
+        1,
         "linux",
         [100, 100, 100, 100, 100],
         100,
-        None,
-        None,
-    );
+        1,
+        "deterministic-test-adapter",
+    )
+    .expect("valid proxy trace");
 
     let evidence = summarize_input_to_photon_traces("linux", &[trace]);
 
@@ -81,12 +89,8 @@ fn excessive_instrumentation_overhead_degrades_the_evidence_state() {
 }
 
 #[test]
-fn unavailable_evidence_does_not_claim_a_target_result() {
-    let evidence = unavailable_evidence(
-        "linux",
-        InputToPhotonState::PhotonDetectionUnavailable,
-        "no GPU access on runner",
-    );
+fn unavailable_proxy_evidence_does_not_claim_a_target_result() {
+    let evidence = unavailable_proxy_evidence("linux", "no GPU access on runner");
 
     assert_eq!(evidence.sample_count, 0);
     assert_eq!(evidence.p95_us, None);
@@ -140,7 +144,15 @@ fn headless_trace_preserves_measured_present_duration() {
         multi_monitor: HeadlessMultiMonitorTelemetry::default(),
     };
 
-    let trace = trace_from_headless_frame(7, "a", "macos", &frame, 10);
+    let trace = trace_from_headless_frame(
+        7,
+        InputToPhotonInputClass::PrintableText,
+        1,
+        "macos",
+        &frame,
+        10,
+    )
+    .expect("headless frame must produce a valid proxy trace");
     let render_submit = trace
         .stages
         .iter()
@@ -159,9 +171,9 @@ fn headless_trace_preserves_measured_present_duration() {
 
 #[test]
 fn target_mapping_preserves_platform_specific_slo() {
-    assert_eq!(target_p95_us_for_platform("macos"), 16_000);
-    assert_eq!(target_p95_us_for_platform("linux"), 20_000);
-    assert_eq!(target_p95_us_for_platform("freebsd"), 20_000);
+    assert_eq!(target_p95_us_for_platform("macos"), Some(16_000));
+    assert_eq!(target_p95_us_for_platform("linux"), Some(20_000));
+    assert_eq!(target_p95_us_for_platform("freebsd"), None);
     assert_eq!(
         format!("{}", InputToPhotonStage::RenderSubmit),
         "render_submit"

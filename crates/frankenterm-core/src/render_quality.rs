@@ -53,10 +53,11 @@ use serde::{Deserialize, Serialize};
 use crate::live_resize::LiveResizeState;
 pub use frankenterm_core_audit_types::input_to_photon::{
     INPUT_TO_PHOTON_CLAIM_ID, INPUT_TO_PHOTON_SCHEMA_VERSION, INPUT_TO_PHOTON_WORKLOAD_CLASS,
-    InputToPhotonEvidence, InputToPhotonStage, InputToPhotonStageTrace, InputToPhotonState,
-    InputToPhotonTrace, MACOS_P95_TARGET_US, MAX_INSTRUMENTATION_OVERHEAD_PCT,
-    WAYLAND_P95_TARGET_US, known_key_trace_from_stage_durations, summarize_input_to_photon_traces,
-    target_p95_us_for_platform, unavailable_evidence,
+    InputToPhotonClaimScope, InputToPhotonEvidence, InputToPhotonInputClass, InputToPhotonStage,
+    InputToPhotonStageTrace, InputToPhotonState, InputToPhotonTrace, MACOS_P95_TARGET_US,
+    MAX_INPUT_BYTE_COUNT, MAX_INSTRUMENTATION_OVERHEAD_PCT, WAYLAND_P95_TARGET_US,
+    classified_input_proxy_trace_from_stage_durations, summarize_input_to_photon_traces,
+    target_p95_us_for_platform, unavailable_proxy_evidence,
 };
 
 // ============================================================================
@@ -1310,46 +1311,52 @@ mod tests {
     }
 
     #[test]
-    fn input_to_photon_summary_reports_percentiles_and_target() {
+    fn input_to_photon_proxy_summary_reports_percentiles_without_target_verdict() {
         let traces = [
-            known_key_trace_from_stage_durations(
+            classified_input_proxy_trace_from_stage_durations(
                 0,
-                "a",
+                InputToPhotonInputClass::PrintableText,
+                1,
                 "macos",
                 [100, 200, 300, 400, 100],
                 20,
-                None,
-                None,
-            ),
-            known_key_trace_from_stage_durations(
                 1,
-                "a",
+                "deterministic-test-adapter",
+            )
+            .expect("valid proxy trace"),
+            classified_input_proxy_trace_from_stage_durations(
+                1,
+                InputToPhotonInputClass::PrintableText,
+                1,
                 "macos",
                 [200, 300, 400, 500, 200],
                 25,
-                None,
-                None,
-            ),
-            known_key_trace_from_stage_durations(
+                1,
+                "deterministic-test-adapter",
+            )
+            .expect("valid proxy trace"),
+            classified_input_proxy_trace_from_stage_durations(
                 2,
-                "a",
+                InputToPhotonInputClass::PrintableText,
+                1,
                 "macos",
                 [300, 400, 500, 600, 300],
                 30,
-                None,
-                None,
-            ),
+                1,
+                "deterministic-test-adapter",
+            )
+            .expect("valid proxy trace"),
         ];
 
         let evidence = summarize_input_to_photon_traces("macos", &traces);
 
         assert_eq!(evidence.state, InputToPhotonState::Measured);
         assert_eq!(evidence.sample_count, 3);
-        assert_eq!(evidence.target_p95_us, MACOS_P95_TARGET_US);
+        assert_eq!(evidence.target_p95_us, Some(MACOS_P95_TARGET_US));
         assert_eq!(evidence.p50_us, Some(1600));
         assert_eq!(evidence.p95_us, Some(2100));
         assert_eq!(evidence.p99_us, Some(2100));
-        assert_eq!(evidence.within_target, Some(true));
+        assert_eq!(evidence.within_target, None);
         assert!(
             evidence
                 .stage_breakdown_p50
@@ -1359,15 +1366,17 @@ mod tests {
 
     #[test]
     fn excessive_instrumentation_overhead_degrades_input_to_photon_evidence() {
-        let trace = known_key_trace_from_stage_durations(
+        let trace = classified_input_proxy_trace_from_stage_durations(
             0,
-            "a",
+            InputToPhotonInputClass::PrintableText,
+            1,
             "linux",
             [100, 100, 100, 100, 100],
             100,
-            None,
-            None,
-        );
+            1,
+            "deterministic-test-adapter",
+        )
+        .expect("valid proxy trace");
 
         let evidence = summarize_input_to_photon_traces("linux", &[trace]);
 
@@ -1409,15 +1418,17 @@ mod tests {
             pipeline_delay_bound,
         };
 
-        let trace = known_key_trace_from_stage_durations(
+        let trace = classified_input_proxy_trace_from_stage_durations(
             0,
-            "a",
+            InputToPhotonInputClass::PrintableText,
+            1,
             "macos",
             [250, 400, 750, 600, 250],
             20,
-            Some(1),
-            Some("deterministic-test-adapter".to_string()),
-        );
+            1,
+            "deterministic-test-adapter",
+        )
+        .expect("valid proxy trace");
         let evidence = summarize_input_to_photon_traces("macos", std::slice::from_ref(&trace));
         let empirical_p99_ms = evidence.p99_us.expect("p99 present") as f64 / 1_000.0;
         let stages: Vec<StageModel> = trace

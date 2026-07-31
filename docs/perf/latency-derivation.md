@@ -69,7 +69,7 @@ and backed by the checked-in `lindley-bounds.json` artifact today.
 |---------------|--------------------------------|----------------|
 | `<50ms` capture benchmark | `PtyCapture`, `DeltaExtraction`, `StorageWrite` | Covered by `docs/attestations/perf/lindley-bounds.json`. |
 | End-to-end capture path | `PtyCapture`, `DeltaExtraction`, `StorageWrite`, `PatternDetection`, `EventEmission` | Modeled, pending empirical: `LindleyTelemetryModel::documented_end_to_end_capture_default()` now covers all five leaves with a 23.1ms budget-backed bound, but the release artifact still lacks an empirical agreement row for the full PTY-to-event path. |
-| Renderer input-to-photon SLOs | Renderer-specific known-key trace stages in `crates/frankenterm-gui/src/renderer_slo.rs` | Substrate wired, pending retained lab run: G18.2 now emits deterministic stage telemetry and `tests/input_to_photon_bound.rs` checks Lindley agreement, but the release artifact must keep the claim non-covered until target-run empirical p95/p99 rows are retained. |
+| Renderer input-to-photon SLOs | Renderer-specific classified-input proxy stages in `crates/frankenterm-gui/src/renderer_slo.rs` | Proxy substrate wired, physical claim unproven: v2 emits content-free classified-input stage telemetry and `tests/input_to_photon_bound.rs` checks internal Lindley agreement, but it omits native input, mux/PTY, production-window presentation, scan-out, and photons. The release artifact must keep the physical claim non-covered until correlated live-path evidence is retained. |
 | Robot Mode response `<5ms` | `ApiResponse` plus handler-specific read/query work | Gap: G19/G54 evidence streams include `robot.p95`, but there is no `LatencyStage` telemetry model for the handler path yet. |
 | FTS5 query `<10ms` | Search/read path plus `ApiResponse`; not the write-side `StorageWrite` leaf | Gap: G19/G54 evidence streams include `fts5.query_p99`, but the FTS5 query service curve is not in `latency_stages.rs` yet. |
 
@@ -78,7 +78,7 @@ than being folded into this artifact with invented numbers. The release
 bundle can use the current artifact for the 4KB overlap benchmark, and
 it can cite the end-to-end capture chain only as `modeled_pending_empirical`
 until a real PTY-to-event empirical row lands. It can cite renderer
-input-to-photon only as `stage_telemetry_substrate_wired_pending_lab_run`.
+input-to-photon only as `proxy_only_stage_telemetry_physical_path_unproven`.
 It must not cite this artifact as proof for renderer, Robot Mode, or FTS5
 read-path SLOs.
 
