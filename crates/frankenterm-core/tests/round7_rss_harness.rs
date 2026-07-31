@@ -61,16 +61,16 @@
 //! * [`CdcArm`] — `Off` | `Always` | `Adaptive`; `.env_label()` maps to the
 //!   `FT_MOONSHOT_SCROLLBACK_CDC_DEDUP` value; `.construct(config)` builds a
 //!   `TieredScrollback` env-free.
-//! * [`harness_config`]`() -> ScrollbackConfig` — the fixed scrollback config the
-//!   verdict is computed under (cold eviction off so the full warm tier stays
-//!   resident; small pages so the fleet flushes many warm pages).
-//! * [`redundant_redraw_trace`]`() -> Vec<String>` /
-//!   [`low_redundancy_trace`]`() -> Vec<String>` — the two deterministic traces.
-//! * [`fleet_resident_bytes`]`(trace, arm, panes, config) -> FleetResident` —
-//!   the **pure metric**: total resident scrollback bytes for a `panes`-wide
-//!   fleet, each pane fed `trace`, summing `estimated_memory_bytes()`. Returns
-//!   [`FleetResident`] { `total_bytes`, `panes`, `per_pane_bytes`,
-//!   `adaptive_engaged_panes`, `sample_cdc_chunks` }.
+//! * [`harness_config`] returns the fixed [`ScrollbackConfig`] the verdict is
+//!   computed under (cold eviction off so the full warm tier stays resident;
+//!   small pages so the fleet flushes many warm pages).
+//! * [`redundant_redraw_trace`] and [`low_redundancy_trace`] return the two
+//!   deterministic `Vec<String>` traces.
+//! * [`fleet_resident_bytes`] is the **pure metric**: total resident scrollback
+//!   bytes for a `panes`-wide fleet, each pane fed `trace`, summing
+//!   `estimated_memory_bytes()`. It returns [`FleetResident`] with
+//!   `total_bytes`, `panes`, `per_pane_bytes`, `adaptive_engaged_panes`, and
+//!   `sample_cdc_chunks`.
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
@@ -297,7 +297,7 @@ pub fn fleet_resident_bytes(
     FleetResident {
         total_bytes: total,
         panes,
-        per_pane_bytes: if panes == 0 { 0 } else { total / panes },
+        per_pane_bytes: total.checked_div(panes).unwrap_or(0),
         adaptive_engaged_panes,
         sample_cdc_chunks,
     }
