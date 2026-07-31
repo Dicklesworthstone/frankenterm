@@ -83,7 +83,7 @@ fn real_wezterm_client_lists_default_pane_via_subprocess() {
 
     let runtime = RuntimeFixture::current_thread();
     let panes = runtime
-        .block_on(async move { client.list_panes().await })
+        .block_on(async move { Box::pin(client.list_panes()).await })
         .expect("list_panes against real mux subprocess");
 
     assert!(

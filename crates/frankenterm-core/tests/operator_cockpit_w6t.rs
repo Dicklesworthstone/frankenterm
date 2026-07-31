@@ -9,18 +9,20 @@
 //! the emergency-stop fail-closed gate or the `expire_stale_approvals` method).
 //!
 //! Coverage map (W6.T acceptance):
-//!   * W6.1 — `AttentionItem` read-only aggregation across many source kinds:
-//!            facts from policy-denials, approvals, connector breaker, stuck
-//!            panes, and ownership conflicts all fold into ranked items, the
-//!            input is never mutated, and the cockpit surface is read-only.
-//!   * W6.2 — Deterministic ranking (`ft robot next` / `ft ln`): severity-
-//!            dominant order, golden-stable across rebuilds and JSON encodings,
-//!            mandatory non-empty `reasons[]` + `suggested_command`, advisory-
-//!            only, and token-budget elision with a continuation cursor.
-//!   * W6.3 — `ft intervene` console: every verb writes an audit row, the
-//!            emergency-stop policy gate fails closed (resume is blocked and
-//!            audited), approvals are one-shot tokens, and stale approvals
-//!            expire via TTL.
+//!
+//! W6.1 — `AttentionItem` read-only aggregation across many source kinds:
+//! facts from policy-denials, approvals, connector breaker, stuck panes, and
+//! ownership conflicts all fold into ranked items, the input is never mutated,
+//! and the cockpit surface is read-only.
+//!
+//! W6.2 — Deterministic ranking (`ft robot next` / `ft ln`): severity-dominant
+//! order, golden-stable across rebuilds and JSON encodings, mandatory non-empty
+//! `reasons[]` + `suggested_command`, advisory-only, and token-budget elision
+//! with a continuation cursor.
+//!
+//! W6.3 — `ft intervene` console: every verb writes an audit row, the
+//! emergency-stop policy gate fails closed (resume is blocked and audited),
+//! approvals are one-shot tokens, and stale approvals expire via TTL.
 //!
 //! Explicitly NOT covered here (BLOCKED / unimplemented at this SHA — tracked as
 //! the lane-gated remainder on ft-7h5da.7.6): W6.4 `ft deck` ftui composition,
