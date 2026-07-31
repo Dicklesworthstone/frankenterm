@@ -1023,7 +1023,7 @@ impl<'de> Deserialize<'de> for RegressionThresholdBits {
     {
         struct RegressionThresholdBitsVisitor;
 
-        impl de::Visitor<'_> for RegressionThresholdBitsVisitor {
+        impl<'de> de::Visitor<'de> for RegressionThresholdBitsVisitor {
             type Value = RegressionThresholdBits;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1036,18 +1036,19 @@ impl<'de> Deserialize<'de> for RegressionThresholdBits {
             where
                 E: de::Error,
             {
-                let bytes = value.as_bytes();
-                if bytes.len() != 18
-                    || !value.starts_with("0x")
-                    || !bytes[2..]
-                        .iter()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+                let Some(hex) = value.strip_prefix("0x") else {
+                    return Err(E::custom("regression threshold bits lack canonical prefix"));
+                };
+                if hex.len() != 16
+                    || !hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
                 {
-                    return Err(E::custom(format_args!(
-                        "non-canonical regression threshold bits {value:?}"
-                    )));
+                    return Err(E::custom(
+                        "regression threshold bits are not 16 lowercase hex digits",
+                    ));
                 }
-                u64::from_str_radix(&value[2..], 16)
+                u64::from_str_radix(hex, 16)
                     .map(RegressionThresholdBits)
                     .map_err(E::custom)
             }
