@@ -35,7 +35,7 @@ benchmark, or an instrumentation DTO exists.
 |---|---|---|
 | `resize_storm.rs` / RQ-S1 | Cost of a deterministic 200-pane dirty-row core loop, plus a separate single-terminal resize assertion | Presented GUI resize FPS, mux work, per-pane resize, full scrollback reflow, shaping, Metal, or appearance |
 | `input_to_photon.rs` / RQ-S2 | A deterministic headless render substrate and one native Metal readback run | Physical key event, LAN transport, remote PTY, production window invalidation, `CAMetalDrawable` presentation, or photons |
-| `input_latency_bench.rs` | Framework/DTO overhead for synthetic timestamps | Production input latency |
+| `input_latency_bench.rs` | Legacy `proxy_only` framework/DTO overhead for synthetic, producer/clock-qualified timestamps | Production input latency, observer effect, or any live keypress stage |
 | `heavy_burst.rs` / RQ-S6 | Deferred-operation harness behavior under a modeled burst | A real key sharing the client socket, server dispatcher, mux main thread, PTY, and renderer with 50 live panes |
 | `load-rig.md` | Deterministic replay and modeled load-regression substrate | Live mux panes, real PTYs, GUI/Metal, actual network transport, or an aged session |
 | `e2e_swarm_stress_core.rs` | Core `TieredScrollback` simulation | A multi-hour GUI/mux/network/storage/reconnect soak |
@@ -52,6 +52,11 @@ In particular:
   long-session stability remain unproven until their named target runs exist.
 - A software call to `present()` is a submit/presentation request. It is not a
   measured display or photon boundary.
+- The legacy `input_latency` schema v2 now rejects empty or incomplete sample
+  windows, duplicate stages or measurement IDs, unrelated or regressing clock
+  domains, invalid budgets, and exhausted sequence identity. Those repairs
+  prevent false green proxy verdicts; they do not promote the framework into
+  the production AppKit/mux/PTY/presentation trace required by `.2`.
 
 ## 2. Code-grounded architecture
 
