@@ -2,7 +2,7 @@
 // deeply-nested async call chains.
 #![allow(clippy::large_futures)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -32,6 +32,13 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_OUTSTANDING_REQUESTS: usize = 256;
+const DEFAULT_MAX_PENDING_RESPONSES: usize = 256;
+const DEFAULT_MAX_PENDING_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_RENDER_CHANGES: usize = 512;
+const DEFAULT_MAX_PENDING_RENDER_CHANGE_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_MAX_RENDER_CHANGE_SNAPSHOTS: usize = 512;
+const DEFAULT_MAX_RENDER_CHANGE_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -41,6 +48,20 @@ pub struct DirectMuxClientConfig {
     pub read_timeout: Duration,
     pub write_timeout: Duration,
     pub max_frame_bytes: usize,
+    /// Maximum request serials that may await a response on one connection.
+    pub max_outstanding_requests: usize,
+    /// Maximum out-of-order responses retained until their waiter consumes them.
+    pub max_pending_responses: usize,
+    /// Exact uncompressed retained-frame budget for out-of-order responses.
+    pub max_pending_response_bytes: usize,
+    /// Maximum unilateral render changes retained until their pane poll consumes them.
+    pub max_pending_render_changes: usize,
+    /// Exact uncompressed retained-frame budget for unilateral render changes.
+    pub max_pending_render_change_bytes: usize,
+    /// Maximum pane snapshots retained for liveness-only render responses.
+    pub max_render_change_snapshots: usize,
+    /// Exact uncompressed retained-frame budget for pane render snapshots.
+    pub max_render_change_snapshot_bytes: usize,
     pub compression_mode: wa_config::VendoredCompressionMode,
 }
 
@@ -61,6 +82,39 @@ impl DirectMuxClientConfig {
         self.socket_path = Some(path.into());
         self
     }
+
+    fn validate(&self) -> Result<(), DirectMuxError> {
+        for (field, value) in [
+            ("max_frame_bytes", self.max_frame_bytes),
+            ("max_outstanding_requests", self.max_outstanding_requests),
+            ("max_pending_responses", self.max_pending_responses),
+            (
+                "max_pending_response_bytes",
+                self.max_pending_response_bytes,
+            ),
+            (
+                "max_pending_render_changes",
+                self.max_pending_render_changes,
+            ),
+            (
+                "max_pending_render_change_bytes",
+                self.max_pending_render_change_bytes,
+            ),
+            (
+                "max_render_change_snapshots",
+                self.max_render_change_snapshots,
+            ),
+            (
+                "max_render_change_snapshot_bytes",
+                self.max_render_change_snapshot_bytes,
+            ),
+        ] {
+            if value == 0 {
+                return Err(DirectMuxError::InvalidLimit { field });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for DirectMuxClientConfig {
@@ -71,6 +125,13 @@ impl Default for DirectMuxClientConfig {
             read_timeout: Duration::from_millis(DEFAULT_READ_TIMEOUT_MS),
             write_timeout: Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_outstanding_requests: DEFAULT_MAX_OUTSTANDING_REQUESTS,
+            max_pending_responses: DEFAULT_MAX_PENDING_RESPONSES,
+            max_pending_response_bytes: DEFAULT_MAX_PENDING_RESPONSE_BYTES,
+            max_pending_render_changes: DEFAULT_MAX_PENDING_RENDER_CHANGES,
+            max_pending_render_change_bytes: DEFAULT_MAX_PENDING_RENDER_CHANGE_BYTES,
+            max_render_change_snapshots: DEFAULT_MAX_RENDER_CHANGE_SNAPSHOTS,
+            max_render_change_snapshot_bytes: DEFAULT_MAX_RENDER_CHANGE_SNAPSHOT_BYTES,
             compression_mode: wa_config::VendoredCompressionMode::Auto,
         }
     }
@@ -94,8 +155,37 @@ pub enum DirectMuxError {
     Disconnected,
     #[error("frame exceeded max size ({max_bytes} bytes)")]
     FrameTooLarge { max_bytes: usize },
+    #[error("direct mux connection identity space exhausted")]
+    ConnectionIdExhausted,
     #[error("request serial space exhausted for this connection")]
     SerialExhausted,
+    #[error("invalid direct mux client limit {field}: value must be nonzero")]
+    InvalidLimit { field: &'static str },
+    #[error(
+        "{resource} retention limit exceeded: requested {requested_count} items/{requested_bytes} \
+         bytes, limit {max_count} items/{max_bytes} bytes"
+    )]
+    RetentionLimitExceeded {
+        resource: &'static str,
+        requested_count: usize,
+        requested_bytes: usize,
+        max_count: usize,
+        max_bytes: usize,
+    },
+    #[error(
+        "response serial {serial} is not outstanding on direct mux connection {connection_id}"
+    )]
+    ResponseSerialNotOutstanding { connection_id: u64, serial: u64 },
+    #[error(
+        "retained mux state belongs to connection {got_connection_id}, not active connection \
+         {expected_connection_id}"
+    )]
+    RetainedConnectionMismatch {
+        expected_connection_id: u64,
+        got_connection_id: u64,
+    },
+    #[error("retained {resource} accounting is inconsistent")]
+    RetainedStateAccounting { resource: &'static str },
     #[error("codec error: {0}")]
     Codec(String),
     #[error("remote error: {0}")]
@@ -152,11 +242,17 @@ impl DirectMuxError {
             | Self::FrameTooLarge { .. }
             | Self::Codec(_)
             | Self::BatchTimeout { .. }
-            | Self::SerialExhausted => ProtocolErrorKind::Recoverable,
+            | Self::SerialExhausted
+            | Self::RetentionLimitExceeded { .. }
+            | Self::ResponseSerialNotOutstanding { .. }
+            | Self::RetainedConnectionMismatch { .. }
+            | Self::RetainedStateAccounting { .. } => ProtocolErrorKind::Recoverable,
             Self::IncompatibleCodec { .. }
             | Self::SocketPathMissing
             | Self::SocketNotFound(_)
-            | Self::ProxyUnsupported => ProtocolErrorKind::Permanent,
+            | Self::ProxyUnsupported
+            | Self::ConnectionIdExhausted
+            | Self::InvalidLimit { .. } => ProtocolErrorKind::Permanent,
             Self::RemoteError(_) => ProtocolErrorKind::Transient,
             Self::Io(err) => match err.kind() {
                 std::io::ErrorKind::BrokenPipe
@@ -205,15 +301,122 @@ fn checkpoint_mux_cx(
     })
 }
 
+#[derive(Debug)]
+struct RetainedMuxPdu {
+    connection_id: u64,
+    serial: u64,
+    frame: Vec<u8>,
+}
+
+impl RetainedMuxPdu {
+    fn encode(connection_id: u64, serial: u64, pdu: Pdu) -> Result<Self, DirectMuxError> {
+        let frame = pdu
+            .encode_retained_frame(serial)
+            .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
+        Ok(Self {
+            connection_id,
+            serial,
+            frame,
+        })
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.frame.len()
+    }
+
+    fn decode(
+        &self,
+        expected_connection_id: u64,
+        expected_serial: u64,
+    ) -> Result<Pdu, DirectMuxError> {
+        if self.connection_id != expected_connection_id {
+            return Err(DirectMuxError::RetainedConnectionMismatch {
+                expected_connection_id,
+                got_connection_id: self.connection_id,
+            });
+        }
+        if self.serial != expected_serial {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "mux PDU serial",
+            });
+        }
+        let decoded = Pdu::decode_retained_frame(self.frame.as_slice())
+            .map_err(|err| DirectMuxError::Codec(err.to_string()))?;
+        if decoded.serial != expected_serial {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "decoded mux PDU serial",
+            });
+        }
+        Ok(decoded.pdu)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RetentionLimit {
+    max_count: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug)]
+struct RetainedRenderChange {
+    pane_id: u64,
+    pdu: RetainedMuxPdu,
+}
+
+impl RetainedRenderChange {
+    fn encode(
+        connection_id: u64,
+        payload: GetPaneRenderChangesResponse,
+    ) -> Result<Self, DirectMuxError> {
+        let pane_id = payload.pane_id as u64;
+        let pdu = RetainedMuxPdu::encode(
+            connection_id,
+            0,
+            Pdu::GetPaneRenderChangesResponse(payload),
+        )?;
+        Ok(Self { pane_id, pdu })
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.pdu.retained_bytes()
+    }
+
+    fn decode(
+        &self,
+        expected_connection_id: u64,
+    ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
+        match self.pdu.decode(expected_connection_id, 0)? {
+            Pdu::GetPaneRenderChangesResponse(payload)
+                if payload.pane_id as u64 == self.pane_id =>
+            {
+                Ok(payload)
+            }
+            Pdu::GetPaneRenderChangesResponse(_) => {
+                Err(DirectMuxError::RetainedStateAccounting {
+                    resource: "render-change pane identity",
+                })
+            }
+            other => Err(DirectMuxError::UnexpectedResponse {
+                expected: "retained GetPaneRenderChangesResponse".to_string(),
+                got: other.pdu_name().to_string(),
+            }),
+        }
+    }
+}
+
 pub struct DirectMuxClient {
     connection_id: u64,
     stream: UnixStream,
     socket_path: PathBuf,
     read_buf: Vec<u8>,
     serial: u64,
-    pending_responses: HashMap<u64, Pdu>,
-    pending_render_changes: VecDeque<GetPaneRenderChangesResponse>,
-    render_change_snapshots: HashMap<u64, GetPaneRenderChangesResponse>,
+    outstanding_requests: HashSet<u64>,
+    pending_responses: HashMap<u64, RetainedMuxPdu>,
+    pending_response_bytes: usize,
+    pending_render_changes: VecDeque<RetainedRenderChange>,
+    pending_render_change_bytes: usize,
+    render_change_snapshots: HashMap<u64, RetainedRenderChange>,
+    render_change_snapshot_bytes: usize,
     config: DirectMuxClientConfig,
     compression_mode: CompressionMode,
 }
@@ -224,8 +427,22 @@ impl std::fmt::Debug for DirectMuxClient {
             .field("connection_id", &self.connection_id)
             .field("socket_path", &self.socket_path)
             .field("serial", &self.serial)
+            .field("outstanding_requests", &self.outstanding_requests.len())
             .field("pending_responses", &self.pending_responses.len())
+            .field("pending_response_bytes", &self.pending_response_bytes)
             .field("pending_render_changes", &self.pending_render_changes.len())
+            .field(
+                "pending_render_change_bytes",
+                &self.pending_render_change_bytes,
+            )
+            .field(
+                "render_change_snapshots",
+                &self.render_change_snapshots.len(),
+            )
+            .field(
+                "render_change_snapshot_bytes",
+                &self.render_change_snapshot_bytes,
+            )
             .field("compression_mode", &self.compression_mode)
             .finish_non_exhaustive()
     }
@@ -248,6 +465,7 @@ impl DirectMuxClient {
         cx: &Cx,
         config: DirectMuxClientConfig,
     ) -> Result<Self, DirectMuxError> {
+        config.validate()?;
         let socket_path = resolve_socket_path(&config)?;
         if !socket_path.exists() {
             return Err(DirectMuxError::SocketNotFound(socket_path));
@@ -299,7 +517,7 @@ impl DirectMuxClient {
         config: DirectMuxClientConfig,
         compression_mode: CompressionMode,
     ) -> Result<Self, DirectMuxError> {
-        let connection_id = next_connection_id();
+        let connection_id = next_connection_id()?;
         checkpoint_mux_cx(cx, connection_id, "connect_start")?;
         // Tick 199 (ft-xbnl0.2.3): route the connect timeout through
         // timeout_with_cx so the caller's explicit cx bounds the
@@ -329,9 +547,13 @@ impl DirectMuxClient {
             socket_path,
             read_buf: Vec::new(),
             serial: 0,
+            outstanding_requests: HashSet::new(),
             pending_responses: HashMap::new(),
+            pending_response_bytes: 0,
             pending_render_changes: VecDeque::new(),
+            pending_render_change_bytes: 0,
             render_change_snapshots: HashMap::new(),
+            render_change_snapshot_bytes: 0,
             config,
         };
 
@@ -375,6 +597,17 @@ impl DirectMuxClient {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Process-local, non-reusing identity for this exact transport instance.
+    ///
+    /// This is deliberately distinct from the server-authored render
+    /// connection identity. It scopes DirectMuxClient-owned request and render
+    /// retention so state from a dropped pool connection cannot be replayed
+    /// into its replacement.
+    #[must_use]
+    pub fn connection_id(&self) -> u64 {
+        self.connection_id
     }
 
     pub async fn list_panes(&mut self) -> Result<ListPanesResponse, DirectMuxError> {
@@ -1231,6 +1464,7 @@ impl DirectMuxClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))?;
 
         tracing::trace!(
             connection_id = self.connection_id,
@@ -1263,7 +1497,12 @@ impl DirectMuxClient {
 
         while !in_flight.is_empty() {
             let decoded = self.read_next_pdu().await?;
+            if decoded.serial == 0 {
+                self.stash_unilateral_pdu(decoded.pdu)?;
+                continue;
+            }
             if let Some(response_idx) = take_in_flight_slot(&mut in_flight, decoded.serial) {
+                self.complete_response_serial(decoded.serial)?;
                 responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
                 if let Some((request_idx, request)) = requests.next() {
                     let serial = self.send_request_only(request).await?;
@@ -1299,6 +1538,7 @@ impl DirectMuxClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_outstanding_request_slots(requests.len().min(max_pipeline_depth))?;
 
         tracing::trace!(
             connection_id = self.connection_id,
@@ -1332,7 +1572,12 @@ impl DirectMuxClient {
 
         while !in_flight.is_empty() {
             let decoded = self.read_next_pdu_with_cx(cx).await?;
+            if decoded.serial == 0 {
+                self.stash_unilateral_pdu(decoded.pdu)?;
+                continue;
+            }
             if let Some(response_idx) = take_in_flight_slot(&mut in_flight, decoded.serial) {
+                self.complete_response_serial(decoded.serial)?;
                 responses[response_idx] = Some(Self::response_from_pdu(decoded.pdu)?);
                 if let Some((request_idx, request)) = requests.next() {
                     let serial = self.send_request_only_with_cx(cx, request).await?;
@@ -1360,6 +1605,79 @@ impl DirectMuxClient {
         Ok(ordered)
     }
 
+    fn ensure_outstanding_request_slots(&self, additional: usize) -> Result<(), DirectMuxError> {
+        let requested_count = self
+            .outstanding_requests
+            .len()
+            .checked_add(additional)
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "outstanding mux requests",
+            })?;
+        if requested_count > self.config.max_outstanding_requests {
+            let item_bytes = std::mem::size_of::<u64>();
+            return Err(DirectMuxError::RetentionLimitExceeded {
+                resource: "outstanding mux requests",
+                requested_count,
+                requested_bytes: requested_count.saturating_mul(item_bytes),
+                max_count: self.config.max_outstanding_requests,
+                max_bytes: self
+                    .config
+                    .max_outstanding_requests
+                    .saturating_mul(item_bytes),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_outstanding_request_capacity(&self) -> Result<(), DirectMuxError> {
+        self.ensure_outstanding_request_slots(1)
+    }
+
+    fn mark_request_outstanding(&mut self, serial: u64) -> Result<(), DirectMuxError> {
+        self.ensure_outstanding_request_capacity()?;
+        if !self.outstanding_requests.insert(serial) {
+            return Err(DirectMuxError::RetainedStateAccounting {
+                resource: "outstanding mux request serials",
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_response_serial(&self, serial: u64) -> Result<(), DirectMuxError> {
+        if serial == 0 || self.outstanding_requests.contains(&serial) {
+            return Ok(());
+        }
+        Err(DirectMuxError::ResponseSerialNotOutstanding {
+            connection_id: self.connection_id,
+            serial,
+        })
+    }
+
+    fn complete_response_serial(&mut self, serial: u64) -> Result<(), DirectMuxError> {
+        if self.outstanding_requests.remove(&serial) {
+            return Ok(());
+        }
+        Err(DirectMuxError::ResponseSerialNotOutstanding {
+            connection_id: self.connection_id,
+            serial,
+        })
+    }
+
+    fn take_pending_response(&mut self, serial: u64) -> Result<Option<Pdu>, DirectMuxError> {
+        let Some(retained) = self.pending_responses.remove(&serial) else {
+            return Ok(None);
+        };
+        self.pending_response_bytes = self
+            .pending_response_bytes
+            .checked_sub(retained.retained_bytes())
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "pending mux responses",
+            })?;
+        let pdu = retained.decode(self.connection_id, serial)?;
+        self.complete_response_serial(serial)?;
+        Ok(Some(pdu))
+    }
+
     async fn send_request(&mut self, pdu: Pdu) -> Result<Pdu, DirectMuxError> {
         let serial = self.send_request_only(pdu).await?;
         self.await_response(serial).await
@@ -1371,6 +1689,7 @@ impl DirectMuxClient {
     }
 
     async fn send_request_only(&mut self, pdu: Pdu) -> Result<u64, DirectMuxError> {
+        self.ensure_outstanding_request_capacity()?;
         let serial = next_request_serial(&mut self.serial)?;
         let pdu_name = pdu.pdu_name();
         let mut buf = Vec::new();
@@ -1421,6 +1740,7 @@ impl DirectMuxClient {
                 return Err(DirectMuxError::WriteTimeout);
             }
         }
+        self.mark_request_outstanding(serial)?;
         Ok(serial)
     }
 
@@ -1430,6 +1750,7 @@ impl DirectMuxClient {
         pdu: Pdu,
     ) -> Result<u64, DirectMuxError> {
         checkpoint_mux_cx(cx, self.connection_id, "request_start")?;
+        self.ensure_outstanding_request_capacity()?;
         let serial = next_request_serial(&mut self.serial)?;
         let pdu_name = pdu.pdu_name();
         let mut buf = Vec::new();
@@ -1502,11 +1823,13 @@ impl DirectMuxClient {
                 ));
             }
         }
+        self.mark_request_outstanding(serial)?;
         Ok(serial)
     }
 
     async fn await_response(&mut self, serial: u64) -> Result<Pdu, DirectMuxError> {
-        if let Some(pending) = self.pending_responses.remove(&serial) {
+        self.validate_response_serial(serial)?;
+        if let Some(pending) = self.take_pending_response(serial)? {
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
@@ -1518,10 +1841,11 @@ impl DirectMuxClient {
         loop {
             let decoded = self.read_next_pdu().await?;
             if decoded.serial == serial {
+                self.complete_response_serial(serial)?;
                 return Self::response_from_pdu(decoded.pdu);
             }
             if decoded.serial == 0 {
-                self.stash_unilateral_pdu(decoded.pdu);
+                self.stash_unilateral_pdu(decoded.pdu)?;
                 continue;
             }
             tracing::trace!(
@@ -1540,7 +1864,8 @@ impl DirectMuxClient {
         cx: &Cx,
         serial: u64,
     ) -> Result<Pdu, DirectMuxError> {
-        if let Some(pending) = self.pending_responses.remove(&serial) {
+        self.validate_response_serial(serial)?;
+        if let Some(pending) = self.take_pending_response(serial)? {
             tracing::trace!(
                 connection_id = self.connection_id,
                 request_serial = serial,
@@ -1553,10 +1878,11 @@ impl DirectMuxClient {
         loop {
             let decoded = self.read_next_pdu_with_cx(cx).await?;
             if decoded.serial == serial {
+                self.complete_response_serial(serial)?;
                 return Self::response_from_pdu(decoded.pdu);
             }
             if decoded.serial == 0 {
-                self.stash_unilateral_pdu(decoded.pdu);
+                self.stash_unilateral_pdu(decoded.pdu)?;
                 continue;
             }
             tracing::trace!(
@@ -1585,7 +1911,7 @@ impl DirectMuxClient {
     ) -> Result<GetPaneRenderChangesResponse, DirectMuxError> {
         match response {
             Pdu::GetPaneRenderChangesResponse(payload) => {
-                self.remember_render_change_snapshot(&payload);
+                self.remember_render_change_snapshot(&payload)?;
                 Ok(payload)
             }
             Pdu::LivenessResponse(liveness) => {
@@ -1600,12 +1926,13 @@ impl DirectMuxClient {
                         "pane {pane_id} is not alive"
                     )));
                 }
-                if let Some(payload) = self.take_pending_render_change(pane_id) {
+                if let Some(payload) = self.take_pending_render_change(pane_id)? {
                     return Ok(payload);
                 }
                 self.render_change_snapshots
                     .get(&pane_id)
-                    .map(Self::idle_render_snapshot)
+                    .map(|snapshot| snapshot.decode(self.connection_id))
+                    .transpose()?
                     .ok_or_else(|| DirectMuxError::UnexpectedResponse {
                         expected: format!(
                             "GetPaneRenderChangesResponse or cached render snapshot for pane {pane_id}"
@@ -1620,11 +1947,23 @@ impl DirectMuxClient {
         }
     }
 
-    fn stash_unilateral_pdu(&mut self, pdu: Pdu) {
+    fn stash_unilateral_pdu(&mut self, pdu: Pdu) -> Result<(), DirectMuxError> {
         match pdu {
             Pdu::GetPaneRenderChangesResponse(payload) => {
-                self.remember_render_change_snapshot(&payload);
-                self.pending_render_changes.push_back(payload);
+                self.stash_unilateral_render_change(payload)?;
+            }
+            Pdu::PaneRemoved(removed) => {
+                let pane_id = removed.pane_id as u64;
+                let (pending_removed, snapshot_removed) =
+                    self.invalidate_render_state_for_pane(pane_id)?;
+                tracing::trace!(
+                    connection_id = self.connection_id,
+                    pane_id,
+                    pending_removed,
+                    snapshot_removed,
+                    phase = "pane_removed_invalidate",
+                    "invalidated direct mux render retention for removed pane"
+                );
             }
             other => {
                 tracing::trace!(
@@ -1635,19 +1974,145 @@ impl DirectMuxClient {
                 );
             }
         }
+        Ok(())
     }
 
-    fn take_pending_render_change(&mut self, pane_id: u64) -> Option<GetPaneRenderChangesResponse> {
+    fn stash_unilateral_render_change(
+        &mut self,
+        payload: GetPaneRenderChangesResponse,
+    ) -> Result<(), DirectMuxError> {
+        let pane_id = payload.pane_id as u64;
+        let snapshot = RetainedRenderChange::encode(
+            self.connection_id,
+            Self::idle_render_snapshot(&payload),
+        )?;
+        let pending = RetainedRenderChange::encode(self.connection_id, payload)?;
+
+        let (_, next_pending_bytes) = checked_retention_after_insert(
+            "pending unilateral render changes",
+            self.pending_render_changes.len(),
+            self.pending_render_change_bytes,
+            None,
+            pending.retained_bytes(),
+            RetentionLimit {
+                max_count: self.config.max_pending_render_changes,
+                max_bytes: self.config.max_pending_render_change_bytes,
+            },
+        )?;
+        let replaced_snapshot_bytes = self
+            .render_change_snapshots
+            .get(&pane_id)
+            .map(RetainedRenderChange::retained_bytes);
+        let (_, next_snapshot_bytes) = checked_retention_after_insert(
+            "render change snapshots",
+            self.render_change_snapshots.len(),
+            self.render_change_snapshot_bytes,
+            replaced_snapshot_bytes,
+            snapshot.retained_bytes(),
+            RetentionLimit {
+                max_count: self.config.max_render_change_snapshots,
+                max_bytes: self.config.max_render_change_snapshot_bytes,
+            },
+        )?;
+
+        self.render_change_snapshots.insert(pane_id, snapshot);
+        self.render_change_snapshot_bytes = next_snapshot_bytes;
+        self.pending_render_changes.push_back(pending);
+        self.pending_render_change_bytes = next_pending_bytes;
+        Ok(())
+    }
+
+    fn take_pending_render_change(
+        &mut self,
+        pane_id: u64,
+    ) -> Result<Option<GetPaneRenderChangesResponse>, DirectMuxError> {
         let idx = self
             .pending_render_changes
             .iter()
-            .position(|payload| payload.pane_id as u64 == pane_id)?;
-        self.pending_render_changes.remove(idx)
+            .position(|payload| payload.pane_id == pane_id);
+        let Some(idx) = idx else {
+            return Ok(None);
+        };
+        let retained = self.pending_render_changes.remove(idx).ok_or(
+            DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes",
+            },
+        )?;
+        self.pending_render_change_bytes = self
+            .pending_render_change_bytes
+            .checked_sub(retained.retained_bytes())
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes",
+            })?;
+        retained.decode(self.connection_id).map(Some)
     }
 
-    fn remember_render_change_snapshot(&mut self, payload: &GetPaneRenderChangesResponse) {
-        self.render_change_snapshots
-            .insert(payload.pane_id as u64, Self::idle_render_snapshot(payload));
+    fn remember_render_change_snapshot(
+        &mut self,
+        payload: &GetPaneRenderChangesResponse,
+    ) -> Result<(), DirectMuxError> {
+        let pane_id = payload.pane_id as u64;
+        let snapshot = RetainedRenderChange::encode(
+            self.connection_id,
+            Self::idle_render_snapshot(payload),
+        )?;
+        let replaced_bytes = self
+            .render_change_snapshots
+            .get(&pane_id)
+            .map(RetainedRenderChange::retained_bytes);
+        let (_, next_bytes) = checked_retention_after_insert(
+            "render change snapshots",
+            self.render_change_snapshots.len(),
+            self.render_change_snapshot_bytes,
+            replaced_bytes,
+            snapshot.retained_bytes(),
+            RetentionLimit {
+                max_count: self.config.max_render_change_snapshots,
+                max_bytes: self.config.max_render_change_snapshot_bytes,
+            },
+        )?;
+        self.render_change_snapshots.insert(pane_id, snapshot);
+        self.render_change_snapshot_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn invalidate_render_state_for_pane(
+        &mut self,
+        pane_id: u64,
+    ) -> Result<(usize, bool), DirectMuxError> {
+        let snapshot_removed = if let Some(snapshot) =
+            self.render_change_snapshots.remove(&pane_id)
+        {
+            self.render_change_snapshot_bytes = self
+                .render_change_snapshot_bytes
+                .checked_sub(snapshot.retained_bytes())
+                .ok_or(DirectMuxError::RetainedStateAccounting {
+                    resource: "render change snapshots",
+                })?;
+            true
+        } else {
+            false
+        };
+
+        let before = self.pending_render_changes.len();
+        self.pending_render_changes
+            .retain(|retained| retained.pane_id != pane_id);
+        let pending_removed = before
+            .checked_sub(self.pending_render_changes.len())
+            .ok_or(DirectMuxError::RetainedStateAccounting {
+                resource: "pending unilateral render changes",
+            })?;
+        self.pending_render_change_bytes = self
+            .pending_render_changes
+            .iter()
+            .try_fold(0usize, |bytes, retained| {
+                bytes.checked_add(retained.retained_bytes()).ok_or(
+                    DirectMuxError::RetainedStateAccounting {
+                        resource: "pending unilateral render changes",
+                    },
+                )
+            })?;
+        Ok((pending_removed, snapshot_removed))
     }
 
     fn idle_render_snapshot(
@@ -1670,7 +2135,14 @@ impl DirectMuxClient {
     }
 
     fn stash_pending_response(&mut self, serial: u64, pdu: Pdu) -> Result<(), DirectMuxError> {
-        if self.pending_responses.insert(serial, pdu).is_some() {
+        if serial == 0 {
+            return Err(DirectMuxError::UnexpectedResponse {
+                expected: "nonzero request response serial".to_string(),
+                got: "reserved unilateral serial 0".to_string(),
+            });
+        }
+        self.validate_response_serial(serial)?;
+        if self.pending_responses.contains_key(&serial) {
             tracing::warn!(
                 connection_id = self.connection_id,
                 duplicate_serial = serial,
@@ -1682,6 +2154,21 @@ impl DirectMuxClient {
                 got: format!("duplicate response serial {serial}"),
             });
         }
+        let retained = RetainedMuxPdu::encode(self.connection_id, serial, pdu)?;
+        let (_, next_bytes) = checked_retention_after_insert(
+            "pending mux responses",
+            self.pending_responses.len(),
+            self.pending_response_bytes,
+            None,
+            retained.retained_bytes(),
+            RetentionLimit {
+                max_count: self.config.max_pending_responses,
+                max_bytes: self.config.max_pending_response_bytes,
+            },
+        )?;
+        let replaced = self.pending_responses.insert(serial, retained);
+        debug_assert!(replaced.is_none());
+        self.pending_response_bytes = next_bytes;
         Ok(())
     }
 
@@ -1690,6 +2177,7 @@ impl DirectMuxClient {
             if let Some(decoded) =
                 decode_from_buffer(&mut self.read_buf, self.config.max_frame_bytes)?
             {
+                self.validate_response_serial(decoded.serial)?;
                 tracing::trace!(
                     connection_id = self.connection_id,
                     response_serial = decoded.serial,
@@ -1756,6 +2244,7 @@ impl DirectMuxClient {
             if let Some(decoded) =
                 decode_from_buffer(&mut self.read_buf, self.config.max_frame_bytes)?
             {
+                self.validate_response_serial(decoded.serial)?;
                 tracing::trace!(
                     connection_id = self.connection_id,
                     response_serial = decoded.serial,
@@ -1834,8 +2323,19 @@ fn ambient_mux_cx() -> Cx {
     Cx::current().unwrap_or_else(crate::cx::for_request)
 }
 
-fn next_connection_id() -> u64 {
-    NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
+fn next_connection_id() -> Result<u64, DirectMuxError> {
+    next_connection_id_from(&NEXT_CONNECTION_ID)
+}
+
+fn next_connection_id_from(next: &AtomicU64) -> Result<u64, DirectMuxError> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        if current == 0 || current == u64::MAX {
+            None
+        } else {
+            Some(current + 1)
+        }
+    })
+    .map_err(|_| DirectMuxError::ConnectionIdExhausted)
 }
 
 fn next_request_serial(serial: &mut u64) -> Result<u64, DirectMuxError> {
@@ -1843,6 +2343,35 @@ fn next_request_serial(serial: &mut u64) -> Result<u64, DirectMuxError> {
         .checked_add(1)
         .ok_or(DirectMuxError::SerialExhausted)?;
     Ok(*serial)
+}
+
+fn checked_retention_after_insert(
+    resource: &'static str,
+    current_count: usize,
+    current_bytes: usize,
+    replaced_bytes: Option<usize>,
+    added_bytes: usize,
+    limit: RetentionLimit,
+) -> Result<(usize, usize), DirectMuxError> {
+    let replaced_count = usize::from(replaced_bytes.is_some());
+    let requested_count = current_count
+        .checked_sub(replaced_count)
+        .and_then(|count| count.checked_add(1))
+        .ok_or(DirectMuxError::RetainedStateAccounting { resource })?;
+    let requested_bytes = current_bytes
+        .checked_sub(replaced_bytes.unwrap_or(0))
+        .and_then(|bytes| bytes.checked_add(added_bytes))
+        .ok_or(DirectMuxError::RetainedStateAccounting { resource })?;
+    if requested_count > limit.max_count || requested_bytes > limit.max_bytes {
+        return Err(DirectMuxError::RetentionLimitExceeded {
+            resource,
+            requested_count,
+            requested_bytes,
+            max_count: limit.max_count,
+            max_bytes: limit.max_bytes,
+        });
+    }
+    Ok((requested_count, requested_bytes))
 }
 
 fn duration_to_ms_u64(duration: Duration) -> u64 {
@@ -2462,6 +2991,37 @@ mod tests {
             socket_path: Some(socket_path),
             read_timeout,
             ..Default::default()
+        }
+    }
+
+    fn test_render_change(
+        pane_id: mux::pane::PaneId,
+        seqno: usize,
+        title: &str,
+    ) -> GetPaneRenderChangesResponse {
+        GetPaneRenderChangesResponse {
+            pane_id,
+            mouse_grabbed: false,
+            alt_screen_active: false,
+            cursor_position: mux::renderable::StableCursorPosition::default(),
+            dimensions: mux::renderable::RenderableDimensions {
+                cols: 80,
+                viewport_rows: 24,
+                scrollback_rows: 0,
+                physical_top: 0,
+                scrollback_top: 0,
+                dpi: 96,
+                pixel_width: 0,
+                pixel_height: 0,
+                reverse_video: false,
+            },
+            tiered_scrollback_status: None,
+            dirty_lines: vec![0..1],
+            title: title.to_string(),
+            working_dir: None,
+            bonus_lines: Vec::new().into(),
+            input_serial: None,
+            seqno,
         }
     }
 
@@ -3526,6 +4086,80 @@ mod tests {
             assert_eq!(second.title, "cached-pane");
             assert_eq!(second.dimensions.cols, 120);
 
+            client
+                .stash_unilateral_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 27 }))
+                .expect("pane removal must invalidate retained render state");
+            assert!(!client.render_change_snapshots.contains_key(&27));
+            assert_eq!(client.render_change_snapshot_bytes, 0);
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+
+            let stale_cache_error = client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::LivenessResponse(codec::LivenessResponse {
+                        pane_id: 27,
+                        is_alive: true,
+                    }),
+                )
+                .expect_err("reused pane ID must not inherit the removed pane snapshot");
+            assert!(matches!(
+                stale_cache_error,
+                DirectMuxError::UnexpectedResponse { .. }
+            ));
+
+            let replacement = client
+                .resolve_render_change_response(
+                    27,
+                    Pdu::GetPaneRenderChangesResponse(test_render_change(
+                        27,
+                        1,
+                        "replacement-pane",
+                    )),
+                )
+                .expect("authoritative replacement snapshot may restart its sequence");
+            assert_eq!(replacement.seqno, 1);
+            assert_eq!(replacement.title, "replacement-pane");
+            assert!(client.render_change_snapshots.contains_key(&27));
+            assert!(client.render_change_snapshot_bytes > 0);
+
+            client.config.max_pending_render_changes = 1;
+            client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    28, 2, "queued-pane",
+                )))
+                .expect("first bounded unilateral render change");
+            let pending_bytes = client.pending_render_change_bytes;
+            let snapshot_bytes = client.render_change_snapshot_bytes;
+            let limit_error = client
+                .stash_unilateral_pdu(Pdu::GetPaneRenderChangesResponse(test_render_change(
+                    29,
+                    3,
+                    "over-limit-pane",
+                )))
+                .expect_err("second unilateral must exceed the one-entry queue");
+            assert!(matches!(
+                limit_error,
+                DirectMuxError::RetentionLimitExceeded {
+                    resource: "pending unilateral render changes",
+                    ..
+                }
+            ));
+            assert_eq!(client.pending_render_changes.len(), 1);
+            assert_eq!(client.pending_render_change_bytes, pending_bytes);
+            assert_eq!(
+                client.render_change_snapshot_bytes, snapshot_bytes,
+                "failed queue admission must not partially publish a snapshot"
+            );
+            assert!(!client.render_change_snapshots.contains_key(&29));
+
+            client
+                .stash_unilateral_pdu(Pdu::PaneRemoved(codec::PaneRemoved { pane_id: 28 }))
+                .expect("pane removal must release queued retention");
+            assert!(client.pending_render_changes.is_empty());
+            assert_eq!(client.pending_render_change_bytes, 0);
+            assert!(!client.render_change_snapshots.contains_key(&28));
+
             drop(client);
             server.await.expect("server task");
         });
@@ -4403,6 +5037,23 @@ mod tests {
                 client.pending_responses.contains_key(&second_serial),
                 "out-of-order second response should be stashed"
             );
+            let retained_bytes = client.pending_response_bytes;
+            assert!(
+                retained_bytes > 0,
+                "stashed response must contribute to the exact byte budget"
+            );
+
+            let duplicate_error = client
+                .stash_pending_response(second_serial, Pdu::UnitResponse(UnitResponse {}))
+                .expect_err("duplicate response serial must fail without replacing state");
+            assert!(matches!(
+                duplicate_error,
+                DirectMuxError::UnexpectedResponse { .. }
+            ));
+            assert_eq!(
+                client.pending_response_bytes, retained_bytes,
+                "duplicate rejection must preserve byte accounting"
+            );
 
             let second_response = client
                 .await_response(second_serial)
@@ -4416,6 +5067,21 @@ mod tests {
                 !client.pending_responses.contains_key(&second_serial),
                 "pending stash should be drained after serving the second response"
             );
+            assert_eq!(
+                client.pending_response_bytes, 0,
+                "draining the retained response must release its byte budget"
+            );
+            let stale_error = client
+                .stash_pending_response(second_serial, Pdu::UnitResponse(UnitResponse {}))
+                .expect_err("response for a completed request must be rejected");
+            assert!(matches!(
+                stale_error,
+                DirectMuxError::ResponseSerialNotOutstanding {
+                    serial,
+                    ..
+                } if serial == second_serial
+            ));
+            assert!(client.pending_responses.is_empty());
 
             drop(client);
             server.await.expect("server task");
@@ -4884,6 +5550,71 @@ mod tests {
         assert!(matches!(err, DirectMuxError::SerialExhausted));
     }
 
+    #[test]
+    fn connection_id_allocator_exhausts_without_wrapping_or_reusing() {
+        let next = std::sync::atomic::AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            next_connection_id_from(&next).expect("last admissible identity"),
+            u64::MAX - 1
+        );
+        assert_eq!(next.load(Ordering::Relaxed), u64::MAX);
+
+        let err = next_connection_id_from(&next)
+            .expect_err("terminal allocator state must fail permanently");
+        assert!(matches!(err, DirectMuxError::ConnectionIdExhausted));
+        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Permanent);
+        assert_eq!(
+            next.load(Ordering::Relaxed),
+            u64::MAX,
+            "exhaustion must not wrap the allocator"
+        );
+
+        let reserved = std::sync::atomic::AtomicU64::new(0);
+        assert!(matches!(
+            next_connection_id_from(&reserved),
+            Err(DirectMuxError::ConnectionIdExhausted)
+        ));
+        assert_eq!(reserved.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn retained_pdu_rejects_cross_connection_replay() {
+        let retained = RetainedMuxPdu::encode(41, 7, Pdu::UnitResponse(UnitResponse {}))
+            .expect("encode retained response");
+        let err = retained
+            .decode(42, 7)
+            .expect_err("successor connection must reject predecessor retention");
+        assert!(matches!(
+            err,
+            DirectMuxError::RetainedConnectionMismatch {
+                expected_connection_id: 42,
+                got_connection_id: 41,
+            }
+        ));
+        assert!(matches!(
+            retained
+                .decode(41, 7)
+                .expect("matching connection may decode retained state"),
+            Pdu::UnitResponse(_)
+        ));
+    }
+
+    #[test]
+    fn config_rejects_zero_retention_limits_before_transport_use() {
+        let mut config = DirectMuxClientConfig::default();
+        config.max_pending_render_changes = 0;
+        let err = config
+            .validate()
+            .expect_err("zero retention bound must fail closed");
+        assert!(matches!(
+            err,
+            DirectMuxError::InvalidLimit {
+                field: "max_pending_render_changes"
+            }
+        ));
+        assert_eq!(err.protocol_error_kind(), ProtocolErrorKind::Permanent);
+    }
+
     fn permutation_from_keys(keys: &[u32]) -> Vec<usize> {
         let mut with_index = keys
             .iter()
@@ -5190,6 +5921,13 @@ mod tests {
         assert!(config.read_timeout.as_secs() > 0);
         assert!(config.write_timeout.as_secs() > 0);
         assert!(config.max_frame_bytes > 0);
+        assert!(config.max_outstanding_requests > 0);
+        assert!(config.max_pending_responses > 0);
+        assert!(config.max_pending_response_bytes > 0);
+        assert!(config.max_pending_render_changes > 0);
+        assert!(config.max_pending_render_change_bytes > 0);
+        assert!(config.max_render_change_snapshots > 0);
+        assert!(config.max_render_change_snapshot_bytes > 0);
         assert!(config.socket_path.is_none());
         assert_eq!(
             config.compression_mode,

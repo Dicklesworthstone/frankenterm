@@ -874,7 +874,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use codec::{
@@ -1004,6 +1004,7 @@ mod tests {
             .expect("bind mock mux listener");
 
         let first_bad = Arc::new(AtomicBool::new(true));
+        let next_connection_ordinal = Arc::new(AtomicUsize::new(1));
 
         task::spawn(async move {
             loop {
@@ -1013,6 +1014,8 @@ mod tests {
                 };
 
                 let first_bad = Arc::clone(&first_bad);
+                let connection_ordinal =
+                    next_connection_ordinal.fetch_add(1, AtomicOrdering::Relaxed);
                 task::spawn(async move {
                     let mut read_buf = Vec::new();
                     loop {
@@ -1048,6 +1051,38 @@ mod tests {
                                             window_titles: HashMap::new(),
                                         })
                                     }
+                                }
+                                Pdu::GetPaneRenderChanges(req) => {
+                                    Pdu::GetPaneRenderChangesResponse(
+                                        GetPaneRenderChangesResponse {
+                                            pane_id: req.pane_id,
+                                            mouse_grabbed: false,
+                                            alt_screen_active: false,
+                                            cursor_position:
+                                                mux::renderable::StableCursorPosition::default(),
+                                            dimensions: mux::renderable::RenderableDimensions {
+                                                cols: 80,
+                                                viewport_rows: 24,
+                                                scrollback_rows: 0,
+                                                physical_top: 0,
+                                                scrollback_top: 0,
+                                                dpi: 96,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
+                                                reverse_video: false,
+                                            },
+                                            tiered_scrollback_status: None,
+                                            dirty_lines: vec![0..1],
+                                            title: format!(
+                                                "connection-{connection_ordinal}-pane-{}",
+                                                req.pane_id
+                                            ),
+                                            working_dir: None,
+                                            bonus_lines: Vec::new().into(),
+                                            input_serial: None,
+                                            seqno: if connection_ordinal == 1 { 99 } else { 1 },
+                                        },
+                                    )
                                 }
                                 Pdu::WriteToPane(_) => Pdu::UnitResponse(UnitResponse {}),
                                 Pdu::SendPaste(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -1495,6 +1530,72 @@ mod tests {
             assert_eq!(stats.recovery_attempts, 1);
             assert_eq!(stats.recovery_successes, 1);
             assert_eq!(stats.connections_created, 2);
+        });
+    }
+
+    #[test]
+    fn discarded_pool_connection_cannot_leak_render_cache_into_successor() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = spawn_mock_server_unexpected_list_panes_once(&temp_dir).await;
+            let config = MuxPoolConfig {
+                pool: PoolConfig {
+                    max_size: 1,
+                    idle_timeout: Duration::from_secs(60),
+                    acquire_timeout: Duration::from_millis(500),
+                },
+                mux: DirectMuxClientConfig::default().with_socket_path(socket_path),
+                recovery: MuxRecoveryConfig {
+                    enabled: true,
+                    retry_policy: RetryPolicy::new(
+                        Duration::from_millis(0),
+                        Duration::from_millis(0),
+                        1.0,
+                        0.0,
+                        Some(2),
+                    ),
+                },
+                pipeline_depth: 32,
+                pipeline_timeout: Duration::from_secs(5),
+            };
+            let pool = MuxPool::new(config);
+
+            let (mut predecessor, predecessor_guard) =
+                pool.acquire_client().await.expect("acquire predecessor");
+            let predecessor_id = predecessor.connection_id();
+            let old_render = predecessor
+                .get_pane_render_changes(77)
+                .await
+                .expect("seed predecessor render snapshot");
+            assert_eq!(old_render.seqno, 99);
+            assert!(old_render.title.starts_with("connection-1-"));
+            let error = predecessor
+                .list_panes()
+                .await
+                .expect_err("first connection must receive the injected bad response");
+            assert!(matches!(error, DirectMuxError::UnexpectedResponse { .. }));
+            drop(predecessor);
+            drop(predecessor_guard);
+
+            let (mut successor, successor_guard) =
+                pool.acquire_client().await.expect("acquire successor");
+            let successor_id = successor.connection_id();
+            assert_ne!(
+                predecessor_id, successor_id,
+                "replacement transport must have a distinct non-reusing identity"
+            );
+            let replacement_render = successor
+                .get_pane_render_changes(77)
+                .await
+                .expect("same pane ID with reset sequence must bootstrap on successor");
+            assert_eq!(replacement_render.seqno, 1);
+            assert!(replacement_render.title.starts_with("connection-2-"));
+
+            pool.return_client(successor).await;
+            drop(successor_guard);
+            let stats = pool.stats().await;
+            assert_eq!(stats.connections_created, 2);
+            assert_eq!(stats.pool.idle_count, 1);
         });
     }
 
