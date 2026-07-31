@@ -486,13 +486,11 @@ fn profile_realistic_workloads_and_emit_scored_targets() {
     // frames clear is the empirical result (profile-dependent: regex-heavy
     // redaction dominates in debug but compresses under release-perf), so it is
     // emitted data, not an asserted invariant.
-    let cleared: Vec<&str> = frames
+    let any_cleared = frames
         .iter()
-        .filter(|f| f.realistic_self_ns() / total_realistic_ns >= GATE_SHARE)
-        .map(|f| f.name)
-        .collect();
+        .any(|f| f.realistic_self_ns() / total_realistic_ns >= GATE_SHARE);
     assert!(
-        !cleared.is_empty(),
+        any_cleared,
         "no frame cleared the {:.1}% gate — measurement/gate is broken",
         GATE_SHARE * 100.0
     );
