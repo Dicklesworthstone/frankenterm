@@ -39,6 +39,14 @@ use wezterm_term::{
 
 const MAX_RENDER_APPLICATION_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
+fn should_process_unilateral_render_delta(
+    current_seqno: SequenceNo,
+    incoming_seqno: SequenceNo,
+    input_dispatch_serial: Option<InputSerial>,
+) -> bool {
+    incoming_seqno >= current_seqno || input_dispatch_serial.is_some()
+}
+
 #[allow(
     dead_code,
     reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
@@ -1060,18 +1068,32 @@ impl ClientPane {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
                 let mouse_grabbed = delta.mouse_grabbed;
                 let alt_screen_active = delta.alt_screen_active;
-                let is_new_enough = registration
-                    .try_with_current(|_| {
+                let current_seqno = registration.try_with_current(|_| {
                         let renderable = self.renderable.lock();
-                        renderable.get_current_seqno() <= delta.seqno
-                    })
-                    .unwrap_or(false);
-                if !is_new_enough {
+                        renderable.get_current_seqno()
+                    });
+                let Some(current_seqno) = current_seqno else {
+                    return Ok(());
+                };
+                if !should_process_unilateral_render_delta(
+                    current_seqno,
+                    delta.seqno,
+                    delta.input_serial,
+                ) {
                     return Ok(());
                 }
+                let stale_dispatch_ack = current_seqno > delta.seqno;
 
-                let bonus_lines = std::mem::take(&mut delta.bonus_lines);
-                let bonus_lines = hydrate_lines(rpc, delta.pane_id, bonus_lines).await;
+                let serialized_bonus_lines = std::mem::take(&mut delta.bonus_lines);
+                let bonus_lines = if stale_dispatch_ack {
+                    // The surface content is stale and will be rejected below. Do
+                    // not spend decompression or image-hydration work on it; the
+                    // dispatch serial and sequence fence are the only admissible
+                    // information in this reordered response.
+                    Vec::new()
+                } else {
+                    hydrate_lines(rpc, delta.pane_id, serialized_bonus_lines).await
+                };
 
                 let applied = rpc
                     .commit_sync(RpcConsumerKind::PaneUnilateral, || {
@@ -1093,10 +1115,17 @@ impl ClientPane {
                     })
                     .map_err(anyhow::Error::new)?;
                 if !applied {
-                    log::trace!(
-                        "discarding render delta for stale client pane registration {}",
-                        self.local_pane_id
-                    );
+                    if stale_dispatch_ack {
+                        log::trace!(
+                            "recorded reordered input dispatch fence without applying stale surface content for client pane {}",
+                            self.local_pane_id
+                        );
+                    } else {
+                        log::trace!(
+                            "discarding render delta for stale client pane registration {}",
+                            self.local_pane_id
+                        );
+                    }
                 }
             }
             Pdu::SetClipboard(SetClipboard {
@@ -1710,6 +1739,20 @@ mod tests {
             TopologyStreamId::from_bytes([0x7a; 16]),
             MuxSessionIncarnation::from_bytes([0x9c; 16]),
         );
+
+    #[test]
+    fn reordered_input_dispatch_ack_survives_unilateral_stale_filter() {
+        let serial = InputSerial::now();
+
+        assert!(!should_process_unilateral_render_delta(11, 10, None));
+        assert!(should_process_unilateral_render_delta(
+            11,
+            10,
+            Some(serial)
+        ));
+        assert!(should_process_unilateral_render_delta(11, 11, None));
+        assert!(should_process_unilateral_render_delta(11, 12, None));
+    }
 
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
         let unix = UnixDomain {
