@@ -24,7 +24,7 @@
 //! - **Deterministic percentiles**: Uses the nearest-rank method (no interpolation).
 //! - **Explicit labels**: Every timestamp carries caller-supplied producer and
 //!   clock-domain IDs; retained bundles must bind them externally.
-//! - **Budget algebra**: Per-stage budgets compose to an aggregate ceiling.
+//! - **Budget algebra**: Per-stage and aggregate budgets are enforced together.
 //! - **Honest overhead**: The legacy `BTreeMap` representation may allocate;
 //!   its benchmark measures proxy-framework overhead, not the production path.
 
@@ -403,6 +403,7 @@ impl InputLatencyMeasurement {
     /// duplicate keys before a `BTreeMap` could collapse them. The result still
     /// passes through [`Self::validate_complete`] before any duration or
     /// percentile can be computed.
+    #[cfg(test)]
     #[must_use]
     fn from_stages(
         id: u64,
