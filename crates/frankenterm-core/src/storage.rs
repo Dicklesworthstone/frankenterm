@@ -11294,8 +11294,11 @@ mod writer_io_scheduler_tests {
             "linger must never exceed the park, got {:?}",
             plan.linger
         );
+        let near_park_floor = park
+            .checked_sub(std::time::Duration::from_micros(50))
+            .expect("the fixed park must exceed the near-park tolerance");
         assert!(
-            plan.linger >= park - std::time::Duration::from_micros(50),
+            plan.linger >= near_park_floor,
             "an over-park W_q must clamp the linger up to ~park, got {:?}",
             plan.linger
         );

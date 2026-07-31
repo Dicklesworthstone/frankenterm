@@ -3246,7 +3246,7 @@ mod tests {
                     );
                     continue;
                 }
-                if to > SCHEMA_VERSION || to < 1 {
+                if !(1..=SCHEMA_VERSION).contains(&to) {
                     assert!(
                         result.is_err(),
                         "out-of-range to_version {to} must be rejected"

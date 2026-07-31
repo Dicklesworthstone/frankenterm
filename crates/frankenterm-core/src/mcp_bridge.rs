@@ -575,7 +575,7 @@ pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()>
     })
 }
 
-/// br-ft-kske1 + ft-0eby0: crate-visible mutex serializing every test
+/// br-ft-kske1 + ft-0eby0: parent-visible mutex serializing every test
 /// that constructs a server (degraded or full). The
 /// `MCP_BRIDGE_TOOLS_SKIPPED_NO_DB` counter is process-global, so any
 /// test that calls `reset_..._for_test()` followed by
@@ -588,7 +588,7 @@ pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()>
 /// the SAME lock; while it was tests-private they couldn't, and each of
 /// their builds injected +29 into this module's delta assertions.
 #[cfg(test)]
-pub(crate) fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub fn mcp_bridge_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }

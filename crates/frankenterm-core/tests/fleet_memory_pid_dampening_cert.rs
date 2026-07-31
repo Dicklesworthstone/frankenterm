@@ -229,8 +229,8 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
     let mut previous_response = open_loop_response(previous_theta);
     let mut previous_gain_residual = complex_magnitude(previous_response) - 1.0;
     let mut previous_unwrapped_phase = principal_phase_degrees(previous_response);
-    let mut phase_margins_degrees = Vec::new();
-    let mut gain_margins_db = Vec::new();
+    let mut unity_crossing_margins = Vec::new();
+    let mut real_axis_crossing_margins = Vec::new();
 
     for frequency_step in 2..=frequency_steps {
         let theta = if frequency_step == frequency_steps {
@@ -272,7 +272,7 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
                 reference_phase,
                 principal_phase_degrees(crossover_response),
             );
-            phase_margins_degrees.push(180.0 + crossover_phase);
+            unity_crossing_margins.push(180.0 + crossover_phase);
         }
 
         let crosses_real_axis = loop_response.1.abs() <= f64::EPSILON
@@ -290,7 +290,7 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
             if crossover_response.0 < 0.0 {
                 let crossover_magnitude = complex_magnitude(crossover_response);
                 assert!(crossover_magnitude > 0.0);
-                gain_margins_db.push(-20.0 * crossover_magnitude.log10());
+                real_axis_crossing_margins.push(-20.0 * crossover_magnitude.log10());
             }
         }
 
@@ -300,11 +300,11 @@ fn pid_nominal_model_margin_and_closed_loop_proxy() {
         previous_unwrapped_phase = unwrapped_phase;
     }
 
-    let phase_margin_degrees = phase_margins_degrees
+    let phase_margin_degrees = unity_crossing_margins
         .into_iter()
         .reduce(f64::min)
         .expect("the fixed nominal design must have a unity-gain crossover");
-    let gain_margin_db = gain_margins_db
+    let gain_margin_db = real_axis_crossing_margins
         .into_iter()
         .reduce(f64::min)
         .expect("the fixed nominal design must have a finite phase crossover");

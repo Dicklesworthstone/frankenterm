@@ -2521,10 +2521,10 @@ mod tests {
         let mut tailer = PaneTailer::new(7, config.min_interval);
         let start = Instant::now();
         let expected = [
-            Duration::from_nanos(75_000_000),
-            Duration::from_nanos(112_500_000),
-            Duration::from_nanos(168_750_000),
-            Duration::from_nanos(253_125_000),
+            Duration::from_millis(75),
+            Duration::from_micros(112_500),
+            Duration::from_micros(168_750),
+            Duration::from_micros(253_125),
             Duration::from_nanos(379_687_500),
             Duration::from_nanos(569_531_250),
             Duration::from_nanos(854_296_875),
@@ -2595,18 +2595,18 @@ mod tests {
         tailer.last_poll = start;
 
         let bursts = [
-            Duration::from_millis(1_000),
-            Duration::from_millis(2_000),
-            Duration::from_millis(3_000),
-            Duration::from_millis(4_000),
-            Duration::from_millis(5_000),
-            Duration::from_millis(6_000),
-            Duration::from_millis(7_000),
-            Duration::from_millis(8_000),
-            Duration::from_millis(9_000),
-            Duration::from_millis(10_000),
-            Duration::from_millis(11_000),
-            Duration::from_millis(12_000),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            Duration::from_secs(4),
+            Duration::from_secs(5),
+            Duration::from_secs(6),
+            Duration::from_secs(7),
+            Duration::from_secs(8),
+            Duration::from_secs(9),
+            Duration::from_secs(10),
+            Duration::from_secs(11),
+            Duration::from_secs(12),
         ];
 
         let mut burst_idx = 0;

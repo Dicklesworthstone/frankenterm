@@ -1577,9 +1577,8 @@ impl WeztermClient {
                                 crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
                                 0,
                             );
-                        #[allow(clippy::single_range_in_vec_init)]
                         let lines_result = pool
-                            .get_lines_with_cx(cx, pane_id, vec![start..chunk_end])
+                            .get_lines_with_cx(cx, pane_id, Vec::from([start..chunk_end]))
                             .await;
                         capacity_timer.finish_result(&lines_result);
                         match lines_result {

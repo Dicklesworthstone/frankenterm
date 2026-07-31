@@ -4227,7 +4227,9 @@ mod tests {
             CapturedSegmentKind::Gap { ref reason } => {
                 assert_eq!(reason, "resume_anchor_not_found");
             }
-            other => panic!("expected an explicit gap, got {other:?}"),
+            other @ CapturedSegmentKind::Delta => {
+                panic!("expected an explicit gap, got {other:?}")
+            }
         }
         assert_eq!(segment.content, "totally different scrollback\n");
         assert!(cursor.in_gap, "cursor must record that it is in a gap");

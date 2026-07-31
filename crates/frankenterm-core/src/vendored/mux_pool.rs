@@ -1072,7 +1072,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: vec![0..1],
+                                            dirty_lines: Vec::from([0..1]),
                                             title: format!(
                                                 "connection-{connection_ordinal}-pane-{}",
                                                 req.pane_id

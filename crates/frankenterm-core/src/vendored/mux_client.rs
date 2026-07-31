@@ -2903,7 +2903,6 @@ fn bonus_lines_to_text(lines: codec::SerializedLines) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use crate::runtime_async::unix as compat_unix;
@@ -3024,7 +3023,7 @@ mod tests {
                 reverse_video: false,
             },
             tiered_scrollback_status: None,
-            dirty_lines: vec![0..1],
+            dirty_lines: Vec::from([0..1]),
             title: title.to_string(),
             working_dir: None,
             bonus_lines: Vec::new().into(),
@@ -3934,7 +3933,7 @@ mod tests {
                                             reverse_video: false,
                                         },
                                         tiered_scrollback_status: None,
-                                        dirty_lines: vec![0..1],
+                                        dirty_lines: Vec::from([0..1]),
                                         title: "sideband-pane".to_string(),
                                         working_dir: None,
                                         bonus_lines: Vec::new().into(),
@@ -3970,7 +3969,7 @@ mod tests {
             assert_eq!(render.pane_id, 12);
             assert_eq!(render.seqno, 9);
             assert_eq!(render.title, "sideband-pane");
-            assert_eq!(render.dirty_lines, vec![0..1]);
+            assert_eq!(render.dirty_lines, Vec::from([0..1]));
 
             drop(client);
             server.await.expect("server task");
@@ -4043,7 +4042,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: vec![10..12],
+                                            dirty_lines: Vec::from([10..12]),
                                             title: "cached-pane".to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
@@ -4082,7 +4081,7 @@ mod tests {
                 .await
                 .expect("first render changes should succeed");
             assert_eq!(first.seqno, 14);
-            assert_eq!(first.dirty_lines, vec![10..12]);
+            assert_eq!(first.dirty_lines, Vec::from([10..12]));
 
             let second = client
                 .get_pane_render_changes(27)
@@ -8377,7 +8376,7 @@ mod tests {
                                         Vec::new()
                                     } else {
                                         emitted_output = true;
-                                        vec![0isize..2isize]
+                                        Vec::from([0isize..2isize])
                                     };
 
                                     Pdu::GetPaneRenderChangesResponse(
@@ -8498,7 +8497,7 @@ mod tests {
                                     Vec::new()
                                 } else {
                                     emitted_output = true;
-                                    vec![0isize..2isize]
+                                    Vec::from([0isize..2isize])
                                 };
 
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
@@ -8767,7 +8766,7 @@ mod tests {
                                             } else {
                                                 emitted_output = true;
                                                 match pane_id {
-                                                    21 => vec![0isize..1isize],
+                                                    21 => Vec::from([0isize..1isize]),
                                                     22 => vec![0isize..1isize, 2isize..4isize],
                                                     _ => Vec::new(),
                                                 }
@@ -8915,10 +8914,9 @@ mod tests {
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                             Pdu::GetPaneRenderChanges(_) => {
                                 render_requests += 1;
-                                #[allow(clippy::single_range_in_vec_init)]
                                 let (seqno, dirty_lines) = match render_requests {
-                                    1 => (1, vec![0isize..1isize]),
-                                    2 => (4, vec![1isize..2isize]),
+                                    1 => (1, Vec::from([0isize..1isize])),
+                                    2 => (4, Vec::from([1isize..2isize])),
                                     _ => (4, Vec::new()),
                                 };
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
@@ -9054,7 +9052,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: vec![0isize..1isize],
+                                            dirty_lines: Vec::from([0isize..1isize]),
                                             title: "disconnect-test".to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
@@ -9177,7 +9175,7 @@ mod tests {
                                         reverse_video: false,
                                     },
                                     tiered_scrollback_status: None,
-                                    dirty_lines: vec![0isize..1isize],
+                                    dirty_lines: Vec::from([0isize..1isize]),
                                     title: "cancel-full-channel".to_string(),
                                     working_dir: None,
                                     bonus_lines: Vec::new().into(),
@@ -9315,7 +9313,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: vec![0isize..1isize],
+                                            dirty_lines: Vec::from([0isize..1isize]),
                                             title: "cancel-full-channel-with-cx".to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
@@ -9430,7 +9428,7 @@ mod tests {
                                 let request_number =
                                     server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                 let (seqno, dirty_lines) = if request_number == 1 {
-                                    (1, vec![0isize..1isize])
+                                    (1, Vec::from([0isize..1isize]))
                                 } else {
                                     // Force a seqno jump with no dirty output. This drives
                                     // the poller through the gap-emission path while the
@@ -9576,7 +9574,7 @@ mod tests {
                                     let request_number =
                                         server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                     let (seqno, dirty_lines) = if request_number == 1 {
-                                        (1, vec![0isize..1isize])
+                                        (1, Vec::from([0isize..1isize]))
                                     } else {
                                         (3, Vec::new())
                                     };
