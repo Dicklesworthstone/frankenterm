@@ -74,10 +74,7 @@ fn engine_from_pack(pack: PatternPack, label: &str) -> PatternEngine {
 }
 
 fn usize_to_u64(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn q5_teddy_engine() -> PatternEngine {
