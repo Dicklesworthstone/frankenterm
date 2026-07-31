@@ -11,18 +11,19 @@
 //! therefore cannot establish production input-to-present latency. Reports
 //! emitted here are permanently classified as [`InputLatencyEvidenceClass::ProxyOnly`].
 //!
-//! Each timestamp names its producer and monotonic clock domain. Durations are
-//! admitted only when every required stage is present, adjacent timestamps use
-//! the same clock domain, and timestamps do not regress. Cross-domain latency
-//! requires the trace-v2 calibration contract; this legacy proxy refuses to
-//! guess it.
+//! Each timestamp carries caller-supplied producer and monotonic-clock labels.
+//! Durations are admitted only when every required stage is present, adjacent
+//! timestamps assert the same clock domain, and timestamps do not regress.
+//! Cross-domain latency requires the trace-v2 calibration contract; this legacy
+//! proxy refuses to guess it.
 //!
 //! # Design Principles
 //!
 //! - **Fail-closed evidence**: Empty, incomplete, ambiguous, or exhausted
 //!   collectors cannot pass a budget.
 //! - **Deterministic percentiles**: Uses the nearest-rank method (no interpolation).
-//! - **Explicit provenance**: Every timestamp binds producer and clock-domain IDs.
+//! - **Explicit labels**: Every timestamp carries caller-supplied producer and
+//!   clock-domain IDs; retained bundles must bind them externally.
 //! - **Budget algebra**: Per-stage budgets compose to an aggregate ceiling.
 //! - **Honest overhead**: The legacy `BTreeMap` representation may allocate;
 //!   its benchmark measures proxy-framework overhead, not the production path.
@@ -87,8 +88,79 @@ where
     }
 }
 
+/// A sequence decoder that never allocates or retains more than `MAX` items.
+struct BoundedVec<T, const MAX: usize>(Vec<T>);
+
+impl<'de, T, const MAX: usize> Deserialize<'de> for BoundedVec<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+        impl<'de, T, const MAX: usize> de::Visitor<'de> for BoundedVecVisitor<T, MAX>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = BoundedVec<T, MAX>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "a sequence containing at most {MAX} items")
+            }
+
+            fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                if let Some(length) = access.size_hint()
+                    && length > MAX
+                {
+                    return Err(de::Error::invalid_length(length, &self));
+                }
+
+                let initial_capacity = access.size_hint().unwrap_or(0).min(MAX);
+                let mut values = Vec::with_capacity(initial_capacity);
+                while values.len() < MAX {
+                    let Some(value) = access.next_element()? else {
+                        return Ok(BoundedVec(values));
+                    };
+                    values.push(value);
+                }
+
+                // Probe for one additional element without deserializing it as
+                // `T`; an adversarial oversize element may itself own an
+                // allocation much larger than this container's bound.
+                if access.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::invalid_length(
+                        MAX.saturating_add(1),
+                        &self,
+                    ));
+                }
+                Ok(BoundedVec(values))
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
+    }
+}
+
 /// Schema version for serialized legacy input-latency reports.
-pub const INPUT_LATENCY_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const INPUT_LATENCY_REPORT_SCHEMA_VERSION: u32 = 3;
+
+/// Schema version for serialized legacy input-latency collectors.
+pub const INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION: u32 = 1;
+
+/// Schema version for standalone serialized legacy budget verdicts.
+pub const INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum samples retained or decoded by the legacy proxy collector.
+pub const MAX_INPUT_LATENCY_EVIDENCE_WINDOW: usize = 65_536;
+
+/// Maximum adjacent stage intervals that can have distinct budgets.
+pub const MAX_INPUT_LATENCY_STAGE_BUDGETS: usize = InputLatencyStage::ALL.len() - 1;
 
 /// Authority class carried by every report and budget verdict from this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,11 +170,12 @@ pub enum InputLatencyEvidenceClass {
     ProxyOnly,
 }
 
-/// Producer identity within one evidence bundle.
+/// Caller-supplied producer label within one synthetic evidence bundle.
 ///
-/// The bundle producer registry binds this non-zero value to an exact host,
-/// process, build, and boot/session identity. Reusing a value for a different
-/// producer invalidates the surrounding bundle rather than this local DTO.
+/// This module does not own a producer registry and cannot independently bind
+/// the label to a host, process, build, or boot/session. A retained bundle must
+/// provide that external registry; without it the label remains unverified
+/// proxy metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct InputLatencyProducerId(NonZeroU64);
@@ -124,10 +197,11 @@ impl InputLatencyProducerId {
     }
 }
 
-/// Monotonic clock-domain identity within one evidence bundle.
+/// Caller-supplied clock-domain label within one synthetic evidence bundle.
 ///
-/// Equal IDs assert that timestamps share one subtraction-safe epoch and rate.
-/// Different IDs are never subtracted by this legacy framework.
+/// Equal labels assert that timestamps share one subtraction-safe epoch and
+/// rate; this module does not calibrate or independently prove that assertion.
+/// Different labels are never subtracted by this legacy framework.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct InputLatencyClockDomainId(NonZeroU64);
@@ -149,19 +223,20 @@ impl InputLatencyClockDomainId {
     }
 }
 
-/// One producer-qualified timestamp in a monotonic clock domain.
+/// One producer- and clock-labelled synthetic timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InputLatencyTimestamp {
     /// Timestamp in microseconds within `clock_domain_id`.
     pub timestamp_us: u64,
-    /// Exact producer that observed this stage.
+    /// Caller label for the producer; an external registry must bind it.
     pub producer_id: InputLatencyProducerId,
-    /// Subtraction-safe monotonic clock domain.
+    /// Caller assertion of a subtraction-safe monotonic clock domain.
     pub clock_domain_id: InputLatencyClockDomainId,
 }
 
 impl InputLatencyTimestamp {
-    /// Construct a producer- and clock-qualified timestamp.
+    /// Construct a producer- and clock-labelled timestamp.
     #[must_use]
     pub const fn new(
         timestamp_us: u64,
@@ -178,9 +253,10 @@ impl InputLatencyTimestamp {
 
 // ── Stage Definitions ────────────────────────────────────────────────────────
 
-/// Stages on the input-to-display critical path.
+/// Stages in the legacy proxy model, shaped like an input-to-presentation path.
 ///
-/// Ordered by pipeline position: user keypress through to visible pixel update.
+/// They are ordered by synthetic pipeline position. The final marker is not a
+/// measured display scanout or photon boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputLatencyStage {
@@ -188,13 +264,13 @@ pub enum InputLatencyStage {
     KeyEvent,
     /// Key event encoded and written to the PTY master fd.
     PtyWrite,
-    /// Response bytes read from the PTY slave fd.
+    /// Response bytes read from the PTY master/reader side.
     PtyRead,
     /// Terminal state machine updated (cell grid, cursor, attributes).
     TermUpdate,
     /// Render command buffer submitted to GPU API (wgpu/Metal).
     RenderSubmit,
-    /// GPU present completed (frame visible on screen).
+    /// Caller-recorded completion marker for a GPU present operation.
     GpuPresent,
 }
 
@@ -274,20 +350,21 @@ pub enum InputLatencyMeasurementError {
 
 /// A single proxy input-latency measurement.
 ///
-/// Each stage retains producer and clock provenance. Partial measurements are
-/// useful diagnostics, but are explicit non-pass evidence.
+/// Each stage retains caller-supplied producer and clock labels. Partial
+/// measurements are useful diagnostics, but are explicit non-pass evidence.
 #[derive(Debug, Clone, Serialize)]
 pub struct InputLatencyMeasurement {
     /// Monotonic measurement ID.
     pub id: u64,
-    /// Qualified timestamp at each recorded stage.
+    /// Caller-labelled timestamp at each recorded stage.
     stages: BTreeMap<InputLatencyStage, InputLatencyTimestamp>,
     /// First recording fault. Once tainted, a measurement cannot become valid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     recording_fault: Option<InputLatencyMeasurementError>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InputLatencyMeasurementWire {
     id: u64,
     stages: DuplicateRejectingMap<InputLatencyStage, InputLatencyTimestamp>,
@@ -320,12 +397,14 @@ impl InputLatencyMeasurement {
         }
     }
 
-    /// Reconstruct a measurement from serialized stage evidence.
+    /// Construct a measurement from an already-unique in-memory stage map.
     ///
-    /// The result still passes through [`Self::validate_complete`] before any
-    /// duration or percentile can be computed.
+    /// Wire callers must use `Deserialize`, whose duplicate-rejecting map sees
+    /// duplicate keys before a `BTreeMap` could collapse them. The result still
+    /// passes through [`Self::validate_complete`] before any duration or
+    /// percentile can be computed.
     #[must_use]
-    pub fn from_stages(
+    fn from_stages(
         id: u64,
         stages: BTreeMap<InputLatencyStage, InputLatencyTimestamp>,
     ) -> Self {
@@ -382,7 +461,8 @@ impl InputLatencyMeasurement {
             .ok_or(InputLatencyMeasurementError::MissingStage { stage })
     }
 
-    /// Validate completeness, clock comparability, and pipeline monotonicity.
+    /// Validate completeness, asserted clock-label consistency, and numeric
+    /// pipeline monotonicity.
     pub fn validate_complete(&self) -> Result<(), InputLatencyMeasurementError> {
         if let Some(error) = &self.recording_fault {
             return Err(error.clone());
@@ -551,6 +631,26 @@ pub enum InputLatencyEvidenceError {
     /// IDs must remain unique within the retained evidence window.
     #[error("measurement ID {id} appears more than once")]
     DuplicateMeasurementId { id: u64 },
+    /// Serialized collectors are admitted only at the exact supported schema.
+    #[error("collector schema version {actual} is unsupported; expected {expected}")]
+    UnsupportedCollectorSchemaVersion { expected: u32, actual: u32 },
+    /// Collector capacity must remain within the bounded evidence envelope.
+    #[error("collector capacity {capacity} is outside the supported evidence window")]
+    InvalidCapacity { capacity: usize },
+    /// A retained ring cannot contain more elements than its declared bound.
+    #[error("collector retains {sample_count} samples beyond capacity {capacity}")]
+    RetainedWindowExceedsCapacity {
+        capacity: usize,
+        sample_count: usize,
+    },
+    /// Allocator state must be reachable from the constructor and allocation API.
+    #[error(
+        "collector allocator state is invalid (next_id={next_id}, id_exhausted={id_exhausted})"
+    )]
+    InvalidAllocatorState { next_id: u64, id_exhausted: bool },
+    /// Every retained ID must have been allocated before the current frontier.
+    #[error("measurement ID {id} was not allocated before next ID {next_id}")]
+    UnallocatedMeasurementId { id: u64, next_id: u64 },
     /// One retained sample is incomplete, ambiguous, or non-monotonic.
     #[error("measurement {id} is invalid: {error}")]
     InvalidMeasurement {
@@ -568,6 +668,13 @@ impl InputLatencyEvidenceError {
             Self::MeasurementIdExhausted => "EVIDENCE_ID_EXHAUSTED",
             Self::ReservedMeasurementId { .. } => "EVIDENCE_RESERVED_ID",
             Self::DuplicateMeasurementId { .. } => "EVIDENCE_DUPLICATE_ID",
+            Self::UnsupportedCollectorSchemaVersion { .. } => {
+                "EVIDENCE_UNSUPPORTED_COLLECTOR_SCHEMA"
+            }
+            Self::InvalidCapacity { .. } => "EVIDENCE_INVALID_CAPACITY",
+            Self::RetainedWindowExceedsCapacity { .. } => "EVIDENCE_CAPACITY_EXCEEDED",
+            Self::InvalidAllocatorState { .. } => "EVIDENCE_INVALID_ALLOCATOR_STATE",
+            Self::UnallocatedMeasurementId { .. } => "EVIDENCE_UNALLOCATED_ID",
             Self::InvalidMeasurement { .. } => "EVIDENCE_INVALID_MEASUREMENT",
         }
     }
@@ -577,25 +684,63 @@ impl InputLatencyEvidenceError {
 ///
 /// The retained sample ring is bounded. Percentile queries first validate the
 /// entire retained window; they never filter invalid samples into a false pass.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InputLatencyCollector {
+    /// Exact wire schema for retained proxy collectors.
+    schema_version: u32,
     /// Raw measurements in recording order.
     measurements: VecDeque<InputLatencyMeasurement>,
     /// Maximum measurements to retain (ring buffer semantics).
     capacity: usize,
     /// Next measurement ID.
     next_id: u64,
-    /// Terminal fail-stop marker set before the reserved ID boundary.
+    /// Sticky fail-stop marker set by an allocation attempt at `u64::MAX`.
     id_exhausted: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputLatencyCollectorWire {
+    schema_version: u32,
+    measurements: BoundedVec<InputLatencyMeasurement, MAX_INPUT_LATENCY_EVIDENCE_WINDOW>,
+    capacity: usize,
+    next_id: u64,
+    id_exhausted: bool,
+}
+
+impl<'de> Deserialize<'de> for InputLatencyCollector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = InputLatencyCollectorWire::deserialize(deserializer)?;
+        let collector = Self {
+            schema_version: wire.schema_version,
+            measurements: wire.measurements.0.into_iter().collect(),
+            capacity: wire.capacity,
+            next_id: wire.next_id,
+            id_exhausted: wire.id_exhausted,
+        };
+        collector
+            .validate_structure()
+            .map_err(de::Error::custom)?;
+        Ok(collector)
+    }
 }
 
 impl InputLatencyCollector {
     /// Create a new collector with the given capacity.
+    ///
+    /// Zero or a value above [`MAX_INPUT_LATENCY_EVIDENCE_WINDOW`] is preserved
+    /// as an invalid configuration rather than normalized; every gate/report
+    /// from such a collector fails with
+    /// [`InputLatencyEvidenceError::InvalidCapacity`].
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
+            schema_version: INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION,
             measurements: VecDeque::with_capacity(capacity.min(4096)),
-            capacity: capacity.max(1),
+            capacity,
             next_id: 1,
             id_exhausted: false,
         }
@@ -603,9 +748,10 @@ impl InputLatencyCollector {
 
     /// Start a new measurement and return its handle.
     ///
-    /// ID zero and `u64::MAX` are reserved. Reaching the terminal boundary
-    /// permanently fail-stops this collector so ignored allocation errors
-    /// cannot leave an apparently authoritative report.
+    /// ID zero and `u64::MAX` are reserved. `u64::MAX - 1` is the last usable
+    /// identity; a subsequent allocation attempt at `u64::MAX` permanently
+    /// fail-stops this collector so ignoring the error cannot leave an
+    /// apparently authoritative report.
     pub fn begin_measurement(
         &mut self,
     ) -> Result<InputLatencyMeasurement, InputLatencyCollectorError> {
@@ -619,14 +765,27 @@ impl InputLatencyCollector {
             return Err(InputLatencyCollectorError::MeasurementIdExhausted);
         };
         self.next_id = next_id;
-        if next_id == u64::MAX {
-            self.id_exhausted = true;
-        }
         Ok(InputLatencyMeasurement::new(id))
     }
 
-    /// Record a completed measurement.
+    /// Record a completed or externally constructed measurement.
+    ///
+    /// A non-reserved imported ID at or beyond the local frontier advances the
+    /// frontier before retention. This keeps subsequent locally allocated IDs
+    /// strictly newer while allowing begun measurements to complete out of
+    /// order. Duplicate, reserved, and invalid samples remain visible to the
+    /// fail-closed retained-window validator.
     pub fn record(&mut self, measurement: InputLatencyMeasurement) {
+        if !self.id_exhausted
+            && measurement.id >= self.next_id
+            && measurement.id != u64::MAX
+            && let Some(next_id) = measurement.id.checked_add(1)
+        {
+            self.next_id = next_id;
+        }
+        if self.capacity == 0 || self.capacity > MAX_INPUT_LATENCY_EVIDENCE_WINDOW {
+            return;
+        }
         if self.measurements.len() >= self.capacity {
             self.measurements.pop_front();
         }
@@ -639,9 +798,60 @@ impl InputLatencyCollector {
         self.measurements.len()
     }
 
+    /// Return the exact serialized collector schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    fn validate_structure(&self) -> Result<(), InputLatencyEvidenceError> {
+        if self.schema_version != INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION {
+            return Err(
+                InputLatencyEvidenceError::UnsupportedCollectorSchemaVersion {
+                    expected: INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION,
+                    actual: self.schema_version,
+                },
+            );
+        }
+        if self.capacity == 0 || self.capacity > MAX_INPUT_LATENCY_EVIDENCE_WINDOW {
+            return Err(InputLatencyEvidenceError::InvalidCapacity {
+                capacity: self.capacity,
+            });
+        }
+        if self.measurements.len() > self.capacity {
+            return Err(InputLatencyEvidenceError::RetainedWindowExceedsCapacity {
+                capacity: self.capacity,
+                sample_count: self.measurements.len(),
+            });
+        }
+        if self.next_id == 0 || (self.id_exhausted && self.next_id != u64::MAX) {
+            return Err(InputLatencyEvidenceError::InvalidAllocatorState {
+                next_id: self.next_id,
+                id_exhausted: self.id_exhausted,
+            });
+        }
+
+        for measurement in &self.measurements {
+            if measurement.id == 0 || measurement.id == u64::MAX {
+                return Err(InputLatencyEvidenceError::ReservedMeasurementId {
+                    id: measurement.id,
+                });
+            }
+            if measurement.id >= self.next_id {
+                return Err(InputLatencyEvidenceError::UnallocatedMeasurementId {
+                    id: measurement.id,
+                    next_id: self.next_id,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate the complete retained evidence window.
     pub fn validate_evidence(&self) -> Result<(), InputLatencyEvidenceError> {
-        if self.id_exhausted || self.next_id == 0 || self.next_id == u64::MAX {
+        self.validate_structure()?;
+        if self.id_exhausted {
             return Err(InputLatencyEvidenceError::MeasurementIdExhausted);
         }
         if self.measurements.is_empty() {
@@ -650,11 +860,6 @@ impl InputLatencyCollector {
 
         let mut ids = BTreeSet::new();
         for measurement in &self.measurements {
-            if measurement.id == 0 || measurement.id == u64::MAX {
-                return Err(InputLatencyEvidenceError::ReservedMeasurementId {
-                    id: measurement.id,
-                });
-            }
             if !ids.insert(measurement.id) {
                 return Err(InputLatencyEvidenceError::DuplicateMeasurementId {
                     id: measurement.id,
@@ -758,6 +963,7 @@ pub struct StageBudget {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StageBudgetWire {
     stage: InputLatencyStage,
     targets: DuplicateRejectingMap<Percentile, u64>,
@@ -789,8 +995,9 @@ pub struct InputLatencyBudget {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InputLatencyBudgetWire {
-    stages: Vec<StageBudget>,
+    stages: BoundedVec<StageBudget, MAX_INPUT_LATENCY_STAGE_BUDGETS>,
     aggregate: DuplicateRejectingMap<Percentile, u64>,
     regression_threshold: f64,
 }
@@ -802,7 +1009,7 @@ impl<'de> Deserialize<'de> for InputLatencyBudget {
     {
         let wire = InputLatencyBudgetWire::deserialize(deserializer)?;
         Ok(Self {
-            stages: wire.stages,
+            stages: wire.stages.0,
             aggregate: wire.aggregate.0,
             regression_threshold: wire.regression_threshold,
         })
@@ -836,11 +1043,19 @@ pub enum InputLatencyBudgetError {
     #[error("aggregate latency budget has no percentile targets")]
     EmptyAggregateTargets,
     /// NaN, infinity, zero, and negative thresholds are not admissible.
-    #[error("regression threshold {value} must be finite and greater than zero")]
-    InvalidRegressionThreshold { value: f64 },
+    ///
+    /// Exact IEEE-754 bits keep every diagnosis serializable without coercing
+    /// NaN or infinity into a misleading JSON value.
+    #[error(
+        "regression threshold bits 0x{value_bits:016x} must encode a finite value greater than zero"
+    )]
+    InvalidRegressionThreshold { value_bits: u64 },
     /// Two entries for one stage make configuration precedence ambiguous.
     #[error("stage {stage} has more than one budget entry")]
     DuplicateStageBudget { stage: InputLatencyStage },
+    /// Only the five adjacent pipeline intervals can carry stage budgets.
+    #[error("budget contains {count} stage entries; maximum is {maximum}")]
+    TooManyStageBudgets { count: usize, maximum: usize },
     /// A configured stage budget must actually contain a target.
     #[error("stage {stage} has no percentile targets")]
     EmptyStageTargets { stage: InputLatencyStage },
@@ -860,6 +1075,7 @@ impl InputLatencyBudgetError {
             Self::EmptyAggregateTargets => "BUDGET_CONFIG_EMPTY_AGGREGATE",
             Self::InvalidRegressionThreshold { .. } => "BUDGET_CONFIG_INVALID_THRESHOLD",
             Self::DuplicateStageBudget { .. } => "BUDGET_CONFIG_DUPLICATE_STAGE",
+            Self::TooManyStageBudgets { .. } => "BUDGET_CONFIG_TOO_MANY_STAGES",
             Self::EmptyStageTargets { .. } => "BUDGET_CONFIG_EMPTY_STAGE",
             Self::StageHasNoPredecessor { .. } => "BUDGET_CONFIG_NO_PREDECESSOR",
             Self::EffectiveBudgetOverflow { .. } => "BUDGET_CONFIG_OVERFLOW",
@@ -867,155 +1083,197 @@ impl InputLatencyBudgetError {
     }
 }
 
-/// Result of evaluating proxy measurements against a budget.
+/// Serialize-only result of evaluating proxy measurements against a budget.
+///
+/// The finite configured threshold and successful per-detail gate boundaries
+/// are diagnostic fields, but the exact source collector, full budget, and
+/// content-bound external producer/clock registry are not retained here. This
+/// derived verdict deliberately does not implement `Deserialize`; consumers
+/// must replay that complete bundle rather than trust decoded `passed` fields.
+///
+/// ```compile_fail
+/// use frankenterm_core::input_latency::BudgetCheckResult;
+/// let _: BudgetCheckResult = serde_json::from_str("{}").unwrap();
+/// ```
+///
+/// ```compile_fail
+/// use frankenterm_core::input_latency::{
+///     InputLatencyBudget, InputLatencyCollector, evaluate_budget,
+/// };
+/// let mut verdict = evaluate_budget(
+///     &InputLatencyCollector::new(1),
+///     &InputLatencyBudget::default(),
+/// );
+/// verdict.passed = true;
+/// ```
 #[derive(Debug, Clone, Serialize)]
 pub struct BudgetCheckResult {
+    /// Exact wire schema for this standalone derived verdict.
+    schema_version: u32,
     /// Permanent authority boundary for this legacy framework.
-    pub evidence_class: InputLatencyEvidenceClass,
-    /// Number of retained samples presented to the gate.
-    pub sample_count: usize,
-    /// Whether all budget checks passed.
-    pub passed: bool,
-    /// Per-percentile results.
-    pub details: Vec<BudgetCheckDetail>,
-    /// Evidence failure, if the collector was not admissible.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_error: Option<InputLatencyEvidenceError>,
-    /// Budget configuration failure, if the gate itself was invalid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_error: Option<InputLatencyBudgetError>,
-    /// Overall reason code.
-    pub reason_code: String,
-}
-
-/// Detail for a single percentile budget check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BudgetCheckDetail {
-    /// `None` means aggregate KeyEvent -> GpuPresent; `Some(stage)` means
-    /// `stage.predecessor() -> stage`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stage: Option<InputLatencyStage>,
-    /// The percentile checked.
-    pub percentile: Percentile,
-    /// Budget target in microseconds.
-    pub budget_us: u64,
-    /// Measured value in microseconds.
-    pub measured_us: u64,
-    /// Whether this check passed.
-    pub passed: bool,
-    /// Ratio of measured/budget (1.0 = exactly at budget).
-    ///
-    /// A zero budget has no finite ratio and is represented as `None`.
-    pub ratio: Option<f64>,
-    /// Reason code.
-    pub reason_code: String,
-}
-
-#[derive(Deserialize)]
-struct BudgetCheckResultWire {
     evidence_class: InputLatencyEvidenceClass,
+    /// Number of retained samples presented to the gate.
     sample_count: usize,
+    /// Finite configured threshold, whether valid or invalid.
+    ///
+    /// `None` is retained for non-finite invalid configurations so the result
+    /// remains serializable; the typed `budget_error` remains authoritative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regression_threshold: Option<f64>,
+    /// Whether all budget checks passed.
     passed: bool,
+    /// Per-percentile results.
     details: Vec<BudgetCheckDetail>,
-    #[serde(default)]
+    /// Evidence failure, if the collector was not admissible.
+    #[serde(skip_serializing_if = "Option::is_none")]
     evidence_error: Option<InputLatencyEvidenceError>,
-    #[serde(default)]
+    /// Budget configuration failure, if the gate itself was invalid.
+    #[serde(skip_serializing_if = "Option::is_none")]
     budget_error: Option<InputLatencyBudgetError>,
+    /// Overall reason code.
     reason_code: String,
 }
 
 impl BudgetCheckResult {
-    fn validate_contract(&self) -> Result<(), &'static str> {
-        match (&self.evidence_error, &self.budget_error) {
-            (Some(_), Some(_)) => {
-                return Err("budget verdict cannot carry evidence and budget errors together");
-            }
-            (Some(error), None) => {
-                if self.passed || !self.details.is_empty() {
-                    return Err("evidence-error verdict must fail without details");
-                }
-                if self.reason_code != error.reason_code() {
-                    return Err("evidence-error verdict reason code does not match its error");
-                }
-                return Ok(());
-            }
-            (None, Some(error)) => {
-                if self.passed || !self.details.is_empty() {
-                    return Err("budget-error verdict must fail without details");
-                }
-                if self.reason_code != error.reason_code() {
-                    return Err("budget-error verdict reason code does not match its error");
-                }
-                return Ok(());
-            }
-            (None, None) => {}
-        }
+    /// Return the exact serialized verdict schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
 
-        if self.sample_count == 0 {
-            return Err("detail-bearing budget verdict requires at least one sample");
-        }
-        if self.details.is_empty() {
-            return Err("error-free budget verdict requires at least one detail");
-        }
+    /// Return the permanent authority boundary for this verdict.
+    #[must_use]
+    pub const fn evidence_class(&self) -> InputLatencyEvidenceClass {
+        self.evidence_class
+    }
 
-        for detail in &self.details {
-            let expected_ratio = (detail.budget_us > 0)
-                .then(|| detail.measured_us as f64 / detail.budget_us as f64);
-            if detail.ratio != expected_ratio {
-                return Err("budget detail ratio does not match measured and target values");
-            }
+    /// Return the number of retained samples presented to the gate.
+    #[must_use]
+    pub const fn sample_count(&self) -> usize {
+        self.sample_count
+    }
 
-            let expected_reason = match (detail.stage, detail.passed) {
-                (None, true) => format!("BUDGET_OK_AGGREGATE_{}", detail.percentile),
-                (None, false) => {
-                    format!("BUDGET_EXCEEDED_AGGREGATE_{}", detail.percentile)
-                }
-                (Some(stage), true) => {
-                    format!("BUDGET_OK_{}_{}", stage.label(), detail.percentile)
-                }
-                (Some(stage), false) => {
-                    format!("BUDGET_EXCEEDED_{}_{}", stage.label(), detail.percentile)
-                }
-            };
-            if detail.reason_code != expected_reason {
-                return Err("budget detail reason code does not match its outcome");
-            }
-        }
+    /// Return the finite configured threshold; inspect `budget_error()` before
+    /// treating it as an admitted gate parameter.
+    #[must_use]
+    pub const fn regression_threshold(&self) -> Option<f64> {
+        self.regression_threshold
+    }
 
-        let all_details_passed = self.details.iter().all(|detail| detail.passed);
-        if self.passed != all_details_passed {
-            return Err("budget verdict disagrees with its detail outcomes");
-        }
-        let expected_reason = if self.passed {
-            "ALL_PROXY_BUDGETS_MET"
-        } else {
-            "PROXY_BUDGET_VIOLATION"
-        };
-        if self.reason_code != expected_reason {
-            return Err("budget verdict reason code does not match its outcome");
-        }
+    /// Return whether every configured budget check passed.
+    #[must_use]
+    pub const fn passed(&self) -> bool {
+        self.passed
+    }
 
-        Ok(())
+    /// Return the derived per-percentile verdicts.
+    #[must_use]
+    pub fn details(&self) -> &[BudgetCheckDetail] {
+        &self.details
+    }
+
+    /// Return the evidence failure when the collector was inadmissible.
+    #[must_use]
+    pub const fn evidence_error(&self) -> Option<&InputLatencyEvidenceError> {
+        self.evidence_error.as_ref()
+    }
+
+    /// Return the budget failure when the configuration was inadmissible.
+    #[must_use]
+    pub const fn budget_error(&self) -> Option<&InputLatencyBudgetError> {
+        self.budget_error.as_ref()
+    }
+
+    /// Return the stable overall reason code.
+    #[must_use]
+    pub fn reason_code(&self) -> &str {
+        &self.reason_code
     }
 }
 
-impl<'de> Deserialize<'de> for BudgetCheckResult {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = BudgetCheckResultWire::deserialize(deserializer)?;
-        let result = Self {
-            evidence_class: wire.evidence_class,
-            sample_count: wire.sample_count,
-            passed: wire.passed,
-            details: wire.details,
-            evidence_error: wire.evidence_error,
-            budget_error: wire.budget_error,
-            reason_code: wire.reason_code,
-        };
-        result.validate_contract().map_err(de::Error::custom)?;
-        Ok(result)
+/// Detail for a single percentile budget check.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetCheckDetail {
+    /// `None` means aggregate KeyEvent -> GpuPresent; `Some(stage)` means
+    /// `stage.predecessor() -> stage`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<InputLatencyStage>,
+    /// The percentile checked.
+    percentile: Percentile,
+    /// Raw, unscaled budget target in microseconds.
+    budget_us: u64,
+    /// Exact floored result of scaling `budget_us` by the threshold.
+    effective_budget_us: u64,
+    /// Measured value in microseconds.
+    measured_us: u64,
+    /// Whether this check passed.
+    passed: bool,
+    /// Ratio of measured/raw budget (1.0 = exactly at the raw target).
+    ///
+    /// A zero budget has no finite ratio and is represented as `None`.
+    raw_budget_ratio: Option<f64>,
+    /// Ratio of measured/effective budget (1.0 = the actual gate boundary).
+    ///
+    /// A zero effective budget has no finite ratio and is represented as
+    /// `None`.
+    effective_budget_ratio: Option<f64>,
+    /// Reason code.
+    reason_code: String,
+}
+
+impl BudgetCheckDetail {
+    /// Return the end stage for a per-stage check, or `None` for aggregate.
+    #[must_use]
+    pub const fn stage(&self) -> Option<InputLatencyStage> {
+        self.stage
+    }
+
+    /// Return the percentile checked.
+    #[must_use]
+    pub const fn percentile(&self) -> Percentile {
+        self.percentile
+    }
+
+    /// Return the configured, unscaled budget in microseconds.
+    #[must_use]
+    pub const fn budget_us(&self) -> u64 {
+        self.budget_us
+    }
+
+    /// Return the exact scaled-and-floored gate boundary in microseconds.
+    #[must_use]
+    pub const fn effective_budget_us(&self) -> u64 {
+        self.effective_budget_us
+    }
+
+    /// Return the measured percentile in microseconds.
+    #[must_use]
+    pub const fn measured_us(&self) -> u64 {
+        self.measured_us
+    }
+
+    /// Return whether this individual check passed.
+    #[must_use]
+    pub const fn passed(&self) -> bool {
+        self.passed
+    }
+
+    /// Return measured/raw-budget, or `None` for a zero raw budget.
+    #[must_use]
+    pub const fn raw_budget_ratio(&self) -> Option<f64> {
+        self.raw_budget_ratio
+    }
+
+    /// Return measured/effective-budget, or `None` for a zero gate boundary.
+    #[must_use]
+    pub const fn effective_budget_ratio(&self) -> Option<f64> {
+        self.effective_budget_ratio
+    }
+
+    /// Return the stable detail reason code.
+    #[must_use]
+    pub fn reason_code(&self) -> &str {
+        &self.reason_code
     }
 }
 
@@ -1025,7 +1283,13 @@ fn validate_budget(budget: &InputLatencyBudget) -> Result<(), InputLatencyBudget
     }
     if !budget.regression_threshold.is_finite() || budget.regression_threshold <= 0.0 {
         return Err(InputLatencyBudgetError::InvalidRegressionThreshold {
-            value: budget.regression_threshold,
+            value_bits: budget.regression_threshold.to_bits(),
+        });
+    }
+    if budget.stages.len() > MAX_INPUT_LATENCY_STAGE_BUDGETS {
+        return Err(InputLatencyBudgetError::TooManyStageBudgets {
+            count: budget.stages.len(),
+            maximum: MAX_INPUT_LATENCY_STAGE_BUDGETS,
         });
     }
 
@@ -1063,27 +1327,75 @@ fn effective_budget_us(
     budget_us: u64,
     threshold: f64,
 ) -> Result<u64, InputLatencyBudgetError> {
-    const U64_EXCLUSIVE_MAX_AS_F64: f64 = 18_446_744_073_709_551_616.0;
-
-    let scaled = budget_us as f64 * threshold;
-    if !scaled.is_finite() || scaled >= U64_EXCLUSIVE_MAX_AS_F64 {
-        return Err(InputLatencyBudgetError::EffectiveBudgetOverflow {
-            budget_us,
-            threshold,
+    if !threshold.is_finite() || threshold <= 0.0 {
+        return Err(InputLatencyBudgetError::InvalidRegressionThreshold {
+            value_bits: threshold.to_bits(),
         });
     }
-    Ok(scaled.floor() as u64)
+    if budget_us == 0 {
+        return Ok(0);
+    }
+
+    // Decode the positive finite f64 exactly as `significand * 2^exponent`.
+    // Multiplying `budget_us as f64` first can round upward above 2^53 and mint
+    // a pass one microsecond beyond the mathematical budget. The 53-bit
+    // significand times u64 fits in u128, so integer shifts can compute the
+    // exact floor of the represented threshold without a second rounding.
+    const FRACTION_BITS: u32 = 52;
+    const EXPONENT_BIAS: i32 = 1023;
+    const FRACTION_MASK: u64 = (1_u64 << FRACTION_BITS) - 1;
+
+    let bits = threshold.to_bits();
+    let encoded_exponent = ((bits >> FRACTION_BITS) & 0x7ff) as i32;
+    let fraction = bits & FRACTION_MASK;
+    let (significand, exponent) = if encoded_exponent == 0 {
+        (u128::from(fraction), 1 - EXPONENT_BIAS - FRACTION_BITS as i32)
+    } else {
+        (
+            u128::from((1_u64 << FRACTION_BITS) | fraction),
+            encoded_exponent - EXPONENT_BIAS - FRACTION_BITS as i32,
+        )
+    };
+    let product = u128::from(budget_us) * significand;
+    let scaled = if exponent >= 0 {
+        let shift = exponent as u32;
+        if shift >= u64::BITS || product > (u128::from(u64::MAX) >> shift) {
+            return Err(InputLatencyBudgetError::EffectiveBudgetOverflow {
+                budget_us,
+                threshold,
+            });
+        }
+        product << shift
+    } else {
+        let shift = exponent.unsigned_abs();
+        if shift >= u128::BITS {
+            0
+        } else {
+            product >> shift
+        }
+    };
+
+    u64::try_from(scaled).map_err(|_| InputLatencyBudgetError::EffectiveBudgetOverflow {
+        budget_us,
+        threshold,
+    })
 }
 
 fn failed_budget_check(
     collector: &InputLatencyCollector,
+    budget: &InputLatencyBudget,
     evidence_error: Option<InputLatencyEvidenceError>,
     budget_error: Option<InputLatencyBudgetError>,
     reason_code: &str,
 ) -> BudgetCheckResult {
     BudgetCheckResult {
+        schema_version: INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION,
         evidence_class: InputLatencyEvidenceClass::ProxyOnly,
         sample_count: collector.count(),
+        regression_threshold: budget
+            .regression_threshold
+            .is_finite()
+            .then_some(budget.regression_threshold),
         passed: false,
         details: Vec::new(),
         evidence_error,
@@ -1100,11 +1412,11 @@ pub fn evaluate_budget(
 ) -> BudgetCheckResult {
     if let Err(error) = validate_budget(budget) {
         let reason_code = error.reason_code();
-        return failed_budget_check(collector, None, Some(error), reason_code);
+        return failed_budget_check(collector, budget, None, Some(error), reason_code);
     }
     if let Err(error) = collector.validate_evidence() {
         let reason_code = error.reason_code();
-        return failed_budget_check(collector, Some(error), None, reason_code);
+        return failed_budget_check(collector, budget, Some(error), None, reason_code);
     }
 
     let mut details = Vec::new();
@@ -1115,18 +1427,21 @@ pub fn evaluate_budget(
             Ok(value) => value,
             Err(error) => {
                 let reason_code = error.reason_code();
-                return failed_budget_check(collector, Some(error), None, reason_code);
+                return failed_budget_check(collector, budget, Some(error), None, reason_code);
             }
         };
         let effective_budget = match effective_budget_us(budget_us, budget.regression_threshold) {
             Ok(value) => value,
             Err(error) => {
                 let reason_code = error.reason_code();
-                return failed_budget_check(collector, None, Some(error), reason_code);
+                return failed_budget_check(collector, budget, None, Some(error), reason_code);
             }
         };
         let passed = measured_us <= effective_budget;
-        let ratio = (budget_us > 0).then(|| measured_us as f64 / budget_us as f64);
+        let raw_budget_ratio =
+            (budget_us > 0).then(|| measured_us as f64 / budget_us as f64);
+        let effective_budget_ratio = (effective_budget > 0)
+            .then(|| measured_us as f64 / effective_budget as f64);
 
         if !passed {
             all_passed = false;
@@ -1136,9 +1451,11 @@ pub fn evaluate_budget(
             stage: None,
             percentile,
             budget_us,
+            effective_budget_us: effective_budget,
             measured_us,
             passed,
-            ratio,
+            raw_budget_ratio,
+            effective_budget_ratio,
             reason_code: if passed {
                 format!("BUDGET_OK_AGGREGATE_{percentile}")
             } else {
@@ -1153,7 +1470,7 @@ pub fn evaluate_budget(
                 stage: stage_budget.stage,
             };
             let reason_code = error.reason_code();
-            return failed_budget_check(collector, None, Some(error), reason_code);
+            return failed_budget_check(collector, budget, None, Some(error), reason_code);
         };
         for (&percentile, &budget_us) in &stage_budget.targets {
             let measured_us = match collector.stage_latency_percentile(
@@ -1164,7 +1481,7 @@ pub fn evaluate_budget(
                 Ok(value) => value,
                 Err(error) => {
                     let reason_code = error.reason_code();
-                    return failed_budget_check(collector, Some(error), None, reason_code);
+                    return failed_budget_check(collector, budget, Some(error), None, reason_code);
                 }
             };
             let effective_budget =
@@ -1172,11 +1489,14 @@ pub fn evaluate_budget(
                     Ok(value) => value,
                     Err(error) => {
                         let reason_code = error.reason_code();
-                        return failed_budget_check(collector, None, Some(error), reason_code);
+                        return failed_budget_check(collector, budget, None, Some(error), reason_code);
                     }
                 };
             let passed = measured_us <= effective_budget;
-            let ratio = (budget_us > 0).then(|| measured_us as f64 / budget_us as f64);
+            let raw_budget_ratio =
+                (budget_us > 0).then(|| measured_us as f64 / budget_us as f64);
+            let effective_budget_ratio = (effective_budget > 0)
+                .then(|| measured_us as f64 / effective_budget as f64);
 
             if !passed {
                 all_passed = false;
@@ -1186,9 +1506,11 @@ pub fn evaluate_budget(
                 stage: Some(stage_budget.stage),
                 percentile,
                 budget_us,
+                effective_budget_us: effective_budget,
                 measured_us,
                 passed,
-                ratio,
+                raw_budget_ratio,
+                effective_budget_ratio,
                 reason_code: if passed {
                     format!("BUDGET_OK_{}_{percentile}", stage_budget.stage.label())
                 } else {
@@ -1202,8 +1524,10 @@ pub fn evaluate_budget(
     }
 
     BudgetCheckResult {
+        schema_version: INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION,
         evidence_class: InputLatencyEvidenceClass::ProxyOnly,
         sample_count: collector.count(),
+        regression_threshold: Some(budget.regression_threshold),
         passed: all_passed,
         details,
         evidence_error: None,
@@ -1228,29 +1552,103 @@ pub enum InputLatencyEvidenceStatus {
     Invalid,
 }
 
-/// Structured proxy latency report suitable for offline regression output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Derived proxy latency summary for immediate regression diagnostics.
+///
+/// This DTO is intentionally serialize-only. It omits the labelled source
+/// timestamps, exact budget, and external producer/clock registry, so decoding
+/// a report alone could not replay or verify its verdict. Retained proxy
+/// evidence must bundle the serialized [`InputLatencyCollector`], exact budget,
+/// and external registry; production authority belongs to trace v2, not this
+/// summary.
+///
+/// ```compile_fail
+/// use frankenterm_core::input_latency::InputLatencyReport;
+/// let _: InputLatencyReport = serde_json::from_str("{}").unwrap();
+/// ```
+///
+/// ```compile_fail
+/// use frankenterm_core::input_latency::{InputLatencyCollector, generate_report};
+/// let mut report = generate_report(&InputLatencyCollector::new(1), None);
+/// report.admitted_sample_count = report.sample_count;
+/// ```
+#[derive(Debug, Clone, Serialize)]
 pub struct InputLatencyReport {
     /// Serialized report schema version.
-    pub schema_version: u32,
+    schema_version: u32,
     /// Permanent authority boundary.
-    pub evidence_class: InputLatencyEvidenceClass,
+    evidence_class: InputLatencyEvidenceClass,
     /// Whether the full retained window was admitted.
-    pub evidence_status: InputLatencyEvidenceStatus,
+    evidence_status: InputLatencyEvidenceStatus,
     /// Typed fail-closed diagnosis for an invalid window.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_error: Option<InputLatencyEvidenceError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_error: Option<InputLatencyEvidenceError>,
     /// Number of measurements in the sample.
-    pub sample_count: usize,
+    sample_count: usize,
     /// Samples admitted to percentile computation; either all or zero.
-    pub admitted_sample_count: usize,
+    admitted_sample_count: usize,
     /// Per-percentile end-to-end latency in microseconds.
-    pub percentiles: BTreeMap<Percentile, u64>,
+    percentiles: BTreeMap<Percentile, u64>,
     /// Per-stage breakdown at p50.
-    pub stage_breakdown_p50: BTreeMap<String, u64>,
+    stage_breakdown_p50: BTreeMap<String, u64>,
     /// Budget evaluation result (None if no budget configured).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_check: Option<BudgetCheckResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_check: Option<BudgetCheckResult>,
+}
+
+impl InputLatencyReport {
+    /// Return the serialized report schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Return the permanent authority boundary for this report.
+    #[must_use]
+    pub const fn evidence_class(&self) -> InputLatencyEvidenceClass {
+        self.evidence_class
+    }
+
+    /// Return whether the entire retained window was admitted.
+    #[must_use]
+    pub const fn evidence_status(&self) -> InputLatencyEvidenceStatus {
+        self.evidence_status
+    }
+
+    /// Return the typed evidence failure for an invalid retained window.
+    #[must_use]
+    pub const fn evidence_error(&self) -> Option<&InputLatencyEvidenceError> {
+        self.evidence_error.as_ref()
+    }
+
+    /// Return the number of measurements presented to the report generator.
+    #[must_use]
+    pub const fn sample_count(&self) -> usize {
+        self.sample_count
+    }
+
+    /// Return the number admitted to percentile computation: all or zero.
+    #[must_use]
+    pub const fn admitted_sample_count(&self) -> usize {
+        self.admitted_sample_count
+    }
+
+    /// Return the derived aggregate percentiles.
+    #[must_use]
+    pub fn percentiles(&self) -> &BTreeMap<Percentile, u64> {
+        &self.percentiles
+    }
+
+    /// Return the derived adjacent-stage p50 breakdown.
+    #[must_use]
+    pub fn stage_breakdown_p50(&self) -> &BTreeMap<String, u64> {
+        &self.stage_breakdown_p50
+    }
+
+    /// Return the optional derived budget verdict.
+    #[must_use]
+    pub const fn budget_check(&self) -> Option<&BudgetCheckResult> {
+        self.budget_check.as_ref()
+    }
 }
 
 /// Generate a latency report from a collector with optional budget evaluation.
@@ -1354,6 +1752,21 @@ mod tests {
                 .expect("fixture stages are unique");
         }
         m
+    }
+
+    fn make_total_measurement(id: u64, total_us: u64) -> InputLatencyMeasurement {
+        let mut measurement = InputLatencyMeasurement::new(id);
+        for &stage in InputLatencyStage::ALL {
+            let timestamp_us = if stage == InputLatencyStage::GpuPresent {
+                total_us
+            } else {
+                0
+            };
+            measurement
+                .record_stage(stage, timestamp(timestamp_us))
+                .expect("fixture stages are unique");
+        }
+        measurement
     }
 
     fn record_measurement(collector: &mut InputLatencyCollector, base: u64, step: u64) {
@@ -1526,11 +1939,12 @@ mod tests {
     #[test]
     fn collector_duplicate_measurement_id_fails_closed() {
         let mut collector = InputLatencyCollector::new(100);
-        collector.record(make_measurement(7, 1000, 100));
-        collector.record(make_measurement(7, 2000, 100));
+        let id = collector.begin_measurement().unwrap().id;
+        collector.record(make_measurement(id, 1000, 100));
+        collector.record(make_measurement(id, 2000, 100));
         assert_eq!(
             collector.validate_evidence(),
-            Err(InputLatencyEvidenceError::DuplicateMeasurementId { id: 7 })
+            Err(InputLatencyEvidenceError::DuplicateMeasurementId { id })
         );
     }
 
@@ -1636,6 +2050,91 @@ mod tests {
 
         // 2500 < 2000*1.5=3000, so should pass
         assert!(result.passed);
+        assert_eq!(result.regression_threshold, Some(1.5));
+        let p50 = result
+            .details
+            .iter()
+            .find(|detail| detail.percentile == Percentile::P50)
+            .unwrap();
+        assert_eq!(p50.budget_us, 2000);
+        assert_eq!(p50.effective_budget_us, 3000);
+        assert_eq!(p50.measured_us, 2500);
+        assert_eq!(p50.raw_budget_ratio, Some(1.25));
+        assert_eq!(p50.effective_budget_ratio, Some(2500.0 / 3000.0));
+    }
+
+    #[test]
+    fn effective_budget_scaling_is_exact_above_f64_integer_range() {
+        let budget_us = (1_u64 << 53) + 3;
+        let measured_us = budget_us + 1;
+        let mut collector = InputLatencyCollector::new(1);
+        let id = collector.begin_measurement().unwrap().id;
+        collector.record(make_total_measurement(id, measured_us));
+        let budget = InputLatencyBudget {
+            stages: Vec::new(),
+            aggregate: [(Percentile::P50, budget_us)].into_iter().collect(),
+            regression_threshold: 1.0,
+        };
+
+        let result = evaluate_budget(&collector, &budget);
+        assert!(!result.passed);
+        let detail = result.details.first().unwrap();
+        assert_eq!(detail.budget_us, budget_us);
+        assert_eq!(detail.effective_budget_us, budget_us);
+        assert_eq!(detail.measured_us, measured_us);
+        assert!(!detail.passed);
+    }
+
+    #[test]
+    fn exact_scaling_handles_binary_fractions_limits_and_invalid_inputs() {
+        assert_eq!(effective_budget_us(3, 0.5), Ok(1));
+        assert_eq!(effective_budget_us(3, 1.5), Ok(4));
+        assert_eq!(effective_budget_us(u64::MAX, 1.0), Ok(u64::MAX));
+        assert!(matches!(
+            effective_budget_us(u64::MAX, 2.0),
+            Err(InputLatencyBudgetError::EffectiveBudgetOverflow { .. })
+        ));
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            assert!(matches!(
+                effective_budget_us(1, threshold),
+                Err(InputLatencyBudgetError::InvalidRegressionThreshold { value_bits })
+                    if value_bits == threshold.to_bits()
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_threshold_verdicts_remain_json_serializable() {
+        let mut collector = InputLatencyCollector::new(1);
+        record_measurement(&mut collector, 1000, 100);
+
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            let budget = InputLatencyBudget {
+                regression_threshold: threshold,
+                ..Default::default()
+            };
+            let result = evaluate_budget(&collector, &budget);
+            assert!(!result.passed);
+            assert!(matches!(
+                &result.budget_error,
+                Some(InputLatencyBudgetError::InvalidRegressionThreshold { value_bits })
+                    if *value_bits == threshold.to_bits()
+            ));
+            let value = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                value["schema_version"],
+                serde_json::json!(INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION)
+            );
+            assert_eq!(
+                value["budget_error"]["value_bits"],
+                serde_json::json!(threshold.to_bits())
+            );
+            if threshold.is_finite() {
+                assert_eq!(value["regression_threshold"], serde_json::json!(threshold));
+            } else {
+                assert!(value.get("regression_threshold").is_none());
+            }
+        }
     }
 
     #[test]
@@ -1830,14 +2329,129 @@ mod tests {
     }
 
     #[test]
+    fn serialized_duplicate_stage_key_is_rejected_before_overwrite() {
+        let json = r#"{
+            "id": 1,
+            "stages": {
+                "key_event": {
+                    "timestamp_us": 100,
+                    "producer_id": 1,
+                    "clock_domain_id": 1
+                },
+                "key_event": {
+                    "timestamp_us": 200,
+                    "producer_id": 1,
+                    "clock_domain_id": 1
+                }
+            }
+        }"#;
+        let error = serde_json::from_str::<InputLatencyMeasurement>(json).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate map key key_event"),
+            "unexpected duplicate-stage error: {error}"
+        );
+    }
+
+    #[test]
+    fn evidence_input_wires_reject_unknown_fields_and_zero_labels() {
+        let mut timestamp_value = serde_json::to_value(timestamp(100)).unwrap();
+        timestamp_value["future_clock_authority"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<InputLatencyTimestamp>(timestamp_value).is_err());
+
+        let measurement = make_measurement(1, 1000, 100);
+        let mut measurement_value = serde_json::to_value(&measurement).unwrap();
+        measurement_value["recording_faults"] = serde_json::json!([]);
+        assert!(
+            serde_json::from_value::<InputLatencyMeasurement>(measurement_value.clone()).is_err()
+        );
+
+        measurement_value
+            .as_object_mut()
+            .unwrap()
+            .remove("recording_faults");
+        measurement_value["stages"]["key_event"]["future_clock_authority"] =
+            serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<InputLatencyMeasurement>(measurement_value).is_err()
+        );
+
+        for label in ["producer_id", "clock_domain_id"] {
+            let mut zero_label = serde_json::to_value(&measurement).unwrap();
+            zero_label["stages"]["key_event"][label] = serde_json::json!(0);
+            assert!(serde_json::from_value::<InputLatencyMeasurement>(zero_label).is_err());
+        }
+
+        let mut collector_value = serde_json::to_value(InputLatencyCollector::new(1)).unwrap();
+        collector_value["future_allocator_authority"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<InputLatencyCollector>(collector_value).is_err());
+
+        let mut stage_budget_value = serde_json::to_value(StageBudget {
+            stage: InputLatencyStage::PtyWrite,
+            targets: [(Percentile::P50, 100)].into_iter().collect(),
+        })
+        .unwrap();
+        stage_budget_value["future_stage_authority"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StageBudget>(stage_budget_value).is_err());
+
+        let mut budget_value = serde_json::to_value(InputLatencyBudget::default()).unwrap();
+        budget_value["future_budget_authority"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<InputLatencyBudget>(budget_value).is_err());
+    }
+
+    #[test]
     fn collector_serde_roundtrip() {
         let mut collector = InputLatencyCollector::new(50);
         for i in 0..5u64 {
             record_measurement(&mut collector, 1000 + i, 200);
         }
         let json = serde_json::to_string(&collector).unwrap();
-        let back: InputLatencyCollector = serde_json::from_str(&json).unwrap();
+        let mut back: InputLatencyCollector = serde_json::from_str(&json).unwrap();
         assert_eq!(back.count(), 5);
+        assert_eq!(back.schema_version(), INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION);
+        assert_eq!(back.begin_measurement().unwrap().id, 6);
+    }
+
+    #[test]
+    fn collector_serde_rejects_unallocated_id_and_invalid_capacity() {
+        let mut collector = InputLatencyCollector::new(2);
+        record_measurement(&mut collector, 1000, 100);
+        let mut encoded = serde_json::to_value(&collector).unwrap();
+        encoded["next_id"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<InputLatencyCollector>(encoded.clone()).is_err());
+
+        encoded["next_id"] = serde_json::json!(2);
+        encoded["capacity"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<InputLatencyCollector>(encoded).is_err());
+    }
+
+    #[test]
+    fn collector_serde_rejects_schema_capacity_and_retained_window_incoherence() {
+        let mut collector = InputLatencyCollector::new(2);
+        record_measurement(&mut collector, 1000, 100);
+        record_measurement(&mut collector, 2000, 100);
+        let encoded = serde_json::to_value(&collector).unwrap();
+
+        let mut unsupported_schema = encoded.clone();
+        unsupported_schema["schema_version"] =
+            serde_json::json!(INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION + 1);
+        assert!(serde_json::from_value::<InputLatencyCollector>(unsupported_schema).is_err());
+
+        let mut retained_overflow = encoded.clone();
+        retained_overflow["capacity"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<InputLatencyCollector>(retained_overflow).is_err());
+
+        let mut incoherent_exhaustion = encoded;
+        incoherent_exhaustion["id_exhausted"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<InputLatencyCollector>(incoherent_exhaustion).is_err());
+
+        let oversized = InputLatencyCollector::new(MAX_INPUT_LATENCY_EVIDENCE_WINDOW + 1);
+        assert_eq!(
+            oversized.validate_evidence(),
+            Err(InputLatencyEvidenceError::InvalidCapacity {
+                capacity: MAX_INPUT_LATENCY_EVIDENCE_WINDOW + 1
+            })
+        );
+        assert!(serde_json::from_str::<BoundedVec<u8, 2>>("[1,2,3]").is_err());
     }
 
     #[test]
@@ -1845,45 +2459,72 @@ mod tests {
         let budget = InputLatencyBudget::default();
         let json = serde_json::to_string(&budget).unwrap();
         let back: InputLatencyBudget = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.aggregate.len(), budget.aggregate.len());
-        assert!((back.regression_threshold - budget.regression_threshold).abs() < 1e-9);
+        assert_eq!(back.aggregate, budget.aggregate);
+        assert_eq!(
+            back.regression_threshold.to_bits(),
+            budget.regression_threshold.to_bits()
+        );
     }
 
     #[test]
-    fn report_serde_roundtrip() {
+    fn serialized_duplicate_budget_targets_are_rejected() {
+        let aggregate = r#"{
+            "stages": [],
+            "aggregate": {"p50": 100, "p50": 200},
+            "regression_threshold": 1.0
+        }"#;
+        assert!(serde_json::from_str::<InputLatencyBudget>(aggregate).is_err());
+
+        let stage = r#"{
+            "stage": "pty_write",
+            "targets": {"p95": 100, "p95": 200}
+        }"#;
+        assert!(serde_json::from_str::<StageBudget>(stage).is_err());
+
+        let stage_value = serde_json::json!({
+            "stage": "pty_write",
+            "targets": {"p50": 100}
+        });
+        let oversized_stages = serde_json::json!({
+            "stages": vec![stage_value; MAX_INPUT_LATENCY_STAGE_BUDGETS + 1],
+            "aggregate": {"p50": 1000},
+            "regression_threshold": 1.0
+        });
+        assert!(serde_json::from_value::<InputLatencyBudget>(oversized_stages).is_err());
+    }
+
+    #[test]
+    fn report_is_serialize_only_derived_summary() {
         let mut collector = InputLatencyCollector::new(100);
         for i in 0..10u64 {
             record_measurement(&mut collector, 1000 + i, 300);
         }
         let report = generate_report(&collector, Some(&InputLatencyBudget::default()));
-        let json = serde_json::to_string(&report).unwrap();
-        let back: InputLatencyReport = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.sample_count, report.sample_count);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value["schema_version"],
+            serde_json::json!(INPUT_LATENCY_REPORT_SCHEMA_VERSION)
+        );
+        assert_eq!(value["sample_count"], serde_json::json!(10));
+        assert_eq!(value["evidence_class"], serde_json::json!("proxy_only"));
     }
 
     #[test]
-    fn budget_check_result_serde_roundtrip() {
-        let result = BudgetCheckResult {
-            evidence_class: InputLatencyEvidenceClass::ProxyOnly,
-            sample_count: 1,
-            passed: true,
-            details: vec![BudgetCheckDetail {
-                stage: None,
-                percentile: Percentile::P50,
-                budget_us: 2000,
-                measured_us: 1500,
-                passed: true,
-                ratio: Some(0.75),
-                reason_code: "BUDGET_OK_AGGREGATE_p50".to_string(),
-            }],
-            evidence_error: None,
-            budget_error: None,
-            reason_code: "ALL_PROXY_BUDGETS_MET".to_string(),
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        let back: BudgetCheckResult = serde_json::from_str(&json).unwrap();
-        assert!(back.passed);
-        assert_eq!(back.details.len(), 1);
+    fn budget_check_is_serialize_only_derived_verdict() {
+        let mut collector = InputLatencyCollector::new(1);
+        record_measurement(&mut collector, 1000, 100);
+        let result = evaluate_budget(&collector, &InputLatencyBudget::default());
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            value["schema_version"],
+            serde_json::json!(INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION)
+        );
+        assert_eq!(value["passed"], serde_json::json!(true));
+        assert_eq!(value["sample_count"], serde_json::json!(1));
+        assert_eq!(
+            value["reason_code"],
+            serde_json::json!("ALL_PROXY_BUDGETS_MET")
+        );
     }
 
     #[test]
@@ -1906,6 +2547,33 @@ mod tests {
         assert_eq!(m1.id, 1);
         assert_eq!(m2.id, 2);
         assert_eq!(m3.id, 3);
+    }
+
+    #[test]
+    fn imported_measurement_advances_allocator_frontier_without_reordering() {
+        let mut collector = InputLatencyCollector::new(4);
+        collector.record(make_measurement(999, 1000, 100));
+        assert_eq!(collector.validate_evidence(), Ok(()));
+        assert_eq!(collector.begin_measurement().unwrap().id, 1000);
+    }
+
+    #[test]
+    fn max_minus_one_is_last_usable_id_then_exhaustion_taints() {
+        let mut collector = InputLatencyCollector::new(2);
+        collector.next_id = u64::MAX - 1;
+        let measurement = collector.begin_measurement().unwrap();
+        assert_eq!(measurement.id, u64::MAX - 1);
+        collector.record(make_measurement(measurement.id, 1000, 100));
+        assert_eq!(collector.validate_evidence(), Ok(()));
+
+        assert_eq!(
+            collector.begin_measurement(),
+            Err(InputLatencyCollectorError::MeasurementIdExhausted)
+        );
+        assert_eq!(
+            collector.validate_evidence(),
+            Err(InputLatencyEvidenceError::MeasurementIdExhausted)
+        );
     }
 
     #[test]

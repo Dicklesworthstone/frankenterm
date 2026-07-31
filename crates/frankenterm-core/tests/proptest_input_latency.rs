@@ -1,20 +1,20 @@
 // Property-based tests for input_latency module (ft-1memj.25).
 //
-// Covers: serde roundtrips for InputLatencyStage, Percentile, InputLatencyMeasurement,
-// InputLatencyCollector, StageBudget, InputLatencyBudget, BudgetCheckResult,
-// BudgetCheckDetail, InputLatencyReport. Also tests behavioral invariants:
-// percentile monotonicity, collector capacity, budget evaluation correctness.
+// Covers: serde roundtrips for input DTOs, serialize-only generated verdicts,
+// duplicate-key and allocator-state rejection, and behavioral invariants for
+// percentiles, collector capacity, and budget evaluation.
 #![allow(clippy::ignored_unit_patterns)]
 
 use proptest::prelude::*;
 
 use frankenterm_core::input_latency::{
-    BudgetCheckDetail, BudgetCheckResult, INPUT_LATENCY_REPORT_SCHEMA_VERSION,
-    InputLatencyBudget, InputLatencyClockDomainId, InputLatencyCollector,
-    InputLatencyCollectorError, InputLatencyEvidenceClass, InputLatencyEvidenceStatus,
-    InputLatencyMeasurement, InputLatencyMeasurementError, InputLatencyProducerId,
-    InputLatencyReport, InputLatencyStage, InputLatencyTimestamp, Percentile, StageBudget,
-    evaluate_budget, generate_report, percentile_nearest_rank,
+    INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION, INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION,
+    INPUT_LATENCY_REPORT_SCHEMA_VERSION, InputLatencyBudget, InputLatencyClockDomainId,
+    InputLatencyCollector, InputLatencyCollectorError, InputLatencyEvidenceError,
+    InputLatencyEvidenceStatus, InputLatencyMeasurement, InputLatencyMeasurementError,
+    InputLatencyProducerId, InputLatencyStage, InputLatencyTimestamp,
+    MAX_INPUT_LATENCY_EVIDENCE_WINDOW, Percentile, StageBudget, evaluate_budget,
+    generate_report, percentile_nearest_rank,
 };
 
 // =============================================================================
@@ -73,12 +73,23 @@ fn complete_measurement(id: u64, start: u64, total: u64) -> InputLatencyMeasurem
     measurement
 }
 
+fn measurement_from_unique_stages(
+    id: u64,
+    stages: impl IntoIterator<Item = (InputLatencyStage, InputLatencyTimestamp)>,
+) -> InputLatencyMeasurement {
+    let mut measurement = InputLatencyMeasurement::new(id);
+    for (stage, timestamp) in stages {
+        measurement.record_stage(stage, timestamp).unwrap();
+    }
+    measurement
+}
+
 fn arb_measurement() -> impl Strategy<Value = InputLatencyMeasurement> {
     (
         1..10_000u64,
         prop::collection::btree_map(arb_stage(), arb_timestamp(), 0..6),
     )
-        .prop_map(|(id, stages)| InputLatencyMeasurement::from_stages(id, stages))
+        .prop_map(|(id, stages)| measurement_from_unique_stages(id, stages))
 }
 
 fn arb_stage_budget() -> impl Strategy<Value = StageBudget> {
@@ -104,66 +115,30 @@ fn arb_budget() -> impl Strategy<Value = InputLatencyBudget> {
         )
 }
 
-fn arb_budget_check_detail() -> impl Strategy<Value = BudgetCheckDetail> {
-    (
-        prop::option::of(arb_stage()),
-        arb_percentile(),
-        100..100_000u64,
-        0..200_000u64,
-        any::<bool>(),
-        prop::option::of(0.0f64..5.0),
-        "[A-Z_]{5,20}",
-    )
-        .prop_map(|(stage, percentile, budget_us, measured_us, passed, ratio, reason_code)| {
-            BudgetCheckDetail {
-                stage,
-                percentile,
-                budget_us,
-                measured_us,
-                passed,
-                ratio,
-                reason_code,
-            }
-        })
-}
+fn assert_invalid_gate_and_report(
+    collector: &InputLatencyCollector,
+    expected_reason_code: &str,
+) -> Result<(), TestCaseError> {
+    let budget = InputLatencyBudget::default();
+    let verdict = evaluate_budget(collector, &budget);
+    prop_assert!(!verdict.passed());
+    prop_assert_eq!(verdict.reason_code(), expected_reason_code);
+    prop_assert!(verdict.evidence_error().is_some());
+    prop_assert!(verdict.details().is_empty());
 
-fn arb_budget_check_result() -> impl Strategy<Value = BudgetCheckResult> {
-    (
-        any::<bool>(),
-        prop::collection::vec(arb_budget_check_detail(), 0..5),
-        "[A-Z_]{5,20}",
-    )
-        .prop_map(|(passed, details, reason_code)| BudgetCheckResult {
-            evidence_class: InputLatencyEvidenceClass::ProxyOnly,
-            sample_count: 1,
-            passed,
-            details,
-            evidence_error: None,
-            budget_error: None,
-            reason_code,
-        })
-}
-
-fn arb_report() -> impl Strategy<Value = InputLatencyReport> {
-    (
-        0..500usize,
-        prop::collection::btree_map(arb_percentile(), 100..100_000u64, 0..4),
-        prop::collection::btree_map("[a-z_]{3,15}", 0..100_000u64, 0..6),
-        prop::option::of(arb_budget_check_result()),
-    )
-        .prop_map(
-            |(sample_count, percentiles, stage_breakdown_p50, budget_check)| InputLatencyReport {
-                schema_version: INPUT_LATENCY_REPORT_SCHEMA_VERSION,
-                evidence_class: InputLatencyEvidenceClass::ProxyOnly,
-                evidence_status: InputLatencyEvidenceStatus::ValidProxy,
-                evidence_error: None,
-                sample_count,
-                admitted_sample_count: sample_count,
-                percentiles,
-                stage_breakdown_p50,
-                budget_check,
-            },
-        )
+    let report = generate_report(collector, Some(&budget));
+    prop_assert_eq!(report.evidence_status(), InputLatencyEvidenceStatus::Invalid);
+    prop_assert_eq!(report.sample_count(), collector.count());
+    prop_assert_eq!(report.admitted_sample_count(), 0);
+    prop_assert!(report.evidence_error().is_some());
+    prop_assert!(report.percentiles().is_empty());
+    prop_assert!(report.stage_breakdown_p50().is_empty());
+    let report_verdict = report
+        .budget_check()
+        .expect("a supplied budget must produce a verdict");
+    prop_assert!(!report_verdict.passed());
+    prop_assert_eq!(report_verdict.reason_code(), expected_reason_code);
+    Ok(())
 }
 
 // =============================================================================
@@ -203,7 +178,7 @@ proptest! {
         let json = serde_json::to_string(&sb).unwrap();
         let back: StageBudget = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(sb.stage, back.stage);
-        prop_assert_eq!(sb.targets.len(), back.targets.len());
+        prop_assert_eq!(&sb.targets, &back.targets);
     }
 
     #[test]
@@ -211,41 +186,82 @@ proptest! {
         let json = serde_json::to_string(&b).unwrap();
         let back: InputLatencyBudget = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(b.stages.len(), back.stages.len());
-        prop_assert_eq!(b.aggregate.len(), back.aggregate.len());
+        for (expected, actual) in b.stages.iter().zip(&back.stages) {
+            prop_assert_eq!(expected.stage, actual.stage);
+            prop_assert_eq!(&expected.targets, &actual.targets);
+        }
+        prop_assert_eq!(&b.aggregate, &back.aggregate);
+        prop_assert_eq!(b.regression_threshold.to_bits(), back.regression_threshold.to_bits());
     }
 
     #[test]
-    fn budget_check_detail_serde_roundtrip(d in arb_budget_check_detail()) {
-        let json = serde_json::to_string(&d).unwrap();
-        let back: BudgetCheckDetail = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(d.stage, back.stage);
-        prop_assert_eq!(d.percentile, back.percentile);
-        prop_assert_eq!(d.budget_us, back.budget_us);
-        prop_assert_eq!(d.measured_us, back.measured_us);
-        prop_assert_eq!(d.passed, back.passed);
-        prop_assert_eq!(d.ratio, back.ratio);
-        prop_assert_eq!(d.reason_code, back.reason_code);
+    fn generated_budget_check_details_serialize_all_fields(
+        count in 1..10usize,
+        total_us in 0..20_000u64,
+    ) {
+        let mut collector = InputLatencyCollector::new(count);
+        for index in 0..count {
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, index as u64, total_us));
+        }
+        let result = evaluate_budget(&collector, &InputLatencyBudget::default());
+        prop_assert!(!result.details().is_empty());
+        for detail in result.details() {
+            let value = serde_json::to_value(detail).unwrap();
+            prop_assert!(value.get("percentile").is_some());
+            prop_assert!(value.get("budget_us").is_some());
+            prop_assert!(value.get("effective_budget_us").is_some());
+            prop_assert!(value.get("measured_us").is_some());
+            prop_assert!(value.get("passed").is_some());
+            prop_assert!(value.get("raw_budget_ratio").is_some());
+            prop_assert!(value.get("effective_budget_ratio").is_some());
+            prop_assert!(value.get("ratio").is_none());
+            prop_assert!(value.get("reason_code").is_some());
+        }
     }
 
     #[test]
-    fn budget_check_result_serde_roundtrip(r in arb_budget_check_result()) {
-        let json = serde_json::to_string(&r).unwrap();
-        let back: BudgetCheckResult = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(r.passed, back.passed);
-        prop_assert_eq!(r.details.len(), back.details.len());
-        prop_assert_eq!(r.reason_code, back.reason_code);
+    fn generated_budget_check_serializes_coherent_shape(
+        count in 1..10usize,
+        total_us in 0..20_000u64,
+    ) {
+        let mut collector = InputLatencyCollector::new(count);
+        for index in 0..count {
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, index as u64, total_us));
+        }
+        let result = evaluate_budget(&collector, &InputLatencyBudget::default());
+        let value = serde_json::to_value(&result).unwrap();
+        prop_assert_eq!(
+            value["schema_version"].as_u64(),
+            Some(u64::from(INPUT_LATENCY_BUDGET_CHECK_SCHEMA_VERSION))
+        );
+        prop_assert_eq!(value["sample_count"].as_u64(), Some(count as u64));
+        prop_assert_eq!(value["passed"].as_bool(), Some(result.passed()));
+        prop_assert_eq!(value["reason_code"].as_str(), Some(result.reason_code()));
     }
 
     #[test]
-    fn report_serde_roundtrip(r in arb_report()) {
-        let json = serde_json::to_string(&r).unwrap();
-        let back: InputLatencyReport = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(r.sample_count, back.sample_count);
-        prop_assert_eq!(r.percentiles.len(), back.percentiles.len());
-        prop_assert_eq!(r.stage_breakdown_p50.len(), back.stage_breakdown_p50.len());
-        let has_check = r.budget_check.is_some();
-        let back_has = back.budget_check.is_some();
-        prop_assert_eq!(has_check, back_has);
+    fn generated_report_serializes_coherent_shape(
+        count in 1..10usize,
+        total_us in 0..20_000u64,
+        with_budget in any::<bool>(),
+    ) {
+        let mut collector = InputLatencyCollector::new(count);
+        for index in 0..count {
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, index as u64, total_us));
+        }
+        let budget = InputLatencyBudget::default();
+        let report = generate_report(&collector, with_budget.then_some(&budget));
+        let value = serde_json::to_value(&report).unwrap();
+        prop_assert_eq!(
+            value["schema_version"].as_u64(),
+            Some(u64::from(INPUT_LATENCY_REPORT_SCHEMA_VERSION))
+        );
+        prop_assert_eq!(value["sample_count"].as_u64(), Some(count as u64));
+        prop_assert_eq!(value["admitted_sample_count"].as_u64(), Some(count as u64));
+        prop_assert_eq!(value.get("budget_check").is_some(), with_budget);
     }
 }
 
@@ -296,13 +312,24 @@ proptest! {
 
     #[test]
     fn measurement_total_latency_needs_all_stages(
-        id in 0..10_000u64,
+        id in 1..10_000u64,
         ts in 100..1_000_000u64
     ) {
         let mut m = InputLatencyMeasurement::new(id);
         m.record_stage(InputLatencyStage::KeyEvent, proxy_timestamp(ts)).unwrap();
         let total = m.total_latency_us();
         prop_assert!(total.is_err());
+
+        let mut collector = InputLatencyCollector::new(1);
+        collector.record(m);
+        prop_assert!(matches!(
+            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+            Some(InputLatencyEvidenceError::InvalidMeasurement {
+                error: InputLatencyMeasurementError::MissingStage { .. },
+                ..
+            })
+        ));
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
     }
 
     #[test]
@@ -344,6 +371,24 @@ proptest! {
             ),
             "duplicate stage fault must remain sticky"
         );
+
+        let encoded = serde_json::to_string(&measurement).unwrap();
+        let decoded: InputLatencyMeasurement = serde_json::from_str(&encoded).unwrap();
+        prop_assert!(matches!(
+            decoded.validate_complete(),
+            Err(InputLatencyMeasurementError::DuplicateStage { stage: failed_stage })
+                if failed_stage == stage
+        ));
+        let mut collector = InputLatencyCollector::new(1);
+        collector.record(decoded);
+        prop_assert!(matches!(
+            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+            Some(InputLatencyEvidenceError::InvalidMeasurement {
+                error: InputLatencyMeasurementError::DuplicateStage { stage: failed_stage },
+                ..
+            }) if *failed_stage == stage
+        ));
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
     }
 
     #[test]
@@ -368,7 +413,7 @@ proptest! {
                 )
             })
             .collect();
-        let measurement = InputLatencyMeasurement::from_stages(id, stages);
+        let measurement = measurement_from_unique_stages(id, stages);
 
         prop_assert!(
             matches!(
@@ -377,6 +422,17 @@ proptest! {
             ),
             "one unrelated clock domain must invalidate the measurement"
         );
+
+        let mut collector = InputLatencyCollector::new(1);
+        collector.record(measurement);
+        prop_assert!(matches!(
+            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+            Some(InputLatencyEvidenceError::InvalidMeasurement {
+                error: InputLatencyMeasurementError::ClockDomainMismatch { .. },
+                ..
+            })
+        ));
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
     }
 
     #[test]
@@ -400,7 +456,7 @@ proptest! {
                 (stage, proxy_timestamp(timestamp_us))
             })
             .collect();
-        let measurement = InputLatencyMeasurement::from_stages(id, stages);
+        let measurement = measurement_from_unique_stages(id, stages);
 
         prop_assert!(
             matches!(
@@ -409,6 +465,34 @@ proptest! {
             ),
             "one timestamp regression must invalidate the measurement"
         );
+
+        let mut collector = InputLatencyCollector::new(1);
+        collector.record(measurement);
+        prop_assert!(matches!(
+            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+            Some(InputLatencyEvidenceError::InvalidMeasurement {
+                error: InputLatencyMeasurementError::TimestampRegression { .. },
+                ..
+            })
+        ));
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
+    }
+
+    #[test]
+    fn duplicate_measurement_id_is_nonpass_end_to_end(
+        id in 1..10_000u64,
+        first_total_us in 0..20_000u64,
+        second_total_us in 0..20_000u64,
+    ) {
+        let mut collector = InputLatencyCollector::new(2);
+        collector.record(complete_measurement(id, 100, first_total_us));
+        collector.record(complete_measurement(id, 200, second_total_us));
+        prop_assert!(matches!(
+            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+            Some(InputLatencyEvidenceError::DuplicateMeasurementId { id: duplicate_id })
+                if *duplicate_id == id
+        ));
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_DUPLICATE_ID")?;
     }
 
     #[test]
@@ -422,13 +506,90 @@ proptest! {
             exhausted.begin_measurement(),
             Err(InputLatencyCollectorError::MeasurementIdExhausted)
         ));
-        let result = evaluate_budget(&exhausted, &InputLatencyBudget::default());
-        prop_assert!(!result.passed);
-        prop_assert_eq!(result.reason_code, "EVIDENCE_ID_EXHAUSTED");
+
+        let encoded = serde_json::to_string(&exhausted).unwrap();
+        let mut restored: InputLatencyCollector = serde_json::from_str(&encoded).unwrap();
+        prop_assert_eq!(
+            restored.validate_evidence(),
+            Err(InputLatencyEvidenceError::MeasurementIdExhausted)
+        );
+        prop_assert!(matches!(
+            restored.begin_measurement(),
+            Err(InputLatencyCollectorError::MeasurementIdExhausted)
+        ));
+        assert_invalid_gate_and_report(&restored, "EVIDENCE_ID_EXHAUSTED")?;
         prop_assert!(matches!(
             exhausted.begin_measurement(),
             Err(InputLatencyCollectorError::MeasurementIdExhausted)
         ));
+    }
+
+    #[test]
+    fn last_non_reserved_measurement_id_remains_usable(capacity in 1..50usize) {
+        let collector = InputLatencyCollector::new(capacity);
+        let mut encoded = serde_json::to_value(collector).unwrap();
+        encoded["next_id"] = serde_json::json!(u64::MAX - 1);
+        let mut terminal: InputLatencyCollector = serde_json::from_value(encoded).unwrap();
+
+        let measurement = terminal.begin_measurement().unwrap();
+        prop_assert_eq!(measurement.id, u64::MAX - 1);
+        terminal.record(complete_measurement(measurement.id, 100, 500));
+        prop_assert!(terminal.validate_evidence().is_ok());
+
+        prop_assert!(matches!(
+            terminal.begin_measurement(),
+            Err(InputLatencyCollectorError::MeasurementIdExhausted)
+        ));
+        assert_invalid_gate_and_report(&terminal, "EVIDENCE_ID_EXHAUSTED")?;
+    }
+
+    #[test]
+    fn malformed_allocator_frontier_is_rejected_before_use(capacity in 1..50usize) {
+        let mut collector = InputLatencyCollector::new(capacity);
+        let id = collector.begin_measurement().unwrap().id;
+        collector.record(complete_measurement(id, 100, 500));
+        let encoded = serde_json::to_value(collector).unwrap();
+
+        let mut invalid_frontier = encoded.clone();
+        invalid_frontier["next_id"] = serde_json::json!(id);
+        prop_assert!(serde_json::from_value::<InputLatencyCollector>(invalid_frontier).is_err());
+
+        let mut zero_frontier = encoded.clone();
+        zero_frontier["next_id"] = serde_json::json!(0);
+        prop_assert!(serde_json::from_value::<InputLatencyCollector>(zero_frontier).is_err());
+
+        let mut incoherent_exhaustion = encoded;
+        incoherent_exhaustion["id_exhausted"] = serde_json::json!(true);
+        prop_assert!(
+            serde_json::from_value::<InputLatencyCollector>(incoherent_exhaustion).is_err()
+        );
+    }
+
+    #[test]
+    fn zero_capacity_constructor_is_permanently_nonpass(_dummy in 0u8..1) {
+        let mut collector = InputLatencyCollector::new(0);
+        let id = collector.begin_measurement().unwrap().id;
+        collector.record(complete_measurement(id, 100, 500));
+        prop_assert_eq!(collector.count(), 0);
+        prop_assert_eq!(
+            collector.validate_evidence(),
+            Err(InputLatencyEvidenceError::InvalidCapacity { capacity: 0 })
+        );
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_CAPACITY")?;
+    }
+
+    #[test]
+    fn oversized_capacity_constructor_is_permanently_nonpass(_dummy in 0u8..1) {
+        let capacity = MAX_INPUT_LATENCY_EVIDENCE_WINDOW + 1;
+        let mut collector = InputLatencyCollector::new(capacity);
+        let id = collector.begin_measurement().unwrap().id;
+        collector.record(complete_measurement(id, 100, 500));
+        prop_assert_eq!(collector.count(), 0);
+        prop_assert_eq!(
+            collector.validate_evidence(),
+            Err(InputLatencyEvidenceError::InvalidCapacity { capacity })
+        );
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_CAPACITY")?;
     }
 
     #[test]
@@ -556,11 +717,7 @@ proptest! {
     #[test]
     fn evaluate_budget_empty_collector_fails_closed(_dummy in 0u8..1) {
         let collector = InputLatencyCollector::new(100);
-        let budget = InputLatencyBudget::default();
-        let result = evaluate_budget(&collector, &budget);
-        prop_assert!(!result.passed);
-        prop_assert!(result.evidence_error.is_some());
-        prop_assert!(result.details.is_empty());
+        assert_invalid_gate_and_report(&collector, "EVIDENCE_EMPTY")?;
     }
 
     #[test]
@@ -571,8 +728,8 @@ proptest! {
             collector.record(complete_measurement(id, (i as u64) * 100, 500));
         }
         let report = generate_report(&collector, None);
-        prop_assert_eq!(report.sample_count, count);
-        prop_assert!(report.budget_check.is_none());
+        prop_assert_eq!(report.sample_count(), count);
+        prop_assert!(report.budget_check().is_none());
     }
 
     /// Metamorphic relation: loosening a budget (raising any budget_us)
@@ -600,24 +757,24 @@ proptest! {
         let loose_result = evaluate_budget(&collector, &loose);
 
         // Per-percentile: a strict pass must remain a pass when loosened.
-        for sd in &strict_result.details {
-            if sd.passed {
+        for sd in strict_result.details() {
+            if sd.passed() {
                 let ld = loose_result
-                    .details
+                    .details()
                     .iter()
-                    .find(|d| d.percentile == sd.percentile)
+                    .find(|detail| detail.percentile() == sd.percentile())
                     .expect("loose result must cover the same percentiles");
                 prop_assert!(
-                    ld.passed,
+                    ld.passed(),
                     "loosening percentile {:?} (budget +{}) broke a pass",
-                    sd.percentile, delta
+                    sd.percentile(), delta
                 );
             }
         }
         // Overall AND is likewise monotonic: strict-pass implies loose-pass.
-        if strict_result.passed {
+        if strict_result.passed() {
             prop_assert!(
-                loose_result.passed,
+                loose_result.passed(),
                 "loosening every budget by {} broke the overall pass", delta
             );
         }
@@ -632,7 +789,7 @@ proptest! {
         }
         let budget = InputLatencyBudget::default();
         let report = generate_report(&collector, Some(&budget));
-        prop_assert!(report.budget_check.is_some());
+        prop_assert!(report.budget_check().is_some());
     }
 
     #[test]
@@ -650,7 +807,9 @@ proptest! {
             collector.record(complete_measurement(id, 100, 500));
         }
         let json = serde_json::to_string(&collector).unwrap();
-        let back: InputLatencyCollector = serde_json::from_str(&json).unwrap();
+        let mut back: InputLatencyCollector = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(collector.count(), back.count());
+        prop_assert_eq!(back.schema_version(), INPUT_LATENCY_COLLECTOR_SCHEMA_VERSION);
+        prop_assert_eq!(back.begin_measurement().unwrap().id, count as u64 + 1);
     }
 }
