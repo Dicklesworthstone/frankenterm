@@ -810,10 +810,8 @@ impl RenderableInner {
                 self.lines.peek(&row),
                 Some(LineEntry::Line(_) | LineEntry::Stale(_) | LineEntry::LineAndFetching(..))
             );
-            if cached {
-                if !self.apply_paste_prediction(idx, paste_line) {
-                    return;
-                }
+            if cached && !self.apply_paste_prediction(idx, paste_line) {
+                return;
             }
         }
         self.cursor_position.y += lines.len().saturating_sub(1) as StableRowIndex;
