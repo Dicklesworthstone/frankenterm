@@ -140,6 +140,8 @@ pub(crate) struct ClientRenderApplicationCounters {
 )]
 #[derive(Default)]
 struct ClientRenderApplicationState {
+    active_connection_identity: Option<RenderConnectionIdentity>,
+    active_connection_generation: Option<u64>,
     applied_connection_identity: Option<RenderConnectionIdentity>,
     applied_connection_generation: Option<u64>,
     applied_state: Option<RenderStateIdentity>,
@@ -167,6 +169,30 @@ enum ClientRenderApplicationBegin {
     reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
 )]
 impl ClientRenderApplicationState {
+    fn prepare_authoritative_bootstrap(
+        &mut self,
+        connection_identity: RenderConnectionIdentity,
+        connection_generation: u64,
+    ) -> bool {
+        if self.active_connection_identity == Some(connection_identity)
+            && self.active_connection_generation == Some(connection_generation)
+        {
+            return false;
+        }
+
+        self.active_connection_identity = Some(connection_identity);
+        self.active_connection_generation = Some(connection_generation);
+        self.applied_connection_identity = None;
+        self.applied_connection_generation = None;
+        self.applied_state = None;
+        self.last_applied = None;
+        if self.applying.take().is_some() {
+            self.counters.cancelled_attempts =
+                self.counters.cancelled_attempts.saturating_add(1);
+        }
+        true
+    }
+
     fn observation(&self) -> RenderApplicationObservedState {
         self.applied_state.map_or(
             RenderApplicationObservedState::Uninitialized,
@@ -195,6 +221,15 @@ impl ClientRenderApplicationState {
                 reason: RenderApplicationNackReason::MalformedOrIncomplete {
                     component: RenderApplicationComponent::Surface,
                 },
+                observed_state: RenderApplicationObservedState::NotApplicable,
+            };
+        }
+        if self.active_connection_identity != Some(connection_identity)
+            || self.active_connection_generation
+                != Some(identity.token.connection_generation)
+        {
+            return ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::GenerationMismatch,
                 observed_state: RenderApplicationObservedState::NotApplicable,
             };
         }
@@ -326,7 +361,10 @@ impl<'a> ClientRenderApplicationGuard<'a> {
 
     fn acknowledge(mut self) {
         let mut state = self.state.lock();
-        if state.applying == Some(self.identity) {
+        if state.applying == Some(self.identity)
+            && state.active_connection_identity == Some(self.identity.connection_identity)
+            && state.active_connection_generation == Some(self.identity.connection_generation)
+        {
             state.applied_connection_generation =
                 Some(self.identity.connection_generation);
             state.applied_connection_identity = Some(self.identity.connection_identity);
@@ -759,6 +797,28 @@ impl ClientPane {
             render_application_limits: ClientRenderApplicationLimits::default(),
             mux_registration,
         }
+    }
+
+    pub(crate) fn prepare_render_application_bootstrap(
+        &self,
+        rpc: &RpcGenerationScope,
+    ) -> anyhow::Result<bool> {
+        let connection_generation = rpc
+            .connection_generation()
+            .ok_or_else(|| anyhow::anyhow!("render bootstrap has no exact RPC generation"))?
+            .get();
+        let connection_identity = rpc
+            .render_connection_identity()
+            .ok_or_else(|| {
+                anyhow::anyhow!("render bootstrap has no committed connection identity")
+            })?;
+        connection_identity
+            .validate()
+            .map_err(anyhow::Error::new)?;
+        Ok(self
+            .render_application_state
+            .lock()
+            .prepare_authoritative_bootstrap(connection_identity, connection_generation))
     }
 
     #[allow(
@@ -1660,7 +1720,7 @@ mod tests {
         local_pane_id: PaneId,
         remote_pane_id: PaneId,
     ) -> Arc<ClientPane> {
-        Arc::new(ClientPane::new(
+        let pane = Arc::new(ClientPane::new(
             inner,
             local_pane_id,
             23,
@@ -1674,7 +1734,10 @@ mod tests {
             },
             "shell",
             false,
-        ))
+        ));
+        pane.prepare_render_application_bootstrap(&inner.client.rpc_scope())
+            .expect("test pane should prepare its committed render connection");
+        pane
     }
 
     fn test_render_application_update(
@@ -2015,6 +2078,13 @@ mod tests {
             4,
         );
         let state = Mutex::new(ClientRenderApplicationState::default());
+        assert!(
+            state.lock().prepare_authoritative_bootstrap(
+                TEST_RENDER_CONNECTION_IDENTITY,
+                connection_generation,
+            ),
+            "the first committed connection must require an authoritative snapshot"
+        );
         assert!(matches!(
             state
                 .lock()
@@ -2155,8 +2225,22 @@ mod tests {
             }
         ));
 
+        let successor_generation = connection_generation + 1;
+        assert!(
+            state.lock().prepare_authoritative_bootstrap(
+                SUCCESSOR_RENDER_CONNECTION_IDENTITY,
+                successor_generation,
+            ),
+            "a successor connection must reset inherited render authority"
+        );
+        assert_eq!(
+            state.lock().observation(),
+            RenderApplicationObservedState::Uninitialized,
+            "a successor must not inherit the predecessor baseline"
+        );
+
         let mut reconnect_delta = test_render_application_update(
-            connection_generation,
+            successor_generation,
             pane_id,
             137,
             1,
@@ -2168,37 +2252,48 @@ mod tests {
         assert!(matches!(
             state.lock().begin(
                 Some(SUCCESSOR_RENDER_CONNECTION_IDENTITY),
-                Some(connection_generation),
+                Some(successor_generation),
                 pane_id,
                 reconnect_delta.connection_identity,
                 reconnect_delta.identity,
             ),
             ClientRenderApplicationBegin::Nack {
-                reason: RenderApplicationNackReason::GenerationMismatch,
-                observed_state: RenderApplicationObservedState::Applied(_),
+                reason: RenderApplicationNackReason::BaseMismatch,
+                observed_state: RenderApplicationObservedState::Uninitialized,
             }
         ));
 
         let mut reconnect_snapshot = test_render_application_update(
-            connection_generation,
+            successor_generation,
             pane_id,
             139,
             1,
             RenderApplicationKind::Snapshot,
             None,
-            snapshot.identity.resulting_state.state_sequence,
+            1,
         );
         reconnect_snapshot.connection_identity = SUCCESSOR_RENDER_CONNECTION_IDENTITY;
         assert!(matches!(
             state.lock().begin(
                 Some(SUCCESSOR_RENDER_CONNECTION_IDENTITY),
-                Some(connection_generation),
+                Some(successor_generation),
                 pane_id,
                 reconnect_snapshot.connection_identity,
                 reconnect_snapshot.identity,
             ),
             ClientRenderApplicationBegin::Apply
         ));
+        ClientRenderApplicationGuard::new(
+            &state,
+            reconnect_snapshot.connection_identity,
+            reconnect_snapshot.identity,
+        )
+        .acknowledge();
+        assert_eq!(
+            state.lock().applied_state,
+            Some(reconnect_snapshot.identity.resulting_state),
+            "the authoritative successor snapshot may restart its sequence below the predecessor"
+        );
     }
 
     #[test]
@@ -2218,6 +2313,10 @@ mod tests {
         retry.identity.token.attempt = 2;
         retry.retry_budget.attempt_ordinal = 2;
         let state = Mutex::new(ClientRenderApplicationState::default());
+        assert!(state.lock().prepare_authoritative_bootstrap(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            connection_generation,
+        ));
         assert!(matches!(
             state
                 .lock()
@@ -2265,6 +2364,98 @@ mod tests {
                 ),
             ClientRenderApplicationBegin::Apply
         ));
+    }
+
+    #[test]
+    fn successor_bootstrap_revokes_predecessor_inflight_guard_without_aliasing() {
+        let first_generation = 11;
+        let successor_generation = 12;
+        let pane_id = 29;
+        let first = test_render_application_update(
+            first_generation,
+            pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        let state = Mutex::new(ClientRenderApplicationState::default());
+        assert!(state.lock().prepare_authoritative_bootstrap(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            first_generation,
+        ));
+        assert!(matches!(
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(first_generation),
+                pane_id,
+                first.connection_identity,
+                first.identity,
+            ),
+            ClientRenderApplicationBegin::Apply
+        ));
+        let predecessor_guard =
+            ClientRenderApplicationGuard::new(&state, first.connection_identity, first.identity);
+
+        assert!(state.lock().prepare_authoritative_bootstrap(
+            SUCCESSOR_RENDER_CONNECTION_IDENTITY,
+            successor_generation,
+        ));
+        predecessor_guard.acknowledge();
+        {
+            let state = state.lock();
+            assert_eq!(
+                state.active_connection_identity,
+                Some(SUCCESSOR_RENDER_CONNECTION_IDENTITY)
+            );
+            assert_eq!(
+                state.active_connection_generation,
+                Some(successor_generation)
+            );
+            assert!(state.applied_state.is_none());
+            assert!(state.applying.is_none());
+            assert_eq!(state.counters.cancelled_attempts, 1);
+            assert_eq!(state.counters.acknowledgements, 0);
+        }
+
+        let mut successor = test_render_application_update(
+            successor_generation,
+            pane_id,
+            113,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        successor.connection_identity = SUCCESSOR_RENDER_CONNECTION_IDENTITY;
+        assert!(matches!(
+            state.lock().begin(
+                Some(SUCCESSOR_RENDER_CONNECTION_IDENTITY),
+                Some(successor_generation),
+                pane_id,
+                successor.connection_identity,
+                successor.identity,
+            ),
+            ClientRenderApplicationBegin::Apply
+        ));
+        let successor_guard = ClientRenderApplicationGuard::new(
+            &state,
+            successor.connection_identity,
+            successor.identity,
+        );
+        assert!(
+            !state.lock().prepare_authoritative_bootstrap(
+                SUCCESSOR_RENDER_CONNECTION_IDENTITY,
+                successor_generation,
+            ),
+            "replaying the same committed topology identity must not cancel live successor work"
+        );
+        successor_guard.acknowledge();
+        let state = state.lock();
+        assert_eq!(state.applied_state, Some(successor.identity.resulting_state));
+        assert_eq!(state.counters.cancelled_attempts, 1);
+        assert_eq!(state.counters.acknowledgements, 1);
     }
 
     #[test]

@@ -303,6 +303,7 @@ struct RpcBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RpcConsumerKind {
     TopologySnapshot,
+    RenderBootstrap,
     InitialAttachment,
     InitialAttachmentCleanup,
     SpawnResolution,
@@ -319,6 +320,7 @@ impl RpcConsumerKind {
     fn metric_label(self) -> &'static str {
         match self {
             Self::TopologySnapshot => "topology_snapshot",
+            Self::RenderBootstrap => "render_bootstrap",
             Self::InitialAttachment => "initial_attachment",
             Self::InitialAttachmentCleanup => "initial_attachment_cleanup",
             Self::SpawnResolution => "spawn_resolution",
@@ -685,17 +687,22 @@ impl RpcTransportState {
     }
 
     fn allocate_monotonic(counter: &AtomicU64) -> Result<NonZeroU64, u64> {
-        counter
-            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |current| {
-                if current == 0 {
-                    None
-                } else if current == u64::MAX {
-                    Some(0)
-                } else {
-                    Some(current + 1)
-                }
-            })
-            .map(|value| NonZeroU64::new(value).expect("zero is never allocated"))
+        let mut current = counter.load(AtomicOrdering::Acquire);
+        loop {
+            let Some(allocated) = NonZeroU64::new(current) else {
+                return Err(current);
+            };
+            let next = current.checked_add(1).unwrap_or(0);
+            match counter.compare_exchange(
+                current,
+                next,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return Ok(allocated),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn allocate_attempt(&self, request: &'static str) -> Result<NonZeroU64, RpcTransportError> {

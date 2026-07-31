@@ -1001,17 +1001,49 @@ impl ClientDomain {
         if !incarnation_is_current() {
             return Ok(false);
         }
-        rpc.with_coherent_topology_snapshot(RpcConsumerKind::TopologySnapshot, |panes| {
+        let topology_current = rpc
+            .with_coherent_topology_snapshot(RpcConsumerKind::TopologySnapshot, |panes| {
+                if !incarnation_is_current() {
+                    bail!("client attachment retired before coherent topology application");
+                }
+                Self::process_pane_list(&mux, Arc::clone(&inner), panes, primary_window_id)?;
+                if !incarnation_is_current() {
+                    bail!("client attachment retired during coherent topology application");
+                }
+                Ok(true)
+            })
+            .await?;
+        if !topology_current || !incarnation_is_current() {
+            return Ok(false);
+        }
+
+        rpc.commit_sync(RpcConsumerKind::RenderBootstrap, || {
             if !incarnation_is_current() {
-                bail!("client attachment retired before coherent topology application");
+                bail!("client attachment retired before render bootstrap preparation");
             }
-            Self::process_pane_list(&mux, Arc::clone(&inner), panes, primary_window_id)?;
+            Self::prepare_render_application_bootstrap(mux.as_ref(), inner.as_ref(), rpc)?;
             if !incarnation_is_current() {
-                bail!("client attachment retired during coherent topology application");
+                bail!("client attachment retired during render bootstrap preparation");
             }
             Ok(true)
         })
-        .await
+        .map_err(anyhow::Error::new)?
+    }
+
+    fn prepare_render_application_bootstrap(
+        mux: &Mux,
+        inner: &ClientInner,
+        rpc: &RpcGenerationScope,
+    ) -> anyhow::Result<()> {
+        for pane in mux.iter_panes() {
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            if client_pane.belongs_to_client(inner) {
+                client_pane.prepare_render_application_bootstrap(rpc)?;
+            }
+        }
+        Ok(())
     }
 
     fn resolve_remote_spawn_entities(
@@ -1636,6 +1668,30 @@ impl ClientDomain {
             result
         })
         .await?;
+
+        rpc.commit_sync(RpcConsumerKind::RenderBootstrap, || {
+            if inner.is_detached()
+                || domain.retired.load(Ordering::Acquire)
+                || !domain.inner_is_current(&inner)
+                || !mux
+                    .get_domain(domain_id)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &domain_registration))
+            {
+                bail!("client domain {domain_id} retired before initial render bootstrap");
+            }
+            Self::prepare_render_application_bootstrap(mux.as_ref(), inner.as_ref(), &rpc)?;
+            if inner.is_detached()
+                || domain.retired.load(Ordering::Acquire)
+                || !domain.inner_is_current(&inner)
+                || !mux
+                    .get_domain(domain_id)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &domain_registration))
+            {
+                bail!("client domain {domain_id} retired during initial render bootstrap");
+            }
+            Ok(())
+        })
+        .map_err(anyhow::Error::new)??;
 
         let bootstrap_result = async {
             if let Some(request) = current_active_workspace_sync(&inner, mux) {
