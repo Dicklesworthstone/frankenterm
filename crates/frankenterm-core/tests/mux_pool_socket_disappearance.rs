@@ -104,7 +104,7 @@ fn mux_pool_handles_socket_disappearance_with_structured_error() {
     // Pre-warm: a successful list_panes proves the pool can talk to
     // the live mux subprocess and creates at least one entry in the
     // `connections_created` counter.
-    let pre_panes = runtime.block_on(async { pool.list_panes().await });
+    let pre_panes = runtime.block_on(async { Box::pin(pool.list_panes()).await });
     if let Err(err) = &pre_panes {
         if is_pre_existing_codec_skew(err) {
             eprintln!(
@@ -144,7 +144,7 @@ fn mux_pool_handles_socket_disappearance_with_structured_error() {
     // variant is informational; what we pin is that there is no
     // panic, no Ok success, and the error is a recognised
     // MuxPoolError variant.
-    let post_result = runtime.block_on(async { pool.list_panes().await });
+    let post_result = runtime.block_on(async { Box::pin(pool.list_panes()).await });
 
     match post_result {
         Ok(panes) => panic!(
@@ -177,7 +177,7 @@ fn mux_pool_handles_socket_disappearance_with_structured_error() {
     // don't assert success or failure shape — just that the pool's
     // internal mutexes are not poisoned and the next call surfaces
     // as a Result instead of unwinding.
-    let _follow_up = runtime.block_on(async { pool.list_panes().await });
+    let _follow_up = runtime.block_on(async { Box::pin(pool.list_panes()).await });
 }
 
 /// Pin: the lighter fault — kill the process but leave the socket
@@ -210,7 +210,7 @@ fn mux_pool_handles_dead_mux_with_socket_present() {
 
     // Pre-warm. Skip-with-message on the pre-existing codec skew
     // (system wezterm-mux-server vs ft's vendored codec).
-    let pre = runtime.block_on(async { pool.list_panes().await });
+    let pre = runtime.block_on(async { Box::pin(pool.list_panes()).await });
     if let Err(err) = &pre {
         if is_pre_existing_codec_skew(err) {
             eprintln!(
@@ -229,7 +229,7 @@ fn mux_pool_handles_dead_mux_with_socket_present() {
 
     // The op must fail; we don't constrain which variant — only that
     // it's a recognised MuxPoolError, not a panic / Ok.
-    let result = runtime.block_on(async { pool.list_panes().await });
+    let result = runtime.block_on(async { Box::pin(pool.list_panes()).await });
     match result {
         Ok(_) => panic!("ft-7v53r: list_panes must fail after mux kill"),
         Err(err) => eprintln!("ft-7v53r: dead-mux-socket-present failure: {err}"),

@@ -128,8 +128,18 @@ proptest! {
     #[test]
     fn hamming_le_lev(len in 0..20usize, seed_a in arb_ascii(20), seed_b in arb_ascii(20)) {
         // Generate equal-length slices from seeds
-        let a: Vec<u8> = seed_a.iter().copied().chain(std::iter::repeat(b'a')).take(len).collect();
-        let b: Vec<u8> = seed_b.iter().copied().chain(std::iter::repeat(b'b')).take(len).collect();
+        let a: Vec<u8> = seed_a
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(b'a', len))
+            .take(len)
+            .collect();
+        let b: Vec<u8> = seed_b
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(b'b', len))
+            .take(len)
+            .collect();
         if let Some(h) = hamming(&a, &b) {
             let l = levenshtein(&a, &b);
             prop_assert!(l <= h, "Lev={} > Hamming={}", l, h);

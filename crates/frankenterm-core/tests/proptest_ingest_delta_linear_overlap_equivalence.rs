@@ -109,7 +109,7 @@ fn arb_sliding_window_pair() -> impl Strategy<Value = (String, String)> {
 /// while the KMP arm stays linear. Equivalence here is the load-bearing case.
 fn arb_repeated_run_pair() -> impl Strategy<Value = (String, String)> {
     (arb_char(), 1usize..32, arb_text(), arb_text()).prop_map(|(c, n, head, tail)| {
-        let run: String = std::iter::repeat(c).take(n).collect();
+        let run: String = std::iter::repeat_n(c, n).collect();
         (format!("{head}{run}"), format!("{run}{tail}"))
     })
 }

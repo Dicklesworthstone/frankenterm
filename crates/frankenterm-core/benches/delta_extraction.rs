@@ -204,12 +204,12 @@ fn adversarial_repeated_run(w: usize) -> (String, String, usize) {
     const RUN_BYTE: char = ' '; // padding spaces are the most common real-world run
     const DIVERGE: char = 'X';
 
-    let previous: String = std::iter::repeat(RUN_BYTE).take(w).collect();
+    let previous: String = std::iter::repeat_n(RUN_BYTE, w).collect();
     let split = w / 2;
     let mut current = String::with_capacity(w);
-    current.extend(std::iter::repeat(RUN_BYTE).take(split));
+    current.extend(std::iter::repeat_n(RUN_BYTE, split));
     current.push(DIVERGE);
-    current.extend(std::iter::repeat(RUN_BYTE).take(w - split - 1));
+    current.extend(std::iter::repeat_n(RUN_BYTE, w - split - 1));
     debug_assert_eq!(current.len(), w);
 
     // Setup-time guard: both arms must agree, else the A/B is comparing apples
