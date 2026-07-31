@@ -105,9 +105,15 @@ The important implementation points are:
 7. The key task immediately calls `PerPane::compute_changes` before returning
    its acknowledgement. That function reads pane metadata, clones the visible
    viewport, filters dirty rows, and fetches the cursor row separately. Normal
-   PTY echo can then produce a second later delta.
-8. Client unilateral processing hydrates line caches, reconciles prediction,
-   scans hyperlinks, and emits a local mux notification.
+   PTY echo can then produce a second later delta. The forced response's
+   `InputSerial` proves only protocol dispatch and supplies a terminal-sequence
+   fence; it is not K7 PTY/application echo evidence and must never be timed or
+   named as such.
+8. Client unilateral processing hydrates line caches, records the dispatch
+   fence, and reconciles prediction only against later authoritative row state.
+   Reordered acknowledgement metadata remains admissible even when its stale
+   surface content is rejected. The client then scans hyperlinks and emits a
+   local mux notification.
 9. Each TermWindow subscriber schedules a main-thread task before it knows
    whether the pane is visible in that window.
 10. macOS invalidation is paced by an integer-millisecond

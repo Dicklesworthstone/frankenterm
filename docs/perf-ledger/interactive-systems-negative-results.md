@@ -294,6 +294,62 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Retry a same-identifier schema extension only with a bounded explicit dual-schema decoder, canonical old/new payload fixtures inside the declared frame length, corruption rejection, and negotiated emission authority.
 
+### IS-N015 — Forced `InputSerial` is dispatch acknowledgement, not PTY/application echo
+
+- **Classification:** causal-boundary and correctness rejection
+- **Bead:** `ft-interactive-systems-performance-4tenz.2.11`
+- **Baseline revision:** `38e7f830fdb7507f6b08e10d5c68a764f84bf13b`
+- **Candidate code revision:** `80487657ba8086214b689ed185e28f4dfd174d57`
+- **Rejected inference:** the forced `GetPaneRenderChangesResponse` emitted
+  immediately after `pane.key_down` was treated as evidence that the PTY or
+  application had echoed every prediction through its returned `InputSerial`.
+  The client retired those overlays at the serial boundary even when the
+  terminal had not changed.
+- **Code-grounded result:** the server samples the terminal sequence and forces
+  a response after key dispatch, before any required PTY read, parser apply, or
+  application echo. A serial-only response therefore measures dispatch RTT,
+  not K7 echo latency. A newer terminal sequence without the predicted row is
+  also missing evidence, and an unchanged row whose line sequence does not
+  cross the dispatch fence cannot validate the prediction.
+- **Correction:** each prediction now records the terminal-sequence fence of
+  its dispatch acknowledgement. Settlement requires later authoritative row
+  state whose terminal and line sequences cross that fence. A reordered stale
+  response may contribute its serial/fence but not its surface content; the
+  outer unilateral filter preserves that metadata without paying hydration
+  work, and cached reconciliation accepts only a fresh `LineEntry::Line`.
+  Missing rows remain pending, no-echo predictions expire with RTT-scaled
+  confidence degradation, authoritative reconnect snapshots reset prediction
+  state, and `InputSerial::now` has a process-local monotonic floor.
+- **Boundedness correction:** retained prediction state is capped at 4,096
+  cells per pane. Paste prediction performs a bounded all-or-nothing preflight
+  before `textwrap::fill`, so an arbitrarily large paste cannot allocate or
+  traverse a second unbounded speculative representation and cannot leave a
+  partially admitted overlay.
+- **Canonical proof:** strict-remote job `j-29953507796713895` on
+  `vmi1264463` ran `cargo test -p frankenterm-client --lib` at the candidate
+  revision: 117 passed, 0 failed, and one pre-existing harness test remained
+  explicitly ignored. Strict-remote job `j-29953507796713890` on `hz1` ran
+  `cargo clippy -p frankenterm-client --all-targets -- -D warnings` and passed.
+  Unchanged codec/server slices retain earlier strict-remote coverage from
+  `j-29953507796713871`, `j-29953507796713874`, and
+  `j-29953507796713878`.
+- **Retained failed evidence:** job `j-29953507796713886` correctly rejected
+  the preflight's nested `if` under warnings-denied Clippy; the exact equivalent
+  collapse is in the candidate. Test jobs `j-29953507796713891` and
+  `j-29953507796713893` failed before Cargo because worker `vmi1227854` could
+  not create its remote target directory. An additional pinned retry failed
+  closed with `RCH-I006` rather than falling back locally. These are lint and
+  infrastructure evidence, not behavioral test failures.
+- **Formatting boundary:** RCH rejected remote `cargo fmt --check` as a
+  non-compilation command (`RCH-E301`). `git diff --check` passed; no local
+  formatter was run and no remote formatting proof is claimed.
+- **Decision:** reject every latency or correctness claim that interprets
+  `InputSerial::elapsed_millis` as PTY/application echo. It is dispatch RTT
+  only. Later matching row state is safe overlay reconciliation, not a renamed
+  K7 measurement.
+- **Primary retry condition:**
+  > Reclassify a protocol marker as PTY/application echo only after it is emitted from a causally downstream PTY-read/parser/application boundary, is retained in a stage trace, and passes delayed, no-echo, reordered, reconnect, and boundedness regressions.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
