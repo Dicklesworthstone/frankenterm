@@ -56,8 +56,8 @@ pub use frankenterm_core_audit_types::input_to_photon::{
     InputToPhotonClaimScope, InputToPhotonEvidence, InputToPhotonInputClass, InputToPhotonStage,
     InputToPhotonStageTrace, InputToPhotonState, InputToPhotonTrace, MACOS_P95_TARGET_US,
     MAX_INPUT_BYTE_COUNT, MAX_INSTRUMENTATION_OVERHEAD_PCT, WAYLAND_P95_TARGET_US,
-    classified_input_proxy_trace_from_stage_durations, summarize_input_to_photon_traces,
-    target_p95_us_for_platform, unavailable_proxy_evidence,
+    classified_input_proxy_trace_from_stage_durations, headless_render_duration_us,
+    summarize_input_to_photon_traces, target_p95_us_for_platform, unavailable_proxy_evidence,
 };
 
 // ============================================================================
@@ -1318,7 +1318,7 @@ mod tests {
                 InputToPhotonInputClass::PrintableText,
                 1,
                 "macos",
-                [100, 200, 300, 400, 100],
+                [100, 200, 300, 400, 1_000],
                 20,
                 1,
                 "deterministic-test-adapter",
@@ -1329,9 +1329,9 @@ mod tests {
                 InputToPhotonInputClass::PrintableText,
                 1,
                 "macos",
-                [200, 300, 400, 500, 200],
+                [200, 300, 400, 500, 2_000],
                 25,
-                1,
+                2,
                 "deterministic-test-adapter",
             )
             .expect("valid proxy trace"),
@@ -1340,9 +1340,9 @@ mod tests {
                 InputToPhotonInputClass::PrintableText,
                 1,
                 "macos",
-                [300, 400, 500, 600, 300],
+                [300, 400, 500, 600, 3_000],
                 30,
-                1,
+                3,
                 "deterministic-test-adapter",
             )
             .expect("valid proxy trace"),
@@ -1353,9 +1353,9 @@ mod tests {
         assert_eq!(evidence.state, InputToPhotonState::Measured);
         assert_eq!(evidence.sample_count, 3);
         assert_eq!(evidence.target_p95_us, Some(MACOS_P95_TARGET_US));
-        assert_eq!(evidence.p50_us, Some(1600));
-        assert_eq!(evidence.p95_us, Some(2100));
-        assert_eq!(evidence.p99_us, Some(2100));
+        assert_eq!(evidence.p50_us, Some(3400));
+        assert_eq!(evidence.p95_us, Some(4800));
+        assert_eq!(evidence.p99_us, Some(4800));
         assert_eq!(evidence.within_target, None);
         assert!(
             evidence
@@ -1371,7 +1371,7 @@ mod tests {
             InputToPhotonInputClass::PrintableText,
             1,
             "linux",
-            [100, 100, 100, 100, 100],
+            [100, 100, 100, 100, 1_000],
             100,
             1,
             "deterministic-test-adapter",
@@ -1423,7 +1423,7 @@ mod tests {
             InputToPhotonInputClass::PrintableText,
             1,
             "macos",
-            [250, 400, 750, 600, 250],
+            [250, 400, 750, 600, 1_000],
             20,
             1,
             "deterministic-test-adapter",

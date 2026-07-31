@@ -191,6 +191,15 @@ pub fn target_p95_us_for_platform(platform: &str) -> Option<u64> {
     }
 }
 
+/// Converts the headless renderer's millisecond timer into the proxy stage unit.
+#[must_use]
+pub fn headless_render_duration_us(render_ms: u128) -> u64 {
+    u64::try_from(render_ms)
+        .unwrap_or(u64::MAX / 1_000)
+        .saturating_mul(1_000)
+        .max(1)
+}
+
 /// Builds and validates one content-free proxy trace.
 ///
 /// # Errors
@@ -530,8 +539,14 @@ fn validate_trace(trace: &InputToPhotonTrace, expected_platform: &str) -> Result
             return Err("trace state does not match its measured overhead".to_string());
         }
     }
-    if trace.headless_render_ms.is_none() {
+    let Some(headless_render_ms) = trace.headless_render_ms else {
         return Err("proxy trace is missing headless_render_ms".to_string());
+    };
+    let expected_render_us = headless_render_duration_us(headless_render_ms);
+    if trace.stages.last().map(|stage| stage.duration_us) != Some(expected_render_us) {
+        return Err(
+            "headless_render_ms does not match the gpu_present stage duration".to_string(),
+        );
     }
     if trace
         .gpu_adapter
@@ -609,6 +624,12 @@ mod tests {
         stage_durations_us: [u64; 5],
         instrumentation_overhead_us: u64,
     ) -> InputToPhotonTrace {
+        let headless_render_ms = u128::from(stage_durations_us[4] / 1_000);
+        assert_eq!(
+            headless_render_duration_us(headless_render_ms),
+            stage_durations_us[4],
+            "test proxy GPU stage must exactly encode whole headless milliseconds"
+        );
         classified_input_proxy_trace_from_stage_durations(
             sample_id,
             input_class,
@@ -616,7 +637,7 @@ mod tests {
             platform,
             stage_durations_us,
             instrumentation_overhead_us,
-            1,
+            headless_render_ms,
             "deterministic-test-adapter",
         )
         .expect("test proxy trace must be valid")
@@ -630,7 +651,7 @@ mod tests {
                 "macos",
                 InputToPhotonInputClass::PrintableText,
                 1,
-                [100, 200, 300, 400, 100],
+                [100, 200, 300, 400, 1_000],
                 20,
             ),
             proxy_trace(
@@ -638,7 +659,7 @@ mod tests {
                 "macos",
                 InputToPhotonInputClass::PrintableText,
                 2,
-                [200, 300, 400, 500, 200],
+                [200, 300, 400, 500, 2_000],
                 25,
             ),
             proxy_trace(
@@ -646,7 +667,7 @@ mod tests {
                 "macos",
                 InputToPhotonInputClass::PrintableText,
                 4,
-                [300, 400, 500, 600, 300],
+                [300, 400, 500, 600, 3_000],
                 30,
             ),
         ];
@@ -663,9 +684,9 @@ mod tests {
         assert_eq!(evidence.min_input_byte_count, Some(1));
         assert_eq!(evidence.max_input_byte_count, Some(4));
         assert_eq!(evidence.target_p95_us, Some(MACOS_P95_TARGET_US));
-        assert_eq!(evidence.p50_us, Some(1600));
-        assert_eq!(evidence.p95_us, Some(2100));
-        assert_eq!(evidence.p99_us, Some(2100));
+        assert_eq!(evidence.p50_us, Some(3400));
+        assert_eq!(evidence.p95_us, Some(4800));
+        assert_eq!(evidence.p99_us, Some(4800));
         assert_eq!(evidence.within_target, None);
         assert_eq!(
             evidence
@@ -682,7 +703,7 @@ mod tests {
             "linux",
             InputToPhotonInputClass::Control,
             1,
-            [100, 100, 100, 100, 100],
+            [100, 100, 100, 100, 1_000],
             100,
         );
 
@@ -726,7 +747,7 @@ mod tests {
             "linux",
             InputToPhotonInputClass::Navigation,
             3,
-            [100, 100, 100, 100, 100],
+            [100, 100, 100, 100, 1_000],
             1,
         );
         trace.stages.swap(1, 2);
@@ -775,7 +796,7 @@ mod tests {
             "macos",
             InputToPhotonInputClass::Editing,
             3,
-            [100, 200, 300, 400, 500],
+            [100, 200, 300, 400, 1_000],
             1,
         );
 
@@ -811,7 +832,7 @@ mod tests {
             "macos",
             InputToPhotonInputClass::PrintableText,
             1,
-            [100, 200, 300, 400, 500],
+            [100, 200, 300, 400, 1_000],
             1,
         );
         let mut value = serde_json::to_value(trace).expect("serialize v2 trace");
@@ -836,7 +857,7 @@ mod tests {
             "linux",
             InputToPhotonInputClass::Function,
             1,
-            [100, 200, 300, 400, 500],
+            [100, 200, 300, 400, 1_000],
             1,
         );
 
@@ -867,7 +888,7 @@ mod tests {
             "macos",
             InputToPhotonInputClass::PrintableText,
             1,
-            [100, 200, 300, 400, 500],
+            [100, 200, 300, 400, 1_000],
             1,
         );
         let mut wrong_schema = valid.clone();
@@ -914,7 +935,7 @@ mod tests {
                 "linux",
                 InputToPhotonInputClass::Keypad,
                 1,
-                [100, 200, 300, 400, 500],
+                [100, 200, 300, 400, 1_000],
                 1,
             );
             trace.input_byte_count = invalid_count;
@@ -940,17 +961,24 @@ mod tests {
             "linux",
             InputToPhotonInputClass::Control,
             1,
-            [100, 200, 300, 400, 500],
+            [100, 200, 300, 400, 1_000],
             1,
         );
         let mut missing_render_duration = valid.clone();
         missing_render_duration.sample_id = 1;
         missing_render_duration.headless_render_ms = None;
-        let mut blank_gpu_identity = valid;
+        let mut blank_gpu_identity = valid.clone();
         blank_gpu_identity.sample_id = 2;
         blank_gpu_identity.gpu_adapter = Some("   ".to_string());
+        let mut inconsistent_render_duration = valid;
+        inconsistent_render_duration.sample_id = 3;
+        inconsistent_render_duration.headless_render_ms = Some(2);
 
-        for invalid in [missing_render_duration, blank_gpu_identity] {
+        for invalid in [
+            missing_render_duration,
+            blank_gpu_identity,
+            inconsistent_render_duration,
+        ] {
             let evidence = summarize_input_to_photon_traces("linux", &[invalid]);
             assert_eq!(evidence.state, InputToPhotonState::InvalidTrace);
             assert_eq!(evidence.sample_count, 0);
@@ -966,7 +994,7 @@ mod tests {
             "linux",
             InputToPhotonInputClass::PrintableText,
             1,
-            [100, 200, 300, 400, 500],
+            [100, 200, 300, 400, 1_000],
             1,
         );
         trace.platform = "freebsd".to_string();

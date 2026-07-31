@@ -11,8 +11,8 @@ pub use frankenterm_core::render_quality::{
     RENDERER_SSIM_PARITY_DEFAULT_MAX_CHANGED_PIXEL_FRACTION_PPM,
     RENDERER_SSIM_PARITY_DEFAULT_MAX_L_INF, RENDERER_SSIM_PARITY_DEFAULT_MIN_SSIM_PPM,
     RENDERER_SSIM_PARITY_MCP_RESOURCE_URI, RENDERER_SSIM_PARITY_STATUS, WAYLAND_P95_TARGET_US,
-    classified_input_proxy_trace_from_stage_durations, summarize_input_to_photon_traces,
-    target_p95_us_for_platform, unavailable_proxy_evidence,
+    classified_input_proxy_trace_from_stage_durations, headless_render_duration_us,
+    summarize_input_to_photon_traces, target_p95_us_for_platform, unavailable_proxy_evidence,
 };
 
 #[cfg(feature = "headless-render")]
@@ -47,10 +47,7 @@ pub mod headless {
         frame: &HeadlessFrame,
         instrumentation_overhead_us: u64,
     ) -> Result<InputToPhotonTrace, String> {
-        let render_us = u64::try_from(frame.render_ms)
-            .unwrap_or(u64::MAX / 1_000)
-            .saturating_mul(1_000)
-            .max(1);
+        let render_us = headless_render_duration_us(frame.render_ms);
         let platform = platform.into();
         classified_input_proxy_trace_from_stage_durations(
             sample_id,

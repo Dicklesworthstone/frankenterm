@@ -31,7 +31,7 @@ fn input_to_photon_empirical_p99_agrees_with_lindley_bound() {
         InputToPhotonInputClass::PrintableText,
         1,
         "macos",
-        [250, 400, 750, 600, 250],
+        [250, 400, 750, 600, 1_000],
         20,
         1,
         "deterministic-test-adapter",

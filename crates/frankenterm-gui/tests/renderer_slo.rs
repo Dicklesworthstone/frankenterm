@@ -12,7 +12,7 @@ fn input_to_photon_proxy_summary_reports_percentiles_without_target_verdict() {
             InputToPhotonInputClass::PrintableText,
             1,
             "macos",
-            [100, 200, 300, 400, 100],
+            [100, 200, 300, 400, 1_000],
             20,
             1,
             "deterministic-test-adapter",
@@ -23,9 +23,9 @@ fn input_to_photon_proxy_summary_reports_percentiles_without_target_verdict() {
             InputToPhotonInputClass::PrintableText,
             1,
             "macos",
-            [200, 300, 400, 500, 200],
+            [200, 300, 400, 500, 2_000],
             25,
-            1,
+            2,
             "deterministic-test-adapter",
         )
         .expect("valid proxy trace"),
@@ -34,9 +34,9 @@ fn input_to_photon_proxy_summary_reports_percentiles_without_target_verdict() {
             InputToPhotonInputClass::PrintableText,
             1,
             "macos",
-            [300, 400, 500, 600, 300],
+            [300, 400, 500, 600, 3_000],
             30,
-            1,
+            3,
             "deterministic-test-adapter",
         )
         .expect("valid proxy trace"),
@@ -47,9 +47,9 @@ fn input_to_photon_proxy_summary_reports_percentiles_without_target_verdict() {
     assert_eq!(evidence.state, InputToPhotonState::Measured);
     assert_eq!(evidence.sample_count, 3);
     assert_eq!(evidence.target_p95_us, Some(MACOS_P95_TARGET_US));
-    assert_eq!(evidence.p50_us, Some(1600));
-    assert_eq!(evidence.p95_us, Some(2100));
-    assert_eq!(evidence.p99_us, Some(2100));
+    assert_eq!(evidence.p50_us, Some(3400));
+    assert_eq!(evidence.p95_us, Some(4800));
+    assert_eq!(evidence.p99_us, Some(4800));
     assert_eq!(evidence.within_target, None);
     assert!(
         evidence
@@ -65,7 +65,7 @@ fn excessive_instrumentation_overhead_degrades_the_evidence_state() {
         InputToPhotonInputClass::PrintableText,
         1,
         "linux",
-        [100, 100, 100, 100, 100],
+        [100, 100, 100, 100, 1_000],
         100,
         1,
         "deterministic-test-adapter",
