@@ -12,7 +12,10 @@
 //! from heartbeat intervals, and the resize scheduler adapts its frame
 //! budget based on system health (e.g., fewer resize units when degraded).
 
-use frankenterm_core::input_latency::{InputLatencyCollector, InputLatencyStage, Percentile};
+use frankenterm_core::input_latency::{
+    InputLatencyClockDomainId, InputLatencyCollector, InputLatencyProducerId, InputLatencyStage,
+    InputLatencyTimestamp, Percentile,
+};
 use frankenterm_core::kalman_watchdog::{AdaptiveWatchdog, AdaptiveWatchdogConfig};
 use frankenterm_core::resize_scheduler::{
     ResizeDomain, ResizeIntent, ResizeScheduler, ResizeSchedulerConfig, ResizeWorkClass,
@@ -36,19 +39,33 @@ fn make_intent(pane_id: u64, seq: u64, work_units: u32, at_ms: u64) -> ResizeInt
 
 /// Record a full input-to-render latency measurement.
 fn record_full_measurement(collector: &mut InputLatencyCollector, base_us: u64, jitter_us: u64) {
-    let mut m = collector.begin_measurement();
+    let producer_id = InputLatencyProducerId::new(1).expect("fixture producer ID is non-zero");
+    let clock_domain_id =
+        InputLatencyClockDomainId::new(1).expect("fixture clock ID is non-zero");
+    let timestamp = |timestamp_us| {
+        InputLatencyTimestamp::new(timestamp_us, producer_id, clock_domain_id)
+    };
+    let mut m = collector
+        .begin_measurement()
+        .expect("fixture collector has ID capacity");
     let mut t = base_us;
-    m.record_stage(InputLatencyStage::KeyEvent, t);
+    m.record_stage(InputLatencyStage::KeyEvent, timestamp(t))
+        .unwrap();
     t += 100 + jitter_us;
-    m.record_stage(InputLatencyStage::PtyWrite, t);
+    m.record_stage(InputLatencyStage::PtyWrite, timestamp(t))
+        .unwrap();
     t += 50 + jitter_us;
-    m.record_stage(InputLatencyStage::PtyRead, t);
+    m.record_stage(InputLatencyStage::PtyRead, timestamp(t))
+        .unwrap();
     t += 200 + jitter_us;
-    m.record_stage(InputLatencyStage::TermUpdate, t);
+    m.record_stage(InputLatencyStage::TermUpdate, timestamp(t))
+        .unwrap();
     t += 150 + jitter_us;
-    m.record_stage(InputLatencyStage::RenderSubmit, t);
+    m.record_stage(InputLatencyStage::RenderSubmit, timestamp(t))
+        .unwrap();
     t += 300 + jitter_us;
-    m.record_stage(InputLatencyStage::GpuPresent, t);
+    m.record_stage(InputLatencyStage::GpuPresent, timestamp(t))
+        .unwrap();
     collector.record(m);
 }
 
@@ -71,8 +88,8 @@ fn latency_and_watchdog_inform_scheduling() {
     // P50 and P95 should be close for stable input.
     let p50 = latency.total_latency_percentile(Percentile::P50);
     let p95 = latency.total_latency_percentile(Percentile::P95);
-    assert!(p50.is_some());
-    assert!(p95.is_some());
+    assert!(p50.is_ok());
+    assert!(p95.is_ok());
     // With zero jitter, P50 ≈ P95.
     let p50_val = p50.unwrap();
     let p95_val = p95.unwrap();
@@ -191,7 +208,7 @@ fn latency_spike_reduces_resize_budget() {
         InputLatencyStage::GpuPresent,
         Percentile::P95,
     );
-    assert!(gpu_p95.is_some());
+    assert!(gpu_p95.is_ok());
 
     // Use latency percentiles to drive scheduler budget.
     let mut scheduler = ResizeScheduler::new(ResizeSchedulerConfig::default());
@@ -258,7 +275,7 @@ fn full_pipeline_latency_watchdog_scheduler() {
     assert!(metrics.frames >= 5);
 
     // Latency percentiles are stable.
-    let summary = latency.total_latency_summary();
+    let summary = latency.total_latency_summary().unwrap();
     assert!(!summary.is_empty());
 
     // Phase 2: simulate load spike.

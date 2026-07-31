@@ -9,9 +9,11 @@
 use proptest::prelude::*;
 
 use frankenterm_core::input_latency::{
-    BudgetCheckDetail, BudgetCheckResult, InputLatencyBudget, InputLatencyCollector,
-    InputLatencyMeasurement, InputLatencyReport, InputLatencyStage, Percentile, StageBudget,
-    evaluate_budget, generate_report, percentile_nearest_rank,
+    BudgetCheckDetail, BudgetCheckResult, INPUT_LATENCY_REPORT_SCHEMA_VERSION,
+    InputLatencyBudget, InputLatencyClockDomainId, InputLatencyCollector,
+    InputLatencyEvidenceClass, InputLatencyEvidenceStatus, InputLatencyMeasurement,
+    InputLatencyProducerId, InputLatencyReport, InputLatencyStage, InputLatencyTimestamp,
+    Percentile, StageBudget, evaluate_budget, generate_report, percentile_nearest_rank,
 };
 
 // =============================================================================
@@ -38,12 +40,44 @@ fn arb_percentile() -> impl Strategy<Value = Percentile> {
     ]
 }
 
+fn arb_timestamp() -> impl Strategy<Value = InputLatencyTimestamp> {
+    (0..1_000_000u64, 1..10_000u64, 1..10_000u64).prop_map(
+        |(timestamp_us, producer_id, clock_domain_id)| {
+            InputLatencyTimestamp::new(
+                timestamp_us,
+                InputLatencyProducerId::new(producer_id).unwrap(),
+                InputLatencyClockDomainId::new(clock_domain_id).unwrap(),
+            )
+        },
+    )
+}
+
+fn proxy_timestamp(timestamp_us: u64) -> InputLatencyTimestamp {
+    InputLatencyTimestamp::new(
+        timestamp_us,
+        InputLatencyProducerId::new(1).unwrap(),
+        InputLatencyClockDomainId::new(1).unwrap(),
+    )
+}
+
+fn complete_measurement(id: u64, start: u64, total: u64) -> InputLatencyMeasurement {
+    let mut measurement = InputLatencyMeasurement::new(id);
+    let final_index = (InputLatencyStage::ALL.len() - 1) as u64;
+    for (index, &stage) in InputLatencyStage::ALL.iter().enumerate() {
+        let offset = total.saturating_mul(index as u64) / final_index;
+        measurement
+            .record_stage(stage, proxy_timestamp(start.saturating_add(offset)))
+            .unwrap();
+    }
+    measurement
+}
+
 fn arb_measurement() -> impl Strategy<Value = InputLatencyMeasurement> {
     (
-        0..10_000u64,
-        prop::collection::btree_map(arb_stage(), 0..1_000_000u64, 0..6),
+        1..10_000u64,
+        prop::collection::btree_map(arb_stage(), arb_timestamp(), 0..6),
     )
-        .prop_map(|(id, stages)| InputLatencyMeasurement { id, stages })
+        .prop_map(|(id, stages)| InputLatencyMeasurement::from_stages(id, stages))
 }
 
 fn arb_stage_budget() -> impl Strategy<Value = StageBudget> {
@@ -71,23 +105,25 @@ fn arb_budget() -> impl Strategy<Value = InputLatencyBudget> {
 
 fn arb_budget_check_detail() -> impl Strategy<Value = BudgetCheckDetail> {
     (
+        prop::option::of(arb_stage()),
         arb_percentile(),
         100..100_000u64,
         0..200_000u64,
         any::<bool>(),
-        0.0f64..5.0,
+        prop::option::of(0.0f64..5.0),
         "[A-Z_]{5,20}",
     )
-        .prop_map(
-            |(percentile, budget_us, measured_us, passed, ratio, reason_code)| BudgetCheckDetail {
+        .prop_map(|(stage, percentile, budget_us, measured_us, passed, ratio, reason_code)| {
+            BudgetCheckDetail {
+                stage,
                 percentile,
                 budget_us,
                 measured_us,
                 passed,
                 ratio,
                 reason_code,
-            },
-        )
+            }
+        })
 }
 
 fn arb_budget_check_result() -> impl Strategy<Value = BudgetCheckResult> {
@@ -97,8 +133,12 @@ fn arb_budget_check_result() -> impl Strategy<Value = BudgetCheckResult> {
         "[A-Z_]{5,20}",
     )
         .prop_map(|(passed, details, reason_code)| BudgetCheckResult {
+            evidence_class: InputLatencyEvidenceClass::ProxyOnly,
+            sample_count: 1,
             passed,
             details,
+            evidence_error: None,
+            budget_error: None,
             reason_code,
         })
 }
@@ -112,7 +152,12 @@ fn arb_report() -> impl Strategy<Value = InputLatencyReport> {
     )
         .prop_map(
             |(sample_count, percentiles, stage_breakdown_p50, budget_check)| InputLatencyReport {
+                schema_version: INPUT_LATENCY_REPORT_SCHEMA_VERSION,
+                evidence_class: InputLatencyEvidenceClass::ProxyOnly,
+                evidence_status: InputLatencyEvidenceStatus::ValidProxy,
+                evidence_error: None,
                 sample_count,
+                admitted_sample_count: sample_count,
                 percentiles,
                 stage_breakdown_p50,
                 budget_check,
@@ -146,9 +191,9 @@ proptest! {
         let json = serde_json::to_string(&m).unwrap();
         let back: InputLatencyMeasurement = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(m.id, back.id);
-        prop_assert_eq!(m.stages.len(), back.stages.len());
-        for (k, v) in &m.stages {
-            prop_assert_eq!(back.stages.get(k), Some(v));
+        prop_assert_eq!(m.stages().len(), back.stages().len());
+        for (k, v) in m.stages() {
+            prop_assert_eq!(back.stages().get(k), Some(v));
         }
     }
 
@@ -172,10 +217,12 @@ proptest! {
     fn budget_check_detail_serde_roundtrip(d in arb_budget_check_detail()) {
         let json = serde_json::to_string(&d).unwrap();
         let back: BudgetCheckDetail = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(d.stage, back.stage);
         prop_assert_eq!(d.percentile, back.percentile);
         prop_assert_eq!(d.budget_us, back.budget_us);
         prop_assert_eq!(d.measured_us, back.measured_us);
         prop_assert_eq!(d.passed, back.passed);
+        prop_assert_eq!(d.ratio, back.ratio);
         prop_assert_eq!(d.reason_code, back.reason_code);
     }
 
@@ -243,20 +290,18 @@ proptest! {
         let m = InputLatencyMeasurement::new(id);
         prop_assert_eq!(m.id, id);
         prop_assert_eq!(m.stage_count(), 0);
-        prop_assert!(m.total_latency_us().is_none());
+        prop_assert!(m.total_latency_us().is_err());
     }
 
     #[test]
-    fn measurement_total_latency_needs_two_stages(
+    fn measurement_total_latency_needs_all_stages(
         id in 0..10_000u64,
         ts in 100..1_000_000u64
     ) {
         let mut m = InputLatencyMeasurement::new(id);
-        m.record_stage(InputLatencyStage::KeyEvent, ts);
-        // Single stage: total_latency should be None (can't compute range)
+        m.record_stage(InputLatencyStage::KeyEvent, proxy_timestamp(ts)).unwrap();
         let total = m.total_latency_us();
-        // With one stage, first==last, so last > first is false → None
-        prop_assert!(total.is_none());
+        prop_assert!(total.is_err());
     }
 
     #[test]
@@ -265,19 +310,17 @@ proptest! {
         start in 100..500_000u64,
         delta in 1..500_000u64
     ) {
-        let mut m = InputLatencyMeasurement::new(id);
-        m.record_stage(InputLatencyStage::KeyEvent, start);
-        m.record_stage(InputLatencyStage::GpuPresent, start + delta);
+        let m = complete_measurement(id, start, delta);
         let total = m.total_latency_us();
-        prop_assert_eq!(total, Some(delta));
+        prop_assert_eq!(total, Ok(delta));
     }
 
     #[test]
     fn collector_respects_capacity(capacity in 1..50usize, count in 0..100usize) {
         let mut collector = InputLatencyCollector::new(capacity);
         for _ in 0..count {
-            let m = collector.begin_measurement();
-            collector.record(m);
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, 100, 500));
         }
         prop_assert!(collector.count() <= capacity);
     }
@@ -286,8 +329,8 @@ proptest! {
     fn collector_clear_resets(count in 1..20usize) {
         let mut collector = InputLatencyCollector::new(100);
         for _ in 0..count {
-            let m = collector.begin_measurement();
-            collector.record(m);
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, 100, 500));
         }
         prop_assert!(collector.count() > 0);
         collector.clear();
@@ -395,22 +438,21 @@ proptest! {
     }
 
     #[test]
-    fn evaluate_budget_empty_collector_passes(_dummy in 0u8..1) {
+    fn evaluate_budget_empty_collector_fails_closed(_dummy in 0u8..1) {
         let collector = InputLatencyCollector::new(100);
         let budget = InputLatencyBudget::default();
         let result = evaluate_budget(&collector, &budget);
-        // Empty collector: all measured values are 0, which is <= budget
-        prop_assert!(result.passed);
+        prop_assert!(!result.passed);
+        prop_assert!(result.evidence_error.is_some());
+        prop_assert!(result.details.is_empty());
     }
 
     #[test]
     fn generate_report_sample_count_matches(count in 0..20usize) {
         let mut collector = InputLatencyCollector::new(100);
         for i in 0..count {
-            let mut m = collector.begin_measurement();
-            m.record_stage(InputLatencyStage::KeyEvent, (i as u64) * 100);
-            m.record_stage(InputLatencyStage::GpuPresent, (i as u64) * 100 + 500);
-            collector.record(m);
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, (i as u64) * 100, 500));
         }
         let report = generate_report(&collector, None);
         prop_assert_eq!(report.sample_count, count);
@@ -430,10 +472,8 @@ proptest! {
     ) {
         let mut collector = InputLatencyCollector::new(100);
         for i in 0..count {
-            let mut m = collector.begin_measurement();
-            m.record_stage(InputLatencyStage::KeyEvent, (i as u64) * 10);
-            m.record_stage(InputLatencyStage::GpuPresent, (i as u64) * 10 + base_us);
-            collector.record(m);
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, (i as u64) * 10, base_us));
         }
         let strict = InputLatencyBudget::default();
         let mut loose = strict.clone();
@@ -471,10 +511,8 @@ proptest! {
     fn generate_report_with_budget_includes_check(count in 1..10usize) {
         let mut collector = InputLatencyCollector::new(100);
         for i in 0..count {
-            let mut m = collector.begin_measurement();
-            m.record_stage(InputLatencyStage::KeyEvent, (i as u64) * 100);
-            m.record_stage(InputLatencyStage::GpuPresent, (i as u64) * 100 + 500);
-            collector.record(m);
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, (i as u64) * 100, 500));
         }
         let budget = InputLatencyBudget::default();
         let report = generate_report(&collector, Some(&budget));
@@ -492,8 +530,8 @@ proptest! {
     fn collector_serde_roundtrip(capacity in 1..20usize, count in 0..15usize) {
         let mut collector = InputLatencyCollector::new(capacity);
         for _ in 0..count {
-            let m = collector.begin_measurement();
-            collector.record(m);
+            let id = collector.begin_measurement().unwrap().id;
+            collector.record(complete_measurement(id, 100, 500));
         }
         let json = serde_json::to_string(&collector).unwrap();
         let back: InputLatencyCollector = serde_json::from_str(&json).unwrap();

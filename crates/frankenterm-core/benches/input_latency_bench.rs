@@ -9,9 +9,10 @@
 //! These benchmarks validate the measurement infrastructure itself is fast enough
 //! to not introduce observable latency when instrumenting the input pipeline.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use frankenterm_core::input_latency::{
-    InputLatencyBudget, InputLatencyCollector, InputLatencyMeasurement, InputLatencyStage,
+    InputLatencyBudget, InputLatencyClockDomainId, InputLatencyCollector,
+    InputLatencyMeasurement, InputLatencyProducerId, InputLatencyStage, InputLatencyTimestamp,
     Percentile, evaluate_budget, generate_report,
 };
 use std::hint::black_box;
@@ -41,10 +42,19 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
+fn timestamp(timestamp_us: u64) -> InputLatencyTimestamp {
+    InputLatencyTimestamp::new(
+        timestamp_us,
+        InputLatencyProducerId::new(1).expect("benchmark producer ID is non-zero"),
+        InputLatencyClockDomainId::new(1).expect("benchmark clock ID is non-zero"),
+    )
+}
+
 fn make_full_measurement(id: u64, base: u64) -> InputLatencyMeasurement {
     let mut m = InputLatencyMeasurement::new(id);
     for (i, &stage) in InputLatencyStage::ALL.iter().enumerate() {
-        m.record_stage(stage, base + (i as u64) * 400);
+        m.record_stage(stage, timestamp(base + (i as u64) * 400))
+            .expect("benchmark stages are unique");
     }
     m
 }
@@ -52,7 +62,10 @@ fn make_full_measurement(id: u64, base: u64) -> InputLatencyMeasurement {
 fn make_populated_collector(n: usize) -> InputLatencyCollector {
     let mut collector = InputLatencyCollector::new(n + 100);
     for i in 0..n {
-        collector.record(make_full_measurement(i as u64, 1000 + i as u64 * 10));
+        collector.record(make_full_measurement(
+            i as u64 + 1,
+            1000 + i as u64 * 10,
+        ));
     }
     collector
 }
@@ -61,26 +74,42 @@ fn bench_record_stage(c: &mut Criterion) {
     let mut group = c.benchmark_group("input_latency");
 
     group.bench_function("record_stage", |b| {
-        let mut m = InputLatencyMeasurement::new(0);
         let mut ts = 1000u64;
-        b.iter(|| {
-            ts += 1;
-            m.record_stage(InputLatencyStage::KeyEvent, black_box(ts));
-        });
+        b.iter_batched(
+            || {
+                ts = ts.saturating_add(1);
+                (InputLatencyMeasurement::new(1), ts)
+            },
+            |(mut measurement, timestamp_us)| {
+                black_box(
+                    measurement
+                        .record_stage(
+                            InputLatencyStage::KeyEvent,
+                            timestamp(black_box(timestamp_us)),
+                        )
+                        .expect("fresh benchmark measurement accepts its first stage"),
+                );
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.bench_function("total_latency", |b| {
-        let m = make_full_measurement(0, 1000);
+        let m = make_full_measurement(1, 1000);
         b.iter(|| {
-            black_box(m.total_latency_us());
+            black_box(
+                m.total_latency_us()
+                    .expect("complete benchmark measurement has a total latency"),
+            );
         });
     });
 
     group.bench_function("stage_latency", |b| {
-        let m = make_full_measurement(0, 1000);
+        let m = make_full_measurement(1, 1000);
         b.iter(|| {
             black_box(
-                m.stage_latency_us(InputLatencyStage::KeyEvent, InputLatencyStage::GpuPresent),
+                m.stage_latency_us(InputLatencyStage::KeyEvent, InputLatencyStage::GpuPresent)
+                    .expect("complete benchmark measurement has the requested stages"),
             );
         });
     });
@@ -95,17 +124,29 @@ fn bench_percentile_computation(c: &mut Criterion) {
         let collector = make_populated_collector(size);
         group.bench_function(format!("percentile_p50_{size}"), |b| {
             b.iter(|| {
-                black_box(collector.total_latency_percentile(Percentile::P50));
+                black_box(
+                    collector
+                        .total_latency_percentile(Percentile::P50)
+                        .expect("populated benchmark collector has a p50"),
+                );
             });
         });
         group.bench_function(format!("percentile_p99_{size}"), |b| {
             b.iter(|| {
-                black_box(collector.total_latency_percentile(Percentile::P99));
+                black_box(
+                    collector
+                        .total_latency_percentile(Percentile::P99)
+                        .expect("populated benchmark collector has a p99"),
+                );
             });
         });
         group.bench_function(format!("summary_{size}"), |b| {
             b.iter(|| {
-                black_box(collector.total_latency_summary());
+                black_box(
+                    collector
+                        .total_latency_summary()
+                        .expect("populated benchmark collector has a summary"),
+                );
             });
         });
     }
@@ -160,7 +201,7 @@ fn bench_collector_recording(c: &mut Criterion) {
         let mut collector = InputLatencyCollector::new(10000);
         let mut id = 0u64;
         b.iter(|| {
-            id += 1;
+            id = id.saturating_add(1);
             let m = make_full_measurement(id, 1000);
             collector.record(black_box(m));
         });
@@ -170,11 +211,11 @@ fn bench_collector_recording(c: &mut Criterion) {
         let mut collector = InputLatencyCollector::new(100);
         // Pre-fill to capacity
         for i in 0..100 {
-            collector.record(make_full_measurement(i, 1000));
+            collector.record(make_full_measurement(i + 1, 1000));
         }
         let mut id = 100u64;
         b.iter(|| {
-            id += 1;
+            id = id.saturating_add(1);
             let m = make_full_measurement(id, 1000);
             collector.record(black_box(m));
         });
