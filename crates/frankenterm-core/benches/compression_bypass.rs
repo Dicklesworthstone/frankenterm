@@ -163,7 +163,7 @@ async fn connect_once(mode: VendoredCompressionMode) -> Result<(), String> {
 
     let mut config = DirectMuxClientConfig::default().with_socket_path(socket_path);
     config.compression_mode = mode;
-    let client = match DirectMuxClient::connect(config).await {
+    let client = match Box::pin(DirectMuxClient::connect(config)).await {
         Ok(client) => client,
         Err(err) => {
             server.abort();
@@ -201,7 +201,7 @@ async fn connect_with_auto_fallback() -> Result<(), String> {
     });
 
     let auto = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
-    let client = match DirectMuxClient::connect(auto).await {
+    let client = match Box::pin(DirectMuxClient::connect(auto)).await {
         Ok(client) => client,
         Err(err) => {
             server.abort();
