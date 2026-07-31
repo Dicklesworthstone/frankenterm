@@ -662,8 +662,8 @@ proptest! {
         }
     }
 
-    /// 16. No chunk exceeds max_chunk_chars by more than a generous factor
-    /// (glue can merge two chunks, and overlap adds chars).
+    /// Property 16: no chunk exceeds max_chunk_chars by more than a generous
+    /// factor (glue can merge two chunks, and overlap adds chars).
     #[test]
     fn no_chunk_exceeds_char_limit_with_glue(
         inputs in arb_chunk_input_events_single_pane(1..=30),

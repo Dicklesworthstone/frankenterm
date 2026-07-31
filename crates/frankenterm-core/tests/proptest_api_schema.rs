@@ -908,8 +908,8 @@ proptest! {
         endpoints in prop::collection::vec(arb_endpoint_meta(), 0..=6),
     ) {
         let reg = SchemaRegistry { version: "0.1.0".into(), endpoints };
-        let ids: Vec<&str> = reg.ids().collect();
-        prop_assert_eq!(ids.len(), reg.endpoints.len(),
-            "ids count ({}) != endpoints count ({})", ids.len(), reg.endpoints.len());
+        let id_count = reg.ids().count();
+        prop_assert_eq!(id_count, reg.endpoints.len(),
+            "ids count ({}) != endpoints count ({})", id_count, reg.endpoints.len());
     }
 }

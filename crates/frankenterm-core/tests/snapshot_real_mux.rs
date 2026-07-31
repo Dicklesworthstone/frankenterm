@@ -563,9 +563,9 @@ fn no_mock_spawn_send_resize_read_loopback() {
     );
 
     let mut direct = block_on_mux_operation(&runtime, "connect direct mux client", async {
-        DirectMuxClient::connect(
+        Box::pin(DirectMuxClient::connect(
             DirectMuxClientConfig::default().with_socket_path(fixture.socket_path()),
-        )
+        ))
         .await
     });
     let resized = TerminalSize {

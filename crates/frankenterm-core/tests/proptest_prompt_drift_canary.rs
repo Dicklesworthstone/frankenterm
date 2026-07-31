@@ -168,8 +168,8 @@ proptest! {
         prop_assert_eq!(snap.alarms_count, 0);
     }
 
-    /// **CUSUM clamping**: cusum_high and cusum_low are always ≥
-    /// 0. The `.max(0.0)` clamp at the substrate's update path
+    /// **CUSUM clamping**: cusum_high and cusum_low are always non-negative.
+    /// The `.max(0.0)` clamp at the substrate's update path
     /// is part of the documented contract — pinned here over
     /// arbitrary observation sequences.
     #[test]
@@ -204,9 +204,8 @@ proptest! {
         prop_assert_eq!(&s2, &s3);
     }
 
-    /// **Determinism**: two fresh canaries with the same params
-    /// + same observation sequence produce byte-identical
-    /// snapshots.
+    /// **Determinism**: two fresh canaries with the same params and the same
+    /// observation sequence produce byte-identical snapshots.
     #[test]
     fn fresh_canaries_with_same_input_match(
         observations in arb_observation_sequence(),

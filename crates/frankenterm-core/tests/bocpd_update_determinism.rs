@@ -35,7 +35,7 @@ fn multi_regime_sequence() -> Vec<f64> {
 
 /// Field-wise equality for `Option<ChangePoint>` (ChangePoint does not derive
 /// `PartialEq`); floats are compared by bit pattern so determinism is exact.
-fn change_points_match(a: &Option<ChangePoint>, b: &Option<ChangePoint>) -> bool {
+fn change_points_match(a: Option<&ChangePoint>, b: Option<&ChangePoint>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => {
@@ -61,7 +61,7 @@ fn two_fresh_models_on_identical_sequence_are_bit_identical() {
         let ca = a.update(x);
         let cb = b.update(x);
         assert!(
-            change_points_match(&ca, &cb),
+            change_points_match(ca.as_ref(), cb.as_ref()),
             "change-point emission diverged at step {step}: {ca:?} vs {cb:?}"
         );
 

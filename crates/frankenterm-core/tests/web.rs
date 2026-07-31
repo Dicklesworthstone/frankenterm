@@ -326,8 +326,8 @@ mod web_tests {
     /// ft-xbnl0.2.4 tick 417: `run_web_server_with_cx` orchestrator-level
     /// mid-flight cx-cancel exits gracefully.
     ///
-    /// Complements `web_server_with_cx_pre_cancelled_refuses_to_bind` (tick
-    /// 323) which pins the pre-start timing. This test pins the mid-flight
+    /// Complements `web_server_with_cx_pre_cancelled_refuses_to_bind` (tick 323),
+    /// which pins the pre-start timing. This test pins the mid-flight
     /// timing: cx is live when `run_web_server_with_cx` is called, the
     /// server binds and enters its `select! { join | shutdown_signal }`
     /// orchestration, then a separate task cancels cx ~200 ms later.
