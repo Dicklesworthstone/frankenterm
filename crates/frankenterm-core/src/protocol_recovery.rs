@@ -142,6 +142,8 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
         || lower.contains("incompatible")
         || lower.contains("socket path not found")
         || lower.contains("proxy command not supported")
+        || lower.contains("connection identity space exhausted")
+        || lower.contains("invalid direct mux client limit")
     {
         return ProtocolErrorKind::Permanent;
     }
@@ -192,16 +194,21 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
 pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErrorKind {
     use crate::vendored::DirectMuxError;
     match err {
-        DirectMuxError::SocketPathMissing | DirectMuxError::ProxyUnsupported => {
-            ProtocolErrorKind::Permanent
-        }
-        DirectMuxError::IncompatibleCodec { .. } => ProtocolErrorKind::Permanent,
+        DirectMuxError::SocketPathMissing
+        | DirectMuxError::ProxyUnsupported
+        | DirectMuxError::IncompatibleCodec { .. }
+        | DirectMuxError::ConnectionIdExhausted
+        | DirectMuxError::InvalidLimit { .. } => ProtocolErrorKind::Permanent,
 
         DirectMuxError::Disconnected
         | DirectMuxError::UnexpectedResponse { .. }
         | DirectMuxError::Codec(_)
         | DirectMuxError::FrameTooLarge { .. }
-        | DirectMuxError::RemoteError(_) => ProtocolErrorKind::Recoverable,
+        | DirectMuxError::RemoteError(_)
+        | DirectMuxError::RetentionLimitExceeded { .. }
+        | DirectMuxError::ResponseSerialNotOutstanding { .. }
+        | DirectMuxError::RetainedConnectionMismatch { .. }
+        | DirectMuxError::RetainedStateAccounting { .. } => ProtocolErrorKind::Recoverable,
 
         DirectMuxError::ConnectTimeout(_)
         | DirectMuxError::ReadTimeout
@@ -1007,6 +1014,65 @@ mod tests {
             classify_error_message("mux socket path not found; set WEZTERM_UNIX_SOCKET"),
             ProtocolErrorKind::Permanent
         );
+    }
+
+    #[test]
+    fn classify_connection_identity_exhausted() {
+        assert_eq!(
+            classify_error_message("direct mux connection identity space exhausted"),
+            ProtocolErrorKind::Permanent
+        );
+    }
+
+    #[test]
+    fn classify_invalid_direct_mux_limit() {
+        assert_eq!(
+            classify_error_message(
+                "invalid direct mux client limit max_pending_responses: value must be nonzero"
+            ),
+            ProtocolErrorKind::Permanent
+        );
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn classify_bounded_retention_mux_errors() {
+        use crate::vendored::DirectMuxError;
+
+        for error in [
+            DirectMuxError::RetentionLimitExceeded {
+                resource: "pending mux responses",
+                requested_count: 2,
+                requested_bytes: 32,
+                max_count: 1,
+                max_bytes: 16,
+            },
+            DirectMuxError::ResponseSerialNotOutstanding {
+                connection_id: 7,
+                serial: 9,
+            },
+            DirectMuxError::RetainedConnectionMismatch {
+                expected_connection_id: 8,
+                got_connection_id: 7,
+            },
+            DirectMuxError::RetainedStateAccounting {
+                resource: "pending mux responses",
+            },
+        ] {
+            assert_eq!(
+                classify_mux_error(&error),
+                ProtocolErrorKind::Recoverable
+            );
+        }
+
+        for error in [
+            DirectMuxError::ConnectionIdExhausted,
+            DirectMuxError::InvalidLimit {
+                field: "max_pending_responses",
+            },
+        ] {
+            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Permanent);
+        }
     }
 
     #[test]

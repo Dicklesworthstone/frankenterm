@@ -2328,14 +2328,22 @@ fn next_connection_id() -> Result<u64, DirectMuxError> {
 }
 
 fn next_connection_id_from(next: &AtomicU64) -> Result<u64, DirectMuxError> {
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let mut current = next.load(Ordering::Relaxed);
+    loop {
         if current == 0 || current == u64::MAX {
-            None
-        } else {
-            Some(current + 1)
+            return Err(DirectMuxError::ConnectionIdExhausted);
         }
-    })
-    .map_err(|_| DirectMuxError::ConnectionIdExhausted)
+
+        match next.compare_exchange(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(current),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn next_request_serial(serial: &mut u64) -> Result<u64, DirectMuxError> {
