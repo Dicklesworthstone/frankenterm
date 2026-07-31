@@ -1069,9 +1069,9 @@ impl ClientPane {
                 let mouse_grabbed = delta.mouse_grabbed;
                 let alt_screen_active = delta.alt_screen_active;
                 let current_seqno = registration.try_with_current(|_| {
-                        let renderable = self.renderable.lock();
-                        renderable.get_current_seqno()
-                    });
+                    let renderable = self.renderable.lock();
+                    renderable.get_current_seqno()
+                });
                 let Some(current_seqno) = current_seqno else {
                     return Ok(());
                 };
