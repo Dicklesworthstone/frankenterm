@@ -868,7 +868,7 @@ impl InputLatencyBudgetError {
 }
 
 /// Result of evaluating proxy measurements against a budget.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BudgetCheckResult {
     /// Permanent authority boundary for this legacy framework.
     pub evidence_class: InputLatencyEvidenceClass,
@@ -909,6 +909,114 @@ pub struct BudgetCheckDetail {
     pub ratio: Option<f64>,
     /// Reason code.
     pub reason_code: String,
+}
+
+#[derive(Deserialize)]
+struct BudgetCheckResultWire {
+    evidence_class: InputLatencyEvidenceClass,
+    sample_count: usize,
+    passed: bool,
+    details: Vec<BudgetCheckDetail>,
+    #[serde(default)]
+    evidence_error: Option<InputLatencyEvidenceError>,
+    #[serde(default)]
+    budget_error: Option<InputLatencyBudgetError>,
+    reason_code: String,
+}
+
+impl BudgetCheckResult {
+    fn validate_contract(&self) -> Result<(), &'static str> {
+        match (&self.evidence_error, &self.budget_error) {
+            (Some(_), Some(_)) => {
+                return Err("budget verdict cannot carry evidence and budget errors together");
+            }
+            (Some(error), None) => {
+                if self.passed || !self.details.is_empty() {
+                    return Err("evidence-error verdict must fail without details");
+                }
+                if self.reason_code != error.reason_code() {
+                    return Err("evidence-error verdict reason code does not match its error");
+                }
+                return Ok(());
+            }
+            (None, Some(error)) => {
+                if self.passed || !self.details.is_empty() {
+                    return Err("budget-error verdict must fail without details");
+                }
+                if self.reason_code != error.reason_code() {
+                    return Err("budget-error verdict reason code does not match its error");
+                }
+                return Ok(());
+            }
+            (None, None) => {}
+        }
+
+        if self.sample_count == 0 {
+            return Err("detail-bearing budget verdict requires at least one sample");
+        }
+        if self.details.is_empty() {
+            return Err("error-free budget verdict requires at least one detail");
+        }
+
+        for detail in &self.details {
+            let expected_ratio = (detail.budget_us > 0)
+                .then(|| detail.measured_us as f64 / detail.budget_us as f64);
+            if detail.ratio != expected_ratio {
+                return Err("budget detail ratio does not match measured and target values");
+            }
+
+            let expected_reason = match (detail.stage, detail.passed) {
+                (None, true) => format!("BUDGET_OK_AGGREGATE_{}", detail.percentile),
+                (None, false) => {
+                    format!("BUDGET_EXCEEDED_AGGREGATE_{}", detail.percentile)
+                }
+                (Some(stage), true) => {
+                    format!("BUDGET_OK_{}_{}", stage.label(), detail.percentile)
+                }
+                (Some(stage), false) => {
+                    format!("BUDGET_EXCEEDED_{}_{}", stage.label(), detail.percentile)
+                }
+            };
+            if detail.reason_code != expected_reason {
+                return Err("budget detail reason code does not match its outcome");
+            }
+        }
+
+        let all_details_passed = self.details.iter().all(|detail| detail.passed);
+        if self.passed != all_details_passed {
+            return Err("budget verdict disagrees with its detail outcomes");
+        }
+        let expected_reason = if self.passed {
+            "ALL_PROXY_BUDGETS_MET"
+        } else {
+            "PROXY_BUDGET_VIOLATION"
+        };
+        if self.reason_code != expected_reason {
+            return Err("budget verdict reason code does not match its outcome");
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for BudgetCheckResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BudgetCheckResultWire::deserialize(deserializer)?;
+        let result = Self {
+            evidence_class: wire.evidence_class,
+            sample_count: wire.sample_count,
+            passed: wire.passed,
+            details: wire.details,
+            evidence_error: wire.evidence_error,
+            budget_error: wire.budget_error,
+            reason_code: wire.reason_code,
+        };
+        result.validate_contract().map_err(de::Error::custom)?;
+        Ok(result)
+    }
 }
 
 fn validate_budget(budget: &InputLatencyBudget) -> Result<(), InputLatencyBudgetError> {
