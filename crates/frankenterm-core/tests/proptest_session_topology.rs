@@ -739,11 +739,11 @@ proptest! {
         let mapping = match_panes(&old_snapshot, &new_panes);
 
         // Every old pane ID is either mapped or unmatched
-        let mapped_old: Vec<u64> = mapping.mappings.keys().copied().collect();
-        let total = mapped_old.len() + mapping.unmatched_old.len();
+        let mapped_old_count = mapping.mappings.len();
+        let total = mapped_old_count + mapping.unmatched_old.len();
         prop_assert_eq!(total, n_old,
             "mapped({}) + unmatched_old({}) should equal n_old({})",
-            mapped_old.len(), mapping.unmatched_old.len(), n_old);
+            mapped_old_count, mapping.unmatched_old.len(), n_old);
     }
 }
 

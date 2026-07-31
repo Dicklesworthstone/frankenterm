@@ -413,17 +413,17 @@ fn storm_detection_throttles_rapid_planner_resubmissions() {
 
     // Schedule — storm detection should limit picks from tab 42.
     let frame = scheduler.schedule_frame();
-    let tab42_picks: Vec<_> = frame
+    let tab42_pick_count = frame
         .scheduled
         .iter()
         .filter(|w| {
             // All panes 1-5 have tab_id=42.
             (1..=5).contains(&w.pane_id)
         })
-        .collect();
+        .count();
     assert!(
-        tab42_picks.len() <= scheduler.config().max_storm_picks_per_tab as usize,
+        tab42_pick_count <= scheduler.config().max_storm_picks_per_tab as usize,
         "storm detection should limit per-tab picks, got {}",
-        tab42_picks.len()
+        tab42_pick_count
     );
 }

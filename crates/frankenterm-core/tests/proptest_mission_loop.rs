@@ -382,18 +382,18 @@ proptest! {
         // Each conflict involves 2 agents, messages sent to both.
         for conflict in &report.conflicts {
             for agent in &conflict.involved_agents {
-                let agent_msgs: Vec<_> = report
+                let agent_message_count = report
                     .messages
                     .iter()
                     .filter(|m| m.recipient == *agent && m.conflict_id == conflict.conflict_id)
-                    .collect();
+                    .count();
                 prop_assert_eq!(
-                    agent_msgs.len(),
+                    agent_message_count,
                     1,
                     "Agent {} should get exactly 1 message for conflict {}, got {}",
                     agent,
                     conflict.conflict_id,
-                    agent_msgs.len()
+                    agent_message_count
                 );
             }
         }

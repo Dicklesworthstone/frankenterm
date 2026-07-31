@@ -306,16 +306,16 @@ fn spam_rapid_same_bead_triggers_no_duplicate_assignments() {
     let issues = vec![issue("bead-1", 1)];
     let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx());
     // Same bead should not be assigned to multiple agents.
-    let bead1_assignments: Vec<_> = decision
+    let bead1_assignment_count = decision
         .assignment_set
         .assignments
         .iter()
         .filter(|a| a.bead_id == "bead-1")
-        .collect();
+        .count();
     assert!(
-        bead1_assignments.len() <= 1,
+        bead1_assignment_count <= 1,
         "same bead must not be assigned to multiple agents: got {}",
-        bead1_assignments.len()
+        bead1_assignment_count
     );
 }
 

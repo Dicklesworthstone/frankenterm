@@ -663,10 +663,10 @@ proptest! {
         let json = serde_json::to_string(&tree).unwrap();
         let restored: IntervalTree<i32, u32> = serde_json::from_str(&json).unwrap();
 
-        let orig_lows: Vec<i32> = tree.iter().map(|(iv, _)| iv.low).collect();
+        let orig_count = tree.iter().count();
         let rest_lows: Vec<i32> = restored.iter().map(|(iv, _)| iv.low).collect();
 
-        prop_assert_eq!(orig_lows.len(), rest_lows.len(),
+        prop_assert_eq!(orig_count, rest_lows.len(),
             "iterator lengths differ after serde roundtrip");
 
         // Both should be sorted

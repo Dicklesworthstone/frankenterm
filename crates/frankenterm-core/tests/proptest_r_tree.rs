@@ -343,21 +343,19 @@ proptest! {
         tree.insert(r1, 1);
         tree.insert(r2, 2);
 
-        let results_r1: Vec<i32> = tree.query(&r1)
+        let r1_contains_r2 = tree.query(&r1)
             .iter()
-            .map(|(_, v)| **v)
-            .collect();
-        let results_r2: Vec<i32> = tree.query(&r2)
+            .any(|(_, v)| **v == 2);
+        let r2_contains_r1 = tree.query(&r2)
             .iter()
-            .map(|(_, v)| **v)
-            .collect();
+            .any(|(_, v)| **v == 1);
 
         prop_assert!(
-            !results_r1.contains(&2),
+            !r1_contains_r2,
             "query for r1 should not return r2's value"
         );
         prop_assert!(
-            !results_r2.contains(&1),
+            !r2_contains_r1,
             "query for r2 should not return r1's value"
         );
     }

@@ -206,15 +206,15 @@ proptest! {
         }
 
         let art_results = art.prefix_search(&prefix);
-        let ref_results: Vec<_> = reference
+        let ref_count = reference
             .iter()
             .filter(|(k, _)| k.starts_with(&prefix))
-            .collect();
+            .count();
 
         prop_assert_eq!(
-            art_results.len(), ref_results.len(),
+            art_results.len(), ref_count,
             "prefix search for {:?}: ART found {}, reference found {}",
-            prefix, art_results.len(), ref_results.len()
+            prefix, art_results.len(), ref_count
         );
     }
 

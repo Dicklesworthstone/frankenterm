@@ -155,19 +155,19 @@ fn wa_22x4r_labruntime_port_files_still_exist() {
         .join("frankenterm-core")
         .join("tests");
     let entries = fs::read_dir(&tests_dir).expect("read tests dir");
-    let port_files: Vec<_> = entries
+    let port_file_count = entries
         .flatten()
         .filter(|e| {
             e.file_name()
                 .to_str()
                 .is_some_and(|n| n.ends_with("_labruntime.rs"))
         })
-        .collect();
+        .count();
     assert!(
-        port_files.len() >= 20,
+        port_file_count >= 20,
         "expected ≥20 `*_labruntime.rs` port files under {}, found {}; \
          the wa-22x4r port work may have regressed",
         tests_dir.display(),
-        port_files.len()
+        port_file_count
     );
 }

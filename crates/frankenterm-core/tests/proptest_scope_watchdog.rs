@@ -318,14 +318,14 @@ proptest! {
         let mut watchdog = ScopeWatchdog::with_config(config);
         let alerts = watchdog.scan(&tree, check_ms);
 
-        let zombies: Vec<_> = alerts.iter()
-            .filter(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. }))
-            .collect();
+        let has_zombie_alert = alerts
+            .iter()
+            .any(|a| matches!(a.kind, AlertKind::ZombieFinalizer { .. }));
 
         if elapsed_ms > timeout_ms as i64 {
-            prop_assert!(!zombies.is_empty(), "should detect zombie at {}ms > {}ms", elapsed_ms, timeout_ms);
+            prop_assert!(has_zombie_alert, "should detect zombie at {}ms > {}ms", elapsed_ms, timeout_ms);
         } else {
-            prop_assert!(zombies.is_empty(), "should NOT detect zombie at {}ms <= {}ms", elapsed_ms, timeout_ms);
+            prop_assert!(!has_zombie_alert, "should NOT detect zombie at {}ms <= {}ms", elapsed_ms, timeout_ms);
         }
     }
 
@@ -393,14 +393,14 @@ proptest! {
         let mut watchdog = ScopeWatchdog::with_config(config);
         let alerts = watchdog.scan(&tree, 2000);
 
-        let depth_alerts: Vec<_> = alerts.iter()
-            .filter(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }))
-            .collect();
+        let has_depth_alert = alerts
+            .iter()
+            .any(|a| matches!(a.kind, AlertKind::ExcessiveDepth { .. }));
 
         if actual_depth > max_depth {
-            prop_assert!(!depth_alerts.is_empty(), "should detect excessive depth {} > {}", actual_depth, max_depth);
+            prop_assert!(has_depth_alert, "should detect excessive depth {} > {}", actual_depth, max_depth);
         } else {
-            prop_assert!(depth_alerts.is_empty(), "should NOT detect excessive depth {} <= {}", actual_depth, max_depth);
+            prop_assert!(!has_depth_alert, "should NOT detect excessive depth {} <= {}", actual_depth, max_depth);
         }
     }
 

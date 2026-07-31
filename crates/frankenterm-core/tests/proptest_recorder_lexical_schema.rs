@@ -158,11 +158,11 @@ proptest! {
         let (schema2, handles2) = build_lexical_schema_v1();
 
         // Field count must always be 25
-        let fields1: Vec<_> = schema1.fields().collect();
-        let fields2: Vec<_> = schema2.fields().collect();
-        prop_assert_eq!(fields1.len(), 25);
-        prop_assert_eq!(fields2.len(), 25);
-        prop_assert_eq!(fields1.len(), fields2.len());
+        let fields1_count = schema1.fields().count();
+        let fields2_count = schema2.fields().count();
+        prop_assert_eq!(fields1_count, 25);
+        prop_assert_eq!(fields2_count, 25);
+        prop_assert_eq!(fields1_count, fields2_count);
 
         // Handles must be identical
         prop_assert_eq!(handles1.event_id, handles2.event_id);

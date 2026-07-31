@@ -558,13 +558,13 @@ fn test_fixture_duplicate_batch_ids_dedup_works() {
     let fixture = load_fixture_from_disk("fixture_duplicate_batch_ids.json").unwrap();
     // Dedup by (pane_id, sequence) — keep first seen
     let mut seen = std::collections::HashSet::new();
-    let deduped: Vec<_> = fixture
+    let deduped_count = fixture
         .events
         .iter()
         .filter(|e| seen.insert((e.pane_id, e.sequence)))
-        .collect();
+        .count();
     // 0..10 unique + 10..20 unique = 20 (the 5 dupes of 0..5 are removed)
-    assert_eq!(deduped.len(), 20);
+    assert_eq!(deduped_count, 20);
 }
 
 #[test]
