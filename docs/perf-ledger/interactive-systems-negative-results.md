@@ -225,6 +225,66 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Do not retry either rejected harness model; retry only after a fixture drives the production admission path or installs the complete generation-tagged lifecycle lease and explicit synchronization barriers.
 
+### IS-N013 — Nested positional fields are not additive wire tails
+
+- **Classification:** protocol-design rejection and wrong test-state rejection
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.4`
+- **Baseline revision:** `5f3384cd146f8c0a4b55b0e24e5c03acef1dfab2`
+- **Rejected design:** the first render-protocol-v2 draft appended
+  `RenderConnectionIdentity` to the nested `RenderApplicationToken`. That
+  token is followed by pane and state fields inside
+  `RenderApplicationIdentity`, which is itself followed by payload fields in
+  PDUs 79 and 80. In varbincode's positional format, the change was therefore
+  a middle insertion, not an additive tail, and could misalign every following
+  field across versions.
+- **Intermediate correction:** connection authority was moved to the literal
+  final field of each top-level render PDU. That removed the middle insertion,
+  but strict-remote job `j-29953507796713785` subsequently proved that a newer
+  varbincode schema still cannot synthesize the absent field at legacy EOF.
+  See IS-N014 for the final distinct-PDU correction.
+- **Superseded proof:** strict-remote `fmd` job
+  `j-29953507796713783` passed 163/163 codec tests and then failed the new
+  client lifecycle test because the fixture captured a ready-only RPC scope
+  before successor readiness publication. Production establishes render
+  identity during coherent bootstrap, so the corrected test uses the exact
+  bootstrap scope, then separately verifies preservation into a ready scope.
+  The failed assertion does not justify weakening readiness fencing.
+- **Decision:** reject both the nested-field layout and ready-only pre-ready
+  fixture. Preserve stage-accurate scope authority; do not mistake literal tail
+  placement for bidirectional positional-schema compatibility.
+- **Primary retry condition:**
+  > Do not add authority inside a nested positional wire struct or model bootstrap with a ready-only scope; use distinct PDU identifiers or an explicit dual-schema decoder with real legacy/current frames, plus the exact scope for each lifecycle stage.
+
+### IS-N014 — `serde(default)` does not fill a missing positional varbincode tail at EOF
+
+- **Classification:** protocol-design and evidence-pipeline rejection
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.4`
+- **Baseline revision:** `5f3384cd146f8c0a4b55b0e24e5c03acef1dfab2`
+- **Rejected design:** the second render-v2 draft put
+  `RenderConnectionIdentity` at the literal tail of PDUs 79 and 80 and marked
+  it `serde(default)`. Existing tests had treated arbitrary bytes appended
+  *after a complete framed PDU* as if they were a future field inside the
+  frame's length-delimited varbincode payload.
+- **Observed result:** strict-remote `fmd` job
+  `j-29953507796713785` failed
+  `render_application_v2_connection_authority_is_a_real_wire_tail_extension`
+  with `failed to fill whole buffer` while a v50 decoder read a canonical
+  v48/v49 payload. The newer positional schema requests all of its fields;
+  reaching EOF while reading the new field is an error before serde can apply
+  the struct default. Bytes outside the frame prove only that a single-frame
+  decoder stops at its declared length.
+- **Correction:** PDU IDs 79/80 remain permanently bound to explicit v1
+  schemas; authoritative v2 uses new IDs 84/85 and is capability-gated at
+  codec 50. PDU 27, whose older four-field response genuinely must remain
+  readable during handshake, now has an explicit bounded dual-schema decoder
+  with canonical legacy/current frame tests in both compression modes.
+- **Decision:** reject positional tail fields as automatically
+  bidirectionally additive. New PDU identifiers are the default evolution
+  mechanism; a reused identifier requires an explicit decoder for every
+  accepted schema and real frames in both directions.
+- **Primary retry condition:**
+  > Retry a same-identifier schema extension only with a bounded explicit dual-schema decoder, canonical old/new payload fixtures inside the declared frame length, corruption rejection, and negotiated emission authority.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window

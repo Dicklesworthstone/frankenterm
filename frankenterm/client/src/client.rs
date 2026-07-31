@@ -52,6 +52,12 @@ const MAX_RPC_READINESS_PUBLICATIONS: usize = 64;
 const MAX_RPC_READINESS_WAITERS: usize = 64;
 const MUX_RPC_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 const TOPOLOGY_FENCE_MIN_CODEC_VERSION: usize = 49;
+#[cfg(test)]
+pub(crate) const TEST_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
+    RenderConnectionIdentity::new(
+        TopologyStreamId::from_bytes([0x35; 16]),
+        MuxSessionIncarnation::from_bytes([0x57; 16]),
+    );
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
@@ -596,6 +602,9 @@ struct RpcTransportLifecycle {
     active_consumer_commits: usize,
     terminal_error: Option<RpcTransportError>,
     readiness_authority: Arc<RpcReadinessAuthority>,
+    /// Exact stream/session authority established only after the coherent
+    /// topology snapshot has been applied and committed by its consumer.
+    render_connection_identity: Option<RenderConnectionIdentity>,
 }
 
 #[derive(Debug)]
@@ -662,6 +671,7 @@ impl RpcTransportState {
                 active_consumer_commits: 0,
                 terminal_error: None,
                 readiness_authority: Arc::new(RpcReadinessAuthority::new(generation)),
+                render_connection_identity: None,
             }),
             consumer_commits_drained: Condvar::new(),
             live_generation: AtomicU64::new(generation.get()),
@@ -710,6 +720,54 @@ impl RpcTransportState {
         NonZeroU64::new(self.live_generation.load(AtomicOrdering::Acquire))
     }
 
+    fn bind_render_connection_identity(
+        &self,
+        generation: NonZeroU64,
+        identity: RenderConnectionIdentity,
+    ) -> anyhow::Result<()> {
+        identity
+            .validate()
+            .context("validating render connection identity")?;
+        let mut lifecycle = self.lifecycle.lock();
+        if !matches!(
+            lifecycle.phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) || self.live_generation.load(AtomicOrdering::Acquire) != generation.get()
+        {
+            bail!(
+                "cannot bind render connection identity for retired mux RPC generation {}",
+                generation
+            );
+        }
+        match lifecycle.render_connection_identity {
+            None => {
+                lifecycle.render_connection_identity = Some(identity);
+                Ok(())
+            }
+            Some(existing) if existing == identity => Ok(()),
+            Some(_) => bail!(
+                "mux RPC generation {} attempted to replace its established render connection identity",
+                generation
+            ),
+        }
+    }
+
+    fn render_connection_identity(
+        &self,
+        generation: NonZeroU64,
+    ) -> Option<RenderConnectionIdentity> {
+        let lifecycle = self.lifecycle.lock();
+        if matches!(
+            lifecycle.phase,
+            RpcTransportPhase::Live(observed) if observed == generation
+        ) && self.live_generation.load(AtomicOrdering::Acquire) == generation.get()
+        {
+            lifecycle.render_connection_identity
+        } else {
+            None
+        }
+    }
+
     fn mark_incarnation_terminal(&self, error: RpcTransportError) -> RpcTransportError {
         debug_assert!(error.is_incarnation_terminal());
         let terminal_error = {
@@ -725,6 +783,7 @@ impl RpcTransportState {
             self.ready_generation.store(0, AtomicOrdering::Release);
             self.live_generation.store(0, AtomicOrdering::Release);
             lifecycle.readiness_authority.retire();
+            lifecycle.render_connection_identity = None;
             lifecycle.phase = RpcTransportPhase::Closed { last_live };
             lifecycle.terminal_error = Some(error.clone());
             error
@@ -1199,6 +1258,17 @@ impl RpcGenerationScope {
     )]
     pub(crate) const fn connection_generation(&self) -> Option<NonZeroU64> {
         self.generation
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
+    )]
+    pub(crate) fn render_connection_identity(&self) -> Option<RenderConnectionIdentity> {
+        self.generation.and_then(|generation| {
+            self.rpc_transport
+                .render_connection_identity(generation)
+        })
     }
 
     pub(crate) fn commit_sync<T>(
@@ -1677,6 +1747,7 @@ impl ClientDispatchAuthority {
             .live_generation
             .store(0, AtomicOrdering::Release);
         lifecycle.readiness_authority.retire();
+        lifecycle.render_connection_identity = None;
         lifecycle.phase = RpcTransportPhase::Reconnecting {
             retired: current,
             next: next_generation,
@@ -1808,6 +1879,7 @@ impl ClientDispatchAuthority {
             {
                 lifecycle.phase = RpcTransportPhase::Live(generation);
                 lifecycle.readiness_authority = readiness_authority;
+                lifecycle.render_connection_identity = None;
                 self.rpc_transport
                     .ready_generation
                     .store(0, AtomicOrdering::Release);
@@ -1839,6 +1911,7 @@ impl ClientDispatchAuthority {
                 RpcTransportPhase::Closed { last_live } => last_live,
             };
             lifecycle.readiness_authority.retire();
+            lifecycle.render_connection_identity = None;
             lifecycle.phase = RpcTransportPhase::Closed { last_live };
         }
         receiver.close();
@@ -1867,6 +1940,7 @@ impl ClientDispatchAuthority {
             RpcTransportPhase::Closed { last_live } => last_live,
         };
         lifecycle.readiness_authority.retire();
+        lifecycle.render_connection_identity = None;
         lifecycle.phase = RpcTransportPhase::Closed { last_live };
         while lifecycle.active_consumer_commits != 0 {
             self.rpc_transport
@@ -2656,6 +2730,10 @@ impl TopologyFenceAuthority {
             session_incarnation: snapshot.session_incarnation,
             snapshot_revision: snapshot.snapshot_revision,
         })
+    }
+
+    const fn render_connection_identity(self) -> RenderConnectionIdentity {
+        RenderConnectionIdentity::new(self.stream_id, self.session_incarnation)
     }
 }
 
@@ -4262,6 +4340,20 @@ async fn client_thread_async(
                             return Err(error).context(message);
                         }
                     };
+                    if let Err(error) = dispatch_authority
+                        .rpc_transport
+                        .bind_render_connection_identity(
+                            generation,
+                            authority.render_connection_identity(),
+                        )
+                    {
+                        let message = format!(
+                            "render connection identity bind failed on generation {}: {error:#}",
+                            generation
+                        );
+                        let _ = promise.try_send(Err(anyhow!(message.clone())));
+                        return Err(error).context(message);
+                    }
                     if let Err(error) = route_client_unilateral_batch(
                         dispatch_authority,
                         generation,
@@ -6286,6 +6378,13 @@ impl Client {
         let (sender, _receiver) = unbounded();
         let rpc_transport = Arc::new(RpcTransportState::new());
         rpc_transport.mark_current_generation_ready_for_test();
+        rpc_transport
+            .bind_render_connection_identity(
+                NonZeroU64::new(INITIAL_CONNECTION_GENERATION)
+                    .expect("initial test generation is nonzero"),
+                TEST_RENDER_CONNECTION_IDENTITY,
+            )
+            .expect("test client should bind a valid render connection identity");
         Self {
             sender,
             local_domain_id,
@@ -7739,6 +7838,114 @@ mod tests {
             Err(async_channel::TryRecvError::Empty)
         ));
         drop(fresh_but_unpolled);
+    }
+
+    #[test]
+    fn render_connection_identity_is_bound_to_one_exact_live_rpc_generation() {
+        let (client, receiver) = client_with_idle_rpc_queue();
+        let authority = client.test_dispatch_authority(Weak::new());
+        let first_scope = client.rpc_scope();
+        let first_generation =
+            NonZeroU64::new(INITIAL_CONNECTION_GENERATION).expect("test generation is nonzero");
+        let successor_identity = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0x36; 16]),
+            MuxSessionIncarnation::from_bytes([0x58; 16]),
+        );
+
+        assert_eq!(first_scope.render_connection_identity(), None);
+        let reserved_identity = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0; 16]),
+            MuxSessionIncarnation::from_bytes([0; 16]),
+        );
+        assert!(
+            client
+                .rpc_transport
+                .bind_render_connection_identity(first_generation, reserved_identity)
+                .is_err(),
+            "a reserved wire default must never acquire render authority"
+        );
+        assert_eq!(first_scope.render_connection_identity(), None);
+
+        client
+            .rpc_transport
+            .bind_render_connection_identity(first_generation, TEST_RENDER_CONNECTION_IDENTITY)
+            .expect("the coherent first-generation snapshot should bind its identity");
+        client
+            .rpc_transport
+            .bind_render_connection_identity(first_generation, TEST_RENDER_CONNECTION_IDENTITY)
+            .expect("replaying the exact committed snapshot should be idempotent");
+        assert_eq!(
+            first_scope.render_connection_identity(),
+            Some(TEST_RENDER_CONNECTION_IDENTITY)
+        );
+        assert!(
+            client
+                .rpc_transport
+                .bind_render_connection_identity(first_generation, successor_identity)
+                .is_err(),
+            "one live RPC generation must never replace its established identity"
+        );
+
+        let successor = authority
+            .advance_generation(&receiver)
+            .expect("retire the first render generation");
+        assert_eq!(
+            first_scope.render_connection_identity(),
+            None,
+            "retirement must immediately revoke stale render authority"
+        );
+        successor
+            .activate_rpc_transport()
+            .expect("activate the exact successor RPC generation");
+        let successor_scope = client.bootstrap_rpc_scope();
+        assert_eq!(
+            successor_scope.render_connection_identity(),
+            None,
+            "a successor must remain render-ineligible until its coherent snapshot commits"
+        );
+        assert!(
+            client
+                .rpc_transport
+                .bind_render_connection_identity(
+                    first_generation,
+                    TEST_RENDER_CONNECTION_IDENTITY,
+                )
+                .is_err(),
+            "a stale generation must not bind after successor publication"
+        );
+
+        let successor_generation = NonZeroU64::new(successor.generation)
+            .expect("successor generation should remain nonzero");
+        client
+            .rpc_transport
+            .bind_render_connection_identity(successor_generation, successor_identity)
+            .expect("the successor coherent snapshot should establish new render authority");
+        assert_eq!(
+            successor_scope.render_connection_identity(),
+            Some(successor_identity)
+        );
+        client
+            .rpc_transport
+            .mark_current_generation_ready_for_test();
+        let ready_successor_scope = client.rpc_scope();
+        assert_eq!(
+            ready_successor_scope.render_connection_identity(),
+            Some(successor_identity),
+            "readiness publication must preserve the exact bootstrapped identity"
+        );
+        assert_eq!(
+            first_scope.render_connection_identity(),
+            None,
+            "a stale scope must never observe its successor's identity"
+        );
+
+        successor.close_rpc_transport_without_receiver();
+        assert_eq!(
+            successor_scope.render_connection_identity(),
+            None,
+            "connection close must revoke the final render identity"
+        );
+        assert_eq!(ready_successor_scope.render_connection_identity(), None);
     }
 
     #[test]

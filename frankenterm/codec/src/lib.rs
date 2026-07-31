@@ -1240,8 +1240,17 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     }
 }
 
+macro_rules! deserialize_pdu_payload {
+    ($data:expr, $is_compressed:expr) => {
+        deserialize($data, $is_compressed)
+    };
+    ($data:expr, $is_compressed:expr, $decoder:path) => {
+        $decoder($data, $is_compressed)
+    };
+}
+
 macro_rules! pdu {
-    ($( $name:ident:$vers:expr),* $(,)?) => {
+    ($( $name:ident:$vers:expr $(=> $decoder:path)?),* $(,)?) => {
         #[derive(PartialEq, Debug)]
         #[allow(clippy::large_enum_variant)]
         pub enum Pdu {
@@ -1431,7 +1440,11 @@ macro_rules! pdu {
                             }
                             Ok(DecodedPdu {
                                 serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?)
+                                pdu: Pdu::$name(deserialize_pdu_payload!(
+                                    decoded.data.as_slice(),
+                                    decoded.is_compressed
+                                    $(, $decoder)?
+                                )?)
                             })
                         }
                     ,)*
@@ -1460,7 +1473,11 @@ macro_rules! pdu {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             Ok(DecodedPdu {
                                 serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?)
+                                pdu: Pdu::$name(deserialize_pdu_payload!(
+                                    decoded.data.as_slice(),
+                                    decoded.is_compressed
+                                    $(, $decoder)?
+                                )?)
                             })
                         }
                     ,)*
@@ -1480,7 +1497,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 49;
+pub const CODEC_VERSION: usize = 50;
 
 /// Lowest codec version this build can decode wire frames from.
 ///
@@ -1490,12 +1507,14 @@ pub const CODEC_VERSION: usize = 49;
 /// a peer announcing version `v` such that
 /// `CODEC_VERSION_MIN_SUPPORTED <= v <= CODEC_VERSION` is interop-safe.
 ///
-/// Bootstrap value: equal to `CODEC_VERSION` (no window yet — every bump
-/// raises the minimum to itself, atomic-redeploy semantics). Future
-/// strictly-additive PDU changes (new variants, end-of-struct fields with
-/// `serde(default)`) bump `CODEC_VERSION` *without* bumping this constant,
-/// opening a backward-compat window. Removals / reorders / type changes
-/// bump both.
+/// Strictly additive PDU changes use new identifiers and bump
+/// `CODEC_VERSION` without bumping this constant, opening a
+/// backward-compatibility window. A positional varbincode struct-field
+/// addition is not bidirectionally additive merely because it is final or
+/// carries `serde(default)`: the newer decoder still requests that field from
+/// an older payload and reaches EOF. Such a change needs either a distinct PDU
+/// identifier or an explicit dual-schema decoder proven with real old and new
+/// frames. Removals, reorders, and type changes bump both constants.
 ///
 /// Advancing this constant is a breaking change. Per `docs/codec-versions.md`
 /// every advance requires a release-note row paired with a `tracing::warn!`
@@ -1609,7 +1628,7 @@ pdu! {
     GetPaneRenderChanges: 24,
     GetPaneRenderChangesResponse: 25,
     GetCodecVersion: 26,
-    GetCodecVersionResponse: 27,
+    GetCodecVersionResponse: 27 => deserialize_get_codec_version_response,
     GetTlsCreds: 28,
     GetTlsCredsResponse: 29,
     LivenessResponse: 30,
@@ -1661,11 +1680,13 @@ pdu! {
     ListPanesTabStacksResponse: 76,
     GetSemanticZones: 77,
     GetSemanticZonesResponse: 78,
-    RenderApplicationUpdate: 79,
-    RenderApplicationResult: 80,
+    RenderApplicationUpdateV1: 79,
+    RenderApplicationResultV1: 80,
     ListPanesCoherent: 81,
     ListPanesCoherentResponse: 82,
     TopologyEvent: 83,
+    RenderApplicationUpdate: 84,
+    RenderApplicationResult: 85,
 }
 
 impl Pdu {
@@ -1810,12 +1831,13 @@ pub struct GetCodecVersionResponse {
     pub version_string: String,
     pub executable_path: PathBuf,
     pub config_file_path: Option<PathBuf>,
-    /// Lowest codec version the responder accepts (ft-kuxho.B.3). Added at
-    /// the *end* of the struct as a strictly-additive field with
-    /// `#[serde(default)]` so older peers that do not yet emit it still
-    /// deserialize cleanly; the legacy default sentinel `0` signals "no
-    /// minimum advertised" to the handshake call-site, which substitutes
-    /// `codec_vers` before invoking `check_compat`.
+    /// Lowest codec version the responder accepts (ft-kuxho.B.3).
+    ///
+    /// PDU 27 uses an explicit dual-schema decoder because positional
+    /// varbincode does not apply this default after an older payload reaches
+    /// EOF. The legacy decoder maps a canonical four-field response to the
+    /// sentinel `0`; the handshake call-site then substitutes `codec_vers`
+    /// before invoking `check_compat`.
     ///
     /// NOTE: NO `skip_serializing_if` — varbincode is a positional binary
     /// format; eliding the field on the encode side would shift offsets
@@ -1823,6 +1845,75 @@ pub struct GetCodecVersionResponse {
     /// See lib.rs:1226 / MEMORY varbincode-skip-serializing-if-bug.
     #[serde(default = "default_legacy_min_supported")]
     pub min_supported: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+struct LegacyGetCodecVersionResponse {
+    codec_vers: usize,
+    version_string: String,
+    executable_path: PathBuf,
+    config_file_path: Option<PathBuf>,
+}
+
+fn materialize_uncompressed_payload<'a>(
+    data: &'a [u8],
+    is_compressed: bool,
+) -> Result<std::borrow::Cow<'a, [u8]>, Error> {
+    if !is_compressed {
+        return Ok(std::borrow::Cow::Borrowed(data));
+    }
+
+    let mut decompressed = Vec::new();
+    let mut decoder = zstd::Decoder::new(data)?.take(max_pdu_read_limit()?);
+    decoder.read_to_end(&mut decompressed)?;
+    if decompressed.len() > MAX_PDU_SIZE {
+        bail!(
+            "decompressed PDU payload size {} exceeds maximum {}",
+            decompressed.len(),
+            MAX_PDU_SIZE
+        );
+    }
+    Ok(std::borrow::Cow::Owned(decompressed))
+}
+
+fn deserialize_get_codec_version_response(
+    data: &[u8],
+    is_compressed: bool,
+) -> Result<GetCodecVersionResponse, Error> {
+    let payload = materialize_uncompressed_payload(data, is_compressed)?;
+
+    let mut current_reader = payload.as_ref();
+    match bounded_varbincode::deserialize::<GetCodecVersionResponse, _>(&mut current_reader) {
+        Ok(current) if current_reader.is_empty() => Ok(current),
+        Ok(_) => {
+            bail!("current GetCodecVersionResponse payload has trailing schema bytes");
+        }
+        Err(current_error) => {
+            let mut legacy_reader = payload.as_ref();
+            let legacy = bounded_varbincode::deserialize::<LegacyGetCodecVersionResponse, _>(
+                &mut legacy_reader,
+            )
+            .map_err(|legacy_error| {
+                anyhow::anyhow!(
+                    "GetCodecVersionResponse matched neither current nor legacy schema: \
+                     current={current_error}; legacy={legacy_error}"
+                )
+            })?;
+            if !legacy_reader.is_empty() {
+                bail!(
+                    "legacy GetCodecVersionResponse payload has {} trailing schema bytes",
+                    legacy_reader.len()
+                );
+            }
+            Ok(GetCodecVersionResponse {
+                codec_vers: legacy.codec_vers,
+                version_string: legacy.version_string,
+                executable_path: legacy.executable_path,
+                config_file_path: legacy.config_file_path,
+                min_supported: default_legacy_min_supported(),
+            })
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -1884,7 +1975,9 @@ impl TopologyCapabilities {
 ///
 /// It is server-owned, rotates on reconnect or any loss-terminal transition,
 /// and is bound to a mux-session incarnation by a coherent snapshot.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
 pub struct TopologyStreamId([u8; 16]);
 
 impl TopologyStreamId {
@@ -1894,6 +1987,45 @@ impl TopologyStreamId {
 
     pub const fn as_bytes(self) -> [u8; 16] {
         self.0
+    }
+}
+
+/// Exact, restart-safe identity of one render connection.
+///
+/// The connection-local numeric generation remains useful for ordering within
+/// one client incarnation, but it can repeat after a client restart. Likewise,
+/// process-local scheduler and ledger counters can repeat after a server
+/// restart. Binding both the unpredictable topology-stream identity and the
+/// unpredictable mux-session incarnation makes a stale render unit
+/// unambiguously foreign across reconnect, client restart, server restart, and
+/// route failover.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct RenderConnectionIdentity {
+    pub stream_id: TopologyStreamId,
+    pub session_incarnation: MuxSessionIncarnation,
+}
+
+impl RenderConnectionIdentity {
+    #[must_use]
+    pub const fn new(
+        stream_id: TopologyStreamId,
+        session_incarnation: MuxSessionIncarnation,
+    ) -> Self {
+        Self {
+            stream_id,
+            session_incarnation,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), RenderApplicationContractError> {
+        if self.stream_id.as_bytes() == [0; 16]
+            || self.session_incarnation.as_bytes() == [0; 16]
+        {
+            return Err(RenderApplicationContractError::ReservedConnectionIdentity);
+        }
+        Ok(())
     }
 }
 
@@ -2368,10 +2500,11 @@ pub struct GetPaneRenderableDimensionsResponse {
     pub pane_id: PaneId,
     pub cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
-    // NOTE: skip_serializing_if removed — varbincode is a positional binary format
-    // where skipping fields misaligns all subsequent field positions. The `default`
-    // attribute alone handles backward compatibility for data serialized before this
-    // field existed (deserializer hits EOF → uses default).
+    // NOTE: skip_serializing_if removed — varbincode is a positional binary
+    // format where skipping fields misaligns all subsequent field positions.
+    // The default remains useful to self-describing serde formats; varbincode
+    // compatibility with a schema that omitted this field requires a distinct
+    // PDU identifier or an explicit dual-schema decoder.
     #[serde(default)]
     pub tiered_scrollback_status: Option<PaneTieredScrollbackStatus>,
 }
@@ -2414,7 +2547,13 @@ pub struct GetPaneRenderChangesResponse {
 /// application acknowledgement. A server may commit a prepared render
 /// baseline only after receiving a matching [`RenderApplicationResult`] whose
 /// outcome is [`RenderApplicationOutcome::Applied`].
-pub const RENDER_APPLICATION_PROTOCOL_VERSION: u16 = 1;
+pub const RENDER_APPLICATION_PROTOCOL_VERSION: u16 = 2;
+
+/// Oldest codec dialect that knows the authoritative v2 render PDU IDs 84/85.
+///
+/// Live activation must negotiate at least this dialect before emitting either
+/// PDU. IDs 79/80 remain permanently bound to their v1 schemas.
+pub const RENDER_APPLICATION_V2_MIN_CODEC_VERSION: usize = 50;
 
 /// Hard upper bound for application attempts retained for one render
 /// obligation. Live code may configure a lower limit, but never a higher one.
@@ -2426,7 +2565,7 @@ pub const MAX_RENDER_APPLICATION_ATTEMPTS: u16 = 8;
 pub const MAX_RENDER_APPLICATION_ALERTS: usize = 64;
 
 /// Hard wire bounds for one atomic render application. Receivers may advertise
-/// lower limits, but no sender may construct a v1 application above these
+/// lower limits, but no sender may construct a v2 application above these
 /// ceilings.
 pub const MAX_RENDER_APPLICATION_DIRTY_RANGES: usize = 16_384;
 pub const MAX_RENDER_APPLICATION_LINES: usize = 16_384;
@@ -2577,6 +2716,21 @@ pub enum RenderComponentUpdate<T> {
 /// applying this unit; the client must not ACK while any referenced image,
 /// semantic-zone replacement, palette change, or alert remains unapplied.
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct RenderApplicationUpdateV1 {
+    pub identity: RenderApplicationIdentity,
+    pub retry_budget: RenderApplicationRetryBudget,
+    pub surface: GetPaneRenderChangesResponse,
+    pub semantic_zones: RenderComponentUpdate<GetSemanticZonesResponse>,
+    pub palette: RenderComponentUpdate<SetPalette>,
+    pub alerts: Vec<NotifyAlert>,
+}
+
+/// Authoritative v2 render application carried only by PDU 84.
+///
+/// PDU 79 remains bound to [`RenderApplicationUpdateV1`]. Assigning v2 a new
+/// identifier makes old/new schema dispatch unambiguous before varbincode sees
+/// the payload.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct RenderApplicationUpdate {
     pub identity: RenderApplicationIdentity,
     pub retry_budget: RenderApplicationRetryBudget,
@@ -2584,6 +2738,7 @@ pub struct RenderApplicationUpdate {
     pub semantic_zones: RenderComponentUpdate<GetSemanticZonesResponse>,
     pub palette: RenderComponentUpdate<SetPalette>,
     pub alerts: Vec<NotifyAlert>,
+    pub connection_identity: RenderConnectionIdentity,
 }
 
 impl RenderApplicationUpdate {
@@ -2598,6 +2753,7 @@ impl RenderApplicationUpdate {
 
     /// Validate all fixed authority, pane, component, and bound invariants.
     pub fn validate(&self) -> Result<(), RenderApplicationContractError> {
+        self.connection_identity.validate()?;
         self.identity.validate()?;
         self.retry_budget.validate()?;
         let pane_id = self.identity.pane_id;
@@ -3106,9 +3262,19 @@ pub enum RenderApplicationOutcome {
 
 /// Application-level settlement sent from client to server.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct RenderApplicationResultV1 {
+    pub identity: RenderApplicationIdentity,
+    pub outcome: RenderApplicationOutcome,
+}
+
+/// Authoritative v2 settlement carried only by PDU 85.
+///
+/// PDU 80 remains bound to [`RenderApplicationResultV1`].
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub struct RenderApplicationResult {
     pub identity: RenderApplicationIdentity,
     pub outcome: RenderApplicationOutcome,
+    pub connection_identity: RenderConnectionIdentity,
 }
 
 impl RenderApplicationResult {
@@ -3116,9 +3282,11 @@ impl RenderApplicationResult {
     pub fn validate_for_identity(
         self,
         expected: RenderApplicationIdentity,
+        expected_connection_identity: RenderConnectionIdentity,
     ) -> Result<(), RenderApplicationContractError> {
+        self.connection_identity.validate()?;
         self.identity.validate()?;
-        if self.identity != expected {
+        if self.identity != expected || self.connection_identity != expected_connection_identity {
             return Err(RenderApplicationContractError::SettlementIdentityMismatch);
         }
         if let RenderApplicationOutcome::Nack(nack) = self.outcome {
@@ -3152,7 +3320,7 @@ impl RenderApplicationResult {
         update: &RenderApplicationUpdate,
     ) -> Result<(), RenderApplicationContractError> {
         update.validate()?;
-        self.validate_for_identity(update.identity)
+        self.validate_for_identity(update.identity, update.connection_identity)
     }
 }
 
@@ -3160,6 +3328,8 @@ impl RenderApplicationResult {
 pub enum RenderApplicationContractError {
     #[error("unsupported render-application protocol version")]
     UnsupportedProtocolVersion,
+    #[error("render connection identity uses a reserved zero stream or session incarnation")]
+    ReservedConnectionIdentity,
     #[error("render-application authority identities must be non-zero")]
     ZeroAuthorityIdentity,
     #[error("render state generation identities must be non-zero")]
@@ -4461,7 +4631,56 @@ mod test {
 
     #[test]
     fn codec_version_is_current() {
-        assert_eq!(CODEC_VERSION, 49);
+        assert_eq!(CODEC_VERSION, 50);
+    }
+
+    #[test]
+    fn codec_version_response_decodes_canonical_legacy_wire_in_both_compression_modes() {
+        let legacy = LegacyGetCodecVersionResponse {
+            codec_vers: 46,
+            version_string: "legacy-frankenterm".to_string(),
+            executable_path: PathBuf::from("/usr/local/bin/frankenterm"),
+            config_file_path: Some(PathBuf::from("/etc/frankenterm.lua")),
+        };
+
+        for mode in [CompressionMode::Never, CompressionMode::Always] {
+            let (payload, is_compressed) =
+                serialize_with_mode(&legacy, mode).expect("legacy response should serialize");
+            let mut frame = Vec::new();
+            encode_raw(27, 9, &payload, is_compressed, &mut frame)
+                .expect("legacy response should frame");
+            let decoded =
+                Pdu::decode(frame.as_slice()).expect("current decoder must accept legacy PDU 27");
+            assert_eq!(decoded.serial, 9);
+            let Pdu::GetCodecVersionResponse(response) = decoded.pdu else {
+                panic!("PDU 27 must remain GetCodecVersionResponse");
+            };
+            assert_eq!(response.codec_vers, legacy.codec_vers);
+            assert_eq!(response.version_string, legacy.version_string);
+            assert_eq!(response.executable_path, legacy.executable_path);
+            assert_eq!(response.config_file_path, legacy.config_file_path);
+            assert_eq!(response.min_supported, 0);
+        }
+    }
+
+    #[test]
+    fn codec_version_response_dual_schema_decoder_rejects_noncanonical_trailing_bytes() {
+        let legacy = LegacyGetCodecVersionResponse {
+            codec_vers: 46,
+            version_string: "legacy-frankenterm".to_string(),
+            executable_path: PathBuf::from("/usr/local/bin/frankenterm"),
+            config_file_path: None,
+        };
+        let (mut payload, is_compressed) =
+            serialize_with_mode(&legacy, CompressionMode::Never)
+                .expect("legacy response should serialize");
+        assert!(!is_compressed);
+        payload.extend_from_slice(&[0, 0]);
+        let mut frame = Vec::new();
+        encode_raw(27, 9, &payload, false, &mut frame)
+            .expect("malformed legacy response should frame");
+        Pdu::decode(frame.as_slice())
+            .expect_err("dual-schema fallback must reject trailing schema bytes");
     }
 
     // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
@@ -4469,7 +4688,7 @@ mod test {
     #[test]
     fn check_compat_additive_window_keeps_min_supported() {
         assert_eq!(CODEC_VERSION_MIN_SUPPORTED, 46);
-        assert_eq!(CODEC_VERSION, 49);
+        assert_eq!(CODEC_VERSION, 50);
     }
 
     #[test]
@@ -5482,7 +5701,101 @@ mod test {
             semantic_zones: RenderComponentUpdate::Unchanged,
             palette: RenderComponentUpdate::Unchanged,
             alerts: Vec::new(),
+            connection_identity: RenderConnectionIdentity::new(
+                TopologyStreamId::from_bytes([0x35; 16]),
+                MuxSessionIncarnation::from_bytes([0x57; 16]),
+            ),
         }
+    }
+
+    #[test]
+    fn render_application_v2_uses_distinct_wire_ids_and_preserves_v1_schemas() {
+        let update = sample_render_application_update();
+        let mut legacy_identity = update.identity;
+        legacy_identity.protocol_version = 1;
+        let legacy_update = RenderApplicationUpdateV1 {
+            identity: legacy_identity,
+            retry_budget: update.retry_budget,
+            surface: update.surface.clone(),
+            semantic_zones: update.semantic_zones.clone(),
+            palette: update.palette.clone(),
+            alerts: update.alerts.clone(),
+        };
+
+        let mut legacy_frame = Vec::new();
+        Pdu::RenderApplicationUpdateV1(legacy_update.clone())
+            .encode_with_mode(&mut legacy_frame, 17, CompressionMode::Never)
+            .expect("legacy render update should frame");
+        assert_eq!(
+            decode_raw(legacy_frame.as_slice())
+                .expect("legacy update frame should decode")
+                .ident,
+            79
+        );
+        let decoded =
+            Pdu::decode(legacy_frame.as_slice()).expect("v50 must retain the v1 PDU 79 schema");
+        assert_eq!(decoded.serial, 17);
+        assert_eq!(
+            decoded.pdu,
+            Pdu::RenderApplicationUpdateV1(legacy_update)
+        );
+
+        let mut current_frame = Vec::new();
+        Pdu::RenderApplicationUpdate(update.clone())
+            .encode_with_mode(&mut current_frame, 18, CompressionMode::Never)
+            .expect("v2 render update should frame");
+        assert_eq!(
+            decode_raw(current_frame.as_slice())
+                .expect("v2 update frame should decode")
+                .ident,
+            84
+        );
+        let decoded =
+            Pdu::decode(current_frame.as_slice()).expect("v50 must decode the v2 PDU 84 schema");
+        assert_eq!(decoded.serial, 18);
+        assert_eq!(decoded.pdu, Pdu::RenderApplicationUpdate(update.clone()));
+
+        let result = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Applied {
+                applied_state: update.identity.resulting_state,
+            },
+            connection_identity: update.connection_identity,
+        };
+        let legacy_result = RenderApplicationResultV1 {
+            identity: legacy_identity,
+            outcome: result.outcome,
+        };
+        let mut legacy_frame = Vec::new();
+        Pdu::RenderApplicationResultV1(legacy_result)
+            .encode_with_mode(&mut legacy_frame, 19, CompressionMode::Never)
+            .expect("legacy render result should frame");
+        assert_eq!(
+            decode_raw(legacy_frame.as_slice())
+                .expect("legacy result frame should decode")
+                .ident,
+            80
+        );
+        let decoded =
+            Pdu::decode(legacy_frame.as_slice()).expect("v50 must retain the v1 PDU 80 schema");
+        assert_eq!(decoded.serial, 19);
+        assert_eq!(decoded.pdu, Pdu::RenderApplicationResultV1(legacy_result));
+
+        let mut current_frame = Vec::new();
+        Pdu::RenderApplicationResult(result)
+            .encode_with_mode(&mut current_frame, 20, CompressionMode::Never)
+            .expect("v2 render result should frame");
+        assert_eq!(
+            decode_raw(current_frame.as_slice())
+                .expect("v2 result frame should decode")
+                .ident,
+            85
+        );
+        let decoded =
+            Pdu::decode(current_frame.as_slice()).expect("v50 must decode the v2 PDU 85 schema");
+        assert_eq!(decoded.serial, 20);
+        assert_eq!(decoded.pdu, Pdu::RenderApplicationResult(result));
+        assert_eq!(RENDER_APPLICATION_V2_MIN_CODEC_VERSION, CODEC_VERSION);
     }
 
     #[test]
@@ -5504,6 +5817,7 @@ mod test {
             outcome: RenderApplicationOutcome::Applied {
                 applied_state: update.identity.resulting_state,
             },
+            connection_identity: update.connection_identity,
         };
         result
             .validate_for(&update)
@@ -5644,6 +5958,16 @@ mod test {
     #[test]
     fn render_application_contract_rejects_ambiguous_or_cross_pane_authority() {
         let mut update = sample_render_application_update();
+        update.connection_identity = RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0; 16]),
+            MuxSessionIncarnation::from_bytes([0x57; 16]),
+        );
+        assert_eq!(
+            update.validate(),
+            Err(RenderApplicationContractError::ReservedConnectionIdentity)
+        );
+
+        let mut update = sample_render_application_update();
         update.identity.token.coordinator_instance = 0;
         assert_eq!(
             update.validate(),
@@ -5682,9 +6006,25 @@ mod test {
             outcome: RenderApplicationOutcome::Applied {
                 applied_state: stale_identity.resulting_state,
             },
+            connection_identity: update.connection_identity,
         };
         assert_eq!(
             stale.validate_for(&update),
+            Err(RenderApplicationContractError::SettlementIdentityMismatch)
+        );
+
+        let foreign_connection = RenderApplicationResult {
+            identity: update.identity,
+            outcome: RenderApplicationOutcome::Applied {
+                applied_state: update.identity.resulting_state,
+            },
+            connection_identity: RenderConnectionIdentity::new(
+                TopologyStreamId::from_bytes([0x71; 16]),
+                MuxSessionIncarnation::from_bytes([0x73; 16]),
+            ),
+        };
+        assert_eq!(
+            foreign_connection.validate_for(&update),
             Err(RenderApplicationContractError::SettlementIdentityMismatch)
         );
 
@@ -5696,6 +6036,7 @@ mod test {
                     state_sequence: update.identity.resulting_state.state_sequence + 1,
                 },
             },
+            connection_identity: update.connection_identity,
         };
         assert_eq!(
             wrong_state.validate_for(&update),
@@ -5708,6 +6049,7 @@ mod test {
                 reason: RenderApplicationNackReason::BaseMismatch,
                 observed_state: RenderApplicationObservedState::NotApplicable,
             }),
+            connection_identity: update.connection_identity,
         };
         assert_eq!(
             incomplete_nack.validate_for(&update),
@@ -5857,6 +6199,7 @@ mod test {
                 reason: RenderApplicationNackReason::BaseMismatch,
                 observed_state: RenderApplicationObservedState::Uninitialized,
             }),
+            connection_identity: update.connection_identity,
         };
         base_mismatch
             .validate_for(&update)
@@ -5872,6 +6215,7 @@ mod test {
                     update.identity.resulting_state,
                 ),
             }),
+            connection_identity: update.connection_identity,
         };
         assert_eq!(
             unexpected_observation.validate_for(&update),
@@ -5887,6 +6231,7 @@ mod test {
                     state_sequence: 1,
                 }),
             }),
+            connection_identity: update.connection_identity,
         };
         assert_eq!(
             invalid_observation.validate_for(&update),
@@ -6393,57 +6738,17 @@ mod test {
         assert_eq!(Pdu::decode(some_encoded.as_slice()).unwrap().pdu, some_pdu);
     }
 
-    // ─── ft-kuxho.B.2: cross-version conformance harness ──────────────────
+    // ─── Positional wire-format mutation guards ────────────────────────────
     //
-    // Extends the ft-e1emx custom_pdu_conformance_matrix with a simulated
-    // (encoded_at_version, decoded_at_version) tuple and binds the
-    // version-pair to the check_compat helper from ft-kuxho.B.1. The
-    // varbincode wire format is not natively versioned — there is no
-    // per-PDU schema descriptor — so "encoded at v+1" is simulated by
-    // taking the canonical encoding and appending bytes that would be
-    // a future end-of-struct field; "decoded at v" is the current
-    // decoder.
-    //
-    // The two synthetic test cases pin the load-bearing claim of the
-    // ft-kuxho.B proposal: additive end-of-struct extensions (the case
-    // for which CODEC_VERSION advances without bumping
-    // CODEC_VERSION_MIN_SUPPORTED) round-trip across the compat window
-    // because the canonical decoder consumes only the canonical-schema
-    // prefix and ignores trailing bytes; middle-insert mutations
-    // (the case that requires a CODEC_VERSION_MIN_SUPPORTED bump and
-    // an atomic redeploy) corrupt the decoder's positional alignment
-    // and surface as either a decode error or a non-equal PDU — never
-    // as a silently-equal mis-decode.
+    // Bytes appended after a complete framed PDU are outside the length
+    // prefix. Ignoring them is a single-frame reader property, not evidence
+    // that an older payload can satisfy a newer positional struct schema.
+    // Real compatibility tests must encode both actual schemas inside their
+    // frame boundaries, as the PDU 27 and render-v1/v2 tests above do.
 
-    /// ft-kuxho.B.2: a strictly-additive future field appended to a PDU's
-    /// frame must be consumed-but-ignored by the canonical decoder. The
-    /// `check_compat` helper from ft-kuxho.B.1 is invoked with a
-    /// simulated (encoder=v+1, decoder=v) pair to confirm the window
-    /// agrees on `v` for this case before the decode attempt.
+    /// A single-frame decoder leaves bytes after the framed PDU untouched.
     #[test]
-    fn cross_version_additive_end_of_struct_decodes_canonically() -> anyhow::Result<()> {
-        // (a) Compat window: simulated v+1 encoder, v decoder; both
-        // sides advertise CODEC_VERSION as their minimum. The window
-        // overlap is [v, v+1] → [v, v] = {v}; agreed = v.
-        let decision = check_compat(
-            CODEC_VERSION + 1, // encoder local
-            CODEC_VERSION,     // encoder local_min
-            CODEC_VERSION,     // decoder remote (== our current)
-            CODEC_VERSION,     // decoder remote_min
-        )
-        .context("v+1 vs v with min=v must be compat-window-compatible")?;
-        assert_eq!(
-            decision,
-            CompatDecision::Compatible {
-                agreed: CODEC_VERSION
-            },
-            "v+1 vs v must agree on v (older peer dictates dialect)"
-        );
-
-        // (b) Encode a PDU with multiple fields (better stress for the
-        // positional decoder than a single-field PDU). SetLayoutCycle
-        // has a Vec<String> tail field which is the realistic shape of
-        // a "field added at the end of a struct".
+    fn bytes_after_complete_frame_do_not_change_single_frame_decode() -> anyhow::Result<()> {
         let pdu = Pdu::SetLayoutCycle(SetLayoutCycle {
             tab_id: 9,
             layout_names: vec!["main".to_string(), "split".to_string()],
@@ -6452,68 +6757,40 @@ mod test {
         pdu.encode_with_mode(&mut encoded, 0xCAFE, CompressionMode::Never)
             .context("canonical encode must succeed")?;
 
-        // (c) Append simulated future-field bytes after the canonical
-        // frame. The existing tail-padded property is the load-bearing
-        // claim — re-asserted here in version-pair language.
         for tail in [
-            vec![0x42_u8, 0x42, 0x42, 0x42], // 4-byte synthetic future field
-            vec![0x00_u8],                   // single null tail byte
-            vec![0xFF_u8; 32],               // 32-byte synthetic future blob
+            vec![0x42_u8, 0x42, 0x42, 0x42],
+            vec![0x00_u8],
+            vec![0xFF_u8; 32],
         ] {
             let mut framed = encoded.clone();
             framed.extend_from_slice(&tail);
 
             let decoded = Pdu::decode(framed.as_slice()).with_context(|| {
                 format!(
-                    "cross-version additive-end decode failed (tail={} bytes)",
+                    "single-frame decode failed with {} following bytes",
                     tail.len()
                 )
             })?;
             assert_eq!(
                 decoded.pdu,
                 pdu,
-                "cross-version additive-end decode produced different PDU (tail={} bytes)",
+                "following bytes changed the decoded PDU (tail={} bytes)",
                 tail.len()
             );
             assert_eq!(
                 decoded.serial,
                 0xCAFE,
-                "cross-version additive-end decode lost serial (tail={} bytes)",
+                "following bytes changed the serial (tail={} bytes)",
                 tail.len()
             );
         }
         Ok(())
     }
 
-    /// ft-kuxho.B.2: a middle-insert mutation (a byte spliced into the
-    /// payload between two existing fields, simulating a field added in
-    /// the wrong position) must NOT silently produce an equal PDU. The
-    /// decoder either errors out or produces a non-equal value — both
-    /// are acceptable signals that the corruption is detectable. This
-    /// is the bug class that requires bumping CODEC_VERSION_MIN_SUPPORTED
-    /// and forcing an atomic redeploy.
+    /// A byte inserted inside a positional frame must not silently preserve
+    /// the canonical PDU.
     #[test]
-    fn cross_version_middle_insert_does_not_silently_decode_canonically() -> anyhow::Result<()> {
-        // Same window setup as the additive-end test: a v+1 encoder
-        // talking to a v decoder is "compatible" per check_compat for
-        // strictly-additive changes. Middle-insert is NOT additive, and
-        // this test pins that the conformance harness detects the
-        // corruption even when the version-window check would have
-        // allowed it.
-        let decision = check_compat(
-            CODEC_VERSION + 1,
-            CODEC_VERSION,
-            CODEC_VERSION,
-            CODEC_VERSION,
-        )
-        .context("window must permit v+1 vs v for the test to be meaningful")?;
-        assert_eq!(
-            decision,
-            CompatDecision::Compatible {
-                agreed: CODEC_VERSION
-            }
-        );
-
+    fn interior_byte_insert_does_not_silently_decode_canonically() -> anyhow::Result<()> {
         let pdu = Pdu::SetLayoutCycle(SetLayoutCycle {
             tab_id: 9,
             layout_names: vec!["main".to_string(), "split".to_string()],
@@ -6530,8 +6807,8 @@ mod test {
         //
         // We skip position 0 (frame length prefix; corrupting it is
         // detected by the framing layer, not interesting here) and
-        // position encoded.len() (= append, which is the additive-end
-        // case the previous test already covers).
+        // position encoded.len() (= bytes after the complete frame, covered by
+        // the preceding single-frame reader test).
         let mut detected_count = 0usize;
         for insert_pos in 1..encoded.len() {
             let mut corrupted = encoded.clone();

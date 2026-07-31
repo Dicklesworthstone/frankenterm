@@ -1,8 +1,32 @@
 # Proposal: `CODEC_VERSION_MIN_SUPPORTED` window for additive PDU rolling upgrade
 
 **Bead:** [ft-k6jco](../../.beads/issues.jsonl) (track B of ft-kuxho)
-**Status:** draft
+**Status:** implemented, with the 2026-07-31 schema-evolution erratum below
 **Related:** ft-kuxho (parent epic), ft-8smkj (track A: CI guard against silent CODEC_VERSION bumps), ft-e1emx (tail-padding conformance harness — proven landing pad for this design)
+
+## 2026-07-31 implementation erratum
+
+The original proposal correctly introduced a two-scalar compatibility
+window, but its positional-field evolution proof was wrong.
+
+- Bytes appended **after a complete frame** are outside that frame's declared
+  length. Their being ignored proves only that `Pdu::decode` can read one frame
+  from a larger stream buffer.
+- A new field serialized **inside** the frame changes the positional schema.
+  An old decoder can ignore the new payload suffix, but a new derived decoder
+  reading an old payload still requests the new field and fails at EOF.
+  `#[serde(default)]` does not turn that I/O error into a missing field.
+- Therefore a new PDU identifier is the default additive evolution mechanism.
+  Reusing an identifier across schemas is allowed only with an explicit,
+  bounded dual-schema decoder and canonical old/current frames that prove both
+  directions and corruption rejection.
+
+Strict-remote job `j-29953507796713785` supplied the decisive negative
+evidence while testing render protocol v2. Codec v50 consequently retains
+render-v1 schemas at IDs 79/80 and assigns v2 IDs 84/85. PDU 27 has the
+explicit dual-schema decoder needed for its bootstrap role. This erratum
+supersedes every contrary tail-field claim in the historical design discussion
+below.
 
 ## 1. Current invariant
 
@@ -55,9 +79,9 @@ pub const CODEC_VERSION_MIN_SUPPORTED: usize = 46;
 ```
 
 `CODEC_VERSION_MIN_SUPPORTED` starts equal to `CODEC_VERSION` (no window
-yet). Future commits that introduce **strictly additive** PDU changes
-bump `CODEC_VERSION` *without* bumping `CODEC_VERSION_MIN_SUPPORTED`,
-opening a backward-compat window.
+yet). Future commits that introduce **strictly additive** PDU changes—normally
+new PDU identifiers—bump `CODEC_VERSION` *without* bumping
+`CODEC_VERSION_MIN_SUPPORTED`, opening a backward-compat window.
 
 The handshake gate becomes:
 
@@ -90,15 +114,15 @@ options. We prefer the two-scalar approach because:
   without a CODEC_VERSION bump (chicken-and-egg).
 - **Bounded reasoning.** "Is `v45` interop-safe?" becomes a single
   inequality check, not a combinatorial sweep across N PDU types.
-- **Cheap to maintain.** Two `pub const`s and one handshake helper
-  versus a per-PDU registry.
+- **Cheap to maintain.** Two `pub const`s and one handshake helper, plus
+  explicit capability gates for newly assigned PDU identifiers.
 - **Honest about scope.** Removed/modified fields still require an
   atomic redeploy. The window only buys headroom for the *additive*
   cases — which empirically dominate. A scan of the last 20 codec
   changes (`git log --oneline frankenterm/codec/src/lib.rs`) shows
-  ~80% are additive (new PDU variant, new field with a default). The
-  window addresses the common case without pretending to address
-  removal/rename/typechange.
+  ~80% were classified as additive. Under the erratum, a new PDU identifier
+  is additive by construction; a new field is additive only when explicit
+  dual-schema decoding or negotiated directional emission proves it.
 
 ## 3. Policy — when does `CODEC_VERSION_MIN_SUPPORTED` advance?
 
@@ -128,18 +152,17 @@ Concrete rule of thumb:
 | change kind                        | bump `CODEC_VERSION` | bump `MIN` |
 | ---------------------------------- | -------------------- | ---------- |
 | add new PDU variant (new ident)    | yes                  | no         |
-| add field with `#[serde(default)]` at the **end** of a struct | yes                  | no         |
+| add a field under a reused positional PDU identifier | yes | yes, unless an explicit dual-schema decoder and real old/current frames prove the retained window |
 | remove a PDU variant               | yes                  | yes        |
 | remove a field                     | yes                  | yes        |
 | change a field's type              | yes                  | yes        |
 | reorder fields                     | yes                  | yes        |
 | add a field in the *middle* of a struct | yes             | yes        |
 
-The rule "additive only at the end" is the same constraint that makes
-the existing `#[serde(default)]` workaround sound (see
-`GetCodecVersionResponse::config_file_path` at lib.rs:840 — added at
-the end of the struct, default `None`, decodes cleanly from older
-peers).
+Field position still matters—middle insertion also corrupts older decoders—but
+tail position alone proves only the new-sender/old-decoder direction.
+`GetCodecVersionResponse` now uses an explicit legacy/current decoder because
+the reverse direction is required during bootstrap.
 
 ## 4. Interaction with the ft-e1emx tail-padding harness
 
@@ -147,10 +170,9 @@ The ft-e1emx conformance harness (commit 211f3b8a) already verifies the
 property this proposal depends on:
 
 - **`tail-padded decode robustness`** — extra bytes after the canonical
-  frame must not corrupt the decoded PDU. This is exactly what happens
-  during a rolling upgrade in the additive case: the new build emits
-  `N+k` bytes, the old build decodes the first `N` and ignores the
-  trailing `k` because the length prefix tells it to stop.
+  frame must not corrupt that decoded PDU. This models another frame already
+  buffered by the stream reader; it does not model bytes added inside the
+  frame's declared payload length.
 - **`Option<T>` tag-byte regression guard** — skips `skip_serializing_if`
   reintroductions, which would silently misalign older decoders even
   for nominally-additive changes.
@@ -158,11 +180,9 @@ property this proposal depends on:
 What ft-e1emx does *not* cover (and what this proposal needs as
 follow-up):
 
-- **End-of-struct addition with default** — the existing harness exercises
-  encode/decode roundtrips at one version. We need a parameterized
-  harness that takes a "decode-as-version" parameter and verifies that a
-  v47 frame containing an end-of-struct addition decodes cleanly as v46
-  (the end-bytes simply land in the consumed-but-ignored tail).
+- **Actual old/current schemas** — compatibility proof must serialize each
+  complete schema inside its real frame boundary. A reused identifier needs
+  an explicit dual-schema decoder; otherwise the change uses a new identifier.
 - **Cross-version handshake matrix** — `(local_min, local_max, remote)`
   triples and the resulting CompatDecision. This is integration-level,
   not codec-unit-level.
@@ -174,22 +194,18 @@ Both gaps become child beads (§6).
 | step | scope | success signal |
 | ---- | ----- | -------------- |
 | 1    | Land the `CODEC_VERSION_MIN_SUPPORTED` const and the `check_compat` helper. Initial value equals `CODEC_VERSION`. No behavior change on the wire. Pre-existing handshake call sites migrate from `==` to the helper. | All existing PDU roundtrip tests pass. New unit test exercises `check_compat` against `(min, max, remote ∈ {min-1, min, max, max+1})`. |
-| 2    | Extend the ft-e1emx harness with a `decode_as_version` parameter. Add a fixture that encodes a synthetic "future" PDU variant (extra trailing bytes representing a v+1 end-of-struct field) and asserts the v decoder consumes only the canonical prefix. | The harness fails on a deliberate "field added in the middle" mutation; passes on "field added at end with default". |
-| 3    | First production-driven `CODEC_VERSION` bump that *exercises* the window. Add a single end-of-struct field to one PDU; bump `CODEC_VERSION` from 46 → 47; leave `MIN` at 46. Roll the server first, then clients incrementally. The handshake warn-line must fire and be observed in production logs at v46/v47 mixed steady state. | Rolling deploy completes with zero hard handshake failures. Logs show the warn-line for the duration of the mixed window and stop firing once all clients are at v47. |
+| 2    | Extend the conformance harness with actual previous/current payload structs framed under their assigned identifiers. | New identifiers remain unknown-but-skippable to old peers; any reused identifier decodes canonical old/current payloads and rejects corruption. |
+| 3    | First production-driven `CODEC_VERSION` bump that exercises the window through a new PDU identifier and negotiated emission gate. | Rolling deploy completes with zero hard handshake failures. Logs show the warn-line for the duration of the mixed window and stop firing once all clients are current. |
 
 ## 6. Open questions
 
-1. **What's the GetCodecVersionResponse wire format change cost?** The
-   existing PDU has `codec_vers: usize`. We may want to add `min_supported`
-   to it so peers can negotiate symmetrically. Adding a field is itself a
-   PDU change — the bootstrap problem. Solvable by piggybacking on the
-   existing `#[serde(default)]` at-end pattern, but the order matters
-   (this becomes step 1's first commit).
-2. **Does this need a per-PDU "frame version" too?** No, per §2: per-PDU
-   versioning costs a positional shift on every PDU and the two-scalar
-   window covers the empirically-dominant additive case. We should
-   revisit if a real-world removal is needed and the atomic-redeploy
-   cost is unacceptable for that specific PDU.
+1. **What's the GetCodecVersionResponse wire format change cost?** Resolved:
+   PDU 27 keeps its identifier and uses an explicit bounded decoder for the
+   canonical four-field legacy and five-field current schemas. Legacy decode
+   produces the conservative `min_supported = 0` sentinel.
+2. **Does this need a per-PDU "frame version" too?** Not globally. New PDU
+   identifiers plus negotiated capabilities are the default. A reused
+   identifier owns its explicit schema dispatcher.
 3. **What about TLS-tunnelled long-lived sessions (ft-nyvyl)?** This
    proposal doesn't fix in-flight sessions — it fixes the *connect-time*
    gate. A v46 session that started before a server upgrade to v47 stays
@@ -214,12 +230,9 @@ Proposed beads:
    `check_compat` helper + handshake-site migration. Step 1 of the
    rollout. Includes the unit test against
    `(min, max, remote)` triples.
-2. `ft-kuxho.B.2` — extend the ft-e1emx conformance harness with a
-   `decode_as_version` parameter and the synthetic "future PDU" fixture
-   that proves the additive end-of-struct case roundtrips across the
-   compat window. Step 2.
-3. `ft-kuxho.B.3` — add a `GetCodecVersionResponse.min_supported` field
-   (end-of-struct, `#[serde(default)]`, defaults to the same value as
-   `codec_vers` for backward compat). Resolves open question §6.1 and
-   prerequisites the symmetric handshake. Order-sensitive; lands before
-   step 3.
+2. `ft-kuxho.B.2` — historical harness bead. Its synthetic
+   bytes-after-frame fixture is retained only as a framing guard; real schema
+   fixtures supersede its compatibility claim.
+3. `ft-kuxho.B.3` — historical `GetCodecVersionResponse.min_supported` bead.
+   Its derived-default assumption is superseded by PDU 27's explicit
+   legacy/current decoder.

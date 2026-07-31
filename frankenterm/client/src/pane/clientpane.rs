@@ -90,6 +90,7 @@ impl Default for ClientRenderApplicationLimits {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RenderApplicationLogicalIdentity {
+    connection_identity: RenderConnectionIdentity,
     connection_generation: u64,
     coordinator_instance: u64,
     scheduler_sequence: u64,
@@ -102,9 +103,13 @@ struct RenderApplicationLogicalIdentity {
     kind: RenderApplicationKind,
 }
 
-impl From<RenderApplicationIdentity> for RenderApplicationLogicalIdentity {
-    fn from(identity: RenderApplicationIdentity) -> Self {
+impl RenderApplicationLogicalIdentity {
+    fn new(
+        connection_identity: RenderConnectionIdentity,
+        identity: RenderApplicationIdentity,
+    ) -> Self {
         Self {
+            connection_identity,
             connection_generation: identity.token.connection_generation,
             coordinator_instance: identity.token.coordinator_instance,
             scheduler_sequence: identity.token.scheduler_sequence,
@@ -135,10 +140,11 @@ pub(crate) struct ClientRenderApplicationCounters {
 )]
 #[derive(Default)]
 struct ClientRenderApplicationState {
+    applied_connection_identity: Option<RenderConnectionIdentity>,
     applied_connection_generation: Option<u64>,
     applied_state: Option<RenderStateIdentity>,
     last_applied: Option<RenderApplicationLogicalIdentity>,
-    applying: Option<RenderApplicationIdentity>,
+    applying: Option<RenderApplicationLogicalIdentity>,
     counters: ClientRenderApplicationCounters,
 }
 
@@ -170,11 +176,15 @@ impl ClientRenderApplicationState {
 
     fn begin(
         &mut self,
+        expected_connection_identity: Option<RenderConnectionIdentity>,
         expected_connection_generation: Option<u64>,
         expected_pane_id: PaneId,
+        connection_identity: RenderConnectionIdentity,
         identity: RenderApplicationIdentity,
     ) -> ClientRenderApplicationBegin {
-        if expected_connection_generation != Some(identity.token.connection_generation) {
+        if expected_connection_identity != Some(connection_identity)
+            || expected_connection_generation != Some(identity.token.connection_generation)
+        {
             return ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::GenerationMismatch,
                 observed_state: self.observation(),
@@ -189,7 +199,7 @@ impl ClientRenderApplicationState {
             };
         }
 
-        let logical_identity = RenderApplicationLogicalIdentity::from(identity);
+        let logical_identity = RenderApplicationLogicalIdentity::new(connection_identity, identity);
         if self.last_applied == Some(logical_identity)
             && self.applied_state == Some(identity.resulting_state)
         {
@@ -198,7 +208,7 @@ impl ClientRenderApplicationState {
             return ClientRenderApplicationBegin::DuplicateApplied;
         }
         if let Some(applying) = self.applying {
-            if RenderApplicationLogicalIdentity::from(applying) == logical_identity {
+            if applying == logical_identity {
                 self.counters.duplicate_in_progress =
                     self.counters.duplicate_in_progress.saturating_add(1);
                 return ClientRenderApplicationBegin::DuplicateInProgress;
@@ -212,7 +222,9 @@ impl ClientRenderApplicationState {
         }
 
         if self.applied_state.is_some()
-            && self.applied_connection_generation != Some(identity.token.connection_generation)
+            && (self.applied_connection_identity != Some(connection_identity)
+                || self.applied_connection_generation
+                    != Some(identity.token.connection_generation))
             && identity.kind == RenderApplicationKind::Delta
         {
             return ClientRenderApplicationBegin::Nack {
@@ -260,8 +272,9 @@ impl ClientRenderApplicationState {
                 }
             }
             RenderApplicationKind::Snapshot => {
-                if self.applied_connection_generation
-                    == Some(identity.token.connection_generation)
+                if self.applied_connection_identity == Some(connection_identity)
+                    && self.applied_connection_generation
+                        == Some(identity.token.connection_generation)
                 {
                     if let Some(current) = self.applied_state {
                         if current.render_generation == identity.resulting_state.render_generation
@@ -277,7 +290,7 @@ impl ClientRenderApplicationState {
             }
         }
 
-        self.applying = Some(identity);
+        self.applying = Some(logical_identity);
         self.counters.applications_started =
             self.counters.applications_started.saturating_add(1);
         ClientRenderApplicationBegin::Apply
@@ -290,7 +303,7 @@ impl ClientRenderApplicationState {
 )]
 struct ClientRenderApplicationGuard<'a> {
     state: &'a Mutex<ClientRenderApplicationState>,
-    identity: RenderApplicationIdentity,
+    identity: RenderApplicationLogicalIdentity,
     armed: bool,
 }
 
@@ -301,11 +314,12 @@ struct ClientRenderApplicationGuard<'a> {
 impl<'a> ClientRenderApplicationGuard<'a> {
     fn new(
         state: &'a Mutex<ClientRenderApplicationState>,
+        connection_identity: RenderConnectionIdentity,
         identity: RenderApplicationIdentity,
     ) -> Self {
         Self {
             state,
-            identity,
+            identity: RenderApplicationLogicalIdentity::new(connection_identity, identity),
             armed: true,
         }
     }
@@ -314,9 +328,10 @@ impl<'a> ClientRenderApplicationGuard<'a> {
         let mut state = self.state.lock();
         if state.applying == Some(self.identity) {
             state.applied_connection_generation =
-                Some(self.identity.token.connection_generation);
+                Some(self.identity.connection_generation);
+            state.applied_connection_identity = Some(self.identity.connection_identity);
             state.applied_state = Some(self.identity.resulting_state);
-            state.last_applied = Some(RenderApplicationLogicalIdentity::from(self.identity));
+            state.last_applied = Some(self.identity);
             state.applying = None;
             state.counters.acknowledgements =
                 state.counters.acknowledgements.saturating_add(1);
@@ -405,6 +420,7 @@ pub struct ClientPane {
     reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
 )]
 fn render_application_nack(
+    connection_identity: RenderConnectionIdentity,
     identity: RenderApplicationIdentity,
     reason: RenderApplicationNackReason,
     observed_state: RenderApplicationObservedState,
@@ -415,6 +431,7 @@ fn render_application_nack(
             reason,
             observed_state,
         }),
+        connection_identity,
     }
 }
 
@@ -422,12 +439,16 @@ fn render_application_nack(
     dead_code,
     reason = "the render-application endpoint is activated by ft-interactive-systems-performance-4tenz.5.5.10"
 )]
-fn render_application_ack(identity: RenderApplicationIdentity) -> RenderApplicationResult {
+fn render_application_ack(
+    connection_identity: RenderConnectionIdentity,
+    identity: RenderApplicationIdentity,
+) -> RenderApplicationResult {
     RenderApplicationResult {
         identity,
         outcome: RenderApplicationOutcome::Applied {
             applied_state: identity.resulting_state,
         },
+        connection_identity,
     }
 }
 
@@ -767,8 +788,12 @@ impl ClientPane {
         rpc: &RpcGenerationScope,
         mut update: RenderApplicationUpdate,
     ) -> ClientRenderApplicationDisposition {
+        let connection_identity = update.connection_identity;
         let identity = update.identity;
-        if let Err(error) = identity.validate() {
+        if let Err(error) = connection_identity
+            .validate()
+            .and_then(|()| identity.validate())
+        {
             return ClientRenderApplicationDisposition::ProtocolViolation(error);
         }
         if let Err(reason) =
@@ -776,6 +801,7 @@ impl ClientPane {
         {
             self.record_render_application_nack();
             return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                connection_identity,
                 identity,
                 reason,
                 RenderApplicationObservedState::NotApplicable,
@@ -786,6 +812,7 @@ impl ClientPane {
         )) else {
             self.record_render_application_nack();
             return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                connection_identity,
                 identity,
                 RenderApplicationNackReason::ApplicationFailure {
                     stage: RenderApplicationStage::Validate,
@@ -796,14 +823,18 @@ impl ClientPane {
 
         let expected_connection_generation =
             rpc.connection_generation().map(std::num::NonZeroU64::get);
+        let expected_connection_identity = rpc.render_connection_identity();
         let begin = self.render_application_state.lock().begin(
+            expected_connection_identity,
             expected_connection_generation,
             self.remote_pane_id,
+            connection_identity,
             identity,
         );
         match begin {
             ClientRenderApplicationBegin::DuplicateApplied => {
                 return ClientRenderApplicationDisposition::Settlement(render_application_ack(
+                    connection_identity,
                     identity,
                 ));
             }
@@ -816,6 +847,7 @@ impl ClientPane {
             } => {
                 self.record_render_application_nack();
                 return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                    connection_identity,
                     identity,
                     reason,
                     observed_state,
@@ -824,7 +856,11 @@ impl ClientPane {
             ClientRenderApplicationBegin::Apply => {}
         }
 
-        let guard = ClientRenderApplicationGuard::new(&self.render_application_state, identity);
+        let guard = ClientRenderApplicationGuard::new(
+            &self.render_application_state,
+            connection_identity,
+            identity,
+        );
         let bonus_lines = std::mem::take(&mut update.surface.bonus_lines);
         let bonus_lines = match hydrate_render_application_lines(
             rpc,
@@ -839,6 +875,7 @@ impl ClientPane {
             Err(reason) => {
                 guard.nack();
                 return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                    connection_identity,
                     identity,
                     reason,
                     RenderApplicationObservedState::NotApplicable,
@@ -856,6 +893,7 @@ impl ClientPane {
         if Instant::now() >= application_deadline {
             guard.nack();
             return ClientRenderApplicationDisposition::Settlement(render_application_nack(
+                connection_identity,
                 identity,
                 RenderApplicationNackReason::ApplicationFailure {
                     stage: RenderApplicationStage::Commit,
@@ -923,6 +961,7 @@ impl ClientPane {
             Ok(Some(Some(true))) => {
                 guard.acknowledge();
                 return ClientRenderApplicationDisposition::Settlement(render_application_ack(
+                    connection_identity,
                     identity,
                 ));
             }
@@ -931,6 +970,7 @@ impl ClientPane {
         };
         guard.nack();
         ClientRenderApplicationDisposition::Settlement(render_application_nack(
+            connection_identity,
             identity,
             RenderApplicationNackReason::ApplicationFailure {
                 stage: failure_stage,
@@ -1585,15 +1625,21 @@ impl std::io::Write for PaneWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::Client;
+    use crate::client::{Client, TEST_RENDER_CONNECTION_IDENTITY};
     use crate::domain::ClientDomainConfig;
     use crate::MuxTestScope;
     use config::UnixDomain;
     use mux::renderable::{RenderableDimensions, StableCursorPosition};
-    use mux::{Mux, MuxNotification};
+    use mux::{Mux, MuxNotification, MuxSessionIncarnation};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
     use termwiz::cell::{CellAttributes, SemanticType};
+
+    const SUCCESSOR_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
+        RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0x79; 16]),
+            MuxSessionIncarnation::from_bytes([0x9b; 16]),
+        );
 
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
         let unix = UnixDomain {
@@ -1739,6 +1785,7 @@ mod tests {
                 RenderComponentUpdate::Unchanged
             },
             alerts: Vec::new(),
+            connection_identity: TEST_RENDER_CONNECTION_IDENTITY,
         }
     }
 
@@ -1971,10 +2018,21 @@ mod tests {
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation), pane_id, snapshot.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation),
+                    pane_id,
+                    snapshot.connection_identity,
+                    snapshot.identity,
+                ),
             ClientRenderApplicationBegin::Apply
         ));
-        ClientRenderApplicationGuard::new(&state, snapshot.identity).acknowledge();
+        ClientRenderApplicationGuard::new(
+            &state,
+            snapshot.connection_identity,
+            snapshot.identity,
+        )
+        .acknowledge();
 
         let gap = test_render_application_update(
             connection_generation,
@@ -1991,7 +2049,13 @@ mod tests {
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation), pane_id, gap.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation),
+                    pane_id,
+                    gap.connection_identity,
+                    gap.identity,
+                ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::DetectedGap,
                 observed_state: RenderApplicationObservedState::Applied(
@@ -2018,7 +2082,13 @@ mod tests {
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation), pane_id, stale.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation),
+                    pane_id,
+                    stale.connection_identity,
+                    stale.identity,
+                ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::BaseMismatch,
                 observed_state: RenderApplicationObservedState::Applied(
@@ -2042,7 +2112,26 @@ mod tests {
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation + 1), pane_id, next.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation + 1),
+                    pane_id,
+                    next.connection_identity,
+                    next.identity,
+                ),
+            ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::GenerationMismatch,
+                ..
+            }
+        ));
+        assert!(matches!(
+            state.lock().begin(
+                Some(SUCCESSOR_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                snapshot.connection_identity,
+                snapshot.identity,
+            ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::GenerationMismatch,
                 ..
@@ -2051,7 +2140,13 @@ mod tests {
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation), pane_id + 1, next.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation),
+                    pane_id + 1,
+                    next.connection_identity,
+                    next.identity,
+                ),
             ClientRenderApplicationBegin::Nack {
                 reason: RenderApplicationNackReason::MalformedOrIncomplete {
                     component: RenderApplicationComponent::Surface,
@@ -2060,8 +2155,8 @@ mod tests {
             }
         ));
 
-        let reconnect_delta = test_render_application_update(
-            connection_generation + 1,
+        let mut reconnect_delta = test_render_application_update(
+            connection_generation,
             pane_id,
             137,
             1,
@@ -2069,10 +2164,13 @@ mod tests {
             Some(snapshot.identity.resulting_state),
             5,
         );
+        reconnect_delta.connection_identity = SUCCESSOR_RENDER_CONNECTION_IDENTITY;
         assert!(matches!(
             state.lock().begin(
-                Some(connection_generation + 1),
+                Some(SUCCESSOR_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
                 pane_id,
+                reconnect_delta.connection_identity,
                 reconnect_delta.identity,
             ),
             ClientRenderApplicationBegin::Nack {
@@ -2081,8 +2179,8 @@ mod tests {
             }
         ));
 
-        let reconnect_snapshot = test_render_application_update(
-            connection_generation + 1,
+        let mut reconnect_snapshot = test_render_application_update(
+            connection_generation,
             pane_id,
             139,
             1,
@@ -2090,10 +2188,13 @@ mod tests {
             None,
             snapshot.identity.resulting_state.state_sequence,
         );
+        reconnect_snapshot.connection_identity = SUCCESSOR_RENDER_CONNECTION_IDENTITY;
         assert!(matches!(
             state.lock().begin(
-                Some(connection_generation + 1),
+                Some(SUCCESSOR_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
                 pane_id,
+                reconnect_snapshot.connection_identity,
                 reconnect_snapshot.identity,
             ),
             ClientRenderApplicationBegin::Apply
@@ -2120,14 +2221,27 @@ mod tests {
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation), pane_id, first.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation),
+                    pane_id,
+                    first.connection_identity,
+                    first.identity,
+                ),
             ClientRenderApplicationBegin::Apply
         ));
-        let guard = ClientRenderApplicationGuard::new(&state, first.identity);
+        let guard =
+            ClientRenderApplicationGuard::new(&state, first.connection_identity, first.identity);
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation), pane_id, retry.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation),
+                    pane_id,
+                    retry.connection_identity,
+                    retry.identity,
+                ),
             ClientRenderApplicationBegin::DuplicateInProgress
         ));
         drop(guard);
@@ -2142,7 +2256,13 @@ mod tests {
         assert!(matches!(
             state
                 .lock()
-                .begin(Some(connection_generation), pane_id, retry.identity),
+                .begin(
+                    Some(TEST_RENDER_CONNECTION_IDENTITY),
+                    Some(connection_generation),
+                    pane_id,
+                    retry.connection_identity,
+                    retry.identity,
+                ),
             ClientRenderApplicationBegin::Apply
         ));
     }

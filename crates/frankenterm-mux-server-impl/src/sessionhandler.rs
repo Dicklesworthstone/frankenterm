@@ -2782,7 +2782,7 @@ impl SessionHandler {
                 })
                 .detach();
             }
-            Pdu::RenderApplicationResult(_) => {
+            Pdu::RenderApplicationResult(_) | Pdu::RenderApplicationResultV1(_) => {
                 send_response(Err(anyhow!(
                     "render-application settlement received before the live delivery \
                      coordinator was activated for this connection"
@@ -2797,6 +2797,7 @@ impl SessionHandler {
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
             | Pdu::GetPaneRenderChangesResponse { .. }
+            | Pdu::RenderApplicationUpdateV1 { .. }
             | Pdu::RenderApplicationUpdate { .. }
             | Pdu::UnitResponse { .. }
             | Pdu::LivenessResponse { .. }

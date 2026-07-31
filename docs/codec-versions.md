@@ -33,6 +33,7 @@ rollback procedure) and the rationale.
 
 | version | date       | kind     | change |
 | ------- | ---------- | -------- | ------ |
+| 50      | 2026-07-30 | additive | adds authoritative render-application-v2 PDUs 84/85 while permanently retaining v1 schemas at 79/80, preventing numeric generation aliasing across reconnect, restart, and route failover. Also gives PDU 27 an explicit canonical legacy/current decoder after real old-frame testing disproved the prior `serde(default)`-at-EOF assumption. See ft-interactive-systems-performance-4tenz.5.5.4. |
 | 49      | 2026-07-30 | additive | adds negotiated coherent `ListPanesCoherent` / `ListPanesCoherentResponse` and stamped `TopologyEvent` PDUs (81/82/83), with exact stream/session identity and typed contention, exhaustion, and unsupported-capability outcomes for ft-interactive-systems-performance-4tenz.5.5.14.1.2.3.2. |
 | 48      | 2026-07-30 | additive | adds fail-closed `RenderApplicationUpdate` / `RenderApplicationResult` PDUs (79/80) with exact generation, scheduler, ledger, base/result-state, complete atomic surface components, hard resource bounds, original-deadline-bounded retry/resync, and typed ACK/NACK authority for ft-interactive-systems-performance-4tenz.5.5.5. |
 | 47      | 2026-06-07 | additive | adds `GetSemanticZones` / `GetSemanticZonesResponse` PDUs (77/78) carrying live SemanticZone coordinates, zone text, and retained OSC 133 exit status for ft-7h5da.2.1 robot DOM queries. |

@@ -26,8 +26,9 @@
 //!     compatible (regression in ft-kuxho.B.1).
 //!   - `GetCodecVersionResponse.min_supported` deserializing to the wrong
 //!     value when emitted by a "future" peer (regression in ft-kuxho.B.3).
-//!   - Tail-padding decode breaking under any of the 3 compression modes
-//!     (regression in ft-e1emx).
+//!   - Single-frame decode consuming or being changed by bytes after its
+//!     declared frame length (regression in ft-e1emx). This is deliberately
+//!     not treated as positional schema-evolution evidence.
 //!   - Serial-number drift across the fleet (regression in pdu_roundtrip
 //!     fuzz target).
 
@@ -259,12 +260,11 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
         &format!("roundtrips={rt_count} total_bytes={total_bytes}"),
     );
 
-    // ── PHASE 5: realistic tail-padding case under load ──
+    // ── PHASE 5: bytes following one complete frame ──
     //
-    // The proposal §4's load-bearing claim is that additive future-field
-    // bytes appended to a frame are consumed-but-ignored by the canonical
-    // decoder. Verify under the agreed dialect with arbitrary tail data
-    // that a real network might inject as the next-frame prefix.
+    // These bytes are outside the frame's declared length and model the next
+    // frame already buffered by a stream reader. They do not model a field
+    // inside the positional varbincode payload.
     let pdu = Pdu::SetLayoutCycle(SetLayoutCycle {
         tab_id: 99,
         layout_names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
@@ -282,7 +282,7 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
         assert_eq!(d.serial, 0xBEEF);
     }
     log_event(
-        "phase5.tail_pad",
+        "phase5.following_bytes",
         "ok",
         "3 tail variants decoded canonically",
     );
@@ -295,20 +295,16 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
     );
 }
 
-/// ft-kuxho.B legacy-peer fallback: a server that pre-dates ft-kuxho.B.3
-/// (no `min_supported` field on the wire) deserializes the field as the
-/// sentinel 0; the handshake call-site must substitute `codec_vers` so
-/// the legacy peer is treated as supporting only its own version. This
-/// test reaches into the same `check_compat` API the production client
-/// uses, with the legacy substitution applied — no mocks.
+/// The handshake call-site treats the legacy sentinel as supporting only the
+/// peer's own version. The codec unit suite separately constructs real
+/// four-field PDU 27 frames and proves that its bounded dual-schema decoder
+/// produces this sentinel.
 #[test]
 fn rolling_upgrade_legacy_peer_fallback_treats_zero_min_as_codec_vers() {
     log_event("setup", "started", "legacy peer (min_supported sentinel=0)");
 
-    // The decoder's serde(default = "default_legacy_min_supported")
-    // returns 0 when the wire payload omits the field. We model that
-    // here by constructing the response with min_supported: 0 directly
-    // (functionally equivalent to a v45 peer that pre-dates the field).
+    // Model the output of PDU 27's dual-schema decoder. This test is about the
+    // production handshake substitution, not wire compatibility by itself.
     let info = GetCodecVersionResponse {
         codec_vers: CODEC_VERSION,
         version_string: "ft-legacy-peer".to_string(),

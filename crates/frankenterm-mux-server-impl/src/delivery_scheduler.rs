@@ -42,7 +42,7 @@ use crate::delivery_ledger::{
 use codec::{
     RenderApplicationContractError, RenderApplicationIdentity, RenderApplicationKind,
     RenderApplicationNackReason, RenderApplicationNackRecovery, RenderApplicationOutcome,
-    RenderApplicationResult, RenderApplicationUpdate,
+    RenderApplicationResult, RenderApplicationUpdate, RenderConnectionIdentity,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
@@ -1082,26 +1082,127 @@ impl AuthorityLane {
     }
 }
 
-/// Connection-local scheduler generation for durable authority handles.
+/// Exact scheduler generation for durable authority handles.
 ///
-/// The producer must never reuse the numeric value while authority handles
-/// from an older connection incarnation can still exist.  Claim and
-/// reservation capabilities carry an additional coordinator-instance identity
-/// and therefore reject cross-instance settlement even if this external
-/// authority-generation precondition is accidentally violated.
+/// The public numeric ordinal is useful for observability and wire settlement,
+/// but cannot establish authority by itself: it may repeat after a client
+/// restart. `connection_identity` binds the generation to the coherent
+/// topology bootstrap, while the private process-local `instance` prevents a
+/// replacement coordinator on the same connection from accepting a cloned
+/// plan minted for its predecessor.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SchedulerGeneration(u64);
+pub struct SchedulerGeneration {
+    connection_identity: RenderConnectionIdentity,
+    ordinal: u64,
+    instance: SchedulerGenerationInstanceId,
+}
 
 impl SchedulerGeneration {
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    #[cfg(test)]
+    const fn for_test(
+        connection_identity: RenderConnectionIdentity,
+        ordinal: u64,
+        instance: u64,
+    ) -> Self {
+        Self {
+            connection_identity,
+            ordinal,
+            instance: SchedulerGenerationInstanceId(instance),
+        }
     }
 
     #[must_use]
     pub const fn get(self) -> u64 {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub const fn connection_identity(self) -> RenderConnectionIdentity {
+        self.connection_identity
+    }
+
+    #[must_use]
+    pub const fn instance_id(self) -> SchedulerGenerationInstanceId {
+        self.instance
+    }
+}
+
+/// Opaque process-local identity for one scheduler-generation authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SchedulerGenerationInstanceId(u64);
+
+impl SchedulerGenerationInstanceId {
+    #[must_use]
+    pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerGenerationError {
+    InvalidConnectionIdentity,
+    ZeroOrdinal,
+    InstanceExhausted,
+}
+
+impl std::fmt::Display for SchedulerGenerationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidConnectionIdentity => {
+                "scheduler generation requires a non-reserved render connection identity"
+            }
+            Self::ZeroOrdinal => "scheduler generation ordinal must be nonzero",
+            Self::InstanceExhausted => {
+                "scheduler generation instance space is exhausted; refusing to wrap or reuse"
+            }
+        })
+    }
+}
+
+impl std::error::Error for SchedulerGenerationError {}
+
+static NEXT_SCHEDULER_GENERATION_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_scheduler_generation_instance(
+    counter: &AtomicU64,
+) -> Result<SchedulerGenerationInstanceId, SchedulerGenerationError> {
+    let mut current = counter.load(AtomicOrdering::Relaxed);
+    loop {
+        if current == 0 {
+            return Err(SchedulerGenerationError::InstanceExhausted);
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or(SchedulerGenerationError::InstanceExhausted)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => return Ok(SchedulerGenerationInstanceId(current)),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn mint_scheduler_generation(
+    connection_identity: RenderConnectionIdentity,
+    ordinal: u64,
+) -> Result<SchedulerGeneration, SchedulerGenerationError> {
+    connection_identity
+        .validate()
+        .map_err(|_| SchedulerGenerationError::InvalidConnectionIdentity)?;
+    if ordinal == 0 {
+        return Err(SchedulerGenerationError::ZeroOrdinal);
+    }
+    let instance =
+        allocate_scheduler_generation_instance(&NEXT_SCHEDULER_GENERATION_INSTANCE)?;
+    Ok(SchedulerGeneration {
+        connection_identity,
+        ordinal,
+        instance,
+    })
 }
 
 /// Stable key plus incarnation.  Raw pane IDs are insufficient when an ID can
@@ -1625,6 +1726,35 @@ impl std::fmt::Display for CoordinatorInstanceExhausted {
 
 impl std::error::Error for CoordinatorInstanceExhausted {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryCoordinatorCreateError {
+    SchedulerGeneration(SchedulerGenerationError),
+    CoordinatorInstance(CoordinatorInstanceExhausted),
+}
+
+impl std::fmt::Display for DeliveryCoordinatorCreateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchedulerGeneration(error) => error.fmt(formatter),
+            Self::CoordinatorInstance(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for DeliveryCoordinatorCreateError {}
+
+impl From<SchedulerGenerationError> for DeliveryCoordinatorCreateError {
+    fn from(error: SchedulerGenerationError) -> Self {
+        Self::SchedulerGeneration(error)
+    }
+}
+
+impl From<CoordinatorInstanceExhausted> for DeliveryCoordinatorCreateError {
+    fn from(error: CoordinatorInstanceExhausted) -> Self {
+        Self::CoordinatorInstance(error)
+    }
+}
+
 fn allocate_coordinator_instance(
     counter: &AtomicU64,
 ) -> Result<CoordinatorInstanceId, CoordinatorInstanceExhausted> {
@@ -1880,6 +2010,7 @@ pub struct RenderApplicationSettlementCounters {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderApplicationClaimMismatch {
     CoordinatorInstance,
+    ConnectionIdentity,
     ConnectionGeneration,
     SchedulerSequence,
     Attempt,
@@ -1942,6 +2073,7 @@ pub enum RenderApplicationCloseOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RenderRetryIdentity {
+    connection_identity: RenderConnectionIdentity,
     connection_generation: u64,
     coordinator_instance: u64,
     scheduler_sequence: u64,
@@ -1956,9 +2088,11 @@ struct RenderRetryIdentity {
 
 impl RenderRetryIdentity {
     fn from_identity(
+        connection_identity: RenderConnectionIdentity,
         identity: RenderApplicationIdentity,
     ) -> Result<Self, RenderApplicationBeginError> {
         Ok(Self {
+            connection_identity,
             connection_generation: identity.token.connection_generation,
             coordinator_instance: identity.token.coordinator_instance,
             scheduler_sequence: identity.token.scheduler_sequence,
@@ -1974,9 +2108,10 @@ impl RenderRetryIdentity {
     }
 
     fn authoritative_resync(
+        connection_identity: RenderConnectionIdentity,
         identity: RenderApplicationIdentity,
     ) -> Result<Self, RenderApplicationBeginError> {
-        let mut retry = Self::from_identity(identity)?;
+        let mut retry = Self::from_identity(connection_identity, identity)?;
         retry.base_state = None;
         retry.kind = RenderApplicationKind::Snapshot;
         Ok(retry)
@@ -1993,6 +2128,7 @@ struct RenderRetryContext {
 
 #[derive(Clone, Debug)]
 struct PendingRenderApplication {
+    connection_identity: RenderConnectionIdentity,
     identity: RenderApplicationIdentity,
     claim: CoordinatorClaimToken,
     max_attempts: u16,
@@ -2097,7 +2233,8 @@ impl RenderApplicationSettlementTracker {
         let advertised_deadline = now_millis
             .checked_add(u64::from(update.retry_budget.remaining_millis))
             .ok_or(RenderApplicationBeginError::DeadlineOverflow)?;
-        let retry_identity = RenderRetryIdentity::from_identity(update.identity)?;
+        let retry_identity =
+            RenderRetryIdentity::from_identity(update.connection_identity, update.identity)?;
         let deadline_millis = match self.retry {
             Some(retry) => {
                 if retry.identity != retry_identity
@@ -2129,6 +2266,7 @@ impl RenderApplicationSettlementTracker {
         };
 
         self.pending = Some(PendingRenderApplication {
+            connection_identity: update.connection_identity,
             identity: update.identity,
             claim: claim.token.clone(),
             max_attempts: update.retry_budget.max_attempts,
@@ -2154,7 +2292,9 @@ impl RenderApplicationSettlementTracker {
             increment(&mut self.counters.stale_or_invalid_results);
             return RenderApplicationSettleOutcome::StaleOrDuplicate;
         };
-        if let Err(error) = result.validate_for_identity(pending.identity) {
+        if let Err(error) =
+            result.validate_for_identity(pending.identity, pending.connection_identity)
+        {
             increment(&mut self.counters.stale_or_invalid_results);
             return RenderApplicationSettleOutcome::Rejected(error);
         }
@@ -2194,8 +2334,11 @@ impl RenderApplicationSettlementTracker {
                         }
                     } else {
                         let retry = RenderRetryContext {
-                            identity: RenderRetryIdentity::authoritative_resync(pending.identity)
-                                .expect("validated pending identity remains wire-representable"),
+                            identity: RenderRetryIdentity::authoritative_resync(
+                                pending.connection_identity,
+                                pending.identity,
+                            )
+                            .expect("validated pending identity remains wire-representable"),
                             max_attempts: pending.max_attempts,
                             last_attempt_ordinal: pending.attempt_ordinal,
                             deadline_millis: pending.deadline_millis,
@@ -2230,8 +2373,11 @@ impl RenderApplicationSettlementTracker {
                         }
                     } else {
                         let retry = RenderRetryContext {
-                            identity: RenderRetryIdentity::from_identity(pending.identity)
-                                .expect("validated pending identity remains wire-representable"),
+                            identity: RenderRetryIdentity::from_identity(
+                                pending.connection_identity,
+                                pending.identity,
+                            )
+                            .expect("validated pending identity remains wire-representable"),
                             max_attempts: pending.max_attempts,
                             last_attempt_ordinal: pending.attempt_ordinal,
                             deadline_millis: pending.deadline_millis,
@@ -2340,6 +2486,11 @@ fn validate_render_claim_binding(
     if token.coordinator_instance != claim.token.coordinator_instance().get() {
         return Err(RenderApplicationBeginError::ClaimMismatch(
             RenderApplicationClaimMismatch::CoordinatorInstance,
+        ));
+    }
+    if update.connection_identity != claim.token.generation().connection_identity() {
+        return Err(RenderApplicationBeginError::ClaimMismatch(
+            RenderApplicationClaimMismatch::ConnectionIdentity,
         ));
     }
     if token.connection_generation != claim.token.generation().get() {
@@ -2478,11 +2629,22 @@ pub struct DeliveryCoordinator {
 
 impl DeliveryCoordinator {
     pub fn try_new(
+        connection_identity: RenderConnectionIdentity,
+        generation_ordinal: u64,
+        limits: HardenedSchedulerLimits,
+    ) -> Result<Self, DeliveryCoordinatorCreateError> {
+        let generation = mint_scheduler_generation(connection_identity, generation_ordinal)?;
+        let instance = CoordinatorInstance::try_new()?;
+        Ok(Self::from_authority(instance, generation, limits))
+    }
+
+    fn from_authority(
+        instance: CoordinatorInstance,
         generation: SchedulerGeneration,
         limits: HardenedSchedulerLimits,
-    ) -> Result<Self, CoordinatorInstanceExhausted> {
-        Ok(Self {
-            instance: CoordinatorInstance::try_new()?,
+    ) -> Self {
+        Self {
+            instance,
             generation,
             limits,
             queue: Vec::new(),
@@ -2500,13 +2662,14 @@ impl DeliveryCoordinator {
             pending_wake: None,
             counters: HardenedCounters::default(),
             last_close_report: None,
-        })
+        }
     }
 
     #[cfg(test)]
     fn new(generation: SchedulerGeneration, limits: HardenedSchedulerLimits) -> Self {
-        Self::try_new(generation, limits)
-            .expect("test delivery coordinator should have instance identity capacity")
+        let instance = CoordinatorInstance::try_new()
+            .expect("test delivery coordinator should have instance identity capacity");
+        Self::from_authority(instance, generation, limits)
     }
 
     #[must_use]
@@ -4083,7 +4246,12 @@ mod hardened_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Wake;
 
-    const GENERATION: SchedulerGeneration = SchedulerGeneration::new(41);
+    const CONNECTION_IDENTITY: RenderConnectionIdentity = RenderConnectionIdentity::new(
+        codec::TopologyStreamId::from_bytes([0x41; 16]),
+        mux::MuxSessionIncarnation::from_bytes([0x43; 16]),
+    );
+    const GENERATION: SchedulerGeneration =
+        SchedulerGeneration::for_test(CONNECTION_IDENTITY, 41, 1);
 
     fn broad_limits() -> HardenedSchedulerLimits {
         HardenedSchedulerLimits::new([16; HARDENED_DELIVERY_LANE_COUNT], 64, 4096, 8, 1024, 64)
@@ -4140,7 +4308,11 @@ mod hardened_tests {
     }
 
     fn wrong_generation_plan(lane: AuthorityLane, id: u64) -> DeliveryPlan {
-        let wrong_generation = SchedulerGeneration::new(GENERATION.get() + 1);
+        let wrong_generation = SchedulerGeneration::for_test(
+            CONNECTION_IDENTITY,
+            GENERATION.get() + 1,
+            GENERATION.instance_id().get() + 1,
+        );
         let effect = match lane {
             AuthorityLane::Event => PlannedEffect::EventJournal {
                 journal: AuthorityHandle::new(wrong_generation, id, 1),
@@ -4278,6 +4450,7 @@ mod hardened_tests {
                 codec::RenderComponentUpdate::Unchanged
             },
             alerts: Vec::new(),
+            connection_identity: claim.token().generation().connection_identity(),
         }
     }
 
@@ -4287,6 +4460,7 @@ mod hardened_tests {
             outcome: RenderApplicationOutcome::Applied {
                 applied_state: update.identity.resulting_state,
             },
+            connection_identity: update.connection_identity,
         }
     }
 
@@ -4317,6 +4491,7 @@ mod hardened_tests {
                 reason,
                 observed_state,
             }),
+            connection_identity: update.connection_identity,
         }
     }
 
@@ -4352,6 +4527,71 @@ mod hardened_tests {
     }
 
     #[test]
+    fn scheduler_generation_allocation_fails_before_wrap_or_reuse() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_scheduler_generation_instance(&counter),
+            Ok(SchedulerGenerationInstanceId(u64::MAX - 1))
+        );
+        assert_eq!(
+            allocate_scheduler_generation_instance(&counter),
+            Err(SchedulerGenerationError::InstanceExhausted)
+        );
+        assert_eq!(
+            allocate_scheduler_generation_instance(&counter),
+            Err(SchedulerGenerationError::InstanceExhausted)
+        );
+    }
+
+    #[test]
+    fn production_generation_mint_rejects_aliasing_and_reserved_authority() {
+        let reserved = RenderConnectionIdentity::new(
+            codec::TopologyStreamId::from_bytes([0; 16]),
+            mux::MuxSessionIncarnation::from_bytes([0; 16]),
+        );
+        assert!(matches!(
+            DeliveryCoordinator::try_new(reserved, 41, broad_limits()),
+            Err(DeliveryCoordinatorCreateError::SchedulerGeneration(
+                SchedulerGenerationError::InvalidConnectionIdentity
+            ))
+        ));
+        assert!(matches!(
+            DeliveryCoordinator::try_new(CONNECTION_IDENTITY, 0, broad_limits()),
+            Err(DeliveryCoordinatorCreateError::SchedulerGeneration(
+                SchedulerGenerationError::ZeroOrdinal
+            ))
+        ));
+
+        let origin = DeliveryCoordinator::try_new(CONNECTION_IDENTITY, 41, broad_limits())
+            .expect("first production scheduler generation should mint");
+        let mut replacement =
+            DeliveryCoordinator::try_new(CONNECTION_IDENTITY, 41, broad_limits())
+                .expect("same numeric ordinal should mint a distinct scheduler instance");
+        assert_eq!(origin.generation().get(), replacement.generation().get());
+        assert_eq!(
+            origin.generation().connection_identity(),
+            replacement.generation().connection_identity()
+        );
+        assert_ne!(
+            origin.generation().instance_id(),
+            replacement.generation().instance_id()
+        );
+
+        let old_plan = DeliveryPlan::new(vec![PlannedEffect::EventJournal {
+            journal: AuthorityHandle::new(origin.generation(), 9, 1),
+            retained_bytes: 1,
+        }])
+        .expect("old scheduler authority is a valid plan shape");
+        assert!(matches!(
+            replacement.admit_plan(old_plan),
+            PlanAdmission::Rejected {
+                reason: PlanRejectReason::WrongGeneration,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn application_ack_is_the_only_path_that_releases_the_exact_claim() {
         let mut coordinator = coordinator();
         let claim = claimed_render(&mut coordinator, 9);
@@ -4375,6 +4615,26 @@ mod hardened_tests {
                 ..RenderApplicationSettlementCounters::default()
             }
         );
+    }
+
+    #[test]
+    fn application_begin_rejects_foreign_connection_with_same_numeric_generation() {
+        let mut coordinator = coordinator();
+        let claim = claimed_render(&mut coordinator, 9);
+        let mut update = render_application_update(&claim, 1, 3, 100);
+        update.connection_identity = RenderConnectionIdentity::new(
+            codec::TopologyStreamId::from_bytes([0x71; 16]),
+            mux::MuxSessionIncarnation::from_bytes([0x73; 16]),
+        );
+        let mut tracker = RenderApplicationSettlementTracker::new();
+        assert_eq!(
+            tracker.begin(&claim, &update, 1_000),
+            Err(RenderApplicationBeginError::ClaimMismatch(
+                RenderApplicationClaimMismatch::ConnectionIdentity
+            ))
+        );
+        assert_eq!(coordinator.capacity().in_flight_plans, 1);
+        assert_eq!(tracker.pending_identity(), None);
     }
 
     #[test]
@@ -4728,7 +4988,7 @@ mod hardened_tests {
 
     proptest! {
         #[test]
-        fn any_single_wire_identity_corruption_cannot_ack_live_work(field in 0u8..8) {
+        fn any_single_wire_identity_corruption_cannot_ack_live_work(field in 0u8..9) {
             let mut coordinator = coordinator();
             let claim = claimed_render(&mut coordinator, 9);
             let update = render_application_update(&claim, 1, 3, 100);
@@ -4738,15 +4998,21 @@ mod hardened_tests {
                 .expect("exact render claim should bind");
             let mut corrupted = applied_result(&update);
             match field {
-                0 => corrupted.identity.token.connection_generation += 1,
-                1 => corrupted.identity.token.coordinator_instance += 1,
-                2 => corrupted.identity.token.scheduler_sequence += 1,
-                3 => corrupted.identity.token.attempt += 1,
-                4 => corrupted.identity.token.ledger_instance += 1,
-                5 => corrupted.identity.token.render_generation += 1,
-                6 => corrupted.identity.token.ledger_obligation += 1,
-                7 => corrupted.identity.pane_id += 1,
-                _ => unreachable!("generated field is constrained to 0..8"),
+                0 => {
+                    corrupted.connection_identity = RenderConnectionIdentity::new(
+                        codec::TopologyStreamId::from_bytes([0x99; 16]),
+                        mux::MuxSessionIncarnation::from_bytes([0x9a; 16]),
+                    );
+                }
+                1 => corrupted.identity.token.connection_generation += 1,
+                2 => corrupted.identity.token.coordinator_instance += 1,
+                3 => corrupted.identity.token.scheduler_sequence += 1,
+                4 => corrupted.identity.token.attempt += 1,
+                5 => corrupted.identity.token.ledger_instance += 1,
+                6 => corrupted.identity.token.render_generation += 1,
+                7 => corrupted.identity.token.ledger_obligation += 1,
+                8 => corrupted.identity.pane_id += 1,
+                _ => unreachable!("generated field is constrained to 0..9"),
             }
             prop_assert!(matches!(
                 tracker.settle(&mut coordinator, corrupted, 1_010),
@@ -5240,7 +5506,11 @@ mod hardened_tests {
             ReservationCommit::Stale { .. }
         ));
         let invalid_replay = DeliveryPlan::new(vec![PlannedEffect::EventJournal {
-            journal: AuthorityHandle::new(SchedulerGeneration::new(99), 9, 1),
+            journal: AuthorityHandle::new(
+                SchedulerGeneration::for_test(CONNECTION_IDENTITY, 99, 99),
+                9,
+                1,
+            ),
             retained_bytes: 1,
         }])
         .expect("generation validation belongs to the coordinator");
@@ -5684,7 +5954,11 @@ mod hardened_tests {
     fn wrong_generation_authority_and_stale_claim_fail_closed_or_reject() {
         let mut coordinator = coordinator();
         let wrong = DeliveryPlan::new(vec![PlannedEffect::EventJournal {
-            journal: AuthorityHandle::new(SchedulerGeneration::new(99), 1, 1),
+            journal: AuthorityHandle::new(
+                SchedulerGeneration::for_test(CONNECTION_IDENTITY, 99, 99),
+                1,
+                1,
+            ),
             retained_bytes: 1,
         }])
         .expect("wrong generation is scheduler validation, not plan shape");

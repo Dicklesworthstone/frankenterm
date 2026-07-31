@@ -125,7 +125,9 @@ pub const DEFAULT_WORKSPACE: &str = "default";
 /// scope. A newly constructed mux always receives a fresh incarnation so a
 /// reconnect can distinguish a surviving session from a restarted server even
 /// when process-local numeric identifiers happen to repeat.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
 pub struct MuxSessionIncarnation([u8; 16]);
 
 impl MuxSessionIncarnation {
