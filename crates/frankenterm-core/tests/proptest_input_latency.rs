@@ -336,11 +336,14 @@ proptest! {
             error,
             InputLatencyMeasurementError::DuplicateStage { stage }
         );
-        prop_assert!(matches!(
-            measurement.validate_complete(),
-            Err(InputLatencyMeasurementError::DuplicateStage { stage: failed_stage })
-                if failed_stage == stage
-        ));
+        prop_assert!(
+            matches!(
+                measurement.validate_complete(),
+                Err(InputLatencyMeasurementError::DuplicateStage { stage: failed_stage })
+                    if failed_stage == stage
+            ),
+            "duplicate stage fault must remain sticky"
+        );
     }
 
     #[test]
@@ -367,10 +370,13 @@ proptest! {
             .collect();
         let measurement = InputLatencyMeasurement::from_stages(id, stages);
 
-        prop_assert!(matches!(
-            measurement.validate_complete(),
-            Err(InputLatencyMeasurementError::ClockDomainMismatch { .. })
-        ));
+        prop_assert!(
+            matches!(
+                measurement.validate_complete(),
+                Err(InputLatencyMeasurementError::ClockDomainMismatch { .. })
+            ),
+            "one unrelated clock domain must invalidate the measurement"
+        );
     }
 
     #[test]
@@ -396,10 +402,13 @@ proptest! {
             .collect();
         let measurement = InputLatencyMeasurement::from_stages(id, stages);
 
-        prop_assert!(matches!(
-            measurement.validate_complete(),
-            Err(InputLatencyMeasurementError::TimestampRegression { .. })
-        ));
+        prop_assert!(
+            matches!(
+                measurement.validate_complete(),
+                Err(InputLatencyMeasurementError::TimestampRegression { .. })
+            ),
+            "one timestamp regression must invalidate the measurement"
+        );
     }
 
     #[test]
