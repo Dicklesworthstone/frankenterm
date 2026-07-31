@@ -21,6 +21,7 @@
 //!   * the `segment_embeddings` writer (`Storage::store_embedding*`) — has no
 //!     in-tree production caller; tracked OPEN by ft-xx5cl ("no production
 //!     writer -> semantic/hybrid search silently degrades to lexical-only").
+//!
 //! When those beads land, add their production callsites to `WIRED` below.
 
 use std::path::PathBuf;
