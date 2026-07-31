@@ -1003,6 +1003,8 @@ pub struct InputLatencyBudget {
     pub regression_threshold: f64,
 }
 
+// Serde's `serialize_with` field adapter contract requires the value as `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn serialize_regression_threshold_bits<S>(
     value: &f64,
     serializer: S,
@@ -1023,7 +1025,7 @@ impl<'de> Deserialize<'de> for RegressionThresholdBits {
     {
         struct RegressionThresholdBitsVisitor;
 
-        impl<'de> de::Visitor<'de> for RegressionThresholdBitsVisitor {
+        impl de::Visitor<'_> for RegressionThresholdBitsVisitor {
             type Value = RegressionThresholdBits;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
