@@ -223,22 +223,50 @@ fn reconcile_predictions_after_terminal_change(
     terminal_seqno: SequenceNo,
     bonus_lines: &[(StableRowIndex, Line)],
 ) -> PredictionReconciliation {
+    reconcile_predictions_with_authoritative_lines(predictions, terminal_seqno, |row| {
+        bonus_lines
+            .iter()
+            .find_map(|(candidate, line)| (*candidate == row).then_some(line))
+    })
+}
+
+fn reconcile_predictions_after_cached_terminal_change(
+    predictions: &mut Vec<Prediction>,
+    terminal_seqno: SequenceNo,
+    lines: &LruCache<StableRowIndex, LineEntry>,
+) -> PredictionReconciliation {
+    reconcile_predictions_with_authoritative_lines(predictions, terminal_seqno, |row| {
+        match lines.peek(&row) {
+            Some(LineEntry::Line(line)) => Some(line),
+            Some(
+                LineEntry::Fetching(_)
+                | LineEntry::LineAndFetching(..)
+                | LineEntry::Stale(_),
+            )
+            | None => None,
+        }
+    })
+}
+
+fn reconcile_predictions_with_authoritative_lines<'a>(
+    predictions: &mut Vec<Prediction>,
+    terminal_seqno: SequenceNo,
+    mut line_for_row: impl FnMut(StableRowIndex) -> Option<&'a Line>,
+) -> PredictionReconciliation {
     let mut reconciliation = PredictionReconciliation::default();
     let mut pending = Vec::with_capacity(predictions.len());
 
     for prediction in std::mem::take(predictions) {
-        let post_dispatch = prediction
-            .dispatch_seqno
-            .is_some_and(|dispatch_seqno| terminal_seqno > dispatch_seqno);
-        if !post_dispatch {
+        let Some(dispatch_seqno) = prediction.dispatch_seqno else {
+            pending.push(prediction);
+            continue;
+        };
+        if terminal_seqno <= dispatch_seqno {
             pending.push(prediction);
             continue;
         }
 
-        let Some((_, line)) = bonus_lines
-            .iter()
-            .find(|(row, _)| *row == prediction.row)
-        else {
+        let Some(line) = line_for_row(prediction.row) else {
             // The terminal advanced, but this delta does not carry the predicted
             // row. Retaining the overlay is safer than treating missing evidence
             // as either confirmation or rejection; bounded expiry handles a row
@@ -246,6 +274,12 @@ fn reconcile_predictions_after_terminal_change(
             pending.push(prediction);
             continue;
         };
+        if line.current_seqno() <= dispatch_seqno {
+            // A later snapshot can carry an unchanged line whose contents predate
+            // the input. Matching that line would be correlation, not evidence.
+            pending.push(prediction);
+            continue;
+        }
 
         let matches = match line.get_cell(prediction.col) {
             Some(cell) => cell.str() == prediction.predicted.str(),
@@ -584,6 +618,15 @@ impl RenderableInner {
         self.apply_prediction_reconciliation(reconciliation, now);
     }
 
+    fn reconcile_predictions_against_cached_state(&mut self, now: Instant) {
+        let reconciliation = reconcile_predictions_after_cached_terminal_change(
+            &mut self.predictions,
+            self.seqno,
+            &self.lines,
+        );
+        self.apply_prediction_reconciliation(reconciliation, now);
+    }
+
     fn prediction_ttl(&self) -> Duration {
         Duration::from_millis(250).max(Duration::from_millis(
             self.last_input_rtt.saturating_mul(4),
@@ -884,6 +927,7 @@ impl RenderableInner {
                 // later in-order delta to settle the prediction without conflating
                 // this stale snapshot with application output.
                 self.record_input_dispatch(serial, delta.seqno);
+                self.reconcile_predictions_against_cached_state(now);
             }
             log::trace!(
                 "ignoring stale render delta for local={} remote={} seqno {} < {}",
@@ -1925,6 +1969,7 @@ mod tests {
         apply_prediction_reconciliation_to_score, base_poll_interval, expire_predictions,
         initial_last_poll, mark_predictions_dispatched, rebuild_cache_as_stale,
         paste_fits_prediction_budget, push_bounded_prediction,
+        reconcile_predictions_after_cached_terminal_change,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
         reset_prediction_state, should_apply_unilateral_delta, FetchToken, ImageLru, LineEntry,
         Prediction, PredictionReconciliation, MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
@@ -2051,19 +2096,31 @@ mod tests {
         let born = Instant::now();
         let serial = input_serial(100);
         let mut predictions = vec![prediction(serial, 0, 0, 'x', born)];
-        let lines = vec![(
+        let mut lines = LruCache::new(NonZeroUsize::new(1).unwrap());
+        lines.put(
             0,
-            Line::from_text("x", &CellAttributes::default(), 11, None),
-        )];
+            LineEntry::Line(Line::from_text(
+                "x",
+                &CellAttributes::default(),
+                11,
+                None,
+            )),
+        );
 
-        let before_ack =
-            reconcile_predictions_after_terminal_change(&mut predictions, 11, &lines);
+        let before_ack = reconcile_predictions_after_cached_terminal_change(
+            &mut predictions,
+            11,
+            &lines,
+        );
         assert_eq!(before_ack, PredictionReconciliation::default());
         assert_eq!(predictions.len(), 1);
 
         mark_predictions_dispatched(&mut predictions, serial, 10);
-        let after_ack =
-            reconcile_predictions_after_terminal_change(&mut predictions, 11, &lines);
+        let after_ack = reconcile_predictions_after_cached_terminal_change(
+            &mut predictions,
+            11,
+            &lines,
+        );
         assert_eq!(
             after_ack,
             PredictionReconciliation {
@@ -2072,6 +2129,33 @@ mod tests {
             }
         );
         assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn unchanged_cached_row_after_dispatch_is_not_false_echo_evidence() {
+        let born = Instant::now();
+        let serial = input_serial(100);
+        let mut predictions = vec![prediction(serial, 0, 0, 'x', born)];
+        mark_predictions_dispatched(&mut predictions, serial, 10);
+        let mut lines = LruCache::new(NonZeroUsize::new(1).unwrap());
+        lines.put(
+            0,
+            LineEntry::Line(Line::from_text(
+                "x",
+                &CellAttributes::default(),
+                10,
+                None,
+            )),
+        );
+
+        let reconciliation = reconcile_predictions_after_cached_terminal_change(
+            &mut predictions,
+            11,
+            &lines,
+        );
+
+        assert_eq!(reconciliation, PredictionReconciliation::default());
+        assert_eq!(predictions.len(), 1);
     }
 
     #[test]
