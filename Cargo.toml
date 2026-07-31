@@ -257,7 +257,7 @@ implicit_clone = "allow"
 [workspace.dependencies]
 # Core dependencies
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 tantivy = "0.26.1"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }

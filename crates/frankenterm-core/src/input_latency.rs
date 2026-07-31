@@ -2437,14 +2437,28 @@ mod tests {
 
     #[test]
     fn budget_serde_roundtrip() {
-        let budget = InputLatencyBudget::default();
-        let json = serde_json::to_string(&budget).unwrap();
-        let back: InputLatencyBudget = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.aggregate, budget.aggregate);
-        assert_eq!(
-            back.regression_threshold.to_bits(),
-            budget.regression_threshold.to_bits()
-        );
+        // The non-default value is a retained regression for a one-ULP drift
+        // exposed by the property suite when serde_json's exact float parser
+        // was not enabled. A changed bit can move an exact budget boundary.
+        for regression_threshold in [
+            1.0,
+            0.908_841_146_302_401_9,
+            0.1,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+        ] {
+            let mut budget = InputLatencyBudget::default();
+            budget.regression_threshold = regression_threshold;
+            let json = serde_json::to_string(&budget).unwrap();
+            let back: InputLatencyBudget = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.aggregate, budget.aggregate);
+            assert_eq!(
+                back.regression_threshold.to_bits(),
+                budget.regression_threshold.to_bits(),
+                "regression threshold changed across JSON: {json}"
+            );
+        }
     }
 
     #[test]
