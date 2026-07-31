@@ -221,17 +221,17 @@ fn pressure_replay() -> Vec<(FleetPressureTier, Option<f64>)> {
     for cycle in 0..4 {
         // rising headroom (pressure easing)
         for step in 0..6 {
-            let headroom = 0.06 + f64::from(step) * 0.04;
+            let headroom = f64::from(step).mul_add(0.04, 0.06);
             cycles.push((FleetPressureTier::Elevated, Some(headroom)));
         }
         // critical spike
         cycles.push((
             FleetPressureTier::Critical,
-            Some(0.05 + f64::from(cycle) * 0.01),
+            Some(f64::from(cycle).mul_add(0.01, 0.05)),
         ));
         // falling headroom (pressure building) — the flip side of the sawtooth
         for step in (0..6).rev() {
-            let headroom = 0.06 + f64::from(step) * 0.04;
+            let headroom = f64::from(step).mul_add(0.04, 0.06);
             cycles.push((FleetPressureTier::Elevated, Some(headroom)));
         }
     }
@@ -267,14 +267,14 @@ fn apply_eviction_plan(panes: &mut [PaneScrollbackInfo], plan: &EvictionPlan) ->
             if pane.warm_pages == 0 || pane.warm_bytes == 0 {
                 continue;
             }
-            let pages = target.pages_to_evict.min(pane.warm_pages);
+            let evictable_pages = target.pages_to_evict.min(pane.warm_pages);
             let bytes = pane
                 .warm_bytes
-                .saturating_mul(pages)
+                .saturating_mul(evictable_pages)
                 .checked_div(pane.warm_pages)
                 .unwrap_or(0)
                 .min(pane.warm_bytes);
-            pane.warm_pages = pane.warm_pages.saturating_sub(pages);
+            pane.warm_pages = pane.warm_pages.saturating_sub(evictable_pages);
             pane.warm_bytes = pane.warm_bytes.saturating_sub(bytes);
             pane.estimated_memory_bytes = pane.estimated_memory_bytes.saturating_sub(bytes);
             evicted = evicted.saturating_add(bytes);
