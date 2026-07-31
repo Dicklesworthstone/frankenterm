@@ -288,6 +288,11 @@ fn push_bounded_prediction(
     true
 }
 
+fn paste_fits_prediction_budget(predictions_len: usize, text: &str) -> bool {
+    let remaining = MAX_PENDING_PREDICTIONS.saturating_sub(predictions_len);
+    text.chars().take(remaining.saturating_add(1)).count() <= remaining
+}
+
 fn apply_prediction_reconciliation_to_score(
     prediction_score: &mut i32,
     last_prediction_miss: &mut Instant,
@@ -737,6 +742,18 @@ impl RenderableInner {
                 if looks_like_secret_prompt(&l.as_str())
         );
         if secret {
+            return;
+        }
+
+        // Preflight before `textwrap::fill` duplicates or traverses an arbitrarily
+        // large paste. A Unicode scalar can produce at most one terminal cell here,
+        // so fitting the scalar count into the remaining cell budget guarantees
+        // all-or-nothing admission. `take(remaining + 1)` keeps refusal work bounded
+        // by the pane-local prediction ceiling rather than by the paste size.
+        if !paste_fits_prediction_budget(self.predictions.len(), text) {
+            let now = Instant::now();
+            self.prediction_score = PREDICT_SUPPRESS_SCORE;
+            self.last_prediction_miss = now;
             return;
         }
 
@@ -1907,7 +1924,7 @@ mod tests {
     use super::{
         apply_prediction_reconciliation_to_score, base_poll_interval, expire_predictions,
         initial_last_poll, mark_predictions_dispatched, rebuild_cache_as_stale,
-        push_bounded_prediction,
+        paste_fits_prediction_budget, push_bounded_prediction,
         reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
         reset_prediction_state, should_apply_unilateral_delta, FetchToken, ImageLru, LineEntry,
         Prediction, PredictionReconciliation, MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
@@ -2104,6 +2121,22 @@ mod tests {
 
         assert!(!push_bounded_prediction(&mut predictions, sample));
         assert_eq!(predictions.len(), MAX_PENDING_PREDICTIONS);
+    }
+
+    #[test]
+    fn paste_prediction_preflight_is_all_or_nothing_and_bounded() {
+        assert!(paste_fits_prediction_budget(
+            MAX_PENDING_PREDICTIONS - 3,
+            "abc"
+        ));
+        assert!(!paste_fits_prediction_budget(
+            MAX_PENDING_PREDICTIONS - 3,
+            "abcd"
+        ));
+        assert!(!paste_fits_prediction_budget(
+            MAX_PENDING_PREDICTIONS,
+            "x"
+        ));
     }
 
     #[test]
