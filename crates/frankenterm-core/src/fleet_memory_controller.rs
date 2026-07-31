@@ -950,7 +950,7 @@ pub struct PaneScrollbackInfo {
 }
 
 /// Eviction plan produced by the orchestrator for a single evaluation cycle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvictionPlan {
     /// Pane IDs to evict, ordered by priority (most idle first).
     pub targets: Vec<EvictionTarget>,
@@ -963,7 +963,7 @@ pub struct EvictionPlan {
 }
 
 /// A single pane targeted for eviction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvictionTarget {
     /// Pane ID to evict from.
     pub pane_id: u64,
@@ -990,38 +990,66 @@ pub enum MemoryDampening {
     Hysteresis,
     /// Discrete-time anti-windup PID governs the fleet-wide reclaim magnitude
     /// toward an RSS-headroom setpoint, smoothing de-escalation. Fails closed to
-    /// the legacy fractions on a missing/non-finite/stalled RSS sample.
+    /// the legacy fractions on invalid configuration or a
+    /// missing/non-finite/out-of-range/stalled RSS sample.
     Pid,
 }
 
 /// Configuration for the M9 PID reclaim-magnitude dampener.
 ///
 /// The default gains are derived by pole placement on the nominal first-order
-/// headroom plant `h[k+1] = 0.7·h[k] + 0.3·u[k]` (closed-loop poles 0.70, 0.65)
-/// and certified to GM ≥ 6 dB, PM ≥ 30°, zero overshoot, zero steady-state error
-/// by the `fleet_memory_pid_dampening_cert` proof. Because `dampening` defaults
-/// to [`MemoryDampening::Hysteresis`], the PID path is inert unless explicitly
-/// enabled.
+/// headroom model `h[k+1] = 0.7·h[k] + 0.3·u[k]` (closed-loop poles 0.70, 0.65).
+/// The `fleet_memory_pid_dampening_cert` test checks nominal-model margins and
+/// bounded step-response error and cross-checks the shipped controller. It is a
+/// deterministic proxy, not an empirical certificate for a production host.
+/// Because `dampening` defaults to [`MemoryDampening::Hysteresis`], the PID path
+/// is inert unless explicitly enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PidDampeningConfig {
     /// Gate: which reclaim-magnitude strategy to use.
     pub dampening: MemoryDampening,
     /// Target RSS headroom fraction (setpoint / reference), in `[0, 1]`.
     pub setpoint_headroom: f64,
-    /// Proportional gain.
+    /// Non-negative finite proportional gain.
     pub kp: f64,
-    /// Integral gain (per evaluation cycle; `dt = 1`).
+    /// Non-negative finite integral gain (per evaluation cycle; `dt = 1`).
     pub ki: f64,
-    /// Derivative gain (per evaluation cycle; `dt = 1`).
+    /// Non-negative finite derivative gain (per evaluation cycle; `dt = 1`).
     pub kd: f64,
-    /// Output (reclaim fraction) clamp lower bound.
+    /// Finite output clamp lower bound in `[0, 1]`.
     pub out_min: f64,
-    /// Output (reclaim fraction) clamp upper bound.
+    /// Finite output clamp upper bound in `[out_min, 1]`.
     pub out_max: f64,
-    /// Consecutive identical finite RSS samples before the sensor is declared
-    /// stalled and the controller fails closed to the legacy fixed fractions.
+    /// Positive count of consecutive bit-identical repeats after the initial
+    /// finite RSS sample before the sensor is declared stalled and the
+    /// controller fails closed to the legacy fixed fractions.
     pub stall_threshold: u32,
+}
+
+impl PidDampeningConfig {
+    /// Whether every controller parameter is finite and within its supported
+    /// safety domain.
+    ///
+    /// Invalid configurations fail closed to the legacy hysteresis plan rather
+    /// than reaching floating-point arithmetic or [`f64::clamp`].
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.setpoint_headroom.is_finite()
+            && (0.0..=1.0).contains(&self.setpoint_headroom)
+            && self.kp.is_finite()
+            && self.kp >= 0.0
+            && self.ki.is_finite()
+            && self.ki >= 0.0
+            && self.kd.is_finite()
+            && self.kd >= 0.0
+            && self.out_min.is_finite()
+            && (0.0..=1.0).contains(&self.out_min)
+            && self.out_max.is_finite()
+            && (0.0..=1.0).contains(&self.out_max)
+            && self.out_min <= self.out_max
+            && self.stall_threshold > 0
+    }
 }
 
 impl Default for PidDampeningConfig {
@@ -1048,8 +1076,8 @@ impl Default for PidDampeningConfig {
 /// Anti-windup combines conditional integration (the integrator is frozen when
 /// it would deepen output saturation) with a hard bound on the integral term so
 /// `Ki·I` can never exceed the output span. The controller is linear in its
-/// unsaturated region; the closed-loop stability certificate is computed on that
-/// small-signal model.
+/// unsaturated region; deterministic proxy checks exercise that nominal
+/// small-signal model but do not constitute empirical production-host evidence.
 #[derive(Debug, Clone)]
 pub struct PidReclaimController {
     integral: f64,
@@ -1057,6 +1085,7 @@ pub struct PidReclaimController {
     have_prev: bool,
     last_sample: f64,
     stall_count: u32,
+    sensor_stalled: bool,
 }
 
 impl PidReclaimController {
@@ -1069,11 +1098,13 @@ impl PidReclaimController {
             have_prev: false,
             last_sample: f64::NAN,
             stall_count: 0,
+            sensor_stalled: false,
         }
     }
 
-    /// Reset integrator, derivative memory, and stall state. Called on full
-    /// de-escalation (return to `Normal`) so the next episode starts cold.
+    /// Reset integrator, derivative memory, and stall state so the next episode
+    /// starts cold. Used for full de-escalation, a disabled PID gate, an empty
+    /// fleet, invalid configuration or input, and non-finite arithmetic.
     pub fn reset(&mut self) {
         *self = Self::new();
     }
@@ -1085,9 +1116,11 @@ impl PidReclaimController {
     }
 
     /// Compute the reclaim fraction in `[out_min, out_max]` for this cycle, or
-    /// `None` to **fail closed** (the `headroom` sample is missing, non-finite,
-    /// or the sensor has stalled), in which case the caller uses the legacy
-    /// fixed fraction.
+    /// `None` to **fail closed** (the configuration is invalid, the `headroom`
+    /// sample is missing, non-finite, or outside `[0, 1]`, arithmetic is not
+    /// finite, or the sensor has stalled), in which case the caller uses the
+    /// legacy fixed fraction. Invalid inputs reset controller history so a
+    /// later valid sample starts a fresh consecutive-sample run.
     ///
     /// `headroom` is the measured RSS headroom fraction (process variable). The
     /// error is `setpoint − headroom`, so a positive error (headroom below the
@@ -1097,27 +1130,48 @@ impl PidReclaimController {
         headroom: Option<f64>,
         cfg: &PidDampeningConfig,
     ) -> Option<f64> {
-        let h = headroom?;
-        if !h.is_finite() {
-            // Sensor fault: do NOT integrate garbage; fail closed.
-            self.stall_count = 0;
+        if !cfg.is_valid() {
+            self.reset();
             return None;
         }
 
-        // Stall detection: an identical finite sample repeating for too long is
-        // treated as a wedged sensor. Freeze the integrator and fail closed.
-        if self.have_prev && (h - self.last_sample).abs() <= f64::EPSILON {
+        let Some(headroom) = headroom else {
+            self.reset();
+            return None;
+        };
+        if !headroom.is_finite() || !(0.0..=1.0).contains(&headroom) {
+            // Sensor fault: discard stale controller and repeat-history state.
+            self.reset();
+            return None;
+        }
+
+        let repeats_last_sample =
+            self.have_prev && headroom.to_bits() == self.last_sample.to_bits();
+        if self.sensor_stalled {
+            if repeats_last_sample {
+                return None;
+            }
+            // A changed valid sample recovers from the latched stall cold.
+            self.reset();
+        }
+
+        // Stall detection: a bit-identical finite sample repeating for too long
+        // is treated as a wedged sensor. Freeze the integrator and fail closed.
+        if repeats_last_sample {
             self.stall_count = self.stall_count.saturating_add(1);
         } else {
             self.stall_count = 0;
         }
-        self.last_sample = h;
+        self.last_sample = headroom;
         if self.stall_count >= cfg.stall_threshold {
+            self.integral = 0.0;
+            self.prev_error = 0.0;
+            self.sensor_stalled = true;
             return None;
         }
 
         let dt = 1.0_f64;
-        let error = cfg.setpoint_headroom - h;
+        let error = cfg.setpoint_headroom - headroom;
         let derivative = if self.have_prev {
             (error - self.prev_error) / dt
         } else {
@@ -1127,10 +1181,18 @@ impl PidReclaimController {
         // Anti-windup via conditional integration: tentatively integrate, then
         // back off if the tentative output is saturated in the same direction.
         let proposed_integral = error.mul_add(dt, self.integral);
+        if !proposed_integral.is_finite() {
+            self.reset();
+            return None;
+        }
         let unsaturated = cfg.kd.mul_add(
             derivative,
             cfg.ki.mul_add(proposed_integral, cfg.kp * error),
         );
+        if !unsaturated.is_finite() {
+            self.reset();
+            return None;
+        }
         let saturating_up = unsaturated > cfg.out_max && error > 0.0;
         let saturating_down = unsaturated < cfg.out_min && error < 0.0;
         if !(saturating_up || saturating_down) {
@@ -1144,12 +1206,15 @@ impl PidReclaimController {
 
         let output = cfg
             .kd
-            .mul_add(derivative, cfg.ki.mul_add(self.integral, cfg.kp * error))
-            .clamp(cfg.out_min, cfg.out_max);
+            .mul_add(derivative, cfg.ki.mul_add(self.integral, cfg.kp * error));
+        if !output.is_finite() {
+            self.reset();
+            return None;
+        }
 
         self.prev_error = error;
         self.have_prev = true;
-        Some(output)
+        Some(output.clamp(cfg.out_min, cfg.out_max))
     }
 }
 
@@ -1358,9 +1423,10 @@ impl FleetScrollbackOrchestrator {
     /// Gate: `cfg.dampening` (default [`MemoryDampening::Hysteresis`]). Behavior:
     ///
     /// * **Default-off / fail-closed** — when `cfg.dampening != Pid`, or the PID
-    ///   fails closed (RSS sample `None`, non-finite, or a stalled sensor), this
-    ///   delegates to the byte-identical legacy [`Self::plan_eviction`] / legacy
-    ///   fixed-fraction target.
+    ///   fails closed (invalid configuration, RSS sample `None`, non-finite or
+    ///   out of range, non-finite arithmetic, or a stalled sensor), this
+    ///   delegates to the field-equivalent legacy [`Self::plan_eviction`] /
+    ///   legacy fixed-fraction target.
     /// * **Smooth de-escalation** — at `Elevated` the PID may reclaim *less* than
     ///   the legacy fraction (down to zero), tapering eviction as headroom
     ///   recovers.
@@ -1368,9 +1434,10 @@ impl FleetScrollbackOrchestrator {
     ///   `Emergency` the reclaim magnitude is floored at the legacy fraction, so
     ///   the PID can only ask for *more*, never less. Safety is never dampened.
     ///
-    /// The default gains are pole-placement-certified (GM ≥ 6 dB, PM ≥ 30°, zero
-    /// overshoot) against the nominal first-order headroom plant — see the
-    /// `fleet_memory_pid_dampening_cert` proof.
+    /// The default gains pass deterministic nominal-model proxy checks for
+    /// GM ≥ 6 dB, PM ≥ 30°, and bounded overshoot — see the
+    /// `fleet_memory_pid_dampening_cert` test. Those checks are not empirical
+    /// evidence for a production host or workload.
     pub fn plan_eviction_damped(
         &mut self,
         tier: FleetPressureTier,
@@ -1381,6 +1448,9 @@ impl FleetScrollbackOrchestrator {
     ) -> Option<EvictionPlan> {
         // Default-off: only the explicit PID mode diverges from legacy.
         if cfg.dampening != MemoryDampening::Pid {
+            // Gate transitions must not preserve a stale PID episode that can
+            // reappear if the gate is enabled again later.
+            pid.reset();
             return self.plan_eviction(tier, panes);
         }
 
@@ -1396,6 +1466,8 @@ impl FleetScrollbackOrchestrator {
             .iter()
             .fold(0usize, |total, pane| total.saturating_add(pane.warm_bytes));
         if fleet_warm_bytes == 0 {
+            // No controlled plant remains. A later non-empty fleet starts cold.
+            pid.reset();
             self.update_activity(panes);
             return None;
         }
