@@ -322,13 +322,16 @@ proptest! {
 
         let mut collector = InputLatencyCollector::new(1);
         collector.record(m);
-        prop_assert!(matches!(
-            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
-            Some(InputLatencyEvidenceError::InvalidMeasurement {
-                error: InputLatencyMeasurementError::MissingStage { .. },
-                ..
-            })
-        ));
+        prop_assert!(
+            matches!(
+                evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+                Some(InputLatencyEvidenceError::InvalidMeasurement {
+                    error: InputLatencyMeasurementError::MissingStage { .. },
+                    ..
+                })
+            ),
+            "incomplete measurement must remain an explicit evidence error"
+        );
         assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
     }
 
@@ -374,20 +377,26 @@ proptest! {
 
         let encoded = serde_json::to_string(&measurement).unwrap();
         let decoded: InputLatencyMeasurement = serde_json::from_str(&encoded).unwrap();
-        prop_assert!(matches!(
-            decoded.validate_complete(),
-            Err(InputLatencyMeasurementError::DuplicateStage { stage: failed_stage })
-                if failed_stage == stage
-        ));
+        prop_assert!(
+            matches!(
+                decoded.validate_complete(),
+                Err(InputLatencyMeasurementError::DuplicateStage { stage: failed_stage })
+                    if failed_stage == stage
+            ),
+            "serialized duplicate-stage fault must remain sticky"
+        );
         let mut collector = InputLatencyCollector::new(1);
         collector.record(decoded);
-        prop_assert!(matches!(
-            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
-            Some(InputLatencyEvidenceError::InvalidMeasurement {
-                error: InputLatencyMeasurementError::DuplicateStage { stage: failed_stage },
-                ..
-            }) if *failed_stage == stage
-        ));
+        prop_assert!(
+            matches!(
+                evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+                Some(InputLatencyEvidenceError::InvalidMeasurement {
+                    error: InputLatencyMeasurementError::DuplicateStage { stage: failed_stage },
+                    ..
+                }) if *failed_stage == stage
+            ),
+            "duplicate-stage evidence must remain invalid at the gate"
+        );
         assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
     }
 
@@ -425,13 +434,16 @@ proptest! {
 
         let mut collector = InputLatencyCollector::new(1);
         collector.record(measurement);
-        prop_assert!(matches!(
-            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
-            Some(InputLatencyEvidenceError::InvalidMeasurement {
-                error: InputLatencyMeasurementError::ClockDomainMismatch { .. },
-                ..
-            })
-        ));
+        prop_assert!(
+            matches!(
+                evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+                Some(InputLatencyEvidenceError::InvalidMeasurement {
+                    error: InputLatencyMeasurementError::ClockDomainMismatch { .. },
+                    ..
+                })
+            ),
+            "clock-domain mismatch must remain invalid at the gate"
+        );
         assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
     }
 
@@ -468,13 +480,16 @@ proptest! {
 
         let mut collector = InputLatencyCollector::new(1);
         collector.record(measurement);
-        prop_assert!(matches!(
-            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
-            Some(InputLatencyEvidenceError::InvalidMeasurement {
-                error: InputLatencyMeasurementError::TimestampRegression { .. },
-                ..
-            })
-        ));
+        prop_assert!(
+            matches!(
+                evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+                Some(InputLatencyEvidenceError::InvalidMeasurement {
+                    error: InputLatencyMeasurementError::TimestampRegression { .. },
+                    ..
+                })
+            ),
+            "timestamp regression must remain invalid at the gate"
+        );
         assert_invalid_gate_and_report(&collector, "EVIDENCE_INVALID_MEASUREMENT")?;
     }
 
@@ -487,11 +502,14 @@ proptest! {
         let mut collector = InputLatencyCollector::new(2);
         collector.record(complete_measurement(id, 100, first_total_us));
         collector.record(complete_measurement(id, 200, second_total_us));
-        prop_assert!(matches!(
-            evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
-            Some(InputLatencyEvidenceError::DuplicateMeasurementId { id: duplicate_id })
-                if *duplicate_id == id
-        ));
+        prop_assert!(
+            matches!(
+                evaluate_budget(&collector, &InputLatencyBudget::default()).evidence_error(),
+                Some(InputLatencyEvidenceError::DuplicateMeasurementId { id: duplicate_id })
+                    if *duplicate_id == id
+            ),
+            "duplicate measurement IDs must remain invalid at the gate"
+        );
         assert_invalid_gate_and_report(&collector, "EVIDENCE_DUPLICATE_ID")?;
     }
 
@@ -502,10 +520,13 @@ proptest! {
         encoded["next_id"] = serde_json::json!(u64::MAX);
         let mut exhausted: InputLatencyCollector = serde_json::from_value(encoded).unwrap();
 
-        prop_assert!(matches!(
-            exhausted.begin_measurement(),
-            Err(InputLatencyCollectorError::MeasurementIdExhausted)
-        ));
+        prop_assert!(
+            matches!(
+                exhausted.begin_measurement(),
+                Err(InputLatencyCollectorError::MeasurementIdExhausted)
+            ),
+            "terminal allocator boundary must fail closed"
+        );
 
         let encoded = serde_json::to_string(&exhausted).unwrap();
         let mut restored: InputLatencyCollector = serde_json::from_str(&encoded).unwrap();
@@ -513,15 +534,21 @@ proptest! {
             restored.validate_evidence(),
             Err(InputLatencyEvidenceError::MeasurementIdExhausted)
         );
-        prop_assert!(matches!(
-            restored.begin_measurement(),
-            Err(InputLatencyCollectorError::MeasurementIdExhausted)
-        ));
+        prop_assert!(
+            matches!(
+                restored.begin_measurement(),
+                Err(InputLatencyCollectorError::MeasurementIdExhausted)
+            ),
+            "restored exhaustion state must remain fail-stop"
+        );
         assert_invalid_gate_and_report(&restored, "EVIDENCE_ID_EXHAUSTED")?;
-        prop_assert!(matches!(
-            exhausted.begin_measurement(),
-            Err(InputLatencyCollectorError::MeasurementIdExhausted)
-        ));
+        prop_assert!(
+            matches!(
+                exhausted.begin_measurement(),
+                Err(InputLatencyCollectorError::MeasurementIdExhausted)
+            ),
+            "exhaustion must remain sticky after repeated allocation"
+        );
     }
 
     #[test]
@@ -536,10 +563,13 @@ proptest! {
         terminal.record(complete_measurement(measurement.id, 100, 500));
         prop_assert!(terminal.validate_evidence().is_ok());
 
-        prop_assert!(matches!(
-            terminal.begin_measurement(),
-            Err(InputLatencyCollectorError::MeasurementIdExhausted)
-        ));
+        prop_assert!(
+            matches!(
+                terminal.begin_measurement(),
+                Err(InputLatencyCollectorError::MeasurementIdExhausted)
+            ),
+            "allocation after the last usable ID must fail closed"
+        );
         assert_invalid_gate_and_report(&terminal, "EVIDENCE_ID_EXHAUSTED")?;
     }
 

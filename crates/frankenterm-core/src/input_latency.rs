@@ -2547,10 +2547,10 @@ mod tests {
         collector.record(make_measurement(measurement.id, 1000, 100));
         assert_eq!(collector.validate_evidence(), Ok(()));
 
-        assert_eq!(
+        assert!(matches!(
             collector.begin_measurement(),
             Err(InputLatencyCollectorError::MeasurementIdExhausted)
-        );
+        ));
         assert_eq!(
             collector.validate_evidence(),
             Err(InputLatencyEvidenceError::MeasurementIdExhausted)
