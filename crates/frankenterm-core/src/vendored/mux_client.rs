@@ -3023,7 +3023,7 @@ mod tests {
                 reverse_video: false,
             },
             tiered_scrollback_status: None,
-            dirty_lines: Vec::from([0..1]),
+            dirty_lines: std::iter::once(0..1).collect(),
             title: title.to_string(),
             working_dir: None,
             bonus_lines: Vec::new().into(),
@@ -3933,7 +3933,7 @@ mod tests {
                                             reverse_video: false,
                                         },
                                         tiered_scrollback_status: None,
-                                        dirty_lines: Vec::from([0..1]),
+                                        dirty_lines: std::iter::once(0..1).collect(),
                                         title: "sideband-pane".to_string(),
                                         working_dir: None,
                                         bonus_lines: Vec::new().into(),
@@ -3969,7 +3969,7 @@ mod tests {
             assert_eq!(render.pane_id, 12);
             assert_eq!(render.seqno, 9);
             assert_eq!(render.title, "sideband-pane");
-            assert_eq!(render.dirty_lines, Vec::from([0..1]));
+            assert_eq!(render.dirty_lines, std::iter::once(0..1).collect::<Vec<_>>());
 
             drop(client);
             server.await.expect("server task");
@@ -4042,7 +4042,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: Vec::from([10..12]),
+                                            dirty_lines: std::iter::once(10..12).collect(),
                                             title: "cached-pane".to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
@@ -4081,7 +4081,10 @@ mod tests {
                 .await
                 .expect("first render changes should succeed");
             assert_eq!(first.seqno, 14);
-            assert_eq!(first.dirty_lines, Vec::from([10..12]));
+            assert_eq!(
+                first.dirty_lines,
+                std::iter::once(10..12).collect::<Vec<_>>()
+            );
 
             let second = client
                 .get_pane_render_changes(27)
@@ -8376,7 +8379,7 @@ mod tests {
                                         Vec::new()
                                     } else {
                                         emitted_output = true;
-                                        Vec::from([0isize..2isize])
+                                        std::iter::once(0isize..2isize).collect()
                                     };
 
                                     Pdu::GetPaneRenderChangesResponse(
@@ -8497,7 +8500,7 @@ mod tests {
                                     Vec::new()
                                 } else {
                                     emitted_output = true;
-                                    Vec::from([0isize..2isize])
+                                    std::iter::once(0isize..2isize).collect()
                                 };
 
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
@@ -8766,7 +8769,7 @@ mod tests {
                                             } else {
                                                 emitted_output = true;
                                                 match pane_id {
-                                                    21 => Vec::from([0isize..1isize]),
+                                                    21 => std::iter::once(0isize..1isize).collect(),
                                                     22 => vec![0isize..1isize, 2isize..4isize],
                                                     _ => Vec::new(),
                                                 }
@@ -8915,8 +8918,8 @@ mod tests {
                             Pdu::GetPaneRenderChanges(_) => {
                                 render_requests += 1;
                                 let (seqno, dirty_lines) = match render_requests {
-                                    1 => (1, Vec::from([0isize..1isize])),
-                                    2 => (4, Vec::from([1isize..2isize])),
+                                    1 => (1, std::iter::once(0isize..1isize).collect()),
+                                    2 => (4, std::iter::once(1isize..2isize).collect()),
                                     _ => (4, Vec::new()),
                                 };
                                 Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse {
@@ -9052,7 +9055,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: Vec::from([0isize..1isize]),
+                                            dirty_lines: std::iter::once(0isize..1isize).collect(),
                                             title: "disconnect-test".to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
@@ -9175,7 +9178,7 @@ mod tests {
                                         reverse_video: false,
                                     },
                                     tiered_scrollback_status: None,
-                                    dirty_lines: Vec::from([0isize..1isize]),
+                                    dirty_lines: std::iter::once(0isize..1isize).collect(),
                                     title: "cancel-full-channel".to_string(),
                                     working_dir: None,
                                     bonus_lines: Vec::new().into(),
@@ -9313,7 +9316,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: Vec::from([0isize..1isize]),
+                                            dirty_lines: std::iter::once(0isize..1isize).collect(),
                                             title: "cancel-full-channel-with-cx".to_string(),
                                             working_dir: None,
                                             bonus_lines: Vec::new().into(),
@@ -9428,7 +9431,7 @@ mod tests {
                                 let request_number =
                                     server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                 let (seqno, dirty_lines) = if request_number == 1 {
-                                    (1, Vec::from([0isize..1isize]))
+                                    (1, std::iter::once(0isize..1isize).collect())
                                 } else {
                                     // Force a seqno jump with no dirty output. This drives
                                     // the poller through the gap-emission path while the
@@ -9574,7 +9577,7 @@ mod tests {
                                     let request_number =
                                         server_request_count.fetch_add(1, Ordering::SeqCst) + 1;
                                     let (seqno, dirty_lines) = if request_number == 1 {
-                                        (1, Vec::from([0isize..1isize]))
+                                        (1, std::iter::once(0isize..1isize).collect())
                                     } else {
                                         (3, Vec::new())
                                     };

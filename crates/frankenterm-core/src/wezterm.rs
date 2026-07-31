@@ -1578,7 +1578,11 @@ impl WeztermClient {
                                 0,
                             );
                         let lines_result = pool
-                            .get_lines_with_cx(cx, pane_id, Vec::from([start..chunk_end]))
+                            .get_lines_with_cx(
+                                cx,
+                                pane_id,
+                                std::iter::once(start..chunk_end).collect(),
+                            )
                             .await;
                         capacity_timer.finish_result(&lines_result);
                         match lines_result {

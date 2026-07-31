@@ -1072,7 +1072,7 @@ mod tests {
                                                 reverse_video: false,
                                             },
                                             tiered_scrollback_status: None,
-                                            dirty_lines: Vec::from([0..1]),
+                                            dirty_lines: std::iter::once(0..1).collect(),
                                             title: format!(
                                                 "connection-{connection_ordinal}-pane-{}",
                                                 req.pane_id
