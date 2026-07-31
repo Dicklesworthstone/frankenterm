@@ -1649,7 +1649,7 @@ mod tests {
             ("pure_ascii_short", b"simple printable ascii run".to_vec()),
             (
                 "pure_ascii_long",
-                std::iter::repeat(b'x').take(96).collect(),
+                std::iter::repeat_n(b'x', 96).collect(),
             ),
             ("ascii_control_mix", b"abc\r\ndef\tghi\x08!".to_vec()),
             (
@@ -1680,7 +1680,7 @@ mod tests {
 
     fn boundary_case(printable_prefix_len: usize, boundary_bytes: &[u8]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(printable_prefix_len + boundary_bytes.len() + 8);
-        bytes.extend(std::iter::repeat(b'a').take(printable_prefix_len));
+        bytes.extend(std::iter::repeat_n(b'a', printable_prefix_len));
         bytes.extend_from_slice(boundary_bytes);
         bytes.extend_from_slice(b"tail");
         bytes
@@ -1810,7 +1810,7 @@ mod tests {
         cases.push(("exact_right_edge_wrap", vec![b'w'; 80]));
         cases.push(("attrs_exact_right_edge_then_wrap", {
             let mut bytes = b"\x1b[1;31m".to_vec();
-            bytes.extend(std::iter::repeat(b'r').take(80));
+            bytes.extend(std::iter::repeat_n(b'r', 80));
             bytes.extend_from_slice(b"\x1b[0mZ");
             bytes
         }));
@@ -1851,7 +1851,7 @@ mod tests {
         cases.push(("exact_right_edge_wrap", vec![b'w'; 80]));
         cases.push(("attrs_exact_right_edge_then_wrap", {
             let mut bytes = b"\x1b[1;31m".to_vec();
-            bytes.extend(std::iter::repeat(b'r').take(80));
+            bytes.extend(std::iter::repeat_n(b'r', 80));
             bytes.extend_from_slice(b"\x1b[0mZ");
             bytes
         }));

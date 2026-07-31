@@ -96,14 +96,8 @@ fn decode_hex_text(scenario_id: &str, hex: &str, label: &str) -> TestResult<Vec<
     }
 
     let mut out = Vec::with_capacity(clean.len() / 2);
-    for (idx, chunk) in clean.chunks_exact(2).enumerate() {
-        let [hi_byte, lo_byte] = chunk else {
-            return Err(format!(
-                "{scenario_id}: invalid hex byte pair length at pair {idx} in {label}"
-            ));
-        };
-        let hi_byte = *hi_byte;
-        let lo_byte = *lo_byte;
+    for (idx, chunk) in clean.as_chunks::<2>().0.iter().enumerate() {
+        let [hi_byte, lo_byte] = *chunk;
         let hi = hex_nibble(hi_byte).ok_or_else(|| {
             format!(
                 "{scenario_id}: invalid high nibble {:?} at byte pair {idx} in {label}",
