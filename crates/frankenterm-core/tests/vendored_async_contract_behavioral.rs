@@ -999,7 +999,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
             ..DirectMuxClientConfig::default()
         };
 
-        let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
         let err = client
@@ -1101,7 +1101,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
             ..DirectMuxClientConfig::default()
         };
 
-        let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
 
@@ -1156,7 +1156,7 @@ fn b23d_explicit_cx_public_connect_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let err = DirectMuxClient::connect_with_cx(&cancelled_cx, config)
+        let err = Box::pin(DirectMuxClient::connect_with_cx(&cancelled_cx, config))
             .await
             .expect_err("connect_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_io(&err);
@@ -1266,7 +1266,7 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let mut client = DirectMuxClient::connect_with_cx(&connect_cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&connect_cx, config))
             .await
             .expect("connect_with_cx");
         handshake_seen_rx
@@ -1385,7 +1385,7 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let mut client = DirectMuxClient::connect_with_cx(&connect_cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&connect_cx, config))
             .await
             .expect("connect_with_cx");
         handshake_seen_rx
@@ -1511,7 +1511,7 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let mut client = DirectMuxClient::connect_with_cx(&connect_cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&connect_cx, config))
             .await
             .expect("connect_with_cx");
         handshake_seen_rx
@@ -1630,7 +1630,7 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let mut client = DirectMuxClient::connect_with_cx(&connect_cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&connect_cx, config))
             .await
             .expect("connect_with_cx");
         handshake_seen_rx
@@ -1749,7 +1749,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let mut client = DirectMuxClient::connect_with_cx(&connect_cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&connect_cx, config))
             .await
             .expect("connect_with_cx");
         handshake_seen_rx
@@ -1870,7 +1870,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let mut client = DirectMuxClient::connect_with_cx(&connect_cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&connect_cx, config))
             .await
             .expect("connect_with_cx");
         handshake_seen_rx
@@ -2010,7 +2010,7 @@ fn b23k_explicit_cx_public_render_batch_timeout_contract() {
 
         let mut config = DirectMuxClientConfig::default().with_socket_path(socket_path);
         config.read_timeout = Duration::from_millis(500);
-        let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
 
@@ -2143,7 +2143,7 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let client = DirectMuxClient::connect_with_cx(&cx, config)
+        let client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
         let mut sub = subscribe_pane_output_with_inherited_cx(
@@ -2315,7 +2315,7 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
         });
 
         let config = DirectMuxClientConfig::default().with_socket_path(socket_path);
-        let client = DirectMuxClient::connect_with_cx(&connect_cx, config)
+        let client = Box::pin(DirectMuxClient::connect_with_cx(&connect_cx, config))
             .await
             .expect("connect_with_cx");
         let mut sub = subscribe_pane_output_with_inherited_cx(
@@ -2452,7 +2452,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
             ..DirectMuxClientConfig::default()
         };
 
-        let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
         let err = client
@@ -2552,7 +2552,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
             ..DirectMuxClientConfig::default()
         };
 
-        let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
         let err = client
@@ -2653,7 +2653,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
             ..DirectMuxClientConfig::default()
         };
 
-        let mut client = DirectMuxClient::connect_with_cx(&cx, config)
+        let mut client = Box::pin(DirectMuxClient::connect_with_cx(&cx, config))
             .await
             .expect("connect_with_cx");
 
@@ -2775,8 +2775,7 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
         });
 
         let pool = MuxPool::new(behavioral_mux_pool_config(socket_path));
-        let warmup = pool
-            .list_panes()
+        let warmup = Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
         assert!(
@@ -2784,8 +2783,7 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
             "behavioral warmup response should use the empty mock payload"
         );
 
-        let err = pool
-            .list_panes_with_cx(&cancelled_cx)
+        let err = Box::pin(pool.list_panes_with_cx(&cancelled_cx))
             .await
             .expect_err("list_panes_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);
@@ -2907,8 +2905,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
         let mut config = behavioral_mux_pool_config(socket_path);
         config.pipeline_depth = 4;
         let pool = MuxPool::new(config);
-        let warmup = pool
-            .list_panes()
+        let warmup = Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
         assert!(
@@ -2921,9 +2918,9 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
             vec![11, 22],
         ))
         .await
-            .expect_err(
-                "get_pane_render_changes_batch_with_cx should fail fast for a pre-cancelled context",
-            );
+        .expect_err(
+            "get_pane_render_changes_batch_with_cx should fail fast for a pre-cancelled context",
+        );
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
@@ -3046,8 +3043,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
         config.recovery.enabled = false;
         config.mux.read_timeout = Duration::from_millis(25);
         let pool = MuxPool::new(config);
-        let warmup = pool
-            .list_panes()
+        let warmup = Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
         assert!(
@@ -3055,8 +3051,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
             "behavioral warmup response should use the empty mock payload"
         );
 
-        let err = pool
-            .list_panes_with_cx(&cx)
+        let err = Box::pin(pool.list_panes_with_cx(&cx))
             .await
             .expect_err("list_panes_with_cx should time out when the warmed peer stalls");
         assert_read_timeout_mux_pool_error(&err);
@@ -3180,8 +3175,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
         config.recovery.enabled = false;
         config.mux.read_timeout = Duration::from_millis(25);
         let pool = MuxPool::new(config);
-        let warmup = pool
-            .list_panes()
+        let warmup = Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
         assert!(
@@ -3189,8 +3183,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
             "behavioral warmup response should use the empty mock payload"
         );
 
-        let err = pool
-            .get_pane_render_changes_with_cx(&cx, 77)
+        let err = Box::pin(pool.get_pane_render_changes_with_cx(&cx, 77))
             .await
             .expect_err(
                 "get_pane_render_changes_with_cx should time out when the warmed peer stalls",
@@ -3310,12 +3303,11 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
         });
 
         let pool = MuxPool::new(behavioral_mux_pool_config(socket_path));
-        pool.list_panes()
+        Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
 
-        let err = pool
-            .health_check_with_cx(&cancelled_cx)
+        let err = Box::pin(pool.health_check_with_cx(&cancelled_cx))
             .await
             .expect_err("health_check_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);
@@ -3440,12 +3432,11 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
         config.recovery.enabled = false;
         config.mux.read_timeout = Duration::from_millis(25);
         let pool = MuxPool::new(config);
-        pool.list_panes()
+        Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
 
-        let err = pool
-            .health_check_with_cx(&cx)
+        let err = Box::pin(pool.health_check_with_cx(&cx))
             .await
             .expect_err("health_check_with_cx should time out when the warmed peer stalls");
         assert_read_timeout_mux_pool_error(&err);
@@ -3564,12 +3555,15 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
         });
 
         let pool = MuxPool::new(behavioral_mux_pool_config(socket_path));
-        pool.list_panes()
+        Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
 
-        let err = pool
-            .get_lines_with_cx(&cancelled_cx, 34, vec![0isize..3isize, 5isize..6isize])
+        let err = Box::pin(pool.get_lines_with_cx(
+            &cancelled_cx,
+            34,
+            vec![0isize..3isize, 5isize..6isize],
+        ))
             .await
             .expect_err("get_lines_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);
@@ -3689,12 +3683,15 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
         });
 
         let pool = MuxPool::new(behavioral_mux_pool_config(socket_path));
-        pool.list_panes()
+        Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
 
-        let err = pool
-            .write_to_pane_with_cx(&cancelled_cx, 56, b"hello".to_vec())
+        let err = Box::pin(pool.write_to_pane_with_cx(
+            &cancelled_cx,
+            56,
+            b"hello".to_vec(),
+        ))
             .await
             .expect_err("write_to_pane_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);
@@ -3813,12 +3810,15 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
         });
 
         let pool = MuxPool::new(behavioral_mux_pool_config(socket_path));
-        pool.list_panes()
+        Box::pin(pool.list_panes())
             .await
             .expect("warmup list_panes should establish a pooled connection");
 
-        let err = pool
-            .send_paste_with_cx(&cancelled_cx, 78, "paste me".to_string())
+        let err = Box::pin(pool.send_paste_with_cx(
+            &cancelled_cx,
+            78,
+            "paste me".to_string(),
+        ))
             .await
             .expect_err("send_paste_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_pool_error(&err);
