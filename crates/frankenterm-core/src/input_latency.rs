@@ -2103,7 +2103,7 @@ mod tests {
         collector.record(make_total_measurement(id, measured_us));
         let budget = InputLatencyBudget {
             stages: Vec::new(),
-            aggregate: [(Percentile::P50, budget_us)].into_iter().collect(),
+            aggregate: std::iter::once((Percentile::P50, budget_us)).collect(),
             regression_threshold: 1.0,
         };
 
@@ -2223,9 +2223,9 @@ mod tests {
         let budget = InputLatencyBudget {
             stages: vec![StageBudget {
                 stage: InputLatencyStage::PtyWrite,
-                targets: [(Percentile::P50, 99)].into_iter().collect(),
+                targets: std::iter::once((Percentile::P50, 99)).collect(),
             }],
-            aggregate: [(Percentile::P50, 1000)].into_iter().collect(),
+            aggregate: std::iter::once((Percentile::P50, 1000)).collect(),
             regression_threshold: 1.0,
         };
         let result = evaluate_budget(&collector, &budget);
@@ -2252,7 +2252,7 @@ mod tests {
             InputLatencyBudget {
                 stages: vec![StageBudget {
                     stage: InputLatencyStage::KeyEvent,
-                    targets: [(Percentile::P50, 100)].into_iter().collect(),
+                    targets: std::iter::once((Percentile::P50, 100)).collect(),
                 }],
                 ..Default::default()
             },
@@ -2260,11 +2260,11 @@ mod tests {
                 stages: vec![
                     StageBudget {
                         stage: InputLatencyStage::PtyWrite,
-                        targets: [(Percentile::P50, 100)].into_iter().collect(),
+                        targets: std::iter::once((Percentile::P50, 100)).collect(),
                     },
                     StageBudget {
                         stage: InputLatencyStage::PtyWrite,
-                        targets: [(Percentile::P95, 100)].into_iter().collect(),
+                        targets: std::iter::once((Percentile::P95, 100)).collect(),
                     },
                 ],
                 ..Default::default()
@@ -2433,7 +2433,7 @@ mod tests {
 
         let mut stage_budget_value = serde_json::to_value(StageBudget {
             stage: InputLatencyStage::PtyWrite,
-            targets: [(Percentile::P50, 100)].into_iter().collect(),
+            targets: std::iter::once((Percentile::P50, 100)).collect(),
         })
         .unwrap();
         stage_budget_value["future_stage_authority"] = serde_json::json!(true);
