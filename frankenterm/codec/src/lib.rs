@@ -2234,11 +2234,18 @@ pub struct SendKeyUp {
     pub event: termwiz::input::KeyEvent,
 }
 
-/// InputSerial is used to sequence input requests with output events.
-/// It started life as a monotonic sequence number but evolved into
-/// the number of milliseconds since the unix epoch.
+/// Client-generated identity used to order input dispatch acknowledgements.
+///
+/// Values retain a millisecond-since-epoch floor so a returned serial can
+/// estimate dispatch round-trip time, but [`InputSerial::now`] also enforces
+/// process-local monotonicity. Before terminal `u64` exhaustion, wall-clock
+/// rollback and multiple keystrokes in one millisecond therefore cannot reverse
+/// or alias the ordering relation.
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, PartialOrd, Ord)]
 pub struct InputSerial(u64);
+
+static LAST_INPUT_SERIAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 impl InputSerial {
     pub const fn empty() -> Self {
@@ -2246,21 +2253,40 @@ impl InputSerial {
     }
 
     pub fn now() -> Self {
-        std::time::SystemTime::now().into()
+        use std::sync::atomic::Ordering;
+
+        let wall_clock = input_serial_from_system_time(std::time::SystemTime::now()).0;
+        let mut observed = LAST_INPUT_SERIAL.load(Ordering::Relaxed);
+        loop {
+            let candidate = wall_clock.max(observed.saturating_add(1));
+            match LAST_INPUT_SERIAL.compare_exchange_weak(
+                observed,
+                candidate,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self(candidate),
+                Err(current) => observed = current,
+            }
+        }
     }
 
     pub fn elapsed_millis(&self) -> u64 {
-        let now = InputSerial::now();
+        let now = input_serial_from_system_time(std::time::SystemTime::now());
         now.0.saturating_sub(self.0)
     }
 }
 
 impl From<std::time::SystemTime> for InputSerial {
     fn from(val: std::time::SystemTime) -> Self {
-        match val.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-            Ok(duration) => input_serial_from_epoch_duration(duration),
-            Err(_) => InputSerial::empty(),
-        }
+        input_serial_from_system_time(val)
+    }
+}
+
+fn input_serial_from_system_time(value: std::time::SystemTime) -> InputSerial {
+    match value.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(duration) => input_serial_from_epoch_duration(duration),
+        Err(_) => InputSerial::empty(),
     }
 }
 
@@ -2537,6 +2563,13 @@ pub struct GetPaneRenderChangesResponse {
     /// want to fetch as soon as we received this response
     pub bonus_lines: SerializedLines,
 
+    /// Highest client input serial whose `pane.key_down` dispatch completed
+    /// before this surface snapshot was sampled.
+    ///
+    /// This is a protocol-dispatch acknowledgement, not proof that the PTY or
+    /// application echoed the input. Consumers must pair it with this snapshot's
+    /// `seqno` as a fence and wait for later authoritative terminal state before
+    /// settling speculative local echo.
     pub input_serial: Option<InputSerial>,
     pub seqno: SequenceNo,
 }
@@ -4082,6 +4115,13 @@ mod test {
         let now = InputSerial::now();
         // Should be a large number of milliseconds since epoch
         assert_ne!(format!("{:?}", now), "InputSerial(0)");
+    }
+
+    #[test]
+    fn input_serial_now_is_strictly_monotonic_within_one_process() {
+        let first = InputSerial::now();
+        let second = InputSerial::now();
+        assert!(second > first);
     }
 
     #[test]

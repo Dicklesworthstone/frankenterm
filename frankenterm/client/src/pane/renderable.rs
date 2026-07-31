@@ -53,6 +53,13 @@ const PREDICT_SUPPRESS_SCORE: i32 = -4;
 /// re-fire on the very next keystroke and keep painting secret characters in an
 /// echo-off prompt. [3c, review F1]
 const PREDICT_SUPPRESS_COOLDOWN: Duration = Duration::from_secs(2);
+/// Hard memory/work bound for speculative cell overlays on one pane.
+///
+/// A paste is not serial-correlated on the wire and an input stream can outrun
+/// acknowledgement under disconnect or extreme latency. Refuse further
+/// prediction instead of allowing pane-local speculative state to grow without
+/// bound.
+const MAX_PENDING_PREDICTIONS: usize = 4096;
 
 /// Best-effort heuristic: does this line look like a secret prompt (password /
 /// passphrase) where we must not predict/echo the typed-or-pasted secret? Not a
@@ -173,8 +180,7 @@ fn rebuild_cache_as_stale(lines: &mut LruCache<StableRowIndex, LineEntry>, capac
 /// validate each against the authoritative server cell (to drive prediction
 /// confidence), rewind a wrong one for free (the overlay simply stops painting,
 /// revealing the authoritative cached content), and resolve the underline cue
-/// from the pane's confidence at render time. The cursor is still predicted in
-/// place (cursor_position) and reconciled by the existing input_serial gate.
+/// from the pane's confidence at render time.
 #[derive(Debug, Clone)]
 struct Prediction {
     row: StableRowIndex,
@@ -182,10 +188,130 @@ struct Prediction {
     /// The plain predicted glyph (no underline); the underline cue is applied at
     /// render time only while prediction confidence is low.
     predicted: Cell,
-    /// Serial of the keystroke that produced this prediction; the server echoes
-    /// it back, letting us tell which predictions a delta confirms.
+    /// Serial of the keystroke that produced this prediction.
     input_serial: InputSerial,
+    /// Terminal sequence sampled by the server after dispatching this input.
+    ///
+    /// The forced response carrying `input_serial` is only a protocol-dispatch
+    /// acknowledgement. It does not prove that the PTY or application echoed the
+    /// input. A later authoritative delta must advance beyond this fence before
+    /// its cells can confirm or reject the prediction.
+    dispatch_seqno: Option<SequenceNo>,
     born: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PredictionReconciliation {
+    confirmed: usize,
+    rejected: usize,
+}
+
+fn mark_predictions_dispatched(
+    predictions: &mut [Prediction],
+    serial: InputSerial,
+    dispatch_seqno: SequenceNo,
+) {
+    for prediction in predictions {
+        if prediction.input_serial <= serial && prediction.dispatch_seqno.is_none() {
+            prediction.dispatch_seqno = Some(dispatch_seqno);
+        }
+    }
+}
+
+fn reconcile_predictions_after_terminal_change(
+    predictions: &mut Vec<Prediction>,
+    terminal_seqno: SequenceNo,
+    bonus_lines: &[(StableRowIndex, Line)],
+) -> PredictionReconciliation {
+    let mut reconciliation = PredictionReconciliation::default();
+    let mut pending = Vec::with_capacity(predictions.len());
+
+    for prediction in std::mem::take(predictions) {
+        let post_dispatch = prediction
+            .dispatch_seqno
+            .is_some_and(|dispatch_seqno| terminal_seqno > dispatch_seqno);
+        if !post_dispatch {
+            pending.push(prediction);
+            continue;
+        }
+
+        let Some((_, line)) = bonus_lines
+            .iter()
+            .find(|(row, _)| *row == prediction.row)
+        else {
+            // The terminal advanced, but this delta does not carry the predicted
+            // row. Retaining the overlay is safer than treating missing evidence
+            // as either confirmation or rejection; bounded expiry handles a row
+            // that never becomes observable.
+            pending.push(prediction);
+            continue;
+        };
+
+        let matches = match line.get_cell(prediction.col) {
+            Some(cell) => cell.str() == prediction.predicted.str(),
+            None => prediction.predicted.str() == " ",
+        };
+        if matches {
+            reconciliation.confirmed += 1;
+        } else {
+            reconciliation.rejected += 1;
+        }
+    }
+
+    *predictions = pending;
+    reconciliation
+}
+
+fn expire_predictions(
+    predictions: &mut Vec<Prediction>,
+    now: Instant,
+    ttl: Duration,
+) -> usize {
+    let before = predictions.len();
+    predictions.retain(|prediction| now.saturating_duration_since(prediction.born) < ttl);
+    before.saturating_sub(predictions.len())
+}
+
+fn reset_prediction_state(predictions: &mut Vec<Prediction>, prediction_score: &mut i32) {
+    predictions.clear();
+    *prediction_score = 0;
+}
+
+fn push_bounded_prediction(
+    predictions: &mut Vec<Prediction>,
+    prediction: Prediction,
+) -> bool {
+    if predictions.len() >= MAX_PENDING_PREDICTIONS {
+        return false;
+    }
+    predictions.push(prediction);
+    true
+}
+
+fn apply_prediction_reconciliation_to_score(
+    prediction_score: &mut i32,
+    last_prediction_miss: &mut Instant,
+    reconciliation: PredictionReconciliation,
+    now: Instant,
+) {
+    if reconciliation.confirmed > 0 {
+        let reward = i32::try_from(reconciliation.confirmed).unwrap_or(i32::MAX);
+        *prediction_score = prediction_score
+            .saturating_add(reward)
+            .min(PREDICT_SCORE_MAX);
+    }
+
+    if reconciliation.rejected > 0 {
+        let rejected = i32::try_from(reconciliation.rejected).unwrap_or(i32::MAX);
+        let penalty = rejected.saturating_mul(2);
+        // A miss drops the score AND forces it below the confident threshold,
+        // so secret characters in an echo-off prompt never render plain even
+        // if the pane was confident a moment ago. [F2]
+        *prediction_score = prediction_score
+            .saturating_sub(penalty)
+            .clamp(PREDICT_SCORE_MIN, PREDICT_CONFIDENT_SCORE - 1);
+        *last_prediction_miss = now;
+    }
 }
 
 pub struct RenderableInner {
@@ -346,7 +472,17 @@ impl RenderableInner {
 
     /// Predictive echo can be noisy when the link is working well,
     /// so we only employ it when it looks like the latency is high.
-    fn should_predict(&self) -> bool {
+    fn should_predict(&mut self) -> bool {
+        // A suppressed pane must eventually get a bounded opportunity to prove
+        // that echo behavior has changed. This check belongs on the input path:
+        // an echo-suppressing application may produce no render delta capable of
+        // re-arming the old reconciliation-only path.
+        if self.prediction_score <= PREDICT_SUPPRESS_SCORE
+            && self.last_prediction_miss.elapsed() > PREDICT_SUPPRESS_COOLDOWN
+        {
+            self.prediction_score = PREDICT_SUPPRESS_SCORE + 1;
+        }
+
         // Never predict into a full-screen / alt-screen app (vim, less, TUIs):
         // those keystrokes are editor commands, not echoed text. [3e]
         if self.alt_screen_active {
@@ -381,70 +517,91 @@ impl RenderableInner {
     /// There are bound to be a number of other edge cases that we should
     /// handle.
     /// Record an overlay prediction for the plain glyph `predicted` at (row, col).
-    fn record_prediction(&mut self, row: StableRowIndex, col: usize, predicted: Cell) {
-        self.predictions.push(Prediction {
+    fn record_prediction(
+        &mut self,
+        row: StableRowIndex,
+        col: usize,
+        predicted: Cell,
+    ) -> bool {
+        let now = Instant::now();
+        let admitted = push_bounded_prediction(&mut self.predictions, Prediction {
             row,
             col,
             predicted,
             input_serial: self.input_serial,
-            born: Instant::now(),
+            dispatch_seqno: None,
+            born: now,
         });
+        if !admitted {
+            self.prediction_score = PREDICT_SUPPRESS_SCORE;
+            self.last_prediction_miss = now;
+        }
+        admitted
     }
 
-    /// Retire the predictions the server has now confirmed (input_serial <= serial),
-    /// validating each against the authoritative cached cell to drive the pane's
-    /// prediction confidence score. Rewind is automatic: a wrong prediction simply
-    /// stops being painted, revealing the authoritative content beneath it. [3b]
-    fn validate_and_retire_predictions(
+    /// Record the terminal sequence at which the server had dispatched every
+    /// input through `serial`.
+    ///
+    /// This is intentionally not prediction settlement: `pane.key_down` can
+    /// return before the PTY or application emits any output.
+    fn record_input_dispatch(
         &mut self,
         serial: InputSerial,
-        bonus_lines: &[(StableRowIndex, Line)],
+        dispatch_seqno: SequenceNo,
     ) {
-        let (confirmed, pending): (Vec<Prediction>, Vec<Prediction>) =
-            std::mem::take(&mut self.predictions)
-                .into_iter()
-                .partition(|p| p.input_serial <= serial);
-        self.predictions = pending;
-        let now = Instant::now();
-        for p in confirmed {
-            // Validate against the authoritative content the server sent inline with
-            // this delta: the cursor row (where typed echo lands) always rides in
-            // bonus_lines, which has NOT yet been written to the cache at this point.
-            // Rows not present in bonus_lines can't be judged -> verdict None. A
-            // missing cell counts as a blank, so a predicted blank (backspace/delete)
-            // at a compressed trailing position reads as correct, not no-event, and a
-            // predicted glyph the server didn't echo reads as a miss. [review F9]
-            let verdict = bonus_lines.iter().find(|(r, _)| *r == p.row).map(|(_, l)| {
-                match l.get_cell(p.col) {
-                    Some(c) => c.str() == p.predicted.str(),
-                    None => p.predicted.str() == " ",
-                }
-            });
-            match verdict {
-                Some(true) => {
-                    self.prediction_score = (self.prediction_score + 1).min(PREDICT_SCORE_MAX);
-                }
-                Some(false) => {
-                    // A miss drops the score AND forces it below the confident
-                    // threshold, so secret characters in an echo-off prompt never
-                    // render plain even if the pane was confident a moment ago. [F2]
-                    self.prediction_score = (self.prediction_score - 2)
-                        .clamp(PREDICT_SCORE_MIN, PREDICT_CONFIDENT_SCORE - 1);
-                    self.last_prediction_miss = now;
-                }
-                None => {}
+        mark_predictions_dispatched(&mut self.predictions, serial, dispatch_seqno);
+    }
+
+    fn apply_prediction_reconciliation(
+        &mut self,
+        reconciliation: PredictionReconciliation,
+        now: Instant,
+    ) {
+        apply_prediction_reconciliation_to_score(
+            &mut self.prediction_score,
+            &mut self.last_prediction_miss,
+            reconciliation,
+            now,
+        );
+    }
+
+    fn reconcile_predictions(
+        &mut self,
+        terminal_seqno: SequenceNo,
+        bonus_lines: &[(StableRowIndex, Line)],
+        now: Instant,
+    ) {
+        let reconciliation = reconcile_predictions_after_terminal_change(
+            &mut self.predictions,
+            terminal_seqno,
+            bonus_lines,
+        );
+        self.apply_prediction_reconciliation(reconciliation, now);
+    }
+
+    fn prediction_ttl(&self) -> Duration {
+        Duration::from_millis(250).max(Duration::from_millis(
+            self.last_input_rtt.saturating_mul(4),
+        ))
+    }
+
+    fn expire_stale_predictions(&mut self, now: Instant) -> RangeSet<StableRowIndex> {
+        let ttl = self.prediction_ttl();
+        let mut dirty_rows = RangeSet::new();
+        for prediction in &self.predictions {
+            if now.saturating_duration_since(prediction.born) >= ttl {
+                dirty_rows.add(prediction.row);
             }
         }
-        // Recover from suppression -- but only after a quiet cooldown since the last
-        // miss, so an echo-off prompt stays suppressed instead of re-firing (and
-        // re-painting a secret char) on the very next keystroke. Once suppressed the
-        // pane stops predicting, so nothing validates it back up; this re-arms it to
-        // re-test after the bad patch has passed. [review F1]
-        if self.prediction_score <= PREDICT_SUPPRESS_SCORE
-            && self.last_prediction_miss.elapsed() > PREDICT_SUPPRESS_COOLDOWN
-        {
-            self.prediction_score = PREDICT_SUPPRESS_SCORE + 1;
-        }
+        let expired = expire_predictions(&mut self.predictions, now, ttl);
+        self.apply_prediction_reconciliation(
+            PredictionReconciliation {
+                confirmed: 0,
+                rejected: expired,
+            },
+            now,
+        );
+        dirty_rows
     }
 
     fn apply_prediction(&mut self, c: KeyCode, line: &Line) {
@@ -475,13 +632,15 @@ impl RenderableInner {
             KeyCode::Delete => {
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x;
-                self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()));
+                let _ =
+                    self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()));
             }
             KeyCode::Backspace if self.cursor_position.x > 0 => {
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x - 1;
-                self.record_prediction(row, col, Cell::new(' ', CellAttributes::default()));
-                self.cursor_position.x -= 1;
+                if self.record_prediction(row, col, Cell::new(' ', CellAttributes::default())) {
+                    self.cursor_position.x -= 1;
+                }
             }
             KeyCode::Char(c) => {
                 // Store the plain glyph; the underline uncertainty cue is applied at
@@ -490,9 +649,10 @@ impl RenderableInner {
                 let width = cell.width();
                 let row = self.cursor_position.y;
                 let col = self.cursor_position.x;
-                self.record_prediction(row, col, cell);
-                // Adjust the cursor to reflect the width of this new cell
-                self.cursor_position.x += width;
+                if self.record_prediction(row, col, cell) {
+                    // Adjust the cursor to reflect the width of this new cell
+                    self.cursor_position.x += width;
+                }
             }
             _ => {}
         }
@@ -536,7 +696,7 @@ impl RenderableInner {
         }
     }
 
-    fn apply_paste_prediction(&mut self, paste_idx: usize, text: &str) {
+    fn apply_paste_prediction(&mut self, paste_idx: usize, text: &str) -> bool {
         // Plain glyphs; the underline cue is applied at render time (3d).
         let attrs = CellAttributes::default();
         let text_line = Line::from_text(text, &attrs, SEQ_ZERO, None);
@@ -546,18 +706,23 @@ impl RenderableInner {
             // First pasted line is appended at the cursor.
             for cell in text_line.visible_cells() {
                 let col = self.cursor_position.x;
-                self.record_prediction(target_row, col, cell.as_cell());
+                if !self.record_prediction(target_row, col, cell.as_cell()) {
+                    return false;
+                }
                 self.cursor_position.x += cell.width();
             }
         } else {
             // Subsequent pasted lines replace the row content from column 0.
             let mut col = 0;
             for cell in text_line.visible_cells() {
-                self.record_prediction(target_row, col, cell.as_cell());
+                if !self.record_prediction(target_row, col, cell.as_cell()) {
+                    return false;
+                }
                 col += cell.width();
             }
             self.cursor_position.x = col;
         }
+        true
     }
 
     pub fn predict_from_paste(&mut self, text: &str) {
@@ -586,7 +751,9 @@ impl RenderableInner {
                 Some(LineEntry::Line(_) | LineEntry::Stale(_) | LineEntry::LineAndFetching(..))
             );
             if cached {
-                self.apply_paste_prediction(idx, paste_line);
+                if !self.apply_paste_prediction(idx, paste_line) {
+                    return;
+                }
             }
         }
         self.cursor_position.y += lines.len().saturating_sub(1) as StableRowIndex;
@@ -685,7 +852,22 @@ impl RenderableInner {
         // user input for echo/tardy responsiveness. [mux round-trip optimization]
         self.last_recv_time = now;
 
+        let input_dispatch_serial = delta.input_serial;
+        if let Some(serial) = input_dispatch_serial {
+            // This round trip ends when the server has dispatched the input. It is
+            // useful transport latency, but it is not PTY/application echo latency.
+            self.last_input_rtt = serial.elapsed_millis();
+        }
+
         if !authoritative_snapshot && !should_apply_unilateral_delta(self.seqno, delta.seqno) {
+            if let Some(serial) = input_dispatch_serial {
+                // Preserve the causal fence even when the associated surface
+                // snapshot arrived after a newer delta. Missing the fence is safe
+                // (TTL eventually removes the overlay), but recording it allows a
+                // later in-order delta to settle the prediction without conflating
+                // this stale snapshot with application output.
+                self.record_input_dispatch(serial, delta.seqno);
+            }
             log::trace!(
                 "ignoring stale render delta for local={} remote={} seqno {} < {}",
                 self.local_pane_id,
@@ -697,7 +879,17 @@ impl RenderableInner {
         }
         if authoritative_snapshot {
             self.lines.clear();
-            self.predictions.clear();
+            reset_prediction_state(&mut self.predictions, &mut self.prediction_score);
+            self.last_prediction_miss = now;
+        } else {
+            if let Some(serial) = input_dispatch_serial {
+                self.record_input_dispatch(serial, delta.seqno);
+            }
+            // A forced input response records only the dispatch fence above. The
+            // same response has `terminal_seqno == dispatch_seqno`, so it cannot
+            // retire a prediction. Only later authoritative state that advances
+            // beyond that fence and carries the predicted row can settle it.
+            self.reconcile_predictions(delta.seqno, &bonus_lines, now);
         }
 
         let mut dirty = RangeSet::new();
@@ -718,18 +910,8 @@ impl RenderableInner {
             dirty.add(delta.cursor_position.y);
         }
 
-        // Keep track of the approximate round trip time by recording how
-        // long it took for this response to come back
         // Track alt-screen state so we never predict into a full-screen TUI. [3e]
         self.alt_screen_active = delta.alt_screen_active;
-        if let Some(serial) = delta.input_serial {
-            self.last_input_rtt = serial.elapsed_millis();
-            // The server has processed every keystroke up to `serial`; validate the
-            // predictions it confirms against the authoritative content and retire
-            // them. Rewinding a wrong prediction is automatic -- removing it from the
-            // overlay reveals the authoritative cell underneath. [3b]
-            self.validate_and_retire_predictions(serial, &bonus_lines);
-        }
 
         // When it comes to updating the cursor position, if the update was tagged
         // with keyboard input, we'll only take the position if the update comes from
@@ -1551,10 +1733,7 @@ impl RenderableState {
         // case the feature is for), while on fast links a short TTL keeps the
         // stale-overpaint window (a unilateral redraw under a stale prediction)
         // small. [review F3/F4]
-        let predict_ttl = Duration::from_millis(250).max(Duration::from_millis(
-            inner.last_input_rtt.saturating_mul(4),
-        ));
-        inner.predictions.retain(|p| p.born.elapsed() < predict_ttl);
+        let _ = inner.expire_stale_predictions(now);
         if !inner.predictions.is_empty() {
             let (start, end) = (lines.start, lines.end);
             // Glitchless flagging: once predictions are reliably confirmed correct
@@ -1672,6 +1851,14 @@ impl RenderableState {
         }
 
         let mut result = RangeSet::new();
+        let expired_prediction_rows = inner.expire_stale_predictions(Instant::now());
+        for expired_range in expired_prediction_rows.iter() {
+            for row in expired_range.clone() {
+                if lines.contains(&row) {
+                    result.add(row);
+                }
+            }
+        }
         for r in lines {
             match inner.lines.get(&r) {
                 None => {
@@ -1718,14 +1905,19 @@ impl RenderableState {
 #[cfg(test)]
 mod tests {
     use super::{
-        base_poll_interval, initial_last_poll, rebuild_cache_as_stale,
-        render_line_cache_capacity_for_values, should_apply_unilateral_delta, FetchToken, ImageLru,
-        LineEntry,
+        apply_prediction_reconciliation_to_score, base_poll_interval, expire_predictions,
+        initial_last_poll, mark_predictions_dispatched, rebuild_cache_as_stale,
+        push_bounded_prediction,
+        reconcile_predictions_after_terminal_change, render_line_cache_capacity_for_values,
+        reset_prediction_state, should_apply_unilateral_delta, FetchToken, ImageLru, LineEntry,
+        Prediction, PredictionReconciliation, MAX_PENDING_PREDICTIONS, PREDICT_CONFIDENT_SCORE,
     };
+    use codec::InputSerial;
     use lru::LruCache;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+    use termwiz::cell::{Cell, CellAttributes};
     use termwiz::image::{ImageData, ImageDataType};
     use termwiz::surface::{SequenceNo, SEQ_ZERO};
     use wezterm_term::Line;
@@ -1736,6 +1928,27 @@ mod tests {
             height,
             vec![fill; (width * height * 4) as usize],
         )))
+    }
+
+    fn input_serial(millis: u64) -> InputSerial {
+        (UNIX_EPOCH + Duration::from_millis(millis)).into()
+    }
+
+    fn prediction(
+        serial: InputSerial,
+        row: isize,
+        col: usize,
+        glyph: char,
+        born: Instant,
+    ) -> Prediction {
+        Prediction {
+            row,
+            col,
+            predicted: Cell::new(glyph, CellAttributes::default()),
+            input_serial: serial,
+            dispatch_seqno: None,
+            born,
+        }
     }
 
     #[test]
@@ -1753,6 +1966,144 @@ mod tests {
         assert!(should_apply_unilateral_delta(current, 10));
         assert!(should_apply_unilateral_delta(current, 11));
         assert!(!should_apply_unilateral_delta(current, 9));
+    }
+
+    #[test]
+    fn forced_dispatch_ack_does_not_retire_prediction_before_terminal_change() {
+        let born = Instant::now();
+        let serial = input_serial(100);
+        let mut predictions = vec![prediction(serial, 0, 0, 'x', born)];
+        mark_predictions_dispatched(&mut predictions, serial, 10);
+        let lines = vec![(
+            0,
+            Line::from_text("x", &CellAttributes::default(), 10, None),
+        )];
+
+        let reconciliation =
+            reconcile_predictions_after_terminal_change(&mut predictions, 10, &lines);
+
+        assert_eq!(reconciliation, PredictionReconciliation::default());
+        assert_eq!(predictions.len(), 1);
+        assert_eq!(predictions[0].dispatch_seqno, Some(10));
+    }
+
+    #[test]
+    fn delayed_authoritative_echo_retires_only_after_dispatch_fence_advances() {
+        let born = Instant::now();
+        let serial = input_serial(100);
+        let mut predictions = vec![prediction(serial, 0, 0, 'x', born)];
+        mark_predictions_dispatched(&mut predictions, serial, 10);
+        let lines = vec![(
+            0,
+            Line::from_text("x", &CellAttributes::default(), 11, None),
+        )];
+
+        let reconciliation =
+            reconcile_predictions_after_terminal_change(&mut predictions, 11, &lines);
+
+        assert_eq!(
+            reconciliation,
+            PredictionReconciliation {
+                confirmed: 1,
+                rejected: 0,
+            }
+        );
+        assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn missing_authoritative_row_is_negative_evidence_not_a_false_verdict() {
+        let born = Instant::now();
+        let serial = input_serial(100);
+        let mut predictions = vec![prediction(serial, 7, 3, 'x', born)];
+        mark_predictions_dispatched(&mut predictions, serial, 10);
+        let unrelated_lines = vec![(
+            0,
+            Line::from_text("other", &CellAttributes::default(), 11, None),
+        )];
+
+        let reconciliation =
+            reconcile_predictions_after_terminal_change(&mut predictions, 11, &unrelated_lines);
+
+        assert_eq!(reconciliation, PredictionReconciliation::default());
+        assert_eq!(predictions.len(), 1);
+    }
+
+    #[test]
+    fn reordered_output_waits_for_dispatch_fence_then_settles_in_order() {
+        let born = Instant::now();
+        let serial = input_serial(100);
+        let mut predictions = vec![prediction(serial, 0, 0, 'x', born)];
+        let lines = vec![(
+            0,
+            Line::from_text("x", &CellAttributes::default(), 11, None),
+        )];
+
+        let before_ack =
+            reconcile_predictions_after_terminal_change(&mut predictions, 11, &lines);
+        assert_eq!(before_ack, PredictionReconciliation::default());
+        assert_eq!(predictions.len(), 1);
+
+        mark_predictions_dispatched(&mut predictions, serial, 10);
+        let after_ack =
+            reconcile_predictions_after_terminal_change(&mut predictions, 11, &lines);
+        assert_eq!(
+            after_ack,
+            PredictionReconciliation {
+                confirmed: 1,
+                rejected: 0,
+            }
+        );
+        assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn no_echo_expires_with_bounded_confidence_degradation() {
+        let born = Instant::now();
+        let serial = input_serial(100);
+        let mut predictions = vec![prediction(serial, 0, 0, 'x', born)];
+        mark_predictions_dispatched(&mut predictions, serial, 10);
+        let now = born + Duration::from_millis(251);
+
+        let expired = expire_predictions(&mut predictions, now, Duration::from_millis(250));
+        let mut score = PREDICT_CONFIDENT_SCORE;
+        let mut last_miss = born;
+        apply_prediction_reconciliation_to_score(
+            &mut score,
+            &mut last_miss,
+            PredictionReconciliation {
+                confirmed: 0,
+                rejected: expired,
+            },
+            now,
+        );
+
+        assert_eq!(expired, 1);
+        assert!(predictions.is_empty());
+        assert!(score < PREDICT_CONFIDENT_SCORE);
+        assert_eq!(last_miss, now);
+    }
+
+    #[test]
+    fn authoritative_reconnect_snapshot_resets_predictions_and_confidence() {
+        let born = Instant::now();
+        let mut predictions = vec![prediction(input_serial(100), 0, 0, 'x', born)];
+        let mut score = PREDICT_CONFIDENT_SCORE;
+
+        reset_prediction_state(&mut predictions, &mut score);
+
+        assert!(predictions.is_empty());
+        assert_eq!(score, 0);
+    }
+
+    #[test]
+    fn speculative_prediction_admission_is_hard_bounded_per_pane() {
+        let born = Instant::now();
+        let sample = prediction(input_serial(100), 0, 0, 'x', born);
+        let mut predictions = vec![sample.clone(); MAX_PENDING_PREDICTIONS];
+
+        assert!(!push_bounded_prediction(&mut predictions, sample));
+        assert_eq!(predictions.len(), MAX_PENDING_PREDICTIONS);
     }
 
     #[test]

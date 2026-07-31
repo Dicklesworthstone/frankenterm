@@ -446,7 +446,7 @@ impl PaneRenderBaseline {
     fn prepare_surface_changes(
         &self,
         pane: &CurrentPane<'_>,
-        force_with_input_serial: Option<InputSerial>,
+        force_with_input_dispatch_serial: Option<InputSerial>,
         force_for_atomic_effects: bool,
     ) -> SurfacePreparation {
         let source_start = pane.get_current_seqno();
@@ -492,7 +492,7 @@ impl PaneRenderBaseline {
             changed = true;
         }
 
-        if !changed && force_with_input_serial.is_none() && !force_for_atomic_effects {
+        if !changed && force_with_input_dispatch_serial.is_none() && !force_for_atomic_effects {
             return SurfacePreparation::NoChange {
                 source_start,
                 source_end: pane.get_current_seqno(),
@@ -554,7 +554,7 @@ impl PaneRenderBaseline {
                 title,
                 bonus_lines,
                 working_dir: working_dir.map(Into::into),
-                input_serial: force_with_input_serial,
+                input_serial: force_with_input_dispatch_serial,
                 seqno: source_start,
             },
             baseline,
@@ -568,11 +568,11 @@ impl PerPane {
     fn compute_changes(
         &mut self,
         pane: &CurrentPane<'_>,
-        force_with_input_serial: Option<InputSerial>,
+        force_with_input_dispatch_serial: Option<InputSerial>,
     ) -> Option<GetPaneRenderChangesResponse> {
         match self.baseline.prepare_surface_changes(
             pane,
-            force_with_input_serial,
+            force_with_input_dispatch_serial,
             false,
         ) {
             SurfacePreparation::NoChange { source_start, .. } => {
@@ -630,7 +630,7 @@ impl PerPane {
     fn begin_transactional_preparation(
         &mut self,
         pane_id: PaneId,
-        force_with_input_serial: Option<InputSerial>,
+        force_with_input_dispatch_serial: Option<InputSerial>,
     ) -> Result<PaneRenderBeginSnapshot, PaneRenderPreparationError> {
         match self.transaction_phase {
             PaneRenderTransactionPhase::Idle => {}
@@ -653,7 +653,7 @@ impl PerPane {
             return Err(PaneRenderPreparationError::AttemptIdentityExhausted);
         };
 
-        let input_epoch = if force_with_input_serial.is_some() {
+        let input_epoch = if force_with_input_dispatch_serial.is_some() {
             let next = self
                 .next_input_epoch
                 .and_then(|epoch| epoch.checked_add(1).map(|next| (epoch, next)));
@@ -912,7 +912,7 @@ enum PaneRenderPreparationOutcome {
 struct PaneRenderPreparation {
     state: Arc<Mutex<PerPane>>,
     snapshot: PaneRenderBeginSnapshot,
-    force_with_input_serial: Option<InputSerial>,
+    force_with_input_dispatch_serial: Option<InputSerial>,
     armed: bool,
 }
 
@@ -987,16 +987,16 @@ fn normalize_prepared_alerts(
 fn begin_transactional_pane_render(
     state: Arc<Mutex<PerPane>>,
     pane_id: PaneId,
-    force_with_input_serial: Option<InputSerial>,
+    force_with_input_dispatch_serial: Option<InputSerial>,
 ) -> Result<PaneRenderPreparation, PaneRenderPreparationError> {
     let snapshot = state
         .lock()
         .map_err(|_| PaneRenderPreparationError::StateLockPoisoned)?
-        .begin_transactional_preparation(pane_id, force_with_input_serial)?;
+        .begin_transactional_preparation(pane_id, force_with_input_dispatch_serial)?;
     Ok(PaneRenderPreparation {
         state,
         snapshot,
-        force_with_input_serial,
+        force_with_input_dispatch_serial,
         armed: true,
     })
 }
@@ -1029,7 +1029,7 @@ impl PaneRenderPreparation {
         let force_for_atomic_effects = needs_palette || !alerts.is_empty();
         let surface = self.snapshot.baseline.prepare_surface_changes(
             pane,
-            self.force_with_input_serial,
+            self.force_with_input_dispatch_serial,
             force_for_atomic_effects,
         );
 
@@ -2128,8 +2128,12 @@ impl SessionHandler {
                             with_current_pane(&authority, &registration, |pane| {
                                 pane.key_down(event.key, event.modifiers)?;
 
-                                // For a key press, always return the cursor
-                                // position so predictive echo remains aligned.
+                                // Force a surface snapshot so the client can
+                                // measure dispatch RTT and record the exact
+                                // terminal-sequence fence sampled after
+                                // `key_down`. This acknowledges protocol
+                                // dispatch only; it does not claim that the PTY
+                                // or application has echoed the input.
                                 let render_changes = {
                                     let mut per_pane = per_pane.lock().map_err(|err| {
                                         anyhow!("per-pane state lock poisoned: {err}")
@@ -3315,12 +3319,12 @@ mod tests {
     fn prepare_transactional_for_registration(
         state: Arc<Mutex<PerPane>>,
         registration: &PaneRegistrationHandle,
-        force_with_input_serial: Option<InputSerial>,
+        force_with_input_dispatch_serial: Option<InputSerial>,
     ) -> Result<PaneRenderPreparationOutcome, PaneRenderPreparationError> {
         let preparation = begin_transactional_pane_render(
             state,
             registration.pane_id(),
-            force_with_input_serial,
+            force_with_input_dispatch_serial,
         )?;
         registration
             .try_with_current(move |pane| preparation.prepare(&pane))
