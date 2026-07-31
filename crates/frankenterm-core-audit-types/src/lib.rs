@@ -63,6 +63,8 @@
 //! Renderer SLO evidence:
 //! - [`input_to_photon`] — portable input-to-photon trace/evidence DTOs and
 //!   known-key summarization used by renderer SLO proof lanes.
+//! - [`renderer_scenario_catalog`] — contract-only resize/zoom scenario,
+//!   topology, corpus-authority, checkpoint, and negative-control vocabulary.
 //!
 //! ## Re-export contract
 //!
@@ -87,6 +89,7 @@ pub mod proof_doctor;
 pub mod proof_handoff;
 pub mod proof_lane;
 pub mod recorder_audit_engine;
+pub mod renderer_scenario_catalog;
 // [ft-xcsm0 / ft-8nqx0 Phase 4] Recorder + session retention POLICY DTOs.
 // Engines (`RetentionManager`, `cleanup_sessions`) stay in
 // `frankenterm-core` next to the SQLite write paths.

@@ -710,6 +710,8 @@ pub use frankenterm_core_audit_types::traceability_verification;
 // fail-closed support/evidence verdict validation live with the other
 // portable audit contracts.
 pub use frankenterm_core_audit_types::product_journey_catalog;
+// Contract-only native resize/zoom scenario vocabulary and semantic validator.
+pub use frankenterm_core_audit_types::renderer_scenario_catalog;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
