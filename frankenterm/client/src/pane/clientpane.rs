@@ -1700,6 +1700,16 @@ mod tests {
             TopologyStreamId::from_bytes([0x79; 16]),
             MuxSessionIncarnation::from_bytes([0x9b; 16]),
         );
+    const ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
+        RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0x7a; 16]),
+            MuxSessionIncarnation::from_bytes([0x9b; 16]),
+        );
+    const SERVER_RESTART_RENDER_CONNECTION_IDENTITY: RenderConnectionIdentity =
+        RenderConnectionIdentity::new(
+            TopologyStreamId::from_bytes([0x7a; 16]),
+            MuxSessionIncarnation::from_bytes([0x9c; 16]),
+        );
 
     fn test_client_inner(local_domain_id: DomainId) -> Arc<ClientInner> {
         let unix = UnixDomain {
@@ -2078,6 +2088,19 @@ mod tests {
             4,
         );
         let state = Mutex::new(ClientRenderApplicationState::default());
+        assert!(matches!(
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(connection_generation),
+                pane_id,
+                snapshot.connection_identity,
+                snapshot.identity,
+            ),
+            ClientRenderApplicationBegin::Nack {
+                reason: RenderApplicationNackReason::GenerationMismatch,
+                observed_state: RenderApplicationObservedState::NotApplicable,
+            }
+        ));
         assert!(
             state.lock().prepare_authoritative_bootstrap(
                 TEST_RENDER_CONNECTION_IDENTITY,
@@ -2456,6 +2479,163 @@ mod tests {
         assert_eq!(state.applied_state, Some(successor.identity.resulting_state));
         assert_eq!(state.counters.cancelled_attempts, 1);
         assert_eq!(state.counters.acknowledgements, 1);
+    }
+
+    #[test]
+    fn restart_route_failover_and_bootstrap_disconnect_never_inherit_state() {
+        let reused_numeric_generation = 1;
+        let pane_id = 29;
+        let first = test_render_application_update(
+            reused_numeric_generation,
+            pane_id,
+            109,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            97,
+        );
+        let state = Mutex::new(ClientRenderApplicationState::default());
+        assert!(state.lock().prepare_authoritative_bootstrap(
+            TEST_RENDER_CONNECTION_IDENTITY,
+            reused_numeric_generation,
+        ));
+        assert!(matches!(
+            state.lock().begin(
+                Some(TEST_RENDER_CONNECTION_IDENTITY),
+                Some(reused_numeric_generation),
+                pane_id,
+                first.connection_identity,
+                first.identity,
+            ),
+            ClientRenderApplicationBegin::Apply
+        ));
+        ClientRenderApplicationGuard::new(
+            &state,
+            first.connection_identity,
+            first.identity,
+        )
+        .acknowledge();
+
+        assert!(state.lock().prepare_authoritative_bootstrap(
+            ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY,
+            reused_numeric_generation,
+        ));
+        assert_eq!(
+            state.lock().observation(),
+            RenderApplicationObservedState::Uninitialized,
+            "a fresh topology stream must fence numeric generation reuse"
+        );
+        let mut abandoned_route_snapshot = test_render_application_update(
+            reused_numeric_generation,
+            pane_id,
+            113,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        abandoned_route_snapshot.connection_identity =
+            ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY;
+        assert!(matches!(
+            state.lock().begin(
+                Some(ROUTE_FAILOVER_RENDER_CONNECTION_IDENTITY),
+                Some(reused_numeric_generation),
+                pane_id,
+                abandoned_route_snapshot.connection_identity,
+                abandoned_route_snapshot.identity,
+            ),
+            ClientRenderApplicationBegin::Apply
+        ));
+        let abandoned_route_guard = ClientRenderApplicationGuard::new(
+            &state,
+            abandoned_route_snapshot.connection_identity,
+            abandoned_route_snapshot.identity,
+        );
+
+        assert!(state.lock().prepare_authoritative_bootstrap(
+            SERVER_RESTART_RENDER_CONNECTION_IDENTITY,
+            reused_numeric_generation,
+        ));
+        abandoned_route_guard.acknowledge();
+        {
+            let state = state.lock();
+            assert_eq!(
+                state.active_connection_identity,
+                Some(SERVER_RESTART_RENDER_CONNECTION_IDENTITY)
+            );
+            assert_eq!(
+                state.observation(),
+                RenderApplicationObservedState::Uninitialized,
+                "disconnect during route bootstrap must retain no partial baseline"
+            );
+            assert!(state.applying.is_none());
+            assert_eq!(state.counters.cancelled_attempts, 1);
+            assert_eq!(state.counters.acknowledgements, 1);
+        }
+
+        let stale_predecessor_delta = test_render_application_update(
+            reused_numeric_generation,
+            pane_id,
+            127,
+            1,
+            RenderApplicationKind::Delta,
+            Some(first.identity.resulting_state),
+            98,
+        );
+        for stale in [&first, &stale_predecessor_delta, &abandoned_route_snapshot] {
+            assert!(matches!(
+                state.lock().begin(
+                    Some(SERVER_RESTART_RENDER_CONNECTION_IDENTITY),
+                    Some(reused_numeric_generation),
+                    pane_id,
+                    stale.connection_identity,
+                    stale.identity,
+                ),
+                ClientRenderApplicationBegin::Nack {
+                    reason: RenderApplicationNackReason::GenerationMismatch,
+                    observed_state: RenderApplicationObservedState::Uninitialized,
+                }
+            ));
+        }
+
+        let mut restarted_server_snapshot = test_render_application_update(
+            reused_numeric_generation,
+            pane_id,
+            131,
+            1,
+            RenderApplicationKind::Snapshot,
+            None,
+            1,
+        );
+        restarted_server_snapshot.connection_identity =
+            SERVER_RESTART_RENDER_CONNECTION_IDENTITY;
+        assert!(matches!(
+            state.lock().begin(
+                Some(SERVER_RESTART_RENDER_CONNECTION_IDENTITY),
+                Some(reused_numeric_generation),
+                pane_id,
+                restarted_server_snapshot.connection_identity,
+                restarted_server_snapshot.identity,
+            ),
+            ClientRenderApplicationBegin::Apply
+        ));
+        ClientRenderApplicationGuard::new(
+            &state,
+            restarted_server_snapshot.connection_identity,
+            restarted_server_snapshot.identity,
+        )
+        .acknowledge();
+        let state = state.lock();
+        assert_eq!(
+            state.applied_connection_identity,
+            Some(SERVER_RESTART_RENDER_CONNECTION_IDENTITY)
+        );
+        assert_eq!(
+            state.applied_state,
+            Some(restarted_server_snapshot.identity.resulting_state)
+        );
+        assert_eq!(state.counters.cancelled_attempts, 1);
+        assert_eq!(state.counters.acknowledgements, 2);
     }
 
     #[test]
