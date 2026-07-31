@@ -27,9 +27,65 @@
 //! - **Honest overhead**: The legacy `BTreeMap` representation may allocate;
 //!   its benchmark measures proxy-framework overhead, not the production path.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry};
+use std::fmt;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
+
+/// A map decoder that rejects duplicate wire keys instead of silently keeping
+/// the last value. `BTreeMap`'s ordinary `Deserialize` implementation cannot
+/// preserve evidence that a duplicate key was present, so authority-bearing
+/// maps must cross this adapter before becoming ordinary maps.
+struct DuplicateRejectingMap<K, V>(BTreeMap<K, V>);
+
+impl<'de, K, V> Deserialize<'de> for DuplicateRejectingMap<K, V>
+where
+    K: Deserialize<'de> + Ord + fmt::Display,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DuplicateRejectingMapVisitor<K, V>(PhantomData<(K, V)>);
+
+        impl<'de, K, V> de::Visitor<'de> for DuplicateRejectingMapVisitor<K, V>
+        where
+            K: Deserialize<'de> + Ord + fmt::Display,
+            V: Deserialize<'de>,
+        {
+            type Value = DuplicateRejectingMap<K, V>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map with unique keys")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = access.next_entry()? {
+                    match values.entry(key) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(value);
+                        }
+                        Entry::Occupied(entry) => {
+                            return Err(de::Error::custom(format_args!(
+                                "duplicate map key {}",
+                                entry.key()
+                            )));
+                        }
+                    }
+                }
+                Ok(DuplicateRejectingMap(values))
+            }
+        }
+
+        deserializer.deserialize_map(DuplicateRejectingMapVisitor(PhantomData))
+    }
+}
 
 /// Schema version for serialized legacy input-latency reports.
 pub const INPUT_LATENCY_REPORT_SCHEMA_VERSION: u32 = 2;
@@ -220,7 +276,7 @@ pub enum InputLatencyMeasurementError {
 ///
 /// Each stage retains producer and clock provenance. Partial measurements are
 /// useful diagnostics, but are explicit non-pass evidence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InputLatencyMeasurement {
     /// Monotonic measurement ID.
     pub id: u64,
@@ -229,6 +285,28 @@ pub struct InputLatencyMeasurement {
     /// First recording fault. Once tainted, a measurement cannot become valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recording_fault: Option<InputLatencyMeasurementError>,
+}
+
+#[derive(Deserialize)]
+struct InputLatencyMeasurementWire {
+    id: u64,
+    stages: DuplicateRejectingMap<InputLatencyStage, InputLatencyTimestamp>,
+    #[serde(default)]
+    recording_fault: Option<InputLatencyMeasurementError>,
+}
+
+impl<'de> Deserialize<'de> for InputLatencyMeasurement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = InputLatencyMeasurementWire::deserialize(deserializer)?;
+        Ok(Self {
+            id: wire.id,
+            stages: wire.stages.0,
+            recording_fault: wire.recording_fault,
+        })
+    }
 }
 
 impl InputLatencyMeasurement {
@@ -270,13 +348,17 @@ impl InputLatencyMeasurement {
         if let Some(error) = &self.recording_fault {
             return Err(error.clone());
         }
-        if self.stages.contains_key(&stage) {
-            let error = InputLatencyMeasurementError::DuplicateStage { stage };
-            self.recording_fault = Some(error.clone());
-            return Err(error);
+        match self.stages.entry(stage) {
+            Entry::Vacant(entry) => {
+                entry.insert(timestamp);
+                Ok(())
+            }
+            Entry::Occupied(_) => {
+                let error = InputLatencyMeasurementError::DuplicateStage { stage };
+                self.recording_fault = Some(error.clone());
+                Err(error)
+            }
         }
-        self.stages.insert(stage, timestamp);
-        Ok(())
     }
 
     /// Read the recorded stage map without permitting replacement.
@@ -532,7 +614,14 @@ impl InputLatencyCollector {
             return Err(InputLatencyCollectorError::MeasurementIdExhausted);
         }
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        let Some(next_id) = id.checked_add(1) else {
+            self.id_exhausted = true;
+            return Err(InputLatencyCollectorError::MeasurementIdExhausted);
+        };
+        self.next_id = next_id;
+        if next_id == u64::MAX {
+            self.id_exhausted = true;
+        }
         Ok(InputLatencyMeasurement::new(id))
     }
 
@@ -552,7 +641,7 @@ impl InputLatencyCollector {
 
     /// Validate the complete retained evidence window.
     pub fn validate_evidence(&self) -> Result<(), InputLatencyEvidenceError> {
-        if self.id_exhausted {
+        if self.id_exhausted || self.next_id == 0 || self.next_id == u64::MAX {
             return Err(InputLatencyEvidenceError::MeasurementIdExhausted);
         }
         if self.measurements.is_empty() {
@@ -660,7 +749,7 @@ impl InputLatencyCollector {
 ///
 /// `stage` names the end of the interval; for example, `PtyWrite` budgets
 /// `KeyEvent -> PtyWrite`. `KeyEvent` has no predecessor and is rejected.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StageBudget {
     /// End stage of the adjacent interval this budget applies to.
     pub stage: InputLatencyStage,
@@ -668,8 +757,27 @@ pub struct StageBudget {
     pub targets: BTreeMap<Percentile, u64>,
 }
 
+#[derive(Deserialize)]
+struct StageBudgetWire {
+    stage: InputLatencyStage,
+    targets: DuplicateRejectingMap<Percentile, u64>,
+}
+
+impl<'de> Deserialize<'de> for StageBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = StageBudgetWire::deserialize(deserializer)?;
+        Ok(Self {
+            stage: wire.stage,
+            targets: wire.targets.0,
+        })
+    }
+}
+
 /// Complete latency budget configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InputLatencyBudget {
     /// Per-stage budgets.
     pub stages: Vec<StageBudget>,
@@ -678,6 +786,27 @@ pub struct InputLatencyBudget {
     /// Regression threshold: if measured latency exceeds budget by this fraction,
     /// the check fails. 1.0 = exactly at budget, 1.1 = 10% over budget.
     pub regression_threshold: f64,
+}
+
+#[derive(Deserialize)]
+struct InputLatencyBudgetWire {
+    stages: Vec<StageBudget>,
+    aggregate: DuplicateRejectingMap<Percentile, u64>,
+    regression_threshold: f64,
+}
+
+impl<'de> Deserialize<'de> for InputLatencyBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = InputLatencyBudgetWire::deserialize(deserializer)?;
+        Ok(Self {
+            stages: wire.stages,
+            aggregate: wire.aggregate.0,
+            regression_threshold: wire.regression_threshold,
+        })
+    }
 }
 
 impl Default for InputLatencyBudget {
