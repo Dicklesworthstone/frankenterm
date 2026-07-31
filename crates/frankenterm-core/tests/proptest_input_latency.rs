@@ -407,7 +407,7 @@ proptest! {
         start in 0..500_000u64,
         step in 0..10_000u64,
     ) {
-        let stages = InputLatencyStage::ALL
+        let stages: Vec<(InputLatencyStage, InputLatencyTimestamp)> = InputLatencyStage::ALL
             .iter()
             .enumerate()
             .map(|(index, &stage)| {
@@ -454,7 +454,7 @@ proptest! {
         start in 1..500_000u64,
         step in 1..10_000u64,
     ) {
-        let stages = InputLatencyStage::ALL
+        let stages: Vec<(InputLatencyStage, InputLatencyTimestamp)> = InputLatencyStage::ALL
             .iter()
             .enumerate()
             .map(|(index, &stage)| {
