@@ -3303,14 +3303,14 @@ impl ObservationRuntime {
                                 let handle = spawn_runtime_task(
                                     &stream_task_cx,
                                     move |stream_task_cx| async move {
-                                        let exit_reason = run_vendored_streaming_capture(
+                                        let exit_reason = Box::pin(run_vendored_streaming_capture(
                                             pane_id,
                                             subscription_pane_id,
                                             socket_path_for_task,
                                             vendored_mux_compression,
                                             subscription_config,
                                             capture_tx,
-                                        )
+                                        ))
                                         .await;
                                         let final_reason = if shutdown_flag.load(Ordering::SeqCst)
                                             && exit_reason == "capture ingress closed"
@@ -4304,13 +4304,14 @@ async fn run_vendored_streaming_capture(
     let mut client_config = DirectMuxClientConfig::default().with_socket_path(socket_path.clone());
     client_config.compression_mode = compression_mode;
 
-    let client = match DirectMuxClient::connect_with_cx(&runtime_cx, client_config).await {
-        Ok(client) => client,
-        Err(err) => {
-            bridge.record_fallback();
-            return format!("connect error: {err}");
-        }
-    };
+    let client =
+        match Box::pin(DirectMuxClient::connect_with_cx(&runtime_cx, client_config)).await {
+            Ok(client) => client,
+            Err(err) => {
+                bridge.record_fallback();
+                return format!("connect error: {err}");
+            }
+        };
 
     info!(
         pane_id,
