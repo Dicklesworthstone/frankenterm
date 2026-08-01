@@ -224,6 +224,10 @@ impl MuxTopologyAuthority {
             self.exhausted = true;
             return Err(TopologyRevisionExhausted);
         };
+        if next == u64::MAX {
+            self.exhausted = true;
+            return Err(TopologyRevisionExhausted);
+        }
         self.revision = TopologyRevision(next);
         Ok(self.revision)
     }
@@ -11594,7 +11598,7 @@ mod tests {
     #[test]
     fn topology_revision_exhaustion_is_terminal_and_never_wraps() {
         let mux = Mux::new(None);
-        mux.topology.lock().revision = TopologyRevision(u64::MAX);
+        mux.topology.lock().revision = TopologyRevision(u64::MAX - 1);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_for_subscriber = Arc::clone(&observed);
         mux.subscribe_with_topology(move |envelope| {
@@ -11610,7 +11614,11 @@ mod tests {
             *observed.lock(),
             vec![MuxTopologyStamp::Exhausted, MuxTopologyStamp::Exhausted],
         );
-        assert_eq!(mux.topology.lock().revision, TopologyRevision(u64::MAX));
+        assert_eq!(
+            mux.topology.lock().revision,
+            TopologyRevision(u64::MAX - 1),
+            "the reserved terminal sentinel must never be published",
+        );
         assert_eq!(
             mux.topology_snapshot_authority().unwrap_err(),
             TopologyRevisionExhausted,
