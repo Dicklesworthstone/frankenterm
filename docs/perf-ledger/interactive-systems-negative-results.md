@@ -359,14 +359,18 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   `9fb37eb5bd8448042587e68bb4abbfa05f6b5a57`
 - **Clippy-corrected implementation revision:**
   `1cfb2212b89c67f26588841e4faf833084233f75`
-- **Latest source descendant under warnings-denied proof:**
-  `91dc37aaf73f0c9cdaa762d32273728047dba77e`. Later source changes repair
+- **Latest fully test/check-reconfirmed source descendant:**
+  `8706d327b5f4902e2596ca80f70b5e69f004c93f`. Later source changes repair
   warnings in documentation, PID evidence, benchmarks, profiling/test paths,
   an unrelated production mux row-range request, and unrelated compile-only
   integration-test targets. The only later `input_latency` edits are
   `#[cfg(test)]` singleton-budget constructors in
   `1856d87fbdbd62b7c4f93302b05b6b96278be5c5`; its production implementation is
-  unchanged from the Clippy-corrected candidate.
+  unchanged from the Clippy-corrected candidate. Current repair descendant
+  `637083428c61b52eb91c1829fca65e7e88ff4255` has not yet earned a replacement
+  all-target warnings-denied verdict because the committed renderer-scenario
+  contract is still being made compile-coherent; that unrelated compile blocker
+  is not latency evidence.
 - **Rejected inference:** a green legacy `InputLatencyReport` or
   `BudgetCheckResult` was treated as replayable production
   keypress-to-present evidence. This framework is not wired into the live
@@ -552,6 +556,37 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   `5d9cd3db79dae96a61c8d545f8f3bef5737a5b38` boxes every diagnosed
   `list_panes`, `split_pane`, and `send_text_with_options` future at its source;
   this compile-only repair does not execute or contact a mux process.
+  Exact-source revision `8706d327b5f4902e2596ca80f70b5e69f004c93f`
+  then received additional strict-remote evidence: job
+  `j-29955720610840668` on `vmi1153651` passed its focused vendored-async
+  warnings-denied lane after the 32 diagnosed futures were boxed; job
+  `j-29955720610840669` on `hz2` passed focused escape-parser Clippy; job
+  `j-29955720610840671` on `vmi1152480` passed focused term library/test
+  Clippy; and job `j-29955720610840672` on `hz2` passed
+  `cargo check -p frankenterm-core --all-targets`. Job
+  `j-29955720610840674` on `vmi1152480` reconfirmed 41/41 property tests and
+  the four synthetic integration tests, while job
+  `j-29955720610840683` on `vmi1149989` reconfirmed all four selected
+  `input_latency` compile-fail doctests. These are package/focused proxy-module
+  proofs, not workspace proof or live latency evidence.
+
+  Exact `8706d327b5f4902e2596ca80f70b5e69f004c93f` all-target Clippy job
+  `j-29955720610840682` on `hz2` remained useful negative evidence: it reached
+  one similar-name diagnostic, one boolean-to-integer diagnostic, and one
+  manual midpoint in unrelated benchmark/test targets. Revision
+  `fd8da9f3c48c72c6ff025095a78dfc64052cdb74` repairs those and the two exact
+  same-pattern midpoint sites without changing `input_latency`. The next
+  package all-target job `j-29955720610840688` on `yto` failed at the separately
+  committed, still-in-progress renderer-scenario contract before it could
+  provide a package verdict. Workspace Clippy job
+  `j-29955720610840687` independently found `chunks_exact(2)` in the unrelated
+  escape-parser hex decoder; revision
+  `637083428c61b52eb91c1829fca65e7e88ff4255` replaces it with exact array
+  chunks and an even-length debug assertion. A clean descendant all-target
+  warnings-denied rerun remains required after the renderer contract is
+  compile-coherent. Remote formatter admission still fails with `RCH-E301`,
+  and no local formatter is authorized or claimed. Therefore `.2.9` remains
+  open despite the focused green evidence.
   <!-- IS-N016-CLIPPY-RESULT -->
 - **Adjacent false-green evidence repaired:** investigation of the PID
   diagnostics proved that its gain-margin phase detector was unreachable, its
