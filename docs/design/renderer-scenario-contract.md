@@ -86,8 +86,10 @@ ordinals are stable inputs; changing one requires a catalog revision.
 
 ## State contract
 
-Every cell declares complete initial and final state rather than relying on
-ambient GUI defaults:
+Every resolved `(base cell, overlay)` declares complete initial and final
+surface/configuration/content state rather than relying on ambient GUI defaults.
+The base cell owns shared gesture, workload, topology, and stage vocabulary;
+the overlay owns the exact phase-state/configuration/materialization bindings:
 
 - pixel width and height;
 - terminal rows and columns;
@@ -95,43 +97,134 @@ ambient GUI defaults:
 - DPI and display identity;
 - exact pane, tab, and window counts;
 - focused window, active tab, and focused pane ordinals;
-- distinct initial and final inline typed topology, split geometry, and
-  complete per-pane state manifests;
+- distinct initial and final normalized typed topology, split geometry, and
+  complete per-pane state-manifest bindings resolved within the same catalog;
 - ordered per-window tab sequences with stable tab IDs and contiguous ordinals;
 - scrollback line count and viewport top;
 - grid and terminal revision IDs;
-- alternate-screen, selection anchors, cursor coordinates, IME preedit/caret,
-  candidate-window rectangle, composition range/segments, and input-source
-  identity, image anchors, hyperlink ranges, and accessibility focus/geometry
-  state;
+- active-buffer identity plus distinct primary/alternate buffer identities,
+  revisions, scrollback/content bindings, selection anchors, cursor coordinates,
+  IME preedit/caret, typed candidate-window coordinate space and rectangle,
+  composition range/segments, and input-source identity, image anchors,
+  hyperlink ranges, and accessibility focus/geometry state;
 - display color-space/profile identity and HDR/EDR mode/availability;
 - terminal-content corpus references;
 - renderer configuration and pinned-font references.
 
 Rows, columns, pixel sizes, DPI, base font size, and scale must be positive.
 Fleet counts must equal the cell's exact fleet point, and ordinals and terminal
-coordinates must be in bounds. The top-level focused `surface_state` must
-exactly equal the focused-pane entry in the corresponding inline manifest.
-Initial, final, and checkpoint manifests deterministically carry every
-pane/tab/window, split geometry, content identity, and output distribution for
-that phase. Each phase manifest contains inline typed windows, ordered tabs,
-panes, split trees and rectangles, focus/active IDs, each pane's complete
-surface state, an exact pane-to-content-corpus mapping, and output distribution,
-plus the feature union derived from those corpus bindings. The validator checks
-count agreement, uniqueness, referential integrity, complete pane coverage,
-split-tree geometry, action-target agreement, exact focused-state equality, and
-exact feature-union equality. An opaque reference or one phase-ambiguous
-manifest cannot impersonate all three. Final state must implement the gesture's
-declared transition. A
-same-grid gesture must retain rows and columns; reflow gestures must use their
+coordinates must be in bounds. To keep p200 reviewable without weakening the
+contract, the catalog normalizes state through four root layout profiles,
+surface-state templates, renderer-configuration profiles,
+content-materialization/distribution profiles, coverage overlays, and phase
+manifests.
+All IDs resolve inside this same typed catalog; none is an opaque external
+manifest reference.
+
+The closed `balanced_contiguous_v1` layout derivation distributes windows,
+tabs, and panes lowest-ordinal-first. It pins stable ID formatting and
+zero-padding, per-window ordered tab sequences, pane membership, split
+direction/ratio/alternation, and integer rounding. A phase manifest's
+`window_rect` is the window-local drawable client/tab-content region consumed
+by that derivation, with `x = 0` and `y = 0`. It excludes operating-system
+window chrome but includes the pane surfaces and their explicitly modelled
+internal content padding, so no unmodelled pixels can be silently subtracted
+from split leaves. Content/state selectors are closed to
+`all`, non-overlapping half-open ordinal ranges, or explicit small ordinal
+lists. Phase manifests select these profiles and carry focused ordinals plus
+state/content/output overrides. A closed derivation computes feature coverage
+from materialized terminal input, typed surface state, and the selected
+renderer configuration; a copied feature-name list is never authoritative.
+
+The validator expands every profile to every exact window, tab, pane, split
+leaf, surface state, renderer configuration, ordered content-materialization
+step, content binding, and output rate. It checks count
+agreement, uniqueness, full and non-overlapping selector coverage, referential
+integrity, split-tree geometry, action-target agreement, exact focused-state
+equality, stable per-window tab ordering, and exact mechanically derived
+feature coverage for every required overlay.
+The crate exposes a pure read-only resolver for a `(scenario_id, overlay_id)`
+pair. The one-pair convenience function remains fail-closed and validates the
+whole catalog before resolving. Suite drivers must instead construct
+`RendererPreparedScenarioCatalog` once, then call `resolve_all_overlays`: that
+path performs exactly one semantic validation pass and one immutable lookup
+index build before expanding all 256 pairs in canonical gesture-major,
+fleet-minor, overlay-minor order. `RendererResolverPreparationStats` makes that
+preparation work explicit. Pair resolution and batch expansion use no mutable
+or global cache, preserve the validation report's pair-scoped readiness and
+blocking gaps, and produce the same results. The resolver and validator share
+the same expansion, materialization-replay, and split-geometry implementation;
+downstream drivers must consume that result instead of reimplementing the
+normalized DSL. Its ordered result includes every checkpoint and exact
+window/tab/pane identity, membership, rectangle, focus/active state, surface
+state, materialized content, output state, revision, phase, and event ordinal.
+Initial, final, and checkpoint bindings therefore deterministically cover the
+whole fleet without repeating 200 large surface objects at every checkpoint.
+An unresolved profile ID or one phase-ambiguous manifest cannot impersonate all
+three. Final state must implement the gesture's declared transition.
+Surface templates and normalized geometry profiles fully type IME composition
+segments/candidate rectangles, image anchors and cell/pixel rectangles,
+hyperlink cell ranges and hit rectangles, and accessibility node-to-cell/pixel
+geometry. Counts and focused/caret identities are derived from those entries;
+an opaque geometry reference or count-plus-revision placeholder is invalid.
+Surface-local image, hyperlink, and accessibility rectangles must be wholly
+contained by the resolved pane viewport. IME candidate-window rectangles use
+signed virtual-display coordinates because they describe an operating-system
+candidate window rather than pane-local pixels; width and height remain
+positive and bounded.
+Every font state pins base cell width and height in milli-pixels at the
+configured base point size, font scale `1.000`, display scale `1.000`, and an
+explicit reference logical DPI. The
+v1 integer derivation applies font scale and logical/reference DPI with checked
+arithmetic, then floors cell boundaries rather than proportionally dividing an
+ambient viewport. Each pane viewport must equal its split leaf, and
+for either axis freezes these operations in order:
+
+```text
+effective_cell_milli_px = floor(
+  base_cell_milli_px * font_scale_milli * logical_dpi_milli
+  * display_scale_factor_milli
+  / (1000 * 1000 * metric_reference_dpi_milli)
+)
+boundary_px(i) = padding_before_px
+  + floor(i * effective_cell_milli_px / 1000)
+```
+
+Platform adapters must report `dpi_milli` as logical DPI independently of the
+window backing scale. On Apple silicon/macOS, `scale_factor_milli` represents
+the backing-pixel scale (for example `2_000` on Retina); physical panel DPI is
+neither substituted for logical DPI nor multiplied as a second scale. Thus the
+canonical move from logical `96_000` DPI at 1x to logical `96_000` DPI at 2x
+turns an 8 px base cell into exactly 16 px, never 32 px.
+
+Every multiply/add uses checked integer arithmetic. Then
+`left padding + derived grid width + right padding` and
+`top padding + derived grid height + bottom padding` must exactly equal that
+viewport. Right and bottom padding are explicit deterministic residuals. A v1
+image, hyperlink, or accessibility entry carrying one pixel rectangle is
+restricted to one terminal row; multi-row geometry requires a future typed
+row-fragment representation rather than an overbroad bounding box.
+Selection anchor and focus are each independently in bounds; backward
+selections are valid and must not be rejected by treating the pair as an
+ordered range.
+A same-grid gesture must retain rows and columns; reflow gestures must use their
 exact 80/200 endpoints; zoom gestures must retain configured base font size
 while moving logical font scale in the declared direction and deriving
 effective font size/cell metrics through the pinned derivation revision.
 Display identity, DPI, and display scale remain unchanged during a zoom. A
-display move must change both display identity and DPI; a display-scale change
-alone is not a display move. It also declares its before/after color profile and
-HDR/EDR state. Draft, Standard, and Fancy must all honor the selected color
-profile; a quality transition cannot silently change gamut. `output_overlap_resize` also declares whether its
+display move must change display identity plus at least one independent display
+metric: logical DPI or backing scale. The canonical Retina move changes scale
+while retaining logical DPI. A scale change without display-identity change is
+not a display move. `RendererDisplayTransition` contains only display
+identity, DPI, scale, color-space/profile, and HDR/EDR metadata; it has no
+viewport or padding fields. Its mutation bundle is exactly `SetWindowSize`,
+`MoveToDisplay`, `SetRevisions`, in that order, with one identical window
+target. `SetWindowSize` alone changes the drawable extent. `MoveToDisplay`
+never reads or writes dimensions: pane viewports remain exact split leaves and
+padding is recomputed from pinned cell metrics after the metadata transition.
+It also declares its before/after color profile and HDR/EDR state. Draft,
+Standard, and Fancy must all honor the selected color profile; a quality
+transition cannot silently change gamut. `output_overlap_resize` also declares whether its
 overlapped resize is `same_grid` or `grid_changing`; omission or use on another
 gesture is invalid.
 
@@ -150,10 +243,19 @@ Each event contains a non-empty atomic action bundle. One native resize callback
 may update viewport dimensions, grid dimensions, and renderer revisions at the
 same ordinal; the contract must not fabricate observable half-states merely to
 serialize fields. `resize_mutation_count` counts such events, not individual
-field actions. Output-overlap timelines explicitly start PTY output, inject
+field actions. Within one atomic event, every `SetWindowSize`, `SetGrid`,
+`SetFontScale`, `SetQualityMode`, `MoveToDisplay`, and `SetRevisions` action
+uses the same complete `RendererMutationTarget`: window, optional tab, and
+ordered affected-pane IDs. A valid target for another window or tab is still
+invalid in that bundle because it would advance generations on surfaces other
+than those whose state changed. Non-targeted output/key/boundary actions do not
+participate in this equality rule. Output-overlap timelines explicitly start PTY output, inject
 foreground-key actions, perform resize events while output remains active, and
 then stop output; merely containing those actions in a non-overlapping order is
-invalid. Live-resize snap-back timelines also encode the closed production
+invalid. The v1 foreground-key event is one indivisible tuple:
+`logical_key = "x"`, no modifiers, and encoded bytes `78`; validating any one
+field independently cannot authorize a different key event. Live-resize
+snap-back timelines also encode the closed production
 quality set `draft`, `standard`, and `fancy`. Mutation frames run in `draft`.
 There is exactly one `snap_back`-role checkpoint and exactly one encoded
 Draft-to-Standard snap-back transition. The later steady-state settle quality
@@ -172,13 +274,29 @@ remain ordered through every phase; duplicate, missing, or non-contiguous tab
 ordinals are invalid. This is the same semantic shape that tab-order continuity
 epic `ft-interactive-swarm-product-convergence-7xqz4.8.10` must persist across
 reconnect/reopen, but this renderer catalog does not implement persistence.
+Topology, split membership, focus, active-tab identity, tab ordering, and the
+selected content-overlay identity are invariant across v1 gesture phases;
+their canary actions remain separate from the primary gesture timeline.
+Geometry, renderer quality, output rates, and revisions may change only through
+their corresponding typed base-timeline actions. Overlay terminal mode/content
+state is inherited between anchors and may change only through its ordered
+materialization steps; the base timeline has no scenario-wide
+`set_terminal_mode` action. An uncaused phase-manifest difference is invalid.
 
 The catalog freezes these eight intermediate invariant classes. Each class has
-canonical phases plus a gesture/feature condition. A scenario omits a
+canonical phases plus a gesture/feature condition. A resolved overlay omits a
 conditional invariant when that condition is false; it must not fabricate a
 non-empty applicability set. The same invariant ID is intentionally evaluated
 at every applicable checkpoint; it is not a one-shot assertion that can make
 later transient frames invisible:
+
+`scenario.expected_invariants` is the canonical ordered union for all eight
+required overlays. It retains both conditional definitions and their phase
+contracts. Each checkpoint row, and the public resolved checkpoint anchor,
+carries the exact ordered subset derived from that overlay anchor's materialized
+features: alternate-screen isolation appears only with `alternate_screen`, and
+accessibility focus geometry only with `accessibility_geometry`. Union
+membership never makes either invariant applicable to another overlay.
 
 - `no_blank_frame_after_nonblank` — no blank frame after a previously
   non-blank frame;
@@ -190,8 +308,10 @@ later transient frames invisible:
   remain in bounds;
 - `reflow_logical_line_identity` — logical-line text and hard/soft wrap
   identity survive reflow;
-- `alternate_screen_isolation` — alternate-screen identity is not merged with
-  primary scrollback;
+- `alternate_screen_isolation` — the typed primary and alternate buffer
+  identities, revisions, and content bindings remain distinct; activating or
+  mutating the alternate buffer never changes the pinned primary scrollback
+  identity;
 - `accessibility_focus_geometry` — accessibility focus is exclusive and
   geometry matches the visible cell map; and
 - `final_state_convergence` — the final frame converges to the declared final
@@ -202,36 +322,65 @@ The output-overlap family additionally fixes aggregate PTY output at exactly
 related RQ-S6 cross-map requires exactly one event with pinned logical key,
 modifiers, and encoded bytes. Concurrent resize makes this an adversarial
 superset, not an exact RQ-S6 scenario. Output generator revision, seed, payload
-identity, and pane distribution are part of workload identity. Other families
+identity, and pane distribution are part of workload identity. The closed
+`even_lowest_ordinal_remainder_v1` policy assigns the integer quotient to every
+expanded pane and one additional byte/s to the lowest pane ordinals until the
+remainder is exhausted; optional explicit selector overrides must be
+non-overlapping and preserve the exact aggregate. Other families
 declare zero background output unless their workload explicitly says otherwise.
+
+Those fields currently describe structure, not executable authority.
+`renderer_output_stream_v1` has no closed implementation, implementation
+manifest, or digest, so every output-overlap scenario-overlay pair carries the
+blocking `DeterministicOutputStreamUnavailable` gap. The production-default
+pair additionally carries `KeyEffectOracleUnavailable`: its foreground-key
+schedule has no canonical foreground fixture, PTY echo binding, or pre/post
+terminal-state oracle connecting the keypress to first-correct-present. Both
+gaps track `ft-interactive-systems-performance-4tenz.3.1.2`. Consequently all
+32 output-overlap pairs are `execution_ready: false`; these rows support only
+structural and explicit-gap reporting and cannot qualify a performance or key
+effect claim until that child closes with the named artifacts.
 
 ## Checkpoint policy
 
-Every scenario has at least three ordered checkpoints; live-resize families
-have at least four:
+Every resolved scenario overlay has exactly three ordered checkpoints anchored
+to the shared base timeline; live-resize families have exactly four:
 
 1. `begin` before the first mutation;
-2. one or more `mutation` checkpoints during the gesture;
+2. exactly one `mutation` checkpoint during the gesture;
 3. exactly one `snap_back` checkpoint after `gesture_end` for same-grid,
    grid-changing, reflow, and output-overlap resize cells; and
 4. `settle` at the declared terminal event ordinal.
 
 Zoom and DPI/display-move cells omit `snap_back`; adding one would invent a
 production guarantee that their gesture family does not own.
+The closed matrix therefore contains exactly 928 checkpoint-to-manifest anchor
+rows: 20 live-resize cells times eight overlays times four checkpoints, plus 12
+steady-quality cells times eight overlays times three checkpoints.
+The root `phase_manifests` collection contains exactly 928 unique manifest IDs
+in the same canonical scenario/checkpoint traversal order. A manifest is owned
+by one checkpoint row; cross-scenario or cross-checkpoint reuse is forbidden so
+that a later edit cannot silently couple two proof anchors through one shared
+state object. Normalization remains at layout, surface-template, configuration,
+and content-distribution profiles.
 
 A checkpoint binds all of the following:
 
 - event ordinal and phase;
 - expected state-invariant IDs;
-- expected detector IDs and expected frame-content class;
-- phase-specific complete inline typed pane/surface-state manifest;
+- expected frame-content class;
+- phase-specific normalized typed pane/surface-state manifest binding that
+  expands completely within the catalog;
 - terminal-state oracle reference;
 - visual oracle reference and one or more comparator-policy references;
 - accessibility oracle reference;
 - whether native capture is required.
 
-Every checkpoint binds at least one applicable invariant and every applicable
-detector. The `begin` checkpoint has an explicit `nonblank` frame-content class,
+Every checkpoint binds at least one applicable invariant. Continuous-frame
+detectors belong to the overlay observation policy; interval,
+checkpoint-oracle-pair, and whole-timeline detectors belong to the scenario's
+typed nonlocal detector bindings. The `begin` checkpoint has an explicit
+`nonblank` frame-content class,
 which establishes the baseline for
 `no_blank_frame_after_nonblank` and evaluates baseline-valid invariants such as
 grid/terminal revision coherence and anchor bounds. Every `mutation`
@@ -249,51 +398,70 @@ Invariant applicability is frozen rather than left to each row:
 | `coherent_grid_terminal_revision` | begin, mutation, snap_back, settle | snap_back only for live-resize |
 | `anchors_in_bounds` | begin, mutation, snap_back, settle | snap_back only for live-resize |
 | `reflow_logical_line_identity` | mutation, snap_back, settle | grid-changing/reflow gestures and grid-changing output-overlap |
-| `alternate_screen_isolation` | begin, mutation, snap_back, settle | content includes alternate screen; snap_back only for live-resize |
-| `accessibility_focus_geometry` | begin, mutation, snap_back, settle | content includes accessibility geometry; snap_back only for live-resize |
+| `alternate_screen_isolation` | begin, mutation, snap_back, settle | overlay derives active alternate-screen state; snap_back only for live-resize |
+| `accessibility_focus_geometry` | begin, mutation, snap_back, settle | overlay derives accessibility geometry; snap_back only for live-resize |
 | `final_state_convergence` | settle | every gesture |
 
-A checkpoint's invariant IDs equal the complete applicable set; subset binding
-is invalid.
+A checkpoint's invariant IDs equal the complete overlay-aware applicable set;
+subset binding, cross-overlay leakage, and omission from a qualifying overlay
+are invalid. `RendererResolvedCheckpointAnchor.expected_invariant_ids` exposes
+that exact set so downstream runners do not reimplement feature conditions.
+
+Structural resolution returning `Ok` is not execution authority.
+`RendererResolvedScenarioOverlay` carries pair-scoped `execution_ready`, exact
+blocking gap codes, and relevant typed gaps; callers must inspect them before
+attempting an execution lane.
 
 State invariants are not the entire visual oracle. Version 1 freezes these 20
 serialized detector IDs in this order:
 
 | Detector ID | Scope | Phases | Condition/policy |
 |---|---|---|---|
-| `no_missing_glyphs` | single checkpoint | begin, mutation, snap_back, settle | every gesture; snap_back only for live-resize |
-| `coherent_cell_widths` | single checkpoint | begin, mutation, snap_back, settle | every gesture; snap_back only for live-resize |
-| `exact_row_width` | single checkpoint | begin, mutation, snap_back, settle | every gesture; snap_back only for live-resize |
+| `no_missing_glyphs` | all observed frames | begin through settle | every gesture and overlay |
+| `coherent_cell_widths` | all observed frames | begin through settle | every gesture and overlay |
+| `exact_row_width` | all observed frames | begin through settle | every gesture and overlay |
 | `no_flicker` | interval | mutation, snap_back, settle | explicit interval ending at the phase checkpoint |
-| `coherent_renderer_generation` | single checkpoint | begin, mutation, snap_back, settle | every gesture; snap_back only for live-resize |
-| `no_mixed_generation_tear_band` | single checkpoint | mutation, snap_back, settle | every gesture; snap_back only for live-resize |
-| `no_stale_or_duplicate_frame` | checkpoint pair | mutation, snap_back, settle | explicit source and target checkpoints |
-| `nonblank_after_baseline` | checkpoint pair | mutation, snap_back, settle | nonblank begin baseline and current checkpoint |
-| `ssim_policy` | checkpoint/oracle pair | begin, mutation, snap_back, settle | comparator-policy reference |
-| `l_inf_policy` | checkpoint/oracle pair | begin, mutation, snap_back, settle | comparator-policy reference |
-| `changed_pixel_fraction_policy` | checkpoint/oracle pair | begin, mutation, snap_back, settle | reported, but non-independent until `.3.5.1` |
-| `exact_terminal_state` | single checkpoint | begin, mutation, snap_back, settle | phase-specific terminal-state oracle |
-| `cursor_geometry` | single checkpoint | begin, mutation, snap_back, settle | content includes cursor |
-| `selection_geometry` | single checkpoint | begin, mutation, snap_back, settle | content includes selection |
-| `ime_geometry` | single checkpoint | begin, mutation, snap_back, settle | content includes IME |
-| `hyperlink_geometry` | single checkpoint | begin, mutation, snap_back, settle | content includes hyperlinks |
-| `image_geometry` | single checkpoint | begin, mutation, snap_back, settle | content includes images |
-| `alternate_screen_state` | single checkpoint | begin, mutation, snap_back, settle | content includes alternate screen |
-| `accessibility_geometry` | single checkpoint | begin, mutation, snap_back, settle | content includes accessibility geometry |
+| `coherent_renderer_generation` | all observed frames | begin through settle | correlation identity and rendered generation must agree |
+| `no_mixed_generation_tear_band` | all observed frames | begin through settle | every gesture and overlay |
+| `no_stale_or_duplicate_frame` | all observed frames | begin through settle | the stream evaluator compares every adjacent correlation and semantic revision |
+| `nonblank_after_baseline` | all observed frames | after the nonblank begin baseline through settle | every gesture and overlay |
+| `ssim_policy` | `checkpoint_oracle_pair` | begin, mutation, snap_back, settle | subject checkpoint, independent oracle, and comparator-policy reference |
+| `l_inf_policy` | `checkpoint_oracle_pair` | begin, mutation, snap_back, settle | subject checkpoint, independent oracle, and comparator-policy reference |
+| `changed_pixel_fraction_policy` | `checkpoint_oracle_pair` | begin, mutation, snap_back, settle | reported, but non-independent until `.3.5.1` |
+| `exact_terminal_state` | all observed frames | begin through settle | event-replayed expected state for the frame's correlation |
+| `cursor_geometry` | all observed frames | begin through settle | every overlay derives cursor state |
+| `selection_geometry` | all observed frames | begin through settle | overlay derives active selection state |
+| `ime_geometry` | all observed frames | begin through settle | overlay derives IME state |
+| `hyperlink_geometry` | all observed frames | begin through settle | overlay derives hyperlink state and geometry |
+| `image_geometry` | all observed frames | begin through settle | overlay derives image state and geometry |
+| `alternate_screen_state` | all observed frames | begin through settle | overlay derives active alternate-screen state |
+| `accessibility_geometry` | all observed frames | begin through settle | overlay derives accessibility geometry |
 | `exactly_one_standard_snap_back` | whole timeline | snap_back | exactly one snap-back-role checkpoint and one Draft-to-Standard transition; later Standard settle is allowed |
 
-Single-checkpoint bindings live on checkpoints. Pair, interval, and
-whole-timeline bindings are separate typed records with exact source/target or
-interval endpoints; a checkpoint-local ID cannot impersonate sequence proof.
-Every applicable detector has exactly one correctly scoped binding. The
+All-observed-frame detector IDs live only on the overlay's continuous
+observation policy. Checkpoint-oracle-pair, interval, and whole-timeline
+bindings are separate typed records with exact subject/oracle/policy or interval
+endpoints; neither a checkpoint row nor a second all-frame binding list can
+create competing detector authority.
+Every applicable detector has exactly one correctly scoped owner. The
 changed-pixel detector remains explicitly non-independent until `.3.5.1`
 repairs its comparator semantics.
+
+The 15 all-observed-frame IDs form a closed suite inventory, not a requirement
+to run feature-inapplicable geometry checks in every overlay. Each observation
+policy carries nine universal IDs (`no_missing_glyphs`,
+`coherent_cell_widths`, `exact_row_width`, `coherent_renderer_generation`,
+`no_mixed_generation_tear_band`, `no_stale_or_duplicate_frame`,
+`nonblank_after_baseline`, `exact_terminal_state`, and `cursor_geometry`) plus
+the geometry/state IDs mechanically derived for that overlay. The exact counts
+in overlay order are therefore 9, 9, 10, 10, 11, 9, 10, and 10; the
+`image_hyperlink` overlay contributes both image and hyperlink detectors.
 
 Checkpoints are deterministic oracle anchors, not a license to ignore the
 transient stream between them. Every observed, captured, or presented frame
 from `gesture_begin` through `settle` carries its event interval, phase,
 renderer-generation identity, and all applicable per-frame and interval
-detector verdicts. A scenario with one mutation checkpoint therefore still
+detector verdicts. A scenario overlay with one mutation checkpoint therefore still
 must detect a blank, mixed-width, torn-generation, stale, or duplicated
 intermediate frame. Checkpoint/oracle comparisons remain anchored at the
 declared checkpoints, while whole-stream safety detectors cover every frame.
@@ -330,24 +498,142 @@ becoming a green headless result.
 
 ## Terminal-content accounting and evidence sources
 
-Every one of the 32 gesture-by-fleet scenarios, in every initial, final, and
-checkpoint phase manifest, must derive the complete closed terminal-feature
-union:
+The closed terminal-feature inventory is:
 
 `ascii`, `cjk`, `rtl`, `combining_marks`, `emoji`, `ligatures`, `images`,
 `hyperlinks`, `alternate_screen`, `selection`, `cursor`, `ime`, and
 `accessibility_geometry`.
 
-This is not global singleton coverage. The `p001` cells use a canonical
-mixed-content pane/corpus that carries all 13 features; larger fleets distribute
-the same feature set deterministically across panes, but no gesture, fleet
-point, or phase may omit one. This keeps the p200 large-session cells and every
-gesture axis subject to the same appearance gates, and it derives IME, image,
-and accessibility capability requirements for every cell.
+Coverage is not a global singleton and is not an impossible requirement that
+all 13 features remain simultaneously active in one pane. Every one of the 32
+gesture-by-fleet base cells carries a typed, ordered overlay suite. The closed
+v1 overlay IDs are `production_default`, `unicode_maximal`,
+`alternate_screen`, `ime_composing`, `image_hyperlink`,
+`ligature_enabled`, `selection`, and `a11y_geometry`. A coverage lint requires
+every gesture-by-fleet cell to define all eight overlays and, across that suite,
+derive all 13 features. There is no caller-authored applicability escape hatch:
+unsupported input or capability remains a typed per-overlay readiness gap, not
+an omitted definition, empty selector, or prose exception.
+
+| Overlay ID | Features introduced beyond inherited base state | Configuration/measurement rule |
+|---|---|---|
+| `production_default` | `ascii`, `cursor` | Bundled configuration; only implicit SLO candidate |
+| `unicode_maximal` | `cjk`, `rtl`, `combining_marks`, `emoji` | Inherits production-default shaping/configuration |
+| `alternate_screen` | `alternate_screen` | Typed primary/alternate buffers; cannot qualify primary-screen-only RQ-S9 |
+| `ime_composing` | `ime` | Cannot qualify K0-through-K13 when IME may consume or transform the key |
+| `image_hyperlink` | `images`, `hyperlinks` | Requires framed image input and typed image/hit geometry |
+| `ligature_enabled` | `ligatures` | Separate pinned `calt`/`clig`/`liga`-enabled shaping configuration |
+| `selection` | `selection` | Exact anchor/focus/granularity state |
+| `a11y_geometry` | `accessibility_geometry` | Machine geometry only; no VoiceOver authority |
+
+Every non-base overlay inherits `ascii` and `cursor`. The exact union of the
+base and introduced feature sets is therefore the 13-item inventory above.
+
+Measurement authority is closed rather than caller-selected. Exact RQ/SLO
+candidate cross-maps bind `production_default` only. The other seven overlays
+are `visual_coverage_related_only`: they may retain separately labelled
+performance observations, but cannot inherit an exact base SLO. In addition,
+`ime_composing` is hard-ineligible for
+`keypress_to_first_correct_present`/RQ-S6, and `alternate_screen` is
+hard-ineligible for primary-screen RQ-S9. These dispositions are enum values in
+the catalog, not free-form reasons supplied by a runner.
+
+This structure preserves exact measurement predicates. The base
+`production_default` overlay uses the bundled renderer configuration and is the
+only implicit SLO candidate. `ime_composing` cannot qualify a foreground-key
+K0-through-K13 measurement when the IME may consume or transform that key.
+`alternate_screen` cannot qualify a primary-screen 1,000-line reflow predicate.
+`ligature_enabled` selects an explicit shaping configuration that enables and
+pins the required OpenType features; the bundled configuration currently
+disables `calt`, `clig`, and `liga`, so the ligature overlay is never described
+as production-default behavior. A measurement may select another overlay only
+when its binding names it and its exact predicate remains compatible.
+
+The overlay suite does not multiply the stable 32 base scenario IDs. The eight
+overlay definitions are root-global reusable templates; the validator applies
+their closed cross-product to every base cell instead of serializing 256
+near-identical profile definitions. Each overlay has its own stable template ID,
+closed measurement-eligibility classification, capability requirements, and
+readiness result. Each scenario binds the eight templates exactly once, while
+its overlay-specific checkpoint rows are the sole owners of ordered
+phase-manifest anchor identity. The validator checks
+coverage at every gesture x fleet point while run logs always name both the
+base scenario and overlay. A valid contract may therefore retain a missing
+image, ligature, or live-IME overlay as an explicit readiness gap without
+pretending the base scenario executed it.
+
+Resolved cell-overlay checkpoint-to-phase-manifest references are exact
+initial/final/intermediate anchors,
+not one repeated manifest per timeline event. Between anchors, the validator
+replays the closed atomic actions from the preceding state and verifies that the
+next anchor equals the derived result. Stable overlay content/configuration is
+inherited until a typed materialization action changes it. This avoids a
+per-event manifest explosion in 100-mutation cells while still making every
+transient event and observed frame accountable.
+The scenario's overlay-template binding must not repeat a second list of anchor
+manifest IDs; competing anchor lists would create ambiguous state authority.
 
 Content inputs and evidence authority are separate collections. A content
-corpus has a stable ID, relative repository reference, feature set, payload or
-generator revision, and is referenced by workloads. An evidence source has its
+corpus has a stable ID, relative repository reference, mechanically derivable
+feature set, payload or generator identity and revision, deterministic seed or
+exact payload digest, and is referenced by workloads. Its input binding uses a
+closed encoding/decoder/framing kind rather than only `path + sha256`.
+`hex_transcript_v1`, for example, names the exact
+`tests/fixtures/terminal-conformance/manifest.json` row and transcript segment,
+hex-decodes it to terminal bytes, and records whether bytes are concatenated,
+framed as a terminal protocol sequence, or applied as a typed state overlay.
+Raw terminal bytes, UTF-8 fixture input, GPU fixture state, and generated input
+use separate closed kinds; a body-only Kitty graphics fixture cannot be
+mistaken for a complete terminal stream. Protocol-body framing uses
+protocol-specific enum variants with contract-fixed envelope bytes; arbitrary
+caller-supplied prefix/suffix hex is invalid. The canonical OSC 8 input is the
+complete hex-decoded terminal-conformance transcript, not a body-only framing
+case.
+
+Version 1 freezes the expected decoded semantic contribution for every
+canonical content ID together with its source reference, digest domain,
+selector, encoding, and framing. The serialized `semantic_kinds` field is a
+redundant assertion and must equal that canonical mapping exactly. It cannot
+relabel an ASCII payload as CJK, ligatures, images, or any other feature;
+state-only inputs carry an empty semantic list and derive their feature from
+typed surface/configuration state instead.
+
+Ordered materialization steps pin corpus selector, decoder, framing, target
+pane set, event boundary, and composition operation. Alternate-screen coverage
+must enter the alternate buffer, materialize the intended visible content, and
+hold that state through the compared checkpoint before any exit step. Selection,
+cursor, IME, image/hyperlink geometry, accessibility geometry, and active-buffer
+state are derived from typed surface/configuration state as well as content;
+they are not falsely attributed to byte payloads. Ligature coverage requires
+both ligature-bearing text and the explicitly enabled shaping profile. The
+derived feature union is the result of those predicates, never a user-supplied
+assertion.
+Materialization replay is phase-aware: it applies `before_gesture`, `at_event`,
+and `after_checkpoint` boundaries in deterministic timeline order, implements
+replace/append/enter-alternate/exit-alternate/typed-state operations against
+the correct buffer, and enforces every `hold_through_checkpoint_ids` lifetime
+continuously from application through the furthest named checkpoint. Removing
+an effect at an intermediate checkpoint and reintroducing it before the named
+endpoint does not satisfy the hold.
+Because v1 carries no executable transform payload for changing typed fixture
+state later in a run, `apply_typed_state_overlay` is restricted to
+`before_gesture`. Typed-state inputs with non-empty visible-content semantics
+append their identity to the active buffer; empty-semantic IME/accessibility
+mode-and-geometry overlays leave buffer identities unchanged. Later
+`at_event`/`after_checkpoint` boundaries are therefore reserved for the four
+explicit byte/buffer operations, which the validator replays into the exact
+active, primary, and alternate buffer state.
+The resulting primary/alternate buffer contents and active-buffer identity must
+exactly equal each resolved surface state. Future or expired steps cannot
+contribute feature coverage to an earlier checkpoint. An unavailable planned
+input may retain its desired feature obligation for gap reporting, but it can
+never make an overlay execution-ready or count as materialized proof.
+
+A future driver must be able to reproduce the declared bytes and terminal state
+without an ambient corpus default. A corpus/materialization gap has an explicit
+availability state, limitation, and tracking reference and makes only the
+affected overlay `execution_ready: false`; it does not invalidate the scenario
+definition or authorize placeholder bytes. An evidence source has its
 own stable ID/reference, authority scope, coverage status, limitation, and
 tracking references, and is referenced by gesture-authority rows. Mock resize
 replays, SLO documents, product journeys, and metadata-less stress sources are
@@ -367,6 +653,25 @@ Coverage below describes checked-in contract substrate only. `Direct` means a
 complete existing headless fixture package, never a native-window or target-run
 pass.
 
+Deterministic input availability is tracked separately from visual authority.
+The terminal-conformance manifest and its `.hex` transcripts provide
+parser-only, hex-decoded terminal-byte input for `tc-utf8-grapheme-001`
+(ASCII/CJK/combining/emoji), `tc-osc8-hyperlink-001`,
+`tc-cursor-mode-001`, and `tc-alt-screen-001`. The last transcript contains
+both enter and exit sequences, so an alternate-screen overlay must select an
+ordered enter/write/checkpoint segment rather than replay the whole artifact
+and claim that its final state is still alternate. These sources authorize
+deterministic bytes, not cell geometry or rendered appearance.
+
+`fuzz/corpus/term_advance_bytes/seed_dcs_sixel_fragment.bin` is a complete raw
+DCS sixel terminal stream with SHA-256
+`ba2f48b0bb4e567cd66fcd75188ec870fd0b5a23474366e5a5d3deac4ea9d162`.
+It can supply deterministic image-protocol input but has no manifest, expected
+geometry, or visual/native authority. A Kitty `input.bin` that contains only
+an APC body is not a terminal stream until a typed framing step supplies the
+protocol envelope. These distinctions are why input readiness and the GPU
+evidence map below are separate fields.
+
 | Feature or source | v1 classification | Reason |
 |---|---|---|
 | ASCII, CJK, RTL, combining marks, emoji, cursor | `direct` | Complete `input.json`, `meta.json`, `expected.json`, and `golden.png` fixture packages exist |
@@ -377,10 +682,39 @@ pass.
 | `multipane-resize-static-snapshot` | `partial` | One static frame is not a native continuous resize gesture |
 | `tests/golden/gpu/stress/*` | `present_unqualified` | Seven fixture directories exist without required `meta.json` identity |
 
+The machine feature-evidence map is complete and ordered by
+`RendererTerminalFeature::ALL`:
+
+| Feature | Exact evidence source IDs | Status | Limitation and tracking |
+|---|---|---|---|
+| `ascii` | `gpu_fixture.text_basic_paragraph` -> `tests/golden/gpu/text-basic-paragraph/meta.json` | `direct` | none |
+| `cjk` | `gpu_fixture.text_cjk_mixed` -> `tests/golden/gpu/text-cjk-mixed/meta.json` | `direct` | none |
+| `rtl` | `gpu_fixture.text_rtl_arabic_hebrew` -> `tests/golden/gpu/text-rtl-arabic-hebrew/meta.json` | `direct` | none |
+| `combining_marks` | `gpu_fixture.text_combining_marks` -> `tests/golden/gpu/text-combining-marks/meta.json` | `direct` | none |
+| `emoji` | `gpu_fixture.text_emoji_fallback` -> `tests/golden/gpu/text-emoji-fallback/meta.json` | `direct` | none |
+| `ligatures` | `inventory.gpu_ligatures_gap` -> `tests/golden/gpu/README.md` | `gap` | No canonical complete GPU fixture exercises enabled ligature shaping and exact cluster/cell geometry; `ft-interactive-systems-performance-4tenz.3.6.2`, `ft-interactive-systems-performance-4tenz.3.5`, `ft-interactive-swarm-product-convergence-7xqz4.9.2` |
+| `images` | `inventory.gpu_images_gap` -> `tests/golden/gpu/README.md` | `gap` | No canonical complete GPU fixture exercises inline-image protocol state and image geometry; `ft-interactive-systems-performance-4tenz.3.6.2`, `ft-interactive-systems-performance-4tenz.3.5`, `ft-interactive-swarm-product-convergence-7xqz4.9.2` |
+| `hyperlinks` | `inventory.gpu_hyperlinks_gap` -> `tests/golden/gpu/README.md` | `gap` | No canonical complete GPU fixture exercises hyperlink ranges and hit geometry; `ft-interactive-systems-performance-4tenz.3.6.2`, `ft-interactive-systems-performance-4tenz.3.5`, `ft-interactive-swarm-product-convergence-7xqz4.9.2` |
+| `alternate_screen` | `inventory.renderer_alt_screen_gap` -> `tests/renderer_golden/SCENARIOS.md` | `gap` | `SCENARIOS.md` marks `alt-screen` gap; no complete package exercises primary/alternate isolation and transition; `ft-ruona`, `ft-interactive-swarm-product-convergence-7xqz4.9.2` |
+| `selection` | `gpu_fixture.selection_char` -> `tests/golden/gpu/selection-char/meta.json`; `gpu_fixture.selection_word` -> `tests/golden/gpu/selection-word/meta.json`; `gpu_fixture.selection_line` -> `tests/golden/gpu/selection-line/meta.json` | `partial` | Static fixtures exist, but no continuous selection-drag timeline exists; `ft-ruona`, `ft-interactive-swarm-product-convergence-7xqz4.9.2` |
+| `cursor` | `gpu_fixture.cursor_beam_blink` -> `tests/golden/gpu/cursor-beam-blink/meta.json`; `gpu_fixture.cursor_beam_steady` -> `tests/golden/gpu/cursor-beam-steady/meta.json`; `gpu_fixture.cursor_block_blink` -> `tests/golden/gpu/cursor-block-blink/meta.json`; `gpu_fixture.cursor_block_steady` -> `tests/golden/gpu/cursor-block-steady/meta.json`; `gpu_fixture.cursor_underline_blink` -> `tests/golden/gpu/cursor-underline-blink/meta.json`; `gpu_fixture.cursor_underline_steady` -> `tests/golden/gpu/cursor-underline-steady/meta.json` | `direct` | none |
+| `ime` | `gpu_fixture.overlay_ime_composition` -> `tests/golden/gpu/overlay-ime-composition/meta.json` | `partial` | `input.json` sets `ime_disabled: true`; the static visual does not exercise live composition or candidate-window transitions; `ft-interactive-systems-performance-4tenz.3.6.2`, `ft-interactive-systems-performance-4tenz.3.5`, `ft-interactive-swarm-product-convergence-7xqz4.9.2`, `ft-interactive-swarm-product-convergence-7xqz4.9.5` |
+| `accessibility_geometry` | `a11y.scenario_corpus_geometry_gap` -> `docs/a11y/scenario-corpus.md` | `gap` | The five scenarios define event ordering/coalescing, not rendered cell/tree geometry or a native comparator; `ft-interactive-systems-performance-4tenz.3.5`, `ft-interactive-swarm-product-convergence-7xqz4.9.3` |
+
+Each `gpu_fixture.*` reference points to canonical package identity in
+`meta.json` and is `direct` only when sibling `input.json`, `expected.json`, and
+`golden.png` all exist. The inventory and accessibility contract sources are
+gap-basis evidence only: they authorize neither replay nor checkpoint
+comparison. No feature-evidence row satisfies the separate overlay
+materialization/terminal-state coverage requirement.
+
 `partial`, `gap`, and `present_unqualified` rows require a reason and tracking
 Bead. They cannot satisfy a native checkpoint or be promoted to `direct` by a
 consumer. The missing stress metadata is owned by `.3.6.1`; missing non-a11y
-visual fixtures remain tracked by `ft-ruona` and the product visual-corpus lane.
+visual fixtures for ligatures, images, hyperlinks, and live IME are owned by
+`.3.6.2`, while `ft-ruona` retains its explicit selection-drag and
+alternate-screen scope. Product native qualification remains in `.9.2` and
+`.9.5` rather than being inferred from either headless corpus bead.
 The renderer-level accessibility-geometry comparator gap is tracked by
 `ft-interactive-systems-performance-4tenz.3.5`; live NSAccessibility and
 VoiceOver authority remains separately owned by
@@ -482,7 +816,7 @@ enough and no binding is itself an SLO verdict.
 | `RQ-S1.resize_fps` | related only: the live requirement is a synthetic 300-frame 80↔200 dirty-row bench and no v1 native matrix cell implements that exact substrate | related-only reference |
 | `RQ-S6.heavy_burst_input_latency` | `output_overlap_resize.p050` preserves 50 panes, 1,000,000 PTY output bytes/s, and one key, but adds concurrent resize absent from the canonical SLO | related adversarial superset |
 | `RQ-S9.reflow_latency` | only `reflow_80_to_200.p001` with exactly 1,000 scrollback lines is an exact scenario candidate; larger fleets are related stress variants because the SLO does not define per-pane/aggregate fleet semantics | p001 exact candidate; larger related-only |
-| `RQ-S10.atlas_rebuild_count` | exactly 100 resize mutations, unchanged font/scale, and zero new glyphs | exact scenario predicate |
+| `RQ-S10.atlas_rebuild_count` | pure resize with exactly 100 resize mutations, unchanged base font/scale, zero new glyphs, zero output stream, zero foreground keys, no content-changing terminal action, and a non-output-overlap gesture; grid changes remain allowed | exact scenario predicate |
 | `RQ-S11.snap_back_ssim` | last-Draft provenance, exactly one snap-back-role checkpoint, independent Standard oracle at identical final dimensions/state, encoded Draft-to-Standard transition, and SSIM `>= 0.999` between the Standard snap-back subject and Standard oracle | checkpoint/oracle predicate |
 | `RQ-S13.ssim_parity_oracle_corpus` | invocation of the pinned comparator mechanism and effective policy only | comparator-mechanism reference |
 
@@ -496,14 +830,17 @@ RQ-S10 or live-resize snap-back RQ-S11.
 
 ## Workload identity
 
-Every cell declares:
+Every base cell declares shared workload identity, and every overlay supplies
+the exact phase-specific content/configuration/state bindings:
 
 - exact pane, tab, and window counts plus initial/final/checkpoint
   layout/topology manifests;
 - scrollback lines per pane;
-- terminal content-corpus IDs;
+- terminal content-corpus IDs, equal in canonical order to the exact union used
+  by the overlay distributions selected for that workload;
 - aggregate output bytes per second plus output generator ID, revision, seed,
-  payload identity, and pane-distribution policy;
+  payload identity, and a closed pane-distribution policy whose deterministic
+  expansion covers every pane and exactly sums to the aggregate;
 - exact foreground key events with logical key, modifiers, and encoded bytes;
 - exact resize-mutation and new-glyph counts;
 - separate gesture-input duration, total/settle duration, and event count;
@@ -518,41 +855,54 @@ or an anonymous count.
 
 ## Production-stage and metric contract
 
-Every scenario binds measurement contract
-`ft.renderer.measurement-contract.v1`. Its closed, ordered renderer/resize
-stage IDs are:
+Every base scenario binds measurement contract
+`ft.renderer.measurement-contract.v1`; each measurement binding also names the
+overlay it admits. Its closed, ordered renderer/resize stage IDs are:
 
-1. `native_gesture_callback`
-2. `main_thread_return`
-3. `mux_resize_dispatch`
-4. `pane_resize_apply`
-5. `terminal_lock_wait`
-6. `terminal_lock_hold`
-7. `terminal_reflow`
-8. `text_shaping`
-9. `glyph_atlas`
-10. `webgpu_encode_submit`
-11. `metal_drawable`
-12. `software_present`
-13. `display_presented`
+1. `R0.native_event_receipt`
+2. `R1.gui_return`
+3. `R2.intent_enqueue`
+4. `R3.mux_resize_dispatch`
+5. `R4.pane_resize_apply`
+6. `R5.intent_supersession`
+7. `R6.worker_create`
+8. `R7.worker_start`
+9. `R8.terminal_lock_wait`
+10. `R9.terminal_lock_hold`
+11. `R10.viewport_reflow`
+12. `R11.near_reflow`
+13. `R12.cold_reflow`
+14. `R13.first_coherent_viewport`
+15. `R14.worker_join`
+16. `R15.gui_invalidation`
+17. `R16.paint`
+18. `R17.text_shaping`
+19. `R18.glyph_raster`
+20. `R19.glyph_atlas`
+21. `R20.line_quad_reuse_rebuild`
+22. `R21.gpu_bind`
+23. `R22.gpu_upload`
+24. `R23.gpu_submit`
+25. `R24.drawable_present_request`
+26. `R25.display_completion`
 
 Output-overlap scenarios additionally bind this distinct closed K0-through-K13
-keypress sequence; `native_gesture_callback` cannot impersonate key receipt:
+keypress sequence; `R0.native_event_receipt` cannot impersonate key receipt:
 
-1. `key_appkit_receipt`
-2. `key_mapping_complete`
-3. `key_client_rpc_enqueue`
-4. `key_client_encode_socket_flush`
-5. `key_server_read_decode`
-6. `key_server_dispatch_mux_wait`
-7. `key_terminal_lock_pty_write`
-8. `key_pty_read_parser_apply`
-9. `key_server_delta_compute`
-10. `key_client_receive_apply`
-11. `key_gui_invalidation`
-12. `key_paint_shape_atlas`
-13. `key_gpu_drawable_request`
-14. `key_display_completion`
+1. `K0.key_appkit_receipt`
+2. `K1.gui_key_mapping_complete`
+3. `K2.client_rpc_enqueue`
+4. `K3.client_encode_socket_flush`
+5. `K4.server_readable_decode`
+6. `K5.server_dispatch_mux_wait`
+7. `K6.terminal_lock_pty_write_flush`
+8. `K7.pty_echo_parser_apply`
+9. `K8.server_delta_compute`
+10. `K9.client_receive_decode_apply`
+11. `K10.local_mux_gui_invalidation`
+12. `K11.paint_shape_atlas`
+13. `K12.gpu_submit_drawable_request`
+14. `K13.display_completion`
 
 Their receipt payloads retain the queue depth/oldest age, socket boundary,
 terminal-lock timing, PTY write/flush and causally downstream read/application,
@@ -571,8 +921,8 @@ WebGPU, drawable, software-present, and display-presented stages actually ran.
 
 For every duration-bearing stage and end-to-end measurement binding, retained
 artifacts include raw correlated samples, sample count, and p50/p95/p99. They
-also retain actual consecutive `display_presented` intervals. The
-`main_thread_return`, `terminal_lock_wait`, and `terminal_lock_hold` IDs remain
+also retain actual consecutive `R25.display_completion` intervals. The
+`R1.gui_return`, `R8.terminal_lock_wait`, and `R9.terminal_lock_hold` IDs remain
 separate intervals. Every stage records `allocation_count`, `allocated_bytes`,
 `copy_count`, and `copied_bytes`; every run records thread-creation count plus
 the initiating stage receipt when attributable. Missing receipts, mixed clock
@@ -606,9 +956,12 @@ The serialized measurement bindings freeze their semantics:
 `cold_reflow_convergence` applies only to a reflow gesture selected with the
 cold profile; and `snap_back` binds the last Draft/gesture-end boundary to the
 first qualifying Standard presented frame. Each binding names its exact source
-and target events or checkpoints plus the observed boundary class.
+event/checkpoint anchors, a typed `first_satisfying_observed_frame` selection,
+the semantic presented-frame predicate, and the observed boundary class. The
+all-frame stream must prove that no earlier presented observation satisfies the
+predicate; a sparse checkpoint alone cannot establish firstness.
 `keypress_to_first_correct_present` binds the catalog's exact generated key to
-its first causally correct `display_presented` frame and requires the complete
+its first causally correct `K13.display_completion` frame and requires the complete
 K0-through-K13 trace-v2 sequence frozen in
 `docs/perf/mux-long-session-performance-campaign.md` section 5.2: native receipt
 and mapping, client/server queue and transport, mux dispatch, terminal-lock and
@@ -635,7 +988,8 @@ them as driver correctness checks before a run can be admitted.
 
 ## Capabilities and unsupported states
 
-Each scenario declares the closed capability set needed by its checkpoints:
+Each scenario declares base capabilities, and every overlay declares its closed
+required-capability delta for its checkpoints:
 
 - `headless_state_oracle`
 - `gpu_visual_capture`
@@ -644,6 +998,7 @@ Each scenario declares the closed capability set needed by its checkpoints:
 - `ime_composition`
 - `accessibility_geometry`
 - `image_protocol`
+- `enabled_ligature_shaping`
 - `production_mux_domain`
 - `real_pty_stream`
 - `production_term_window`
@@ -661,14 +1016,16 @@ authority classes. A native-looking window backed by a mock mux/PTY, a generic
 GPU image, or a software present timestamp cannot satisfy the production mux,
 real PTY, Metal drawable, display, or photon requirements by inference.
 
-Requirement and availability are separate axes. `requirement` is `required`,
+Requirement and availability are separate axes on each resolved
+scenario-overlay execution. `requirement` is `required`,
 `optional`, or `not_applicable`; `availability` is `declared_available`,
 `partial`, `unsupported`, `unknown_not_probed`, or `target_dependent` with a
 typed profile reference. `declared_available` describes the checked-in
 substrate only and is not a run verdict. `partial` and `unsupported` require a
 non-empty reason and `tracking_ref`; `unknown_not_probed` remains an explicit
 gap, while `target_dependent` names the profile that resolves it. Any unresolved
-required row makes `execution_ready` false and cannot satisfy a checkpoint; an
+required row makes that overlay's execution-readiness false and cannot satisfy
+a checkpoint; an
 unresolved optional photon boundary does not. None of these availability states
 makes the scenario definition invalid. This separation records honest gaps
 without deleting the scenario, conflating applicability with support, or
@@ -678,24 +1035,33 @@ Capability derivation is exact rather than advisory:
 
 | Scenario/content condition | Derived capability requirement |
 |---|---|
-| Every native scenario | `headless_state_oracle`, `gpu_visual_capture`, `production_mux_domain`, `real_pty_stream`, `production_term_window`, `production_renderer_backend`, `metal_drawable_capture`, `software_present_boundary`, and `display_presentation_boundary` are required |
+| Every native overlay execution | `headless_state_oracle`, `gpu_visual_capture`, `production_mux_domain`, `real_pty_stream`, `production_term_window`, `production_renderer_backend`, `metal_drawable_capture`, `software_present_boundary`, and `display_presentation_boundary` are required |
 | Resize, zoom, or live-resize gesture | `native_window_gesture` is required |
 | DPI/display move | `native_display_move` is required |
 | Output-overlap resize | `native_key_injection` is required |
-| IME, image, accessibility, or color-profile content/state | The corresponding capability is required |
+| IME, image, accessibility, or color-profile content/state in an overlay | The corresponding capability is required for that overlay |
+| Ligature-enabled overlay | `enabled_ligature_shaping` is required together with ligature-bearing input and the pinned renderer/font-feature configuration |
 | HDR/EDR output requested | `hdr_edr_output` is required; recording an SDR state alone does not require it |
 | Every v1 scenario | `display_photon_boundary` is optional; it cannot support a photon claim unless a later typed opt-in profile makes it required and supplies a detector |
 
-Capability requirements are derived from every content corpus and complete
-pane-state manifest used by the scenario. IME, image-protocol, and
-accessibility content therefore cannot be hidden in a non-focused pane while
-declaring the corresponding capability `not_applicable`.
+Capability requirements are derived separately for every overlay from its
+materialized content, complete pane-state manifest, and renderer-configuration
+profile. IME, image-protocol, accessibility state, or enabled ligature shaping
+therefore cannot be hidden in a non-focused pane or copied feature list while
+declaring the corresponding substrate `not_applicable`. An incompatibility can
+exclude an overlay from one measurement binding, but cannot erase that
+gesture-by-fleet cell's coverage obligation.
 
 The validation report exposes definition validity and execution readiness as
-separate verdicts. A structurally and semantically valid catalog may still have
-`execution_ready: false`; every unresolved required capability and every
-unavailable native checkpoint contributes a typed readiness gap. Consumers
-must not interpret `valid: true` as runnable, supported, or green.
+separate per-overlay verdicts. Root aggregation uses two unambiguous fields:
+`production_default_execution_ready` reflects only the base production-default
+overlay, while `coverage_suite_execution_ready` is true only when every required
+overlay is ready. Every unresolved required capability, unavailable
+materialization step, and unavailable native checkpoint contributes a typed
+readiness gap to the affected overlay and the coverage-suite aggregate, but it
+does not falsely make the production-default overlay unrunnable. Consumers must
+not interpret `valid: true`, production-default readiness, or one ready overlay
+as complete feature coverage, support, or green.
 
 ### Accessibility scope
 
@@ -758,10 +1124,10 @@ bindings:
 | `blank_frame_after_nonblank` | `nonblank_after_baseline` | `RSC-CONTROL-012` |
 | `mixed_generation_tear_band` | `no_mixed_generation_tear_band` | `RSC-CONTROL-013` |
 
-Each serialized control also names an exact scenario ID, checkpoint ID,
-injected phase, bound detector ID, and any required terminal feature.
-The validator proves that the checkpoint belongs to the scenario, its phase and
-detector applicability agrees, and the scenario actually contains the
+Each serialized control also names an exact scenario ID, overlay ID, checkpoint
+ID, injected phase, bound detector ID, and any required terminal feature.
+The validator proves that the checkpoint belongs to the resolved overlay, its
+phase and detector applicability agrees, and the overlay actually contains the
 prerequisite feature. Detector IDs are reusable classes across the 32 cells,
 not globally unique injection targets. State invariants remain a distinct
 phase-applicability model. This contract proves only that definitions are
@@ -771,12 +1137,14 @@ rig/event/clock/artifact/teardown canaries.
 
 ## Structured run vocabulary
 
-Later runners must log `scenario_id`, `phase`, `event_ordinal`,
+Later runners must log `scenario_id`, `overlay_id`, overlay/materialization and
+renderer-configuration profile revisions, `phase`, `event_ordinal`,
 `expected_invariant_id` where applicable, `expected_detector_id`, detector
 scope and nonlocal endpoints where applicable, and `detector_result` for every
 detector. Retained run artifacts must also name
 catalog revision, seed, target identity, selected cadence and preconditioning
-profile IDs, actual refresh/VRR/frame phase, observed presentation-boundary
+profile IDs, exact ordered materialization identity, actual
+refresh/VRR/frame phase, observed presentation-boundary
 class, precondition receipt, bundle and renderer identity, corpus hashes,
 checkpoint artifacts, canary outcomes, and capability verdicts. This v1
 catalog contains none of those verdicts.
@@ -799,8 +1167,8 @@ negative-evidence ledger:
 ```bash
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec \
   --base <exact-candidate-sha> --clean-overlay --no-overlay -- \
-  env CARGO_TARGET_DIR=/tmp/ft-4tenz-3-1-audit-types-test \
-  cargo test -p frankenterm-core-audit-types --lib renderer_scenario_catalog
+  env CARGO_TARGET_DIR=/tmp/ft-4tenz-3-1-audit-types-check \
+  cargo check -p frankenterm-core-audit-types --all-targets
 
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec \
   --base <exact-candidate-sha> --clean-overlay --no-overlay -- \

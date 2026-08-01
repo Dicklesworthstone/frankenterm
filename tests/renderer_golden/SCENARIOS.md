@@ -40,6 +40,26 @@ under this catalog must conform to the same fixture format
 | 17 | `cjk-mixed` | `text-cjk-mixed` | shipped | — | — |
 | 18 | `screen-reader-active` | a11y event-stream + native comparator contract (`gpu_regression_fuzz_report.rs`) | headless-shipped | — | — |
 
+### resize-step
+
+Stable reference anchor for scenario-index row 5. Its status remains
+`partial`; this anchor does not promote it to an exact native resize sequence.
+
+### resize-burst
+
+Stable reference anchor for scenario-index row 6. Its status remains `gap`;
+this anchor supplies identity only, not replay or checkpoint authority.
+
+### dpi-change
+
+Stable reference anchor for scenario-index row 11. Its status remains `gap`;
+the catalog still lacks a native display-transition capture.
+
+### font-change
+
+Stable reference anchor for scenario-index row 12. Its status remains `gap`;
+the catalog still lacks a native zoom checkpoint sequence.
+
 Status legend:
 
 - **shipped** — fixture exists, golden captured, runs in CI today

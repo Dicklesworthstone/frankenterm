@@ -1,0 +1,2863 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-renderer-scenario-catalog.json",
+  "title": "FrankenTerm Renderer Scenario Catalog",
+  "description": "Closed, contract-only Draft 2020-12 schema for the deterministic 32-cell renderer resize, zoom, display-move, and output-overlap scenario catalog. Schema validity does not assert execution, native-target support, visual quality, accessibility support, or performance qualification.",
+  "type": "object",
+  "required": [
+    "contract_id",
+    "schema_version",
+    "catalog_revision",
+    "source_bead_id",
+    "authority",
+    "oracle_contracts",
+    "run_observation_contracts",
+    "accessibility_authority_boundary",
+    "content_corpus_references",
+    "evidence_sources",
+    "feature_evidence_bindings",
+    "workloads",
+    "renderer_config_profiles",
+    "layout_profiles",
+    "surface_state_templates",
+    "content_distribution_profiles",
+    "phase_manifests",
+    "coverage_overlay_profiles",
+    "detector_contracts",
+    "presentation_target_profiles",
+    "preconditioning_profiles",
+    "driver_canaries",
+    "rq_s1_synthetic_substrate",
+    "gesture_authority_map",
+    "legacy_mappings",
+    "negative_controls",
+    "scenarios"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "contract_id": {
+      "type": "string",
+      "const": "ft.renderer_scenario_catalog.v1"
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "catalog_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "source_bead_id": {
+      "type": "string",
+      "const": "ft-interactive-systems-performance-4tenz.3.1"
+    },
+    "authority": {
+      "type": "string",
+      "const": "contract_only"
+    },
+    "oracle_contracts": { "$ref": "#/$defs/oracle_contracts" },
+    "run_observation_contracts": { "$ref": "#/$defs/run_observation_contracts" },
+    "accessibility_authority_boundary": { "$ref": "#/$defs/accessibility_authority_boundary" },
+    "content_corpus_references": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/content_corpus_reference" }
+    },
+    "evidence_sources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/evidence_source" }
+    },
+    "feature_evidence_bindings": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": { "$ref": "#/$defs/feature_evidence_binding" }
+    },
+    "workloads": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/workload_definition" }
+    },
+    "renderer_config_profiles": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/config_profile" }
+    },
+    "layout_profiles": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/layout_profile" }
+    },
+    "surface_state_templates": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2048,
+      "items": { "$ref": "#/$defs/surface_state_template" }
+    },
+    "content_distribution_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2048,
+      "items": { "$ref": "#/$defs/content_distribution_profile" }
+    },
+    "phase_manifests": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8192,
+      "items": { "$ref": "#/$defs/phase_manifest" }
+    },
+    "coverage_overlay_profiles": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/coverage_overlay_profile" }
+    },
+    "detector_contracts": {
+      "type": "array",
+      "minItems": 20,
+      "maxItems": 20,
+      "items": { "$ref": "#/$defs/detector_contract" }
+    },
+    "presentation_target_profiles": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/presentation_target_profile" }
+    },
+    "preconditioning_profiles": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/preconditioning_profile" }
+    },
+    "driver_canaries": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": { "$ref": "#/$defs/driver_canary_definition" }
+    },
+    "rq_s1_synthetic_substrate": {
+      "oneOf": [
+        { "$ref": "#/$defs/rq_s1_synthetic_substrate" },
+        { "type": "null" }
+      ]
+    },
+    "gesture_authority_map": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/gesture_authority_entry" }
+    },
+    "legacy_mappings": {
+      "type": "array",
+      "minItems": 14,
+      "maxItems": 14,
+      "items": { "$ref": "#/$defs/legacy_scenario_mapping" }
+    },
+    "negative_controls": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": { "$ref": "#/$defs/negative_control_definition" }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 32,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/scenario_definition" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "nonempty_text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "repository_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "tracking_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "u16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "positive_u16": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "positive_u32": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "positive_u64": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "i64": {
+      "type": "integer",
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "gesture": {
+      "type": "string",
+      "enum": [
+        "same_grid_drag",
+        "grid_changing_drag",
+        "reflow_80_to_200",
+        "reflow_200_to_80",
+        "zoom_in",
+        "zoom_out",
+        "dpi_display_move",
+        "output_overlap_resize"
+      ]
+    },
+    "fleet_point": {
+      "type": "string",
+      "enum": ["p001", "p020", "p050", "p200"]
+    },
+    "terminal_feature": {
+      "type": "string",
+      "enum": [
+        "ascii",
+        "cjk",
+        "rtl",
+        "combining_marks",
+        "emoji",
+        "ligatures",
+        "images",
+        "hyperlinks",
+        "alternate_screen",
+        "selection",
+        "cursor",
+        "ime",
+        "accessibility_geometry"
+      ]
+    },
+    "capability": {
+      "type": "string",
+      "enum": [
+        "headless_state_oracle",
+        "gpu_visual_capture",
+        "native_window_gesture",
+        "native_display_move",
+        "ime_composition",
+        "accessibility_geometry",
+        "image_protocol",
+        "production_mux_domain",
+        "real_pty_stream",
+        "production_term_window",
+        "production_renderer_backend",
+        "metal_drawable_capture",
+        "software_present_boundary",
+        "display_presentation_boundary",
+        "display_photon_boundary",
+        "native_key_injection",
+        "native_color_profile",
+        "hdr_edr_output",
+        "enabled_ligature_shaping"
+      ]
+    },
+    "capability_requirement": {
+      "type": "string",
+      "enum": ["required", "optional", "not_applicable"]
+    },
+    "capability_availability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": { "status": { "const": "declared_available" } }
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "partial" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "unknown_not_probed" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["status", "target_profile_ref", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "target_dependent" },
+            "target_profile_ref": { "$ref": "#/$defs/repository_ref" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "unsupported" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        }
+      ]
+    },
+    "capability_binding": {
+      "type": "object",
+      "required": ["capability", "requirement", "availability"],
+      "additionalProperties": false,
+      "properties": {
+        "capability": { "$ref": "#/$defs/capability" },
+        "requirement": { "$ref": "#/$defs/capability_requirement" },
+        "availability": { "$ref": "#/$defs/capability_availability" }
+      }
+    },
+    "timeline_phase": {
+      "type": "string",
+      "enum": ["begin", "mutation", "end", "snap_back", "settle"]
+    },
+    "grid_state": {
+      "type": "object",
+      "required": ["columns", "rows"],
+      "additionalProperties": false,
+      "properties": {
+        "columns": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "rows": { "type": "integer", "minimum": 1, "maximum": 4096 }
+      }
+    },
+    "font_state": {
+      "type": "object",
+      "required": [
+        "font_id",
+        "pinned_font_ref",
+        "base_size_milli_points",
+        "scale_milli",
+        "base_cell_width_milli_px",
+        "base_cell_height_milli_px",
+        "metric_reference_dpi_milli",
+        "metric_derivation_revision"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "font_id": { "$ref": "#/$defs/identifier" },
+        "pinned_font_ref": { "$ref": "#/$defs/repository_ref" },
+        "base_size_milli_points": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512000
+        },
+        "scale_milli": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32000
+        },
+        "base_cell_width_milli_px": { "$ref": "#/$defs/positive_u32" },
+        "base_cell_height_milli_px": { "$ref": "#/$defs/positive_u32" },
+        "metric_reference_dpi_milli": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4000000
+        },
+        "metric_derivation_revision": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "config_authority": {
+      "type": "string",
+      "enum": ["bundled_production_default", "feature_maximal_non_default"]
+    },
+    "ligature_feature_state": {
+      "type": "object",
+      "required": ["calt_enabled", "clig_enabled", "liga_enabled"],
+      "additionalProperties": false,
+      "properties": {
+        "calt_enabled": { "type": "boolean" },
+        "clig_enabled": { "type": "boolean" },
+        "liga_enabled": { "type": "boolean" }
+      }
+    },
+    "configuration_availability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": { "status": { "const": "available" } }
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_refs"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "unavailable" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_refs": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "items": { "$ref": "#/$defs/tracking_ref" }
+            }
+          }
+        }
+      ]
+    },
+    "config_profile": {
+      "type": "object",
+      "required": [
+        "renderer_config_profile_id",
+        "profile_revision",
+        "repository_ref",
+        "authority",
+        "ligature_features",
+        "availability"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "renderer_config_profile_id": { "$ref": "#/$defs/identifier" },
+        "profile_revision": { "$ref": "#/$defs/positive_u32" },
+        "repository_ref": { "$ref": "#/$defs/repository_ref" },
+        "authority": { "$ref": "#/$defs/config_authority" },
+        "ligature_features": { "$ref": "#/$defs/ligature_feature_state" },
+        "availability": { "$ref": "#/$defs/configuration_availability" }
+      }
+    },
+    "dynamic_range_mode": {
+      "type": "string",
+      "enum": ["sdr", "hdr"]
+    },
+    "display_state": {
+      "type": "object",
+      "required": [
+        "display_id",
+        "dpi_milli",
+        "scale_factor_milli",
+        "color_space_id",
+        "color_profile_ref",
+        "dynamic_range_mode",
+        "edr_available",
+        "edr_headroom_milli",
+        "viewport_width_px",
+        "viewport_height_px",
+        "content_padding_left_px",
+        "content_padding_top_px",
+        "content_padding_right_px",
+        "content_padding_bottom_px"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "display_id": { "$ref": "#/$defs/identifier" },
+        "dpi_milli": { "type": "integer", "minimum": 1, "maximum": 4000000 },
+        "scale_factor_milli": { "type": "integer", "minimum": 1, "maximum": 32000 },
+        "color_space_id": { "$ref": "#/$defs/identifier" },
+        "color_profile_ref": { "$ref": "#/$defs/repository_ref" },
+        "dynamic_range_mode": { "$ref": "#/$defs/dynamic_range_mode" },
+        "edr_available": { "type": "boolean" },
+        "edr_headroom_milli": { "$ref": "#/$defs/positive_u32" },
+        "viewport_width_px": { "type": "integer", "minimum": 1, "maximum": 131072 },
+        "viewport_height_px": { "type": "integer", "minimum": 1, "maximum": 131072 },
+        "content_padding_left_px": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 131072
+        },
+        "content_padding_top_px": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 131072
+        },
+        "content_padding_right_px": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 131072
+        },
+        "content_padding_bottom_px": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 131072
+        }
+      }
+    },
+    "display_transition": {
+      "type": "object",
+      "required": [
+        "display_id",
+        "dpi_milli",
+        "scale_factor_milli",
+        "color_space_id",
+        "color_profile_ref",
+        "dynamic_range_mode",
+        "edr_available",
+        "edr_headroom_milli"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "display_id": { "$ref": "#/$defs/identifier" },
+        "dpi_milli": { "type": "integer", "minimum": 1, "maximum": 4000000 },
+        "scale_factor_milli": { "type": "integer", "minimum": 1, "maximum": 32000 },
+        "color_space_id": { "$ref": "#/$defs/identifier" },
+        "color_profile_ref": { "$ref": "#/$defs/repository_ref" },
+        "dynamic_range_mode": { "$ref": "#/$defs/dynamic_range_mode" },
+        "edr_available": { "type": "boolean" },
+        "edr_headroom_milli": { "$ref": "#/$defs/positive_u32" }
+      }
+    },
+    "pixel_rect": {
+      "type": "object",
+      "required": ["x", "y", "width", "height"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "y": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "width": { "type": "integer", "minimum": 1, "maximum": 131072 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 131072 }
+      }
+    },
+    "pixel_coordinate_space": {
+      "type": "string",
+      "enum": ["window_drawable", "virtual_display"]
+    },
+    "ime_candidate_window_geometry": {
+      "type": "object",
+      "required": ["coordinate_space", "rect"],
+      "additionalProperties": false,
+      "properties": {
+        "coordinate_space": { "$ref": "#/$defs/pixel_coordinate_space" },
+        "rect": { "$ref": "#/$defs/pixel_rect" }
+      }
+    },
+    "cell_coordinate": {
+      "type": "object",
+      "required": ["row", "column"],
+      "additionalProperties": false,
+      "properties": {
+        "row": { "$ref": "#/$defs/u16" },
+        "column": { "$ref": "#/$defs/u16" }
+      }
+    },
+    "selection_granularity": {
+      "type": "string",
+      "enum": ["character", "word", "line"]
+    },
+    "selection_state": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state"],
+          "additionalProperties": false,
+          "properties": { "state": { "const": "inactive" } }
+        },
+        {
+          "type": "object",
+          "required": ["state", "granularity", "anchor", "focus"],
+          "additionalProperties": false,
+          "properties": {
+            "state": { "const": "active" },
+            "granularity": { "$ref": "#/$defs/selection_granularity" },
+            "anchor": { "$ref": "#/$defs/cell_coordinate" },
+            "focus": { "$ref": "#/$defs/cell_coordinate" }
+          }
+        }
+      ]
+    },
+    "cursor_shape": {
+      "type": "string",
+      "enum": ["block", "beam", "underline"]
+    },
+    "cursor_blink_phase": {
+      "type": "string",
+      "enum": ["steady", "on", "off"]
+    },
+    "cursor_state": {
+      "type": "object",
+      "required": ["shape", "visible", "blink_phase", "row", "column"],
+      "additionalProperties": false,
+      "properties": {
+        "shape": { "$ref": "#/$defs/cursor_shape" },
+        "visible": { "type": "boolean" },
+        "blink_phase": { "$ref": "#/$defs/cursor_blink_phase" },
+        "row": { "$ref": "#/$defs/u16" },
+        "column": { "$ref": "#/$defs/u16" }
+      }
+    },
+    "ime_composition_segment": {
+      "type": "object",
+      "required": ["segment_id", "start", "end", "selected"],
+      "additionalProperties": false,
+      "properties": {
+        "segment_id": { "$ref": "#/$defs/identifier" },
+        "start": { "$ref": "#/$defs/cell_coordinate" },
+        "end": { "$ref": "#/$defs/cell_coordinate" },
+        "selected": { "type": "boolean" }
+      }
+    },
+    "ime_state": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state"],
+          "additionalProperties": false,
+          "properties": { "state": { "const": "inactive" } }
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "preedit_content_corpus_id",
+            "preedit_origin",
+            "caret",
+            "input_source_id",
+            "composition_segments",
+            "candidate_window_geometry"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "state": { "const": "composing" },
+            "preedit_content_corpus_id": { "$ref": "#/$defs/identifier" },
+            "preedit_origin": { "$ref": "#/$defs/cell_coordinate" },
+            "caret": { "$ref": "#/$defs/cell_coordinate" },
+            "input_source_id": { "$ref": "#/$defs/identifier" },
+            "composition_segments": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "items": { "$ref": "#/$defs/ime_composition_segment" }
+            },
+            "candidate_window_geometry": {
+              "oneOf": [
+                { "$ref": "#/$defs/ime_candidate_window_geometry" },
+                { "type": "null" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "inline_image_geometry": {
+      "type": "object",
+      "required": ["image_id", "cell_start", "cell_end", "pixel_rect"],
+      "additionalProperties": false,
+      "properties": {
+        "image_id": { "$ref": "#/$defs/identifier" },
+        "cell_start": { "$ref": "#/$defs/cell_coordinate" },
+        "cell_end": { "$ref": "#/$defs/cell_coordinate" },
+        "pixel_rect": { "$ref": "#/$defs/pixel_rect" }
+      }
+    },
+    "hyperlink_geometry": {
+      "type": "object",
+      "required": ["hyperlink_id", "cell_start", "cell_end", "pixel_rect"],
+      "additionalProperties": false,
+      "properties": {
+        "hyperlink_id": { "$ref": "#/$defs/identifier" },
+        "cell_start": { "$ref": "#/$defs/cell_coordinate" },
+        "cell_end": { "$ref": "#/$defs/cell_coordinate" },
+        "pixel_rect": { "$ref": "#/$defs/pixel_rect" }
+      }
+    },
+    "accessibility_node_geometry": {
+      "type": "object",
+      "required": ["node_id", "role_id", "cell_start", "cell_end", "pixel_rect", "focused"],
+      "additionalProperties": false,
+      "properties": {
+        "node_id": { "$ref": "#/$defs/identifier" },
+        "role_id": { "$ref": "#/$defs/identifier" },
+        "cell_start": { "$ref": "#/$defs/cell_coordinate" },
+        "cell_end": { "$ref": "#/$defs/cell_coordinate" },
+        "pixel_rect": { "$ref": "#/$defs/pixel_rect" },
+        "focused": { "type": "boolean" }
+      }
+    },
+    "accessibility_geometry_state": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["state"],
+          "additionalProperties": false,
+          "properties": { "state": { "const": "inactive" } }
+        },
+        {
+          "type": "object",
+          "required": ["state", "tree_revision", "nodes", "caret_rect"],
+          "additionalProperties": false,
+          "properties": {
+            "state": { "const": "active" },
+            "tree_revision": { "$ref": "#/$defs/u64" },
+            "nodes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 4096,
+              "items": { "$ref": "#/$defs/accessibility_node_geometry" }
+            },
+            "caret_rect": {
+              "oneOf": [
+                { "$ref": "#/$defs/pixel_rect" },
+                { "type": "null" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "terminal_buffer_kind": {
+      "type": "string",
+      "enum": ["primary", "alternate"]
+    },
+    "terminal_buffer_state": {
+      "type": "object",
+      "required": ["buffer_id", "revision", "content_corpus_ids", "scrollback_lines"],
+      "additionalProperties": false,
+      "properties": {
+        "buffer_id": { "$ref": "#/$defs/identifier" },
+        "revision": { "$ref": "#/$defs/u64" },
+        "content_corpus_ids": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "scrollback_lines": { "$ref": "#/$defs/u32" }
+      }
+    },
+    "terminal_mode_state": {
+      "type": "object",
+      "required": [
+        "viewport_top",
+        "active_buffer",
+        "primary_buffer",
+        "alternate_buffer",
+        "selection",
+        "cursor",
+        "ime",
+        "inline_images",
+        "hyperlinks",
+        "accessibility_geometry"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "viewport_top": { "$ref": "#/$defs/i64" },
+        "active_buffer": { "$ref": "#/$defs/terminal_buffer_kind" },
+        "primary_buffer": { "$ref": "#/$defs/terminal_buffer_state" },
+        "alternate_buffer": { "$ref": "#/$defs/terminal_buffer_state" },
+        "selection": { "$ref": "#/$defs/selection_state" },
+        "cursor": { "$ref": "#/$defs/cursor_state" },
+        "ime": { "$ref": "#/$defs/ime_state" },
+        "inline_images": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/inline_image_geometry" }
+        },
+        "hyperlinks": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/hyperlink_geometry" }
+        },
+        "accessibility_geometry": { "$ref": "#/$defs/accessibility_geometry_state" }
+      }
+    },
+    "resize_mode": {
+      "type": "string",
+      "enum": ["same_grid", "grid_changing"]
+    },
+    "quality_mode": {
+      "type": "string",
+      "enum": ["draft", "standard", "fancy"]
+    },
+    "surface_state": {
+      "type": "object",
+      "required": [
+        "renderer_generation",
+        "grid_revision",
+        "terminal_revision",
+        "renderer_config_profile_id",
+        "quality_mode",
+        "grid",
+        "font",
+        "display",
+        "terminal"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "renderer_generation": { "$ref": "#/$defs/u64" },
+        "grid_revision": { "$ref": "#/$defs/u64" },
+        "terminal_revision": { "$ref": "#/$defs/u64" },
+        "renderer_config_profile_id": { "$ref": "#/$defs/identifier" },
+        "quality_mode": { "$ref": "#/$defs/quality_mode" },
+        "grid": { "$ref": "#/$defs/grid_state" },
+        "font": { "$ref": "#/$defs/font_state" },
+        "display": { "$ref": "#/$defs/display_state" },
+        "terminal": { "$ref": "#/$defs/terminal_mode_state" }
+      }
+    },
+    "mutation_target": {
+      "type": "object",
+      "required": ["window_id", "tab_id", "affected_pane_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "window_id": { "$ref": "#/$defs/identifier" },
+        "tab_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "type": "null" }
+          ]
+        },
+        "affected_pane_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 200,
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      }
+    },
+    "timeline_action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "gesture_begin" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target", "width_px", "height_px"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_window_size" },
+            "target": { "$ref": "#/$defs/mutation_target" },
+            "width_px": { "type": "integer", "minimum": 1, "maximum": 131072 },
+            "height_px": { "type": "integer", "minimum": 1, "maximum": 131072 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target", "columns", "rows"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_grid" },
+            "target": { "$ref": "#/$defs/mutation_target" },
+            "columns": { "type": "integer", "minimum": 1, "maximum": 4096 },
+            "rows": { "type": "integer", "minimum": 1, "maximum": 4096 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target", "scale_milli"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_font_scale" },
+            "target": { "$ref": "#/$defs/mutation_target" },
+            "scale_milli": { "type": "integer", "minimum": 1, "maximum": 32000 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target", "mode"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_quality_mode" },
+            "target": { "$ref": "#/$defs/mutation_target" },
+            "mode": { "$ref": "#/$defs/quality_mode" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target", "display"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "move_to_display" },
+            "target": { "$ref": "#/$defs/mutation_target" },
+            "display": { "$ref": "#/$defs/display_transition" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "stream_id", "bytes_per_second"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_output_rate" },
+            "stream_id": { "$ref": "#/$defs/identifier" },
+            "bytes_per_second": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10000000000
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "key_event_id"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "foreground_key" },
+            "key_event_id": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "target",
+            "renderer_generation",
+            "grid_revision",
+            "terminal_revision"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_revisions" },
+            "target": { "$ref": "#/$defs/mutation_target" },
+            "renderer_generation": { "$ref": "#/$defs/u64" },
+            "grid_revision": { "$ref": "#/$defs/u64" },
+            "terminal_revision": { "$ref": "#/$defs/u64" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "gesture_end" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "settle" } }
+        }
+      ]
+    },
+    "timeline_event": {
+      "type": "object",
+      "required": ["event_ordinal", "at_us", "phase", "actions"],
+      "additionalProperties": false,
+      "properties": {
+        "event_ordinal": { "$ref": "#/$defs/u32" },
+        "at_us": { "$ref": "#/$defs/u64" },
+        "phase": { "$ref": "#/$defs/timeline_phase" },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "items": { "$ref": "#/$defs/timeline_action" }
+        }
+      }
+    },
+    "expected_invariant": {
+      "type": "object",
+      "required": ["invariant_id", "applicable_phases", "oracle_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "invariant_id": { "$ref": "#/$defs/identifier" },
+        "applicable_phases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/timeline_phase" }
+        },
+        "oracle_ref": { "$ref": "#/$defs/repository_ref" }
+      }
+    },
+    "checkpoint_role": {
+      "type": "string",
+      "enum": [
+        "initial_baseline",
+        "last_draft_provenance",
+        "intermediate",
+        "standard_snap_back_subject",
+        "final_steady_state"
+      ]
+    },
+    "frame_content_class": {
+      "type": "string",
+      "enum": [
+        "nonblank_baseline",
+        "nonblank_transient",
+        "nonblank_standard_snap_back",
+        "nonblank_steady_state"
+      ]
+    },
+    "coverage_overlay_id": {
+      "type": "string",
+      "enum": [
+        "production_default",
+        "unicode_maximal",
+        "alternate_screen",
+        "ime_composing",
+        "image_hyperlink",
+        "ligature_enabled",
+        "selection",
+        "a11y_geometry"
+      ]
+    },
+    "split_direction": {
+      "type": "string",
+      "enum": ["horizontal", "vertical"]
+    },
+    "layout_derivation": {
+      "type": "string",
+      "const": "balanced_contiguous_v1"
+    },
+    "layout_profile": {
+      "type": "object",
+      "required": [
+        "layout_profile_id",
+        "fleet_point",
+        "derivation",
+        "stable_id_revision",
+        "pane_count",
+        "tab_count",
+        "window_count",
+        "initial_split_direction",
+        "split_ratio_milli",
+        "alternate_split_direction",
+        "lowest_ordinal_gets_remainder"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "layout_profile_id": { "$ref": "#/$defs/identifier" },
+        "fleet_point": { "$ref": "#/$defs/fleet_point" },
+        "derivation": { "$ref": "#/$defs/layout_derivation" },
+        "stable_id_revision": { "$ref": "#/$defs/identifier" },
+        "pane_count": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "tab_count": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "window_count": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "initial_split_direction": { "$ref": "#/$defs/split_direction" },
+        "split_ratio_milli": { "type": "integer", "minimum": 1, "maximum": 999 },
+        "alternate_split_direction": { "type": "boolean" },
+        "lowest_ordinal_gets_remainder": { "type": "boolean" }
+      }
+    },
+    "surface_state_template": {
+      "type": "object",
+      "required": ["surface_state_template_id", "surface_state"],
+      "additionalProperties": false,
+      "properties": {
+        "surface_state_template_id": { "$ref": "#/$defs/identifier" },
+        "surface_state": { "$ref": "#/$defs/surface_state" }
+      }
+    },
+    "pane_ordinal_selector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "all" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "start", "end_exclusive"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "ordinal_range" },
+            "start": { "type": "integer", "minimum": 0, "maximum": 199 },
+            "end_exclusive": { "type": "integer", "minimum": 1, "maximum": 200 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "ordinals"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "explicit" },
+            "ordinals": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 32,
+              "items": { "type": "integer", "minimum": 0, "maximum": 199 }
+            }
+          }
+        }
+      ]
+    },
+    "content_composition_operation": {
+      "type": "string",
+      "enum": [
+        "replace_active_buffer",
+        "append_to_active_buffer",
+        "enter_alternate_buffer",
+        "exit_alternate_buffer",
+        "apply_typed_state_overlay"
+      ]
+    },
+    "content_application_boundary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "before_gesture" } }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "event_ordinal"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "at_event" },
+            "event_ordinal": { "$ref": "#/$defs/u32" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "checkpoint_id"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "after_checkpoint" },
+            "checkpoint_id": { "$ref": "#/$defs/identifier" }
+          }
+        }
+      ]
+    },
+    "content_input_availability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": { "status": { "const": "available" } }
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_refs"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "unavailable" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_refs": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "items": { "$ref": "#/$defs/tracking_ref" }
+            }
+          }
+        }
+      ]
+    },
+    "content_materialization_step": {
+      "type": "object",
+      "required": [
+        "step_ordinal",
+        "content_corpus_id",
+        "operation",
+        "application_boundary",
+        "hold_through_checkpoint_ids",
+        "availability"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "step_ordinal": { "$ref": "#/$defs/u16" },
+        "content_corpus_id": { "$ref": "#/$defs/identifier" },
+        "operation": { "$ref": "#/$defs/content_composition_operation" },
+        "application_boundary": { "$ref": "#/$defs/content_application_boundary" },
+        "hold_through_checkpoint_ids": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "availability": { "$ref": "#/$defs/content_input_availability" }
+      }
+    },
+    "content_distribution_assignment": {
+      "type": "object",
+      "required": ["selector", "materialization_steps"],
+      "additionalProperties": false,
+      "properties": {
+        "selector": { "$ref": "#/$defs/pane_ordinal_selector" },
+        "materialization_steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/content_materialization_step" }
+        }
+      }
+    },
+    "content_distribution_profile": {
+      "type": "object",
+      "required": [
+        "content_distribution_profile_id",
+        "profile_revision",
+        "fleet_point",
+        "assignments"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "content_distribution_profile_id": { "$ref": "#/$defs/identifier" },
+        "profile_revision": { "$ref": "#/$defs/positive_u32" },
+        "fleet_point": { "$ref": "#/$defs/fleet_point" },
+        "assignments": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 200,
+          "items": { "$ref": "#/$defs/content_distribution_assignment" }
+        }
+      }
+    },
+    "pane_output_state": {
+      "type": "object",
+      "required": ["stream_id", "bytes_per_second"],
+      "additionalProperties": false,
+      "properties": {
+        "stream_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/identifier" },
+            { "type": "null" }
+          ]
+        },
+        "bytes_per_second": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000000000
+        }
+      }
+    },
+    "phase_pane_override": {
+      "type": "object",
+      "required": ["selector", "surface_state_template_id", "output"],
+      "additionalProperties": false,
+      "properties": {
+        "selector": { "$ref": "#/$defs/pane_ordinal_selector" },
+        "surface_state_template_id": { "$ref": "#/$defs/identifier" },
+        "output": { "$ref": "#/$defs/pane_output_state" }
+      }
+    },
+    "phase_window_state": {
+      "type": "object",
+      "required": ["window_ordinal", "active_tab_ordinal", "window_rect"],
+      "additionalProperties": false,
+      "properties": {
+        "window_ordinal": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "active_tab_ordinal": { "type": "integer", "minimum": 0, "maximum": 15 },
+        "window_rect": { "$ref": "#/$defs/pixel_rect" }
+      }
+    },
+    "phase_manifest": {
+      "type": "object",
+      "required": [
+        "phase_manifest_id",
+        "phase",
+        "event_ordinal",
+        "overlay_id",
+        "layout_profile_id",
+        "default_surface_state_template_id",
+        "content_distribution_profile_id",
+        "focused_window_ordinal",
+        "focused_pane_ordinal",
+        "window_states",
+        "default_output",
+        "pane_overrides"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "phase_manifest_id": { "$ref": "#/$defs/identifier" },
+        "phase": { "$ref": "#/$defs/timeline_phase" },
+        "event_ordinal": { "$ref": "#/$defs/u32" },
+        "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+        "layout_profile_id": { "$ref": "#/$defs/identifier" },
+        "default_surface_state_template_id": { "$ref": "#/$defs/identifier" },
+        "content_distribution_profile_id": { "$ref": "#/$defs/identifier" },
+        "focused_window_ordinal": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "focused_pane_ordinal": { "type": "integer", "minimum": 0, "maximum": 199 },
+        "window_states": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/phase_window_state" }
+        },
+        "default_output": { "$ref": "#/$defs/pane_output_state" },
+        "pane_overrides": {
+          "type": "array",
+          "maxItems": 200,
+          "items": { "$ref": "#/$defs/phase_pane_override" }
+        }
+      }
+    },
+    "overlay_exclusion_reason": {
+      "type": "string",
+      "enum": [
+        "ime_may_consume_or_transform_foreground_key",
+        "alternate_screen_conflicts_with_primary_scrollback"
+      ]
+    },
+    "requirement_id": {
+      "type": "string",
+      "enum": [
+        "RQ-S1.resize_fps",
+        "RQ-S6.heavy_burst_input_latency",
+        "RQ-S9.reflow_latency",
+        "RQ-S10.atlas_rebuild_count",
+        "RQ-S11.snap_back_ssim",
+        "RQ-S13.ssim_parity_oracle_corpus"
+      ]
+    },
+    "measurement_role": {
+      "type": "string",
+      "enum": [
+        "first_correct_viewport",
+        "steady_presented_fps",
+        "cold_reflow_convergence",
+        "snap_back",
+        "keypress_to_first_correct_present"
+      ]
+    },
+    "overlay_qualification_target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["target_kind", "requirement_id"],
+          "additionalProperties": false,
+          "properties": {
+            "target_kind": { "const": "requirement" },
+            "requirement_id": { "$ref": "#/$defs/requirement_id" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["target_kind", "measurement_role"],
+          "additionalProperties": false,
+          "properties": {
+            "target_kind": { "const": "measurement" },
+            "measurement_role": { "$ref": "#/$defs/measurement_role" }
+          }
+        }
+      ]
+    },
+    "overlay_qualification_exclusion": {
+      "type": "object",
+      "required": ["target", "reason", "detail", "tracking_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "target": { "$ref": "#/$defs/overlay_qualification_target" },
+        "reason": { "$ref": "#/$defs/overlay_exclusion_reason" },
+        "detail": { "$ref": "#/$defs/nonempty_text" },
+        "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+      }
+    },
+    "overlay_qualification_class": {
+      "type": "string",
+      "enum": ["production_default_slo_candidate", "visual_coverage_related_only"]
+    },
+    "coverage_overlay_profile": {
+      "type": "object",
+      "required": [
+        "overlay_profile_id",
+        "profile_revision",
+        "overlay_id",
+        "renderer_config_profile_id",
+        "qualification_class",
+        "capability_deltas",
+        "qualification_exclusions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "overlay_profile_id": { "$ref": "#/$defs/identifier" },
+        "profile_revision": { "$ref": "#/$defs/positive_u32" },
+        "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+        "renderer_config_profile_id": { "$ref": "#/$defs/identifier" },
+        "qualification_class": { "$ref": "#/$defs/overlay_qualification_class" },
+        "capability_deltas": {
+          "type": "array",
+          "maxItems": 19,
+          "items": { "$ref": "#/$defs/capability_binding" }
+        },
+        "qualification_exclusions": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/overlay_qualification_exclusion" }
+        }
+      }
+    },
+    "checkpoint_detector_id": {
+      "type": "string",
+      "enum": [
+        "no_missing_glyphs",
+        "coherent_cell_widths",
+        "exact_row_width",
+        "no_flicker",
+        "coherent_renderer_generation",
+        "no_mixed_generation_tear_band",
+        "no_stale_or_duplicate_frame",
+        "nonblank_after_baseline",
+        "ssim_policy",
+        "l_inf_policy",
+        "changed_pixel_fraction_policy",
+        "exact_terminal_state",
+        "cursor_geometry",
+        "selection_geometry",
+        "ime_geometry",
+        "hyperlink_geometry",
+        "image_geometry",
+        "alternate_screen_state",
+        "accessibility_geometry",
+        "exactly_one_standard_snap_back"
+      ]
+    },
+    "visual_checkpoint": {
+      "type": "object",
+      "required": [
+        "checkpoint_id",
+        "overlay_id",
+        "role",
+        "phase",
+        "event_ordinal",
+        "expected_invariant_ids",
+        "expected_frame_content_class",
+        "phase_manifest_id",
+        "state_oracle_ref",
+        "visual_oracle_ref",
+        "independent_standard_oracle_ref",
+        "accessibility_oracle_ref",
+        "comparator_policy_refs",
+        "native_capture_required"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_id": { "$ref": "#/$defs/identifier" },
+        "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+        "role": { "$ref": "#/$defs/checkpoint_role" },
+        "phase": { "$ref": "#/$defs/timeline_phase" },
+        "event_ordinal": { "$ref": "#/$defs/u32" },
+        "expected_invariant_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "expected_frame_content_class": { "$ref": "#/$defs/frame_content_class" },
+        "phase_manifest_id": { "$ref": "#/$defs/identifier" },
+        "state_oracle_ref": { "$ref": "#/$defs/repository_ref" },
+        "visual_oracle_ref": { "$ref": "#/$defs/repository_ref" },
+        "independent_standard_oracle_ref": {
+          "oneOf": [
+            { "$ref": "#/$defs/repository_ref" },
+            { "type": "null" }
+          ]
+        },
+        "accessibility_oracle_ref": { "$ref": "#/$defs/repository_ref" },
+        "comparator_policy_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/repository_ref" }
+        },
+        "native_capture_required": { "type": "boolean" }
+      }
+    },
+    "corpus_authority_scope": {
+      "type": "string",
+      "enum": [
+        "headless_visual_fixture",
+        "headless_state_replay",
+        "metamorphic_signal_only",
+        "contract_only"
+      ]
+    },
+    "corpus_coverage_status": {
+      "type": "string",
+      "enum": ["direct", "partial", "gap", "present_unqualified"]
+    },
+    "content_encoding": {
+      "type": "string",
+      "enum": [
+        "raw_terminal_bytes",
+        "utf8_text",
+        "hex_transcript_v1",
+        "gpu_fixture_state_v1",
+        "generated_terminal_bytes_v1",
+        "generated_typed_state_v1"
+      ]
+    },
+    "content_decoder": {
+      "type": "string",
+      "enum": ["identity", "utf8_validate_v1", "hex_decode_v1", "json_fixture_state_v1", "generator_v1"]
+    },
+    "content_semantic_kind": {
+      "type": "string",
+      "enum": [
+        "ascii_text",
+        "cjk_text",
+        "rtl_text",
+        "combining_mark_text",
+        "emoji_text",
+        "ligature_sequence",
+        "image_protocol",
+        "hyperlink_protocol",
+        "alternate_screen_control"
+      ]
+    },
+    "content_payload_selector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "additionalProperties": false,
+          "properties": { "kind": { "const": "whole_payload" } }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "manifest_ref",
+            "manifest_row_id",
+            "decoded_byte_start",
+            "decoded_byte_end_exclusive"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "manifest_row_segment" },
+            "manifest_ref": { "$ref": "#/$defs/repository_ref" },
+            "manifest_row_id": { "$ref": "#/$defs/identifier" },
+            "decoded_byte_start": { "$ref": "#/$defs/u64" },
+            "decoded_byte_end_exclusive": { "$ref": "#/$defs/positive_u64" }
+          }
+        }
+      ]
+    },
+    "content_framing": {
+      "oneOf": [
+        { "$ref": "#/$defs/framing_complete_terminal_stream" },
+        { "$ref": "#/$defs/framing_utf8_text" },
+        { "$ref": "#/$defs/framing_kitty_graphics_apc_body_v1" },
+        { "$ref": "#/$defs/framing_sixel_dcs_body_v1" },
+        { "$ref": "#/$defs/framing_typed_state_overlay" }
+      ]
+    },
+    "framing_complete_terminal_stream": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": { "kind": { "const": "complete_terminal_stream" } }
+    },
+    "framing_utf8_text": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": { "kind": { "const": "utf8_text" } }
+    },
+    "framing_kitty_graphics_apc_body_v1": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": { "kind": { "const": "kitty_graphics_apc_body_v1" } }
+    },
+    "framing_sixel_dcs_body_v1": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": { "kind": { "const": "sixel_dcs_body_v1" } }
+    },
+    "framing_typed_state_overlay": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": { "kind": { "const": "typed_state_overlay" } }
+    },
+    "content_deterministic_identity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "generator_id",
+            "generator_revision",
+            "generator_seed",
+            "input_manifest_ref",
+            "output_encoding",
+            "output_decoder",
+            "output_framing"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "generator" },
+            "generator_id": { "$ref": "#/$defs/identifier" },
+            "generator_revision": { "$ref": "#/$defs/positive_u32" },
+            "generator_seed": { "$ref": "#/$defs/positive_u64" },
+            "input_manifest_ref": { "$ref": "#/$defs/repository_ref" },
+            "output_encoding": { "$ref": "#/$defs/content_encoding" },
+            "output_decoder": { "$ref": "#/$defs/content_decoder" },
+            "output_framing": { "$ref": "#/$defs/content_framing" }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "payload_ref",
+            "selector",
+            "encoding",
+            "decoder",
+            "framing",
+            "encoded_payload_sha256",
+            "decoded_payload_sha256"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "payload" },
+            "payload_ref": { "$ref": "#/$defs/repository_ref" },
+            "selector": { "$ref": "#/$defs/content_payload_selector" },
+            "encoding": { "$ref": "#/$defs/content_encoding" },
+            "decoder": { "$ref": "#/$defs/content_decoder" },
+            "framing": { "$ref": "#/$defs/content_framing" },
+            "encoded_payload_sha256": { "$ref": "#/$defs/sha256" },
+            "decoded_payload_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "content_corpus_reference": {
+      "type": "object",
+      "required": [
+        "content_corpus_id",
+        "repository_ref",
+        "semantic_kinds",
+        "payload_revision",
+        "availability",
+        "deterministic_identity"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "content_corpus_id": { "$ref": "#/$defs/identifier" },
+        "repository_ref": { "$ref": "#/$defs/repository_ref" },
+        "semantic_kinds": {
+          "type": "array",
+          "maxItems": 9,
+          "items": { "$ref": "#/$defs/content_semantic_kind" }
+        },
+        "payload_revision": { "$ref": "#/$defs/positive_u32" },
+        "availability": { "$ref": "#/$defs/content_input_availability" },
+        "deterministic_identity": { "$ref": "#/$defs/content_deterministic_identity" }
+      }
+    },
+    "evidence_source": {
+      "type": "object",
+      "required": [
+        "evidence_source_id",
+        "repository_ref",
+        "authority_scope",
+        "authorizes_gesture_replay",
+        "authorizes_headless_checkpoint_comparison",
+        "coverage_status",
+        "limitation",
+        "tracking_refs"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_source_id": { "$ref": "#/$defs/identifier" },
+        "repository_ref": { "$ref": "#/$defs/repository_ref" },
+        "authority_scope": { "$ref": "#/$defs/corpus_authority_scope" },
+        "authorizes_gesture_replay": { "type": "boolean" },
+        "authorizes_headless_checkpoint_comparison": { "type": "boolean" },
+        "coverage_status": { "$ref": "#/$defs/corpus_coverage_status" },
+        "limitation": {
+          "oneOf": [
+            { "$ref": "#/$defs/nonempty_text" },
+            { "type": "null" }
+          ]
+        },
+        "tracking_refs": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/tracking_ref" }
+        }
+      }
+    },
+    "feature_evidence_source_binding": {
+      "type": "object",
+      "required": ["evidence_source_id", "coverage_status", "limitation", "tracking_refs"],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_source_id": { "$ref": "#/$defs/identifier" },
+        "coverage_status": { "$ref": "#/$defs/corpus_coverage_status" },
+        "limitation": {
+          "oneOf": [
+            { "$ref": "#/$defs/nonempty_text" },
+            { "type": "null" }
+          ]
+        },
+        "tracking_refs": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/tracking_ref" }
+        }
+      }
+    },
+    "feature_evidence_binding": {
+      "type": "object",
+      "required": ["terminal_feature", "sources"],
+      "additionalProperties": false,
+      "properties": {
+        "terminal_feature": { "$ref": "#/$defs/terminal_feature" },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/feature_evidence_source_binding" }
+        }
+      }
+    },
+    "output_distribution_policy": {
+      "type": "string",
+      "const": "even_lowest_ordinal_remainder_v1"
+    },
+    "output_rate_override": {
+      "type": "object",
+      "required": ["selector", "bytes_per_second"],
+      "additionalProperties": false,
+      "properties": {
+        "selector": { "$ref": "#/$defs/pane_ordinal_selector" },
+        "bytes_per_second": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000000000
+        }
+      }
+    },
+    "output_stream_definition": {
+      "type": "object",
+      "required": [
+        "stream_id",
+        "generator_id",
+        "generator_revision",
+        "generator_seed",
+        "payload_manifest_ref",
+        "distribution_id",
+        "layout_profile_id",
+        "distribution_policy",
+        "aggregate_bytes_per_second",
+        "rate_overrides"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "stream_id": { "$ref": "#/$defs/identifier" },
+        "generator_id": { "$ref": "#/$defs/identifier" },
+        "generator_revision": { "$ref": "#/$defs/positive_u32" },
+        "generator_seed": { "$ref": "#/$defs/positive_u64" },
+        "payload_manifest_ref": { "$ref": "#/$defs/repository_ref" },
+        "distribution_id": { "$ref": "#/$defs/identifier" },
+        "layout_profile_id": { "$ref": "#/$defs/identifier" },
+        "distribution_policy": { "$ref": "#/$defs/output_distribution_policy" },
+        "aggregate_bytes_per_second": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000000000
+        },
+        "rate_overrides": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/output_rate_override" }
+        }
+      }
+    },
+    "key_modifier": {
+      "type": "string",
+      "enum": ["shift", "control", "alt", "super"]
+    },
+    "foreground_key_event": {
+      "type": "object",
+      "required": ["key_event_id", "logical_key", "modifiers", "encoded_bytes_hex", "target_pane_id"],
+      "additionalProperties": false,
+      "properties": {
+        "key_event_id": { "$ref": "#/$defs/identifier" },
+        "logical_key": { "$ref": "#/$defs/identifier" },
+        "modifiers": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/key_modifier" }
+        },
+        "encoded_bytes_hex": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 131072,
+          "pattern": "^(?:[0-9a-f]{2})*$"
+        },
+        "target_pane_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "workload_definition": {
+      "type": "object",
+      "required": [
+        "workload_id",
+        "revision",
+        "pane_count",
+        "tab_count",
+        "window_count",
+        "layout_profile_id",
+        "renderer_config_profile_id",
+        "font_metric_derivation_ref",
+        "gesture_duration_us",
+        "total_duration_us",
+        "event_count",
+        "output_stream",
+        "foreground_key_events",
+        "scrollback_lines_per_pane",
+        "new_glyph_count",
+        "resize_mutation_count",
+        "content_corpus_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "workload_id": { "$ref": "#/$defs/identifier" },
+        "revision": { "$ref": "#/$defs/positive_u32" },
+        "pane_count": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "tab_count": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "window_count": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "layout_profile_id": { "$ref": "#/$defs/identifier" },
+        "renderer_config_profile_id": { "$ref": "#/$defs/identifier" },
+        "font_metric_derivation_ref": { "$ref": "#/$defs/repository_ref" },
+        "gesture_duration_us": { "$ref": "#/$defs/positive_u64" },
+        "total_duration_us": { "$ref": "#/$defs/positive_u64" },
+        "event_count": { "type": "integer", "minimum": 1, "maximum": 256 },
+        "output_stream": {
+          "oneOf": [
+            { "$ref": "#/$defs/output_stream_definition" },
+            { "type": "null" }
+          ]
+        },
+        "foreground_key_events": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/foreground_key_event" }
+        },
+        "scrollback_lines_per_pane": { "$ref": "#/$defs/u32" },
+        "new_glyph_count": { "$ref": "#/$defs/u32" },
+        "resize_mutation_count": { "$ref": "#/$defs/u32" },
+        "content_corpus_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      }
+    },
+    "oracle_contracts": {
+      "type": "object",
+      "required": [
+        "state_oracle_contract_ref",
+        "visual_comparator_contract_ref",
+        "accessibility_oracle_contract_ref",
+        "checkpoint_policy_ref",
+        "rq_s11_contradiction_tracking_ref"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "state_oracle_contract_ref": { "$ref": "#/$defs/repository_ref" },
+        "visual_comparator_contract_ref": { "$ref": "#/$defs/repository_ref" },
+        "accessibility_oracle_contract_ref": { "$ref": "#/$defs/repository_ref" },
+        "checkpoint_policy_ref": { "$ref": "#/$defs/repository_ref" },
+        "rq_s11_contradiction_tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+      }
+    },
+    "accessibility_authority_boundary": {
+      "type": "object",
+      "required": [
+        "renderer_geometry_tracking_ref",
+        "native_accessibility_tracking_ref",
+        "machine_geometry_authorizes_native_accessibility"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "renderer_geometry_tracking_ref": { "$ref": "#/$defs/tracking_ref" },
+        "native_accessibility_tracking_ref": { "$ref": "#/$defs/tracking_ref" },
+        "machine_geometry_authorizes_native_accessibility": { "type": "boolean" }
+      }
+    },
+    "detector_mechanism_status": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": { "status": { "const": "contract_defined" } }
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "known_non_independent" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        }
+      ]
+    },
+    "detector_scope": {
+      "type": "string",
+      "enum": [
+        "checkpoint_oracle_pair",
+        "interval",
+        "whole_timeline",
+        "all_observed_frames"
+      ]
+    },
+    "detector_contract": {
+      "type": "object",
+      "required": ["detector_id", "scope", "oracle_ref", "mechanism_status"],
+      "additionalProperties": false,
+      "properties": {
+        "detector_id": { "$ref": "#/$defs/checkpoint_detector_id" },
+        "scope": { "$ref": "#/$defs/detector_scope" },
+        "oracle_ref": { "$ref": "#/$defs/repository_ref" },
+        "mechanism_status": { "$ref": "#/$defs/detector_mechanism_status" }
+      }
+    },
+    "requirement_scope": {
+      "type": "string",
+      "enum": [
+        "exact_scenario_predicate",
+        "exact_candidate_unproven",
+        "related_only",
+        "related_adversarial_superset",
+        "related_fleet_stress",
+        "checkpoint_predicate",
+        "comparator_mechanism_only"
+      ]
+    },
+    "requirement_binding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["requirement_id", "scope", "overlay_id"],
+          "additionalProperties": false,
+          "properties": {
+            "requirement_id": { "const": "RQ-S1.resize_fps" },
+            "scope": { "$ref": "#/$defs/requirement_scope" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["requirement_id", "scope", "overlay_id"],
+          "additionalProperties": false,
+          "properties": {
+            "requirement_id": { "const": "RQ-S6.heavy_burst_input_latency" },
+            "scope": { "$ref": "#/$defs/requirement_scope" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["requirement_id", "scope", "overlay_id"],
+          "additionalProperties": false,
+          "properties": {
+            "requirement_id": { "const": "RQ-S9.reflow_latency" },
+            "scope": { "$ref": "#/$defs/requirement_scope" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["requirement_id", "scope", "overlay_id"],
+          "additionalProperties": false,
+          "properties": {
+            "requirement_id": { "const": "RQ-S10.atlas_rebuild_count" },
+            "scope": { "$ref": "#/$defs/requirement_scope" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "requirement_id",
+            "scope",
+            "overlay_id",
+            "last_draft_checkpoint_id",
+            "standard_snap_back_subject_checkpoint_id",
+            "independent_standard_oracle_ref"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "requirement_id": { "const": "RQ-S11.snap_back_ssim" },
+            "scope": { "$ref": "#/$defs/requirement_scope" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "last_draft_checkpoint_id": { "$ref": "#/$defs/identifier" },
+            "standard_snap_back_subject_checkpoint_id": { "$ref": "#/$defs/identifier" },
+            "independent_standard_oracle_ref": { "$ref": "#/$defs/repository_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["requirement_id", "scope", "overlay_id"],
+          "additionalProperties": false,
+          "properties": {
+            "requirement_id": { "const": "RQ-S13.ssim_parity_oracle_corpus" },
+            "scope": { "$ref": "#/$defs/requirement_scope" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" }
+          }
+        }
+      ]
+    },
+    "negative_control_id": {
+      "type": "string",
+      "enum": [
+        "missing_glyph",
+        "mixed_renderer_generation",
+        "cursor_displacement",
+        "selection_loss",
+        "stale_image",
+        "ime_geometry_displacement",
+        "hyperlink_range_corruption",
+        "alternate_screen_flip",
+        "grid_dimension_mismatch",
+        "duplicate_stale_frame",
+        "accessibility_geometry_displacement",
+        "blank_frame_after_nonblank",
+        "mixed_generation_tear_band"
+      ]
+    },
+    "negative_control_definition": {
+      "type": "object",
+      "required": [
+        "control_id",
+        "scenario_id",
+        "overlay_id",
+        "checkpoint_id",
+        "injected_phase",
+        "bound_detector_id",
+        "required_feature",
+        "expected_failure_code"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "control_id": { "$ref": "#/$defs/negative_control_id" },
+        "scenario_id": { "$ref": "#/$defs/identifier" },
+        "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+        "checkpoint_id": { "$ref": "#/$defs/identifier" },
+        "injected_phase": { "$ref": "#/$defs/timeline_phase" },
+        "bound_detector_id": { "$ref": "#/$defs/checkpoint_detector_id" },
+        "required_feature": {
+          "oneOf": [
+            { "$ref": "#/$defs/terminal_feature" },
+            { "type": "null" }
+          ]
+        },
+        "expected_failure_code": {
+          "type": "string",
+          "pattern": "^RSC-CONTROL-[0-9]{3}$"
+        }
+      }
+    },
+    "gesture_authority_source": {
+      "type": "object",
+      "required": ["evidence_source_id", "coverage_status", "limitation", "tracking_refs"],
+      "additionalProperties": false,
+      "properties": {
+        "evidence_source_id": { "$ref": "#/$defs/identifier" },
+        "coverage_status": { "$ref": "#/$defs/corpus_coverage_status" },
+        "limitation": {
+          "oneOf": [
+            { "$ref": "#/$defs/nonempty_text" },
+            { "type": "null" }
+          ]
+        },
+        "tracking_refs": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/tracking_ref" }
+        }
+      }
+    },
+    "gesture_authority_entry": {
+      "type": "object",
+      "required": [
+        "gesture",
+        "sources",
+        "headless_gesture_replay",
+        "headless_checkpoint_compare",
+        "native_target_authority"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "gesture": { "$ref": "#/$defs/gesture" },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/gesture_authority_source" }
+        },
+        "headless_gesture_replay": { "type": "boolean" },
+        "headless_checkpoint_compare": { "type": "boolean" },
+        "native_target_authority": { "type": "boolean" }
+      }
+    },
+    "legacy_scenario_id": {
+      "type": "string",
+      "enum": [
+        "resize-step",
+        "resize-burst",
+        "font-change",
+        "dpi-change",
+        "resize_single_pane_scrollback.yaml",
+        "resize_multi_tab_storm.yaml",
+        "font_churn_multi_pane.yaml",
+        "mixed_scale_soak.yaml",
+        "mixed_workload_interactive_streaming.yaml",
+        "steady_typing",
+        "pane_focus_change",
+        "dialog_open",
+        "selection_change",
+        "scroll_position_change"
+      ]
+    },
+    "legacy_mapping_disposition": {
+      "type": "string",
+      "enum": ["related_only", "rejected"]
+    },
+    "legacy_scenario_mapping": {
+      "type": "object",
+      "required": ["legacy_id", "source_ref", "target_gestures", "disposition", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "legacy_id": { "$ref": "#/$defs/legacy_scenario_id" },
+        "source_ref": { "$ref": "#/$defs/repository_ref" },
+        "target_gestures": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/gesture" }
+        },
+        "disposition": { "$ref": "#/$defs/legacy_mapping_disposition" },
+        "reason": { "$ref": "#/$defs/nonempty_text" }
+      }
+    },
+    "presentation_target_profile_id": {
+      "type": "string",
+      "enum": ["fixed60_hz", "fixed120_hz", "variable_refresh_rate"]
+    },
+    "presentation_target_availability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "unknown_not_probed" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["status", "target_profile_ref", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "target_dependent" },
+            "target_profile_ref": { "$ref": "#/$defs/repository_ref" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["status", "reason", "tracking_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "unsupported" },
+            "reason": { "$ref": "#/$defs/nonempty_text" },
+            "tracking_ref": { "$ref": "#/$defs/tracking_ref" }
+          }
+        }
+      ]
+    },
+    "presentation_target_profile": {
+      "type": "object",
+      "required": ["profile_id", "minimum_millihz", "maximum_millihz", "availability"],
+      "additionalProperties": false,
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/presentation_target_profile_id" },
+        "minimum_millihz": { "$ref": "#/$defs/positive_u32" },
+        "maximum_millihz": { "$ref": "#/$defs/positive_u32" },
+        "availability": { "$ref": "#/$defs/presentation_target_availability" }
+      }
+    },
+    "preconditioning_profile_id": {
+      "type": "string",
+      "enum": ["cold", "warm", "aged"]
+    },
+    "cache_precondition": {
+      "type": "string",
+      "enum": ["cold", "warm", "aged"]
+    },
+    "preconditioning_profile": {
+      "type": "object",
+      "required": [
+        "profile_id",
+        "session_age_us",
+        "scrollback_age_us",
+        "scrollback_lines_per_pane",
+        "glyph_cache",
+        "atlas",
+        "prewarm_manifest_ref"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/preconditioning_profile_id" },
+        "session_age_us": { "$ref": "#/$defs/u64" },
+        "scrollback_age_us": { "$ref": "#/$defs/u64" },
+        "scrollback_lines_per_pane": { "$ref": "#/$defs/u32" },
+        "glyph_cache": { "$ref": "#/$defs/cache_precondition" },
+        "atlas": { "$ref": "#/$defs/cache_precondition" },
+        "prewarm_manifest_ref": { "$ref": "#/$defs/repository_ref" }
+      }
+    },
+    "execution_path_class": {
+      "type": "string",
+      "enum": ["production_native", "headless_reference", "unsupported"]
+    },
+    "observed_boundary_class": {
+      "type": "string",
+      "enum": ["internal_state", "software_present", "metal_drawable", "display_presented", "photon"]
+    },
+    "observed_frame_selection": {
+      "type": "string",
+      "const": "first_satisfying_observed_frame"
+    },
+    "keypress_trace_stage": {
+      "type": "string",
+      "enum": [
+        "K0.key_appkit_receipt",
+        "K1.gui_key_mapping_complete",
+        "K2.client_rpc_enqueue",
+        "K3.client_encode_socket_flush",
+        "K4.server_readable_decode",
+        "K5.server_dispatch_mux_wait",
+        "K6.terminal_lock_pty_write_flush",
+        "K7.pty_echo_parser_apply",
+        "K8.server_delta_compute",
+        "K9.client_receive_decode_apply",
+        "K10.local_mux_gui_invalidation",
+        "K11.paint_shape_atlas",
+        "K12.gpu_submit_drawable_request",
+        "K13.display_completion"
+      ]
+    },
+    "resize_trace_stage": {
+      "type": "string",
+      "enum": [
+        "R0.native_event_receipt",
+        "R1.gui_return",
+        "R2.intent_enqueue",
+        "R3.mux_resize_dispatch",
+        "R4.pane_resize_apply",
+        "R5.intent_supersession",
+        "R6.worker_create",
+        "R7.worker_start",
+        "R8.terminal_lock_wait",
+        "R9.terminal_lock_hold",
+        "R10.viewport_reflow",
+        "R11.near_reflow",
+        "R12.cold_reflow",
+        "R13.first_coherent_viewport",
+        "R14.worker_join",
+        "R15.gui_invalidation",
+        "R16.paint",
+        "R17.text_shaping",
+        "R18.glyph_raster",
+        "R19.glyph_atlas",
+        "R20.line_quad_reuse_rebuild",
+        "R21.gpu_bind",
+        "R22.gpu_upload",
+        "R23.gpu_submit",
+        "R24.drawable_present_request",
+        "R25.display_completion"
+      ]
+    },
+    "measurement_binding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "role",
+            "overlay_id",
+            "mutation_event_ordinal",
+            "target_selection",
+            "target_presented_frame_predicate_ref",
+            "required_stage_ids",
+            "observed_boundary",
+            "presentation_target_profile_ids"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "role": { "const": "first_correct_viewport" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "mutation_event_ordinal": { "$ref": "#/$defs/u32" },
+            "target_selection": { "$ref": "#/$defs/observed_frame_selection" },
+            "target_presented_frame_predicate_ref": { "$ref": "#/$defs/repository_ref" },
+            "required_stage_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 26,
+              "items": { "$ref": "#/$defs/resize_trace_stage" }
+            },
+            "observed_boundary": { "$ref": "#/$defs/observed_boundary_class" },
+            "presentation_target_profile_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": { "$ref": "#/$defs/presentation_target_profile_id" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "role",
+            "overlay_id",
+            "interval_start_event_ordinal",
+            "interval_end_event_ordinal",
+            "minimum_presented_interval_count",
+            "presented_interval_contract_ref",
+            "required_stage_ids",
+            "observed_boundary",
+            "presentation_target_profile_ids"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "role": { "const": "steady_presented_fps" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "interval_start_event_ordinal": { "$ref": "#/$defs/u32" },
+            "interval_end_event_ordinal": { "$ref": "#/$defs/u32" },
+            "minimum_presented_interval_count": { "$ref": "#/$defs/positive_u32" },
+            "presented_interval_contract_ref": { "$ref": "#/$defs/repository_ref" },
+            "required_stage_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 26,
+              "items": { "$ref": "#/$defs/resize_trace_stage" }
+            },
+            "observed_boundary": { "$ref": "#/$defs/observed_boundary_class" },
+            "presentation_target_profile_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": { "$ref": "#/$defs/presentation_target_profile_id" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "role",
+            "overlay_id",
+            "trigger_event_ordinal",
+            "target_checkpoint_id",
+            "target_selection",
+            "target_presented_frame_predicate_ref",
+            "preconditioning_profile_id",
+            "required_stage_ids",
+            "observed_boundary",
+            "presentation_target_profile_ids"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "role": { "const": "cold_reflow_convergence" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "trigger_event_ordinal": { "$ref": "#/$defs/u32" },
+            "target_checkpoint_id": { "$ref": "#/$defs/identifier" },
+            "target_selection": { "$ref": "#/$defs/observed_frame_selection" },
+            "target_presented_frame_predicate_ref": { "$ref": "#/$defs/repository_ref" },
+            "preconditioning_profile_id": { "$ref": "#/$defs/preconditioning_profile_id" },
+            "required_stage_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 26,
+              "items": { "$ref": "#/$defs/resize_trace_stage" }
+            },
+            "observed_boundary": { "$ref": "#/$defs/observed_boundary_class" },
+            "presentation_target_profile_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": { "$ref": "#/$defs/presentation_target_profile_id" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "role",
+            "overlay_id",
+            "last_draft_checkpoint_id",
+            "standard_snap_back_subject_checkpoint_id",
+            "independent_standard_oracle_ref",
+            "target_selection",
+            "target_presented_frame_predicate_ref",
+            "required_stage_ids",
+            "observed_boundary",
+            "presentation_target_profile_ids"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "role": { "const": "snap_back" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "last_draft_checkpoint_id": { "$ref": "#/$defs/identifier" },
+            "standard_snap_back_subject_checkpoint_id": { "$ref": "#/$defs/identifier" },
+            "independent_standard_oracle_ref": { "$ref": "#/$defs/repository_ref" },
+            "target_selection": { "$ref": "#/$defs/observed_frame_selection" },
+            "target_presented_frame_predicate_ref": { "$ref": "#/$defs/repository_ref" },
+            "required_stage_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 26,
+              "items": { "$ref": "#/$defs/resize_trace_stage" }
+            },
+            "observed_boundary": { "$ref": "#/$defs/observed_boundary_class" },
+            "presentation_target_profile_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": { "$ref": "#/$defs/presentation_target_profile_id" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "role",
+            "overlay_id",
+            "key_event_id",
+            "key_action_event_ordinal",
+            "target_selection",
+            "target_presented_frame_predicate_ref",
+            "expected_terminal_effect_oracle_ref",
+            "stage_metrics_contract_ref",
+            "required_stage_ids",
+            "observed_boundary",
+            "presentation_target_profile_ids"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "role": { "const": "keypress_to_first_correct_present" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "key_event_id": { "$ref": "#/$defs/identifier" },
+            "key_action_event_ordinal": { "$ref": "#/$defs/u32" },
+            "target_selection": { "$ref": "#/$defs/observed_frame_selection" },
+            "target_presented_frame_predicate_ref": { "$ref": "#/$defs/repository_ref" },
+            "expected_terminal_effect_oracle_ref": { "$ref": "#/$defs/repository_ref" },
+            "stage_metrics_contract_ref": { "$ref": "#/$defs/repository_ref" },
+            "required_stage_ids": {
+              "type": "array",
+              "minItems": 14,
+              "maxItems": 14,
+              "items": { "$ref": "#/$defs/keypress_trace_stage" }
+            },
+            "observed_boundary": { "$ref": "#/$defs/observed_boundary_class" },
+            "presentation_target_profile_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": { "$ref": "#/$defs/presentation_target_profile_id" }
+            }
+          }
+        }
+      ]
+    },
+    "driver_canary_id": {
+      "type": "string",
+      "enum": ["focus_window", "activate_tab", "focus_pane", "split_geometry", "topology_manifest"]
+    },
+    "driver_canary_action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "target_window_ordinal"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "focus_window" },
+            "target_window_ordinal": { "type": "integer", "minimum": 0, "maximum": 3 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target_window_ordinal", "target_tab_ordinal"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "activate_tab" },
+            "target_window_ordinal": { "type": "integer", "minimum": 0, "maximum": 3 },
+            "target_tab_ordinal": { "type": "integer", "minimum": 0, "maximum": 15 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "target_pane_ordinal"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "focus_pane" },
+            "target_pane_ordinal": { "type": "integer", "minimum": 0, "maximum": 199 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "split_geometry_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_split_geometry" },
+            "split_geometry_ref": { "$ref": "#/$defs/repository_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "topology_ref"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "set_topology_manifest" },
+            "topology_ref": { "$ref": "#/$defs/repository_ref" }
+          }
+        }
+      ]
+    },
+    "driver_canary_definition": {
+      "type": "object",
+      "required": [
+        "canary_id",
+        "action",
+        "expected_observed_event_ref",
+        "expected_state_ref",
+        "timeout_us",
+        "maximum_geometry_delta_px",
+        "prerequisite_capabilities",
+        "minimum_window_count",
+        "minimum_tab_count",
+        "minimum_pane_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "canary_id": { "$ref": "#/$defs/driver_canary_id" },
+        "action": { "$ref": "#/$defs/driver_canary_action" },
+        "expected_observed_event_ref": { "$ref": "#/$defs/repository_ref" },
+        "expected_state_ref": { "$ref": "#/$defs/repository_ref" },
+        "timeout_us": { "$ref": "#/$defs/positive_u64" },
+        "maximum_geometry_delta_px": { "$ref": "#/$defs/u32" },
+        "prerequisite_capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 19,
+          "items": { "$ref": "#/$defs/capability" }
+        },
+        "minimum_window_count": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "minimum_tab_count": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "minimum_pane_count": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "detector_binding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "scope",
+            "overlay_id",
+            "detector_id",
+            "subject_checkpoint_id",
+            "independent_oracle_ref",
+            "comparator_policy_ref"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "scope": { "const": "checkpoint_oracle_pair" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "detector_id": { "$ref": "#/$defs/checkpoint_detector_id" },
+            "subject_checkpoint_id": { "$ref": "#/$defs/identifier" },
+            "independent_oracle_ref": { "$ref": "#/$defs/repository_ref" },
+            "comparator_policy_ref": { "$ref": "#/$defs/repository_ref" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["scope", "overlay_id", "detector_id", "start_checkpoint_id", "end_checkpoint_id"],
+          "additionalProperties": false,
+          "properties": {
+            "scope": { "const": "interval" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "detector_id": { "$ref": "#/$defs/checkpoint_detector_id" },
+            "start_checkpoint_id": { "$ref": "#/$defs/identifier" },
+            "end_checkpoint_id": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["scope", "overlay_id", "detector_id"],
+          "additionalProperties": false,
+          "properties": {
+            "scope": { "const": "whole_timeline" },
+            "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+            "detector_id": { "$ref": "#/$defs/checkpoint_detector_id" }
+          }
+        }
+      ]
+    },
+    "observed_frame_identity_field": {
+      "type": "string",
+      "enum": [
+        "timeline_event_ordinal",
+        "timeline_phase",
+        "renderer_generation",
+        "grid_revision",
+        "terminal_revision",
+        "presentation_boundary",
+        "actual_refresh_millihz",
+        "vrr_state"
+      ]
+    },
+    "observed_frame_class": {
+      "type": "string",
+      "enum": ["renderer_produced", "metal_drawable", "software_presented", "display_presented"]
+    },
+    "observed_frame_policy": {
+      "type": "object",
+      "required": [
+        "overlay_id",
+        "observation_policy_ref",
+        "start_event_ordinal",
+        "end_event_ordinal",
+        "required_frame_classes",
+        "require_monotonic_correlation",
+        "detect_dropped_correlations",
+        "detect_duplicate_correlations",
+        "identity_fields",
+        "all_frame_detector_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "overlay_id": { "$ref": "#/$defs/coverage_overlay_id" },
+        "observation_policy_ref": { "$ref": "#/$defs/repository_ref" },
+        "start_event_ordinal": { "$ref": "#/$defs/u32" },
+        "end_event_ordinal": { "$ref": "#/$defs/u32" },
+        "required_frame_classes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/observed_frame_class" }
+        },
+        "require_monotonic_correlation": { "type": "boolean" },
+        "detect_dropped_correlations": { "type": "boolean" },
+        "detect_duplicate_correlations": { "type": "boolean" },
+        "identity_fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/observed_frame_identity_field" }
+        },
+        "all_frame_detector_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "$ref": "#/$defs/checkpoint_detector_id" }
+        }
+      }
+    },
+    "run_observation_contracts": {
+      "type": "object",
+      "required": [
+        "measurement_contract_id",
+        "observed_frame_stream_ref",
+        "stage_metrics_contract_ref",
+        "production_path_receipt_contract_ref",
+        "run_log_schema_ref",
+        "require_overlay_and_profile_revision_identity",
+        "resize_stage_ids",
+        "keypress_stage_ids"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "measurement_contract_id": {
+          "type": "string",
+          "const": "ft.renderer.measurement-contract.v1"
+        },
+        "observed_frame_stream_ref": { "$ref": "#/$defs/repository_ref" },
+        "stage_metrics_contract_ref": { "$ref": "#/$defs/repository_ref" },
+        "production_path_receipt_contract_ref": { "$ref": "#/$defs/repository_ref" },
+        "run_log_schema_ref": { "$ref": "#/$defs/repository_ref" },
+        "require_overlay_and_profile_revision_identity": { "type": "boolean" },
+        "resize_stage_ids": {
+          "type": "array",
+          "minItems": 26,
+          "maxItems": 26,
+          "items": { "$ref": "#/$defs/resize_trace_stage" }
+        },
+        "keypress_stage_ids": {
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "items": { "$ref": "#/$defs/keypress_trace_stage" }
+        }
+      }
+    },
+    "rq_s1_synthetic_substrate": {
+      "type": "object",
+      "required": [
+        "benchmark_ref",
+        "frame_count",
+        "low_columns",
+        "high_columns",
+        "dirty_rows_per_frame",
+        "gesture_duration_us"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "benchmark_ref": { "$ref": "#/$defs/repository_ref" },
+        "frame_count": { "$ref": "#/$defs/positive_u16" },
+        "low_columns": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "high_columns": { "type": "integer", "minimum": 1, "maximum": 4096 },
+        "dirty_rows_per_frame": { "$ref": "#/$defs/positive_u16" },
+        "gesture_duration_us": { "$ref": "#/$defs/positive_u64" }
+      }
+    },
+    "scenario_definition": {
+      "type": "object",
+      "required": [
+        "scenario_id",
+        "gesture",
+        "fleet_point",
+        "required_path_class",
+        "pane_count",
+        "tab_count",
+        "window_count",
+        "coverage_overlay_profile_ids",
+        "seed",
+        "workload_id",
+        "requirement_bindings",
+        "output_overlap_resize_mode",
+        "configured_steady_quality",
+        "timeline",
+        "expected_invariants",
+        "visual_checkpoints",
+        "observed_frame_policies",
+        "detector_bindings",
+        "measurement_bindings",
+        "presentation_target_profile_ids",
+        "preconditioning_profile_ids",
+        "driver_canary_ids",
+        "capabilities"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scenario_id": { "$ref": "#/$defs/identifier" },
+        "gesture": { "$ref": "#/$defs/gesture" },
+        "fleet_point": { "$ref": "#/$defs/fleet_point" },
+        "required_path_class": { "$ref": "#/$defs/execution_path_class" },
+        "pane_count": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "tab_count": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "window_count": { "type": "integer", "minimum": 1, "maximum": 4 },
+        "coverage_overlay_profile_ids": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "seed": { "$ref": "#/$defs/positive_u64" },
+        "workload_id": { "$ref": "#/$defs/identifier" },
+        "requirement_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/requirement_binding" }
+        },
+        "output_overlap_resize_mode": {
+          "oneOf": [
+            { "$ref": "#/$defs/resize_mode" },
+            { "type": "null" }
+          ]
+        },
+        "configured_steady_quality": { "$ref": "#/$defs/quality_mode" },
+        "timeline": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/timeline_event" }
+        },
+        "expected_invariants": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/expected_invariant" }
+        },
+        "visual_checkpoints": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/visual_checkpoint" }
+        },
+        "observed_frame_policies": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/observed_frame_policy" }
+        },
+        "detector_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/detector_binding" }
+        },
+        "measurement_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/measurement_binding" }
+        },
+        "presentation_target_profile_ids": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/presentation_target_profile_id" }
+        },
+        "preconditioning_profile_ids": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "$ref": "#/$defs/preconditioning_profile_id" }
+        },
+        "driver_canary_ids": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/driver_canary_id" }
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 19,
+          "maxItems": 19,
+          "items": { "$ref": "#/$defs/capability_binding" }
+        }
+      }
+    }
+  }
+}
