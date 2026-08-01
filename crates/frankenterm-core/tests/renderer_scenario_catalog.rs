@@ -1140,6 +1140,12 @@ fn hold_through_rejects_early_alternate_exit_and_replacement() {
             .expect("alternate distribution enters the alternate buffer");
         let mut destructive = steps[enter_position].clone();
         destructive.operation = destructive_operation;
+        if destructive_operation
+            == RendererContentCompositionOperation::ReplaceActiveBuffer
+        {
+            destructive.content_corpus_id =
+                "content.gpu_text_basic_paragraph.v1".to_string();
+        }
         destructive.hold_through_checkpoint_ids.clear();
         destructive.step_ordinal = u16::try_from(enter_position + 1)
             .expect("small canonical materialization position fits u16");
@@ -1150,7 +1156,17 @@ fn hold_through_rejects_early_alternate_exit_and_replacement() {
                 .expect("canonical step ordinal has headroom");
         }
         steps.insert(enter_position + 1, destructive);
-        assert_has_code(&mutated, RendererScenarioValidationCode::InvalidState);
+        let report = mutated.validate();
+        assert!(
+            report.errors.iter().any(|error| {
+                error.code == RendererScenarioValidationCode::InvalidState
+                    && error
+                        .detail
+                        .contains("does not survive continuously through promised checkpoint")
+            }),
+            "{destructive_operation:?} must invalidate the earlier hold-through promise; got:\n{}",
+            validation_errors(&mutated)
+        );
     }
 
     let mut remove_then_reintroduce = catalog;
