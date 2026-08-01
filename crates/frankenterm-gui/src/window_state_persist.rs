@@ -1706,7 +1706,14 @@ where
 /// input on the next process startup or an explicit fresh read; they do not
 /// rewrite an active restore cohort.
 pub fn load_startup_for_workspace(workspace: &str) -> Option<PersistedWindowState> {
-    match load_startup_workspace_from(&STARTUP_SNAPSHOT, workspace, load_layout_state) {
+    if let Err(failure) = validate_workspace(workspace) {
+        log::warn!(
+            "window-state: restore ignored invalid workspace ({:?})",
+            failure.code()
+        );
+        return None;
+    }
+    match cached_startup_snapshot(&STARTUP_SNAPSHOT, load_layout_state).window_state(workspace) {
         Ok(state) => state,
         // Initialization reports the pinned baseline failure once. A later
         // successfully admitted runtime update still overrides that failure
@@ -2095,8 +2102,9 @@ fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
 /// latency-sensitive GUI callbacks run.
 ///
 /// A load failure is pinned for the process so one startup cannot mix restored
-/// and default state across windows. The caller reports that single startup
-/// failure; per-window lookups then remain silent and allocation-bounded.
+/// and default state across windows. Writer and snapshot initialization are
+/// attempted independently and retain distinct finite diagnostics; per-window
+/// lookups then remain silent and allocation-bounded.
 pub fn initialize() -> Result<(), PersistenceFailure> {
     let writer_failure = global_writer().err();
     let snapshot_failure =

@@ -2162,6 +2162,22 @@ fn classify_webgpu_surface_error(
     }
 }
 
+fn resolve_saved_window_state<F>(
+    captured_workspace: &str,
+    captured_state: Option<crate::window_state_persist::PersistedWindowState>,
+    current_workspace: Option<&str>,
+    load_current: F,
+) -> Option<crate::window_state_persist::PersistedWindowState>
+where
+    F: FnOnce(&str) -> Option<crate::window_state_persist::PersistedWindowState>,
+{
+    match current_workspace {
+        Some(workspace) if workspace == captured_workspace => captured_state,
+        Some(workspace) => load_current(workspace),
+        None => None,
+    }
+}
+
 impl TermWindow {
     pub async fn new_window(
         mux_window_id: MuxWindowId,
@@ -2521,22 +2537,27 @@ impl TermWindow {
         // missing entry calls neither method, so a window with no saved state
         // keeps today's exact default geometry. The existing position-restore
         // path above is untouched.
-        if let Some(saved) = saved_window_state {
-            let current_workspace = mux
-                .get_window(mux_window_id)
-                .map(|window| window.get_workspace().to_owned());
-            if current_workspace.as_deref() == Some(saved_workspace.as_str()) {
-                if saved.maximized {
-                    window.maximize();
-                }
-                if saved.fullscreen {
-                    window.toggle_fullscreen();
-                }
-            } else {
+        let saved_window_state = mux.get_window(mux_window_id).and_then(|mux_window| {
+            let current_workspace = mux_window.get_workspace();
+            if current_workspace != saved_workspace.as_str() {
                 log::debug!(
-                    "skipping stale window-state restore for mux window {mux_window_id}: \
+                    "refreshing stale window-state restore for mux window {mux_window_id}: \
                      captured workspace changed before application"
                 );
+            }
+            resolve_saved_window_state(
+                &saved_workspace,
+                saved_window_state,
+                Some(current_workspace),
+                crate::window_state_persist::load_startup_for_workspace,
+            )
+        });
+        if let Some(saved) = saved_window_state {
+            if saved.maximized {
+                window.maximize();
+            }
+            if saved.fullscreen {
+                window.toggle_fullscreen();
             }
         }
 
@@ -6470,10 +6491,50 @@ mod tests {
         mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
         pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
         record_frame_budget_execution_outstanding, record_sync_output_mux_event,
-        reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
+        reduce_motion_state_from_preference, render, resolve_saved_window_state,
+        run_clear_dirty_lines_after_frame,
         should_force_paint_for_frame_budget, should_run_frame_budget_decision,
         should_skip_clean_line, webgpu,
     };
+
+    #[test]
+    fn moved_window_refreshes_restore_state_for_current_workspace() {
+        let captured = crate::window_state_persist::PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let current = crate::window_state_persist::PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", Some(captured), Some("workspace-a"), |_| {
+                panic!("unchanged workspace must keep the cohort capture")
+            }),
+            Some(captured)
+        );
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", Some(captured), Some("workspace-b"), |name| {
+                assert_eq!(name, "workspace-b");
+                Some(current)
+            }),
+            Some(current)
+        );
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", None, Some("workspace-b"), |_| {
+                Some(current)
+            }),
+            Some(current),
+            "a missing old-workspace state must not suppress the new workspace state"
+        );
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", Some(captured), None, |_| {
+                panic!("removed mux windows have no current workspace to restore")
+            }),
+            None
+        );
+    }
 
     #[test]
     fn ui_item_hit_test_uses_half_open_extents() {

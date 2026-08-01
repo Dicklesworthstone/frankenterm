@@ -49,6 +49,37 @@ impl WorkspaceReconcileGate {
     }
 }
 
+#[derive(Default)]
+struct WorkspaceReconcileWaiters {
+    active_pass: Vec<Promise<()>>,
+    next_pass: Vec<Promise<()>>,
+}
+
+impl WorkspaceReconcileWaiters {
+    fn waiter_count(&self) -> usize {
+        self.active_pass.len().saturating_add(self.next_pass.len())
+    }
+
+    fn push(&mut self, starts_new_pass: bool, promise: Promise<()>) {
+        if starts_new_pass {
+            debug_assert!(self.active_pass.is_empty());
+            self.active_pass.push(promise);
+        } else {
+            self.next_pass.push(promise);
+        }
+    }
+
+    fn finish_active_pass(&mut self, run_again: bool) -> Vec<Promise<()>> {
+        let completed = std::mem::take(&mut self.active_pass);
+        if run_again {
+            self.active_pass = std::mem::take(&mut self.next_pass);
+        } else {
+            debug_assert!(self.next_pass.is_empty());
+        }
+        completed
+    }
+}
+
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
     switching_workspaces: RefCell<bool>,
@@ -58,7 +89,7 @@ pub struct GuiFrontEnd {
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
     workspace_reconcile_gate: Cell<WorkspaceReconcileGate>,
-    workspace_reconcile_waiters: RefCell<Vec<Promise<()>>>,
+    workspace_reconcile_waiters: RefCell<WorkspaceReconcileWaiters>,
 }
 
 impl Drop for GuiFrontEnd {
@@ -87,7 +118,7 @@ impl GuiFrontEnd {
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
             workspace_reconcile_gate: Cell::new(WorkspaceReconcileGate::default()),
-            workspace_reconcile_waiters: RefCell::new(Vec::new()),
+            workspace_reconcile_waiters: RefCell::new(WorkspaceReconcileWaiters::default()),
         });
 
         mux.subscribe(move |n| {
@@ -440,7 +471,8 @@ impl GuiFrontEnd {
     }
 
     pub fn reconcile_workspace(&self) -> Future<()> {
-        if self.workspace_reconcile_waiters.borrow().len() >= MAX_RECONCILE_WAITERS {
+        let mut waiters = self.workspace_reconcile_waiters.borrow_mut();
+        if waiters.waiter_count() >= MAX_RECONCILE_WAITERS {
             return Future::err(Error::msg(format!(
                 "workspace reconciliation waiter count would exceed {MAX_RECONCILE_WAITERS}"
             )));
@@ -448,13 +480,12 @@ impl GuiFrontEnd {
 
         let mut promise = Promise::new();
         let future = promise.get_future().unwrap();
-        self.workspace_reconcile_waiters
-            .borrow_mut()
-            .push(promise);
 
         let mut gate = self.workspace_reconcile_gate.get();
         let start_pass = gate.request_pass();
         self.workspace_reconcile_gate.set(gate);
+        waiters.push(start_pass, promise);
+        drop(waiters);
         if start_pass {
             self.run_workspace_reconcile_pass();
         }
@@ -573,14 +604,15 @@ impl GuiFrontEnd {
         let mut gate = self.workspace_reconcile_gate.get();
         let run_again = gate.finish_pass();
         self.workspace_reconcile_gate.set(gate);
+        let completed = self
+            .workspace_reconcile_waiters
+            .borrow_mut()
+            .finish_active_pass(run_again);
+        for mut promise in completed {
+            promise.ok(());
+        }
         if run_again {
             self.run_workspace_reconcile_pass();
-            return;
-        }
-
-        let waiters = std::mem::take(&mut *self.workspace_reconcile_waiters.borrow_mut());
-        for mut promise in waiters {
-            promise.ok(());
         }
     }
 
@@ -757,10 +789,13 @@ fn focus_terminal_toast_source(pane_id: mux::pane::PaneId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CursorShapeSlug, MouseCursor, WorkspaceReconcileGate,
+        CursorShapeSlug, MouseCursor, WorkspaceReconcileGate, WorkspaceReconcileWaiters,
         cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+    use std::future::Future as _;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
 
     #[test]
     fn workspace_reconcile_gate_serializes_reentrant_requests() {
@@ -784,6 +819,55 @@ mod tests {
             "the stable rerun must release the gate"
         );
         assert_eq!(gate, WorkspaceReconcileGate::default());
+    }
+
+    #[test]
+    fn workspace_reconcile_promises_complete_by_pass_generation() {
+        let mut gate = WorkspaceReconcileGate::default();
+        let mut waiters = WorkspaceReconcileWaiters::default();
+        let mut first_promise = promise::Promise::new();
+        let mut first_future = first_promise.get_future().expect("first future");
+        let mut second_promise = promise::Promise::new();
+        let mut second_future = second_promise.get_future().expect("second future");
+
+        let first_starts = gate.request_pass();
+        waiters.push(first_starts, first_promise);
+        let second_starts = gate.request_pass();
+        waiters.push(second_starts, second_promise);
+        assert!(first_starts);
+        assert!(!second_starts);
+
+        let run_again = gate.finish_pass();
+        let completed = waiters.finish_active_pass(run_again);
+        assert!(run_again);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(waiters.active_pass.len(), 1);
+        for mut promise in completed {
+            promise.ok(());
+        }
+
+        let waker = Waker::noop().clone();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut first_future).poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            Pin::new(&mut second_future).poll(&mut context),
+            Poll::Pending
+        ));
+
+        let run_again = gate.finish_pass();
+        let completed = waiters.finish_active_pass(run_again);
+        assert!(!run_again);
+        assert_eq!(completed.len(), 1);
+        for mut promise in completed {
+            promise.ok(());
+        }
+        assert!(matches!(
+            Pin::new(&mut second_future).poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
     }
 
     #[test]
