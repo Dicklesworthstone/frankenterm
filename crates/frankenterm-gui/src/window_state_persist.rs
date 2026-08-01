@@ -33,12 +33,14 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use window::WindowState;
 
-const STORE_SCHEMA_VERSION: u32 = 2;
+const STORE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_STORE_SCHEMA_VERSION: u32 = 2;
 const MAX_STATE_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_WORKSPACE_BYTES: usize = 1_024;
 const MAX_WORKSPACES: usize = 4_096;
 const MAX_DOMAIN_BINDINGS: usize = 4_096;
 const MAX_LAYOUT_OVERLAYS: usize = 4_096;
+const MAX_OVERLAY_TOMBSTONES: usize = 4_096;
 const MAX_TABS_PER_OVERLAY: usize = 4_096;
 const MAX_TOTAL_OVERLAY_TABS: usize = 16_384;
 const MAX_PENDING_WAITERS: usize = 4_096;
@@ -58,6 +60,8 @@ pub enum PersistenceFailureCode {
     RevisionExhausted,
     StaleOverlay,
     OverlayRevisionConflict,
+    OverlayCasConflict,
+    RetiredOverlay,
     AmbiguousGeneration,
     WorkerStopped,
 }
@@ -87,6 +91,13 @@ pub enum PersistenceFailure {
     StaleOverlay { incoming: u64, committed: u64 },
     #[error("overlay revision {revision} was reused with different content")]
     OverlayRevisionConflict { revision: u64 },
+    #[error("overlay CAS expected base {expected:?}, but authority is at {committed:?}")]
+    OverlayCasConflict {
+        expected: Option<u64>,
+        committed: Option<u64>,
+    },
+    #[error("overlay identity was retired at local revision {last_revision}")]
+    RetiredOverlay { last_revision: u64 },
     #[error("two different persisted states claim generation {revision}")]
     AmbiguousGeneration { revision: u64 },
     #[error("persistence worker stopped")]
@@ -108,6 +119,8 @@ impl PersistenceFailure {
             Self::OverlayRevisionConflict { .. } => {
                 PersistenceFailureCode::OverlayRevisionConflict
             }
+            Self::OverlayCasConflict { .. } => PersistenceFailureCode::OverlayCasConflict,
+            Self::RetiredOverlay { .. } => PersistenceFailureCode::RetiredOverlay,
             Self::AmbiguousGeneration { .. } => {
                 PersistenceFailureCode::AmbiguousGeneration
             }
@@ -450,6 +463,162 @@ impl MixedDomainLayoutOverlay {
     }
 }
 
+/// Durable proof that one stable mixed-layout window identity was retired.
+///
+/// Tombstones deliberately retain only the last live local revision and the
+/// store generation that committed the retirement. A stable
+/// [`LayoutWindowId`] is never reusable; the bounded retention policy protects
+/// recent lineages, while a mutation with `base_revision = Some(_)` still
+/// fails against absence after an old tombstone is pruned.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayTombstone {
+    window_id: LayoutWindowId,
+    last_local_revision: u64,
+    retired_at_store_revision: u64,
+}
+
+impl OverlayTombstone {
+    fn new(
+        window_id: LayoutWindowId,
+        last_local_revision: u64,
+        retired_at_store_revision: u64,
+    ) -> Result<Self, PersistenceFailure> {
+        let tombstone = Self {
+            window_id,
+            last_local_revision,
+            retired_at_store_revision,
+        };
+        validate_tombstone(&tombstone)?;
+        Ok(tombstone)
+    }
+
+    #[must_use]
+    pub const fn window_id(self) -> LayoutWindowId {
+        self.window_id
+    }
+
+    #[must_use]
+    pub const fn last_local_revision(self) -> u64 {
+        self.last_local_revision
+    }
+
+    #[must_use]
+    pub const fn retired_at_store_revision(self) -> u64 {
+        self.retired_at_store_revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DesiredOverlayState {
+    Live(MixedDomainLayoutOverlay),
+    Deleted {
+        window_id: LayoutWindowId,
+        last_local_revision: u64,
+    },
+}
+
+impl DesiredOverlayState {
+    const fn window_id(&self) -> LayoutWindowId {
+        match self {
+            Self::Live(overlay) => overlay.window_id,
+            Self::Deleted { window_id, .. } => *window_id,
+        }
+    }
+
+    const fn last_local_revision(&self) -> u64 {
+        match self {
+            Self::Live(overlay) => overlay.local_revision,
+            Self::Deleted {
+                last_local_revision,
+                ..
+            } => *last_local_revision,
+        }
+    }
+
+    fn live_tab_count(&self) -> usize {
+        match self {
+            Self::Live(overlay) => overlay.slots.len(),
+            Self::Deleted { .. } => 0,
+        }
+    }
+}
+
+/// One coalesced compare-and-swap lineage.
+///
+/// `base_revision` is always the revision that was durably observed before
+/// the first queued mutation. Coalescing replaces only `desired`, so a chain
+/// never becomes a CAS against an intermediate revision that exists only in
+/// memory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingOverlayMutation {
+    base_revision: Option<u64>,
+    desired: DesiredOverlayState,
+    superseded_updates: usize,
+}
+
+impl PendingOverlayMutation {
+    fn live(
+        base_revision: Option<u64>,
+        overlay: MixedDomainLayoutOverlay,
+    ) -> Result<Self, PersistenceFailure> {
+        validate_overlay(&overlay)?;
+        let expected_revision = match base_revision {
+            Some(base) => base
+                .checked_add(1)
+                .ok_or(PersistenceFailure::RevisionExhausted)?,
+            None => 1,
+        };
+        if overlay.local_revision != expected_revision {
+            return Err(PersistenceFailure::OverlayCasConflict {
+                expected: base_revision,
+                committed: overlay.local_revision.checked_sub(1),
+            });
+        }
+        Ok(Self {
+            base_revision,
+            desired: DesiredOverlayState::Live(overlay),
+            superseded_updates: 0,
+        })
+    }
+
+    fn deleted(
+        window_id: LayoutWindowId,
+        base_revision: Option<u64>,
+    ) -> Result<Self, PersistenceFailure> {
+        let Some(last_local_revision) = base_revision else {
+            return Err(PersistenceFailure::invalid(
+                "cannot retire an overlay without a committed or pending live base",
+            ));
+        };
+        if last_local_revision == 0 {
+            return Err(PersistenceFailure::invalid(
+                "overlay revision zero is reserved",
+            ));
+        }
+        Ok(Self {
+            base_revision,
+            desired: DesiredOverlayState::Deleted {
+                window_id,
+                last_local_revision,
+            },
+            superseded_updates: 0,
+        })
+    }
+
+    const fn window_id(&self) -> LayoutWindowId {
+        self.desired.window_id()
+    }
+
+    const fn desired_revision(&self) -> u64 {
+        self.desired.last_local_revision()
+    }
+
+    fn live_tab_count(&self) -> usize {
+        self.desired.live_tab_count()
+    }
+}
+
 /// Source selected by the two-slot recovery algorithm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreSource {
@@ -470,6 +639,7 @@ pub struct LayoutStateSnapshot {
     pub window_states: BTreeMap<String, PersistedWindowState>,
     pub domain_bindings: Vec<DomainBindingRecord>,
     pub overlays: Vec<MixedDomainLayoutOverlay>,
+    pub tombstones: Vec<OverlayTombstone>,
 }
 
 impl LayoutStateSnapshot {
@@ -489,6 +659,14 @@ impl LayoutStateSnapshot {
         self.overlays
             .iter()
             .find(|overlay| overlay.window_id == window_id)
+    }
+
+    #[must_use]
+    pub fn tombstone(&self, window_id: LayoutWindowId) -> Option<OverlayTombstone> {
+        self.tombstones
+            .iter()
+            .copied()
+            .find(|tombstone| tombstone.window_id == window_id)
     }
 }
 
@@ -659,6 +837,7 @@ struct PersistedState {
     domain_bindings: Vec<DomainBindingRecord>,
     #[serde(default)]
     overlays: Vec<MixedDomainLayoutOverlay>,
+    tombstones: Vec<OverlayTombstone>,
 }
 
 impl Default for PersistedState {
@@ -669,6 +848,36 @@ impl Default for PersistedState {
             window_states: BTreeMap::new(),
             domain_bindings: Vec::new(),
             overlays: Vec::new(),
+            tombstones: Vec::new(),
+        }
+    }
+}
+
+/// Exact schema-v2 payload shape. Keeping this type separate is essential:
+/// its checksum must be verified over the bytes produced by the v2 field set
+/// before an empty tombstone collection is introduced by migration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStateV2 {
+    schema_version: u32,
+    store_revision: u64,
+    #[serde(default)]
+    window_states: BTreeMap<String, PersistedWindowState>,
+    #[serde(default)]
+    domain_bindings: Vec<DomainBindingRecord>,
+    #[serde(default)]
+    overlays: Vec<MixedDomainLayoutOverlay>,
+}
+
+impl PersistedStateV2 {
+    fn into_current(self) -> PersistedState {
+        PersistedState {
+            schema_version: STORE_SCHEMA_VERSION,
+            store_revision: self.store_revision,
+            window_states: self.window_states,
+            domain_bindings: self.domain_bindings,
+            overlays: self.overlays,
+            tombstones: Vec::new(),
         }
     }
 }
@@ -680,17 +889,46 @@ struct DiskSlot {
     sha256: [u8; 32],
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DiskSlotV2 {
+    payload: PersistedStateV2,
+    sha256: [u8; 32],
+}
+
 #[derive(Debug)]
 struct CorruptEvidence {
     path: PathBuf,
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotSchema {
+    Current,
+    V2,
+    LegacyGeometry,
+}
+
+impl SlotSchema {
+    const fn preference(self) -> u8 {
+        match self {
+            Self::Current => 2,
+            Self::V2 => 1,
+            Self::LegacyGeometry => 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedSlot {
+    state: PersistedState,
+    schema: SlotSchema,
+}
+
 #[derive(Debug)]
 enum ReadSlot {
     Missing,
-    Current(PersistedState),
-    Legacy(PersistedState),
+    Valid(ValidatedSlot),
     Corrupt {
         failure: PersistenceFailure,
         evidence: CorruptEvidence,
@@ -703,8 +941,11 @@ impl ReadSlot {
     const fn kind(&self) -> &'static str {
         match self {
             Self::Missing => "missing",
-            Self::Current(_) => "current",
-            Self::Legacy(_) => "legacy",
+            Self::Valid(validated) => match validated.schema {
+                SlotSchema::Current => "current",
+                SlotSchema::V2 => "schema_v2",
+                SlotSchema::LegacyGeometry => "legacy_geometry",
+            },
             Self::Corrupt { .. } => "corrupt",
             Self::UnsupportedVersion(_) => "unsupported_version",
             Self::Oversized(_) => "oversized",
@@ -719,6 +960,7 @@ struct LoadedAuthoritative {
     target: PathBuf,
     degraded_recovery: bool,
     corrupt_evidence: Option<CorruptEvidence>,
+    requires_schema_upgrade: bool,
 }
 
 #[derive(Clone, Debug, Default)]
