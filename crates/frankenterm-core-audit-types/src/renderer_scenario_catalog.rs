@@ -10204,10 +10204,10 @@ struct ResolvedPaneMaterialization {
     semantics: BTreeSet<RendererContentSemanticKind>,
 }
 
-fn distribution_steps_for_pane<'a>(
-    distribution: &'a RendererContentDistributionProfile,
+fn distribution_steps_for_pane(
+    distribution: &RendererContentDistributionProfile,
     pane_ordinal: u16,
-) -> Option<&'a [RendererContentMaterializationStep]> {
+) -> Option<&[RendererContentMaterializationStep]> {
     distribution.assignments.iter().find_map(|assignment| {
         let selected = match &assignment.selector {
             RendererPaneOrdinalSelector::All => true,
