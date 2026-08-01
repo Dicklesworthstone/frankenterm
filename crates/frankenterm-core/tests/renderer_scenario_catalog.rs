@@ -39,6 +39,8 @@ const CATALOG_RELATIVE_PATH: &str = "docs/design/renderer-scenario-catalog.v1.js
 const SCHEMA_RELATIVE_PATH: &str = "docs/json-schema/ft-renderer-scenario-catalog.json";
 const ISSUES_RELATIVE_PATH: &str = ".beads/issues.jsonl";
 
+type CatalogMutationCase = (&'static str, fn(&mut RendererScenarioCatalog));
+
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -285,11 +287,8 @@ fn markdown_heading_match_count(document: &str, fragment: &str) -> usize {
 fn json_object_id_match_count(value: &Value, fragment: &str) -> usize {
     match value {
         Value::Object(object) => {
-            let own_match = if object.get("id").and_then(Value::as_str) == Some(fragment) {
-                1
-            } else {
-                0
-            };
+            let has_own_match = object.get("id").and_then(Value::as_str) == Some(fragment);
+            let own_match = usize::from(has_own_match);
             own_match
                 + object
                     .values()
@@ -2318,7 +2317,7 @@ fn backward_selection_is_a_valid_positive_case() {
 #[test]
 fn zero_counts_and_empty_core_vectors_fail_closed_without_panicking() {
     let root = repository_root();
-    let mutations: [(&str, fn(&mut RendererScenarioCatalog)); 25] = [
+    let mutations: [CatalogMutationCase; 25] = [
         ("zero scenario pane count", |catalog| {
             catalog.scenarios[0].pane_count = 0;
         }),
