@@ -710,12 +710,6 @@ struct PendingBatch {
 }
 
 impl PendingBatch {
-    fn is_empty(&self) -> bool {
-        self.window_states.is_empty()
-            && self.overlays.is_empty()
-            && self.ensure_bindings.is_empty()
-    }
-
     fn queued_updates(&self) -> usize {
         self.window_states
             .len()
