@@ -12,11 +12,42 @@ use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
+
+const MAX_RECONCILE_WAITERS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkspaceReconcileGate {
+    pass_running: bool,
+    rerun_requested: bool,
+}
+
+impl WorkspaceReconcileGate {
+    fn request_pass(&mut self) -> bool {
+        if self.pass_running {
+            self.rerun_requested = true;
+            false
+        } else {
+            self.pass_running = true;
+            true
+        }
+    }
+
+    fn finish_pass(&mut self) -> bool {
+        debug_assert!(self.pass_running);
+        if self.rerun_requested {
+            self.rerun_requested = false;
+            true
+        } else {
+            self.pass_running = false;
+            false
+        }
+    }
+}
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
@@ -26,6 +57,8 @@ pub struct GuiFrontEnd {
     osc22_cursor_shapes: RefCell<Osc22PerPaneCursorMap>,
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
+    workspace_reconcile_gate: Cell<WorkspaceReconcileGate>,
+    workspace_reconcile_waiters: RefCell<Vec<Promise<()>>>,
 }
 
 impl Drop for GuiFrontEnd {
@@ -53,6 +86,8 @@ impl GuiFrontEnd {
             osc22_cursor_shapes: RefCell::new(Osc22PerPaneCursorMap::new()),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
+            workspace_reconcile_gate: Cell::new(WorkspaceReconcileGate::default()),
+            workspace_reconcile_waiters: RefCell::new(Vec::new()),
         });
 
         mux.subscribe(move |n| {
@@ -405,11 +440,32 @@ impl GuiFrontEnd {
     }
 
     pub fn reconcile_workspace(&self) -> Future<()> {
+        if self.workspace_reconcile_waiters.borrow().len() >= MAX_RECONCILE_WAITERS {
+            return Future::err(Error::msg(format!(
+                "workspace reconciliation waiter count would exceed {MAX_RECONCILE_WAITERS}"
+            )));
+        }
+
         let mut promise = Promise::new();
+        let future = promise.get_future().unwrap();
+        self.workspace_reconcile_waiters
+            .borrow_mut()
+            .push(promise);
+
+        let mut gate = self.workspace_reconcile_gate.get();
+        let start_pass = gate.request_pass();
+        self.workspace_reconcile_gate.set(gate);
+        if start_pass {
+            self.run_workspace_reconcile_pass();
+        }
+        future
+    }
+
+    fn run_workspace_reconcile_pass(&self) {
         let Some(mux) = Mux::try_get() else {
             log::warn!("cannot reconcile workspace: mux singleton is not available");
-            promise.ok(());
-            return promise.get_future().unwrap();
+            self.finish_workspace_reconcile_pass();
+            return;
         };
         let workspace = mux.active_workspace_for_client(&self.client_id);
 
@@ -418,8 +474,8 @@ impl GuiFrontEnd {
             // be running in other workspaces, so let's pick one
             // and activate it
             if self.is_switching_workspace() {
-                promise.ok(());
-                return promise.get_future().unwrap();
+                self.finish_workspace_reconcile_pass();
+                return;
             }
             for workspace in mux.iter_workspaces() {
                 if !mux.is_workspace_empty(&workspace) {
@@ -433,6 +489,12 @@ impl GuiFrontEnd {
         let workspace = mux.active_workspace_for_client(&self.client_id);
         log::debug!("workspace is {}, fixup windows", workspace);
 
+        // Freeze one restore value for this entire reconciliation cohort before
+        // notifying, repurposing, or showing any GUI window. Window callbacks
+        // can enqueue newer state, but they must not make a single startup
+        // cohort observe a mixture of launch-time and callback-time values.
+        let saved_window_state =
+            crate::window_state_persist::load_startup_for_workspace(&workspace);
         let mut mux_windows = mux.iter_windows_in_workspace(&workspace);
 
         // First, repurpose existing windows.
@@ -470,13 +532,10 @@ impl GuiFrontEnd {
         log::trace!("reconcile: windows -> {:?}", windows);
         *self.known_windows.borrow_mut() = windows;
 
-        let future = promise.get_future().unwrap();
-
         // then spawn any new windows that are needed
         promise::spawn::spawn(async move {
             while let Some(mux_window_id) = mux_windows.next() {
                 let Some(fe) = try_front_end() else {
-                    promise.ok(());
                     return;
                 };
                 if fe.has_mux_window(mux_window_id)
@@ -486,7 +545,13 @@ impl GuiFrontEnd {
                 }
                 fe.spawned_mux_window.borrow_mut().insert(mux_window_id);
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
-                if let Err(err) = TermWindow::new_window(mux_window_id).await {
+                if let Err(err) = TermWindow::new_window(
+                    mux_window_id,
+                    workspace.clone(),
+                    saved_window_state,
+                )
+                .await
+                {
                     log::error!("Failed to create window: {:#}", err);
                     if let Some(mux) = Mux::try_get() {
                         mux.kill_window(mux_window_id);
@@ -498,11 +563,25 @@ impl GuiFrontEnd {
             }
             if let Some(fe) = try_front_end() {
                 *fe.switching_workspaces.borrow_mut() = false;
+                fe.finish_workspace_reconcile_pass();
             }
-            promise.ok(());
         })
         .detach();
-        future
+    }
+
+    fn finish_workspace_reconcile_pass(&self) {
+        let mut gate = self.workspace_reconcile_gate.get();
+        let run_again = gate.finish_pass();
+        self.workspace_reconcile_gate.set(gate);
+        if run_again {
+            self.run_workspace_reconcile_pass();
+            return;
+        }
+
+        let waiters = std::mem::take(&mut *self.workspace_reconcile_waiters.borrow_mut());
+        for mut promise in waiters {
+            promise.ok(());
+        }
     }
 
     fn has_mux_window(&self, mux_window_id: MuxWindowId) -> bool {
@@ -678,9 +757,34 @@ fn focus_terminal_toast_source(pane_id: mux::pane::PaneId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
+        CursorShapeSlug, MouseCursor, WorkspaceReconcileGate,
+        cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
+
+    #[test]
+    fn workspace_reconcile_gate_serializes_reentrant_requests() {
+        let mut gate = WorkspaceReconcileGate::default();
+
+        assert!(gate.request_pass(), "first request must start a pass");
+        assert!(gate.pass_running);
+        assert!(
+            !gate.request_pass(),
+            "reentrant request must join the running pass"
+        );
+        assert!(gate.rerun_requested);
+        assert!(
+            gate.finish_pass(),
+            "the running pass must hand off to one coalesced rerun"
+        );
+        assert!(gate.pass_running);
+        assert!(!gate.rerun_requested);
+        assert!(
+            !gate.finish_pass(),
+            "the stable rerun must release the gate"
+        );
+        assert_eq!(gate, WorkspaceReconcileGate::default());
+    }
 
     #[test]
     fn osc22_request_parser_accepts_terminal_cursor_slugs() {

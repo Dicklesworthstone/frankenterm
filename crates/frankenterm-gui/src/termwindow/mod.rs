@@ -2163,7 +2163,11 @@ fn classify_webgpu_surface_error(
 }
 
 impl TermWindow {
-    pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
+    pub async fn new_window(
+        mux_window_id: MuxWindowId,
+        saved_workspace: String,
+        saved_window_state: Option<crate::window_state_persist::PersistedWindowState>,
+    ) -> anyhow::Result<()> {
         let config = config_with_accessibility_palette(configuration());
         let dpi = config.dpi.unwrap_or_else(::window::default_dpi) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
@@ -2512,21 +2516,27 @@ impl TermWindow {
             myself.emit_status_event();
         }
 
-        // Restore the persisted maximize/fullscreen state for this window's
-        // workspace, if any. A missing/empty entry calls neither method, so a
-        // window with no saved state keeps today's exact default geometry. The
-        // existing position-restore path above is untouched.
-        if let Some(workspace) = mux
-            .get_window(mux_window_id)
-            .map(|w| w.get_workspace().to_string())
-        {
-            if let Some(saved) = crate::window_state_persist::load_for_workspace(&workspace) {
+        // Restore the maximize/fullscreen state captured for this entire GUI
+        // reconciliation cohort before any member was notified or shown. A
+        // missing entry calls neither method, so a window with no saved state
+        // keeps today's exact default geometry. The existing position-restore
+        // path above is untouched.
+        if let Some(saved) = saved_window_state {
+            let current_workspace = mux
+                .get_window(mux_window_id)
+                .map(|window| window.get_workspace().to_owned());
+            if current_workspace.as_deref() == Some(saved_workspace.as_str()) {
                 if saved.maximized {
                     window.maximize();
                 }
                 if saved.fullscreen {
                     window.toggle_fullscreen();
                 }
+            } else {
+                log::debug!(
+                    "skipping stale window-state restore for mux window {mux_window_id}: \
+                     captured workspace changed before application"
+                );
             }
         }
 

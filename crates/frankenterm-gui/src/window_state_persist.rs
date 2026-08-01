@@ -1598,24 +1598,120 @@ pub fn load_layout_state() -> Result<LayoutStateSnapshot, PersistenceFailure> {
     load_snapshot_at(&state_file_name())
 }
 
-/// The saved maximize/fullscreen state for `workspace`, if any.
-pub fn load_for_workspace(workspace: &str) -> Option<PersistedWindowState> {
-    if let Err(failure) = validate_workspace(workspace) {
-        log::warn!(
-            "window-state: restore ignored invalid workspace ({:?})",
-            failure.code()
-        );
-        return None;
-    }
-    match load_layout_state() {
-        Ok(snapshot) => snapshot.window_states.get(workspace).copied(),
-        Err(failure) => {
-            log::warn!(
-                "window-state: restore ignored fail-closed state ({:?})",
-                failure.code()
-            );
-            None
+#[derive(Debug)]
+struct StartupRestoreCache {
+    snapshot: Result<LayoutStateSnapshot, PersistenceFailure>,
+    admitted_window_states: Mutex<BTreeMap<String, PersistedWindowState>>,
+}
+
+impl StartupRestoreCache {
+    fn new(snapshot: Result<LayoutStateSnapshot, PersistenceFailure>) -> Self {
+        Self {
+            snapshot,
+            admitted_window_states: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn window_state(
+        &self,
+        workspace: &str,
+    ) -> Result<Option<PersistedWindowState>, PersistenceFailure> {
+        if let Some(state) = lock_pending(&self.admitted_window_states)
+            .get(workspace)
+            .copied()
+        {
+            return Ok(Some(state));
+        }
+        match &self.snapshot {
+            Ok(snapshot) => Ok(snapshot.window_states.get(workspace).copied()),
+            Err(failure) => Err(failure.clone()),
+        }
+    }
+
+    fn snapshot_failure(&self) -> Option<PersistenceFailure> {
+        self.snapshot.as_ref().err().cloned()
+    }
+
+    fn admit_window_state<Q>(
+        &self,
+        workspace: &str,
+        state: PersistedWindowState,
+        queue: Q,
+    ) -> Result<(), PersistenceFailure>
+    where
+        Q: FnOnce(&str, PersistedWindowState) -> Result<(), PersistenceFailure>,
+    {
+        let mut admitted = lock_pending(&self.admitted_window_states);
+        if !admitted.contains_key(workspace) && admitted.len() >= MAX_WORKSPACES {
+            return Err(PersistenceFailure::quota(format!(
+                "startup restore override count would exceed {MAX_WORKSPACES}"
+            )));
+        }
+        // Keep admission and the in-memory mirror atomic with respect to other
+        // restore-cache readers/writers. The queue closure is nonblocking and
+        // only takes the persistence coordinator's pending-batch mutex; no
+        // persistence path takes these locks in the opposite order.
+        queue(workspace, state)?;
+        admitted.insert(workspace.to_owned(), state);
+        Ok(())
+    }
+}
+
+fn cached_startup_snapshot<F>(
+    cache: &OnceLock<StartupRestoreCache>,
+    loader: F,
+) -> &StartupRestoreCache
+where
+    F: FnOnce() -> Result<LayoutStateSnapshot, PersistenceFailure>,
+{
+    cache.get_or_init(|| StartupRestoreCache::new(loader()))
+}
+
+fn load_startup_workspace_from<F>(
+    cache: &OnceLock<StartupRestoreCache>,
+    workspace: &str,
+    loader: F,
+) -> Result<Option<PersistedWindowState>, PersistenceFailure>
+where
+    F: FnOnce() -> Result<LayoutStateSnapshot, PersistenceFailure>,
+{
+    validate_workspace(workspace)?;
+    cached_startup_snapshot(cache, loader).window_state(workspace)
+}
+
+fn admit_window_state_and_record<Q>(
+    cache: &OnceLock<StartupRestoreCache>,
+    workspace: &str,
+    state: PersistedWindowState,
+    queue: Q,
+) -> Result<(), PersistenceFailure>
+where
+    Q: FnOnce(&str, PersistedWindowState) -> Result<(), PersistenceFailure>,
+{
+    validate_workspace(workspace)?;
+    match cache.get() {
+        Some(cache) => cache.admit_window_state(workspace, state, queue),
+        None => queue(workspace, state),
+    }
+}
+
+/// The saved startup maximize/fullscreen state for `workspace`, if any.
+///
+/// Each process uses one pinned, validated load result. Window-state changes
+/// admitted later in this process override either a valid baseline or a pinned
+/// baseline failure for their exact workspace, so dynamically created windows
+/// cannot regress to launch-time state. Fresh authority reads remain available
+/// through [`load_layout_state`], while commit paths continue to reload under
+/// the exclusive cross-process lock. External-process commits become restore
+/// input on the next process startup or an explicit fresh read; they do not
+/// rewrite an active restore cohort.
+pub fn load_startup_for_workspace(workspace: &str) -> Option<PersistedWindowState> {
+    match load_startup_workspace_from(&STARTUP_SNAPSHOT, workspace, load_layout_state) {
+        Ok(state) => state,
+        // Initialization reports the pinned baseline failure once. A later
+        // successfully admitted runtime update still overrides that failure
+        // for its exact workspace through the same cache.
+        Err(_) => None,
     }
 }
 
@@ -1986,6 +2082,7 @@ fn commit_batch(
 }
 
 static GLOBAL_WRITER: OnceLock<Result<PersistenceWriter, PersistenceFailure>> = OnceLock::new();
+static STARTUP_SNAPSHOT: OnceLock<StartupRestoreCache> = OnceLock::new();
 
 fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
     match GLOBAL_WRITER.get_or_init(|| PersistenceWriter::open(state_file_name())) {
@@ -1994,12 +2091,32 @@ fn global_writer() -> Result<&'static PersistenceWriter, PersistenceFailure> {
     }
 }
 
-/// Start the persistence worker before latency-sensitive GUI callbacks run.
+/// Start the persistence worker and load one validated restore snapshot before
+/// latency-sensitive GUI callbacks run.
 ///
-/// The worker performs no filesystem access until it receives an update or
-/// explicit barrier.
+/// A load failure is pinned for the process so one startup cannot mix restored
+/// and default state across windows. The caller reports that single startup
+/// failure; per-window lookups then remain silent and allocation-bounded.
 pub fn initialize() -> Result<(), PersistenceFailure> {
-    global_writer().map(|_| ())
+    let writer_failure = global_writer().err();
+    let snapshot_failure =
+        cached_startup_snapshot(&STARTUP_SNAPSHOT, load_layout_state).snapshot_failure();
+
+    match (writer_failure, snapshot_failure) {
+        (None, None) => Ok(()),
+        (Some(failure), None) | (None, Some(failure)) => Err(failure),
+        (Some(writer_failure), Some(snapshot_failure)) => {
+            // Return the restore failure to the caller and retain the distinct
+            // writer failure as a finite secondary diagnostic. Both startup
+            // paths were attempted, so a writer failure cannot force a later
+            // GUI callback to perform the restore read.
+            log::warn!(
+                "window-state: persistence worker initialization also failed ({:?})",
+                writer_failure.code()
+            );
+            Err(snapshot_failure)
+        }
+    }
 }
 
 /// Queue the maximize/fullscreen subset of `window_state` for `workspace`.
@@ -2013,9 +2130,16 @@ pub fn save_for_workspace(workspace: &str, window_state: WindowState) {
         maximized: window_state.contains(WindowState::MAXIMIZED),
         fullscreen: window_state.contains(WindowState::FULL_SCREEN),
     };
-    let result = global_writer().and_then(|writer| {
-        writer.queue_window_state(workspace, state).map(|_| ())
-    });
+    let result = admit_window_state_and_record(
+        &STARTUP_SNAPSHOT,
+        workspace,
+        state,
+        |workspace, state| {
+            global_writer().and_then(|writer| {
+                writer.queue_window_state(workspace, state).map(|_| ())
+            })
+        },
+    );
     if let Err(failure) = result {
         log::warn!(
             "window-state: could not enqueue geometry state ({:?})",
@@ -2048,6 +2172,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::fs::OpenOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
 
     fn local_slot(value: u8) -> StableTabSlot {
         StableTabSlot::local(
@@ -2105,6 +2231,348 @@ mod tests {
         let result =
             commit_for_test(path, &batch, WriteInterruption::None).expect("commit binding");
         (fingerprint, result.bindings[&fingerprint])
+    }
+
+    fn snapshot_with_window_states(
+        window_states: BTreeMap<String, PersistedWindowState>,
+    ) -> LayoutStateSnapshot {
+        LayoutStateSnapshot {
+            source: StoreSource::Empty,
+            degraded_recovery: false,
+            store_revision: 0,
+            window_states,
+            domain_bindings: Vec::new(),
+            overlays: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn startup_snapshot_loads_once_for_multiple_workspaces() {
+        let cache = OnceLock::new();
+        let loads = AtomicUsize::new(0);
+        let first = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let second = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        let states = BTreeMap::from([
+            ("first".to_string(), first),
+            ("second".to_string(), second),
+        ]);
+
+        assert_eq!(
+            load_startup_workspace_from(&cache, "first", || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(snapshot_with_window_states(states))
+            })
+            .expect("load first workspace"),
+            Some(first)
+        );
+        assert_eq!(
+            load_startup_workspace_from(&cache, "second", || {
+                panic!("cached startup snapshot must prevent a second load")
+            })
+            .expect("load second workspace"),
+            Some(second)
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn startup_snapshot_caches_failure_for_the_whole_restore() {
+        let cache = OnceLock::new();
+        let loads = AtomicUsize::new(0);
+        let first = load_startup_workspace_from(&cache, "default", || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Err(PersistenceFailure::corrupt("test startup failure"))
+        })
+        .expect_err("first startup load must fail");
+        let second = load_startup_workspace_from(&cache, "default", || {
+            panic!("cached startup failure must prevent a second load")
+        })
+        .expect_err("cached startup load must fail");
+
+        assert_eq!(first, second);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admitted_runtime_state_overrides_a_cached_startup_failure() {
+        let cache = OnceLock::new();
+        let runtime = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        load_startup_workspace_from(&cache, "default", || {
+            Err(PersistenceFailure::corrupt("test startup failure"))
+        })
+        .expect_err("startup baseline must fail");
+
+        admit_window_state_and_record(&cache, "default", runtime, |_, _| Ok(()))
+            .expect("admit runtime state after baseline failure");
+
+        assert_eq!(
+            load_startup_workspace_from(&cache, "default", || {
+                panic!("cached failure plus override must not reread authority")
+            })
+            .expect("runtime override must supersede baseline failure"),
+            Some(runtime)
+        );
+        assert!(
+            load_startup_workspace_from(&cache, "other", || {
+                panic!("cached baseline failure must remain pinned")
+            })
+            .is_err(),
+            "unmodified workspaces must retain the pinned baseline failure"
+        );
+    }
+
+    #[test]
+    fn admitted_window_state_overrides_the_pinned_startup_snapshot() {
+        let cache = OnceLock::new();
+        let initial = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let admitted = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        assert_eq!(
+            load_startup_workspace_from(&cache, "default", || {
+                Ok(snapshot_with_window_states(BTreeMap::from([(
+                    "default".to_string(),
+                    initial,
+                )])))
+            })
+            .expect("load initial state"),
+            Some(initial)
+        );
+
+        admit_window_state_and_record(&cache, "default", admitted, |_, _| Ok(()))
+            .expect("record admitted runtime state");
+
+        assert_eq!(
+            load_startup_workspace_from(&cache, "default", || {
+                panic!("runtime override lookup must not reread the authority")
+            })
+            .expect("load admitted runtime state"),
+            Some(admitted)
+        );
+    }
+
+    #[test]
+    fn failed_window_state_admission_does_not_override_startup_snapshot() {
+        let cache = OnceLock::new();
+        let initial = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let rejected = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        assert_eq!(
+            load_startup_workspace_from(&cache, "default", || {
+                Ok(snapshot_with_window_states(BTreeMap::from([(
+                    "default".to_string(),
+                    initial,
+                )])))
+            })
+            .expect("load initial state"),
+            Some(initial)
+        );
+
+        let failure = admit_window_state_and_record(
+            &cache,
+            "default",
+            rejected,
+            |_, _| Err(PersistenceFailure::WorkerStopped),
+        )
+        .expect_err("failed queue admission must remain a failure");
+        assert_eq!(failure.code(), PersistenceFailureCode::WorkerStopped);
+        assert_eq!(
+            load_startup_workspace_from(&cache, "default", || {
+                panic!("failed admission lookup must not reread the authority")
+            })
+            .expect("load state after failed admission"),
+            Some(initial)
+        );
+    }
+
+    #[test]
+    fn override_quota_failure_does_not_enqueue_window_state() {
+        let cache = OnceLock::new();
+        let startup = cached_startup_snapshot(&cache, || {
+            Ok(snapshot_with_window_states(BTreeMap::new()))
+        });
+        {
+            let mut admitted = lock_pending(&startup.admitted_window_states);
+            for index in 0..MAX_WORKSPACES {
+                admitted.insert(
+                    format!("workspace-{index}"),
+                    PersistedWindowState::default(),
+                );
+            }
+        }
+        let queue_calls = AtomicUsize::new(0);
+
+        let failure = admit_window_state_and_record(
+            &cache,
+            "one-workspace-too-many",
+            PersistedWindowState {
+                maximized: true,
+                fullscreen: false,
+            },
+            |_, _| {
+                queue_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("cache quota must reject before queue admission");
+
+        assert_eq!(failure.code(), PersistenceFailureCode::Quota);
+        assert_eq!(queue_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            lock_pending(&startup.admitted_window_states).len(),
+            MAX_WORKSPACES
+        );
+    }
+
+    #[test]
+    fn reconciliation_cohort_keeps_one_value_across_runtime_updates() {
+        let cache = OnceLock::new();
+        let launch = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let runtime = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        let cohort_value = load_startup_workspace_from(&cache, "default", || {
+            Ok(snapshot_with_window_states(BTreeMap::from([(
+                "default".to_string(),
+                launch,
+            )])))
+        })
+        .expect("capture reconciliation cohort state");
+
+        admit_window_state_and_record(&cache, "default", runtime, |_, _| Ok(()))
+            .expect("admit runtime update");
+
+        assert_eq!(cohort_value, Some(launch));
+        assert_eq!(
+            load_startup_workspace_from(&cache, "default", || {
+                panic!("runtime lookup must not reread the authority")
+            })
+            .expect("load post-cohort runtime state"),
+            Some(runtime)
+        );
+    }
+
+    #[test]
+    fn concurrent_startup_snapshot_callers_initialize_once() {
+        let cache = Arc::new(OnceLock::new());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let loads = Arc::clone(&loads);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_startup_workspace_from(&cache, "default", || {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        Ok(snapshot_with_window_states(BTreeMap::new()))
+                    })
+                    .expect("concurrent startup load")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            assert_eq!(handle.join().expect("startup loader thread"), None);
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalid_workspace_does_not_initialize_startup_snapshot() {
+        let cache = OnceLock::new();
+        let loads = AtomicUsize::new(0);
+        let failure = load_startup_workspace_from(&cache, "", || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            Ok(snapshot_with_window_states(BTreeMap::new()))
+        })
+        .expect_err("empty workspace must fail");
+
+        assert_eq!(failure.code(), PersistenceFailureCode::Invalid);
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+        assert!(cache.get().is_none());
+    }
+
+    #[test]
+    fn startup_snapshot_remains_pinned_after_authority_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut first_batch = PendingBatch::default();
+        first_batch
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
+        commit_for_test(&path, &first_batch, WriteInterruption::None)
+            .expect("commit first state");
+
+        let cache = OnceLock::new();
+        let first = load_startup_workspace_from(&cache, "default", || {
+            load_snapshot_at(&path)
+        })
+        .expect("load pinned snapshot");
+
+        let mut second_batch = PendingBatch::default();
+        second_batch
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue second state");
+        commit_for_test(&path, &second_batch, WriteInterruption::None)
+            .expect("commit second state");
+        let pinned = load_startup_workspace_from(&cache, "default", || {
+            panic!("pinned startup snapshot must not reread the authority")
+        })
+        .expect("load pinned state after commit");
+
+        assert_eq!(first, pinned);
+        assert_eq!(
+            pinned,
+            Some(PersistedWindowState {
+                maximized: true,
+                fullscreen: false,
+            })
+        );
+        assert_eq!(
+            load_snapshot_at(&path)
+                .expect("load fresh authority")
+                .window_states["default"],
+            PersistedWindowState {
+                maximized: false,
+                fullscreen: true,
+            }
+        );
     }
 
     #[test]

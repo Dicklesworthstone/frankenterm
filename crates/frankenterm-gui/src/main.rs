@@ -377,6 +377,7 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
 
     build_initial_mux(&config::configuration(), None, None)?;
 
+    initialize_window_state_persistence();
     let gui = crate::frontend::try_new()?;
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
 
@@ -388,7 +389,7 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    run_gui_event_loop(gui)
 }
 
 async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
@@ -429,6 +430,7 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
 
     build_initial_mux(&config, None, None)?;
 
+    initialize_window_state_persistence();
     let gui = crate::frontend::try_new()?;
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
 
@@ -440,7 +442,7 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    run_gui_event_loop(gui)
 }
 
 fn subscribe_to_mux_domain_config_reload() -> config::ConfigSubscription {
@@ -1035,15 +1037,7 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         return Ok(());
     }
 
-    // Pay the one-time persistence worker startup cost before entering GUI
-    // callbacks. The worker remains idle and performs no filesystem access
-    // until the first state update or explicit lifecycle barrier.
-    if let Err(failure) = window_state_persist::initialize() {
-        log::warn!(
-            "window-state: could not initialize persistence worker ({:?})",
-            failure.code()
-        );
-    }
+    initialize_window_state_persistence();
 
     let gui = crate::frontend::try_new()?;
     let _mux_domain_config_subscription = subscribe_to_mux_domain_config_reload();
@@ -1058,6 +1052,23 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     .detach();
 
     maybe_show_configuration_error_window();
+    run_gui_event_loop(gui)
+}
+
+fn initialize_window_state_persistence() {
+    // Pay the one-time persistence worker and validated restore-snapshot cost
+    // before entering GUI callbacks. Every startup window then performs only a
+    // bounded in-memory workspace lookup rather than rereading both journal
+    // slots.
+    if let Err(failure) = window_state_persist::initialize() {
+        log::warn!(
+            "window-state: could not initialize persistence coordinator ({:?})",
+            failure.code()
+        );
+    }
+}
+
+fn run_gui_event_loop(gui: Rc<crate::frontend::GuiFrontEnd>) -> anyhow::Result<()> {
     let result = gui.run_forever();
     flush_window_state_at_shutdown();
     result
