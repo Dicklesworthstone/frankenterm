@@ -565,10 +565,15 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   Clippy; and job `j-29955720610840672` on `hz2` passed
   `cargo check -p frankenterm-core --all-targets`. Job
   `j-29955720610840674` on `vmi1152480` reconfirmed 41/41 property tests and
-  the four synthetic integration tests, while job
+  the four synthetic integration tests; job `j-29955720610840673` on
+  `vmi1153651` reconfirmed all 52 selected library tests; and job
   `j-29955720610840683` on `vmi1149989` reconfirmed all four selected
-  `input_latency` compile-fail doctests. These are package/focused proxy-module
-  proofs, not workspace proof or live latency evidence.
+  `input_latency` compile-fail doctests. Exact workspace job
+  `j-29955720610840686` on `vmi1152480` also passed
+  `cargo check --workspace --all-targets` after 28 minutes. All reached an
+  identified remote worker with no local fallback. These are static,
+  package/focused proxy-module, and workspace compilation proofs, not live
+  latency evidence.
 
   Exact `8706d327b5f4902e2596ca80f70b5e69f004c93f` all-target Clippy job
   `j-29955720610840682` on `hz2` remained useful negative evidence: it reached
