@@ -4815,7 +4815,7 @@ fn validate_non_direct_status_fields(
         if value.trim().is_empty() {
             validator.error(
                 RendererScenarioValidationCode::InvalidGestureAuthority,
-                reference_path,
+                reference_path.as_str(),
                 "tracking reference must not be empty",
             );
         } else {
@@ -4824,7 +4824,7 @@ fn validate_non_direct_status_fields(
         if !seen.insert(value.as_str()) {
             validator.error(
                 RendererScenarioValidationCode::InvalidGestureAuthority,
-                reference_path,
+                reference_path.as_str(),
                 format!("duplicate tracking reference `{value}`"),
             );
         }
@@ -7741,7 +7741,7 @@ fn validate_expected_invariants(
     scenario_path: &str,
     scenario: &RendererScenarioDefinition,
     validator: &mut Validator,
-) -> BTreeMap<&str, &RendererExpectedInvariant> {
+) {
     let path = format!("{scenario_path}.expected_invariants");
     let expected_ids = expected_scenario_invariant_ids(scenario);
     if scenario.expected_invariants.len() != expected_ids.len()
@@ -7757,7 +7757,7 @@ fn validate_expected_invariants(
             ),
         );
     }
-    let mut index = BTreeMap::new();
+    let mut seen = BTreeSet::new();
     for (position, invariant) in scenario.expected_invariants.iter().enumerate() {
         let invariant_path = format!("{path}[{position}]");
         validator.require_identifier(
@@ -7768,10 +7768,7 @@ fn validate_expected_invariants(
             &format!("{invariant_path}.oracle_ref"),
             &invariant.oracle_ref,
         );
-        if index
-            .insert(invariant.invariant_id.as_str(), invariant)
-            .is_some()
-        {
+        if !seen.insert(invariant.invariant_id.as_str()) {
             validator.error(
                 RendererScenarioValidationCode::DuplicateId,
                 format!("{invariant_path}.invariant_id"),
@@ -7814,7 +7811,6 @@ fn validate_expected_invariants(
             format!("invariants must equal canonical applicable order {expected_ids:?}"),
         );
     }
-    index
 }
 
 fn expected_checkpoint_invariant_ids<'a>(
@@ -9398,11 +9394,7 @@ fn validate_coverage_overlay_profiles<'a>(
                     RendererOverlayExclusionReason::ImeMayConsumeOrTransformForegroundKey,
                     RendererOverlayQualificationTarget::Measurement {
                         measurement_role: RendererMeasurementRole::KeypressToFirstCorrectPresent
-                    }
-                ) | (
-                    RendererCoverageOverlayId::ImeComposing,
-                    RendererOverlayExclusionReason::ImeMayConsumeOrTransformForegroundKey,
-                    RendererOverlayQualificationTarget::Requirement {
+                    } | RendererOverlayQualificationTarget::Requirement {
                         requirement_id: RendererRequirementId::RqS6HeavyBurstInputLatency
                     }
                 ) | (
