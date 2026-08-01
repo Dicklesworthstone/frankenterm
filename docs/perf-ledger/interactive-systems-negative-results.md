@@ -730,9 +730,12 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   `j-29955720610840707` respectively completed the corrected leaf library's
   all-target check and warnings-denied library Clippy gate. Job
   `j-29955720610840709` completed the exact descendant's renderer
-  integration-test target Clippy gate with warnings denied. Full
-  renderer-catalog and workspace gates were still running when this entry was
-  created and are not pre-credited here.
+  integration-test target Clippy gate with warnings denied. Exact corrected
+  descendant `24c43fd6db72fcdd12599cdbf0cb474053b7e74b` then passed all 34
+  renderer-catalog tests in strict-remote job `j-29955720610840724` and passed
+  the warnings-denied integration-test Clippy gate in job
+  `j-29955720610840727`. Job `j-29955720610840726` ended in an RCH broken pipe
+  before proof and is retained only as infrastructure-negative evidence.
 - **Proof boundary:** these are contract, schema, serialization, and test-gate
   corrections. They do not cover a live FrankenTerm session, mux domain, PTY,
   AppKit path, renderer, presented frame, visual-equivalence workload, or
@@ -754,7 +757,8 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   `hold_through_rejects_early_alternate_exit_and_replacement` expected
   `RSC-STATE-001` from a mutation that validation correctly accepted. The
   remaining long-running tests were allowed to continue so their outcomes
-  could not be hidden by the first failure.
+  could not be hidden by the first failure; the final result was 33 passed and
+  exactly this one failed.
 - **Rejected inference:** changing an `EnterAlternateBuffer` step into
   `ReplaceActiveBuffer` was assumed to destroy the earlier hold-through effect.
   The mutation retained the exact same alternate-screen corpus identity, and
@@ -766,13 +770,19 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   different corpus and requires the intended “does not survive continuously
   through promised checkpoint” diagnostic, rather than accepting any unrelated
   `InvalidState` result.
+- **Corrected remote proof:** strict-remote job `j-29955720610840719` passed
+  the exact corrected hold-through test. Job `j-29955720610840724` then passed
+  the complete 34-test renderer-catalog suite at the same exact revision, and
+  job `j-29955720610840727` passed its warnings-denied integration-test Clippy
+  gate. Job `j-29955720610840726` suffered an RCH broken pipe and contributes
+  no source verdict.
 - **Proof boundary:** this repairs a semantic negative control only. It does
   not execute a live terminal, alternate-screen application, PTY, renderer, or
   presentation path and carries no visual or performance authority.
-- **Decision:** reject the same-corpus replacement as evidence, retain the
-  causally destructive mutation, and withhold a green verdict until the exact
-  corrected revision passes the focused test, full renderer suite, and
-  warnings-denied test-target Clippy remotely.
+- **Decision:** reject the same-corpus replacement as evidence and retain the
+  causally destructive mutation. The focused, full-suite, and warnings-denied
+  structural gates are now green at the exact corrected revision; this does
+  not promote any live terminal, visual, or performance claim.
 - **Primary retry condition:**
   > Credit this negative control only when the replacement uses a corpus identity different from the held alternate-screen corpus and the exact corrected revision fails specifically because the original effect does not survive continuously through its promised checkpoint.
 
