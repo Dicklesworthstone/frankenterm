@@ -81,8 +81,13 @@ suffixes at `p020`, `p050`, and `p200` do not qualify product `q020`, `q050`, or
 with the product catalog's `q` qualification namespace.
 
 Each scenario ID is `renderer.<gesture>.<fleet-point>`. The deterministic seed is
-scenario-specific and non-zero. IDs, seeds, workload identities, and event
-ordinals are stable inputs; changing one requires a catalog revision.
+scenario-specific and non-zero. Its JSON wire form is exactly `0x` followed by
+16 lowercase hexadecimal digits; bare JSON numbers and decimal, uppercase, or
+short strings are invalid. The typed Rust surface remains `u64`. This prevents
+IEEE-754-only JSON tooling from rounding or collapsing the 64-bit identity.
+IDs, seeds, workload identities, and event ordinals are stable inputs; changing
+one requires a catalog revision. The canonical v1 document and typed validator
+currently require catalog revision `2` exactly.
 
 ## State contract
 
@@ -372,7 +377,9 @@ A checkpoint binds all of the following:
 - phase-specific normalized typed pane/surface-state manifest binding that
   expands completely within the catalog;
 - terminal-state oracle reference;
-- visual oracle reference and one or more comparator-policy references;
+- visual oracle reference and exact role-specific comparator-policy references:
+  zero for last-Draft provenance, one for initial/intermediate/final checkpoints,
+  and two for the Standard snap-back subject;
 - accessibility oracle reference;
 - whether native capture is required.
 

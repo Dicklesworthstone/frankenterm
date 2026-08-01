@@ -24,11 +24,46 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+mod renderer_seed_wire {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    // Serde's field-adapter contract requires the value as `&T`.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(seed: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(&format_args!("0x{seed:016x}"))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = encoded.as_bytes();
+        if bytes.len() != 18
+            || &bytes[..2] != b"0x"
+            || !bytes[2..]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(serde::de::Error::custom(
+                "renderer seed must be exactly `0x` plus 16 lowercase hexadecimal digits",
+            ));
+        }
+        u64::from_str_radix(&encoded[2..], 16).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Contract identifier accepted by schema version 1.
 pub const RENDERER_SCENARIO_CONTRACT_ID: &str = "ft.renderer_scenario_catalog.v1";
 
 /// Schema version implemented by this module.
 pub const RENDERER_SCENARIO_SCHEMA_VERSION: u32 = 1;
+
+/// Exact canonical catalog revision implemented by this module.
+pub const RENDERER_SCENARIO_CATALOG_REVISION: u32 = 2;
 
 /// Bead that owns the version-1 contract.
 pub const RENDERER_SCENARIO_SOURCE_BEAD_ID: &str =
@@ -2815,6 +2850,10 @@ pub struct RendererScenarioDefinition {
     /// Exact eight reusable overlay-profile IDs in canonical overlay order.
     pub coverage_overlay_profile_ids: Vec<String>,
     /// Must equal [`expected_renderer_scenario_seed`] for this coverage cell.
+    ///
+    /// JSON uses fixed-width lowercase hexadecimal so IEEE-754-only consumers
+    /// cannot silently round or collapse this 64-bit identity.
+    #[serde(with = "renderer_seed_wire")]
     pub seed: u64,
     /// Reference to a deterministic workload definition.
     pub workload_id: String,
@@ -3064,6 +3103,8 @@ pub enum RendererScenarioValidationCode {
     UnknownContract,
     /// Schema version differs from version 1.
     UnknownSchemaVersion,
+    /// Catalog revision differs from the exact canonical revision.
+    UnknownCatalogRevision,
     /// Source bead identity differs from the contract owner.
     UnknownSourceBead,
     /// A required field or collection is empty.
@@ -3125,6 +3166,7 @@ impl RendererScenarioValidationCode {
         match self {
             Self::UnknownContract => "RSC-CONTRACT-001",
             Self::UnknownSchemaVersion => "RSC-SCHEMA-001",
+            Self::UnknownCatalogRevision => "RSC-SCHEMA-003",
             Self::UnknownSourceBead => "RSC-CONTRACT-002",
             Self::EmptyRequiredField => "RSC-SCHEMA-002",
             Self::LimitExceeded => "RSC-BOUNDS-001",
@@ -4360,11 +4402,14 @@ fn validate_catalog_header(catalog: &RendererScenarioCatalog, validator: &mut Va
             ),
         );
     }
-    if catalog.catalog_revision == 0 {
+    if catalog.catalog_revision != RENDERER_SCENARIO_CATALOG_REVISION {
         validator.error(
-            RendererScenarioValidationCode::EmptyRequiredField,
+            RendererScenarioValidationCode::UnknownCatalogRevision,
             "$.catalog_revision",
-            "catalog revision must be positive",
+            format!(
+                "expected catalog revision {RENDERER_SCENARIO_CATALOG_REVISION}, found {}",
+                catalog.catalog_revision
+            ),
         );
     }
     if catalog.source_bead_id != RENDERER_SCENARIO_SOURCE_BEAD_ID {

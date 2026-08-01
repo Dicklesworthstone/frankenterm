@@ -12,8 +12,10 @@ use frankenterm_core::renderer_scenario_catalog::{
     MAX_RENDERER_SCENARIO_CATALOG_BYTES, REQUIRED_RENDERER_CHECKPOINT_BINDING_COUNT,
     REQUIRED_RENDERER_COVERAGE_OVERLAY_COUNT, REQUIRED_RENDERER_SCENARIO_COUNT,
     REQUIRED_RENDERER_TERMINAL_FEATURE_COUNT, RENDERER_OUTPUT_AUTHORITY_TRACKING_REF,
+    RENDERER_SCENARIO_CATALOG_REVISION, RQ_S11_COMPARATOR_POLICY_REF,
+    RQ_S13_COMPARATOR_POLICY_REF,
     RendererCatalogAuthority,
-    RendererAccessibilityGeometryState, RendererCheckpointDetectorId,
+    RendererAccessibilityGeometryState, RendererCheckpointDetectorId, RendererCheckpointRole,
     RendererContentApplicationBoundary, RendererContentDecoder,
     RendererContentCompositionOperation, RendererContentDeterministicIdentity,
     RendererContentEncoding, RendererContentInputAvailability, RendererContentPayloadSelector,
@@ -91,6 +93,17 @@ fn schema_errors(validator: &Validator, instance: &Value) -> Vec<String> {
         .iter_errors(instance)
         .map(|error| format!("{error} at {}", error.instance_path()))
         .collect()
+}
+
+fn load_schema_clean_catalog(root: &Path, validator: &Validator) -> Value {
+    let catalog = load_catalog_value(root);
+    let errors = schema_errors(validator, &catalog);
+    assert!(
+        errors.is_empty(),
+        "canonical renderer catalog must be schema-clean before a mutation can prove rejection:\n{}",
+        errors.join("\n")
+    );
+    catalog
 }
 
 fn validation_errors(catalog: &RendererScenarioCatalog) -> String {
@@ -800,7 +813,10 @@ fn assert_resolved_overlay_topology(
 ) {
     assert_eq!(resolved.fleet_point, fleet_point);
     assert_eq!(resolved.overlay_id, RendererCoverageOverlayId::ProductionDefault);
-    assert!(resolved.catalog_revision > 0);
+    assert_eq!(
+        resolved.catalog_revision,
+        RENDERER_SCENARIO_CATALOG_REVISION
+    );
     assert!(resolved.workload_revision > 0);
     assert!(resolved.overlay_profile_revision > 0);
     assert!(resolved.renderer_config_profile_revision > 0);
@@ -827,14 +843,8 @@ fn assert_resolved_overlay_topology(
 #[test]
 fn checked_in_catalog_matches_draft_2020_12_schema() {
     let root = repository_root();
-    let catalog = load_catalog_value(&root);
     let validator = load_schema_validator(&root);
-    let errors = schema_errors(&validator, &catalog);
-    assert!(
-        errors.is_empty(),
-        "checked-in renderer catalog failed JSON Schema:\n{}",
-        errors.join("\n")
-    );
+    let _catalog = load_schema_clean_catalog(&root, &validator);
 }
 
 #[test]
@@ -845,6 +855,10 @@ fn checked_in_catalog_passes_typed_semantic_validation() {
         report.valid,
         "checked-in renderer catalog failed semantic validation:\n{}",
         validation_errors(&catalog)
+    );
+    assert_eq!(
+        catalog.catalog_revision,
+        RENDERER_SCENARIO_CATALOG_REVISION
     );
     assert_eq!(catalog.authority, RendererCatalogAuthority::ContractOnly);
     assert!(
@@ -940,18 +954,28 @@ fn exact_matrix_overlay_readiness_and_checkpoint_counts_are_frozen() {
 
 #[test]
 fn scenario_ids_seeds_and_coverage_cells_are_exact_and_unique() {
-    let catalog = load_catalog(&repository_root());
+    let root = repository_root();
+    let catalog_value = load_catalog_value(&root);
+    let catalog = load_catalog(&root);
+    let wire_scenarios = catalog_value["scenarios"]
+        .as_array()
+        .expect("canonical scenarios must be an array");
     let mut cells = BTreeSet::new();
     let mut ids = BTreeSet::new();
     let mut seeds = BTreeSet::new();
-    for scenario in &catalog.scenarios {
+    for (position, scenario) in catalog.scenarios.iter().enumerate() {
         assert_eq!(
             scenario.scenario_id,
             expected_renderer_scenario_id(scenario.gesture, scenario.fleet_point)
         );
+        let expected_seed =
+            expected_renderer_scenario_seed(scenario.gesture, scenario.fleet_point);
+        assert_eq!(scenario.seed, expected_seed);
+        let expected_wire_seed = format!("0x{expected_seed:016x}");
         assert_eq!(
-            scenario.seed,
-            expected_renderer_scenario_seed(scenario.gesture, scenario.fleet_point)
+            wire_scenarios[position]["seed"].as_str(),
+            Some(expected_wire_seed.as_str()),
+            "scenario seed wire encoding drifted at index {position}"
         );
         assert!(cells.insert((scenario.gesture, scenario.fleet_point)));
         assert!(ids.insert(scenario.scenario_id.as_str()));
@@ -966,6 +990,73 @@ fn scenario_ids_seeds_and_coverage_cells_are_exact_and_unique() {
         })
         .collect::<BTreeSet<_>>();
     assert_eq!(cells, expected);
+}
+
+#[test]
+fn checkpoint_comparator_policies_are_exact_for_every_role() {
+    let catalog = load_catalog(&repository_root());
+    let cases: &[(&str, RendererCheckpointRole, &[&str])] = &[
+        (
+            "last Draft cannot acquire comparison authority",
+            RendererCheckpointRole::LastDraftProvenance,
+            &[RQ_S13_COMPARATOR_POLICY_REF],
+        ),
+        (
+            "initial baseline cannot lose its comparator",
+            RendererCheckpointRole::InitialBaseline,
+            &[],
+        ),
+        (
+            "intermediate checkpoint cannot lose its comparator",
+            RendererCheckpointRole::Intermediate,
+            &[],
+        ),
+        (
+            "final checkpoint cannot lose its comparator",
+            RendererCheckpointRole::FinalSteadyState,
+            &[],
+        ),
+        (
+            "snap-back subject requires both comparators",
+            RendererCheckpointRole::StandardSnapBackSubject,
+            &[RQ_S13_COMPARATOR_POLICY_REF],
+        ),
+        (
+            "snap-back comparator order is canonical",
+            RendererCheckpointRole::StandardSnapBackSubject,
+            &[
+                RQ_S13_COMPARATOR_POLICY_REF,
+                RQ_S11_COMPARATOR_POLICY_REF,
+            ],
+        ),
+        (
+            "snap-back comparators cannot be replaced",
+            RendererCheckpointRole::StandardSnapBackSubject,
+            &[
+                RQ_S11_COMPARATOR_POLICY_REF,
+                "docs/perf/resize-quality-slo.json#wrong-policy",
+            ],
+        ),
+    ];
+    for &(label, role, policies) in cases {
+        let mut mutated = catalog.clone();
+        let checkpoint = mutated
+            .scenarios
+            .iter_mut()
+            .flat_map(|scenario| scenario.visual_checkpoints.iter_mut())
+            .find(|checkpoint| checkpoint.role == role)
+            .unwrap_or_else(|| panic!("canonical catalog must contain {role:?}"));
+        checkpoint.comparator_policy_refs = policies
+            .iter()
+            .map(|&policy| policy.to_owned())
+            .collect();
+        let report = mutated.validate();
+        assert!(
+            report.contains_code(RendererScenarioValidationCode::InvalidCheckpoint),
+            "{label}: role-specific comparator mutation was not rejected:\n{}",
+            validation_errors(&mutated)
+        );
+    }
 }
 
 #[test]
@@ -1968,6 +2059,7 @@ fn bounded_decoder_rejects_every_ambiguous_document_shape() {
 fn every_schema_required_nullable_field_rejects_omission() {
     let root = repository_root();
     let schema = load_schema_validator(&root);
+    let canonical = load_schema_clean_catalog(&root, &schema);
     for pointer in [
         "/surface_state_templates/9/surface_state/terminal/ime/candidate_window_geometry",
         "/surface_state_templates/21/surface_state/terminal/accessibility_geometry/caret_rect",
@@ -1982,7 +2074,7 @@ fn every_schema_required_nullable_field_rejects_omission() {
         "/scenarios/0/output_overlap_resize_mode",
         "/rq_s1_synthetic_substrate",
     ] {
-        let mut value = load_catalog_value(&root);
+        let mut value = canonical.clone();
         let (parent_pointer, key) = pointer
             .rsplit_once('/')
             .expect("test pointer names a parent and field");
@@ -2010,8 +2102,9 @@ fn every_schema_required_nullable_field_rejects_omission() {
 fn schema_and_decoder_reject_checkpoint_detector_authority_drift() {
     let root = repository_root();
     let validator = load_schema_validator(&root);
+    let canonical = load_schema_clean_catalog(&root, &validator);
 
-    let mut checkpoint_field = load_catalog_value(&root);
+    let mut checkpoint_field = canonical.clone();
     checkpoint_field["scenarios"][0]["visual_checkpoints"][0]
         .as_object_mut()
         .expect("first checkpoint is an object")
@@ -2032,7 +2125,7 @@ fn schema_and_decoder_reject_checkpoint_detector_authority_drift() {
         RendererScenarioDecodeCode::InvalidJson
     );
 
-    let mut all_frames_binding = load_catalog_value(&root);
+    let mut all_frames_binding = canonical;
     all_frames_binding["scenarios"][0]["detector_bindings"]
         .as_array_mut()
         .expect("detector_bindings is an array")
@@ -2059,30 +2152,71 @@ fn schema_and_decoder_reject_checkpoint_detector_authority_drift() {
 fn schema_rejects_unknown_versions_fields_and_missing_required_collections() {
     let root = repository_root();
     let validator = load_schema_validator(&root);
+    let canonical = load_schema_clean_catalog(&root, &validator);
 
-    let mut unknown_version = load_catalog_value(&root);
+    let mut unknown_version = canonical.clone();
     unknown_version["schema_version"] = json!(2);
     assert!(!schema_errors(&validator, &unknown_version).is_empty());
 
-    let mut unknown_field = load_catalog_value(&root);
+    let mut old_catalog_revision = canonical.clone();
+    old_catalog_revision["catalog_revision"] = json!(1);
+    assert!(!schema_errors(&validator, &old_catalog_revision).is_empty());
+
+    let mut unknown_field = canonical.clone();
     unknown_field["native_target_passed"] = json!(true);
     assert!(!schema_errors(&validator, &unknown_field).is_empty());
 
-    let mut missing_scenarios = load_catalog_value(&root);
+    let mut missing_scenarios = canonical.clone();
     missing_scenarios
         .as_object_mut()
         .expect("catalog is an object")
         .remove("scenarios");
     assert!(!schema_errors(&validator, &missing_scenarios).is_empty());
 
-    let mut bad_overlay = load_catalog_value(&root);
+    let mut bad_overlay = canonical;
     bad_overlay["coverage_overlay_profiles"][0]["overlay_id"] = json!("future_overlay");
     assert!(!schema_errors(&validator, &bad_overlay).is_empty());
 }
 
 #[test]
+fn schema_and_decoder_reject_ambiguous_renderer_seed_encodings() {
+    let root = repository_root();
+    let validator = load_schema_validator(&root);
+    let canonical = load_schema_clean_catalog(&root, &validator);
+    for invalid_seed in [
+        json!(5_067_765_997_134_473_000_u64),
+        json!("5067765997134479361"),
+        json!("0X4654525300010001"),
+        json!("0x465452530001000A"),
+        json!("0x465452530001001"),
+    ] {
+        let mut value = canonical.clone();
+        value["scenarios"][0]["seed"] = invalid_seed.clone();
+        assert!(
+            !schema_errors(&validator, &value).is_empty(),
+            "schema accepted ambiguous renderer seed {invalid_seed}"
+        );
+        let encoded = serde_json::to_vec(&value).expect("seed mutation should encode");
+        assert_eq!(
+            RendererScenarioCatalog::decode_json_bounded(&encoded)
+                .expect_err("typed decoder must reject ambiguous renderer seed")
+                .code(),
+            RendererScenarioDecodeCode::InvalidJson,
+            "typed decoder accepted ambiguous renderer seed {invalid_seed}"
+        );
+    }
+}
+
+#[test]
 fn semantic_validator_rejects_identity_layout_content_and_timeline_drift() {
     let root = repository_root();
+
+    let mut revision = load_catalog(&root);
+    revision.catalog_revision = 1;
+    assert_has_code(
+        &revision,
+        RendererScenarioValidationCode::UnknownCatalogRevision,
+    );
 
     let mut identity = load_catalog(&root);
     identity.scenarios[0].seed ^= 1;
