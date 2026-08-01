@@ -651,6 +651,131 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Do not retry from a cold read; use the trace-v2 identity/clock bundle and isolated live Mac-to-trj input rig in .2.1–.2.8 instead.
 
+### IS-N017 — Retina logical DPI and backing scale are not two independent pixel-density multipliers
+
+- **Classification:** wrong-model rejection; kept structural correction
+- **Bead:** `ft-interactive-systems-performance-4tenz.3.1`
+- **Rejected candidate:** an uncommitted catalog draft; it has no immutable
+  revision or retained qualifying artifact.
+- **Retained structural revision:**
+  `fba4ecf0131fcca1f286fc7525c6b2d8011c8544`
+- **Rejected inference:** representing a canonical macOS Retina move as logical
+  `192_000` DPI plus backing scale `2_000` and multiplying both treated
+  physical/backing density as two independent scale inputs. With the frozen
+  8 px reference cell, that model produces 32 px—4x the reference—rather than
+  the intended 16 px backing-pixel cell.
+- **Structural correction:** `dpi_milli` is logical DPI, independent of
+  physical panel DPI and backing scale. The canonical move retains logical
+  `96_000` DPI and changes scale from `1_000` to `2_000`; the checked
+  fixed-point derivation therefore maps 8 px to 16 px exactly. At the retained
+  revision, all four `MoveToDisplay` payloads and all 32
+  `display-retina-002` surface states carry `(96_000, 2_000)`. The checked-in
+  catalog is 4,804,862 bytes with SHA-256
+  `8d21fe3a26db8ca06e7def8746a7e22051dab980698438a574cbaf7df3a00b66`.
+- **Proof boundary:** this is structural source, contract, and artifact
+  evidence only. It collected no AppKit or `NSScreen` adapter trace,
+  Apple-silicon render, presented-frame geometry, visual-equivalence result,
+  or performance sample. It therefore cannot qualify native DPI handling,
+  text appearance, resize/zoom latency, or M4/M5 performance.
+- **Decision:** reject the double-scaling model and retain the corrected
+  contract, without promoting any runtime or performance claim.
+- **Primary retry condition:**
+  > Reopen native qualification only when one retained same-window Apple-silicon display-move trace independently records logical DPI and backing scale at the platform adapter, proves the production render path applies each exactly once, and matches the predicted 8 px to 16 px cell geometry, exact residual padding, and native presented-frame visual oracle.
+
+### IS-N018 — Bare numeric renderer-scenario `u64` seeds and mutation tests built on an invalid canonical schema are rejected evidence
+
+- **Classification:** ambiguous wire identity and false-green schema-gate
+  rejection; kept structural correction
+- **Bead:** `ft-interactive-systems-performance-4tenz.3.1`
+- **Rejected candidate revision:**
+  `2f6a6f3c567bd0d20f51919c950aaab69c56dcbc`
+- **Rejected inferences:** a bare JSON integer was treated as a portable 64-bit
+  renderer-scenario identity even though IEEE-754-only consumers can round
+  values above `2^53`. Separately, schema-mutation tests treated “some
+  validation error exists” as proof that their mutation was rejected without
+  first proving the canonical document was schema-valid. This result is scoped
+  to `RendererScenarioDefinition.seed`; other generator-seed contracts require
+  their own wire-identity audit.
+- **Failed remote evidence:** job `j-29955720610840704` completed with 17 tests
+  passing and 15 failing. The canonical schema incorrectly required at least
+  one `comparator_policy_refs` entry, rejecting all 160 legitimate last-Draft
+  provenance checkpoints whose exact semantic policy set is empty. That
+  candidate also serialized the four distinct
+  `renderer.dpi_display_move.{p001,p020,p050,p200}` seeds
+  `0x4654525300070001`, `0x4654525300070014`, `0x4654525300070032`, and
+  `0x46545253000700c8` as the same rounded decimal
+  `5067765997134873000`. The schema contradiction and seed-identity collapse
+  cascaded through schema, round-trip, and mutation checks; the 15 failures are
+  not 15 independent defects. Job `j-29955720610840705` exited 101, but its
+  diagnostics were unavailable, so it cannot classify a source failure or
+  provide corrective proof. Exact-descendant job `j-29955720610840708` later
+  isolated only two integration-test lint defects, `bool_to_int_with_if` and
+  `type_complexity`, which led to the Clippy-only descendant below.
+- **Structural correction:** revision
+  `fba4ecf0131fcca1f286fc7525c6b2d8011c8544` changes all 32 seeds to exact
+  `0x` plus 16 lowercase hexadecimal digits while retaining typed Rust `u64`
+  values, rejects numeric/decimal/uppercase/short encodings, and binds source,
+  schema, contract, artifact, and semantic validation to catalog revision `2`.
+  It also permits structurally empty comparator arrays while the Rust validator
+  enforces the exact role-specific zero/one/two policy set, and requires every
+  schema mutation to begin from a schema-clean canonical document.
+- **Clippy-only descendant:**
+  `0eff8fe78ac8a495c14c5c3d9878c36a2d64c218` repairs integration-test lint
+  findings without changing the corrected wire or validation semantics.
+- **Corrected artifact:** `docs/design/renderer-scenario-catalog.v1.json` is
+  4,804,862 bytes with SHA-256
+  `8d21fe3a26db8ca06e7def8746a7e22051dab980698438a574cbaf7df3a00b66`;
+  it contains exactly 32 unique string seeds and `catalog_revision: 2`.
+- **Retained corrected proof:** strict-remote jobs `j-29955720610840706` and
+  `j-29955720610840707` respectively completed the corrected leaf library's
+  all-target check and warnings-denied library Clippy gate. Job
+  `j-29955720610840709` completed the exact descendant's renderer
+  integration-test target Clippy gate with warnings denied. Full
+  renderer-catalog and workspace gates were still running when this entry was
+  created and are not pre-credited here.
+- **Proof boundary:** these are contract, schema, serialization, and test-gate
+  corrections. They do not cover a live FrankenTerm session, mux domain, PTY,
+  AppKit path, renderer, presented frame, visual-equivalence workload, or
+  performance sample.
+- **Decision:** reject numeric-`u64` JSON as canonical seed identity and reject
+  every mutation verdict obtained from a schema-invalid baseline. Keep the
+  structural correction, but promote no runtime, visual, or performance claim.
+- **Primary retry condition:**
+  > Reintroduce a numeric `u64` wire only when every supported serializer, parser, query tool, and evidence consumer demonstrably preserves all 64 identity bits above `2^53` and a negative regression fails on any rounded representation; otherwise retain the fixed-width lowercase hexadecimal wire and require every mutation test to prove its canonical baseline schema-clean before mutation.
+
+### IS-N019 — Replacing a held buffer with the same corpus is not a destructive negative control
+
+- **Classification:** invalid negative-control rejection; kept test correction
+- **Bead:** `ft-interactive-systems-performance-4tenz.3.1`
+- **Rejected candidate revision:**
+  `0eff8fe78ac8a495c14c5c3d9878c36a2d64c218`
+- **Failed remote evidence:** strict-remote job `j-29955720610840712`
+  reached the 34-test renderer-catalog suite and showed that
+  `hold_through_rejects_early_alternate_exit_and_replacement` expected
+  `RSC-STATE-001` from a mutation that validation correctly accepted. The
+  remaining long-running tests were allowed to continue so their outcomes
+  could not be hidden by the first failure.
+- **Rejected inference:** changing an `EnterAlternateBuffer` step into
+  `ReplaceActiveBuffer` was assumed to destroy the earlier hold-through effect.
+  The mutation retained the exact same alternate-screen corpus identity, and
+  the following typed-state materialization restored the same canonical buffer
+  contents. It therefore did not violate the continuous hold promise and could
+  not prove that the validator missed an early replacement.
+- **Structural correction:** revision
+  `24c43fd6db72fcdd12599cdbf0cb474053b7e74b` makes the replacement select a
+  different corpus and requires the intended “does not survive continuously
+  through promised checkpoint” diagnostic, rather than accepting any unrelated
+  `InvalidState` result.
+- **Proof boundary:** this repairs a semantic negative control only. It does
+  not execute a live terminal, alternate-screen application, PTY, renderer, or
+  presentation path and carries no visual or performance authority.
+- **Decision:** reject the same-corpus replacement as evidence, retain the
+  causally destructive mutation, and withhold a green verdict until the exact
+  corrected revision passes the focused test, full renderer suite, and
+  warnings-denied test-target Clippy remotely.
+- **Primary retry condition:**
+  > Credit this negative control only when the replacement uses a corpus identity different from the held alternate-screen corpus and the exact corrected revision fails specifically because the original effect does not survive continuously through its promised checkpoint.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
