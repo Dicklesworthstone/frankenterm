@@ -212,7 +212,9 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
         }
     };
     let mut out = Vec::with_capacity(clean.len() / 2);
-    for pair in clean.chunks_exact(2) {
+    let (pairs, remainder) = clean.as_chunks::<2>();
+    debug_assert!(remainder.is_empty(), "even-length hex has no remainder");
+    for pair in pairs {
         out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
     }
     Some(out)
