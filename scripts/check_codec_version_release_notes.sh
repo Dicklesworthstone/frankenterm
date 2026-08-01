@@ -35,7 +35,7 @@ if [[ ! -f "${RELEASE_NOTES}" ]]; then
 fi
 
 # Extract the current CODEC_VERSION literal. The line shape is
-#   pub const CODEC_VERSION: usize = 46;
+#   pub const CODEC_VERSION: usize = NNN;
 # Anchor on `pub const CODEC_VERSION` and pull the integer immediately
 # after the `=`. No regex flexibility on the spacing — keep the source
 # format stable.
@@ -87,11 +87,12 @@ To fix:
   1. Open ${RELEASE_NOTES}.
   2. Add a row at the top of the History table:
        | ${current_version} | YYYY-MM-DD | additive|breaking | <one-line summary referencing the PDU id(s) and bead> |
-     - 'additive' = end-of-struct field with serde(default) or new PDU
-       variant — rolling upgrade safe.
-     - 'breaking' = field removal, type change, or middle-insert — must
-       be paired with a CODEC_VERSION_MIN_SUPPORTED bump once
-       ft-kuxho.B.1 lands.
+     - 'additive' = a distinct new PDU or behavior guarded by negotiated
+       version/capability — rolling upgrade safe. Appending a field to an
+       existing varbincode PDU is not additive because old payloads end at EOF.
+     - 'breaking' = field addition/removal, type change, or middle-insert in
+       an existing PDU — must be paired with a
+       CODEC_VERSION_MIN_SUPPORTED bump in the same commit.
   3. Commit the row in the same commit as the CODEC_VERSION bump.
 
 If you are *reverting* a CODEC_VERSION change, also revert the row.

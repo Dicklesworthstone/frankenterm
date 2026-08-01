@@ -4,7 +4,7 @@ Single source of truth for `CODEC_VERSION` history.
 
 The CI guard `scripts/check_codec_version_release_notes.sh` (track A
 of ft-kuxho, ft-8smkj) reads the current `CODEC_VERSION` constant from
-`frankenterm/codec/src/lib.rs:650` and **fails CI** if no row in this
+`frankenterm/codec/src/lib.rs` and **fails CI** if no row in this
 file documents that version. Bumping `CODEC_VERSION` without adding a
 row here is a silent protocol change and is rejected at CI time.
 
@@ -14,20 +14,19 @@ row at the top of the table below in the same commit. Each row records:
 - **version** — the new `CODEC_VERSION` value (matches the constant exactly)
 - **date** — `YYYY-MM-DD` of the commit that bumped the version
 - **kind** — `additive` (rolling upgrade safe per ft-kuxho/B) or `breaking`
-  (atomic redeploy required; bumps `CODEC_VERSION_MIN_SUPPORTED` once
-  ft-kuxho.B.1 lands)
+  (atomic redeploy required and must advance `CODEC_VERSION_MIN_SUPPORTED`)
 - **change** — short summary; reference the PDU id(s) and the bead/commit
 
-Future-proofing: when `CODEC_VERSION_MIN_SUPPORTED` lands (ft-kuxho.B.1),
-the same guard will be extended to require a row whenever `MIN`
-advances. Until then, every `CODEC_VERSION` bump implicitly raises the
-minimum to itself (atomic-redeploy semantics).
+`CODEC_VERSION_MIN_SUPPORTED` is live. Peers may negotiate any version in the
+inclusive `MIN_SUPPORTED..=CODEC_VERSION` window. A new, separately negotiated
+PDU may advance only `CODEC_VERSION`; a breaking change must advance the
+minimum in the same commit. Adding a field to an existing varbincode PDU is not
+additive because old payloads end at EOF and do not synthesize a missing field.
 
-**Operator note:** every entry in this table currently implies a
-maintenance-window deploy. See
-[`docs/codec-atomic-redeploy.md`](codec-atomic-redeploy.md) for the
-deploy runbook (server-first ordering, expected connection drops,
-rollback procedure) and the rationale.
+**Operator note:** rows marked additive are rolling-upgrade safe only when the
+new PDU or behavior is guarded by the negotiated version/capability. Rows
+marked breaking require the maintenance-window procedure in
+[`docs/codec-atomic-redeploy.md`](codec-atomic-redeploy.md).
 
 ## History
 
