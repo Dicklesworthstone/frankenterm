@@ -340,6 +340,27 @@ pub struct PersistedWindowState {
     pub fullscreen: bool,
 }
 
+/// Select the restore state for a window after asynchronous construction.
+///
+/// A mux window can move workspaces while its native window and renderer are
+/// being created. The cohort capture remains valid only while the workspace is
+/// unchanged; otherwise the caller supplies a current, already-cached lookup.
+pub fn resolve_saved_window_state<F>(
+    captured_workspace: &str,
+    captured_state: Option<PersistedWindowState>,
+    current_workspace: Option<&str>,
+    load_current: F,
+) -> Option<PersistedWindowState>
+where
+    F: FnOnce(&str) -> Option<PersistedWindowState>,
+{
+    match current_workspace {
+        Some(workspace) if workspace == captured_workspace => captured_state,
+        Some(workspace) => load_current(workspace),
+        None => None,
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DomainBindingRecord {
@@ -2252,6 +2273,45 @@ mod tests {
             domain_bindings: Vec::new(),
             overlays: Vec::new(),
         }
+    }
+
+    #[test]
+    fn moved_window_refreshes_restore_state_for_current_workspace() {
+        let captured = PersistedWindowState {
+            maximized: true,
+            fullscreen: false,
+        };
+        let current = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", Some(captured), Some("workspace-a"), |_| {
+                panic!("unchanged workspace must keep the cohort capture")
+            }),
+            Some(captured)
+        );
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", Some(captured), Some("workspace-b"), |name| {
+                assert_eq!(name, "workspace-b");
+                Some(current)
+            }),
+            Some(current)
+        );
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", None, Some("workspace-b"), |_| {
+                Some(current)
+            }),
+            Some(current),
+            "a missing old-workspace state must not suppress the new workspace state"
+        );
+        assert_eq!(
+            resolve_saved_window_state("workspace-a", Some(captured), None, |_| {
+                panic!("removed mux windows have no current workspace to restore")
+            }),
+            None
+        );
     }
 
     #[test]

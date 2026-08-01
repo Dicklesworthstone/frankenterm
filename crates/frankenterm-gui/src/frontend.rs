@@ -7,6 +7,9 @@ use anyhow::{Context, Error};
 use config::keyassignment::{KeyAssignment, SpawnCommand};
 use config::{ConfigSubscription, NotificationHandling};
 use frankenterm_core::osc_protocol_integration::{CursorShapeSlug, Osc22PerPaneCursorMap};
+use frankenterm_gui::workspace_reconcile::{
+    WorkspaceReconcileGate, WorkspaceReconcileWaiters,
+};
 use frankenterm_toast_notification::*;
 use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
@@ -19,66 +22,6 @@ use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
 
 const MAX_RECONCILE_WAITERS: usize = 4_096;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct WorkspaceReconcileGate {
-    pass_running: bool,
-    rerun_requested: bool,
-}
-
-impl WorkspaceReconcileGate {
-    fn request_pass(&mut self) -> bool {
-        if self.pass_running {
-            self.rerun_requested = true;
-            false
-        } else {
-            self.pass_running = true;
-            true
-        }
-    }
-
-    fn finish_pass(&mut self) -> bool {
-        debug_assert!(self.pass_running);
-        if self.rerun_requested {
-            self.rerun_requested = false;
-            true
-        } else {
-            self.pass_running = false;
-            false
-        }
-    }
-}
-
-#[derive(Default)]
-struct WorkspaceReconcileWaiters {
-    active_pass: Vec<Promise<()>>,
-    next_pass: Vec<Promise<()>>,
-}
-
-impl WorkspaceReconcileWaiters {
-    fn waiter_count(&self) -> usize {
-        self.active_pass.len().saturating_add(self.next_pass.len())
-    }
-
-    fn push(&mut self, starts_new_pass: bool, promise: Promise<()>) {
-        if starts_new_pass {
-            debug_assert!(self.active_pass.is_empty());
-            self.active_pass.push(promise);
-        } else {
-            self.next_pass.push(promise);
-        }
-    }
-
-    fn finish_active_pass(&mut self, run_again: bool) -> Vec<Promise<()>> {
-        let completed = std::mem::take(&mut self.active_pass);
-        if run_again {
-            self.active_pass = std::mem::take(&mut self.next_pass);
-        } else {
-            debug_assert!(self.next_pass.is_empty());
-        }
-        completed
-    }
-}
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
@@ -789,86 +732,9 @@ fn focus_terminal_toast_source(pane_id: mux::pane::PaneId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CursorShapeSlug, MouseCursor, WorkspaceReconcileGate, WorkspaceReconcileWaiters,
-        cursor_shape_slug_from_osc22_request,
+        CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
         mouse_cursor_for_osc22_shape, osc22_accessibility_announcement, terminal_toast_action,
     };
-    use std::future::Future as _;
-    use std::pin::Pin;
-    use std::task::{Context, Poll, Waker};
-
-    #[test]
-    fn workspace_reconcile_gate_serializes_reentrant_requests() {
-        let mut gate = WorkspaceReconcileGate::default();
-
-        assert!(gate.request_pass(), "first request must start a pass");
-        assert!(gate.pass_running);
-        assert!(
-            !gate.request_pass(),
-            "reentrant request must join the running pass"
-        );
-        assert!(gate.rerun_requested);
-        assert!(
-            gate.finish_pass(),
-            "the running pass must hand off to one coalesced rerun"
-        );
-        assert!(gate.pass_running);
-        assert!(!gate.rerun_requested);
-        assert!(
-            !gate.finish_pass(),
-            "the stable rerun must release the gate"
-        );
-        assert_eq!(gate, WorkspaceReconcileGate::default());
-    }
-
-    #[test]
-    fn workspace_reconcile_promises_complete_by_pass_generation() {
-        let mut gate = WorkspaceReconcileGate::default();
-        let mut waiters = WorkspaceReconcileWaiters::default();
-        let mut first_promise = promise::Promise::new();
-        let mut first_future = first_promise.get_future().expect("first future");
-        let mut second_promise = promise::Promise::new();
-        let mut second_future = second_promise.get_future().expect("second future");
-
-        let first_starts = gate.request_pass();
-        waiters.push(first_starts, first_promise);
-        let second_starts = gate.request_pass();
-        waiters.push(second_starts, second_promise);
-        assert!(first_starts);
-        assert!(!second_starts);
-
-        let run_again = gate.finish_pass();
-        let completed = waiters.finish_active_pass(run_again);
-        assert!(run_again);
-        assert_eq!(completed.len(), 1);
-        assert_eq!(waiters.active_pass.len(), 1);
-        for mut promise in completed {
-            promise.ok(());
-        }
-
-        let waker = Waker::noop().clone();
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            Pin::new(&mut first_future).poll(&mut context),
-            Poll::Ready(Ok(()))
-        ));
-        assert!(matches!(
-            Pin::new(&mut second_future).poll(&mut context),
-            Poll::Pending
-        ));
-
-        let run_again = gate.finish_pass();
-        let completed = waiters.finish_active_pass(run_again);
-        assert!(!run_again);
-        assert_eq!(completed.len(), 1);
-        for mut promise in completed {
-            promise.ok(());
-        }
-        assert!(matches!(
-            Pin::new(&mut second_future).poll(&mut context),
-            Poll::Ready(Ok(()))
-        ));
-    }
 
     #[test]
     fn osc22_request_parser_accepts_terminal_cursor_slugs() {

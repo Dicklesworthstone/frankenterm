@@ -15,6 +15,159 @@ pub mod renderer_slo;
 pub mod rollout_env;
 pub mod window_state_persist;
 
+/// Bounded, generation-aware coordination for GUI workspace reconciliation.
+///
+/// The GUI binary owns the actual mux/window work. These pure state machines
+/// live in the library so their Promise ordering remains covered by the normal
+/// `cargo test --lib` proof lane even though the GUI binary has `test = false`.
+pub mod workspace_reconcile {
+    use promise::Promise;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct WorkspaceReconcileGate {
+        pass_running: bool,
+        rerun_requested: bool,
+    }
+
+    impl WorkspaceReconcileGate {
+        #[must_use]
+        pub fn request_pass(&mut self) -> bool {
+            if self.pass_running {
+                self.rerun_requested = true;
+                false
+            } else {
+                self.pass_running = true;
+                true
+            }
+        }
+
+        #[must_use]
+        pub fn finish_pass(&mut self) -> bool {
+            debug_assert!(self.pass_running);
+            if self.rerun_requested {
+                self.rerun_requested = false;
+                true
+            } else {
+                self.pass_running = false;
+                false
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub struct WorkspaceReconcileWaiters {
+        active_pass: Vec<Promise<()>>,
+        next_pass: Vec<Promise<()>>,
+    }
+
+    impl WorkspaceReconcileWaiters {
+        #[must_use]
+        pub fn waiter_count(&self) -> usize {
+            self.active_pass
+                .len()
+                .saturating_add(self.next_pass.len())
+        }
+
+        pub fn push(&mut self, starts_new_pass: bool, promise: Promise<()>) {
+            if starts_new_pass {
+                debug_assert!(self.active_pass.is_empty());
+                self.active_pass.push(promise);
+            } else {
+                self.next_pass.push(promise);
+            }
+        }
+
+        #[must_use]
+        pub fn finish_active_pass(&mut self, run_again: bool) -> Vec<Promise<()>> {
+            let completed = std::mem::take(&mut self.active_pass);
+            if run_again {
+                self.active_pass = std::mem::take(&mut self.next_pass);
+            } else {
+                debug_assert!(self.next_pass.is_empty());
+            }
+            completed
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{WorkspaceReconcileGate, WorkspaceReconcileWaiters};
+        use promise::Promise;
+        use std::future::Future as _;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        #[test]
+        fn gate_serializes_reentrant_requests() {
+            let mut gate = WorkspaceReconcileGate::default();
+
+            assert!(gate.request_pass(), "first request must start a pass");
+            assert!(
+                !gate.request_pass(),
+                "reentrant request must join the running pass"
+            );
+            assert!(
+                gate.finish_pass(),
+                "the running pass must hand off to one coalesced rerun"
+            );
+            assert!(
+                !gate.finish_pass(),
+                "the stable rerun must release the gate"
+            );
+            assert_eq!(gate, WorkspaceReconcileGate::default());
+        }
+
+        #[test]
+        fn promises_complete_by_pass_generation() {
+            let mut gate = WorkspaceReconcileGate::default();
+            let mut waiters = WorkspaceReconcileWaiters::default();
+            let mut first_promise = Promise::new();
+            let mut first_future = first_promise.get_future().expect("first future");
+            let mut second_promise = Promise::new();
+            let mut second_future = second_promise.get_future().expect("second future");
+
+            let first_starts = gate.request_pass();
+            waiters.push(first_starts, first_promise);
+            let second_starts = gate.request_pass();
+            waiters.push(second_starts, second_promise);
+            assert!(first_starts);
+            assert!(!second_starts);
+
+            let run_again = gate.finish_pass();
+            let completed = waiters.finish_active_pass(run_again);
+            assert!(run_again);
+            assert_eq!(completed.len(), 1);
+            assert_eq!(waiters.waiter_count(), 1);
+            for mut promise in completed {
+                promise.ok(());
+            }
+
+            let waker = Waker::noop().clone();
+            let mut context = Context::from_waker(&waker);
+            assert!(matches!(
+                Pin::new(&mut first_future).poll(&mut context),
+                Poll::Ready(Ok(()))
+            ));
+            assert!(matches!(
+                Pin::new(&mut second_future).poll(&mut context),
+                Poll::Pending
+            ));
+
+            let run_again = gate.finish_pass();
+            let completed = waiters.finish_active_pass(run_again);
+            assert!(!run_again);
+            assert_eq!(completed.len(), 1);
+            for mut promise in completed {
+                promise.ok(());
+            }
+            assert!(matches!(
+                Pin::new(&mut second_future).poll(&mut context),
+                Poll::Ready(Ok(()))
+            ));
+        }
+    }
+}
+
 /// Keep drag-selection geometry alive while live output dirties rows under it.
 ///
 /// This lives in the library crate so the binary-owned `termwindow` selection
