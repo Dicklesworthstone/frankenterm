@@ -56,7 +56,7 @@ fn build_panes() -> Vec<PaneScrollbackInfo> {
             let warm_bytes = warm_pages * bytes_per_page;
             PaneScrollbackInfo {
                 pane_id: pane as u64,
-                activity_counter: if pane % 5 == 0 { 1 } else { 0 },
+                activity_counter: u64::from(pane % 5 == 0),
                 warm_bytes,
                 warm_pages,
                 estimated_memory_bytes: warm_bytes + 128 * 256,
@@ -75,14 +75,14 @@ fn apply_eviction_plan(
             if pane.warm_pages == 0 || pane.warm_bytes == 0 {
                 continue;
             }
-            let pages = target.pages_to_evict.min(pane.warm_pages);
+            let evictable_pages = target.pages_to_evict.min(pane.warm_pages);
             let bytes = pane
                 .warm_bytes
-                .saturating_mul(pages)
+                .saturating_mul(evictable_pages)
                 .checked_div(pane.warm_pages)
                 .unwrap_or(0)
                 .min(pane.warm_bytes);
-            pane.warm_pages = pane.warm_pages.saturating_sub(pages);
+            pane.warm_pages = pane.warm_pages.saturating_sub(evictable_pages);
             pane.warm_bytes = pane.warm_bytes.saturating_sub(bytes);
             pane.estimated_memory_bytes = pane.estimated_memory_bytes.saturating_sub(bytes);
             evicted_bytes = evicted_bytes.saturating_add(bytes);
