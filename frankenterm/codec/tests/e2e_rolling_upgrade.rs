@@ -6,15 +6,15 @@
 //! no test doubles, no in-memory wire-format simulators, no abbreviated
 //! schema. We model a realistic mixed-fleet rolling-upgrade scenario:
 //!
-//!   1. A v47 server (simulated by encoding `GetCodecVersionResponse` with
+//!   1. A v+1 server (simulated by encoding `GetCodecVersionResponse` with
 //!      `codec_vers = CODEC_VERSION + 1` and `min_supported = CODEC_VERSION`)
-//!      handshakes with a v46 client (the test process, running at
+//!      handshakes with a v client (the test process, running at
 //!      `CODEC_VERSION`).
 //!   2. The client decodes the response, applies `check_compat(local,
 //!      local_min, remote, remote_min)`, and asserts the negotiation lands
 //!      on `agreed = CODEC_VERSION` per the proposal §2 invariant.
-//!   3. The "agreed" version then drives a stress loop of 250 PDU
-//!      roundtrips covering the full custom-PDU matrix (IDs 63-72) under
+//!   3. The "agreed" version then drives a stress loop of approximately 750
+//!      PDU roundtrips covering the full custom-PDU matrix (IDs 63-72) under
 //!      all three `CompressionMode` variants. Each roundtrip exercises
 //!      the actual encode→stream_decode→assert path with real bytes.
 //!   4. Every step emits a structured JSON line to stdout so the run is
@@ -63,8 +63,8 @@ fn log_event(phase: &str, outcome: &str, detail: &str) {
 
 /// ft-kuxho.B end-to-end contract: a future-version peer's GetCodecVersionResponse
 /// (codec_vers=v+1, min_supported=v) handshakes successfully with a v
-/// client and the negotiated session encodes/decodes 250 PDUs across the
-/// custom-PDU matrix without drift, under all three compression modes.
+/// client and the negotiated session encodes/decodes approximately 750 PDUs
+/// across the custom-PDU matrix without drift, under all three compression modes.
 #[test]
 fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
     let started = Instant::now();
@@ -149,7 +149,7 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
     );
     log_event("phase3.check_compat", "ok", &format!("agreed={agreed}"));
 
-    // ── PHASE 4: 250-PDU storm under the agreed dialect ──
+    // ── PHASE 4: approximately 750-PDU storm under the agreed dialect ──
     //
     // The skill calls for "realistic load" — sweep the full custom-PDU
     // matrix (IDs 63-72) repeatedly under all three CompressionMode
