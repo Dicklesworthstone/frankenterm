@@ -2058,6 +2058,75 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 - **Primary retry condition:**
   > Promote generation replacement only after deterministic barriers enqueue old-source output on both sides of revocation, commit a new producer epoch, and prove every stale envelope is rejected before all persistence side effects while the new generation emits one bounded resync and converges exactly.
 
+### IS-N058 — Reweighting after serialization is not an allocator or RSS bound
+
+- **Classification:** pre-allocation admission rejection; capacity-limited writer
+  required
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.3.5.5`
+- **Structural candidate retained:** `a32a47834803f0c7949725a464664b7b9db3ca77`
+  charges the encoded frame's retained capacity to the connection-wide outbound
+  budget and fails the connection generation closed when reweighting exceeds
+  the topology ceiling.
+- **Rejected candidate:** serialize a typed PDU into a newly allocated `Vec`,
+  then use its capacity to decide whether the allocation was admissible.
+- **Rejected inference:** post-allocation accounting bounds retained ownership
+  after the decision, but the allocator has already serviced the `Vec` growth.
+  Serialization and compression can therefore create an instantaneous
+  allocation peak before the budget rejects and releases the frame.
+- **Required correction:** reserve a checked upper bound before allocation, or
+  serialize through a capacity-limited writer whose growth consumes the exact
+  connection reservation before each allocation. Preserve exact transfer and
+  release across typed, encoded, compressed, deferred, partial-write, failure,
+  cancellation, and teardown states.
+- **Decision:** keep the retained-byte accounting, but reject allocator-envelope
+  and RSS claims from post-allocation reweighting alone.
+- **Primary retry condition:**
+  > Promote the outbound allocation envelope only after q2/q20/q200/q4096 and oversized-frame barriers prove that every serializer and compressor allocation is pre-admitted, peak live capacity remains within one frozen connection budget, and every terminal path returns the reservation to zero.
+
+### IS-N059 — Reserved control capacity is not control scheduling priority
+
+- **Classification:** service-order rejection; class-aware fairness required
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.1`
+- **Structural candidate retained:** `a32a47834803f0c7949725a464664b7b9db3ca77`
+  reserves 64 connection slots for control traffic while bounding bulk
+  admission independently.
+- **Rejected candidate:** append admitted control and bulk frames to the same
+  FIFO and infer low control latency because bulk cannot consume the reserved
+  control slots.
+- **Rejected inference:** admission headroom prevents control rejection, but a
+  newly admitted control frame can still wait behind every older bulk frame.
+  The reserve establishes capacity, not a service deadline, burst bound, or
+  starvation theorem.
+- **Required correction:** schedule explicit traffic classes with a bounded
+  priority or deficit policy, an executable maximum bulk burst, per-class age
+  telemetry, and a fairness rule that also prevents bulk starvation.
+- **Decision:** keep the control reserve, but reject keypress/control latency
+  claims until service order is independently bounded and measured.
+- **Primary retry condition:**
+  > Promote control-path scheduling only after deterministic saturated-bulk barriers and retained q2/q20/q200/q4096 traces prove the declared control service gap and bulk starvation bound from admission through socket progress.
+
+### IS-N060 — Two pending-request ledgers cannot both own retirement
+
+- **Classification:** split-authority rejection; one request-lineage owner
+  required
+- **Bead:** `ft-interactive-systems-performance-4tenz.5.5.3`
+- **Rejected candidate:** add a server-dispatch pending-request ledger beside
+  the client's authoritative `PendingReplies` serial-to-waiter map so both
+  sides attempt to classify response, cancellation, and transport teardown.
+- **Rejected inference:** duplicate bookkeeping does not strengthen exact-once
+  retirement. It creates two independently mutable authorities that can
+  diverge across cancellation, reconnect, serial reuse, or a response/teardown
+  race, producing double retirement, an orphaned waiter, or an ABA match.
+- **Required correction:** keep `PendingReplies` as the sole owner of client
+  request admission and waiter retirement. Server dispatch may own only its
+  generation-scoped response obligations, with explicit handoff at the wire
+  boundary and no shadow serial authority.
+- **Decision:** reject the duplicate ledger. Retain the client teardown
+  regression that proves one live and one abandoned waiter settle exactly once
+  under the existing authority.
+- **Primary retry condition:**
+  > Reconsider end-to-end request accounting only with one non-duplicated lineage capability whose admission, response, cancellation, teardown, reconnect, and serial-reuse transitions have a single linearization point and deterministic exact-once proofs.
+
 ## Open hypothesis register
 
 These are not negative results. Each remains open until a retained same-window
