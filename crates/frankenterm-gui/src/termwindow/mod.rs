@@ -1822,23 +1822,16 @@ impl TermWindow {
         }
     }
 
-    fn settle_render_damage(&mut self, completion: FrameCompletion) -> DamageCommitOutcome {
-        let outcome = settle_frame_damage(
+    fn complete_presented_frame(&mut self, outcome: PaintOutcome) {
+        let settlement = apply_presented_render_attempt(
             &mut self.dirty_lines,
             &mut self.last_dirty_event_was_whole_screen,
             self.damage_generation,
-            completion,
-        );
-        metrics::counter!("gui.render.damage_settlement", "outcome" => outcome.label())
-            .increment(1);
-        outcome
-    }
-
-    fn complete_presented_frame(&mut self, outcome: PaintOutcome) {
-        let settlement = self.settle_render_damage(FrameCompletion::Presented(
+            &mut self.render_recovery_state,
             outcome.damage_generation,
-        ));
-        self.render_recovery_state.record_success();
+        );
+        metrics::counter!("gui.render.damage_settlement", "outcome" => settlement.label())
+            .increment(1);
         if self.render_wake_state.cancel() {
             metrics::counter!("gui.render.retry", "action" => "cancelled_by_success")
                 .increment(1);
@@ -1849,11 +1842,6 @@ impl TermWindow {
                 window.invalidate();
             }
         }
-    }
-
-    fn retain_failed_frame(&mut self, stage: RenderFailureStage) {
-        let _ = self.settle_render_damage(FrameCompletion::Failed(stage));
-        metrics::counter!("gui.render.frame_failure", "stage" => stage.label()).increment(1);
     }
 
     fn plan_render_wake(
@@ -1966,8 +1954,17 @@ impl TermWindow {
 
     fn handle_render_failure(&mut self, failure: &RenderAttemptFailure) {
         let stage = failure.stage();
-        self.retain_failed_frame(stage);
-        match self.render_recovery_state.record_failure(stage) {
+        let (settlement, directive) = apply_failed_render_attempt(
+            &mut self.dirty_lines,
+            &mut self.last_dirty_event_was_whole_screen,
+            self.damage_generation,
+            &mut self.render_recovery_state,
+            stage,
+        );
+        metrics::counter!("gui.render.damage_settlement", "outcome" => settlement.label())
+            .increment(1);
+        metrics::counter!("gui.render.frame_failure", "stage" => stage.label()).increment(1);
+        match directive {
             RenderRecoveryDirective::RetryAfter(delay) => {
                 self.schedule_render_retry(stage, delay);
             }
@@ -2756,6 +2753,46 @@ enum RenderRecoveryDirective {
     OpenCircuit,
 }
 
+/// Apply the state transition for a failed admitted render attempt.
+///
+/// Keeping damage settlement and negative-evidence accounting in one shared
+/// helper prevents deterministic backend-fault tests from reproducing only a
+/// test-side approximation of the production transition.
+fn apply_failed_render_attempt(
+    bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
+    last_was_whole_screen: &mut bool,
+    current_generation: DamageGeneration,
+    recovery: &mut RenderRecoveryState,
+    stage: RenderFailureStage,
+) -> (DamageCommitOutcome, RenderRecoveryDirective) {
+    let damage = settle_frame_damage(
+        bitmaps,
+        last_was_whole_screen,
+        current_generation,
+        FrameCompletion::Failed(stage),
+    );
+    let directive = recovery.record_failure(stage);
+    (damage, directive)
+}
+
+/// Apply the state transition for a synchronously presented frame.
+fn apply_presented_render_attempt(
+    bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
+    last_was_whole_screen: &mut bool,
+    current_generation: DamageGeneration,
+    recovery: &mut RenderRecoveryState,
+    captured_generation: DamageGeneration,
+) -> DamageCommitOutcome {
+    let damage = settle_frame_damage(
+        bitmaps,
+        last_was_whole_screen,
+        current_generation,
+        FrameCompletion::Presented(captured_generation),
+    );
+    recovery.record_success();
+    damage
+}
+
 fn retry_delay(failed_attempts_since_success: u32) -> Duration {
     let index = usize::try_from(failed_attempts_since_success.saturating_sub(1))
         .unwrap_or(usize::MAX)
@@ -2925,6 +2962,104 @@ const fn webgpu_repair_failure_stage() -> RenderFailureStage {
     // Treat the failed repair as validation/reconstruction evidence so a
     // resize or focus signal cannot silently reopen it as a transient fault.
     RenderFailureStage::SurfaceAcquire(webgpu::WebGpuSurfaceTextureError::Validation)
+}
+
+/// Drive the production WebGPU acquisition/repair policy through injectable
+/// backend boundaries.
+///
+/// Production passes the real `WebGpuState` operations below. Tests can
+/// deterministically script the synchronous surface results while still
+/// exercising this exact prepare/classify/repair/reacquire state machine.
+fn acquire_webgpu_frame_with_repair_using<
+    T,
+    PrepareSurface,
+    AcquireSurfaceFrame,
+    ForceConfigure,
+    RecreateSurface,
+>(
+    dimensions: Dimensions,
+    mut prepare_surface: PrepareSurface,
+    mut acquire_surface_frame: AcquireSurfaceFrame,
+    mut force_configure: ForceConfigure,
+    mut recreate_surface: RecreateSurface,
+) -> Result<T, RenderAttemptFailure>
+where
+    PrepareSurface:
+        FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
+    AcquireSurfaceFrame:
+        FnMut() -> Result<T, webgpu::WebGpuSurfaceTextureError>,
+    ForceConfigure:
+        FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
+    RecreateSurface:
+        FnMut(Dimensions) -> anyhow::Result<webgpu::SurfaceConfigureOutcome>,
+{
+    match prepare_surface(dimensions) {
+        Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
+        Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
+            return Err(RenderAttemptFailure::new(
+                RenderFailureStage::SurfaceAcquire(
+                    webgpu::WebGpuSurfaceTextureError::Occluded,
+                ),
+                anyhow!("webgpu surface has zero extent; waiting for resize/focus"),
+            ));
+        }
+        Err(err) => {
+            return Err(RenderAttemptFailure::new(
+                RenderFailureStage::SurfaceAcquire(
+                    webgpu::WebGpuSurfaceTextureError::Validation,
+                ),
+                err.context("prepare webgpu surface"),
+            ));
+        }
+    }
+
+    let first_error = match acquire_surface_frame() {
+        Ok(frame) => return Ok(frame),
+        Err(err) => err,
+    };
+    let repair = match classify_webgpu_surface_error(&first_error) {
+        WebGpuSurfaceErrorAction::ForceConfigure => {
+            metrics::counter!("gui.render.retry", "action" => "force_configure")
+                .increment(1);
+            force_configure(dimensions).context("force-configure outdated webgpu surface")
+        }
+        WebGpuSurfaceErrorAction::RecreateSurface => {
+            metrics::counter!("gui.render.retry", "action" => "recreate_surface")
+                .increment(1);
+            recreate_surface(dimensions).context("recreate lost webgpu surface")
+        }
+        WebGpuSurfaceErrorAction::DeferToRecoveryPolicy => {
+            return Err(RenderAttemptFailure::new(
+                RenderFailureStage::SurfaceAcquire(first_error),
+                first_error.into(),
+            ));
+        }
+    };
+
+    match repair {
+        Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
+        Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
+            return Err(RenderAttemptFailure::new(
+                RenderFailureStage::SurfaceAcquire(
+                    webgpu::WebGpuSurfaceTextureError::Occluded,
+                ),
+                anyhow!("webgpu repair deferred for zero surface extent"),
+            ));
+        }
+        Err(err) => {
+            return Err(RenderAttemptFailure::new(
+                webgpu_repair_failure_stage(),
+                err.context(format!(
+                    "webgpu surface repair failed after {first_error}"
+                )),
+            ));
+        }
+    }
+
+    acquire_surface_frame().map_err(|err| {
+        // Only one immediate repair is permitted per admitted paint.
+        RenderAttemptFailure::new(RenderFailureStage::SurfaceAcquire(err), err.into())
+    })
 }
 
 impl TermWindow {
@@ -3608,77 +3743,13 @@ impl TermWindow {
         webgpu: &WebGpuState,
         dimensions: Dimensions,
     ) -> Result<webgpu::AcquiredWebGpuFrame, RenderAttemptFailure> {
-        match webgpu.prepare_surface(dimensions) {
-            Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
-            Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
-                return Err(RenderAttemptFailure::new(
-                    RenderFailureStage::SurfaceAcquire(
-                        webgpu::WebGpuSurfaceTextureError::Occluded,
-                    ),
-                    anyhow!("webgpu surface has zero extent; waiting for resize/focus"),
-                ));
-            }
-            Err(err) => {
-                return Err(RenderAttemptFailure::new(
-                    RenderFailureStage::SurfaceAcquire(
-                        webgpu::WebGpuSurfaceTextureError::Validation,
-                    ),
-                    err.context("prepare webgpu surface"),
-                ));
-            }
-        }
-
-        let first_error = match webgpu.acquire_surface_frame() {
-            Ok(frame) => return Ok(frame),
-            Err(err) => err,
-        };
-        let repair = match classify_webgpu_surface_error(&first_error) {
-            WebGpuSurfaceErrorAction::ForceConfigure => {
-                metrics::counter!("gui.render.retry", "action" => "force_configure")
-                    .increment(1);
-                webgpu
-                    .force_configure(dimensions)
-                    .context("force-configure outdated webgpu surface")
-            }
-            WebGpuSurfaceErrorAction::RecreateSurface => {
-                metrics::counter!("gui.render.retry", "action" => "recreate_surface")
-                    .increment(1);
-                webgpu
-                    .recreate_surface(dimensions)
-                    .context("recreate lost webgpu surface")
-            }
-            WebGpuSurfaceErrorAction::DeferToRecoveryPolicy => {
-                return Err(RenderAttemptFailure::new(
-                    RenderFailureStage::SurfaceAcquire(first_error),
-                    first_error.into(),
-                ));
-            }
-        };
-
-        match repair {
-            Ok(webgpu::SurfaceConfigureOutcome::Ready) => {}
-            Ok(webgpu::SurfaceConfigureOutcome::DeferredZeroExtent) => {
-                return Err(RenderAttemptFailure::new(
-                    RenderFailureStage::SurfaceAcquire(
-                        webgpu::WebGpuSurfaceTextureError::Occluded,
-                    ),
-                    anyhow!("webgpu repair deferred for zero surface extent"),
-                ));
-            }
-            Err(err) => {
-                return Err(RenderAttemptFailure::new(
-                    webgpu_repair_failure_stage(),
-                    err.context(format!(
-                        "webgpu surface repair failed after {first_error}"
-                    )),
-                ));
-            }
-        }
-
-        webgpu.acquire_surface_frame().map_err(|err| {
-            // Only one immediate repair is permitted per admitted paint.
-            RenderAttemptFailure::new(RenderFailureStage::SurfaceAcquire(err), err.into())
-        })
+        acquire_webgpu_frame_with_repair_using(
+            dimensions,
+            |dims| webgpu.prepare_surface(dims),
+            || webgpu.acquire_surface_frame(),
+            |dims| webgpu.force_configure(dims),
+            |dims| webgpu.recreate_surface(dims),
+        )
     }
 
     fn dispatch_notif(&mut self, notif: TermWindowNotif, window: &Window) -> anyhow::Result<()> {
@@ -7373,9 +7444,10 @@ mod tests {
         RenderFailureStage, RenderRecoveryDirective, RenderRecoveryState, RenderWakeDispatch,
         RenderWakePlan, RenderWakeReason, RenderWakeState,
         SyncOutputDoctorSnapshot, UIItem, UIItemType, WebGpuSurfaceErrorAction,
-        a11y_op_kind_from_frame_budget_op, base_policy_for_frame_budget_state,
-        classify_webgpu_surface_error, combine_glium_draw_and_finish,
-        default_frame_budget_cost_ns,
+        acquire_webgpu_frame_with_repair_using, a11y_op_kind_from_frame_budget_op,
+        apply_failed_render_attempt, apply_presented_render_attempt,
+        base_policy_for_frame_budget_state, classify_webgpu_surface_error,
+        combine_glium_draw_and_finish, default_frame_budget_cost_ns,
         evaluate_frame_budget_reduce_motion_gate, frame_budget, mark_cursor_rows_dirty,
         mark_stable_row_ranges_dirty, mark_stable_rows_dirty,
         pane_health_snapshot_from_watchdoged_health, record_drained_frame_budget_ops,
@@ -8406,6 +8478,124 @@ mod tests {
             assert_eq!(bm.count(), 0, "pane {pane_id} must be cleared");
             assert_eq!(bm.frames_cleared_total(), 1);
         }
+    }
+
+    #[test]
+    fn injected_acquire_submit_present_failures_retain_until_eventual_success() {
+        let dimensions = ::window::Dimensions {
+            pixel_width: 1280,
+            pixel_height: 720,
+            dpi: 96,
+        };
+        let timeout: Result<u8, RenderAttemptFailure> =
+            acquire_webgpu_frame_with_repair_using(
+                dimensions,
+                |_| Ok(webgpu::SurfaceConfigureOutcome::Ready),
+                || Err(webgpu::WebGpuSurfaceTextureError::Timeout),
+                |_| unreachable!("timeout must not force-configure the surface"),
+                |_| unreachable!("timeout must not recreate the surface"),
+            );
+        let timeout = timeout.expect_err("timeout acquisition must fail");
+        let timeout_stage = RenderFailureStage::SurfaceAcquire(
+            webgpu::WebGpuSurfaceTextureError::Timeout,
+        );
+        assert_eq!(timeout.stage(), timeout_stage);
+
+        let generation = DamageGeneration::default();
+        let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        let mut bitmap = render::dirty_lines::DirtyLineBitmap::new(24);
+        bitmap.mark(2);
+        bitmap.mark(19);
+        bitmaps.insert(7, bitmap);
+        let before = bitmaps.clone();
+        let mut whole_screen = true;
+        let mut recovery = RenderRecoveryState::default();
+        let mut wakes = RenderWakeState::default();
+        let now = Instant::now();
+
+        for (attempt, stage) in [
+            timeout_stage,
+            RenderFailureStage::Submission,
+            RenderFailureStage::Present,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (damage, directive) = apply_failed_render_attempt(
+                &mut bitmaps,
+                &mut whole_screen,
+                generation,
+                &mut recovery,
+                stage,
+            );
+            assert_eq!(damage, DamageCommitOutcome::RetainedFailure);
+            assert_eq!(bitmaps, before, "attempt {attempt} changed dirty rows");
+            assert!(whole_screen, "attempt {attempt} consumed whole-screen damage");
+
+            let delay = match directive {
+                RenderRecoveryDirective::RetryAfter(delay) => delay,
+                other => panic!("attempt {attempt} was not retryable: {other:?}"),
+            };
+            let ticket = match wakes.plan(RenderWakeReason::Retry(stage), now + delay, now) {
+                RenderWakePlan::Schedule { ticket, .. } => ticket,
+                _ => panic!("attempt {attempt} did not schedule an exact retry"),
+            };
+            recovery.enter_cooldown(ticket, stage);
+            assert_eq!(recovery.admit(), PaintAdmission::SuppressCooldown);
+            assert_eq!(
+                wakes.dispatch(ticket),
+                RenderWakeDispatch::Fired(RenderWakeReason::Retry(stage))
+            );
+            assert!(recovery.mark_retry_ready(ticket));
+            assert_eq!(recovery.admit(), PaintAdmission::Admit);
+        }
+
+        let mut acquire_calls = 0;
+        let mut recreate_calls = 0;
+        let repaired: Result<u8, RenderAttemptFailure> =
+            acquire_webgpu_frame_with_repair_using(
+                dimensions,
+                |_| Ok(webgpu::SurfaceConfigureOutcome::Ready),
+                || {
+                    acquire_calls += 1;
+                    match acquire_calls {
+                        1 => Err(webgpu::WebGpuSurfaceTextureError::Lost),
+                        2 => Ok(42),
+                        _ => unreachable!("repair may reacquire only once"),
+                    }
+                },
+                |_| unreachable!("lost surface must not use force-configure"),
+                |_| {
+                    recreate_calls += 1;
+                    Ok(webgpu::SurfaceConfigureOutcome::Ready)
+                },
+            );
+        assert_eq!(repaired.expect("lost surface must repair and reacquire"), 42);
+        assert_eq!(acquire_calls, 2);
+        assert_eq!(recreate_calls, 1);
+
+        let first_success = apply_presented_render_attempt(
+            &mut bitmaps,
+            &mut whole_screen,
+            generation,
+            &mut recovery,
+            generation,
+        );
+        assert_eq!(first_success, DamageCommitOutcome::RetainedWholeScreen);
+        assert_eq!(bitmaps, before);
+        assert!(!whole_screen);
+        assert_eq!(recovery.failed_attempts_since_success, 0);
+        assert_eq!(recovery.admit(), PaintAdmission::Admit);
+
+        let follow_up = apply_presented_render_attempt(
+            &mut bitmaps,
+            &mut whole_screen,
+            generation,
+            &mut recovery,
+            generation,
+        );
+        assert_eq!(follow_up, DamageCommitOutcome::Cleared);
+        assert_eq!(bitmaps.get(&7).expect("pane retained").count(), 0);
     }
 
     #[test]
