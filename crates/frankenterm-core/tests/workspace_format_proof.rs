@@ -3,7 +3,11 @@
 //! RCH classifies direct `cargo fmt` as a light local command and therefore
 //! rejects it when remote execution is required.  This integration-test
 //! wrapper keeps the outer command compilation-bearing while running the
-//! canonical workspace-wide formatter check on the exact remote checkout.
+//! canonical workspace-wide formatter check on the remote checkout.  The
+//! retained outer RCH command is the source-identity authority: RCH clean
+//! mirrors intentionally omit `.git`, so this test validates the requested
+//! revision label and source-mode contract but does not pretend that a
+//! caller-supplied environment value proves Git identity by itself.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -11,35 +15,58 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const EXPECTED_SHA_ENV: &str = "FT_FORMAT_PROOF_SHA";
+const REQUESTED_SHA_ENV: &str = "FT_FORMAT_PROOF_SHA";
+const SOURCE_MODE_ENV: &str = "FT_FORMAT_PROOF_SOURCE_MODE";
+const RCH_CLEAN_BASELINE_SOURCE_MODE: &str = "rch-clean-baseline-no-overlay-v1";
 
 #[test]
-fn exact_sha_workspace_formatting_is_clean() {
+fn workspace_formatting_is_clean_under_rch_source_contract() {
     let repo_root = repo_root();
-    let expected_sha = env::var(EXPECTED_SHA_ENV)
-        .unwrap_or_else(|_| panic!("{EXPECTED_SHA_ENV} must bind the RCH --base revision"));
+    let requested_sha = env::var(REQUESTED_SHA_ENV)
+        .unwrap_or_else(|_| panic!("{REQUESTED_SHA_ENV} must label the RCH --base revision"));
     assert!(
-        expected_sha.len() == 40 && expected_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "{EXPECTED_SHA_ENV} must be one full hexadecimal Git SHA, got {expected_sha:?}"
+        requested_sha.len() == 40 && requested_sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{REQUESTED_SHA_ENV} must be one full 40-hex Git object name, got {requested_sha:?}"
     );
-
-    let head = checked_output(&repo_root, "git", ["rev-parse", "HEAD"]);
-    let actual_sha = String::from_utf8(head.stdout)
-        .expect("git rev-parse HEAD must emit UTF-8")
-        .trim()
-        .to_owned();
+    let source_mode = env::var(SOURCE_MODE_ENV).unwrap_or_else(|_| {
+        panic!(
+            "{SOURCE_MODE_ENV} must be {RCH_CLEAN_BASELINE_SOURCE_MODE:?}; the retained RCH \
+             command must independently prove --base, --clean-overlay, and --no-overlay"
+        )
+    });
     assert_eq!(
-        actual_sha, expected_sha,
-        "remote formatting checkout is not the requested exact revision"
+        source_mode, RCH_CLEAN_BASELINE_SOURCE_MODE,
+        "unsupported formatting source mode"
     );
-    assert_clean_checkout(&repo_root);
+    println!(
+        "requested formatting revision: {requested_sha}; source authority: retained RCH \
+         --base/--clean-overlay/--no-overlay command"
+    );
 
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let cargo = OsStr::new(env!("CARGO"));
     let rustfmt = env::var_os("RUSTFMT").unwrap_or_else(|| OsString::from("rustfmt"));
-    print_version(&repo_root, "cargo", &cargo, ["--version"]);
-    print_version(&repo_root, "rustc", OsStr::new("rustc"), ["-Vv"]);
-    print_version(&repo_root, "rustfmt", &rustfmt, ["--version"]);
+    print_version(&repo_root, "cargo", cargo, ["--version"], "cargo ");
+    print_version(
+        &repo_root,
+        "rustc",
+        OsStr::new("rustc"),
+        ["-Vv"],
+        "rustc ",
+    );
+    print_version(
+        &repo_root,
+        "rustfmt",
+        &rustfmt,
+        ["--version"],
+        "rustfmt ",
+    );
 
+    assert_accepted_rustfmt_stdin(
+        &repo_root,
+        &rustfmt,
+        "fn main() {\n    println!(\"formatted canary\");\n}\n",
+        "already-formatted canary",
+    );
     assert_rejected_rustfmt_stdin(
         &repo_root,
         &rustfmt,
@@ -53,25 +80,19 @@ fn exact_sha_workspace_formatting_is_clean() {
         "malformed Rust canary",
     );
 
-    let output = Command::new(&cargo)
+    let output = Command::new(cargo)
         .current_dir(&repo_root)
+        .env("RUSTFMT", &rustfmt)
         .args(["fmt", "--all", "--", "--check"])
         .output()
         .unwrap_or_else(|err| panic!("spawn workspace cargo fmt --check: {err}"));
     assert_command_success("cargo fmt --all -- --check", output);
-    println!("workspace formatting proof passed at exact SHA {actual_sha}");
-}
-
-fn assert_clean_checkout(repo_root: &Path) {
-    let status = checked_output(
-        repo_root,
-        "git",
-        ["status", "--porcelain=v1", "--untracked-files=all"],
+    println!(
+        "workspace formatting check passed for requested revision {requested_sha}; exact source \
+         identity remains bound by the retained RCH command"
     );
-    assert!(
-        status.stdout.is_empty(),
-        "remote formatting checkout contains an index, worktree, or untracked overlay: {}",
-        String::from_utf8_lossy(&status.stdout)
+    println!(
+        "WORKSPACE_FORMAT_PROOF_SUCCESS requested_sha={requested_sha} source_mode={source_mode}"
     );
 }
 
@@ -83,20 +104,13 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn checked_output<I, S>(repo_root: &Path, program: &str, args: I) -> Output
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new(program)
-        .current_dir(repo_root)
-        .args(args)
-        .output()
-        .unwrap_or_else(|err| panic!("spawn {program}: {err}"));
-    assert_command_success(program, output)
-}
-
-fn print_version<I, S>(repo_root: &Path, label: &str, program: &OsStr, args: I)
+fn print_version<I, S>(
+    repo_root: &Path,
+    label: &str,
+    program: &OsStr,
+    args: I,
+    expected_prefix: &str,
+)
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -107,7 +121,30 @@ where
         .output()
         .unwrap_or_else(|err| panic!("spawn {label} version probe: {err}"));
     let output = assert_command_success(label, output);
-    println!("{label}: {}", String::from_utf8_lossy(&output.stdout).trim());
+    let stdout = String::from_utf8(output.stdout)
+        .unwrap_or_else(|err| panic!("{label} version output must be UTF-8: {err}"));
+    let version = stdout.trim();
+    assert!(!version.is_empty(), "{label} version output must not be empty");
+    assert!(
+        version.starts_with(expected_prefix),
+        "{label} version output must start with {expected_prefix:?}, got {version:?}"
+    );
+    println!("{label}: {version}");
+}
+
+fn assert_accepted_rustfmt_stdin(
+    repo_root: &Path,
+    rustfmt: &OsStr,
+    source: &str,
+    label: &str,
+) {
+    let output = rustfmt_stdin_output(repo_root, rustfmt, source, label);
+    assert!(
+        output.status.success(),
+        "rustfmt rejected {label}; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_rejected_rustfmt_stdin(
@@ -116,6 +153,23 @@ fn assert_rejected_rustfmt_stdin(
     source: &str,
     label: &str,
 ) {
+    let output = rustfmt_stdin_output(repo_root, rustfmt, source, label);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "rustfmt must reject {label} with exit code 1, got {}; stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn rustfmt_stdin_output(
+    repo_root: &Path,
+    rustfmt: &OsStr,
+    source: &str,
+    label: &str,
+) -> Output {
     let mut child = Command::new(rustfmt)
         .current_dir(repo_root)
         .args(["--edition", "2024", "--check"])
@@ -130,15 +184,9 @@ fn assert_rejected_rustfmt_stdin(
         .expect("rustfmt canary stdin must be piped")
         .write_all(source.as_bytes())
         .unwrap_or_else(|err| panic!("write {label}: {err}"));
-    let output = child
+    child
         .wait_with_output()
-        .unwrap_or_else(|err| panic!("wait for rustfmt {label}: {err}"));
-    assert!(
-        !output.status.success(),
-        "rustfmt incorrectly accepted {label}; stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .unwrap_or_else(|err| panic!("wait for rustfmt {label}: {err}"))
 }
 
 fn assert_command_success(label: &str, output: Output) -> Output {

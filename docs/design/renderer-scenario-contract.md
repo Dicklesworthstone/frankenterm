@@ -1204,10 +1204,15 @@ RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec \
   env CARGO_TARGET_DIR=/tmp/ft-4tenz-3-1-workspace-clippy \
   cargo clippy --workspace --all-targets -- -D warnings
 
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec \
-  --base <exact-candidate-sha> --clean-overlay --no-overlay -- \
-  env CARGO_TARGET_DIR=/tmp/ft-4tenz-3-1-workspace-fmt \
-  cargo fmt --check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=<worker-id> \
+  rch --no-self-healing exec \
+  --base <full-40-hex-candidate-sha> --clean-overlay --no-overlay -- \
+  env FT_FORMAT_PROOF_SHA=<same-full-40-hex-candidate-sha> \
+      FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 \
+      CARGO_TARGET_DIR=/tmp/ft-4tenz-3-1-workspace-format-<worker-id> \
+  cargo test -j <bounded-jobs> -p frankenterm-core \
+      --test workspace_format_proof --locked \
+      workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
 ```
 
 All three broad gates must pass remotely before closeout. If RCH rejects a

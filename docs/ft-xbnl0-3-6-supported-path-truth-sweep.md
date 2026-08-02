@@ -227,7 +227,15 @@ rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-check \
   cargo check -p frankenterm-core --lib --tests
 rch exec -- env CARGO_TARGET_DIR=target/rch-ft-xbnl0-3-6-clippy \
   cargo clippy --no-deps -p frankenterm-core --lib --tests -- -D warnings
-rch exec -- cargo fmt --check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=<worker-id> \
+rch --no-self-healing exec \
+  --base <full-40-hex-sha> --clean-overlay --no-overlay -- \
+  env FT_FORMAT_PROOF_SHA=<same-full-40-hex-sha> \
+      FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 \
+      CARGO_TARGET_DIR=/tmp/ft-xbnl0-3-6-workspace-format-<worker-id> \
+  cargo test -j <bounded-jobs> -p frankenterm-core \
+      --test workspace_format_proof --locked \
+      workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
 bash tests/e2e/test_ft_xbnl0_3_6_supported_path_truth_sweep.sh
 ```
 

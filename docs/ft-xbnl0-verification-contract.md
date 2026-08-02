@@ -40,7 +40,9 @@ Required for every implementation bead.
 
 - Unit tests for happy path, edge cases, and failure modes.
 - Integration or targeted E2E coverage for the touched surface.
-- `cargo fmt --check`.
+- Workspace formatting. A local `cargo fmt --all -- --check` is light hygiene;
+  finish-line closure that requires exact-revision remote formatting must use
+  the composite `workspace_format_proof` contract below.
 - `cargo check` and `cargo clippy -D warnings` for the touched crate or lane.
 
 ### Level B: Remote Verification Proof
@@ -93,8 +95,23 @@ The default command style for finish-line work is:
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo test -p <crate> <filter> -- --nocapture
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo check -p <crate> --all-targets
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-<purpose> cargo clippy --no-deps -p <crate> --all-targets -- -D warnings
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo fmt --check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=<worker-id> rch --no-self-healing exec --base <full-40-hex-sha> --clean-overlay --no-overlay -- env FT_FORMAT_PROOF_SHA=<same-full-40-hex-sha> FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-format-<worker-id> cargo test -j <bounded-jobs> -p frankenterm-core --test workspace_format_proof --locked workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
 ```
+
+Direct `rch ... cargo fmt ...` is not a substitute: RCH classifies that command
+as light and rejects it when remote execution is required. The formatting
+wrapper is a composite proof. Its retained outer RCH invocation supplies the
+full-SHA clean/no-overlay source identity and worker/exit evidence; the remote
+test supplies toolchain identity, positive and negative formatter canaries, and
+the workspace-wide `cargo fmt --all -- --check`. RCH clean mirrors do not
+contain `.git`, so the
+environment SHA is only a consistency label and must never be cited without
+the matching retained RCH command. The full normative command, two-worker
+rules, and nonclaims are in `docs/asupersync-rch-execution-policy.md` under
+"Strict exact-revision remote formatting."
+The retained transcript must additionally show exactly one named passing test,
+`0 filtered out`, and the final `WORKSPACE_FORMAT_PROOF_SUCCESS` sentinel;
+remote exit zero alone is not proof because libtest permits zero-test success.
 
 If a lane needs a shell harness, it must fail closed on `rch` fallback and record the same commands inside its logs. Placeholder-remediation harnesses under `tests/e2e/` using `lib_rch_guards.sh` already satisfy this pattern and should be treated as the model.
 
@@ -106,6 +123,7 @@ same terms as the repository-wide policy:
 | Finish-line claim | Required proof-ledger category |
 |---|---|
 | Heavy source/test behavior passed | `proven_remote` |
+| Exact-revision workspace formatting passed | `proven_remote` outer `workspace_format_proof` run(s), with the required distinct pinned-worker count; formatting claim only |
 | Formatting, docs, schema, or shell syntax only | `light_local` or a static-only check artifact |
 | Human-approved degraded heavy run | `approved_fallback`, with residual risk named |
 | Verifier could not produce proof | blocked verifier reason such as `missing_artifact`, `malformed`, queue/worker blocker, or timeout |
@@ -163,12 +181,15 @@ Representative remote command set for substrate validation:
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-build cargo build -p frankenterm --bin ft
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-test cargo test -p frankenterm-ssh match_exec -- --nocapture
 RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- env CARGO_TARGET_DIR=target/rch-<bead>-lint cargo clippy --no-deps -p frankenterm-ssh --all-targets -- -D warnings
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo fmt --check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=<worker-id> rch --no-self-healing exec --base <full-40-hex-sha> --clean-overlay --no-overlay -- env FT_FORMAT_PROOF_SHA=<same-full-40-hex-sha> FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-format-<worker-id> cargo test -j <bounded-jobs> -p frankenterm-core --test workspace_format_proof --locked workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
 bash tests/e2e/test_ft_akx00_7_4_ssh_match_exec.sh
 ```
 
-The direct commands prove build or test or lint or fmt against a known worker.
-The shell harness proves that downstream fail-closed E2E wrappers keep the same audit surface instead of depending on chat memory.
+The direct heavy commands prove build, test, or lint against a known worker.
+The composite wrapper separately proves formatting on the source identity
+attested by its retained RCH invocation. The shell harness proves that
+downstream fail-closed E2E wrappers keep the same audit surface instead of
+depending on chat memory.
 
 ## Artifact Contract
 
@@ -205,7 +226,8 @@ Applies to:
 Required evidence:
 - updated inventory or doctrine references when the migration surface changes
 - deterministic unit or integration coverage for the touched async boundary
-- remote `cargo test`, `cargo check`, `cargo clippy`, and `cargo fmt --check`
+- remote `cargo test`, `cargo check`, and `cargo clippy`, plus the required
+  distinct pinned-worker `workspace_format_proof` run(s)
 - audit proof that supported builds and docs do not reintroduce direct `tokio`, `smol`, or `async-io` usage where the lane claims closure
 
 Failure diagnostics must identify:

@@ -385,7 +385,15 @@ rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
 rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
     cargo test -p frankenterm-core \
     --test ft_xbnl0_2_4_no_direct_tokio_net_or_rustls -- --nocapture
-rch exec -- env CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo fmt --check
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=<worker-id> \
+rch --no-self-healing exec \
+    --base <full-40-hex-sha> --clean-overlay --no-overlay -- \
+    env FT_FORMAT_PROOF_SHA=<same-full-40-hex-sha> \
+        FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 \
+        CARGO_TARGET_DIR=/tmp/ft-xbnl0-2-4-workspace-format-<worker-id> \
+    cargo test -j <bounded-jobs> -p frankenterm-core \
+        --test workspace_format_proof --locked \
+        workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
 ```
 
 Each command's output should be captured into a bead-scoped artifact

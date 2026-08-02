@@ -42,6 +42,64 @@ Classifier implementation is canonical in:
 The classifier is intentionally strict: setup or sync chatter that merely
 mentions `rch` is not proof that Cargo ran remotely.
 
+### Strict exact-revision remote formatting
+
+Direct `cargo fmt` remains a light command. Consequently,
+`RCH_REQUIRE_REMOTE=1 rch ... cargo fmt ...` is rejected by RCH and is not
+remote formatting proof. When a bead requires formatting on an exact remote
+source revision, use the compilation-bearing integration-test wrapper:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_WORKER=<worker-id> \
+rch --no-self-healing exec \
+  --base <full-40-hex-sha> --clean-overlay --no-overlay -- \
+  env FT_FORMAT_PROOF_SHA=<same-full-40-hex-sha> \
+      FT_FORMAT_PROOF_SOURCE_MODE=rch-clean-baseline-no-overlay-v1 \
+      CARGO_TARGET_DIR=/tmp/ft-<bead>-workspace-format-<worker-id> \
+  cargo test -j <bounded-jobs> -p frankenterm-core \
+      --test workspace_format_proof --locked \
+      workspace_formatting_is_clean_under_rch_source_contract -- --exact --nocapture
+```
+
+The source-identity proof is composite. The retained outer command and RCH log
+must show the same full `--base` SHA, `--clean-overlay`, `--no-overlay`, the
+requested and selected worker, no local/fallback marker, and remote exit zero.
+RCH clean mirrors intentionally omit `.git`; inside the mirror,
+`FT_FORMAT_PROOF_SHA` is a consistency label, not an independent Git
+attestation. The test validates that label and the explicit source-mode
+contract, records nonempty and correctly prefixed Cargo, rustc, and rustfmt
+identities, requires rustfmt to accept an already-formatted stdin canary and
+reject valid-but-unformatted and malformed canaries with exit code 1, binds the
+nested Cargo formatter to that same rustfmt binary, and runs
+`cargo fmt --all -- --check` over the complete workspace.
+
+Exit zero is necessary but not sufficient because libtest succeeds when an
+exact filter matches zero tests. The retained transcript must also contain
+`running 1 test`,
+`workspace_formatting_is_clean_under_rch_source_contract ... ok`, a result with
+`1 passed` and `0 filtered out`, and the final
+`WORKSPACE_FORMAT_PROOF_SUCCESS requested_sha=<same-full-40-hex-sha>` sentinel.
+The sentinel is emitted only after all canaries and the workspace formatter
+pass. Missing any one of these fields blocks the claim.
+
+For a two-worker claim, run the command on two distinct explicitly pinned
+workers with the same full SHA and distinct target directories, retaining both
+complete logs. Two runs on one worker, an unconfirmed scheduler-selected
+worker, or one passing run are not two-worker proof. Any missing/wrong worker,
+SHA or source-mode mismatch, RCH admission failure, local fallback, missing
+rustfmt, accepted negative canary, or formatting failure blocks the claim.
+
+The current repository contract deliberately accepts 40-hex Git object names.
+It does not claim generic Git SHA-256 support. RCH's clean-overlay initiation
+is the supported Unix-client path for this macOS/Linux campaign.
+
+Because the outer command is `cargo test`, a valid run is heavy
+`proven_remote` execution evidence. Its supported claim remains formatting
+only: it does not replace `cargo check`, Clippy, behavioral tests, runtime or
+GUI proof, performance measurements, hardware qualification, or broad
+toolchain parity. A local formatter run remains useful hygiene but cannot
+replace this composite proof.
+
 ## Proof Vocabulary
 
 Use this vocabulary in proof-ledger artifacts, Beads comments, Agent Mail
