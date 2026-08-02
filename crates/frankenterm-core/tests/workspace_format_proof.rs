@@ -32,6 +32,7 @@ fn exact_sha_workspace_formatting_is_clean() {
         actual_sha, expected_sha,
         "remote formatting checkout is not the requested exact revision"
     );
+    assert_clean_checkout(&repo_root);
 
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let rustfmt = env::var_os("RUSTFMT").unwrap_or_else(|| OsString::from("rustfmt"));
@@ -59,6 +60,19 @@ fn exact_sha_workspace_formatting_is_clean() {
         .unwrap_or_else(|err| panic!("spawn workspace cargo fmt --check: {err}"));
     assert_command_success("cargo fmt --all -- --check", output);
     println!("workspace formatting proof passed at exact SHA {actual_sha}");
+}
+
+fn assert_clean_checkout(repo_root: &Path) {
+    let status = checked_output(
+        repo_root,
+        "git",
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    assert!(
+        status.stdout.is_empty(),
+        "remote formatting checkout contains an index, worktree, or untracked overlay: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
 }
 
 fn repo_root() -> PathBuf {
