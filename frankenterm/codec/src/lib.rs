@@ -5590,8 +5590,9 @@ mod test {
             })
             .await
             .expect_err("oversize payload declaration must fail before selection");
+            let rendered_error = format!("{error:#}");
             assert!(
-                error.to_string().contains("exceeds maximum"),
+                rendered_error.contains("exceeds maximum"),
                 "unexpected oversize-header error: {:#}",
                 error
             );
