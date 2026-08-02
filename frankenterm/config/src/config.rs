@@ -3290,10 +3290,12 @@ mod tests {
     fn frame_interval_never_exceeds_the_valid_configured_rate() {
         for max_fps in MIN_MAX_FPS..=MAX_MAX_FPS {
             let interval_ms = frame_interval_for_max_fps(max_fps).as_millis();
-            assert!(interval_ms > 0, "max_fps={max_fps}");
+            assert!(interval_ms > 0, "max_fps={}", max_fps);
             assert!(
                 interval_ms * u128::from(max_fps) >= 1_000,
-                "max_fps={max_fps}, interval_ms={interval_ms}"
+                "max_fps={}, interval_ms={}",
+                max_fps,
+                interval_ms
             );
         }
     }
@@ -3628,14 +3630,16 @@ mod tests {
             Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
                 .expect_err("zero max_fps must be rejected");
         let message = error.to_string();
-        assert!(message.contains("max_fps"), "unexpected error: {message}");
+        assert!(message.contains("max_fps"), "unexpected error: {}", message);
         assert!(
             message.contains("1..=1000"),
-            "unexpected error: {message}"
+            "unexpected error: {}",
+            message
         );
         assert!(
             message.contains("got 0"),
-            "unexpected error: {message}"
+            "unexpected error: {}",
+            message
         );
     }
 
@@ -3653,15 +3657,18 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("max_fps"),
-            "unexpected error: {message}"
+            "unexpected error: {}",
+            message
         );
         assert!(
             message.contains("1..=1000"),
-            "unexpected error: {message}"
+            "unexpected error: {}",
+            message
         );
         assert!(
             message.contains(&format!("got {invalid_value}")),
-            "unexpected error: {message}"
+            "unexpected error: {}",
+            message
         );
     }
 
