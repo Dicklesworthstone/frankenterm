@@ -1248,11 +1248,12 @@ async fn discard_raw_body_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     // 64 KiB array here can overflow bounded executor stacks while the future is
     // moved or polled.  Reserve fallibly before setting the length so allocation
     // failure remains an ordinary decode error rather than an abort.
+    let scratch_len = header.data_len.min(DISCARDED_PAYLOAD_READ_CHUNK);
     let mut scratch = Vec::new();
     scratch
-        .try_reserve_exact(DISCARDED_PAYLOAD_READ_CHUNK)
+        .try_reserve_exact(scratch_len)
         .context("allocating abandoned-PDU discard scratch buffer")?;
-    scratch.resize(DISCARDED_PAYLOAD_READ_CHUNK, 0_u8);
+    scratch.resize(scratch_len, 0_u8);
     let mut consumed = 0_usize;
     let mut chunk_reads = 0_usize;
     let mut max_chunk_bytes = 0_usize;
