@@ -5945,7 +5945,8 @@ mod tests {
         exit_thread.join().expect("exit thread should finish");
 
         wait_until("terminal cleanup after admitted tmux write", || {
-            inner.lifecycle.lock().active_operations == 0
+            let lifecycle = inner.lifecycle.lock();
+            lifecycle.active_operations == 0 && lifecycle.resources_cleaned
         });
         assert_eq!(*inner.state.lock(), State::Exit);
         {

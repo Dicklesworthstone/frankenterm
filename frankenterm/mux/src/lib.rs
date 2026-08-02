@@ -8016,6 +8016,7 @@ mod tests {
     }
 
     fn register_attached_test_pane(
+        _global_scheduler_guard: &StdMutexGuard<'static, ()>,
         mux: &Arc<Mux>,
         pane: &Arc<dyn Pane>,
     ) -> (Arc<Tab>, WindowId) {
@@ -8817,10 +8818,12 @@ mod tests {
 
     #[test]
     fn pane_operation_guard_fences_same_and_different_arc_replacements_after_retirement() {
+        let global_guard = global_test_lock();
         for (pane_id, reuse_same_arc) in [(160, true), (161, false)] {
             let mux = Arc::new(Mux::new(None));
             let (pane, kills) = KillCountingPane::new(pane_id, test_size());
-            let (tab, window_id) = register_attached_test_pane(&mux, &pane);
+            let (tab, window_id) =
+                register_attached_test_pane(&global_guard, &mux, &pane);
             let registration = mux
                 .capture_pane_registration(&pane)
                 .expect("attached pane should yield an exact registration");
@@ -8891,7 +8894,7 @@ mod tests {
 
     #[test]
     fn pane_operation_guard_uses_origin_mux_after_global_swap_and_allows_reentrancy() {
-        let _global = global_test_lock();
+        let global_guard = global_test_lock();
         Mux::shutdown();
 
         let origin = Arc::new(Mux::new(None));
@@ -8899,7 +8902,7 @@ mod tests {
         let (origin_pane, origin_kills) = KillCountingPane::new(162, test_size());
         let (replacement_pane, replacement_kills) = KillCountingPane::new(162, test_size());
         let (origin_tab, origin_window_id) =
-            register_attached_test_pane(&origin, &origin_pane);
+            register_attached_test_pane(&global_guard, &origin, &origin_pane);
         replacement_mux
             .add_pane(&replacement_pane)
             .expect("replacement mux may use the same numeric pane ID");
@@ -8999,13 +9002,14 @@ mod tests {
 
     #[test]
     fn pane_operation_guard_retains_exact_objects_only_until_drop() {
-        let _global = global_test_lock();
+        let global_guard = global_test_lock();
         let executor = BoundedTestExecutor::new();
         let mux = Arc::new(Mux::new(None));
         let weak_mux = Arc::downgrade(&mux);
         let (pane, kills) = KillCountingPane::new(165, test_size());
         let weak_pane = Arc::downgrade(&pane);
-        let (tab, _window_id) = register_attached_test_pane(&mux, &pane);
+        let (tab, _window_id) =
+            register_attached_test_pane(&global_guard, &mux, &pane);
         let registration = mux
             .capture_pane_registration(&pane)
             .expect("collectability registration");
@@ -9083,10 +9087,12 @@ mod tests {
 
     #[test]
     fn guarded_spawned_split_survives_target_registry_detach_after_admission() {
+        let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
         let (target, target_kills) = KillCountingPane::new(168, test_size());
         let (spawned, spawned_kills) = KillCountingPane::new(169, test_size());
-        let (target_tab, target_window_id) = register_attached_test_pane(&mux, &target);
+        let (target_tab, target_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &target);
         let domain: Arc<dyn Domain> =
             Arc::new(GuardedMutationTestDomain::new(Some(Arc::clone(&spawned))));
         mux.add_domain(&domain).expect("register test domain");
@@ -9128,11 +9134,14 @@ mod tests {
 
     #[test]
     fn guarded_moved_split_survives_both_registry_detaches_after_admission() {
+        let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
         let (target, target_kills) = KillCountingPane::new(170, test_size());
         let (source, source_kills) = KillCountingPane::new(171, test_size());
-        let (target_tab, target_window_id) = register_attached_test_pane(&mux, &target);
-        let (source_tab, _source_window_id) = register_attached_test_pane(&mux, &source);
+        let (target_tab, target_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &target);
+        let (source_tab, _source_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &source);
         let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
         mux.add_domain(&domain).expect("register test domain");
 
@@ -9182,9 +9191,11 @@ mod tests {
 
     #[test]
     fn guarded_move_to_new_tab_never_reauthorizes_a_detached_registry_slot() {
+        let global_guard = global_test_lock();
         let mux = Arc::new(Mux::new(None));
         let (pane, kills) = KillCountingPane::new(172, test_size());
-        let (source_tab, _source_window_id) = register_attached_test_pane(&mux, &pane);
+        let (source_tab, _source_window_id) =
+            register_attached_test_pane(&global_guard, &mux, &pane);
         let domain: Arc<dyn Domain> = Arc::new(GuardedMutationTestDomain::new(None));
         mux.add_domain(&domain).expect("register test domain");
 
