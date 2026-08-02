@@ -128,6 +128,10 @@ impl PersistenceFailure {
         }
     }
 
+    const fn may_have_published_generation(&self) -> bool {
+        matches!(self, Self::Io { .. })
+    }
+
     fn io(operation: &'static str, error: io::Error) -> Self {
         Self::Io {
             operation,
@@ -467,9 +471,10 @@ impl MixedDomainLayoutOverlay {
 ///
 /// Tombstones deliberately retain only the last live local revision and the
 /// store generation that committed the retirement. A stable
-/// [`LayoutWindowId`] is never reusable; the bounded retention policy protects
-/// recent lineages, while a mutation with `base_revision = Some(_)` still
-/// fails against absence after an old tombstone is pruned.
+/// [`LayoutWindowId`] is never reusable and its tombstone is never pruned. The
+/// hard cap therefore fails a new distinct retirement closed before removing
+/// its live overlay; safe reuse beyond that cap requires a future durable
+/// identity-generation scheme rather than lossy eviction.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayTombstone {
@@ -563,6 +568,11 @@ impl PendingOverlayMutation {
         overlay: MixedDomainLayoutOverlay,
     ) -> Result<Self, PersistenceFailure> {
         validate_overlay(&overlay)?;
+        if base_revision == Some(0) {
+            return Err(PersistenceFailure::invalid(
+                "overlay base revision zero is reserved; absence is represented by none",
+            ));
+        }
         let expected_revision = match base_revision {
             Some(base) => base
                 .checked_add(1)
@@ -570,10 +580,9 @@ impl PendingOverlayMutation {
             None => 1,
         };
         if overlay.local_revision != expected_revision {
-            return Err(PersistenceFailure::OverlayCasConflict {
-                expected: base_revision,
-                committed: overlay.local_revision.checked_sub(1),
-            });
+            return Err(PersistenceFailure::invalid(
+                "overlay local revision must be exactly one greater than its declared base",
+            ));
         }
         Ok(Self {
             base_revision,
@@ -957,6 +966,7 @@ impl ReadSlot {
 struct LoadedAuthoritative {
     state: PersistedState,
     source: StoreSource,
+    authority: Option<PathBuf>,
     target: PathBuf,
     degraded_recovery: bool,
     corrupt_evidence: Option<CorruptEvidence>,
@@ -966,18 +976,27 @@ struct LoadedAuthoritative {
 #[derive(Clone, Debug, Default)]
 struct PendingBatch {
     window_states: BTreeMap<String, PersistedWindowState>,
-    overlays: BTreeMap<LayoutWindowId, MixedDomainLayoutOverlay>,
+    window_state_superseded: BTreeMap<String, usize>,
+    overlay_mutations: BTreeMap<LayoutWindowId, PendingOverlayMutation>,
     ensure_bindings: BTreeSet<PrivacySafeTargetFingerprint>,
     overlay_tab_count: usize,
-    superseded_updates: usize,
 }
 
 impl PendingBatch {
-    fn queued_updates(&self) -> usize {
-        self.window_states
-            .len()
-            .saturating_add(self.overlays.len())
-            .saturating_add(self.ensure_bindings.len())
+    fn superseded_updates_for(
+        &self,
+        accepted_workspaces: &BTreeSet<String>,
+        accepted_overlay_ids: &BTreeSet<LayoutWindowId>,
+    ) -> usize {
+        let window_updates = accepted_workspaces
+            .iter()
+            .filter_map(|workspace| self.window_state_superseded.get(workspace).copied())
+            .fold(0usize, usize::saturating_add);
+        accepted_overlay_ids
+            .iter()
+            .filter_map(|window_id| self.overlay_mutations.get(window_id))
+            .map(|mutation| mutation.superseded_updates)
+            .fold(window_updates, usize::saturating_add)
     }
 
     fn queue_window_state(
@@ -992,31 +1011,60 @@ impl PendingBatch {
                 "pending workspace count would exceed {MAX_WORKSPACES}"
             )));
         }
-        match self.window_states.insert(workspace, state) {
-            None => Ok(EnqueueOutcome::Queued),
-            Some(previous) if previous == state => Ok(EnqueueOutcome::Unchanged),
+        match self.window_states.get(&workspace) {
+            Some(previous) if *previous == state => return Ok(EnqueueOutcome::Unchanged),
             Some(_) => {
-                self.superseded_updates = self.superseded_updates.saturating_add(1);
-                Ok(EnqueueOutcome::Coalesced)
+                let count = self
+                    .window_state_superseded
+                    .entry(workspace.clone())
+                    .or_default();
+                *count = count.saturating_add(1);
             }
+            None => {}
         }
+        let outcome = if self.window_states.insert(workspace, state).is_some() {
+            EnqueueOutcome::Coalesced
+        } else {
+            EnqueueOutcome::Queued
+        };
+        Ok(outcome)
     }
 
-    fn queue_overlay(
+    fn queue_overlay_live(
         &mut self,
+        base_revision: Option<u64>,
         overlay: MixedDomainLayoutOverlay,
     ) -> Result<EnqueueOutcome, PersistenceFailure> {
-        let previous = self.overlays.get(&overlay.window_id);
+        self.queue_overlay_mutation(PendingOverlayMutation::live(base_revision, overlay)?)
+    }
+
+    fn queue_overlay_delete(
+        &mut self,
+        window_id: LayoutWindowId,
+        base_revision: Option<u64>,
+    ) -> Result<EnqueueOutcome, PersistenceFailure> {
+        self.queue_overlay_mutation(PendingOverlayMutation::deleted(
+            window_id,
+            base_revision,
+        )?)
+    }
+
+    fn queue_overlay_mutation(
+        &mut self,
+        mutation: PendingOverlayMutation,
+    ) -> Result<EnqueueOutcome, PersistenceFailure> {
+        let window_id = mutation.window_id();
+        let previous = self.overlay_mutations.get(&window_id).cloned();
         match previous {
-            None if self.overlays.len() >= MAX_LAYOUT_OVERLAYS => {
+            None if self.overlay_mutations.len() >= MAX_LAYOUT_OVERLAYS => {
                 return Err(PersistenceFailure::quota(format!(
-                    "pending overlay count would exceed {MAX_LAYOUT_OVERLAYS}"
+                    "pending overlay mutation count would exceed {MAX_LAYOUT_OVERLAYS}"
                 )));
             }
             None => {
                 let total = self
                     .overlay_tab_count
-                    .checked_add(overlay.slots.len())
+                    .checked_add(mutation.live_tab_count())
                     .ok_or_else(|| {
                         PersistenceFailure::quota("pending overlay tab count overflowed")
                     })?;
@@ -1026,30 +1074,26 @@ impl PendingBatch {
                     )));
                 }
                 self.overlay_tab_count = total;
-                self.overlays.insert(overlay.window_id, overlay);
+                self.overlay_mutations.insert(window_id, mutation);
                 Ok(EnqueueOutcome::Queued)
             }
-            Some(previous) if previous.local_revision > overlay.local_revision => {
-                Err(PersistenceFailure::StaleOverlay {
-                    incoming: overlay.local_revision,
-                    committed: previous.local_revision,
+            Some(previous) if previous.desired == mutation.desired => {
+                Ok(EnqueueOutcome::Unchanged)
+            }
+            Some(previous)
+                if matches!(&previous.desired, DesiredOverlayState::Deleted { .. }) =>
+            {
+                Err(PersistenceFailure::RetiredOverlay {
+                    last_revision: previous.desired_revision(),
                 })
             }
             Some(previous)
-                if previous.local_revision == overlay.local_revision && previous == &overlay =>
+                if mutation.base_revision == Some(previous.desired_revision()) =>
             {
-                Ok(EnqueueOutcome::Unchanged)
-            }
-            Some(previous) if previous.local_revision == overlay.local_revision => {
-                Err(PersistenceFailure::OverlayRevisionConflict {
-                    revision: overlay.local_revision,
-                })
-            }
-            Some(previous) => {
                 let total = self
                     .overlay_tab_count
-                    .checked_sub(previous.slots.len())
-                    .and_then(|count| count.checked_add(overlay.slots.len()))
+                    .checked_sub(previous.live_tab_count())
+                    .and_then(|count| count.checked_add(mutation.live_tab_count()))
                     .ok_or_else(|| {
                         PersistenceFailure::quota("pending overlay tab count overflowed")
                     })?;
@@ -1058,40 +1102,126 @@ impl PendingBatch {
                         "pending overlay tab count {total} exceeds {MAX_TOTAL_OVERLAY_TABS}"
                     )));
                 }
+                let composed = PendingOverlayMutation {
+                    base_revision: previous.base_revision,
+                    desired: mutation.desired,
+                    superseded_updates: previous.superseded_updates.saturating_add(1),
+                };
                 self.overlay_tab_count = total;
-                self.overlays.insert(overlay.window_id, overlay);
-                self.superseded_updates = self.superseded_updates.saturating_add(1);
+                self.overlay_mutations.insert(window_id, composed);
                 Ok(EnqueueOutcome::Coalesced)
             }
+            Some(previous) if mutation.desired_revision() < previous.desired_revision() => {
+                Err(PersistenceFailure::StaleOverlay {
+                    incoming: mutation.desired_revision(),
+                    committed: previous.desired_revision(),
+                })
+            }
+            Some(previous) if mutation.desired_revision() == previous.desired_revision() => {
+                Err(PersistenceFailure::OverlayRevisionConflict {
+                    revision: mutation.desired_revision(),
+                })
+            }
+            Some(previous) => Err(PersistenceFailure::OverlayCasConflict {
+                expected: mutation.base_revision,
+                committed: Some(previous.desired_revision()),
+            }),
         }
     }
 
-    fn acknowledge_committed(
+    fn acknowledge_resolved(
         &mut self,
-        committed: &Self,
+        snapshot: &Self,
+        accepted_overlay_ids: &BTreeSet<LayoutWindowId>,
+        rejected_overlay_ids: &BTreeSet<LayoutWindowId>,
         binding_requests_after_snapshot: &BTreeSet<PrivacySafeTargetFingerprint>,
     ) {
-        for (workspace, state) in &committed.window_states {
+        for (workspace, state) in &snapshot.window_states {
             if self.window_states.get(workspace) == Some(state) {
                 self.window_states.remove(workspace);
+                self.window_state_superseded.remove(workspace);
+            } else if self.window_states.contains_key(workspace) {
+                let committed_superseded = snapshot
+                    .window_state_superseded
+                    .get(workspace)
+                    .copied()
+                    .unwrap_or(0);
+                let remove_counter = if let Some(current) =
+                    self.window_state_superseded.get_mut(workspace)
+                {
+                    *current = current.saturating_sub(committed_superseded.saturating_add(1));
+                    *current == 0
+                } else {
+                    false
+                };
+                if remove_counter {
+                    self.window_state_superseded.remove(workspace);
+                }
             }
         }
-        for (window_id, overlay) in &committed.overlays {
-            if self.overlays.get(window_id) == Some(overlay) {
+
+        for window_id in accepted_overlay_ids {
+            let Some(committed) = snapshot.overlay_mutations.get(window_id) else {
+                continue;
+            };
+            if self.overlay_mutations.get(window_id) == Some(committed) {
                 self.overlay_tab_count = self
                     .overlay_tab_count
-                    .saturating_sub(overlay.slots.len());
-                self.overlays.remove(window_id);
+                    .saturating_sub(committed.live_tab_count());
+                self.overlay_mutations.remove(window_id);
+                continue;
+            }
+            let Some(current) = self.overlay_mutations.get_mut(window_id) else {
+                continue;
+            };
+            let committed_revision = committed.desired_revision();
+            let continues_committed_live =
+                current.desired_revision() > committed_revision
+                    || matches!(
+                        &current.desired,
+                        DesiredOverlayState::Deleted {
+                            last_local_revision,
+                            ..
+                        } if *last_local_revision == committed_revision
+                    );
+            if current.base_revision == committed.base_revision
+                && matches!(&committed.desired, DesiredOverlayState::Live(_))
+                && continues_committed_live
+            {
+                current.base_revision = Some(committed_revision);
+                current.superseded_updates = current
+                    .superseded_updates
+                    .saturating_sub(committed.superseded_updates.saturating_add(1));
             }
         }
-        for fingerprint in &committed.ensure_bindings {
+
+        for window_id in rejected_overlay_ids {
+            let Some(rejected) = snapshot.overlay_mutations.get(window_id) else {
+                continue;
+            };
+            // A coalesced descendant retains the snapshot's durable base. If
+            // the snapshot was rejected, that descendant has no committed
+            // predecessor and must not survive as a revision-skipping create
+            // or update. Callers may submit a fresh lineage after observing
+            // the rejection.
+            let same_rejected_lineage = self
+                .overlay_mutations
+                .get(window_id)
+                .is_some_and(|current| current.base_revision == rejected.base_revision);
+            if same_rejected_lineage
+                && let Some(rejected_lineage) = self.overlay_mutations.remove(window_id)
+            {
+                self.overlay_tab_count = self
+                    .overlay_tab_count
+                    .saturating_sub(rejected_lineage.live_tab_count());
+            }
+        }
+
+        for fingerprint in &snapshot.ensure_bindings {
             if !binding_requests_after_snapshot.contains(fingerprint) {
                 self.ensure_bindings.remove(fingerprint);
             }
         }
-        self.superseded_updates = self
-            .superseded_updates
-            .saturating_sub(committed.superseded_updates);
     }
 }
 
@@ -1108,24 +1238,142 @@ pub struct CommitReceipt {
     pub wrote_new_generation: bool,
     pub committed_updates: usize,
     pub coalesced_updates: usize,
+    pub rejected_updates: usize,
+}
+
+#[derive(Debug)]
+struct RejectedOverlayMutation {
+    mutation: PendingOverlayMutation,
+    failure: PersistenceFailure,
 }
 
 #[derive(Debug)]
 struct BatchCommit {
     receipt: CommitReceipt,
     bindings: BTreeMap<PrivacySafeTargetFingerprint, DomainBindingId>,
+    rejected_bindings: BTreeMap<PrivacySafeTargetFingerprint, PersistenceFailure>,
+    rejected_workspaces: BTreeMap<String, PersistenceFailure>,
+    accepted_overlay_ids: BTreeSet<LayoutWindowId>,
+    rejected_overlay_mutations: BTreeMap<LayoutWindowId, RejectedOverlayMutation>,
+}
+
+impl BatchCommit {
+    fn first_semantic_failure(&self) -> Option<&PersistenceFailure> {
+        self.rejected_workspaces
+            .values()
+            .next()
+            .or_else(|| self.rejected_bindings.values().next())
+            .or_else(|| {
+                self.rejected_overlay_mutations
+                    .values()
+                    .next()
+                    .map(|rejected| &rejected.failure)
+            })
+    }
 }
 
 pub type CommitResult = Result<CommitReceipt, PersistenceFailure>;
 pub type BindingResult = Result<DomainBindingId, PersistenceFailure>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SemanticFailureOutcome {
+    sequence: u64,
+    failure: PersistenceFailure,
+}
+
+struct FlushWaiter {
+    sender: flume::Sender<CommitResult>,
+    prior_semantic_failure: Option<SemanticFailureOutcome>,
+}
+
+impl FlushWaiter {
+    fn new(sender: flume::Sender<CommitResult>) -> Self {
+        Self {
+            sender,
+            prior_semantic_failure: None,
+        }
+    }
+
+    fn remember_semantic_failure(&mut self, outcome: &SemanticFailureOutcome) {
+        if self.prior_semantic_failure.is_none() {
+            self.prior_semantic_failure = Some(outcome.clone());
+        }
+    }
+
+    fn result(
+        &self,
+        current_semantic_failure: Option<&SemanticFailureOutcome>,
+        receipt: CommitReceipt,
+    ) -> CommitResult {
+        self.prior_semantic_failure
+            .as_ref()
+            .or(current_semantic_failure)
+            .map(|outcome| outcome.failure.clone())
+            .map_or(Ok(receipt), Err)
+    }
+
+    fn reported_semantic_sequence(
+        &self,
+        current_semantic_failure: Option<&SemanticFailureOutcome>,
+    ) -> Option<u64> {
+        self.prior_semantic_failure
+            .as_ref()
+            .or(current_semantic_failure)
+            .map(|outcome| outcome.sequence)
+    }
+
+    fn transaction_failure_result(&self, failure: &PersistenceFailure) -> CommitResult {
+        Err(failure.clone())
+    }
+}
+
 #[derive(Default)]
 struct CoordinatorPending {
     batch: PendingBatch,
-    flush_waiters: Vec<flume::Sender<CommitResult>>,
+    flush_waiters: Vec<FlushWaiter>,
     binding_waiters:
         BTreeMap<PrivacySafeTargetFingerprint, Vec<flume::Sender<BindingResult>>>,
     waiter_count: usize,
+    next_semantic_sequence: u64,
+    unreported_semantic_failure: Option<SemanticFailureOutcome>,
+}
+
+impl CoordinatorPending {
+    fn record_semantic_failure(
+        &mut self,
+        failure: &PersistenceFailure,
+    ) -> SemanticFailureOutcome {
+        // Retain the first rejection not yet crossed by a successful explicit
+        // flush. Later rejections in the same barrier interval remain covered
+        // by that deterministic first failure; exact per-lineage receipts are
+        // a separate API layer.
+        let outcome = self
+            .unreported_semantic_failure
+            .clone()
+            .unwrap_or_else(|| {
+                self.next_semantic_sequence = self.next_semantic_sequence.saturating_add(1);
+                let outcome = SemanticFailureOutcome {
+                    sequence: self.next_semantic_sequence,
+                    failure: failure.clone(),
+                };
+                self.unreported_semantic_failure = Some(outcome.clone());
+                outcome
+            });
+        for waiter in &mut self.flush_waiters {
+            waiter.remember_semantic_failure(&outcome);
+        }
+        outcome
+    }
+
+    fn clear_reported_semantic_failure(&mut self, sequence: u64) {
+        if self
+            .unreported_semantic_failure
+            .as_ref()
+            .is_some_and(|outcome| outcome.sequence == sequence)
+        {
+            self.unreported_semantic_failure = None;
+        }
+    }
 }
 
 struct CoordinatorShared {
@@ -1164,24 +1412,40 @@ impl PersistenceWriter {
         validate_workspace(workspace)?;
         let outcome = {
             let mut pending = lock_pending(&self.shared.pending);
+            self.wake_worker()?;
             pending
                 .batch
                 .queue_window_state(workspace.to_owned(), state)?
         };
-        self.wake_worker()?;
         Ok(outcome)
     }
 
     pub fn queue_overlay(
         &self,
+        base_revision: Option<u64>,
         overlay: MixedDomainLayoutOverlay,
     ) -> Result<EnqueueOutcome, PersistenceFailure> {
         validate_overlay(&overlay)?;
         let outcome = {
             let mut pending = lock_pending(&self.shared.pending);
-            pending.batch.queue_overlay(overlay)?
+            self.wake_worker()?;
+            pending.batch.queue_overlay_live(base_revision, overlay)?
         };
-        self.wake_worker()?;
+        Ok(outcome)
+    }
+
+    pub fn queue_overlay_delete(
+        &self,
+        window_id: LayoutWindowId,
+        base_revision: Option<u64>,
+    ) -> Result<EnqueueOutcome, PersistenceFailure> {
+        let outcome = {
+            let mut pending = lock_pending(&self.shared.pending);
+            self.wake_worker()?;
+            pending
+                .batch
+                .queue_overlay_delete(window_id, base_revision)?
+        };
         Ok(outcome)
     }
 
@@ -1208,6 +1472,7 @@ impl PersistenceWriter {
                     "pending domain binding count would exceed {MAX_DOMAIN_BINDINGS}"
                 )));
             }
+            self.wake_worker()?;
             pending.batch.ensure_bindings.insert(target_fingerprint);
             pending
                 .binding_waiters
@@ -1216,7 +1481,6 @@ impl PersistenceWriter {
                 .push(sender);
             pending.waiter_count += 1;
         }
-        self.wake_worker()?;
         Ok(receiver)
     }
 
@@ -1230,10 +1494,14 @@ impl PersistenceWriter {
                     "pending persistence waiter count would exceed {MAX_PENDING_WAITERS}"
                 )));
             }
-            pending.flush_waiters.push(sender);
+            self.wake_worker()?;
+            let mut waiter = FlushWaiter::new(sender);
+            if let Some(outcome) = pending.unreported_semantic_failure.as_ref() {
+                waiter.remember_semantic_failure(outcome);
+            }
+            pending.flush_waiters.push(waiter);
             pending.waiter_count += 1;
         }
-        self.wake_worker()?;
         Ok(receiver)
     }
 
@@ -1257,7 +1525,96 @@ fn lock_pending<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+type BindingWaiters = BTreeMap<
+    PrivacySafeTargetFingerprint,
+    Vec<flume::Sender<BindingResult>>,
+>;
+
+fn take_waiters(
+    shared: &CoordinatorShared,
+) -> (Vec<FlushWaiter>, BindingWaiters) {
+    let mut pending = lock_pending(&shared.pending);
+    let flush_waiters = std::mem::take(&mut pending.flush_waiters);
+    let binding_waiters = std::mem::take(&mut pending.binding_waiters);
+    pending.waiter_count = 0;
+    (flush_waiters, binding_waiters)
+}
+
+fn acknowledge_committed_batch(
+    shared: &CoordinatorShared,
+    batch: &PendingBatch,
+    committed: &BatchCommit,
+) -> Option<SemanticFailureOutcome> {
+    let rejected_overlay_ids = committed
+        .rejected_overlay_mutations
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let semantic_failure = committed.first_semantic_failure();
+    let flush_outcome = {
+        let mut pending = lock_pending(&shared.pending);
+        let binding_requests_after_snapshot = pending.binding_waiters.keys().copied().collect();
+        pending.batch.acknowledge_resolved(
+            batch,
+            &committed.accepted_overlay_ids,
+            &rejected_overlay_ids,
+            &binding_requests_after_snapshot,
+        );
+        semantic_failure.map(|failure| pending.record_semantic_failure(failure))
+    };
+
+    for failure in committed.rejected_workspaces.values() {
+        log::warn!(
+            "window-state: workspace mutation rejected ({:?})",
+            failure.code()
+        );
+    }
+    for failure in committed.rejected_bindings.values() {
+        log::warn!(
+            "window-state: domain binding mutation rejected ({:?})",
+            failure.code()
+        );
+    }
+    for (window_id, rejected) in &committed.rejected_overlay_mutations {
+        debug_assert_eq!(
+            batch.overlay_mutations.get(window_id),
+            Some(&rejected.mutation)
+        );
+        log::warn!(
+            "window-state: overlay mutation rejected ({:?})",
+            rejected.failure.code()
+        );
+    }
+    flush_outcome
+}
+
+fn respond_transaction_failure(
+    failure: &PersistenceFailure,
+    flush_waiters: Vec<FlushWaiter>,
+    binding_waiters: BindingWaiters,
+) {
+    for waiters in binding_waiters.into_values() {
+        for waiter in waiters {
+            let _ = waiter.send(Err(failure.clone()));
+        }
+    }
+    for waiter in flush_waiters {
+        let result = waiter.transaction_failure_result(failure);
+        let _ = waiter.sender.send(result);
+    }
+}
+
+fn resolve_exact_retry(
+    shared: &CoordinatorShared,
+    batch: &PendingBatch,
+) -> Result<(), PersistenceFailure> {
+    let committed = commit_batch(&shared.primary_path, batch, WriteInterruption::None)?;
+    let _ = acknowledge_committed_batch(shared, batch, &committed);
+    Ok(())
+}
+
 fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<()>) {
+    let mut retry_batch = None;
     while receiver.recv().is_ok() {
         let deadline = Instant::now() + WRITE_DEBOUNCE;
         loop {
@@ -1279,6 +1636,24 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
             }
         }
 
+        if let Some(batch) = retry_batch.take() {
+            match resolve_exact_retry(&shared, &batch) {
+                Ok(()) => {}
+                Err(failure) => {
+                    if failure.may_have_published_generation() {
+                        retry_batch = Some(batch);
+                    }
+                    log::warn!(
+                        "window-state: exact in-flight retry rejected ({:?})",
+                        failure.code()
+                    );
+                    let (flush_waiters, binding_waiters) = take_waiters(&shared);
+                    respond_transaction_failure(&failure, flush_waiters, binding_waiters);
+                    continue;
+                }
+            }
+        }
+
         let (batch, flush_waiters, binding_waiters) = {
             let mut pending = lock_pending(&shared.pending);
             let batch = pending.batch.clone();
@@ -1291,41 +1666,41 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
         let result = commit_batch(&shared.primary_path, &batch, WriteInterruption::None);
         match result {
             Ok(committed) => {
-                {
-                    let mut pending = lock_pending(&shared.pending);
-                    let binding_requests_after_snapshot =
-                        pending.binding_waiters.keys().copied().collect();
-                    pending
-                        .batch
-                        .acknowledge_committed(&batch, &binding_requests_after_snapshot);
+                let flush_outcome = acknowledge_committed_batch(&shared, &batch, &committed);
+                let reported_semantic_sequence = flush_waiters.iter().find_map(|waiter| {
+                    waiter.reported_semantic_sequence(flush_outcome.as_ref())
+                });
+                if let Some(sequence) = reported_semantic_sequence {
+                    lock_pending(&shared.pending).clear_reported_semantic_failure(sequence);
                 }
                 for (fingerprint, waiters) in binding_waiters {
-                    let binding = committed.bindings.get(&fingerprint).copied().ok_or_else(|| {
-                        PersistenceFailure::corrupt(
+                    let binding = if let Some(binding) = committed.bindings.get(&fingerprint) {
+                        Ok(*binding)
+                    } else if let Some(failure) = committed.rejected_bindings.get(&fingerprint) {
+                        Err(failure.clone())
+                    } else {
+                        Err(PersistenceFailure::corrupt(
                             "binding commit succeeded without its requested identity",
-                        )
-                    });
+                        ))
+                    };
                     for waiter in waiters {
                         let _ = waiter.send(binding.clone());
                     }
                 }
                 for waiter in flush_waiters {
-                    let _ = waiter.send(Ok(committed.receipt));
+                    let result = waiter.result(flush_outcome.as_ref(), committed.receipt);
+                    let _ = waiter.sender.send(result);
                 }
             }
             Err(failure) => {
+                if failure.may_have_published_generation() {
+                    retry_batch = Some(batch);
+                }
                 log::warn!(
                     "window-state: persistence commit rejected ({:?})",
                     failure.code()
                 );
-                for waiters in binding_waiters.into_values() {
-                    for waiter in waiters {
-                        let _ = waiter.send(Err(failure.clone()));
-                    }
-                }
-                for waiter in flush_waiters {
-                    let _ = waiter.send(Err(failure.clone()));
-                }
+                respond_transaction_failure(&failure, flush_waiters, binding_waiters);
             }
         }
     }
@@ -1337,7 +1712,9 @@ fn persistence_worker(shared: Arc<CoordinatorShared>, receiver: flume::Receiver<
         }
     }
     for waiter in std::mem::take(&mut pending.flush_waiters) {
-        let _ = waiter.send(Err(PersistenceFailure::WorkerStopped));
+        let _ = waiter
+            .sender
+            .send(Err(PersistenceFailure::WorkerStopped));
     }
     pending.waiter_count = 0;
 }
@@ -1356,6 +1733,20 @@ fn validate_workspace(workspace: &str) -> Result<(), PersistenceFailure> {
     if workspace.chars().any(char::is_control) {
         return Err(PersistenceFailure::invalid(
             "workspace contains control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tombstone(tombstone: &OverlayTombstone) -> Result<(), PersistenceFailure> {
+    if tombstone.last_local_revision == 0 {
+        return Err(PersistenceFailure::invalid(
+            "overlay tombstone revision zero is reserved",
+        ));
+    }
+    if tombstone.retired_at_store_revision == 0 {
+        return Err(PersistenceFailure::invalid(
+            "overlay tombstone store revision zero is reserved",
         ));
     }
     Ok(())
@@ -1450,6 +1841,7 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
         )));
     }
     let mut overlay_ids = HashSet::with_capacity(state.overlays.len());
+    let mut globally_owned_tabs = HashSet::new();
     let mut total_tabs = 0usize;
     for overlay in &state.overlays {
         validate_overlay(overlay)?;
@@ -1467,6 +1859,11 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
             )));
         }
         for slot in &overlay.slots {
+            if !globally_owned_tabs.insert(*slot) {
+                return Err(PersistenceFailure::invalid(
+                    "one stable tab identity is owned by multiple layout windows",
+                ));
+            }
             if let Some(binding_id) = slot.remote_binding()
                 && !binding_ids.contains(&binding_id)
             {
@@ -1474,6 +1871,32 @@ fn validate_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
                     "remote overlay slot references an unknown domain binding",
                 ));
             }
+        }
+    }
+    if state.tombstones.len() > MAX_OVERLAY_TOMBSTONES {
+        return Err(PersistenceFailure::quota(format!(
+            "overlay tombstone count {} exceeds {}",
+            state.tombstones.len(),
+            MAX_OVERLAY_TOMBSTONES
+        )));
+    }
+    let mut tombstone_ids = HashSet::with_capacity(state.tombstones.len());
+    for tombstone in &state.tombstones {
+        validate_tombstone(tombstone)?;
+        if tombstone.retired_at_store_revision > state.store_revision {
+            return Err(PersistenceFailure::invalid(
+                "overlay tombstone retirement is newer than its store generation",
+            ));
+        }
+        if !tombstone_ids.insert(tombstone.window_id) {
+            return Err(PersistenceFailure::invalid(
+                "duplicate overlay tombstone identity",
+            ));
+        }
+        if overlay_ids.contains(&tombstone.window_id) {
+            return Err(PersistenceFailure::invalid(
+                "overlay identity is both live and tombstoned",
+            ));
         }
     }
     Ok(())
@@ -1489,6 +1912,12 @@ fn canonicalize_state(state: &mut PersistedState) {
     state
         .overlays
         .sort_by_key(|overlay| overlay.window_id.as_bytes());
+    state.tombstones.sort_by_key(|tombstone| {
+        (
+            tombstone.retired_at_store_revision,
+            tombstone.window_id.as_bytes(),
+        )
+    });
 }
 
 fn validate_published_state(state: &PersistedState) -> Result<(), PersistenceFailure> {
@@ -1530,6 +1959,37 @@ fn schema_version_probe(value: &serde_json::Value) -> Option<u32> {
         .and_then(|version| u32::try_from(version).ok())
 }
 
+fn corrupt_slot(
+    path: &Path,
+    bytes: Vec<u8>,
+    failure: PersistenceFailure,
+) -> ReadSlot {
+    ReadSlot::Corrupt {
+        failure,
+        evidence: CorruptEvidence {
+            path: path.to_path_buf(),
+            bytes,
+        },
+    }
+}
+
+fn migrate_v2_state(state: PersistedStateV2) -> Result<PersistedState, PersistenceFailure> {
+    if state.schema_version != PREVIOUS_STORE_SCHEMA_VERSION {
+        return Err(PersistenceFailure::UnsupportedVersion {
+            found: state.schema_version,
+            current: STORE_SCHEMA_VERSION,
+        });
+    }
+    if state.store_revision == 0 {
+        return Err(PersistenceFailure::invalid(
+            "published schema-v2 state has revision zero",
+        ));
+    }
+    let current = state.into_current();
+    validate_state(&current)?;
+    Ok(current)
+}
+
 fn read_slot(path: &Path, allow_legacy: bool) -> Result<ReadSlot, PersistenceFailure> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -1555,21 +2015,22 @@ fn read_slot(path: &Path, allow_legacy: bool) -> Result<ReadSlot, PersistenceFai
     let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(value) => value,
         Err(_) => {
-            return Ok(ReadSlot::Corrupt {
-                failure: PersistenceFailure::corrupt("state slot is not valid JSON"),
-                evidence: CorruptEvidence {
-                    path: path.to_path_buf(),
-                    bytes,
-                },
-            });
+            return Ok(corrupt_slot(
+                path,
+                bytes,
+                PersistenceFailure::corrupt("state slot is not valid JSON"),
+            ));
         }
     };
 
-    if let Some(version) = schema_version_probe(&value) {
-        if version != STORE_SCHEMA_VERSION {
-            return Ok(ReadSlot::UnsupportedVersion(version));
+    let Some(version) = schema_version_probe(&value) else {
+        if !allow_legacy {
+            return Ok(corrupt_slot(
+                path,
+                bytes,
+                PersistenceFailure::corrupt("state slot has no schema version"),
+            ));
         }
-    } else if allow_legacy {
         return match serde_json::from_value::<BTreeMap<String, PersistedWindowState>>(value) {
             Ok(window_states) => {
                 let state = PersistedState {
@@ -1577,67 +2038,83 @@ fn read_slot(path: &Path, allow_legacy: bool) -> Result<ReadSlot, PersistenceFai
                     ..PersistedState::default()
                 };
                 match validate_state(&state) {
-                    Ok(()) => Ok(ReadSlot::Legacy(state)),
-                    Err(failure) => Ok(ReadSlot::Corrupt {
-                        failure,
-                        evidence: CorruptEvidence {
-                            path: path.to_path_buf(),
-                            bytes,
-                        },
-                    }),
+                    Ok(()) => Ok(ReadSlot::Valid(ValidatedSlot {
+                        state,
+                        schema: SlotSchema::LegacyGeometry,
+                    })),
+                    Err(failure) => Ok(corrupt_slot(path, bytes, failure)),
                 }
             }
-            Err(_) => Ok(ReadSlot::Corrupt {
-                failure: PersistenceFailure::corrupt("legacy geometry map is invalid"),
-                evidence: CorruptEvidence {
-                    path: path.to_path_buf(),
-                    bytes,
-                },
-            }),
+            Err(_) => Ok(corrupt_slot(
+                path,
+                bytes,
+                PersistenceFailure::corrupt("legacy geometry map is invalid"),
+            )),
         };
-    } else {
-        return Ok(ReadSlot::Corrupt {
-            failure: PersistenceFailure::corrupt("state slot has no schema version"),
-            evidence: CorruptEvidence {
-                path: path.to_path_buf(),
-                bytes,
-            },
-        });
-    }
-
-    let disk = match serde_json::from_value::<DiskSlot>(value) {
-        Ok(disk) => disk,
-        Err(_) => {
-            return Ok(ReadSlot::Corrupt {
-                failure: PersistenceFailure::corrupt("state slot schema is invalid"),
-                evidence: CorruptEvidence {
-                    path: path.to_path_buf(),
-                    bytes,
-                },
-            });
-        }
     };
-    let payload = serde_json::to_vec(&disk.payload)
-        .map_err(|_| PersistenceFailure::corrupt("could not verify state payload"))?;
-    let expected: [u8; 32] = Sha256::digest(&payload).into();
-    if expected != disk.sha256 {
-        return Ok(ReadSlot::Corrupt {
-            failure: PersistenceFailure::corrupt("state slot checksum mismatch"),
-            evidence: CorruptEvidence {
-                path: path.to_path_buf(),
-                bytes,
-            },
-        });
-    }
-    match validate_published_state(&disk.payload) {
-        Ok(()) => Ok(ReadSlot::Current(disk.payload)),
-        Err(failure) => Ok(ReadSlot::Corrupt {
-            failure,
-            evidence: CorruptEvidence {
-                path: path.to_path_buf(),
-                bytes,
-            },
-        }),
+
+    match version {
+        STORE_SCHEMA_VERSION => {
+            let disk = match serde_json::from_value::<DiskSlot>(value) {
+                Ok(disk) => disk,
+                Err(_) => {
+                    return Ok(corrupt_slot(
+                        path,
+                        bytes,
+                        PersistenceFailure::corrupt("state slot schema is invalid"),
+                    ));
+                }
+            };
+            let payload = serde_json::to_vec(&disk.payload)
+                .map_err(|_| PersistenceFailure::corrupt("could not verify state payload"))?;
+            let expected: [u8; 32] = Sha256::digest(&payload).into();
+            if expected != disk.sha256 {
+                return Ok(corrupt_slot(
+                    path,
+                    bytes,
+                    PersistenceFailure::corrupt("state slot checksum mismatch"),
+                ));
+            }
+            match validate_published_state(&disk.payload) {
+                Ok(()) => Ok(ReadSlot::Valid(ValidatedSlot {
+                    state: disk.payload,
+                    schema: SlotSchema::Current,
+                })),
+                Err(failure) => Ok(corrupt_slot(path, bytes, failure)),
+            }
+        }
+        PREVIOUS_STORE_SCHEMA_VERSION => {
+            let disk = match serde_json::from_value::<DiskSlotV2>(value) {
+                Ok(disk) => disk,
+                Err(_) => {
+                    return Ok(corrupt_slot(
+                        path,
+                        bytes,
+                        PersistenceFailure::corrupt("schema-v2 state slot is invalid"),
+                    ));
+                }
+            };
+            // Verify the exact v2 payload shape before introducing v3 fields.
+            let payload = serde_json::to_vec(&disk.payload).map_err(|_| {
+                PersistenceFailure::corrupt("could not verify schema-v2 state payload")
+            })?;
+            let expected: [u8; 32] = Sha256::digest(&payload).into();
+            if expected != disk.sha256 {
+                return Ok(corrupt_slot(
+                    path,
+                    bytes,
+                    PersistenceFailure::corrupt("schema-v2 state slot checksum mismatch"),
+                ));
+            }
+            match migrate_v2_state(disk.payload) {
+                Ok(state) => Ok(ReadSlot::Valid(ValidatedSlot {
+                    state,
+                    schema: SlotSchema::V2,
+                })),
+                Err(failure) => Ok(corrupt_slot(path, bytes, failure)),
+            }
+        }
+        _ => Ok(ReadSlot::UnsupportedVersion(version)),
     }
 }
 
@@ -1688,6 +2165,40 @@ fn reject_blocking_slot(slot: &ReadSlot) -> Result<(), PersistenceFailure> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotPosition {
+    Primary,
+    Shadow,
+}
+
+fn loaded_from_valid(
+    valid: ValidatedSlot,
+    position: SlotPosition,
+    primary_path: &Path,
+    shadow_path: &Path,
+    degraded_recovery: bool,
+    corrupt_evidence: Option<CorruptEvidence>,
+) -> LoadedAuthoritative {
+    let source = match (valid.schema, position) {
+        (SlotSchema::LegacyGeometry, _) => StoreSource::LegacyGeometry,
+        (_, SlotPosition::Primary) => StoreSource::Primary,
+        (_, SlotPosition::Shadow) => StoreSource::Shadow,
+    };
+    let (authority, target) = match position {
+        SlotPosition::Primary => (primary_path.to_path_buf(), shadow_path.to_path_buf()),
+        SlotPosition::Shadow => (shadow_path.to_path_buf(), primary_path.to_path_buf()),
+    };
+    LoadedAuthoritative {
+        state: valid.state,
+        source,
+        authority: Some(authority),
+        target,
+        degraded_recovery,
+        corrupt_evidence,
+        requires_schema_upgrade: valid.schema != SlotSchema::Current,
+    }
+}
+
 fn load_authoritative_unlocked(
     primary_path: &Path,
 ) -> Result<LoadedAuthoritative, PersistenceFailure> {
@@ -1701,108 +2212,103 @@ fn load_authoritative_unlocked(
         (ReadSlot::Missing, ReadSlot::Missing) => Ok(LoadedAuthoritative {
             state: PersistedState::default(),
             source: StoreSource::Empty,
+            authority: None,
             target: primary_path.to_path_buf(),
             degraded_recovery: false,
             corrupt_evidence: None,
+            requires_schema_upgrade: false,
         }),
-        (ReadSlot::Legacy(state), ReadSlot::Missing) => Ok(LoadedAuthoritative {
-            state,
-            source: StoreSource::LegacyGeometry,
-            target: shadow_path,
-            degraded_recovery: false,
-            corrupt_evidence: None,
-        }),
-        (ReadSlot::Current(state), ReadSlot::Missing) => Ok(LoadedAuthoritative {
-            state,
-            source: StoreSource::Primary,
-            target: shadow_path,
-            degraded_recovery: false,
-            corrupt_evidence: None,
-        }),
-        (ReadSlot::Missing, ReadSlot::Current(state)) => Ok(LoadedAuthoritative {
-            state,
-            source: StoreSource::Shadow,
-            target: primary_path.to_path_buf(),
-            degraded_recovery: false,
-            corrupt_evidence: None,
-        }),
-        (ReadSlot::Legacy(_), ReadSlot::Current(state)) => Ok(LoadedAuthoritative {
-            state,
-            source: StoreSource::Shadow,
-            target: primary_path.to_path_buf(),
-            degraded_recovery: false,
-            corrupt_evidence: None,
-        }),
-        (ReadSlot::Current(primary), ReadSlot::Current(shadow)) => {
-            if primary.store_revision > shadow.store_revision {
-                Ok(LoadedAuthoritative {
-                    state: primary,
-                    source: StoreSource::Primary,
-                    target: shadow_path,
-                    degraded_recovery: false,
-                    corrupt_evidence: None,
-                })
-            } else if shadow.store_revision > primary.store_revision {
-                Ok(LoadedAuthoritative {
-                    state: shadow,
-                    source: StoreSource::Shadow,
-                    target: primary_path.to_path_buf(),
-                    degraded_recovery: false,
-                    corrupt_evidence: None,
-                })
-            } else if primary == shadow {
-                Ok(LoadedAuthoritative {
-                    state: primary,
-                    source: StoreSource::Primary,
-                    target: shadow_path,
-                    degraded_recovery: false,
-                    corrupt_evidence: None,
-                })
+        (ReadSlot::Valid(valid), ReadSlot::Missing) => Ok(loaded_from_valid(
+            valid,
+            SlotPosition::Primary,
+            primary_path,
+            &shadow_path,
+            true,
+            None,
+        )),
+        (ReadSlot::Missing, ReadSlot::Valid(valid)) => Ok(loaded_from_valid(
+            valid,
+            SlotPosition::Shadow,
+            primary_path,
+            &shadow_path,
+            true,
+            None,
+        )),
+        (ReadSlot::Valid(primary), ReadSlot::Valid(shadow)) => {
+            let primary_revision = primary.state.store_revision;
+            let shadow_revision = shadow.state.store_revision;
+            if primary_revision > shadow_revision {
+                Ok(loaded_from_valid(
+                    primary,
+                    SlotPosition::Primary,
+                    primary_path,
+                    &shadow_path,
+                    false,
+                    None,
+                ))
+            } else if shadow_revision > primary_revision {
+                Ok(loaded_from_valid(
+                    shadow,
+                    SlotPosition::Shadow,
+                    primary_path,
+                    &shadow_path,
+                    false,
+                    None,
+                ))
+            } else if primary.state == shadow.state {
+                if shadow.schema.preference() > primary.schema.preference() {
+                    Ok(loaded_from_valid(
+                        shadow,
+                        SlotPosition::Shadow,
+                        primary_path,
+                        &shadow_path,
+                        false,
+                        None,
+                    ))
+                } else {
+                    Ok(loaded_from_valid(
+                        primary,
+                        SlotPosition::Primary,
+                        primary_path,
+                        &shadow_path,
+                        false,
+                        None,
+                    ))
+                }
             } else {
                 Err(PersistenceFailure::AmbiguousGeneration {
-                    revision: primary.store_revision,
+                    revision: primary_revision,
                 })
             }
         }
         (
-            ReadSlot::Current(state),
+            ReadSlot::Valid(valid),
             ReadSlot::Corrupt {
                 evidence,
                 failure: _,
             },
-        ) => Ok(LoadedAuthoritative {
-            state,
-            source: StoreSource::Primary,
-            target: shadow_path,
-            degraded_recovery: true,
-            corrupt_evidence: Some(evidence),
-        }),
+        ) => Ok(loaded_from_valid(
+            valid,
+            SlotPosition::Primary,
+            primary_path,
+            &shadow_path,
+            true,
+            Some(evidence),
+        )),
         (
             ReadSlot::Corrupt {
                 evidence,
                 failure: _,
             },
-            ReadSlot::Current(state),
-        ) => {
-            let target = evidence.path.clone();
-            Ok(LoadedAuthoritative {
-                state,
-                source: StoreSource::Shadow,
-                target,
-                degraded_recovery: true,
-                corrupt_evidence: Some(evidence),
-            })
-        }
-        (ReadSlot::Legacy(state), ReadSlot::Corrupt { evidence, .. }) => {
-            let target = evidence.path.clone();
-            Ok(LoadedAuthoritative {
-                state,
-                source: StoreSource::LegacyGeometry,
-                target,
-                degraded_recovery: true,
-                corrupt_evidence: Some(evidence),
-            })
-        }
+            ReadSlot::Valid(valid),
+        ) => Ok(loaded_from_valid(
+            valid,
+            SlotPosition::Shadow,
+            primary_path,
+            &shadow_path,
+            true,
+            Some(evidence),
+        )),
         (
             ReadSlot::Corrupt {
                 failure,
@@ -1845,6 +2351,7 @@ fn load_snapshot_unlocked(
         window_states: loaded.state.window_states,
         domain_bindings: loaded.state.domain_bindings,
         overlays: loaded.state.overlays,
+        tombstones: loaded.state.tombstones,
     })
 }
 
@@ -2005,6 +2512,42 @@ fn count_retained_evidence(
     Ok(retained)
 }
 
+fn validate_existing_corrupt_evidence(
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), PersistenceFailure> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| PersistenceFailure::io("inspect corrupt-state evidence", error))?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != u64::try_from(expected.len()).unwrap_or(u64::MAX)
+    {
+        return Err(PersistenceFailure::corrupt(
+            "existing corrupt-state evidence does not match its digest identity",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| PersistenceFailure::io("open corrupt-state evidence", error))?;
+    let read_limit = u64::try_from(expected.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut retained = Vec::with_capacity(expected.len());
+    (&mut file)
+        .take(read_limit)
+        .read_to_end(&mut retained)
+        .map_err(|error| PersistenceFailure::io("read corrupt-state evidence", error))?;
+    if retained != expected {
+        return Err(PersistenceFailure::corrupt(
+            "existing corrupt-state evidence does not match its digest identity",
+        ));
+    }
+    file.sync_all()
+        .map_err(|error| PersistenceFailure::io("sync corrupt-state evidence", error))?;
+    sync_parent_directory(path)
+}
+
 fn quarantine_corrupt_evidence(evidence: &CorruptEvidence) -> Result<(), PersistenceFailure> {
     let digest = Sha256::digest(&evidence.bytes);
     let mut digest_hex = String::with_capacity(64);
@@ -2020,8 +2563,15 @@ fn quarantine_corrupt_evidence(evidence: &CorruptEvidence) -> Result<(), Persist
     let quarantine = evidence
         .path
         .with_file_name(format!("{name}.corrupt-{digest_hex}"));
-    if quarantine.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(&quarantine) {
+        Ok(_) => return validate_existing_corrupt_evidence(&quarantine, &evidence.bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(PersistenceFailure::io(
+                "inspect corrupt-state evidence",
+                error,
+            ));
+        }
     }
     if let Some(parent) = evidence.path.parent() {
         let prefix = format!("{name}.corrupt-");
@@ -2039,7 +2589,9 @@ fn quarantine_corrupt_evidence(evidence: &CorruptEvidence) -> Result<(), Persist
         .open(&quarantine)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return validate_existing_corrupt_evidence(&quarantine, &evidence.bytes);
+        }
         Err(error) => {
             return Err(PersistenceFailure::io(
                 "create corrupt-state evidence",
@@ -2054,40 +2606,439 @@ fn quarantine_corrupt_evidence(evidence: &CorruptEvidence) -> Result<(), Persist
     sync_parent_directory(&quarantine)
 }
 
+#[derive(Debug)]
+struct OverlayPreflight {
+    accepted_overlay_ids: BTreeSet<LayoutWindowId>,
+    apply_overlay_ids: BTreeSet<LayoutWindowId>,
+    rejected_overlay_mutations: BTreeMap<LayoutWindowId, RejectedOverlayMutation>,
+    new_tombstones: usize,
+}
+
+#[derive(Debug)]
+struct BatchPreflight {
+    overlays: OverlayPreflight,
+    accepted_workspaces: BTreeSet<String>,
+    rejected_workspaces: BTreeMap<String, PersistenceFailure>,
+    accepted_bindings: BTreeSet<PrivacySafeTargetFingerprint>,
+    rejected_bindings: BTreeMap<PrivacySafeTargetFingerprint, PersistenceFailure>,
+}
+
+#[derive(Debug)]
+struct AppliedBatch {
+    changed: bool,
+    bindings: BTreeMap<PrivacySafeTargetFingerprint, DomainBindingId>,
+    rejected_bindings: BTreeMap<PrivacySafeTargetFingerprint, PersistenceFailure>,
+}
+
+fn preflight_one_overlay_mutation(
+    live: Option<&MixedDomainLayoutOverlay>,
+    tombstone: Option<&OverlayTombstone>,
+    mutation: &PendingOverlayMutation,
+) -> Result<bool, PersistenceFailure> {
+    debug_assert!(live.is_none() || tombstone.is_none());
+
+    match (&mutation.desired, live, tombstone) {
+        (DesiredOverlayState::Live(desired), Some(current), _) if desired == current => {
+            return Ok(false);
+        }
+        (
+            DesiredOverlayState::Deleted {
+                last_local_revision,
+                ..
+            },
+            _,
+            Some(current),
+        ) if *last_local_revision == current.last_local_revision => {
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    match (live, tombstone) {
+        (None, None) if mutation.base_revision.is_none() => Ok(true),
+        (None, None) => Err(PersistenceFailure::OverlayCasConflict {
+            expected: mutation.base_revision,
+            committed: None,
+        }),
+        (Some(current), None)
+            if mutation.base_revision == Some(current.local_revision) =>
+        {
+            Ok(true)
+        }
+        (Some(current), None) => {
+            let incoming = mutation.desired_revision();
+            if incoming < current.local_revision {
+                Err(PersistenceFailure::StaleOverlay {
+                    incoming,
+                    committed: current.local_revision,
+                })
+            } else if incoming == current.local_revision
+                && matches!(&mutation.desired, DesiredOverlayState::Live(_))
+            {
+                Err(PersistenceFailure::OverlayRevisionConflict {
+                    revision: incoming,
+                })
+            } else {
+                Err(PersistenceFailure::OverlayCasConflict {
+                    expected: mutation.base_revision,
+                    committed: Some(current.local_revision),
+                })
+            }
+        }
+        (None, Some(current)) => Err(PersistenceFailure::RetiredOverlay {
+            last_revision: current.last_local_revision,
+        }),
+        (Some(_), Some(_)) => Err(PersistenceFailure::invalid(
+            "overlay identity is both live and tombstoned",
+        )),
+    }
+}
+
+fn prospective_overlay_counts(
+    live_count: usize,
+    tombstone_count: usize,
+    total_tabs: usize,
+    current_live_tabs: usize,
+    current_is_live: bool,
+    mutation: &PendingOverlayMutation,
+) -> Result<(usize, usize, usize, bool), PersistenceFailure> {
+    let next_total_tabs = total_tabs
+        .checked_sub(current_live_tabs)
+        .and_then(|count| count.checked_add(mutation.live_tab_count()))
+        .ok_or_else(|| PersistenceFailure::quota("total overlay tab count overflowed"))?;
+    match &mutation.desired {
+        DesiredOverlayState::Live(_) => {
+            let next_live_count = if current_is_live {
+                live_count
+            } else {
+                live_count.checked_add(1).ok_or_else(|| {
+                    PersistenceFailure::quota("layout overlay count overflowed")
+                })?
+            };
+            Ok((
+                next_live_count,
+                tombstone_count,
+                next_total_tabs,
+                false,
+            ))
+        }
+        DesiredOverlayState::Deleted { .. } => {
+            let next_live_count = if current_is_live {
+                live_count.saturating_sub(1)
+            } else {
+                live_count
+            };
+            let next_tombstone_count = tombstone_count
+                .checked_add(1)
+                .ok_or_else(|| PersistenceFailure::quota("overlay tombstone count overflowed"))?;
+            Ok((
+                next_live_count,
+                next_tombstone_count,
+                next_total_tabs,
+                true,
+            ))
+        }
+    }
+}
+
+fn projected_overlay_tabs_are_unique(
+    state: &PersistedState,
+    batch: &PendingBatch,
+    apply_overlay_ids: &BTreeSet<LayoutWindowId>,
+) -> bool {
+    let retained_slots = state
+        .overlays
+        .iter()
+        .filter(|overlay| !apply_overlay_ids.contains(&overlay.window_id))
+        .flat_map(|overlay| overlay.slots.iter().copied());
+    let replacement_slots = apply_overlay_ids.iter().flat_map(|window_id| {
+        match &batch.overlay_mutations[window_id].desired {
+            DesiredOverlayState::Live(overlay) => overlay.slots.as_slice(),
+            DesiredOverlayState::Deleted { .. } => &[],
+        }
+        .iter()
+        .copied()
+    });
+    let mut owned = HashSet::new();
+    retained_slots
+        .chain(replacement_slots)
+        .all(|slot| owned.insert(slot))
+}
+
+fn preflight_overlay_mutations(
+    state: &PersistedState,
+    batch: &PendingBatch,
+) -> Result<OverlayPreflight, PersistenceFailure> {
+    validate_state(state)?;
+    let live_by_id = state
+        .overlays
+        .iter()
+        .map(|overlay| (overlay.window_id, overlay))
+        .collect::<BTreeMap<_, _>>();
+    let tombstone_by_id = state
+        .tombstones
+        .iter()
+        .map(|tombstone| (tombstone.window_id, tombstone))
+        .collect::<BTreeMap<_, _>>();
+    let authoritative_binding_ids = state
+        .domain_bindings
+        .iter()
+        .map(|record| record.binding_id)
+        .collect::<HashSet<_>>();
+    let mut accepted_overlay_ids = BTreeSet::new();
+    let mut apply_overlay_ids = BTreeSet::new();
+    let mut rejected_overlay_mutations = BTreeMap::new();
+    let mut quota_candidates = Vec::new();
+
+    for (window_id, mutation) in &batch.overlay_mutations {
+        debug_assert_eq!(*window_id, mutation.window_id());
+        if let DesiredOverlayState::Live(overlay) = &mutation.desired
+            && overlay.slots.iter().any(|slot| {
+                slot.remote_binding()
+                    .is_some_and(|binding| !authoritative_binding_ids.contains(&binding))
+            })
+        {
+            rejected_overlay_mutations.insert(
+                *window_id,
+                RejectedOverlayMutation {
+                    mutation: mutation.clone(),
+                    failure: PersistenceFailure::invalid(
+                        "overlay remote slot references an unknown domain binding",
+                    ),
+                },
+            );
+            continue;
+        }
+        match preflight_one_overlay_mutation(
+            live_by_id.get(window_id).copied(),
+            tombstone_by_id.get(window_id).copied(),
+            mutation,
+        ) {
+            Ok(false) => {
+                accepted_overlay_ids.insert(*window_id);
+            }
+            Ok(true) => {
+                quota_candidates.push(*window_id);
+            }
+            Err(failure) => {
+                rejected_overlay_mutations.insert(
+                    *window_id,
+                    RejectedOverlayMutation {
+                        mutation: mutation.clone(),
+                        failure,
+                    },
+                );
+            }
+        }
+    }
+
+    // Resource-reducing mutations are admitted before growth, independent of
+    // identity order. A same-batch close can therefore make room for a create,
+    // and a shrink can make room for a grow, without either lineage receiving
+    // topology authority before every CAS check above has completed.
+    quota_candidates.sort_by_key(|window_id| {
+        let mutation = &batch.overlay_mutations[window_id];
+        let current_live_tabs = live_by_id
+            .get(window_id)
+            .map_or(0, |overlay| overlay.slots.len());
+        let priority = match &mutation.desired {
+            DesiredOverlayState::Live(_)
+                if live_by_id.contains_key(window_id)
+                    && mutation.live_tab_count() <= current_live_tabs =>
+            {
+                0
+            }
+            DesiredOverlayState::Deleted { .. } => 1,
+            DesiredOverlayState::Live(_) => 2,
+        };
+        (priority, *window_id)
+    });
+
+    let mut live_count = state.overlays.len();
+    let mut tombstone_count = state.tombstones.len();
+    let mut total_tabs = state.overlays.iter().try_fold(0usize, |total, overlay| {
+        total
+            .checked_add(overlay.slots.len())
+            .ok_or_else(|| PersistenceFailure::quota("total overlay tab count overflowed"))
+    })?;
+    let mut new_tombstones = 0usize;
+
+    for window_id in quota_candidates {
+        let mutation = &batch.overlay_mutations[&window_id];
+        let current_live = live_by_id.get(&window_id).copied();
+        let current_live_tabs = current_live.map_or(0, |overlay| overlay.slots.len());
+        let prospective = prospective_overlay_counts(
+            live_count,
+            tombstone_count,
+            total_tabs,
+            current_live_tabs,
+            current_live.is_some(),
+            mutation,
+        );
+
+        let quota_failure = match prospective {
+            Err(failure) => Some(failure),
+            Ok((next_live_count, _, _, _)) if next_live_count > MAX_LAYOUT_OVERLAYS => {
+                Some(PersistenceFailure::quota(format!(
+                    "layout overlay count would exceed {MAX_LAYOUT_OVERLAYS}"
+                )))
+            }
+            Ok((_, next_tombstone_count, _, _))
+                if next_tombstone_count > MAX_OVERLAY_TOMBSTONES =>
+            {
+                Some(PersistenceFailure::quota(format!(
+                    "overlay tombstone count would exceed {MAX_OVERLAY_TOMBSTONES}"
+                )))
+            }
+            Ok((_, _, next_total_tabs, _)) if next_total_tabs > MAX_TOTAL_OVERLAY_TABS => {
+                Some(PersistenceFailure::quota(format!(
+                    "total overlay tab count {next_total_tabs} exceeds {MAX_TOTAL_OVERLAY_TABS}"
+                )))
+            }
+            Ok((next_live_count, next_tombstone_count, next_total_tabs, adds_tombstone)) => {
+                live_count = next_live_count;
+                tombstone_count = next_tombstone_count;
+                total_tabs = next_total_tabs;
+                if adds_tombstone {
+                    new_tombstones = new_tombstones.saturating_add(1);
+                }
+                accepted_overlay_ids.insert(window_id);
+                apply_overlay_ids.insert(window_id);
+                None
+            }
+        };
+        if let Some(failure) = quota_failure {
+            rejected_overlay_mutations.insert(
+                window_id,
+                RejectedOverlayMutation {
+                    mutation: mutation.clone(),
+                    failure,
+                },
+            );
+        }
+    }
+
+    if !projected_overlay_tabs_are_unique(state, batch, &apply_overlay_ids) {
+        let failure = PersistenceFailure::invalid(
+            "one stable tab identity would be owned by multiple layout windows",
+        );
+        for window_id in std::mem::take(&mut apply_overlay_ids) {
+            accepted_overlay_ids.remove(&window_id);
+            rejected_overlay_mutations.insert(
+                window_id,
+                RejectedOverlayMutation {
+                    mutation: batch.overlay_mutations[&window_id].clone(),
+                    failure: failure.clone(),
+                },
+            );
+        }
+        new_tombstones = 0;
+    }
+
+    Ok(OverlayPreflight {
+        accepted_overlay_ids,
+        apply_overlay_ids,
+        rejected_overlay_mutations,
+        new_tombstones,
+    })
+}
+
+fn preflight_batch(
+    state: &PersistedState,
+    batch: &PendingBatch,
+) -> Result<BatchPreflight, PersistenceFailure> {
+    let overlays = preflight_overlay_mutations(state, batch)?;
+    let mut accepted_workspaces = BTreeSet::new();
+    let mut rejected_workspaces = BTreeMap::new();
+    let mut prospective_workspace_count = state.window_states.len();
+    for workspace in batch.window_states.keys() {
+        if state.window_states.contains_key(workspace) {
+            accepted_workspaces.insert(workspace.clone());
+        } else if prospective_workspace_count < MAX_WORKSPACES {
+            prospective_workspace_count = prospective_workspace_count.saturating_add(1);
+            accepted_workspaces.insert(workspace.clone());
+        } else {
+            rejected_workspaces.insert(
+                workspace.clone(),
+                PersistenceFailure::quota(format!(
+                    "workspace count would exceed {MAX_WORKSPACES}"
+                )),
+            );
+        }
+    }
+
+    let existing_bindings = state
+        .domain_bindings
+        .iter()
+        .map(|record| record.target_fingerprint)
+        .collect::<HashSet<_>>();
+    let mut accepted_bindings = BTreeSet::new();
+    let mut rejected_bindings = BTreeMap::new();
+    let mut prospective_binding_count = state.domain_bindings.len();
+    for fingerprint in &batch.ensure_bindings {
+        if existing_bindings.contains(fingerprint) {
+            accepted_bindings.insert(*fingerprint);
+        } else if prospective_binding_count < MAX_DOMAIN_BINDINGS {
+            prospective_binding_count = prospective_binding_count.saturating_add(1);
+            accepted_bindings.insert(*fingerprint);
+        } else {
+            rejected_bindings.insert(
+                *fingerprint,
+                PersistenceFailure::quota(format!(
+                    "domain binding count would exceed {MAX_DOMAIN_BINDINGS}"
+                )),
+            );
+        }
+    }
+
+    Ok(BatchPreflight {
+        overlays,
+        accepted_workspaces,
+        rejected_workspaces,
+        accepted_bindings,
+        rejected_bindings,
+    })
+}
+
 fn apply_batch(
     state: &mut PersistedState,
     batch: &PendingBatch,
-) -> Result<(bool, BTreeMap<PrivacySafeTargetFingerprint, DomainBindingId>), PersistenceFailure> {
-    validate_state(state)?;
+    preflight: &BatchPreflight,
+    retirement_store_revision: Option<u64>,
+) -> Result<AppliedBatch, PersistenceFailure> {
     let mut changed = false;
     let mut bindings = BTreeMap::new();
+    let mut rejected_bindings = BTreeMap::new();
+    let mut binding_by_fingerprint = state
+        .domain_bindings
+        .iter()
+        .map(|record| (record.target_fingerprint, record.binding_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut binding_ids = state
+        .domain_bindings
+        .iter()
+        .map(|record| record.binding_id)
+        .collect::<HashSet<_>>();
 
-    for fingerprint in &batch.ensure_bindings {
-        if let Some(existing) = state
-            .domain_bindings
-            .iter()
-            .find(|record| record.target_fingerprint == *fingerprint)
-            .map(|record| record.binding_id)
-        {
+    for fingerprint in &preflight.accepted_bindings {
+        if let Some(existing) = binding_by_fingerprint.get(fingerprint).copied() {
             bindings.insert(*fingerprint, existing);
             continue;
         }
-        if state.domain_bindings.len() >= MAX_DOMAIN_BINDINGS {
-            return Err(PersistenceFailure::quota(format!(
-                "domain binding count would exceed {MAX_DOMAIN_BINDINGS}"
-            )));
-        }
-        let existing_ids = state
-            .domain_bindings
-            .iter()
-            .map(|record| record.binding_id)
-            .collect::<HashSet<_>>();
-        let binding_id = (0..8)
+        let Some(binding_id) = (0..8)
             .map(|_| DomainBindingId::new())
-            .find(|candidate| !existing_ids.contains(candidate))
-            .ok_or_else(|| {
-                PersistenceFailure::invalid("could not allocate a unique domain binding identity")
-            })?;
+            .find(|candidate| !binding_ids.contains(candidate))
+        else {
+            rejected_bindings.insert(
+                *fingerprint,
+                PersistenceFailure::invalid(
+                    "could not allocate a unique domain binding identity",
+                ),
+            );
+            continue;
+        };
+        binding_by_fingerprint.insert(*fingerprint, binding_id);
+        binding_ids.insert(binding_id);
         state.domain_bindings.push(DomainBindingRecord {
             target_fingerprint: *fingerprint,
             binding_id,
@@ -2096,7 +3047,8 @@ fn apply_batch(
         changed = true;
     }
 
-    for (workspace, window_state) in &batch.window_states {
+    for workspace in &preflight.accepted_workspaces {
+        let window_state = &batch.window_states[workspace];
         validate_workspace(workspace)?;
         match state.window_states.get(workspace) {
             Some(existing) if existing == window_state => {}
@@ -2105,61 +3057,74 @@ fn apply_batch(
                 changed = true;
             }
             None => {
-                if state.window_states.len() >= MAX_WORKSPACES {
-                    return Err(PersistenceFailure::quota(format!(
-                        "workspace count would exceed {MAX_WORKSPACES}"
-                    )));
-                }
                 state.window_states.insert(workspace.clone(), *window_state);
                 changed = true;
             }
         }
     }
 
-    for overlay in batch.overlays.values() {
-        validate_overlay(overlay)?;
-        match state
-            .overlays
-            .iter()
-            .position(|existing| existing.window_id == overlay.window_id)
-        {
-            None => {
-                if state.overlays.len() >= MAX_LAYOUT_OVERLAYS {
-                    return Err(PersistenceFailure::quota(format!(
-                        "layout overlay count would exceed {MAX_LAYOUT_OVERLAYS}"
-                    )));
-                }
-                state.overlays.push(overlay.clone());
-                changed = true;
+    let mut overlay_apply_order = preflight
+        .overlays
+        .apply_overlay_ids
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    overlay_apply_order.sort_by_key(|window_id| {
+        let mutation = &batch.overlay_mutations[window_id];
+        let priority = match &mutation.desired {
+            DesiredOverlayState::Deleted { .. } => 0,
+            DesiredOverlayState::Live(_) => 1,
+        };
+        (priority, *window_id)
+    });
+
+    let mut overlays_by_id = std::mem::take(&mut state.overlays)
+        .into_iter()
+        .map(|overlay| (overlay.window_id, overlay))
+        .collect::<BTreeMap<_, _>>();
+    let mut tombstones_by_id = std::mem::take(&mut state.tombstones)
+        .into_iter()
+        .map(|tombstone| (tombstone.window_id, tombstone))
+        .collect::<BTreeMap<_, _>>();
+
+    for window_id in overlay_apply_order {
+        let mutation = &batch.overlay_mutations[&window_id];
+        match &mutation.desired {
+            DesiredOverlayState::Live(overlay) => {
+                overlays_by_id.insert(window_id, overlay.clone());
             }
-            Some(index)
-                if state.overlays[index].local_revision > overlay.local_revision =>
-            {
-                return Err(PersistenceFailure::StaleOverlay {
-                    incoming: overlay.local_revision,
-                    committed: state.overlays[index].local_revision,
-                });
-            }
-            Some(index)
-                if state.overlays[index].local_revision == overlay.local_revision
-                    && state.overlays[index] == *overlay => {}
-            Some(index)
-                if state.overlays[index].local_revision == overlay.local_revision =>
-            {
-                return Err(PersistenceFailure::OverlayRevisionConflict {
-                    revision: overlay.local_revision,
-                });
-            }
-            Some(index) => {
-                state.overlays[index] = overlay.clone();
-                changed = true;
+            DesiredOverlayState::Deleted {
+                last_local_revision,
+                ..
+            } => {
+                overlays_by_id.remove(&window_id);
+                let retired_at_store_revision = retirement_store_revision.ok_or_else(|| {
+                    PersistenceFailure::invalid(
+                        "overlay retirement has no reserved store generation",
+                    )
+                })?;
+                tombstones_by_id.insert(
+                    window_id,
+                    OverlayTombstone::new(
+                        window_id,
+                        *last_local_revision,
+                        retired_at_store_revision,
+                    )?,
+                );
             }
         }
+        changed = true;
     }
 
+    state.overlays = overlays_by_id.into_values().collect();
+    state.tombstones = tombstones_by_id.into_values().collect();
+
     canonicalize_state(state);
-    validate_state(state)?;
-    Ok((changed, bindings))
+    Ok(AppliedBatch {
+        changed,
+        bindings,
+        rejected_bindings,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2173,6 +3138,8 @@ enum WriteInterruption {
     AfterFullWrite,
     #[cfg(test)]
     AfterSync,
+    #[cfg(test)]
+    AfterDirectorySync,
 }
 
 fn write_inactive_slot(
@@ -2221,7 +3188,14 @@ fn write_inactive_slot(
             "injected acknowledgement loss after state-slot sync",
         ));
     }
-    sync_parent_directory(path)
+    sync_parent_directory(path)?;
+    #[cfg(test)]
+    if interruption == WriteInterruption::AfterDirectorySync {
+        return Err(PersistenceFailure::injected_io(
+            "injected acknowledgement loss after state-directory sync",
+        ));
+    }
+    Ok(())
 }
 
 fn write_initial_slot(
@@ -2282,6 +3256,23 @@ fn write_initial_slot(
     }
     std::fs::rename(&temporary, path)
         .map_err(|error| PersistenceFailure::io("publish initial state slot", error))?;
+    sync_parent_directory(path)?;
+    #[cfg(test)]
+    if interruption == WriteInterruption::AfterDirectorySync {
+        return Err(PersistenceFailure::injected_io(
+            "injected acknowledgement loss after initial-state directory sync",
+        ));
+    }
+    Ok(())
+}
+
+fn sync_authoritative_slot(path: &Path) -> Result<(), PersistenceFailure> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| PersistenceFailure::io("sync authoritative state slot", error))?;
     sync_parent_directory(path)
 }
 
@@ -2311,24 +3302,84 @@ fn commit_batch(
 
     let loaded = load_authoritative_unlocked(primary_path)?;
     let source = loaded.source;
+    let requires_schema_upgrade = loaded.requires_schema_upgrade;
+    let degraded_recovery = loaded.degraded_recovery;
     let mut state = loaded.state;
-    let (changed, bindings) = apply_batch(&mut state, batch)?;
+    let preflight = preflight_batch(&state, batch)?;
+    let reserved_retirement_revision = if preflight.overlays.new_tombstones == 0 {
+        None
+    } else {
+        Some(
+            state
+                .store_revision
+                .checked_add(1)
+                .ok_or(PersistenceFailure::RevisionExhausted)?,
+        )
+    };
+    let AppliedBatch {
+        changed: batch_changed,
+        bindings,
+        rejected_bindings: allocation_rejections,
+    } = apply_batch(
+        &mut state,
+        batch,
+        &preflight,
+        reserved_retirement_revision,
+    )?;
+    let committed_binding_count = preflight
+        .accepted_bindings
+        .len()
+        .saturating_sub(allocation_rejections.len());
+    let mut rejected_bindings = preflight.rejected_bindings;
+    rejected_bindings.extend(allocation_rejections);
+    let changed = batch_changed || requires_schema_upgrade || degraded_recovery;
+    let committed_updates = preflight
+        .accepted_workspaces
+        .len()
+        .saturating_add(committed_binding_count)
+        .saturating_add(preflight.overlays.accepted_overlay_ids.len());
+    let coalesced_updates = batch.superseded_updates_for(
+        &preflight.accepted_workspaces,
+        &preflight.overlays.accepted_overlay_ids,
+    );
+    let rejected_updates = preflight
+        .rejected_workspaces
+        .len()
+        .saturating_add(rejected_bindings.len())
+        .saturating_add(preflight.overlays.rejected_overlay_mutations.len());
     if !changed {
+        if let Some(authority) = loaded.authority.as_deref() {
+            sync_authoritative_slot(authority)?;
+            #[cfg(test)]
+            if interruption == WriteInterruption::AfterDirectorySync {
+                return Err(PersistenceFailure::injected_io(
+                    "injected acknowledgement loss after authoritative replay sync",
+                ));
+            }
+        }
         return Ok(BatchCommit {
             receipt: CommitReceipt {
                 store_revision: state.store_revision,
                 wrote_new_generation: false,
-                committed_updates: batch.queued_updates(),
-                coalesced_updates: batch.superseded_updates,
+                committed_updates,
+                coalesced_updates,
+                rejected_updates,
             },
             bindings,
+            rejected_bindings,
+            rejected_workspaces: preflight.rejected_workspaces,
+            accepted_overlay_ids: preflight.overlays.accepted_overlay_ids,
+            rejected_overlay_mutations: preflight.overlays.rejected_overlay_mutations,
         });
     }
 
-    state.store_revision = state
-        .store_revision
-        .checked_add(1)
-        .ok_or(PersistenceFailure::RevisionExhausted)?;
+    state.store_revision = match reserved_retirement_revision {
+        Some(revision) => revision,
+        None => state
+            .store_revision
+            .checked_add(1)
+            .ok_or(PersistenceFailure::RevisionExhausted)?,
+    };
     canonicalize_state(&mut state);
     validate_state(&state)?;
     let encoded = encode_disk_slot(&state)?;
@@ -2344,10 +3395,15 @@ fn commit_batch(
         receipt: CommitReceipt {
             store_revision: state.store_revision,
             wrote_new_generation: true,
-            committed_updates: batch.queued_updates(),
-            coalesced_updates: batch.superseded_updates,
+            committed_updates,
+            coalesced_updates,
+            rejected_updates,
         },
         bindings,
+        rejected_bindings,
+        rejected_workspaces: preflight.rejected_workspaces,
+        accepted_overlay_ids: preflight.overlays.accepted_overlay_ids,
+        rejected_overlay_mutations: preflight.overlays.rejected_overlay_mutations,
     })
 }
 
@@ -2421,9 +3477,22 @@ pub fn save_for_workspace(workspace: &str, window_state: WindowState) {
 
 /// Queue a validated mixed-domain layout overlay on the default worker.
 pub fn queue_layout_overlay(
+    base_revision: Option<u64>,
     overlay: MixedDomainLayoutOverlay,
 ) -> Result<EnqueueOutcome, PersistenceFailure> {
-    global_writer()?.queue_overlay(overlay)
+    global_writer()?.queue_overlay(base_revision, overlay)
+}
+
+/// Queue retirement of one exact live overlay revision on the default worker.
+///
+/// This is intentionally only a storage primitive. The GUI close path must not
+/// call it until that path owns a durable [`LayoutWindowId`] and exact live
+/// revision rather than a transient mux window number.
+pub fn queue_layout_overlay_delete(
+    window_id: LayoutWindowId,
+    base_revision: Option<u64>,
+) -> Result<EnqueueOutcome, PersistenceFailure> {
+    global_writer()?.queue_overlay_delete(window_id, base_revision)
 }
 
 /// Request a nonblocking lifecycle barrier on the default authority.
@@ -2453,7 +3522,7 @@ mod tests {
         )
     }
 
-    fn local_slots(count: usize) -> Vec<StableTabSlot> {
+    fn local_slots(session: u8, count: usize) -> Vec<StableTabSlot> {
         (0..count)
             .map(|index| {
                 let mut tab_id = [0u8; 16];
@@ -2463,11 +3532,33 @@ mod tests {
                         .to_le_bytes(),
                 );
                 StableTabSlot::local(
-                    StableLocalSessionId::from_bytes([0x12; 16]),
+                    StableLocalSessionId::from_bytes([session; 16]),
                     StableLocalTabId::from_bytes(tab_id),
                 )
             })
             .collect()
+    }
+
+    fn window_id(number: u64) -> LayoutWindowId {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&number.to_le_bytes());
+        LayoutWindowId::from_bytes(bytes)
+    }
+
+    fn local_overlay(
+        window_id: LayoutWindowId,
+        local_revision: u64,
+        tab_value: u8,
+    ) -> MixedDomainLayoutOverlay {
+        let slot = local_slot(tab_value);
+        MixedDomainLayoutOverlay::new(
+            window_id,
+            "default",
+            local_revision,
+            vec![slot],
+            Some(slot),
+        )
+        .expect("valid local overlay")
     }
 
     fn remote_slot(
@@ -2484,12 +3575,46 @@ mod tests {
         )
     }
 
+    fn indexed_fingerprint(index: u64) -> PrivacySafeTargetFingerprint {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        PrivacySafeTargetFingerprint::from_bytes(bytes)
+    }
+
+    fn indexed_binding_id(index: u64) -> DomainBindingId {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        DomainBindingId::from_bytes(bytes)
+    }
+
+    fn capped_domain_bindings() -> Vec<DomainBindingRecord> {
+        (0..MAX_DOMAIN_BINDINGS)
+            .map(|index| {
+                let index = u64::try_from(index).expect("binding index fits u64");
+                DomainBindingRecord {
+                    target_fingerprint: indexed_fingerprint(index),
+                    binding_id: indexed_binding_id(index),
+                }
+            })
+            .collect()
+    }
+
     fn commit_for_test(
         path: &Path,
         batch: &PendingBatch,
         interruption: WriteInterruption,
     ) -> Result<BatchCommit, PersistenceFailure> {
         commit_batch(path, batch, interruption)
+    }
+
+    fn encode_v2_slot_for_test(state: PersistedStateV2) -> Vec<u8> {
+        let payload = serde_json::to_vec(&state).expect("serialize schema-v2 payload");
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        serde_json::to_vec(&DiskSlotV2 {
+            payload: state,
+            sha256,
+        })
+        .expect("serialize schema-v2 slot")
     }
 
     fn ensure_binding_for_test(
@@ -2514,6 +3639,7 @@ mod tests {
             window_states,
             domain_bindings: Vec::new(),
             overlays: Vec::new(),
+            tombstones: Vec::new(),
         }
     }
 
@@ -2931,6 +4057,142 @@ mod tests {
     }
 
     #[test]
+    fn checksum_verified_v2_migrates_to_v3_on_an_empty_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let overlay = local_overlay(window_id(20), 1, 20);
+        let v2 = PersistedStateV2 {
+            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            store_revision: 7,
+            window_states: BTreeMap::from([(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )]),
+            domain_bindings: Vec::new(),
+            overlays: vec![overlay.clone()],
+        };
+        std::fs::write(&path, encode_v2_slot_for_test(v2)).expect("write schema-v2 slot");
+
+        let before = load_snapshot_at(&path).expect("load schema-v2 authority");
+        assert_eq!(before.source, StoreSource::Primary);
+        assert_eq!(before.store_revision, 7);
+        assert_eq!(before.overlays, vec![overlay.clone()]);
+        assert!(before.tombstones.is_empty());
+
+        let migration = commit_for_test(
+            &path,
+            &PendingBatch::default(),
+            WriteInterruption::None,
+        )
+        .expect("publish schema-v3 generation");
+        assert!(migration.receipt.wrote_new_generation);
+        assert_eq!(migration.receipt.store_revision, 8);
+        assert_eq!(migration.receipt.committed_updates, 0);
+
+        let after = load_snapshot_at(&path).expect("load migrated authority");
+        assert_eq!(after.store_revision, 8);
+        assert_eq!(after.window_states, before.window_states);
+        assert_eq!(after.overlays, vec![overlay]);
+        assert!(after.tombstones.is_empty());
+        assert!(matches!(
+            read_slot(&shadow_file_name(&path), false).expect("read migrated slot"),
+            ReadSlot::Valid(ValidatedSlot {
+                schema: SlotSchema::Current,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_v2_checksum_never_migrates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let payload = PersistedStateV2 {
+            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            store_revision: 1,
+            window_states: BTreeMap::new(),
+            domain_bindings: Vec::new(),
+            overlays: Vec::new(),
+        };
+        let disk = DiskSlotV2 {
+            payload,
+            sha256: [0; 32],
+        };
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&disk).expect("serialize corrupt schema-v2 slot"),
+        )
+        .expect("write corrupt schema-v2 slot");
+
+        assert_eq!(
+            load_snapshot_at(&path)
+                .expect_err("bad schema-v2 checksum must fail")
+                .code(),
+            PersistenceFailureCode::Corrupt
+        );
+        assert_eq!(
+            commit_for_test(
+                &path,
+                &PendingBatch::default(),
+                WriteInterruption::None,
+            )
+            .expect_err("bad schema-v2 checksum must not migrate")
+            .code(),
+            PersistenceFailureCode::Corrupt
+        );
+        assert!(!shadow_file_name(&path).exists());
+    }
+
+    #[test]
+    fn equal_generation_prefers_v3_only_when_logical_state_matches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let v2 = PersistedStateV2 {
+            schema_version: PREVIOUS_STORE_SCHEMA_VERSION,
+            store_revision: 9,
+            window_states: BTreeMap::from([(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )]),
+            domain_bindings: Vec::new(),
+            overlays: Vec::new(),
+        };
+        std::fs::write(&path, encode_v2_slot_for_test(v2.clone())).expect("write schema-v2 slot");
+        std::fs::write(
+            shadow_file_name(&path),
+            encode_disk_slot(&v2.clone().into_current()).expect("encode matching schema-v3 slot"),
+        )
+        .expect("write matching schema-v3 slot");
+        assert_eq!(
+            load_snapshot_at(&path).expect("load matching generations").source,
+            StoreSource::Shadow
+        );
+
+        let ambiguous_path = temp.path().join("ambiguous.json");
+        std::fs::write(&ambiguous_path, encode_v2_slot_for_test(v2.clone()))
+            .expect("write ambiguous schema-v2 slot");
+        let mut different = v2.into_current();
+        different.window_states.get_mut("default").expect("window state").fullscreen = true;
+        std::fs::write(
+            shadow_file_name(&ambiguous_path),
+            encode_disk_slot(&different).expect("encode different schema-v3 slot"),
+        )
+        .expect("write different schema-v3 slot");
+        assert_eq!(
+            load_snapshot_at(&ambiguous_path)
+                .expect_err("different equal generations are ambiguous")
+                .code(),
+            PersistenceFailureCode::AmbiguousGeneration
+        );
+    }
+
+    #[test]
     fn overlay_and_binding_roundtrip_through_validated_slots() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
@@ -2946,13 +4208,318 @@ mod tests {
         )
         .expect("valid overlay");
         let mut batch = PendingBatch::default();
-        batch.queue_overlay(overlay.clone()).expect("queue overlay");
+        batch
+            .queue_overlay_live(None, overlay.clone())
+            .expect("queue overlay");
         commit_for_test(&path, &batch, WriteInterruption::None).expect("commit overlay");
 
         let snapshot = load_snapshot_at(&path).expect("load current");
         assert_eq!(snapshot.overlays, vec![overlay]);
         assert_eq!(snapshot.domain_bindings.len(), 1);
         assert_eq!(snapshot.store_revision, 2);
+    }
+
+    #[test]
+    fn overlay_retirement_roundtrips_and_blocks_every_resurrection_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(30);
+        let live = local_overlay(window, 1, 30);
+        let mut create = PendingBatch::default();
+        create
+            .queue_overlay_live(None, live.clone())
+            .expect("queue live overlay");
+        commit_for_test(&path, &create, WriteInterruption::None).expect("commit live overlay");
+
+        let mut retire = PendingBatch::default();
+        retire
+            .queue_overlay_delete(window, Some(1))
+            .expect("queue exact retirement");
+        let retirement = commit_for_test(&path, &retire, WriteInterruption::None)
+            .expect("commit retirement");
+        assert!(retirement.receipt.wrote_new_generation);
+        let retired_revision = retirement.receipt.store_revision;
+
+        let snapshot = load_snapshot_at(&path).expect("reload retired overlay");
+        assert!(snapshot.overlay(window).is_none());
+        assert_eq!(
+            snapshot.tombstone(window),
+            Some(
+                OverlayTombstone::new(window, 1, retired_revision)
+                    .expect("expected tombstone")
+            )
+        );
+
+        for (base_revision, overlay) in [
+            (Some(1), local_overlay(window, 2, 31)),
+            (None, local_overlay(window, 1, 32)),
+        ] {
+            let mut resurrection = PendingBatch::default();
+            resurrection
+                .queue_overlay_live(base_revision, overlay)
+                .expect("queue stale resurrection attempt");
+            let rejection = commit_for_test(
+                &path,
+                &resurrection,
+                WriteInterruption::None,
+            )
+            .expect("retired lineage is partitioned");
+            assert!(!rejection.receipt.wrote_new_generation);
+            assert_eq!(rejection.receipt.rejected_updates, 1);
+            assert_eq!(
+                rejection.rejected_overlay_mutations[&window]
+                    .failure
+                    .code(),
+                PersistenceFailureCode::RetiredOverlay
+            );
+        }
+
+        let mut replay = PendingBatch::default();
+        replay
+            .queue_overlay_delete(window, Some(1))
+            .expect("queue exact retirement replay");
+        let replay = commit_for_test(&path, &replay, WriteInterruption::None)
+            .expect("retirement replay is idempotent");
+        assert!(!replay.receipt.wrote_new_generation);
+        assert_eq!(replay.receipt.rejected_updates, 0);
+        assert_eq!(replay.receipt.committed_updates, 1);
+        assert_eq!(
+            load_snapshot_at(&path).expect("reload after replays"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn live_then_delete_coalesces_to_one_precommit_tombstone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(40);
+        let mut pending = PendingBatch::default();
+        pending
+            .queue_overlay_live(None, local_overlay(window, 1, 40))
+            .expect("queue live overlay");
+        assert_eq!(
+            pending
+                .queue_overlay_delete(window, Some(1))
+                .expect("coalesce retirement"),
+            EnqueueOutcome::Coalesced
+        );
+        let mutation = &pending.overlay_mutations[&window];
+        assert_eq!(mutation.base_revision, None);
+        assert!(matches!(
+            &mutation.desired,
+            DesiredOverlayState::Deleted {
+                last_local_revision,
+                ..
+            } if *last_local_revision == 1
+        ));
+        assert_eq!(mutation.superseded_updates, 1);
+        assert_eq!(pending.overlay_tab_count, 0);
+
+        let committed = commit_for_test(&path, &pending, WriteInterruption::None)
+            .expect("commit coalesced retirement");
+        assert_eq!(committed.receipt.committed_updates, 1);
+        assert_eq!(committed.receipt.coalesced_updates, 1);
+        let snapshot = load_snapshot_at(&path).expect("load coalesced retirement");
+        assert!(snapshot.overlay(window).is_none());
+        assert_eq!(
+            snapshot
+                .tombstone(window)
+                .expect("coalesced tombstone")
+                .last_local_revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn inflight_live_ack_rebases_equal_revision_delete_without_losing_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(50);
+        let mut pending = PendingBatch::default();
+        pending
+            .queue_overlay_live(None, local_overlay(window, 1, 50))
+            .expect("queue live overlay");
+        let in_flight = pending.clone();
+        commit_for_test(&path, &in_flight, WriteInterruption::None)
+            .expect("commit in-flight live snapshot");
+
+        pending
+            .queue_overlay_delete(window, Some(1))
+            .expect("queue delete behind in-flight live snapshot");
+        pending.acknowledge_resolved(
+            &in_flight,
+            &BTreeSet::from([window]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        let rebased = &pending.overlay_mutations[&window];
+        assert_eq!(rebased.base_revision, Some(1));
+        assert!(matches!(
+            &rebased.desired,
+            DesiredOverlayState::Deleted { .. }
+        ));
+
+        commit_for_test(&path, &pending, WriteInterruption::None)
+            .expect("commit retained delete");
+        let snapshot = load_snapshot_at(&path).expect("load retained delete");
+        assert!(snapshot.overlay(window).is_none());
+        assert!(snapshot.tombstone(window).is_some());
+    }
+
+    #[test]
+    fn synced_delete_ack_loss_replays_without_a_second_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(60);
+        let mut create = PendingBatch::default();
+        create
+            .queue_overlay_live(None, local_overlay(window, 1, 60))
+            .expect("queue live overlay");
+        commit_for_test(&path, &create, WriteInterruption::None).expect("commit live overlay");
+
+        let mut retire = PendingBatch::default();
+        retire
+            .queue_overlay_delete(window, Some(1))
+            .expect("queue retirement");
+        commit_for_test(&path, &retire, WriteInterruption::AfterSync)
+            .expect_err("inject delete acknowledgement loss");
+        let after_sync = load_snapshot_at(&path).expect("recover synced retirement");
+        assert!(after_sync.overlay(window).is_none());
+        assert!(after_sync.tombstone(window).is_some());
+
+        let replay = commit_for_test(&path, &retire, WriteInterruption::None)
+            .expect("retry exact retirement");
+        assert!(!replay.receipt.wrote_new_generation);
+        assert_eq!(replay.receipt.store_revision, after_sync.store_revision);
+    }
+
+    #[test]
+    fn exact_retry_rebases_a_post_snapshot_overlay_successor_after_ack_loss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(61);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 61))
+            .expect("queue initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial overlay");
+
+        let mut in_flight = PendingBatch::default();
+        in_flight
+            .queue_overlay_live(Some(1), local_overlay(window, 2, 62))
+            .expect("queue in-flight update");
+        let shared = CoordinatorShared {
+            primary_path: path.clone(),
+            pending: Mutex::new(CoordinatorPending {
+                batch: in_flight.clone(),
+                ..CoordinatorPending::default()
+            }),
+        };
+
+        commit_for_test(
+            &path,
+            &in_flight,
+            WriteInterruption::AfterDirectorySync,
+        )
+        .expect_err("inject acknowledgement loss after durable publication");
+        {
+            let mut pending = lock_pending(&shared.pending);
+            pending
+                .batch
+                .queue_overlay_live(Some(2), local_overlay(window, 3, 63))
+                .expect("queue successor behind ambiguous in-flight update");
+            assert_eq!(pending.batch.overlay_mutations[&window].base_revision, Some(1));
+        }
+
+        resolve_exact_retry(&shared, &in_flight).expect("resolve exact durable snapshot first");
+        let successor = {
+            let pending = lock_pending(&shared.pending);
+            assert_eq!(pending.batch.overlay_mutations[&window].base_revision, Some(2));
+            assert_eq!(pending.batch.overlay_mutations[&window].desired_revision(), 3);
+            pending.batch.clone()
+        };
+        let committed = commit_for_test(&path, &successor, WriteInterruption::None)
+            .expect("commit rebased successor");
+        let _ = acknowledge_committed_batch(&shared, &successor, &committed);
+
+        let snapshot = load_snapshot_at(&path).expect("load final successor");
+        assert_eq!(
+            snapshot
+                .overlay(window)
+                .expect("successor overlay")
+                .local_revision(),
+            3
+        );
+        assert!(lock_pending(&shared.pending)
+            .batch
+            .overlay_mutations
+            .is_empty());
+    }
+
+    #[test]
+    fn exact_retry_rebases_a_post_snapshot_delete_after_ack_loss() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(62);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 64))
+            .expect("queue initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial overlay");
+
+        let mut in_flight = PendingBatch::default();
+        in_flight
+            .queue_overlay_live(Some(1), local_overlay(window, 2, 65))
+            .expect("queue in-flight update");
+        let shared = CoordinatorShared {
+            primary_path: path.clone(),
+            pending: Mutex::new(CoordinatorPending {
+                batch: in_flight.clone(),
+                ..CoordinatorPending::default()
+            }),
+        };
+
+        commit_for_test(
+            &path,
+            &in_flight,
+            WriteInterruption::AfterDirectorySync,
+        )
+        .expect_err("inject acknowledgement loss after durable publication");
+        {
+            let mut pending = lock_pending(&shared.pending);
+            pending
+                .batch
+                .queue_overlay_delete(window, Some(2))
+                .expect("queue retirement behind ambiguous in-flight update");
+        }
+
+        resolve_exact_retry(&shared, &in_flight).expect("resolve exact durable snapshot first");
+        let successor = {
+            let pending = lock_pending(&shared.pending);
+            let mutation = &pending.batch.overlay_mutations[&window];
+            assert_eq!(mutation.base_revision, Some(2));
+            assert!(matches!(
+                &mutation.desired,
+                DesiredOverlayState::Deleted { .. }
+            ));
+            pending.batch.clone()
+        };
+        let committed = commit_for_test(&path, &successor, WriteInterruption::None)
+            .expect("commit rebased retirement");
+        let _ = acknowledge_committed_batch(&shared, &successor, &committed);
+
+        let snapshot = load_snapshot_at(&path).expect("load retired overlay");
+        assert!(snapshot.overlay(window).is_none());
+        assert_eq!(
+            snapshot
+                .tombstone(window)
+                .expect("durable retirement")
+                .last_local_revision(),
+            2
+        );
     }
 
     #[test]
@@ -2964,11 +4531,19 @@ mod tests {
             let overlay =
                 MixedDomainLayoutOverlay::new(window, "default", revision, vec![slot], Some(slot))
                     .expect("valid overlay");
-            batch.queue_overlay(overlay).expect("monotonic update");
+            let base_revision = if revision == 1 {
+                None
+            } else {
+                Some(revision - 1)
+            };
+            batch
+                .queue_overlay_live(base_revision, overlay)
+                .expect("monotonic update");
         }
-        assert_eq!(batch.overlays.len(), 1);
-        assert_eq!(batch.overlays[&window].local_revision, 64);
-        assert_eq!(batch.superseded_updates, 63);
+        assert_eq!(batch.overlay_mutations.len(), 1);
+        assert_eq!(batch.overlay_mutations[&window].desired_revision(), 64);
+        assert_eq!(batch.overlay_mutations[&window].base_revision, None);
+        assert_eq!(batch.overlay_mutations[&window].superseded_updates, 63);
     }
 
     #[test]
@@ -2978,7 +4553,8 @@ mod tests {
         let second = local_slot(2);
         let mut batch = PendingBatch::default();
         batch
-            .queue_overlay(
+            .queue_overlay_live(
+                None,
                 MixedDomainLayoutOverlay::new(
                     window,
                     "default",
@@ -2990,7 +4566,8 @@ mod tests {
             )
             .expect("queue first");
         let failure = batch
-            .queue_overlay(
+            .queue_overlay_live(
+                None,
                 MixedDomainLayoutOverlay::new(
                     window,
                     "default",
@@ -3005,6 +4582,28 @@ mod tests {
             failure.code(),
             PersistenceFailureCode::OverlayRevisionConflict
         );
+    }
+
+    #[test]
+    fn zero_base_revision_cannot_alias_absent_overlay_authority() {
+        let window = window_id(64);
+        let mut batch = PendingBatch::default();
+        let failure = batch
+            .queue_overlay_live(Some(0), local_overlay(window, 1, 64))
+            .expect_err("zero base must not masquerade as absent authority");
+        assert_eq!(failure.code(), PersistenceFailureCode::Invalid);
+        assert!(batch.overlay_mutations.is_empty());
+    }
+
+    #[test]
+    fn local_revision_chain_mismatch_is_not_reported_as_authority_state() {
+        let window = window_id(640);
+        let mut batch = PendingBatch::default();
+        let failure = batch
+            .queue_overlay_live(Some(7), local_overlay(window, 3, 64))
+            .expect_err("malformed local revision chain must fail before authority lookup");
+        assert_eq!(failure.code(), PersistenceFailureCode::Invalid);
+        assert!(batch.overlay_mutations.is_empty());
     }
 
     #[test]
@@ -3023,7 +4622,8 @@ mod tests {
             )
             .expect("queue first geometry");
         pending
-            .queue_overlay(
+            .queue_overlay_live(
+                None,
                 MixedDomainLayoutOverlay::new(
                     window,
                     "default",
@@ -3046,7 +4646,8 @@ mod tests {
             )
             .expect("queue newer geometry");
         pending
-            .queue_overlay(
+            .queue_overlay_live(
+                Some(1),
                 MixedDomainLayoutOverlay::new(
                     window,
                     "default",
@@ -3057,11 +4658,86 @@ mod tests {
                 .expect("second overlay"),
             )
             .expect("queue newer overlay");
-        pending.acknowledge_committed(&committed_snapshot, &BTreeSet::new());
+        pending.acknowledge_resolved(
+            &committed_snapshot,
+            &BTreeSet::from([window]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
 
         assert!(pending.window_states["default"].fullscreen);
-        assert_eq!(pending.overlays[&window].local_revision, 2);
+        assert_eq!(pending.overlay_mutations[&window].desired_revision(), 2);
+        assert_eq!(pending.overlay_mutations[&window].base_revision, Some(1));
         assert_eq!(pending.overlay_tab_count, 1);
+    }
+
+    #[test]
+    fn rejected_ack_invalidates_every_post_snapshot_descendant() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(65);
+        let mut exact = PendingBatch::default();
+        exact
+            .queue_overlay_live(None, local_overlay(window, 1, 65))
+            .expect("queue rejected snapshot");
+        let rejected_snapshot = exact.clone();
+        exact.acknowledge_resolved(
+            &rejected_snapshot,
+            &BTreeSet::new(),
+            &BTreeSet::from([window]),
+            &BTreeSet::new(),
+        );
+        assert!(exact.overlay_mutations.is_empty());
+        assert_eq!(exact.overlay_tab_count, 0);
+
+        let mut advanced = rejected_snapshot.clone();
+        advanced
+            .queue_overlay_live(Some(1), local_overlay(window, 2, 66))
+            .expect("queue post-snapshot descendant");
+        advanced.acknowledge_resolved(
+            &rejected_snapshot,
+            &BTreeSet::new(),
+            &BTreeSet::from([window]),
+            &BTreeSet::new(),
+        );
+        assert!(advanced.overlay_mutations.is_empty());
+        assert_eq!(advanced.overlay_tab_count, 0);
+        commit_for_test(&path, &advanced, WriteInterruption::None)
+            .expect("empty post-rejection batch cannot publish the descendant");
+        assert_eq!(
+            load_snapshot_at(&path)
+                .expect("load empty authority")
+                .source,
+            StoreSource::Empty
+        );
+    }
+
+    #[test]
+    fn fresh_coalesced_overlay_chain_can_publish_its_latest_revision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(651);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(None, local_overlay(window, 1, 67))
+            .expect("queue first in-memory revision");
+        batch
+            .queue_overlay_live(Some(1), local_overlay(window, 2, 68))
+            .expect("coalesce second in-memory revision");
+        assert_eq!(batch.overlay_mutations[&window].base_revision, None);
+
+        let committed = commit_for_test(&path, &batch, WriteInterruption::None)
+            .expect("publish latest coalesced create");
+        assert_eq!(committed.receipt.rejected_updates, 0);
+        assert_eq!(committed.receipt.coalesced_updates, 1);
+        assert_eq!(
+            load_snapshot_at(&path)
+                .expect("load coalesced create")
+                .overlay(window)
+                .expect("published overlay")
+                .local_revision(),
+            2
+        );
     }
 
     #[test]
@@ -3071,13 +4747,20 @@ mod tests {
         pending.ensure_bindings.insert(fingerprint);
         let committed_snapshot = pending.clone();
 
-        pending.acknowledge_committed(
+        pending.acknowledge_resolved(
             &committed_snapshot,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
             &BTreeSet::from([fingerprint]),
         );
         assert!(pending.ensure_bindings.contains(&fingerprint));
 
-        pending.acknowledge_committed(&committed_snapshot, &BTreeSet::new());
+        pending.acknowledge_resolved(
+            &committed_snapshot,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
         assert!(!pending.ensure_bindings.contains(&fingerprint));
     }
 
@@ -3085,10 +4768,11 @@ mod tests {
     fn pending_overlay_tab_quota_is_enforced_before_growth() {
         let mut pending = PendingBatch::default();
         for window_number in 1u8..=4 {
-            let slots = local_slots(MAX_TABS_PER_OVERLAY);
+            let slots = local_slots(window_number, MAX_TABS_PER_OVERLAY);
             let active = slots.first().copied();
             pending
-                .queue_overlay(
+                .queue_overlay_live(
+                    None,
                     MixedDomainLayoutOverlay::new(
                         LayoutWindowId::from_bytes([window_number; 16]),
                         "default",
@@ -3104,7 +4788,8 @@ mod tests {
 
         let slot = local_slot(0xff);
         let failure = pending
-            .queue_overlay(
+            .queue_overlay_live(
+                None,
                 MixedDomainLayoutOverlay::new(
                     LayoutWindowId::from_bytes([0x65; 16]),
                     "default",
@@ -3117,7 +4802,931 @@ mod tests {
             .expect_err("aggregate quota must reject growth");
         assert_eq!(failure.code(), PersistenceFailureCode::Quota);
         assert_eq!(pending.overlay_tab_count, MAX_TOTAL_OVERLAY_TABS);
-        assert_eq!(pending.overlays.len(), 4);
+        assert_eq!(pending.overlay_mutations.len(), 4);
+    }
+
+    #[test]
+    fn higher_id_delete_makes_room_for_lower_id_empty_create_at_live_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let create_window = LayoutWindowId::from_bytes([0; 16]);
+        let retiring_window = LayoutWindowId::from_bytes([0xff; 16]);
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.overlays = (1..MAX_LAYOUT_OVERLAYS)
+            .map(|index| {
+                MixedDomainLayoutOverlay::new(
+                    window_id(u64::try_from(index).expect("overlay index fits u64")),
+                    "default",
+                    1,
+                    Vec::new(),
+                    None,
+                )
+                .expect("valid empty overlay")
+            })
+            .collect();
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                retiring_window,
+                "default",
+                1,
+                Vec::new(),
+                None,
+            )
+            .expect("valid retiring overlay"),
+        );
+        canonicalize_state(&mut state);
+        std::fs::write(&path, encode_disk_slot(&state).expect("encode full live state"))
+            .expect("write full live state");
+
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    create_window,
+                    "default",
+                    1,
+                    Vec::new(),
+                    None,
+                )
+                .expect("valid empty create"),
+            )
+            .expect("queue lexically earlier create");
+        batch
+            .queue_overlay_delete(retiring_window, Some(1))
+            .expect("queue lexically later delete");
+
+        let committed = commit_for_test(&path, &batch, WriteInterruption::None)
+            .expect("delete must free live capacity before create admission");
+        assert_eq!(committed.receipt.rejected_updates, 0);
+        let snapshot = load_snapshot_at(&path).expect("load swapped live identity");
+        assert_eq!(snapshot.overlays.len(), MAX_LAYOUT_OVERLAYS);
+        assert!(snapshot.overlay(create_window).is_some());
+        assert!(snapshot.overlay(retiring_window).is_none());
+        assert!(snapshot.tombstone(retiring_window).is_some());
+    }
+
+    #[test]
+    fn higher_id_shrink_makes_room_for_lower_id_growth_at_tab_cap() {
+        let growing_window = LayoutWindowId::from_bytes([0; 16]);
+        let shrinking_window = LayoutWindowId::from_bytes([0xff; 16]);
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                growing_window,
+                "default",
+                1,
+                Vec::new(),
+                None,
+            )
+            .expect("empty growing overlay"),
+        );
+        let full_slots = local_slots(0xf0, MAX_TABS_PER_OVERLAY);
+        state.overlays.push(
+            MixedDomainLayoutOverlay::new(
+                shrinking_window,
+                "default",
+                1,
+                full_slots.clone(),
+                full_slots.first().copied(),
+            )
+            .expect("full shrinking overlay"),
+        );
+        for number in 1..=3 {
+            let slots = local_slots(
+                u8::try_from(number).expect("test window number fits u8"),
+                MAX_TABS_PER_OVERLAY,
+            );
+            state.overlays.push(
+                MixedDomainLayoutOverlay::new(
+                    window_id(number),
+                    "default",
+                    1,
+                    slots.clone(),
+                    slots.first().copied(),
+                )
+                .expect("full stable overlay"),
+            );
+        }
+        validate_state(&state).expect("state exactly at aggregate tab cap");
+
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(
+                Some(1),
+                local_overlay(growing_window, 2, 90),
+            )
+            .expect("queue lexically earlier growth");
+        let mut reduced_slots = full_slots;
+        reduced_slots.pop();
+        batch
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    shrinking_window,
+                    "default",
+                    2,
+                    reduced_slots.clone(),
+                    reduced_slots.first().copied(),
+                )
+                .expect("one-tab shrink"),
+            )
+            .expect("queue lexically later shrink");
+
+        let preflight = preflight_overlay_mutations(&state, &batch)
+            .expect("shrink must free tab capacity before growth admission");
+        assert_eq!(
+            preflight.accepted_overlay_ids,
+            BTreeSet::from([growing_window, shrinking_window])
+        );
+        assert!(preflight.rejected_overlay_mutations.is_empty());
+    }
+
+    #[test]
+    fn tombstone_cap_rejects_only_retirement_and_preserves_unrelated_work() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 5_000;
+        state.tombstones = (1..=MAX_OVERLAY_TOMBSTONES)
+            .map(|index| {
+                OverlayTombstone::new(
+                    window_id(u64::try_from(index).expect("tombstone index fits u64")),
+                    1,
+                    u64::try_from(index).expect("tombstone revision fits u64"),
+                )
+                .expect("valid capped tombstone")
+            })
+            .collect();
+        let retiring_window = window_id(10_000);
+        let updating_window = window_id(10_001);
+        state.overlays = vec![
+            local_overlay(retiring_window, 1, 70),
+            local_overlay(updating_window, 1, 71),
+        ];
+        canonicalize_state(&mut state);
+        std::fs::write(&path, encode_disk_slot(&state).expect("encode capped state"))
+            .expect("write capped state");
+
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x72; 32]);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_delete(retiring_window, Some(1))
+            .expect("queue cap-exceeding retirement");
+        batch
+            .queue_overlay_live(
+                Some(1),
+                local_overlay(updating_window, 2, 73),
+            )
+            .expect("queue unrelated overlay update");
+        batch
+            .queue_window_state(
+                "other".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue unrelated geometry");
+        batch.ensure_bindings.insert(fingerprint);
+
+        let committed = commit_for_test(&path, &batch, WriteInterruption::None)
+            .expect("partition capped retirement");
+        assert!(committed.receipt.wrote_new_generation);
+        assert_eq!(committed.receipt.rejected_updates, 1);
+        assert_eq!(
+            committed.rejected_overlay_mutations[&retiring_window]
+                .failure
+                .code(),
+            PersistenceFailureCode::Quota
+        );
+        assert!(committed.accepted_overlay_ids.contains(&updating_window));
+        assert!(committed.bindings.contains_key(&fingerprint));
+
+        let after = load_snapshot_at(&path).expect("load partial success");
+        assert_eq!(after.tombstones.len(), MAX_OVERLAY_TOMBSTONES);
+        assert_eq!(
+            after
+                .overlay(retiring_window)
+                .expect("rejected retirement remains live")
+                .local_revision(),
+            1
+        );
+        assert_eq!(
+            after
+                .overlay(updating_window)
+                .expect("unrelated update committed")
+                .local_revision(),
+            2
+        );
+        assert!(after.window_states["other"].fullscreen);
+        assert_eq!(after.binding_for(fingerprint), committed.bindings.get(&fingerprint).copied());
+
+        let replay_window = window_id(1);
+        let mut replay = PendingBatch::default();
+        replay
+            .queue_overlay_delete(replay_window, Some(1))
+            .expect("queue capped tombstone replay");
+        let replay = commit_for_test(&path, &replay, WriteInterruption::None)
+            .expect("existing tombstone replay remains idempotent at cap");
+        assert!(!replay.receipt.wrote_new_generation);
+        assert_eq!(replay.receipt.rejected_updates, 0);
+        assert_eq!(replay.receipt.store_revision, after.store_revision);
+    }
+
+    #[test]
+    fn cas_rejection_does_not_poison_overlay_geometry_or_binding_commits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let conflicted_window = window_id(11_000);
+        let valid_window = window_id(11_001);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(conflicted_window, 1, 80))
+            .expect("queue first overlay");
+        initial
+            .queue_overlay_live(None, local_overlay(valid_window, 1, 81))
+            .expect("queue second overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial overlays");
+
+        let mut advance_conflicted = PendingBatch::default();
+        advance_conflicted
+            .queue_overlay_live(
+                Some(1),
+                local_overlay(conflicted_window, 2, 82),
+            )
+            .expect("queue committed advance");
+        commit_for_test(&path, &advance_conflicted, WriteInterruption::None)
+            .expect("advance conflicted authority");
+
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x83; 32]);
+        let mut mixed = PendingBatch::default();
+        mixed
+            .queue_overlay_live(
+                Some(3),
+                local_overlay(conflicted_window, 4, 84),
+            )
+            .expect("queue wrong-base update");
+        mixed
+            .queue_overlay_live(Some(1), local_overlay(valid_window, 2, 85))
+            .expect("queue valid update");
+        mixed
+            .queue_window_state(
+                "mixed".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue geometry");
+        mixed.ensure_bindings.insert(fingerprint);
+
+        let committed = commit_for_test(&path, &mixed, WriteInterruption::None)
+            .expect("partition wrong-base lineage");
+        assert_eq!(committed.receipt.rejected_updates, 1);
+        assert_eq!(
+            committed.rejected_overlay_mutations[&conflicted_window]
+                .failure
+                .code(),
+            PersistenceFailureCode::OverlayCasConflict
+        );
+        assert!(committed.accepted_overlay_ids.contains(&valid_window));
+        assert!(committed.bindings.contains_key(&fingerprint));
+
+        let snapshot = load_snapshot_at(&path).expect("load mixed partial success");
+        assert_eq!(
+            snapshot
+                .overlay(conflicted_window)
+                .expect("conflicted overlay unchanged")
+                .local_revision(),
+            2
+        );
+        assert_eq!(
+            snapshot
+                .overlay(valid_window)
+                .expect("valid overlay advanced")
+                .local_revision(),
+            2
+        );
+        assert!(snapshot.window_states["mixed"].maximized);
+        assert!(snapshot.binding_for(fingerprint).is_some());
+    }
+
+    #[test]
+    fn authority_cap_races_reject_only_new_workspace_and_binding_lineages() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.window_states = (0..MAX_WORKSPACES)
+            .map(|index| (format!("workspace-{index}"), PersistedWindowState::default()))
+            .collect();
+        state.domain_bindings = capped_domain_bindings();
+        canonicalize_state(&mut state);
+        validate_state(&state).expect("valid state at independent authority caps");
+        std::fs::write(&path, encode_disk_slot(&state).expect("encode capped authority"))
+            .expect("write capped authority");
+
+        let existing_fingerprint = indexed_fingerprint(0);
+        let new_fingerprint = PrivacySafeTargetFingerprint::from_bytes([0xff; 32]);
+        let valid_window = window_id(11_050);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_window_state(
+                "workspace-0".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue existing workspace update");
+        batch
+            .queue_window_state(
+                "zz-cross-process-overflow".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("local queue cannot yet observe authority cap");
+        batch.ensure_bindings.insert(existing_fingerprint);
+        batch.ensure_bindings.insert(new_fingerprint);
+        batch
+            .queue_overlay_live(None, local_overlay(valid_window, 1, 89))
+            .expect("queue unrelated overlay");
+
+        let committed = commit_for_test(&path, &batch, WriteInterruption::None)
+            .expect("partition cross-process authority cap races");
+        assert_eq!(committed.receipt.committed_updates, 3);
+        assert_eq!(committed.receipt.rejected_updates, 2);
+        assert_eq!(
+            committed.rejected_workspaces["zz-cross-process-overflow"].code(),
+            PersistenceFailureCode::Quota
+        );
+        assert_eq!(
+            committed.rejected_bindings[&new_fingerprint].code(),
+            PersistenceFailureCode::Quota
+        );
+        assert_eq!(
+            committed.bindings[&existing_fingerprint],
+            indexed_binding_id(0)
+        );
+
+        let shared = CoordinatorShared {
+            primary_path: path.clone(),
+            pending: Mutex::new(CoordinatorPending {
+                batch: batch.clone(),
+                ..CoordinatorPending::default()
+            }),
+        };
+        {
+            let mut pending = lock_pending(&shared.pending);
+            pending
+                .batch
+                .queue_window_state(
+                    "zz-cross-process-overflow".to_string(),
+                    PersistedWindowState {
+                        maximized: true,
+                        fullscreen: false,
+                    },
+                )
+                .expect("queue post-snapshot workspace successor");
+        }
+        let _ = acknowledge_committed_batch(&shared, &batch, &committed);
+        let pending = lock_pending(&shared.pending);
+        assert_eq!(pending.batch.window_states.len(), 1);
+        assert!(pending.batch.window_states["zz-cross-process-overflow"].maximized);
+        drop(pending);
+
+        let snapshot = load_snapshot_at(&path).expect("load partitioned capped authority");
+        assert!(snapshot.window_states["workspace-0"].maximized);
+        assert!(!snapshot
+            .window_states
+            .contains_key("zz-cross-process-overflow"));
+        assert_eq!(snapshot.domain_bindings.len(), MAX_DOMAIN_BINDINGS);
+        assert!(snapshot.overlay(valid_window).is_some());
+    }
+
+    #[test]
+    fn final_workspace_and_binding_capacity_is_admitted_deterministically() {
+        let mut state = PersistedState::default();
+        state.window_states = (0..MAX_WORKSPACES - 1)
+            .map(|index| (format!("workspace-{index}"), PersistedWindowState::default()))
+            .collect();
+        state.domain_bindings = capped_domain_bindings();
+        state.domain_bindings.pop();
+        validate_state(&state).expect("valid authority one slot below both caps");
+
+        let first_fingerprint = PrivacySafeTargetFingerprint::from_bytes([0xfe; 32]);
+        let second_fingerprint = PrivacySafeTargetFingerprint::from_bytes([0xff; 32]);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_window_state("zz-first".to_string(), PersistedWindowState::default())
+            .expect("queue first workspace candidate");
+        batch
+            .queue_window_state("zz-second".to_string(), PersistedWindowState::default())
+            .expect("queue second workspace candidate");
+        batch.ensure_bindings.insert(first_fingerprint);
+        batch.ensure_bindings.insert(second_fingerprint);
+
+        let preflight = preflight_batch(&state, &batch).expect("partition final capacity slots");
+        assert!(preflight.accepted_workspaces.contains("zz-first"));
+        assert_eq!(
+            preflight.rejected_workspaces["zz-second"].code(),
+            PersistenceFailureCode::Quota
+        );
+        assert!(preflight.accepted_bindings.contains(&first_fingerprint));
+        assert_eq!(
+            preflight.rejected_bindings[&second_fingerprint].code(),
+            PersistenceFailureCode::Quota
+        );
+    }
+
+    #[test]
+    fn duplicate_tab_owner_rejection_does_not_wedge_later_worker_commits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let owner_window = window_id(11_060);
+        let duplicate_window = window_id(11_061);
+        let later_window = window_id(11_062);
+        let owned_slot = local_slot(90);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    owner_window,
+                    "default",
+                    1,
+                    vec![owned_slot],
+                    Some(owned_slot),
+                )
+                .expect("initial owner"),
+            )
+            .expect("queue initial owner");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial owner");
+
+        let mut first_batch = PendingBatch::default();
+        first_batch
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    duplicate_window,
+                    "default",
+                    1,
+                    vec![owned_slot],
+                    Some(owned_slot),
+                )
+                .expect("structurally valid duplicate owner"),
+            )
+            .expect("queue duplicate owner");
+        first_batch
+            .queue_window_state(
+                "duplicate-owner".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue unrelated geometry");
+        let (first_sender, first_receiver) = flume::bounded(1);
+        let shared = Arc::new(CoordinatorShared {
+            primary_path: path.clone(),
+            pending: Mutex::new(CoordinatorPending {
+                batch: first_batch,
+                flush_waiters: vec![FlushWaiter::new(first_sender)],
+                binding_waiters: BTreeMap::new(),
+                waiter_count: 1,
+                ..CoordinatorPending::default()
+            }),
+        });
+        let (wake, receiver) = flume::bounded(1);
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || persistence_worker(worker_shared, receiver));
+        wake.send(()).expect("wake duplicate-owner batch");
+        assert_eq!(
+            first_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first flush response")
+                .expect_err("duplicate owner must be a semantic rejection")
+                .code(),
+            PersistenceFailureCode::Invalid
+        );
+
+        let (second_sender, second_receiver) = flume::bounded(1);
+        {
+            let mut pending = lock_pending(&shared.pending);
+            pending
+                .batch
+                .queue_overlay_live(None, local_overlay(later_window, 1, 91))
+                .expect("queue later valid overlay");
+            pending.flush_waiters.push(FlushWaiter::new(second_sender));
+            pending.waiter_count = 1;
+        }
+        wake.send(()).expect("wake later valid batch");
+        second_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second flush response")
+            .expect("later valid batch must not be wedged");
+        drop(wake);
+        worker.join().expect("persistence worker exits");
+
+        let snapshot = load_snapshot_at(&path).expect("load post-rejection state");
+        assert!(snapshot.overlay(owner_window).is_some());
+        assert!(snapshot.overlay(duplicate_window).is_none());
+        assert!(snapshot.overlay(later_window).is_some());
+        assert!(snapshot.window_states["duplicate-owner"].fullscreen);
+    }
+
+    #[test]
+    fn one_batch_can_transfer_tab_ownership_between_layout_windows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let source_window = window_id(11_070);
+        let destination_window = window_id(11_071);
+        let slot = local_slot(92);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    source_window,
+                    "default",
+                    1,
+                    vec![slot],
+                    Some(slot),
+                )
+                .expect("source owner"),
+            )
+            .expect("queue source owner");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit source owner");
+
+        let mut transfer = PendingBatch::default();
+        transfer
+            .queue_overlay_live(
+                Some(1),
+                MixedDomainLayoutOverlay::new(
+                    source_window,
+                    "default",
+                    2,
+                    Vec::new(),
+                    None,
+                )
+                .expect("empty source after transfer"),
+            )
+            .expect("queue source removal");
+        transfer
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    destination_window,
+                    "default",
+                    1,
+                    vec![slot],
+                    Some(slot),
+                )
+                .expect("destination owner"),
+            )
+            .expect("queue destination ownership");
+        let committed = commit_for_test(&path, &transfer, WriteInterruption::None)
+            .expect("commit atomic ownership transfer");
+        assert_eq!(committed.receipt.rejected_updates, 0);
+
+        let snapshot = load_snapshot_at(&path).expect("load ownership transfer");
+        assert!(snapshot
+            .overlay(source_window)
+            .expect("source overlay retained")
+            .slots()
+            .is_empty());
+        assert_eq!(
+            snapshot
+                .overlay(destination_window)
+                .expect("destination overlay")
+                .slots(),
+            &[slot]
+        );
+    }
+
+    #[test]
+    fn unknown_remote_binding_rejects_only_its_overlay_lineage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let invalid_window = window_id(11_100);
+        let valid_window = window_id(11_101);
+        let unknown_binding = DomainBindingId::from_bytes([0x86; 16]);
+        let remote = remote_slot(unknown_binding, 0x87, 1, 1);
+        let invalid_overlay = MixedDomainLayoutOverlay::new(
+            invalid_window,
+            "default",
+            1,
+            vec![remote],
+            Some(remote),
+        )
+        .expect("structurally valid overlay");
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(None, invalid_overlay)
+            .expect("queue cross-state-invalid overlay");
+        batch
+            .queue_overlay_live(None, local_overlay(valid_window, 1, 88))
+            .expect("queue valid local overlay");
+        batch
+            .queue_window_state(
+                "binding-check".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue unrelated geometry");
+
+        let committed = commit_for_test(&path, &batch, WriteInterruption::None)
+            .expect("partition unknown binding lineage");
+        assert_eq!(committed.receipt.rejected_updates, 1);
+        assert_eq!(
+            committed.rejected_overlay_mutations[&invalid_window]
+                .failure
+                .code(),
+            PersistenceFailureCode::Invalid
+        );
+        assert!(committed.accepted_overlay_ids.contains(&valid_window));
+        let snapshot = load_snapshot_at(&path).expect("load partitioned binding result");
+        assert!(snapshot.overlay(invalid_window).is_none());
+        assert!(snapshot.overlay(valid_window).is_some());
+        assert!(snapshot.window_states["binding-check"].maximized);
+    }
+
+    #[test]
+    fn worker_reports_overlay_rejection_without_failing_committed_binding_waiter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(12_000);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 91))
+            .expect("queue initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial overlay");
+
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x92; 32]);
+        let mut batch = PendingBatch::default();
+        batch
+            .queue_overlay_live(Some(2), local_overlay(window, 3, 93))
+            .expect("queue wrong-base mutation");
+        batch
+            .queue_window_state(
+                "worker".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue worker geometry");
+        batch.ensure_bindings.insert(fingerprint);
+
+        let (flush_sender, flush_receiver) = flume::bounded(1);
+        let (binding_sender, binding_receiver) = flume::bounded(1);
+        let shared = Arc::new(CoordinatorShared {
+            primary_path: path.clone(),
+            pending: Mutex::new(CoordinatorPending {
+                batch,
+                flush_waiters: vec![FlushWaiter::new(flush_sender)],
+                binding_waiters: BTreeMap::from([(fingerprint, vec![binding_sender])]),
+                waiter_count: 2,
+                ..CoordinatorPending::default()
+            }),
+        });
+        let (wake, receiver) = flume::bounded(1);
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || persistence_worker(worker_shared, receiver));
+        wake.send(()).expect("wake deterministic worker");
+
+        let binding = binding_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("binding waiter response")
+            .expect("binding committed despite overlay rejection");
+        let flush_failure = flush_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("flush waiter response")
+            .expect_err("flush reports first semantic rejection");
+        assert_eq!(
+            flush_failure.code(),
+            PersistenceFailureCode::OverlayCasConflict
+        );
+        drop(wake);
+        worker.join().expect("persistence worker exits");
+
+        let snapshot = load_snapshot_at(&path).expect("load worker partial success");
+        assert_eq!(snapshot.binding_for(fingerprint), Some(binding));
+        assert!(snapshot.window_states["worker"].fullscreen);
+        assert_eq!(
+            snapshot
+                .overlay(window)
+                .expect("wrong-base overlay unchanged")
+                .local_revision(),
+            1
+        );
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.overlay_mutations.is_empty());
+        assert!(pending.batch.window_states.is_empty());
+        assert!(pending.batch.ensure_bindings.is_empty());
+    }
+
+    #[test]
+    fn later_explicit_flush_reports_and_consumes_a_debounced_rejection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let window = window_id(12_050);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(None, local_overlay(window, 1, 94))
+            .expect("queue initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None)
+            .expect("commit initial overlay");
+
+        let fingerprint = PrivacySafeTargetFingerprint::from_bytes([0x95; 32]);
+        let mut rejected_batch = PendingBatch::default();
+        rejected_batch
+            .queue_overlay_live(Some(2), local_overlay(window, 3, 96))
+            .expect("queue wrong-base overlay");
+        rejected_batch.ensure_bindings.insert(fingerprint);
+        let (binding_sender, binding_receiver) = flume::bounded(1);
+        let shared = Arc::new(CoordinatorShared {
+            primary_path: path.clone(),
+            pending: Mutex::new(CoordinatorPending {
+                batch: rejected_batch,
+                flush_waiters: Vec::new(),
+                binding_waiters: BTreeMap::from([(fingerprint, vec![binding_sender])]),
+                waiter_count: 1,
+                ..CoordinatorPending::default()
+            }),
+        });
+        let (wake, receiver) = flume::bounded(1);
+        let writer = PersistenceWriter {
+            shared: Arc::clone(&shared),
+            wake: wake.clone(),
+        };
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || persistence_worker(worker_shared, receiver));
+        wake.send(()).expect("wake debounced rejection");
+        binding_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("binding completion proves first batch resolved")
+            .expect("unrelated binding commits");
+
+        assert_eq!(
+            writer
+                .flush()
+                .expect("register later explicit flush")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("later explicit flush response")
+                .expect_err("later flush must observe the unreported rejection")
+                .code(),
+            PersistenceFailureCode::OverlayCasConflict
+        );
+        writer
+            .flush()
+            .expect("register post-consumption flush")
+            .recv_timeout(Duration::from_secs(5))
+            .expect("post-consumption flush response")
+            .expect("the first rejection is reported exactly once");
+
+        drop(writer);
+        drop(wake);
+        worker.join().expect("persistence worker exits");
+        assert!(load_snapshot_at(&path)
+            .expect("load first batch partial success")
+            .binding_for(fingerprint)
+            .is_some());
+    }
+
+    #[test]
+    fn worker_reports_exact_binding_quota_failure_while_committing_geometry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut state = PersistedState::default();
+        state.store_revision = 1;
+        state.domain_bindings = capped_domain_bindings();
+        canonicalize_state(&mut state);
+        std::fs::write(&path, encode_disk_slot(&state).expect("encode binding cap"))
+            .expect("write binding cap");
+
+        let existing_fingerprint = indexed_fingerprint(0);
+        let rejected_fingerprint = PrivacySafeTargetFingerprint::from_bytes([0xfe; 32]);
+        let mut batch = PendingBatch::default();
+        batch.ensure_bindings.insert(existing_fingerprint);
+        batch.ensure_bindings.insert(rejected_fingerprint);
+        batch
+            .queue_window_state(
+                "quota-worker".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue unrelated geometry");
+
+        let (flush_sender, flush_receiver) = flume::bounded(1);
+        let (existing_sender, existing_receiver) = flume::bounded(1);
+        let (rejected_sender, rejected_receiver) = flume::bounded(1);
+        let shared = Arc::new(CoordinatorShared {
+            primary_path: path.clone(),
+            pending: Mutex::new(CoordinatorPending {
+                batch,
+                flush_waiters: vec![FlushWaiter::new(flush_sender)],
+                binding_waiters: BTreeMap::from([
+                    (existing_fingerprint, vec![existing_sender]),
+                    (rejected_fingerprint, vec![rejected_sender]),
+                ]),
+                waiter_count: 3,
+                ..CoordinatorPending::default()
+            }),
+        });
+        let (wake, receiver) = flume::bounded(1);
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || persistence_worker(worker_shared, receiver));
+        wake.send(()).expect("wake deterministic worker");
+
+        assert_eq!(
+            existing_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("existing binding response")
+                .expect("existing binding remains resolvable"),
+            indexed_binding_id(0)
+        );
+        assert_eq!(
+            rejected_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rejected binding response")
+                .expect_err("new binding must be rejected at the authority cap")
+                .code(),
+            PersistenceFailureCode::Quota
+        );
+        assert_eq!(
+            flush_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("flush response")
+                .expect_err("flush reports the deterministic partial rejection")
+                .code(),
+            PersistenceFailureCode::Quota
+        );
+        drop(wake);
+        worker.join().expect("persistence worker exits");
+
+        let snapshot = load_snapshot_at(&path).expect("load partial binding result");
+        assert!(snapshot.window_states["quota-worker"].maximized);
+        let pending = lock_pending(&shared.pending);
+        assert!(pending.batch.ensure_bindings.is_empty());
+        assert!(pending.batch.window_states.is_empty());
+    }
+
+    #[test]
+    fn post_snapshot_flush_waiter_retains_first_rejection_until_its_later_barrier() {
+        let (sender, receiver) = flume::bounded(1);
+        let mut waiter = FlushWaiter::new(sender);
+        let first = PersistenceFailure::OverlayCasConflict {
+            expected: Some(3),
+            committed: Some(2),
+        };
+        waiter.remember_semantic_failure(&SemanticFailureOutcome {
+            sequence: 1,
+            failure: first.clone(),
+        });
+        waiter.remember_semantic_failure(&SemanticFailureOutcome {
+            sequence: 2,
+            failure: PersistenceFailure::RetiredOverlay {
+                last_revision: 4,
+            },
+        });
+        let later_receipt = CommitReceipt {
+            store_revision: 9,
+            wrote_new_generation: true,
+            committed_updates: 1,
+            coalesced_updates: 0,
+            rejected_updates: 0,
+        };
+        let transaction_failure = PersistenceFailure::Io {
+            operation: "test later barrier",
+            kind: io::ErrorKind::Other,
+        };
+        assert_eq!(
+            waiter.transaction_failure_result(&transaction_failure),
+            Err(transaction_failure)
+        );
+
+        waiter
+            .sender
+            .send(waiter.result(None, later_receipt))
+            .expect("send later barrier result");
+        assert_eq!(
+            receiver.recv().expect("receive carried rejection"),
+            Err(first)
+        );
     }
 
     #[test]
@@ -3283,6 +5892,54 @@ mod tests {
     }
 
     #[test]
+    fn full_write_retry_syncs_the_selected_authority_before_success() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut first = PendingBatch::default();
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
+        commit_for_test(&path, &first, WriteInterruption::None).expect("commit first state");
+
+        let mut second = PendingBatch::default();
+        second
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: false,
+                    fullscreen: true,
+                },
+            )
+            .expect("queue second state");
+        commit_for_test(&path, &second, WriteInterruption::AfterFullWrite)
+            .expect_err("inject failure after complete but unsynced bytes");
+
+        assert_eq!(
+            commit_for_test(
+                &path,
+                &second,
+                WriteInterruption::AfterDirectorySync,
+            )
+            .expect_err("prove idempotent retry crosses the durability barrier")
+            .code(),
+            PersistenceFailureCode::Io
+        );
+        let replay = commit_for_test(&path, &second, WriteInterruption::None)
+            .expect("durable idempotent replay");
+        assert!(!replay.receipt.wrote_new_generation);
+        assert!(load_snapshot_at(&path)
+            .expect("load durable retry")
+            .window_states["default"]
+            .fullscreen);
+    }
+
+    #[test]
     fn truncate_or_unsynced_full_write_recovers_one_complete_generation() {
         for interruption in [
             WriteInterruption::AfterTruncate,
@@ -3391,6 +6048,152 @@ mod tests {
     }
 
     #[test]
+    fn partial_existing_quarantine_never_authorizes_source_overwrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let shadow = shadow_file_name(&path);
+        let mut first = PendingBatch::default();
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
+        commit_for_test(&path, &first, WriteInterruption::None).expect("first commit");
+        let corrupt_bytes = b"truncated".to_vec();
+        std::fs::write(&shadow, &corrupt_bytes).expect("write corrupt inactive slot");
+        quarantine_corrupt_evidence(&CorruptEvidence {
+            path: shadow.clone(),
+            bytes: corrupt_bytes.clone(),
+        })
+        .expect("create complete quarantine evidence");
+        let quarantine = std::fs::read_dir(temp.path())
+            .expect("list quarantine directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(".corrupt-"))
+            })
+            .expect("find quarantine evidence");
+        std::fs::write(&quarantine, b"partial").expect("simulate partial evidence publish");
+
+        assert_eq!(
+            commit_for_test(
+                &path,
+                &PendingBatch::default(),
+                WriteInterruption::None,
+            )
+            .expect_err("partial evidence must block corrupt-slot reuse")
+            .code(),
+            PersistenceFailureCode::Corrupt
+        );
+        assert_eq!(
+            std::fs::read(&shadow).expect("read preserved corrupt source"),
+            corrupt_bytes
+        );
+    }
+
+    #[test]
+    fn empty_commit_repairs_a_degraded_two_slot_journal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let mut first = PendingBatch::default();
+        first
+            .queue_window_state(
+                "default".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue first state");
+        commit_for_test(&path, &first, WriteInterruption::None).expect("first commit");
+        std::fs::write(shadow_file_name(&path), b"truncated").expect("corrupt inactive slot");
+        assert!(load_snapshot_at(&path)
+            .expect("load degraded authority")
+            .degraded_recovery);
+
+        let repaired = commit_for_test(
+            &path,
+            &PendingBatch::default(),
+            WriteInterruption::None,
+        )
+        .expect("empty barrier repairs degraded redundancy");
+        assert!(repaired.receipt.wrote_new_generation);
+        let snapshot = load_snapshot_at(&path).expect("load repaired journal");
+        assert!(!snapshot.degraded_recovery);
+        assert!(snapshot.window_states["default"].maximized);
+        let quarantines = std::fs::read_dir(temp.path())
+            .expect("list repaired directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(quarantines, 1);
+    }
+
+    #[test]
+    fn empty_commit_repairs_either_missing_journal_peer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary_only = temp.path().join("primary-only.json");
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_window_state(
+                "primary".to_string(),
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: false,
+                },
+            )
+            .expect("queue primary-only state");
+        commit_for_test(&primary_only, &initial, WriteInterruption::None)
+            .expect("publish primary-only authority");
+        assert!(load_snapshot_at(&primary_only)
+            .expect("load primary-only authority")
+            .degraded_recovery);
+        commit_for_test(
+            &primary_only,
+            &PendingBatch::default(),
+            WriteInterruption::None,
+        )
+        .expect("repair missing shadow");
+        assert!(!load_snapshot_at(&primary_only)
+            .expect("load repaired primary authority")
+            .degraded_recovery);
+
+        let shadow_only = temp.path().join("shadow-only.json");
+        let mut shadow_state = PersistedState::default();
+        shadow_state.store_revision = 7;
+        shadow_state.window_states.insert(
+            "shadow".to_string(),
+            PersistedWindowState {
+                maximized: false,
+                fullscreen: true,
+            },
+        );
+        std::fs::write(
+            shadow_file_name(&shadow_only),
+            encode_disk_slot(&shadow_state).expect("encode shadow-only authority"),
+        )
+        .expect("write shadow-only authority");
+        let before = load_snapshot_at(&shadow_only).expect("load shadow-only authority");
+        assert_eq!(before.source, StoreSource::Shadow);
+        assert!(before.degraded_recovery);
+        commit_for_test(
+            &shadow_only,
+            &PendingBatch::default(),
+            WriteInterruption::None,
+        )
+        .expect("repair missing primary");
+        let after = load_snapshot_at(&shadow_only).expect("load repaired shadow authority");
+        assert!(!after.degraded_recovery);
+        assert!(after.window_states["shadow"].fullscreen);
+    }
+
+    #[test]
     fn future_and_oversized_state_fail_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let future_path = temp.path().join("future.json");
@@ -3400,7 +6203,8 @@ mod tests {
                 "store_revision": 1,
                 "window_states": {},
                 "domain_bindings": [],
-                "overlays": []
+                "overlays": [],
+                "tombstones": []
             },
             "sha256": vec![0; 32]
         });
@@ -3483,7 +6287,15 @@ mod tests {
             active: Some(slot),
         };
         let mut batch = PendingBatch::default();
-        batch.overlays.insert(malformed.window_id, malformed);
+        batch.overlay_tab_count = malformed.slots.len();
+        batch.overlay_mutations.insert(
+            malformed.window_id,
+            PendingOverlayMutation {
+                base_revision: None,
+                desired: DesiredOverlayState::Live(malformed),
+                superseded_updates: 0,
+            },
+        );
         assert_eq!(
             commit_for_test(&path, &batch, WriteInterruption::None)
                 .expect_err("malformed must fail")
@@ -3498,10 +6310,28 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("window-state.json");
         let window = LayoutWindowId::from_bytes([0x92; 16]);
+        let initial_slot = local_slot(1);
+        let mut initial = PendingBatch::default();
+        initial
+            .queue_overlay_live(
+                None,
+                MixedDomainLayoutOverlay::new(
+                    window,
+                    "default",
+                    1,
+                    vec![initial_slot],
+                    Some(initial_slot),
+                )
+                .expect("initial overlay"),
+            )
+            .expect("queue initial overlay");
+        commit_for_test(&path, &initial, WriteInterruption::None).expect("commit initial");
+
         let current_slot = local_slot(2);
         let mut current = PendingBatch::default();
         current
-            .queue_overlay(
+            .queue_overlay_live(
+                Some(1),
                 MixedDomainLayoutOverlay::new(
                     window,
                     "default",
@@ -3518,7 +6348,8 @@ mod tests {
         let stale_slot = local_slot(1);
         let mut stale = PendingBatch::default();
         stale
-            .queue_overlay(
+            .queue_overlay_live(
+                None,
                 MixedDomainLayoutOverlay::new(
                     window,
                     "default",
@@ -3529,9 +6360,13 @@ mod tests {
                 .expect("stale overlay"),
             )
             .expect("queue stale overlay");
+        let rejection = commit_for_test(&path, &stale, WriteInterruption::None)
+            .expect("stale lineage is partitioned from the transaction");
+        assert!(!rejection.receipt.wrote_new_generation);
+        assert_eq!(rejection.receipt.rejected_updates, 1);
         assert_eq!(
-            commit_for_test(&path, &stale, WriteInterruption::None)
-                .expect_err("stale overlay must fail")
+            rejection.rejected_overlay_mutations[&window]
+                .failure
                 .code(),
             PersistenceFailureCode::StaleOverlay
         );
@@ -3564,6 +6399,90 @@ mod tests {
         let snapshot = load_snapshot_at(&path).expect("load");
         assert!(!snapshot.window_states["default"].maximized);
         assert!(snapshot.window_states["default"].fullscreen);
+    }
+
+    #[test]
+    fn stopped_worker_rejects_before_mutation_or_waiter_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (wake, receiver) = flume::bounded(1);
+        drop(receiver);
+        let writer = PersistenceWriter {
+            shared: Arc::new(CoordinatorShared {
+                primary_path: temp.path().join("window-state.json"),
+                pending: Mutex::new(CoordinatorPending::default()),
+            }),
+            wake,
+        };
+        assert_eq!(
+            writer
+                .queue_window_state("stopped", PersistedWindowState::default())
+                .expect_err("stopped worker rejects geometry")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            writer
+                .queue_overlay(None, local_overlay(window_id(20_000), 1, 100))
+                .expect_err("stopped worker rejects overlay")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            writer
+                .ensure_domain_binding(PrivacySafeTargetFingerprint::from_bytes([0xa1; 32]))
+                .expect_err("stopped worker rejects binding waiter")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        assert_eq!(
+            writer
+                .flush()
+                .expect_err("stopped worker rejects flush waiter")
+                .code(),
+            PersistenceFailureCode::WorkerStopped
+        );
+        let pending = lock_pending(&writer.shared.pending);
+        assert!(pending.batch.window_states.is_empty());
+        assert!(pending.batch.overlay_mutations.is_empty());
+        assert!(pending.batch.ensure_bindings.is_empty());
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+    }
+
+    #[test]
+    fn waiter_capacity_rejects_without_waking_or_mutating_pending_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (wake, _receiver) = flume::bounded(1);
+        let writer = PersistenceWriter {
+            shared: Arc::new(CoordinatorShared {
+                primary_path: temp.path().join("window-state.json"),
+                pending: Mutex::new(CoordinatorPending {
+                    waiter_count: MAX_PENDING_WAITERS,
+                    ..CoordinatorPending::default()
+                }),
+            }),
+            wake,
+        };
+        assert_eq!(
+            writer
+                .ensure_domain_binding(PrivacySafeTargetFingerprint::from_bytes([0xa2; 32]))
+                .expect_err("binding waiter cap must reject")
+                .code(),
+            PersistenceFailureCode::Quota
+        );
+        assert_eq!(
+            writer
+                .flush()
+                .expect_err("flush waiter cap must reject")
+                .code(),
+            PersistenceFailureCode::Quota
+        );
+        let pending = lock_pending(&writer.shared.pending);
+        assert!(pending.batch.ensure_bindings.is_empty());
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, MAX_PENDING_WAITERS);
     }
 
     #[test]
@@ -3681,6 +6600,7 @@ mod tests {
                 "window_states": {},
                 "domain_bindings": [],
                 "overlays": [],
+                "tombstones": [],
                 "credential_value_that_must_not_escape": "sensitive"
             },
             "sha256": vec![0; 32]
