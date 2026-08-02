@@ -846,7 +846,8 @@ experiment. It is not converted into a flattering keep or a durable rejection.
 
 - **Classification:** crash-consistency rejection; kept exact-retry and
   durability-barrier correction
-- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5`
+- **Beads:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5` and
+  `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.5`
 - **Rejected candidates:** retrying the latest coalesced pending batch after an
   ambiguous I/O result, and treating parseable bytes visible through a file
   name as proof that the generation was durable.
@@ -864,19 +865,65 @@ experiment. It is not converted into a flattering keep or a durable rejection.
   authority and parent directory before success; `AfterDirectorySync` is a
   distinct injected boundary rather than an alias for file sync. Rejected
   snapshot lineages invalidate same-base descendants instead of allowing a
-  revision-skipping successor.
-- **Proof boundary:** the commit primitive and exact-retry helper have
-  deterministic interruption coverage, but the production
-  `persistence_worker` still invokes commits with `WriteInterruption::None`.
-  Consequently this revision does not yet prove the real worker's wake token,
-  retry slot, successor coalescing, flush/binding waiter transfer, disconnect,
-  or shutdown behavior under an injected ambiguous commit. That missing proof
-  is tracked by `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.5`.
+  revision-skipping successor. Revision
+  `37a8820d7be2107cef94e8a12b2369d5114dd888` adds a test-only rendezvous seam
+  around the real `persistence_worker`, while leaving the production
+  `WriteInterruption::None` path unchanged. The controlled worker proves that
+  ambiguous update and live-to-delete predecessors retry exactly before their
+  post-snapshot successors; failures block for a later wake instead of
+  spinning; semantic outcomes cross an explicit barrier once; and dropped or
+  disconnected flush/binding receivers are drained without false durability
+  acknowledgement or waiter leakage.
+- **Proof boundary:** exact revision
+  `37a8820d7be2107cef94e8a12b2369d5114dd888` passed the eight focused
+  controlled-worker tests and all 77 module tests on remote worker
+  `vmi1153651` (jobs `j-29957405445980188` and
+  `j-29957405445980189`), `cargo check -p frankenterm-gui --all-targets
+  --locked` on `vmi1264463` (job `j-29957405445980191`), and
+  `cargo clippy -p frankenterm-gui --all-targets --locked -- -D warnings` on
+  `vmi1153651` (job `j-29957405445980194`). These deterministic Linux tests
+  establish the worker state-machine contract; they do not simulate power
+  loss, prove a particular filesystem or storage device's durability, exercise
+  the native GUI, or establish ordered-tab restoration end to end.
 - **Decision:** reject latest-state retry and visibility-as-durability. Retain
   exact-snapshot replay and explicit file-plus-directory durability barriers,
-  without promoting helper-level evidence into worker or end-to-end authority.
+  now with real-worker state-machine evidence but without promoting it into
+  filesystem, native-GUI, or ordered-tab end-to-end authority.
 - **Primary retry condition:**
-  > Credit end-to-end crash consistency only when a test-only deterministic seam drives the real persistence worker through each ambiguous publication epoch and proves the exact frozen batch resolves before update and live-to-delete successors, with bounded wake, waiter, disconnect, repeated-failure, and shutdown behavior and no sleeps.
+  > Credit target-filesystem crash consistency and ordered-tab restoration only after retained power-loss or equivalent target-class evidence and a native end-to-end restore trial bind the same journal generation to the reconstructed mux-window order; the deterministic worker proof is necessary but not sufficient.
+
+### IS-N023 — Later error classification cannot erase antecedent ambiguous publication
+
+- **Classification:** crash-consistency rejection; kept exact retry-debt
+  correction
+- **Bead:** `ft-interactive-swarm-product-convergence-7xqz4.8.10.5.5`
+- **Rejected candidate:** after an exact retry returns a definite non-I/O error,
+  clear the frozen retry slot because the latest error cannot itself have
+  published a generation.
+- **Rejected inference:** retry debt describes uncertainty created by an
+  earlier publication attempt, not the taxonomy of the most recent failure.
+  Once a full write, file sync, directory sync, or lost acknowledgement may
+  have published the predecessor, a later corruption, validation, transaction,
+  or other definite failure supplies no evidence that the antecedent
+  publication did not occur. Dropping the frozen batch at that point lets a
+  coalesced successor bypass an unresolved CAS base.
+- **Structural correction:** revision
+  `37a8820d7be2107cef94e8a12b2369d5114dd888` restores the exact retry batch
+  after every exact-retry failure, independent of the later error class. A
+  deterministic production-worker test drives ambiguous directory-sync loss,
+  repeated ambiguous retry, a definite `Corrupt` retry failure, recovery of
+  the same frozen revision, and only then successor handling. Its causal
+  before-wake gate also proves the retained debt blocks without a timer or
+  retry spin.
+- **Proof boundary:** the exact revision and remote jobs listed in IS-N022
+  cover this transition and its package check/Clippy gates. The injected
+  `Corrupt` result proves state-machine classification, not real media
+  corruption recovery or storage-hardware behavior.
+- **Decision:** retry debt is monotonic until the exact predecessor is durably
+  resolved and acknowledged. Later failures may change the error reported to
+  current waiters, but they may not erase that debt or admit a successor.
+- **Primary retry condition:**
+  > Reconsider only if a stronger authority protocol can prove that the original possibly published generation is impossible or durably superseded before the frozen retry slot is cleared; a later error code alone is never that proof.
 
 ## Open hypothesis register
 
