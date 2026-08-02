@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::max;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::{ErrorKind, Read};
 use std::num::NonZeroU32;
 use std::os::fd::AsRawFd;
@@ -274,51 +274,51 @@ async fn run_key_repeat(
             }
         };
 
-        let (handle, translation) = {
-            let Some(conn) = WaylandConnection::get() else {
-                log::debug!(
-                    "Stopping Wayland key repeat for window {window_id}: connection unavailable"
-                );
-                return;
-            };
-            let conn = conn.wayland();
-            let Some(handle) = conn.window_by_id(window_id) else {
-                return;
-            };
-            let translation = {
-                let state = conn.wayland_state.borrow();
-                let Some(mapper) = state.keyboard_mapper.as_ref() else {
+        {
+            let (handle, translation) = {
+                let Some(conn) = WaylandConnection::get() else {
                     log::debug!(
-                        "Stopping Wayland key repeat for window {window_id}: keyboard mapper unavailable"
+                        "Stopping Wayland key repeat for window {window_id}: connection unavailable"
                     );
                     return;
                 };
-                let Some(event) = mapper.translate_wayland_repeat(&seed) else {
-                    report_invalid_wayland_keycode(seed.key());
+                let conn = conn.wayland();
+                let Some(handle) = conn.window_by_id(window_id) else {
                     return;
                 };
-                event
+                let translation = {
+                    let state = conn.wayland_state.borrow();
+                    let Some(mapper) = state.keyboard_mapper.as_ref() else {
+                        log::debug!(
+                            "Stopping Wayland key repeat for window {window_id}: keyboard mapper unavailable"
+                        );
+                        return;
+                    };
+                    let Some(event) = mapper.translate_wayland_repeat(&seed) else {
+                        report_invalid_wayland_keycode(seed.key());
+                        return;
+                    };
+                    event
+                };
+                (handle, translation)
             };
-            (handle, translation)
-        };
 
-        let mut inner = handle.borrow_mut();
-        let is_current = inner.key_repeat.as_ref().is_some_and(|held| {
-            held.timer
-                .as_ref()
-                .is_some_and(|timer| Arc::ptr_eq(&timer.identity, &identity))
-        });
-        if !is_current || inner.window.is_none() {
-            return;
+            let mut inner = handle.borrow_mut();
+            let is_current = inner.key_repeat.as_ref().is_some_and(|held| {
+                held.timer
+                    .as_ref()
+                    .is_some_and(|timer| Arc::ptr_eq(&timer.identity, &identity))
+            });
+            if !is_current || inner.window.is_none() {
+                return;
+            }
+            if let Some(held) = inner.key_repeat.as_mut() {
+                held.last_dispatch = Some(origin.elapsed());
+            }
+            inner
+                .events
+                .dispatch(key_repeat_window_event(translation, repeat_count));
         }
-        if let Some(held) = inner.key_repeat.as_mut() {
-            held.last_dispatch = Some(origin.elapsed());
-        }
-        inner
-            .events
-            .dispatch(key_repeat_window_event(translation, repeat_count));
-        drop(inner);
-        drop(handle);
 
         // A slow event handler can leave the absolute deadline overdue. Yield
         // after each coalesced dispatch so close, release, focus, and settings
@@ -2524,7 +2524,7 @@ mod tests {
             Poll::Ready(Err(err)) => {
                 assert!(err.downcast_ref::<BrokenPromise>().is_some());
             }
-            other => panic!("expected Ready(Err(BrokenPromise)), got {other:?}"),
+            other => panic!("expected Ready(Err(BrokenPromise)), got {:?}", other),
         }
     }
 
