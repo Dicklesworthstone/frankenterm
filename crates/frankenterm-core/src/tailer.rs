@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crate::runtime_async::{mpsc, oneshot};
 use crate::runtime_async::timeout;
 use crate::runtime_async::{RwLock, Semaphore};
-use futures::Stream;
+use futures::{FutureExt, Stream, StreamExt};
 use futures::stream::FuturesUnordered;
 use tracing::{debug, trace, warn};
 
@@ -347,6 +347,66 @@ impl SchedulerTierSnapshot {
     }
 }
 
+/// Shared, single-assignment outcome for one generation-resync persistence
+/// barrier.
+///
+/// The capture coordinator retains this receipt while the provisional binding
+/// is unpublished.  Persistence decides it only after durable commit and any
+/// required cursor correction, or records a terminal failure on every earlier
+/// exit.  Unlike a one-shot receiver, the outcome remains inspectable after a
+/// coordinator timeout or scheduling delay.
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureResyncReceipt {
+    outcome: Arc<OnceLock<std::result::Result<u64, String>>>,
+}
+
+impl CaptureResyncReceipt {
+    /// Return the terminal outcome when persistence has decided it.
+    pub(crate) fn outcome(&self) -> Option<std::result::Result<u64, String>> {
+        self.outcome.get().cloned()
+    }
+}
+
+/// Drop-safe producer half of a [`CaptureResyncReceipt`].
+#[derive(Debug)]
+pub(crate) struct CaptureResyncDecision {
+    receipt: CaptureResyncReceipt,
+    decided: bool,
+}
+
+impl CaptureResyncDecision {
+    /// Create one decision/receipt pair for a provisional resync event.
+    pub(crate) fn channel() -> (Self, CaptureResyncReceipt) {
+        let receipt = CaptureResyncReceipt {
+            outcome: Arc::new(OnceLock::new()),
+        };
+        (
+            Self {
+                receipt: receipt.clone(),
+                decided: false,
+            },
+            receipt,
+        )
+    }
+
+    /// Publish the one terminal persistence decision.
+    pub(crate) fn finish(&mut self, outcome: std::result::Result<u64, String>) {
+        if self.decided {
+            return;
+        }
+        let _ = self.receipt.outcome.set(outcome);
+        self.decided = true;
+    }
+}
+
+impl Drop for CaptureResyncDecision {
+    fn drop(&mut self) {
+        self.finish(Err(
+            "capture resync left the pipeline without a persistence decision".to_string(),
+        ));
+    }
+}
+
 /// A captured segment event for persistence.
 #[derive(Debug)]
 pub struct CaptureEvent {
@@ -358,6 +418,8 @@ pub struct CaptureEvent {
     /// coordinator must not expose successor producers until persistence has
     /// durably acknowledged this exact event.
     durability_ack: Option<oneshot::Sender<std::result::Result<u64, String>>>,
+    /// Drop-safe, inspectable receipt for a provisional generation resync.
+    resync_decision: Option<CaptureResyncDecision>,
 }
 
 impl CaptureEvent {
@@ -378,6 +440,7 @@ impl CaptureEvent {
             segment,
             stamp,
             durability_ack: None,
+            resync_decision: None,
         })
     }
 
@@ -401,6 +464,17 @@ impl CaptureEvent {
         &mut self,
     ) -> Option<oneshot::Sender<std::result::Result<u64, String>>> {
         self.durability_ack.take()
+    }
+
+    /// Attach the durable decision cell for a provisional generation resync.
+    pub(crate) fn with_resync_decision(mut self, decision: CaptureResyncDecision) -> Self {
+        self.resync_decision = Some(decision);
+        self
+    }
+
+    /// Transfer the optional resync decision to the persistence consumer.
+    pub(crate) fn take_resync_decision(&mut self) -> Option<CaptureResyncDecision> {
+        self.resync_decision.take()
     }
 }
 
@@ -1175,6 +1249,19 @@ impl TailerPollTaskSet {
             Pin::new(&mut self.inner).poll_next(poll_cx)
         })
         .await
+    }
+
+    /// Poll the task set once without waiting for an outcome.
+    ///
+    /// Reconciliation uses this bounded fairness hook before looping back to a
+    /// prompt lifecycle retry. Without polling the set, a 10 ms transition
+    /// cadence can starve the producer futures that hold the exact authority
+    /// guards the transition is waiting to drain.
+    pub(crate) fn try_join_next(&mut self) -> Option<(u64, PollOutcome)> {
+        if self.inner.is_empty() {
+            return None;
+        }
+        self.inner.next().now_or_never().flatten()
     }
 
     #[must_use]
@@ -2632,6 +2719,45 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn capture_resync_receipt_is_single_assignment_and_drop_safe() {
+        let (mut decision, receipt) = CaptureResyncDecision::channel();
+        assert_eq!(receipt.outcome(), None);
+        decision.finish(Ok(7));
+        decision.finish(Err("late overwrite".to_string()));
+        assert_eq!(receipt.outcome(), Some(Ok(7)));
+        drop(decision);
+        assert_eq!(receipt.outcome(), Some(Ok(7)));
+
+        let (undecided, dropped_receipt) = CaptureResyncDecision::channel();
+        drop(undecided);
+        assert!(
+            dropped_receipt
+                .outcome()
+                .is_some_and(|outcome| outcome.is_err()),
+            "every pipeline exit must leave a terminal receipt"
+        );
+    }
+
+    #[test]
+    fn nonblocking_poll_reap_advances_ready_work_without_waiting() {
+        let mut ready = TailerPollTaskSet::new();
+        ready.spawn_poll_task(async { (7, PollOutcome::NoChange) });
+        let outcome = ready
+            .try_join_next()
+            .expect("immediately ready poll must be reaped");
+        assert_eq!(outcome.0, 7);
+        assert!(matches!(outcome.1, PollOutcome::NoChange));
+        assert!(ready.is_empty());
+
+        let mut pending = TailerPollTaskSet::new();
+        pending.spawn_poll_task(async {
+            std::future::pending::<(u64, PollOutcome)>().await
+        });
+        assert!(pending.try_join_next().is_none());
+        assert_eq!(pending.len(), 1, "pending work remains owned by the set");
     }
 
     /// ft-l8uk7: a pre-cancelled `Cx` must short-circuit

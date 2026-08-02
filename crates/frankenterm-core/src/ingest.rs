@@ -4438,6 +4438,24 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unproven_replacement_resync_keeps_full_snapshot_despite_common_prompt() {
+        let mut replacement = PaneCursor::from_seq(9, 12);
+        let successor = "successor banner\n$ common prompt\nvaluable successor output\n";
+
+        let gap = replacement.capture_generation_resync(
+            successor,
+            "capture_generation_resync",
+        );
+
+        assert_eq!(gap.content, successor);
+        assert!(matches!(
+            gap.kind,
+            CapturedSegmentKind::Gap { ref reason }
+                if reason == "capture_generation_resync:durable_anchor_unavailable"
+        ));
+    }
+
     /// ft-6lso5: a tail that repeats in the scrollback (a prompt line, a
     /// progress banner) must resume from its most recent occurrence, or the
     /// output in between is stored twice — the very duplication being fixed.

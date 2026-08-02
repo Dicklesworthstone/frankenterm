@@ -38,8 +38,8 @@ use crate::config::{
     SnapshotConfig, SnapshotSchedulingMode,
 };
 use crate::capture_authority::{
-    ActivePaneIdentity, CaptureAuthority, CaptureLease, CapturePersistenceGuard,
-    CaptureSourceKind, PaneIncarnation,
+    ActivePaneIdentity, CaptureAuthority, CaptureLease, CapturePersistenceGuard, CaptureRevision,
+    CaptureSourceKind, CaptureViewEpoch, PaneIncarnation,
 };
 #[cfg(feature = "native-wezterm")]
 use crate::capture_authority::CaptureProducerGuard;
@@ -67,6 +67,7 @@ use crate::ingest::{
     CapturedSegment, CapturedSegmentKind, PaneCursor, PaneRegistry, PersistedCapture,
     bounded_segment_for_persistence, persist_authorized_captured_segment_with_zone_with_cx,
 };
+use crate::lru_cache::LruCache;
 use crate::memory_budget::{BudgetLevel, MemoryBudgetConfig};
 use crate::memory_pressure::{MemoryPressureConfig, MemoryPressureMonitor, MemoryPressureTier};
 #[cfg(feature = "native-wezterm")]
@@ -85,7 +86,10 @@ use crate::storage::PaneRecord;
 use crate::storage::{MaintenanceRecord, StorageHandle, StoredEvent};
 #[cfg(all(feature = "vendored", unix))]
 use crate::tailer::StreamingBridge;
-use crate::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
+use crate::tailer::{
+    CaptureEvent, CaptureResyncDecision, CaptureResyncReceipt, TailerConfig, TailerPollTaskSet,
+    TailerSupervisor,
+};
 #[cfg(all(feature = "vendored", unix))]
 use crate::vendored::subscribe_pane_output_with_inherited_cx;
 #[cfg(all(feature = "vendored", unix))]
@@ -886,18 +890,33 @@ impl DiscoveryRevision {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ObservedCapturePane {
     info: PaneInfo,
     generation: u32,
     pane_uuid: String,
     revision: DiscoveryRevision,
+    requires_storage_resync: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureTransitionDescriptor {
+    desired_revision: DiscoveryRevision,
+    predecessor_revision: Option<DiscoveryRevision>,
+}
+
+#[derive(Clone, Debug)]
 struct DiscoveryCapturePublication {
     epoch: u64,
     observed_panes: Arc<HashMap<u64, ObservedCapturePane>>,
+    /// Pane IDs intentionally withheld while discovery prepares a successor.
+    /// This distinguishes a pending transition from a terminal close so the
+    /// capture coordinator retains exact predecessor resync obligations.
+    transitioning_pane_ids: Arc<HashSet<u64>>,
+    /// Current successor transition descriptors.  These survive watch-channel
+    /// coalescing so capture can recover the predecessor fast path even when it
+    /// observes the ready publication without first observing the pending one.
+    transitions: Arc<HashMap<u64, CaptureTransitionDescriptor>>,
 }
 
 impl Default for DiscoveryCapturePublication {
@@ -905,7 +924,201 @@ impl Default for DiscoveryCapturePublication {
         Self {
             epoch: 0,
             observed_panes: Arc::new(HashMap::new()),
+            transitioning_pane_ids: Arc::new(HashSet::new()),
+            transitions: Arc::new(HashMap::new()),
         }
+    }
+}
+
+/// Build the strongest capture view that can be justified from a fresh mux
+/// listing without mutating the registry or awaiting storage.
+///
+/// Existing panes are retained only when the generation-defining metadata
+/// still matches exactly. Missing IDs are terminally absent; new or changed
+/// IDs are marked as transitioning. Duplicate IDs are ambiguous and therefore
+/// excluded. Installing this view before stable-UUID I/O closes predecessor
+/// admission across that await.
+fn conservative_capture_view_before_storage(
+    previous: &HashMap<u64, ObservedCapturePane>,
+    panes: &[PaneInfo],
+) -> (
+    Arc<HashMap<u64, ObservedCapturePane>>,
+    Arc<HashSet<u64>>,
+) {
+    let mut listed = HashMap::<u64, &PaneInfo>::with_capacity(panes.len());
+    let mut duplicate_ids = HashSet::new();
+    for pane in panes {
+        if listed.insert(pane.pane_id, pane).is_some() {
+            duplicate_ids.insert(pane.pane_id);
+        }
+    }
+
+    let mut retained = HashMap::with_capacity(previous.len().min(listed.len()));
+    let mut transitioning = HashSet::new();
+    for (&pane_id, observed) in previous {
+        let Some(listed_pane) = listed.get(&pane_id).copied() else {
+            continue;
+        };
+        if duplicate_ids.contains(&pane_id) {
+            transitioning.insert(pane_id);
+            continue;
+        }
+        let previous_fingerprint = crate::ingest::PaneFingerprint::without_content(&observed.info);
+        let listed_fingerprint = crate::ingest::PaneFingerprint::without_content(listed_pane);
+        if previous_fingerprint.is_same_generation(&listed_fingerprint) {
+            retained.insert(pane_id, observed.clone());
+        } else {
+            transitioning.insert(pane_id);
+        }
+    }
+    for pane in panes {
+        if !previous.contains_key(&pane.pane_id) {
+            transitioning.insert(pane.pane_id);
+        }
+    }
+
+    (Arc::new(retained), Arc::new(transitioning))
+}
+
+fn capture_publication_view(
+    registry: &PaneRegistry,
+    revisions: &HashMap<u64, DiscoveryRevision>,
+    storage_resync_revisions: &HashMap<u64, DiscoveryRevision>,
+    excluded: &HashSet<u64>,
+) -> Arc<HashMap<u64, ObservedCapturePane>> {
+    let observed_ids = registry.observed_pane_ids();
+    let mut published = HashMap::with_capacity(observed_ids.len());
+    for pane_id in observed_ids {
+        if excluded.contains(&pane_id) {
+            continue;
+        }
+        let Some(entry) = registry.get_entry(pane_id) else {
+            continue;
+        };
+        let Some(revision) = revisions.get(&pane_id).copied() else {
+            continue;
+        };
+        published.insert(
+            pane_id,
+            ObservedCapturePane {
+                info: entry.info.clone(),
+                generation: entry.generation,
+                pane_uuid: entry.pane_uuid.clone(),
+                revision,
+                requires_storage_resync: storage_resync_revisions.get(&pane_id).copied()
+                    == Some(revision),
+            },
+        );
+    }
+    Arc::new(published)
+}
+
+fn capture_publication_identity_matches(
+    left: &HashMap<u64, ObservedCapturePane>,
+    right: &HashMap<u64, ObservedCapturePane>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(pane_id, left_pane)| {
+            right.get(pane_id).is_some_and(|right_pane| {
+                left_pane.generation == right_pane.generation
+                    && left_pane.pane_uuid == right_pane.pane_uuid
+                    && left_pane.revision == right_pane.revision
+                    && left_pane.requires_storage_resync == right_pane.requires_storage_resync
+            })
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureResyncRequirement {
+    Exact(DiscoveryRevision),
+    StorageAudit,
+}
+
+/// Bounded, lossless accounting for successor resync obligations.
+///
+/// Exact predecessor revisions use the in-memory durability checkpoint fast
+/// path. When that bounded tier is full, the affected pane moves into an
+/// explicit storage-audit set retained only while the pane is observed or in a
+/// published transition. The fallback therefore survives a predecessor commit
+/// that races an earlier discovery read without poisoning unrelated future
+/// panes with a process-lifetime global mode.
+struct PendingCaptureResyncs {
+    exact: HashMap<u64, DiscoveryRevision>,
+    storage_audit: HashSet<u64>,
+    exact_capacity: usize,
+}
+
+impl PendingCaptureResyncs {
+    fn new(exact_capacity: usize) -> Self {
+        let exact_capacity = exact_capacity.max(1);
+        Self {
+            exact: HashMap::with_capacity(exact_capacity),
+            storage_audit: HashSet::new(),
+            exact_capacity,
+        }
+    }
+
+    /// Remember an obligation without evicting an earlier one.
+    ///
+    /// Returns `true` when this pane is using the storage-audit tier. An
+    /// overflow loses only the exact-checkpoint fast path, never the resync
+    /// obligation itself.
+    fn remember(&mut self, pane_id: u64, revision: DiscoveryRevision) -> bool {
+        if self.storage_audit.contains(&pane_id) {
+            return true;
+        }
+        if let Some(existing) = self.exact.get_mut(&pane_id) {
+            *existing = revision;
+            return false;
+        }
+        if self.exact.len() < self.exact_capacity {
+            self.exact.insert(pane_id, revision);
+            return false;
+        }
+        self.storage_audit.insert(pane_id);
+        true
+    }
+
+    fn requirement(
+        &self,
+        pane_id: u64,
+        requires_storage_resync: bool,
+    ) -> Option<CaptureResyncRequirement> {
+        self.exact
+            .get(&pane_id)
+            .copied()
+            .map(CaptureResyncRequirement::Exact)
+            .or((self.storage_audit.contains(&pane_id) || requires_storage_resync)
+                .then_some(CaptureResyncRequirement::StorageAudit))
+    }
+
+    fn acknowledge(&mut self, pane_id: u64) {
+        self.exact.remove(&pane_id);
+        self.storage_audit.remove(&pane_id);
+    }
+
+    /// Force an unproven storage recovery for a failed successor resync.
+    ///
+    /// Storage rows are keyed by numeric pane ID, not discovery revision. A
+    /// caller-supplied successor revision therefore cannot relabel the loaded
+    /// predecessor tail into positive continuity evidence. Dropping the exact
+    /// tier here guarantees the retry emits a full successor snapshot.
+    fn require_storage_audit(&mut self, pane_id: u64) {
+        self.exact.remove(&pane_id);
+        self.storage_audit.insert(pane_id);
+    }
+
+    fn retain_authoritative(
+        &mut self,
+        publication: &DiscoveryCapturePublication,
+    ) {
+        let retain = |pane_id: &u64| {
+            publication.observed_panes.contains_key(pane_id)
+                || publication.transitioning_pane_ids.contains(pane_id)
+                || publication.transitions.contains_key(pane_id)
+        };
+        self.exact.retain(|pane_id, _| retain(pane_id));
+        self.storage_audit.retain(retain);
     }
 }
 
@@ -914,10 +1127,20 @@ struct CaptureDurabilityCheckpoint {
     revision: DiscoveryRevision,
     next_seq: u64,
     raw_tail: String,
-    certain: bool,
 }
 
-type CaptureCheckpointCache = Arc<StdMutex<LruCache<u64, CaptureDurabilityCheckpoint>>>;
+#[derive(Clone, Debug)]
+enum CachedCaptureCheckpoint {
+    Certain(CaptureDurabilityCheckpoint),
+    Uncertain { revision: DiscoveryRevision },
+}
+
+type CaptureCheckpointCache = Arc<StdMutex<LruCache<u64, CachedCaptureCheckpoint>>>;
+
+struct CaptureCheckpointWrite {
+    revision: DiscoveryRevision,
+    baseline: Option<CaptureDurabilityCheckpoint>,
+}
 
 struct CaptureDurabilityAck {
     sender: Option<oneshot::Sender<std::result::Result<u64, String>>>,
@@ -943,36 +1166,39 @@ impl Drop for CaptureDurabilityAck {
     }
 }
 
-fn mark_capture_checkpoint_uncertain(
+fn begin_capture_checkpoint_write(
     checkpoints: &CaptureCheckpointCache,
     pane_id: u64,
     revision: DiscoveryRevision,
-) {
+) -> CaptureCheckpointWrite {
     let Ok(mut cache) = checkpoints.lock() else {
         error!(pane_id, "Capture durability checkpoint cache is poisoned");
-        return;
+        return CaptureCheckpointWrite {
+            revision,
+            baseline: None,
+        };
     };
-    if let Some(checkpoint) = cache.get_mut(&pane_id)
-        && checkpoint.revision == revision
-    {
-        checkpoint.certain = false;
-        return;
-    }
+    let baseline = match cache.get(&pane_id) {
+        Some(CachedCaptureCheckpoint::Certain(checkpoint))
+            if checkpoint.revision == revision =>
+        {
+            Some(checkpoint.clone())
+        }
+        Some(CachedCaptureCheckpoint::Certain(_)
+        | CachedCaptureCheckpoint::Uncertain { .. })
+        | None => None,
+    };
     let _ = cache.put(
         pane_id,
-        CaptureDurabilityCheckpoint {
-            revision,
-            next_seq: 0,
-            raw_tail: String::new(),
-            certain: false,
-        },
+        CachedCaptureCheckpoint::Uncertain { revision },
     );
+    CaptureCheckpointWrite { revision, baseline }
 }
 
 fn confirm_capture_checkpoint(
     checkpoints: &CaptureCheckpointCache,
     pane_id: u64,
-    revision: DiscoveryRevision,
+    write: &CaptureCheckpointWrite,
     persisted_seq: u64,
     raw_content: &str,
 ) {
@@ -984,17 +1210,35 @@ fn confirm_capture_checkpoint(
         error!(pane_id, "Capture durability checkpoint cache is poisoned");
         return;
     };
-    let checkpoint = cache
-        .get(&pane_id)
-        .filter(|checkpoint| checkpoint.revision == revision)
-        .cloned()
-        .unwrap_or(CaptureDurabilityCheckpoint {
-            revision,
-            next_seq: 0,
-            raw_tail: String::new(),
-            certain: false,
-        });
-    let mut raw_tail = checkpoint.raw_tail;
+    let current_write_is_live = matches!(
+        cache.get(&pane_id),
+        Some(CachedCaptureCheckpoint::Uncertain { revision })
+            if *revision == write.revision
+    );
+    if !current_write_is_live {
+        error!(
+            pane_id,
+            revision = write.revision.get(),
+            "Capture checkpoint write lost its exact cache generation"
+        );
+        return;
+    }
+    let Some(baseline) = write.baseline.as_ref() else {
+        // A missing, evicted, or previously uncertain baseline cannot be
+        // reconstructed from one later segment.  Keep the cache uncertain so
+        // the next transition performs an authoritative storage read.
+        return;
+    };
+    if baseline.next_seq != persisted_seq {
+        error!(
+            pane_id,
+            expected_seq = baseline.next_seq,
+            persisted_seq,
+            "Capture checkpoint sequence correction requires storage reconciliation"
+        );
+        return;
+    }
+    let mut raw_tail = baseline.raw_tail.clone();
     raw_tail.push_str(raw_content);
     raw_tail = crate::ingest::resume_anchor_tail(
         &raw_tail,
@@ -1003,12 +1247,11 @@ fn confirm_capture_checkpoint(
     .to_string();
     let _ = cache.put(
         pane_id,
-        CaptureDurabilityCheckpoint {
-            revision,
+        CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
+            revision: write.revision,
             next_seq,
             raw_tail,
-            certain: true,
-        },
+        }),
     );
 }
 
@@ -1021,10 +1264,16 @@ fn certain_capture_checkpoint(
         error!(pane_id, "Capture durability checkpoint cache is poisoned");
         return None;
     };
-    cache
-        .get(&pane_id)
-        .filter(|checkpoint| checkpoint.revision == revision && checkpoint.certain)
-        .cloned()
+    match cache.get(&pane_id) {
+        Some(CachedCaptureCheckpoint::Certain(checkpoint))
+            if checkpoint.revision == revision =>
+        {
+            Some(checkpoint.clone())
+        }
+        Some(CachedCaptureCheckpoint::Certain(_)
+        | CachedCaptureCheckpoint::Uncertain { .. })
+        | None => None,
+    }
 }
 
 #[derive(Clone)]
@@ -1040,10 +1289,19 @@ struct ActiveCaptureBinding {
     revision: DiscoveryRevision,
     identity: ActivePaneIdentity,
     polling_lease: CaptureLease,
+    /// Present while the successor's mandatory resync is queued or being
+    /// persisted. The binding is not exposed to normal producers until this
+    /// receipt is durably committed.
+    resync_receipt: Option<CaptureResyncReceipt>,
     #[cfg(feature = "native-wezterm")]
     native_lease: Option<CaptureLease>,
     #[cfg(all(feature = "vendored", unix))]
     streaming_lease: Option<CaptureLease>,
+}
+
+struct PendingCaptureResyncBinding {
+    binding: ActiveCaptureBinding,
+    submitted_at: Instant,
 }
 
 impl ActiveCaptureBinding {
@@ -1066,6 +1324,73 @@ fn allocate_discovery_publication_epoch(last_epoch: &mut u64) -> Option<u64> {
     Some(next)
 }
 
+fn publish_discovery_capture_view(
+    publication_tx: &watch::Sender<DiscoveryCapturePublication>,
+    authority: &CaptureAuthority,
+    last_epoch: &mut u64,
+    last_view: &mut Arc<HashMap<u64, ObservedCapturePane>>,
+    observed_panes: Arc<HashMap<u64, ObservedCapturePane>>,
+    transitioning_pane_ids: Arc<HashSet<u64>>,
+    transitions: Arc<HashMap<u64, CaptureTransitionDescriptor>>,
+    phase: &'static str,
+) -> Result<()> {
+    let authority_gate_uninitialized = *last_epoch == 0;
+    let Some(epoch) = allocate_discovery_publication_epoch(last_epoch) else {
+        return Err(runtime_backend_error(
+            "capture.discovery.publish",
+            format!(
+                "{phase}: discovery publication namespace exhausted; capture remains on its last complete view"
+            ),
+        ));
+    };
+    let Some(authority_epoch) = CaptureViewEpoch::new(epoch) else {
+        return Err(runtime_backend_error(
+            "capture.discovery.publish",
+            format!("{phase}: discovery produced an invalid zero authority-view epoch"),
+        ));
+    };
+    if authority_gate_uninitialized
+        || !capture_publication_identity_matches(last_view, &observed_panes)
+    {
+        let mut desired_revisions = HashMap::with_capacity(observed_panes.len());
+        for (pane_id, pane) in observed_panes.iter() {
+            let Some(revision) = CaptureRevision::new(pane.revision.get()) else {
+                return Err(runtime_backend_error(
+                    "capture.discovery.publish",
+                    format!(
+                        "{phase}: pane {pane_id} has an invalid zero capture revision"
+                    ),
+                ));
+            };
+            desired_revisions.insert(*pane_id, revision);
+        }
+        authority
+            .install_desired_revisions(authority_epoch, &desired_revisions)
+            .map_err(|error| {
+                runtime_backend_error(
+                    "capture.discovery.publish",
+                    format!("{phase}: failed to install discovery revision gate: {error}"),
+                )
+            })?;
+    }
+    let publication = DiscoveryCapturePublication {
+        epoch,
+        observed_panes: Arc::clone(&observed_panes),
+        transitioning_pane_ids,
+        transitions,
+    };
+    publication_tx.send(publication).map_err(|_| {
+        runtime_backend_error(
+            "capture.discovery.publish",
+            format!(
+                "{phase}: capture publication receiver closed before epoch {epoch} was delivered"
+            ),
+        )
+    })?;
+    *last_view = observed_panes;
+    Ok(())
+}
+
 fn capture_sync_due(
     now: Instant,
     next_sync_tick: Instant,
@@ -1086,7 +1411,76 @@ fn capture_publication_matches(
         .is_some_and(|pane| pane.revision == revision)
 }
 
+async fn relay_capture_event_with_cx(
+    cx: &RuntimeLoopCx,
+    capture_ring_tx: &SpscProducer<CaptureEvent>,
+    event: CaptureEvent,
+) -> Result<()> {
+    capture_ring_tx
+        .send_with_cx(cx, event)
+        .await
+        .map_err(|_| runtime_backend_error("capture.relay", "persistence ring closed"))
+}
+
+/// Acquire the complete persistence-side admission before any semantic lookup
+/// or side effect.  Keeping authority, immutable incarnation metadata, and the
+/// latest discovery publication behind one seam makes it impossible for a
+/// caller to validate only the queue stamp and then accidentally process a
+/// discovery-superseded event.
+async fn admit_capture_event_for_persistence(
+    authority: &CaptureAuthority,
+    capture_metadata: &RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>,
+    publication_rx: &watch::Receiver<DiscoveryCapturePublication>,
+    event: &CaptureEvent,
+) -> Result<(CapturePersistenceGuard, CapturePaneMetadata)> {
+    let stamp = event.stamp();
+    let guard = authority.try_acquire_persistence(stamp, event.segment.pane_id)?;
+    let pane_incarnation = stamp.pane_incarnation();
+    let metadata = capture_metadata
+        .read()
+        .await
+        .get(&pane_incarnation)
+        .cloned()
+        .ok_or_else(|| {
+            runtime_backend_error(
+                "capture.persistence.admission",
+                format!(
+                    "pane {} incarnation {} has no immutable capture metadata",
+                    event.segment.pane_id,
+                    pane_incarnation.get()
+                ),
+            )
+        })?;
+    let is_current = {
+        let publication = publication_rx.borrow();
+        publication
+            .observed_panes
+            .get(&event.segment.pane_id)
+            .is_some_and(|pane| {
+                pane.pane_uuid == metadata.pane_uuid
+                    && pane.generation == metadata.discovery_generation
+                    && pane.revision == metadata.discovery_revision
+            })
+    };
+    if !is_current {
+        return Err(runtime_backend_error(
+            "capture.persistence.admission",
+            format!(
+                "pane {} incarnation {} discovery revision {} is no longer current",
+                event.segment.pane_id,
+                pane_incarnation.get(),
+                metadata.discovery_revision.get()
+            ),
+        ));
+    }
+    Ok((guard, metadata))
+}
+
 const CAPTURE_AUTHORITY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPTURE_TRANSITION_QUEUE_TIMEOUT: Duration = Duration::from_millis(100);
+const CAPTURE_RESYNC_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPTURE_PROMPT_DRAIN_WINDOW: Duration = Duration::from_secs(5);
+const CAPTURE_POLL_REAP_BUDGET: usize = 64;
 
 async fn rollback_empty_capture_binding(
     cx: &RuntimeLoopCx,
@@ -1120,7 +1514,13 @@ async fn activate_capture_binding(
     capture_metadata: &Arc<RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>>,
     metadata: CapturePaneMetadata,
 ) -> Result<ActiveCaptureBinding> {
-    let identity = authority.activate_pane(global_pane_id)?;
+    let capture_revision = CaptureRevision::new(metadata.discovery_revision.get()).ok_or_else(|| {
+        runtime_backend_error(
+            "capture.transition.activate",
+            format!("pane {global_pane_id} has an invalid zero discovery revision"),
+        )
+    })?;
+    let identity = authority.activate_pane_for_revision(global_pane_id, capture_revision)?;
     let pane_uuid = metadata.pane_uuid.clone();
     let revision = metadata.discovery_revision;
     capture_metadata
@@ -1146,6 +1546,7 @@ async fn activate_capture_binding(
         revision,
         identity,
         polling_lease,
+        resync_receipt: None,
         #[cfg(feature = "native-wezterm")]
         native_lease: None,
         #[cfg(all(feature = "vendored", unix))]
@@ -1173,16 +1574,48 @@ fn enable_native_capture_source(
     Ok(())
 }
 
-async fn retire_capture_binding(
-    cx: &RuntimeLoopCx,
+async fn retire_or_quarantine_capture_binding(
     authority: &CaptureAuthority,
-    binding: &ActiveCaptureBinding,
-) -> Result<()> {
-    authority
-        .begin_pane_revocation(binding.identity)?
-        .wait_with_cx(cx, CAPTURE_AUTHORITY_DRAIN_TIMEOUT)
-        .await?;
-    Ok(())
+    capture_metadata: &Arc<RwLock<HashMap<PaneIncarnation, CapturePaneMetadata>>>,
+    draining_bindings: &mut HashMap<u64, ActiveCaptureBinding>,
+    draining_since: &mut HashMap<u64, Instant>,
+    binding: ActiveCaptureBinding,
+    context: &'static str,
+) -> bool {
+    let pane_id = binding.identity.global_pane_id();
+    match authority.retire_pane_if_drained(binding.identity) {
+        Ok(true) => {
+            draining_since.remove(&pane_id);
+            capture_metadata
+                .write()
+                .await
+                .remove(&binding.identity.pane_incarnation());
+            true
+        }
+        Ok(false) => {
+            debug!(
+                pane_id,
+                context,
+                "Capture binding quarantined while exact revocation drains"
+            );
+            let replaced = draining_bindings.insert(pane_id, binding);
+            debug_assert!(replaced.is_none(), "one exact draining binding per pane");
+            draining_since.entry(pane_id).or_insert_with(Instant::now);
+            false
+        }
+        Err(error) => {
+            error!(
+                pane_id,
+                context,
+                error = %error,
+                "Capture binding retirement failed; exact binding quarantined"
+            );
+            let replaced = draining_bindings.insert(pane_id, binding);
+            debug_assert!(replaced.is_none(), "one exact draining binding per pane");
+            draining_since.entry(pane_id).or_insert_with(Instant::now);
+            false
+        }
+    }
 }
 
 async fn load_capture_checkpoint_from_storage(
@@ -1208,7 +1641,6 @@ async fn load_capture_checkpoint_from_storage(
         revision,
         next_seq,
         raw_tail: assemble_resume_anchor(segments),
-        certain: true,
     })
 }
 
@@ -1227,29 +1659,78 @@ async fn recover_capture_checkpoint(
     load_capture_checkpoint_from_storage(cx, storage, pane_id, predecessor_revision).await
 }
 
-async fn reset_capture_state_from_checkpoint(
+/// Install the storage-proven baseline for a pane that has not yet been
+/// exposed to capture in this runtime.
+///
+/// All fallible guards are acquired before mutation.  If a cursor already
+/// exists, a transition coordinator owns it and this setup must not overwrite
+/// its potentially newer in-flight state; that coordinator will perform the
+/// exact drain/reset before exposing the new revision.
+async fn initialize_capture_state_from_checkpoint(
     pane_id: u64,
-    desired_revision: DiscoveryRevision,
     checkpoint: &CaptureDurabilityCheckpoint,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     detection_contexts: &Arc<RwLock<HashMap<u64, DetectionContext>>>,
     pane_activity_tracker: &Arc<RwLock<HashMap<u64, PaneActivityState>>>,
     checkpoints: &CaptureCheckpointCache,
-) -> Result<()> {
-    {
-        let mut cursor_guard = cursors.write().await;
-        let mut context_guard = detection_contexts.write().await;
-        let mut activity_guard = pane_activity_tracker.write().await;
-        cursor_guard.insert(
-            pane_id,
-            PaneCursor::from_seq(pane_id, checkpoint.next_seq)
-                .with_resume_anchor(checkpoint.raw_tail.clone()),
-        );
-        let mut context = DetectionContext::new();
-        context.pane_id = Some(pane_id);
-        context_guard.insert(pane_id, context);
-        activity_guard.remove(&pane_id);
+) -> Result<bool> {
+    let mut cursor_guard = cursors.write().await;
+    let mut context_guard = detection_contexts.write().await;
+    let mut activity_guard = pane_activity_tracker.write().await;
+    let mut cache = checkpoints.lock().map_err(|_| {
+        runtime_backend_error(
+            "capture.transition.checkpoint",
+            "capture durability checkpoint cache is poisoned",
+        )
+    })?;
+    if cursor_guard.contains_key(&pane_id) {
+        return Ok(false);
     }
+
+    let cursor = PaneCursor::from_seq(pane_id, checkpoint.next_seq)
+        .with_resume_anchor(checkpoint.raw_tail.clone());
+    let mut context = DetectionContext::new();
+    context.pane_id = Some(pane_id);
+    let _ = cache.put(
+        pane_id,
+        CachedCaptureCheckpoint::Certain(checkpoint.clone()),
+    );
+    cursor_guard.insert(pane_id, cursor);
+    context_guard.insert(pane_id, context);
+    activity_guard.remove(&pane_id);
+    Ok(true)
+}
+
+async fn reset_capture_state_from_checkpoint(
+    pane_id: u64,
+    desired_revision: DiscoveryRevision,
+    checkpoint: &CaptureDurabilityCheckpoint,
+    preserve_durable_anchor: bool,
+    cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
+    detection_contexts: &Arc<RwLock<HashMap<u64, DetectionContext>>>,
+    pane_activity_tracker: &Arc<RwLock<HashMap<u64, PaneActivityState>>>,
+    checkpoints: &CaptureCheckpointCache,
+) -> Result<()> {
+    let replacement_raw_tail = if preserve_durable_anchor {
+        checkpoint.raw_tail.clone()
+    } else {
+        String::new()
+    };
+    let replacement_cursor = if preserve_durable_anchor {
+        PaneCursor::from_seq(pane_id, checkpoint.next_seq)
+            .with_resume_anchor(replacement_raw_tail.clone())
+    } else {
+        PaneCursor::from_seq(pane_id, checkpoint.next_seq)
+    };
+    let mut replacement_context = DetectionContext::new();
+    replacement_context.pane_id = Some(pane_id);
+    // Acquire every fallible/awaiting guard before mutating any member.  Once
+    // all four guards are held, the commit below contains no await and cannot
+    // return a partial cursor/context/activity reset merely because the
+    // checkpoint cache was poisoned.
+    let mut cursor_guard = cursors.write().await;
+    let mut context_guard = detection_contexts.write().await;
+    let mut activity_guard = pane_activity_tracker.write().await;
     let mut cache = checkpoints.lock().map_err(|_| {
         runtime_backend_error(
             "capture.transition.checkpoint",
@@ -1258,13 +1739,15 @@ async fn reset_capture_state_from_checkpoint(
     })?;
     let _ = cache.put(
         pane_id,
-        CaptureDurabilityCheckpoint {
+        CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
             revision: desired_revision,
             next_seq: checkpoint.next_seq,
-            raw_tail: checkpoint.raw_tail.clone(),
-            certain: true,
-        },
+            raw_tail: replacement_raw_tail,
+        }),
     );
+    cursor_guard.insert(pane_id, replacement_cursor);
+    context_guard.insert(pane_id, replacement_context);
+    activity_guard.remove(&pane_id);
     Ok(())
 }
 
@@ -1274,13 +1757,23 @@ async fn emit_capture_generation_resync(
     capture_tx: &mpsc::Sender<CaptureEvent>,
     cursors: &Arc<RwLock<HashMap<u64, PaneCursor>>>,
     binding: &ActiveCaptureBinding,
-) -> Result<u64> {
+) -> Result<CaptureResyncReceipt> {
     let pane_id = binding.identity.global_pane_id();
     // Reserve bounded-queue capacity before acquiring authority or mutating
     // the cursor.  Backpressure therefore cannot create a speculative hole.
-    let permit = capture_tx.reserve(cx).await.map_err(|error| {
-        runtime_backend_error("capture.transition.reserve", error)
-    })?;
+    let permit = runtime_timeout(
+        cx,
+        CAPTURE_TRANSITION_QUEUE_TIMEOUT,
+        capture_tx.reserve(cx),
+    )
+    .await
+    .map_err(|_| {
+        runtime_backend_error(
+            "capture.transition.reserve",
+            format!("pane {pane_id} capture ingress stayed full"),
+        )
+    })?
+    .map_err(|error| runtime_backend_error("capture.transition.reserve", error))?;
     let producer_guard = binding.polling_lease.try_acquire_producer(
         binding.polling_lease.stamp(),
         pane_id,
@@ -1307,33 +1800,12 @@ async fn emit_capture_generation_resync(
         })?;
         cursor.capture_generation_resync(&text, "capture_generation_resync")
     };
-    let (ack_tx, ack_rx) = oneshot::channel();
+    let (resync_decision, resync_receipt) = CaptureResyncDecision::channel();
     let event = CaptureEvent::from_producer(segment, &producer_guard)?
-        .with_durability_ack(ack_tx);
+        .with_resync_decision(resync_decision);
     permit.send(event);
     drop(producer_guard);
-
-    match runtime_timeout(
-        cx,
-        CAPTURE_AUTHORITY_DRAIN_TIMEOUT,
-        crate::runtime_async::oneshot_recv_with_cx(cx, ack_rx),
-    )
-    .await
-    {
-        Ok(Ok(Ok(sequence))) => Ok(sequence),
-        Ok(Ok(Err(reason))) => Err(runtime_backend_error(
-            "capture.transition.persistence",
-            reason,
-        )),
-        Ok(Err(error)) => Err(runtime_backend_error(
-            "capture.transition.persistence",
-            error,
-        )),
-        Err(_) => Err(runtime_backend_error(
-            "capture.transition.persistence",
-            format!("pane {pane_id} resync durability acknowledgement timed out"),
-        )),
-    }
+    Ok(resync_receipt)
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -2407,10 +2879,11 @@ impl ObservationRuntime {
         // consumed by the persistence task.
         let (capture_ring_tx, capture_ring_rx) =
             spsc_channel::<CaptureEvent>(self.config.channel_buffer);
-        // Discovery publishes one immutable, revision-stamped capture view
-        // only after all registry/cursor setup for that tick is complete.  A
+        // Discovery publishes immutable, revision-stamped pending and ready
+        // views around its fallible identity work. Cursor/checkpoint setup is
+        // deliberately deferred to capture after exact predecessor drain. A
         // watch channel retains the latest view across startup scheduling and
-        // coalesces superseded discovery ticks without losing pane identity.
+        // coalesces superseded ticks without losing transition descriptors.
         let (discovery_publication_tx, discovery_publication_rx) =
             watch::channel(DiscoveryCapturePublication::default());
         // The hot path resets a successor cursor from the most recent
@@ -3436,6 +3909,7 @@ impl ObservationRuntime {
         let heartbeats = Arc::clone(&self.heartbeats);
         let wezterm = Arc::clone(&self.wezterm_handle);
         let replay_capture = self.replay_capture.clone();
+        let capture_authority = self.capture_authority.clone();
 
         let loop_cx = runtime_loop_cx();
         spawn_runtime_task(&loop_cx, move |loop_cx| async move {
@@ -3444,6 +3918,11 @@ impl ObservationRuntime {
             let mut last_discovery_revision = 0_u64;
             let mut last_publication_epoch = 0_u64;
             let mut discovery_revisions = HashMap::<u64, DiscoveryRevision>::new();
+            let mut storage_resync_revisions = HashMap::<u64, DiscoveryRevision>::new();
+            let mut capture_transitions =
+                HashMap::<u64, CaptureTransitionDescriptor>::new();
+            let mut last_capture_view = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
+            let mut capture_setup_pending = HashMap::<u64, &'static str>::new();
 
             loop {
                 if first_tick {
@@ -3490,7 +3969,33 @@ impl ObservationRuntime {
                 match wezterm.list_panes().await {
                     Ok(panes) => {
                         heartbeats.record_discovery();
-                        // Resolve stored UUIDs before first publication. Capture
+                        // This must be the first operation after the listing:
+                        // do not cross even a contended async registry lock
+                        // while an identity contradicted by the fresh mux view
+                        // can still admit producer or persistence guards.
+                        let (pre_storage_view, pre_storage_transitioning) =
+                            conservative_capture_view_before_storage(
+                                &last_capture_view,
+                                &panes,
+                            );
+                        if let Err(error) = publish_discovery_capture_view(
+                            &discovery_publication_tx,
+                            &capture_authority,
+                            &mut last_publication_epoch,
+                            &mut last_capture_view,
+                            pre_storage_view,
+                            pre_storage_transitioning,
+                            Arc::new(capture_transitions.clone()),
+                            "post-list-barrier",
+                        ) {
+                            error!(
+                                error = %error,
+                                "Discovery cannot install the post-list capture barrier; stopping the runtime fail-closed"
+                            );
+                            shutdown_flag.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        // Resolve stored UUIDs before the first ready publication. Capture
                         // snapshots the UUID and generation under the registry
                         // lock; publishing a generated UUID and adopting the
                         // stable one after an await lets a producer advance its
@@ -3503,17 +4008,25 @@ impl ObservationRuntime {
                                 .map(|pane| pane.pane_id)
                                 .collect::<Vec<_>>()
                         };
-                        let mut stable_uuids = storage
-                            .get_panes_by_ids_with_cx(&loop_cx, &candidate_new_panes)
-                            .await
-                            .unwrap_or_else(|error| {
-                                warn!(
-                                    candidate_count = candidate_new_panes.len(),
-                                    error = %error,
-                                    "Failed to recover stable UUIDs for new panes"
-                                );
-                                Vec::new()
-                            })
+                        let stable_pane_records = if candidate_new_panes.is_empty() {
+                            Vec::new()
+                        } else {
+                            match storage
+                                .get_panes_by_ids_with_cx(&loop_cx, &candidate_new_panes)
+                                .await
+                            {
+                                Ok(records) => records,
+                                Err(error) => {
+                                    warn!(
+                                        candidate_count = candidate_new_panes.len(),
+                                        error = %error,
+                                        "Discovery remains pending because stable pane UUID recovery failed"
+                                    );
+                                    continue;
+                                }
+                            }
+                        };
+                        let mut stable_uuids = stable_pane_records
                             .into_iter()
                             .filter_map(|record| {
                                 record
@@ -3521,7 +4034,7 @@ impl ObservationRuntime {
                                     .map(|pane_uuid| (record.pane_id, pane_uuid))
                             })
                             .collect::<HashMap<_, _>>();
-                        let (diff, new_entries) = {
+                        let (diff, new_entries, pending_capture_view) = {
                             let mut reg = registry.write().await;
                             let diff = reg.discovery_tick(panes);
                             for pane_id in &diff.new_panes {
@@ -3551,6 +4064,80 @@ impl ObservationRuntime {
                                     );
                                 }
                             }
+                            for pane_id in &diff.closed_panes {
+                                discovery_revisions.remove(pane_id);
+                                storage_resync_revisions.remove(pane_id);
+                                capture_transitions.remove(pane_id);
+                                capture_setup_pending.remove(pane_id);
+                            }
+                            for pane_id in &diff.new_panes {
+                                capture_setup_pending.insert(*pane_id, "observation_started");
+                            }
+                            for pane_id in &diff.re_observed_panes {
+                                capture_setup_pending.insert(*pane_id, "observation_resumed");
+                            }
+                            let mut transitioning_pane_ids = diff
+                                .new_panes
+                                .iter()
+                                .chain(&diff.new_generations)
+                                .chain(&diff.re_observed_panes)
+                                .copied()
+                                .collect::<Vec<_>>();
+                            transitioning_pane_ids.sort_unstable();
+                            transitioning_pane_ids.dedup();
+                            for pane_id in &transitioning_pane_ids {
+                                let predecessor_revision =
+                                    discovery_revisions.get(pane_id).copied();
+                                match allocate_discovery_revision(&mut last_discovery_revision) {
+                                    Some(revision) => {
+                                        discovery_revisions.insert(*pane_id, revision);
+                                        capture_transitions.insert(
+                                            *pane_id,
+                                            CaptureTransitionDescriptor {
+                                                desired_revision: revision,
+                                                predecessor_revision,
+                                            },
+                                        );
+                                    }
+                                    None => {
+                                        discovery_revisions.remove(pane_id);
+                                        capture_transitions.remove(pane_id);
+                                        error!(
+                                            pane_id,
+                                            "Discovery revision namespace exhausted; refusing capture admission"
+                                        );
+                                    }
+                                }
+                            }
+                            for pane_id in &diff.new_panes {
+                                storage_resync_revisions.remove(pane_id);
+                            }
+                            for pane_id in diff
+                                .new_generations
+                                .iter()
+                                .chain(&diff.re_observed_panes)
+                            {
+                                if let Some(revision) = discovery_revisions.get(pane_id).copied() {
+                                    storage_resync_revisions.insert(*pane_id, revision);
+                                }
+                            }
+                            let pending_capture_view = if transitioning_pane_ids.is_empty()
+                                && diff.closed_panes.is_empty()
+                            {
+                                None
+                            } else {
+                                let transitioning =
+                                    transitioning_pane_ids.into_iter().collect::<HashSet<_>>();
+                                Some((
+                                    capture_publication_view(
+                                        &reg,
+                                        &discovery_revisions,
+                                        &storage_resync_revisions,
+                                        &transitioning,
+                                    ),
+                                    Arc::new(transitioning),
+                                ))
+                            };
                             let new_entries: Vec<_> = diff
                                 .new_panes
                                 .iter()
@@ -3560,25 +4147,34 @@ impl ObservationRuntime {
                                         .map(|entry| (*pane_id, entry))
                                 })
                                 .collect();
-                            (diff, new_entries)
+                            (diff, new_entries, pending_capture_view)
                         };
 
-                        for pane_id in &diff.closed_panes {
-                            discovery_revisions.remove(pane_id);
-                        }
-                        for pane_id in diff.new_panes.iter().chain(&diff.new_generations) {
-                            match allocate_discovery_revision(&mut last_discovery_revision) {
-                                Some(revision) => {
-                                    discovery_revisions.insert(*pane_id, revision);
-                                }
-                                None => {
-                                    discovery_revisions.remove(pane_id);
-                                    error!(
-                                        pane_id,
-                                        "Discovery revision namespace exhausted; refusing capture admission"
-                                    );
-                                }
-                            }
+                        // Publish a transition-pending identity view before any
+                        // storage/cursor setup awaits.  Changed, closed, newly
+                        // observed, and replacement pane IDs are absent here,
+                        // so predecessor persistence admission closes before a
+                        // poll can read a reused live mux pane and attribute it
+                        // to the old revision.
+                        if let Some((pending_capture_view, transitioning_pane_ids)) =
+                            pending_capture_view
+                            && let Err(error) = publish_discovery_capture_view(
+                                &discovery_publication_tx,
+                                &capture_authority,
+                                &mut last_publication_epoch,
+                                &mut last_capture_view,
+                                pending_capture_view,
+                                transitioning_pane_ids,
+                                Arc::new(capture_transitions.clone()),
+                                "transition-pending",
+                            )
+                        {
+                            error!(
+                                error = %error,
+                                "Discovery cannot install the transition barrier; stopping the runtime fail-closed"
+                            );
+                            shutdown_flag.store(true, Ordering::SeqCst);
+                            break;
                         }
 
                         // Handle new panes
@@ -3596,63 +4192,7 @@ impl ObservationRuntime {
                                 );
                             }
 
-                            // Upsert pane in storage
-                            // ft-xbnl0.2.3 tick 251: cx-first upsert (reuse pane_setup_cx).
-                            let record = entry.to_pane_record();
-                            if let Err(e) = storage.upsert_pane_with_cx(&loop_cx, record).await {
-                                error!(pane_id = pane_id, error = %e, "Failed to upsert pane");
-                            }
-
-                            // Create cursor if observed
-                            if entry.should_observe() {
-                                // Initialize cursor from storage to resume capture
-                                // ft-xbnl0.2.3 tick 251: cx-first max_seq (reuse pane_setup_cx).
-                                let max_seq = storage
-                                    .get_max_seq_with_cx(&loop_cx, pane_id)
-                                    .await
-                                    .unwrap_or(None);
-
-                                let next_seq = max_seq.map_or(0, |s| s + 1);
-                                // ft-6lso5: on a restart this pane is "new" to
-                                // the registry but not to storage. Without an
-                                // anchor into what is already persisted, the
-                                // first capture re-emits the pane's whole
-                                // scrollback as a fresh delta.
-                                let resume_anchor =
-                                    load_resume_anchor(&storage, &loop_cx, pane_id).await;
-
-                                {
-                                    let mut cursors = cursors.write().await;
-                                    cursors.insert(
-                                        pane_id,
-                                        PaneCursor::from_seq(pane_id, next_seq)
-                                            .with_resume_anchor(resume_anchor),
-                                    );
-                                }
-
-                                {
-                                    let mut contexts = detection_contexts.write().await;
-                                    let mut ctx = DetectionContext::new();
-                                    ctx.pane_id = Some(pane_id);
-                                    contexts.insert(pane_id, ctx);
-                                }
-
-                                debug!(
-                                    pane_id = pane_id,
-                                    next_seq = next_seq,
-                                    "Started observing pane"
-                                );
-                                if let Some(ref adapter) = replay_capture {
-                                    adapter.capture_lifecycle(
-                                        pane_id,
-                                        crate::recording::RecorderLifecyclePhase::CaptureStarted,
-                                        None,
-                                        serde_json::json!({
-                                            "reason": "observation_started",
-                                        }),
-                                    );
-                                }
-                            } else if let Some(reason) = entry.observation.ignore_reason() {
+                            if let Some(reason) = entry.observation.ignore_reason() {
                                 info!(
                                     pane_id = pane_id,
                                     reason = reason,
@@ -3703,80 +4243,65 @@ impl ObservationRuntime {
                             );
                         }
 
-                        // ft-0kdi9: re-admit panes the observation filter had
-                        // excluded. A pane whose title/cwd changes (`sudo —
-                        // password`, `vim`, …) is marked Ignored on one tick and
-                        // Observed again on a later one, and the compaction below
-                        // deletes the runtime cursor of every unobserved pane.
-                        // Such a pane is not in `diff.new_panes` — the registry
-                        // entry already existed — so the new-pane arm above never
-                        // runs for it and nothing re-creates the cursor. The
-                        // tailer keeps polling it (it is observed again) and every
-                        // poll takes the `None` branch and returns
-                        // `PollOutcome::NoCursor`, so capture stays dead for the
-                        // rest of the daemon's life with no error and no event.
-                        for pane_id in diff.re_observed_panes.iter().copied() {
-                            // The registry retired the pane's last known
-                            // `next_seq` into `resume_next_seq`, but that value is
-                            // published from the capture pipeline once per
-                            // discovery tick, so it can lag by one interval.
-                            // Storage is authoritative for what actually
-                            // persisted; take whichever is further along so seq
-                            // stays monotonic and cannot collide with an existing
-                            // row.
-                            let resume_next_seq = {
+                        // New and re-admitted panes remain absent until their
+                        // durable pane identity is upserted. Cursor/context and
+                        // checkpoint state deliberately belongs to the capture
+                        // coordinator: only it can prove an exact same-ID
+                        // predecessor has drained before reading and certifying
+                        // the successor baseline.
+                        let setup_pane_ids =
+                            capture_setup_pending.keys().copied().collect::<Vec<_>>();
+                        for pane_id in setup_pane_ids {
+                            let Some(reason) = capture_setup_pending.get(&pane_id).copied() else {
+                                continue;
+                            };
+                            let setup_entry = {
                                 let reg = registry.read().await;
-                                reg.get_entry(pane_id)
-                                    .map_or(0, |entry| entry.resume_next_seq)
+                                reg.get_entry(pane_id).cloned().map(|entry| {
+                                    let revision = discovery_revisions.get(&pane_id).copied();
+                                    (entry, revision)
+                                })
                             };
-                            let max_seq = storage
-                                .get_max_seq_with_cx(&loop_cx, pane_id)
+                            let Some((entry, revision)) = setup_entry else {
+                                capture_setup_pending.remove(&pane_id);
+                                continue;
+                            };
+
+                            if let Err(error) = storage
+                                .upsert_pane_with_cx(&loop_cx, entry.to_pane_record())
                                 .await
-                                .unwrap_or(None);
-                            let next_seq = resumed_capture_next_seq(max_seq, resume_next_seq);
-                            // ft-6lso5: same reasoning as the new-pane arm —
-                            // the compacted cursor took its snapshot baseline
-                            // with it, so anchor the resumed capture against
-                            // what is already persisted.
-                            let resume_anchor =
-                                load_resume_anchor(&storage, &loop_cx, pane_id).await;
-
-                            let created = {
-                                // Lock order: cursors (rank 1) before
-                                // detection_contexts, same as the compaction
-                                // block below.
-                                let mut cursors_guard = cursors.write().await;
-                                let mut contexts_guard = detection_contexts.write().await;
-                                resume_runtime_pane_state(
+                            {
+                                error!(
                                     pane_id,
-                                    next_seq,
-                                    resume_anchor,
-                                    &mut cursors_guard,
-                                    &mut contexts_guard,
-                                )
-                            };
-
-                            if created {
-                                info!(
-                                    pane_id = pane_id,
-                                    next_seq = next_seq,
-                                    resume_next_seq = resume_next_seq,
-                                    "Resumed observing pane (observation filter re-admitted it)"
+                                    error = %error,
+                                    "Capture setup remains pending because pane upsert failed"
                                 );
-                                if let Some(ref adapter) = replay_capture {
-                                    adapter.capture_lifecycle(
-                                        pane_id,
-                                        crate::recording::RecorderLifecyclePhase::CaptureStarted,
-                                        None,
-                                        serde_json::json!({
-                                            "reason": "observation_resumed",
-                                        }),
-                                    );
-                                }
-                            } else {
-                                debug!(
-                                    pane_id = pane_id,
-                                    "Pane re-observed with capture cursor still live"
+                                continue;
+                            }
+                            if !entry.should_observe() {
+                                capture_setup_pending.remove(&pane_id);
+                                continue;
+                            }
+                            let Some(revision) = revision else {
+                                error!(
+                                    pane_id,
+                                    "Capture setup remains pending because no checked discovery revision exists"
+                                );
+                                continue;
+                            };
+                            capture_setup_pending.remove(&pane_id);
+                            info!(
+                                pane_id,
+                                revision = revision.get(),
+                                reason,
+                                "Prepared durable pane identity; capture baseline remains post-drain"
+                            );
+                            if let Some(ref adapter) = replay_capture {
+                                adapter.capture_lifecycle(
+                                    pane_id,
+                                    crate::recording::RecorderLifecyclePhase::CaptureStarted,
+                                    None,
+                                    serde_json::json!({ "reason": reason }),
                                 );
                             }
                         }
@@ -3868,50 +4393,35 @@ impl ObservationRuntime {
                             );
                         }
 
+                        let setup_excluded = capture_setup_pending
+                            .keys()
+                            .copied()
+                            .collect::<HashSet<_>>();
                         let observed_panes = {
                             let reg = registry.read().await;
-                            let observed_ids = reg.observed_pane_ids();
-                            let mut published = HashMap::with_capacity(observed_ids.len());
-                            for pane_id in observed_ids {
-                                let Some(entry) = reg.get_entry(pane_id) else {
-                                    continue;
-                                };
-                                let Some(revision) = discovery_revisions.get(&pane_id).copied()
-                                else {
-                                    continue;
-                                };
-                                published.insert(
-                                    pane_id,
-                                    ObservedCapturePane {
-                                        info: entry.info.clone(),
-                                        generation: entry.generation,
-                                        pane_uuid: entry.pane_uuid.clone(),
-                                        revision,
-                                    },
-                                );
-                            }
-                            Arc::new(published)
+                            capture_publication_view(
+                                &reg,
+                                &discovery_revisions,
+                                &storage_resync_revisions,
+                                &setup_excluded,
+                            )
                         };
-                        match allocate_discovery_publication_epoch(&mut last_publication_epoch) {
-                            Some(epoch) => {
-                                if discovery_publication_tx
-                                    .send(DiscoveryCapturePublication {
-                                        epoch,
-                                        observed_panes,
-                                    })
-                                    .is_err()
-                                {
-                                    debug!(
-                                        epoch,
-                                        "Discovery publication receiver closed; interval fallback remains active"
-                                    );
-                                }
-                            }
-                            None => {
-                                error!(
-                                    "Discovery publication namespace exhausted; capture remains fail-closed on its last complete view"
-                                );
-                            }
+                        if let Err(error) = publish_discovery_capture_view(
+                            &discovery_publication_tx,
+                            &capture_authority,
+                            &mut last_publication_epoch,
+                            &mut last_capture_view,
+                            observed_panes,
+                            Arc::new(setup_excluded),
+                            Arc::new(capture_transitions.clone()),
+                            "ready",
+                        ) {
+                            error!(
+                                error = %error,
+                                "Discovery cannot publish the ready capture view; stopping the runtime fail-closed"
+                            );
+                            shutdown_flag.store(true, Ordering::SeqCst);
+                            break;
                         }
                     }
                     Err(e) => {
@@ -3935,7 +4445,7 @@ impl ObservationRuntime {
     fn spawn_capture_task(
         &self,
         capture_tx: mpsc::Sender<CaptureEvent>,
-        mut discovery_publication_rx: watch::Receiver<DiscoveryCapturePublication>,
+        discovery_publication_rx: watch::Receiver<DiscoveryCapturePublication>,
         capture_checkpoints: CaptureCheckpointCache,
     ) -> JoinHandle<()> {
         let registry = Arc::clone(&self.registry);
@@ -3993,7 +4503,7 @@ impl ObservationRuntime {
             let mut supervisor = TailerSupervisor::with_budget(
                 initial_config,
                 capture_tx_for_supervisor,
-                cursors,
+                Arc::clone(&cursors),
                 Arc::clone(&registry), // Pass registry for authoritative state
                 Arc::clone(&shutdown_flag),
                 source,
@@ -4015,8 +4525,13 @@ impl ObservationRuntime {
             let mut streaming_tasks: StreamingTasks = StreamingTasks::new();
             let mut observed_panes_cache = Arc::new(HashMap::<u64, ObservedCapturePane>::new());
             let mut capture_bindings = HashMap::<u64, ActiveCaptureBinding>::new();
-            let mut pending_resyncs =
-                LruCache::<u64, DiscoveryRevision>::new(transition_cache_capacity);
+            let mut pending_resync_bindings =
+                HashMap::<u64, PendingCaptureResyncBinding>::new();
+            let mut draining_bindings = HashMap::<u64, ActiveCaptureBinding>::new();
+            let mut draining_since = HashMap::<u64, Instant>::new();
+            let mut retired_state_candidates = HashSet::<u64>::new();
+            let mut pending_resyncs = PendingCaptureResyncs::new(transition_cache_capacity);
+            let mut completed_resyncs = HashMap::<u64, DiscoveryRevision>::new();
             #[cfg(all(feature = "vendored", unix))]
             let mut next_stream_task_token = 1_u64;
 
@@ -4195,8 +4710,182 @@ impl ObservationRuntime {
                     // monotonic revision-stamped view.
                     let publication = discovery_publication_rx.borrow_and_clone();
                     let publication_epoch = publication.epoch;
-                    observed_panes_cache = publication.observed_panes;
+                    observed_panes_cache = Arc::clone(&publication.observed_panes);
                     let observed_pane_count = observed_panes_cache.len();
+                    pending_resyncs.retain_authoritative(&publication);
+                    completed_resyncs.retain(|pane_id, revision| {
+                        observed_panes_cache
+                            .get(pane_id)
+                            .is_some_and(|pane| pane.revision == *revision)
+                    });
+
+                    // A successor resync is submitted without blocking fleet
+                    // reconciliation on storage.  Persistence decides the
+                    // receipt after durable commit plus cursor correction.
+                    // Until then the provisional binding remains unpublished,
+                    // but unrelated panes continue to reconcile normally.
+                    let pending_resync_pane_ids =
+                        pending_resync_bindings.keys().copied().collect::<Vec<_>>();
+                    for pane_id in pending_resync_pane_ids {
+                        let Some(pending_binding) = pending_resync_bindings.remove(&pane_id) else {
+                            continue;
+                        };
+                        let PendingCaptureResyncBinding {
+                            mut binding,
+                            submitted_at,
+                        } = pending_binding;
+                        let still_current = capture_publication_matches(
+                            &discovery_publication_rx,
+                            pane_id,
+                            binding.revision,
+                        );
+                        if !still_current {
+                            if pending_resyncs.remember(pane_id, binding.revision) {
+                                error!(
+                                    exact_capacity = transition_cache_capacity,
+                                    "Superseded resync will use storage-audited recovery"
+                                );
+                            }
+                            let retired = retire_or_quarantine_capture_binding(
+                                &capture_authority,
+                                &capture_metadata,
+                                &mut draining_bindings,
+                                &mut draining_since,
+                                binding,
+                                "provisional resync superseded",
+                            )
+                            .await;
+                            if retired {
+                                retired_state_candidates.insert(pane_id);
+                            }
+                            continue;
+                        }
+
+                        let outcome = binding
+                            .resync_receipt
+                            .as_ref()
+                            .and_then(CaptureResyncReceipt::outcome);
+                        match outcome {
+                            Some(Ok(sequence)) => {
+                                pending_resyncs.acknowledge(pane_id);
+                                completed_resyncs.insert(pane_id, binding.revision);
+                                binding.resync_receipt = None;
+                                if let Err(error) = enable_native_capture_source(
+                                    &capture_authority,
+                                    &mut binding,
+                                    native_capture_enabled,
+                                ) {
+                                    error!(
+                                        pane_id,
+                                        sequence,
+                                        error = %error,
+                                        "Failed to activate native source after durable resync"
+                                    );
+                                    let retired = retire_or_quarantine_capture_binding(
+                                        &capture_authority,
+                                        &capture_metadata,
+                                        &mut draining_bindings,
+                                        &mut draining_since,
+                                        binding,
+                                        "native source activation failed after resync",
+                                    )
+                                    .await;
+                                    if retired {
+                                        retired_state_candidates.insert(pane_id);
+                                    }
+                                    continue;
+                                }
+                                retired_state_candidates.remove(&pane_id);
+                                capture_bindings.insert(pane_id, binding);
+                            }
+                            Some(Err(reason)) => {
+                                error!(
+                                    pane_id,
+                                    reason = %reason,
+                                    "Capture successor resync failed before durable acknowledgement"
+                                );
+                                pending_resyncs.require_storage_audit(pane_id);
+                                let retired = retire_or_quarantine_capture_binding(
+                                    &capture_authority,
+                                    &capture_metadata,
+                                    &mut draining_bindings,
+                                    &mut draining_since,
+                                    binding,
+                                    "resync persistence failed",
+                                )
+                                .await;
+                                if retired {
+                                    retired_state_candidates.insert(pane_id);
+                                }
+                            }
+                            None => {
+                                if Instant::now().saturating_duration_since(submitted_at)
+                                    >= CAPTURE_RESYNC_RECEIPT_TIMEOUT
+                                {
+                                    error!(
+                                        pane_id,
+                                        timeout_ms = duration_ms_u64(CAPTURE_RESYNC_RECEIPT_TIMEOUT),
+                                        "Capture successor resync receipt timed out; retrying from storage audit"
+                                    );
+                                    pending_resyncs.require_storage_audit(pane_id);
+                                    let retired = retire_or_quarantine_capture_binding(
+                                        &capture_authority,
+                                        &capture_metadata,
+                                        &mut draining_bindings,
+                                        &mut draining_since,
+                                        binding,
+                                        "resync receipt timed out",
+                                    )
+                                    .await;
+                                    if retired {
+                                        retired_state_candidates.insert(pane_id);
+                                    }
+                                } else {
+                                    pending_resync_bindings.insert(
+                                        pane_id,
+                                        PendingCaptureResyncBinding {
+                                            binding,
+                                            submitted_at,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // A timed-out revocation is quarantined here rather than
+                    // reinserted as an active binding.  Retry exact drain on
+                    // each reconciliation; no successor can be admitted while
+                    // a same-ID predecessor remains in this map.
+                    let draining_pane_ids = draining_bindings.keys().copied().collect::<Vec<_>>();
+                    for pane_id in draining_pane_ids {
+                        let Some(binding) = draining_bindings.remove(&pane_id) else {
+                            continue;
+                        };
+                        match capture_authority.retire_pane_if_drained(binding.identity) {
+                            Ok(true) => {
+                                draining_since.remove(&pane_id);
+                                capture_metadata
+                                    .write()
+                                    .await
+                                    .remove(&binding.identity.pane_incarnation());
+                                retired_state_candidates.insert(pane_id);
+                            }
+                            Ok(false) => {
+                                debug!(
+                                    pane_id,
+                                    "Capture binding remains quarantined while exact revocation drains"
+                                );
+                                draining_since.entry(pane_id).or_insert_with(Instant::now);
+                                draining_bindings.insert(pane_id, binding);
+                            }
+                            Err(error) => {
+                                error!(pane_id, error = %error, "Failed to retry quarantined capture revocation");
+                                draining_since.entry(pane_id).or_insert_with(Instant::now);
+                                draining_bindings.insert(pane_id, binding);
+                            }
+                        }
+                    }
 
                     let obsolete_bindings = capture_bindings
                         .iter()
@@ -4240,68 +4929,81 @@ impl ObservationRuntime {
                         error!(error = %error, "Failed to suspend obsolete polling bindings");
                     }
 
-                    // Poll futures live in a FuturesUnordered and only make
-                    // progress while join_next is polled.  Once admission for
-                    // obsolete tailers is removed, settle their already-issued
-                    // polls before awaiting authority drain; otherwise a future
-                    // holding a producer guard could be parked by this very
-                    // task and force a deterministic drain timeout. Unrelated
-                    // polls remain live in the set and must not impose a
-                    // fleet-wide barrier for one pane transition.
-                    if !obsolete_bindings.is_empty() {
-                        let mut poll_drain_cancelled = false;
-                        while obsolete_bindings
-                            .iter()
-                            .any(|pane_id| supervisor.capture_inflight(*pane_id))
-                        {
-                            let Some((pane_id, outcome)) =
-                                poll_tasks.join_next_with_cx(&loop_cx).await
-                            else {
-                                poll_drain_cancelled = true;
-                                break;
-                            };
-                            supervisor.handle_poll_result(pane_id, outcome);
-                        }
-                        let obsolete_polls_remaining = obsolete_bindings
-                            .iter()
-                            .filter(|pane_id| supervisor.capture_inflight(**pane_id))
-                            .count();
-                        if poll_drain_cancelled || obsolete_polls_remaining > 0 {
-                            error!(
-                                pending_poll_tasks = poll_tasks.len(),
-                                obsolete_polls_remaining,
-                                "Capture poll drain was cancelled; leaving successors unpublished"
-                            );
+                    for pane_id in obsolete_bindings {
+                        let Some(binding) = capture_bindings.remove(&pane_id) else {
                             continue;
+                        };
+                        // Always retain the obsolete revision until a fresh
+                        // publication proves the pane terminal. A successor can
+                        // be published after the borrowed snapshot above, so a
+                        // snapshot-conditioned remember would lose its exact
+                        // predecessor obligation in that race.
+                        if pending_resyncs.remember(pane_id, binding.revision) {
+                            error!(
+                                exact_capacity = transition_cache_capacity,
+                                "Capture transition exact fast path saturated; successor will use storage-audited resync"
+                            );
+                        }
+                        let retired = retire_or_quarantine_capture_binding(
+                            &capture_authority,
+                            &capture_metadata,
+                            &mut draining_bindings,
+                            &mut draining_since,
+                            binding,
+                            "obsolete publication binding",
+                        )
+                        .await;
+                        if retired {
+                            retired_state_candidates.insert(pane_id);
                         }
                     }
 
-                    for pane_id in obsolete_bindings {
-                        let Some(binding) = capture_bindings.get(&pane_id) else {
-                            continue;
-                        };
-                        match retire_capture_binding(&loop_cx, &capture_authority, binding).await {
-                            Ok(()) => {
-                                if let Some(retired) = capture_bindings.remove(&pane_id) {
-                                    let _ = pending_resyncs.put(pane_id, retired.revision);
-                                    capture_metadata
-                                        .write()
-                                        .await
-                                        .remove(&retired.identity.pane_incarnation());
-                                }
+                    // The capture coordinator is the sole owner of terminal
+                    // cursor/context/activity teardown. Retire exact authority
+                    // first, then borrow the latest publication so a same-ID
+                    // successor published during drain cannot lose its state.
+                    let terminal_publication = discovery_publication_rx.borrow_and_clone();
+                    let terminal_candidates = retired_state_candidates
+                        .iter()
+                        .copied()
+                        .filter(|pane_id| {
+                            !terminal_publication.observed_panes.contains_key(pane_id)
+                                && !terminal_publication
+                                    .transitioning_pane_ids
+                                    .contains(pane_id)
+                                && !terminal_publication.transitions.contains_key(pane_id)
+                        })
+                        .collect::<Vec<_>>();
+                    for pane_id in terminal_candidates {
+                        remove_runtime_pane_state_for_pane(
+                            pane_id,
+                            &cursors,
+                            &detection_contexts,
+                            &pane_activity_tracker,
+                        )
+                        .await;
+                        backpressure.cleanup_pane(pane_id);
+                        match capture_checkpoints.lock() {
+                            Ok(mut checkpoints) => {
+                                checkpoints.remove(&pane_id);
                             }
-                            Err(error) => {
+                            Err(_) => {
                                 error!(
                                     pane_id,
-                                    error = %error,
-                                    "Capture pane remained fail-closed while draining"
+                                    "Capture checkpoint cache is poisoned during terminal teardown"
                                 );
                             }
                         }
+                        pending_resyncs.acknowledge(pane_id);
+                        completed_resyncs.remove(&pane_id);
+                        retired_state_candidates.remove(&pane_id);
                     }
 
-                    for (&pane_id, observed) in &observed_panes_cache {
-                        if capture_bindings.contains_key(&pane_id) {
+                    for (&pane_id, observed) in observed_panes_cache.iter() {
+                        if capture_bindings.contains_key(&pane_id)
+                            || pending_resync_bindings.contains_key(&pane_id)
+                            || draining_bindings.contains_key(&pane_id)
+                        {
                             continue;
                         }
                         let desired_is_current = capture_publication_matches(
@@ -4314,17 +5016,101 @@ impl ObservationRuntime {
                             continue;
                         }
 
-                        let pending_predecessor = pending_resyncs.get(&pane_id).copied();
-                        if let Some(predecessor_revision) = pending_predecessor {
-                            let checkpoint = match recover_capture_checkpoint(
+                        // Discovery never certifies a cursor baseline. Do the
+                        // storage read here, after every exact same-ID
+                        // predecessor has left both active and draining maps.
+                        // A late predecessor commit therefore cannot race this
+                        // successor baseline into false certainty.
+                        let initialized_checkpoint = if cursors.read().await.contains_key(&pane_id)
+                        {
+                            None
+                        } else {
+                            let checkpoint = match load_capture_checkpoint_from_storage(
                                 &loop_cx,
                                 &storage,
-                                &capture_checkpoints,
                                 pane_id,
-                                predecessor_revision,
+                                observed.revision,
                             )
                             .await
                             {
+                                Ok(checkpoint) => checkpoint,
+                                Err(error) => {
+                                    error!(
+                                        pane_id,
+                                        error = %error,
+                                        "Capture successor remains unpublished because post-drain baseline recovery failed"
+                                    );
+                                    continue;
+                                }
+                            };
+                            match initialize_capture_state_from_checkpoint(
+                                pane_id,
+                                &checkpoint,
+                                &cursors,
+                                &detection_contexts,
+                                &pane_activity_tracker,
+                                &capture_checkpoints,
+                            )
+                            .await
+                            {
+                                Ok(true) => Some(checkpoint),
+                                Ok(false) => None,
+                                Err(error) => {
+                                    error!(
+                                        pane_id,
+                                        error = %error,
+                                        "Capture successor remains unpublished because post-drain state initialization failed"
+                                    );
+                                    continue;
+                                }
+                            }
+                        };
+
+                        let resync_completed = completed_resyncs.get(&pane_id).copied()
+                            == Some(observed.revision);
+                        let mut resync_requirement = if resync_completed {
+                            None
+                        } else {
+                            pending_resyncs.requirement(
+                                pane_id,
+                                observed.requires_storage_resync,
+                            )
+                        };
+                        if !resync_completed
+                            && resync_requirement.is_none()
+                            && initialized_checkpoint
+                                .as_ref()
+                                .is_some_and(|checkpoint| checkpoint.next_seq > 0)
+                        {
+                            resync_requirement = Some(CaptureResyncRequirement::StorageAudit);
+                        }
+                        if let Some(requirement) = resync_requirement {
+                            let checkpoint_result = match requirement {
+                                CaptureResyncRequirement::Exact(predecessor_revision) => {
+                                    recover_capture_checkpoint(
+                                        &loop_cx,
+                                        &storage,
+                                        &capture_checkpoints,
+                                        pane_id,
+                                        predecessor_revision,
+                                    )
+                                    .await
+                                }
+                                CaptureResyncRequirement::StorageAudit => {
+                                    if let Some(checkpoint) = initialized_checkpoint.as_ref() {
+                                        Ok(checkpoint.clone())
+                                    } else {
+                                        load_capture_checkpoint_from_storage(
+                                            &loop_cx,
+                                            &storage,
+                                            pane_id,
+                                            observed.revision,
+                                        )
+                                        .await
+                                    }
+                                }
+                            };
+                            let checkpoint = match checkpoint_result {
                                 Ok(checkpoint) => checkpoint,
                                 Err(error) => {
                                     error!(
@@ -4340,6 +5126,7 @@ impl ObservationRuntime {
                                 pane_id,
                                 observed.revision,
                                 &checkpoint,
+                                false,
                                 &cursors,
                                 &detection_contexts,
                                 &pane_activity_tracker,
@@ -4386,31 +5173,28 @@ impl ObservationRuntime {
                                     observed.revision,
                                 ) {
                                     next_sync_tick = Instant::now();
-                                    match retire_capture_binding(
-                                        &loop_cx,
+                                    if pending_resyncs.remember(pane_id, observed.revision) {
+                                        error!(
+                                            exact_capacity = transition_cache_capacity,
+                                            "Capture transition exact fast path saturated; successor will use storage-audited resync"
+                                        );
+                                    }
+                                    let retired = retire_or_quarantine_capture_binding(
                                         &capture_authority,
-                                        &binding,
+                                        &capture_metadata,
+                                        &mut draining_bindings,
+                                        &mut draining_since,
+                                        binding,
+                                        "superseded before exposure",
                                     )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            capture_metadata.write().await.remove(
-                                                &binding.identity.pane_incarnation(),
-                                            );
-                                        }
-                                        Err(retire_error) => {
-                                            error!(
-                                                pane_id,
-                                                error = %retire_error,
-                                                "Superseded unexposed successor remained draining"
-                                            );
-                                            capture_bindings.insert(pane_id, binding);
-                                        }
+                                    .await;
+                                    if retired {
+                                        retired_state_candidates.insert(pane_id);
                                     }
                                     continue;
                                 }
-                                if pending_predecessor.is_some() {
-                                    if let Err(error) = emit_capture_generation_resync(
+                                if resync_requirement.is_some() {
+                                    match emit_capture_generation_resync(
                                         &loop_cx,
                                         &resync_source,
                                         &capture_tx,
@@ -4419,36 +5203,39 @@ impl ObservationRuntime {
                                     )
                                     .await
                                     {
-                                        error!(
-                                            pane_id,
-                                            desired_revision = observed.revision.get(),
-                                            error = %error,
-                                            "Capture successor resync was not durably acknowledged"
-                                        );
-                                        match retire_capture_binding(
-                                            &loop_cx,
-                                            &capture_authority,
-                                            &binding,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                capture_metadata.write().await.remove(
-                                                    &binding.identity.pane_incarnation(),
-                                                );
-                                            }
-                                            Err(retire_error) => {
-                                                error!(
-                                                    pane_id,
-                                                    error = %retire_error,
-                                                    "Unacknowledged successor remained draining"
-                                                );
-                                                capture_bindings.insert(pane_id, binding);
+                                        Ok(receipt) => {
+                                            binding.resync_receipt = Some(receipt);
+                                            pending_resync_bindings.insert(
+                                                pane_id,
+                                                PendingCaptureResyncBinding {
+                                                    binding,
+                                                    submitted_at: Instant::now(),
+                                                },
+                                            );
+                                        }
+                                        Err(error) => {
+                                            error!(
+                                                pane_id,
+                                                desired_revision = observed.revision.get(),
+                                                error = %error,
+                                                "Capture successor resync could not enter the durable pipeline"
+                                            );
+                                            pending_resyncs.require_storage_audit(pane_id);
+                                            let retired = retire_or_quarantine_capture_binding(
+                                                &capture_authority,
+                                                &capture_metadata,
+                                                &mut draining_bindings,
+                                                &mut draining_since,
+                                                binding,
+                                                "resync submission failed",
+                                            )
+                                            .await;
+                                            if retired {
+                                                retired_state_candidates.insert(pane_id);
                                             }
                                         }
-                                        continue;
                                     }
-                                    pending_resyncs.remove(&pane_id);
+                                    continue;
                                 }
                                 if !capture_publication_matches(
                                     &discovery_publication_rx,
@@ -4456,28 +5243,23 @@ impl ObservationRuntime {
                                     observed.revision,
                                 ) {
                                     next_sync_tick = Instant::now();
-                                    match retire_capture_binding(
-                                        &loop_cx,
+                                    if pending_resyncs.remember(pane_id, observed.revision) {
+                                        error!(
+                                            exact_capacity = transition_cache_capacity,
+                                            "Capture transition exact fast path saturated; successor will use storage-audited resync"
+                                        );
+                                    }
+                                    let retired = retire_or_quarantine_capture_binding(
                                         &capture_authority,
-                                        &binding,
+                                        &capture_metadata,
+                                        &mut draining_bindings,
+                                        &mut draining_since,
+                                        binding,
+                                        "durable successor superseded before exposure",
                                     )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            capture_metadata.write().await.remove(
-                                                &binding.identity.pane_incarnation(),
-                                            );
-                                            let _ = pending_resyncs
-                                                .put(pane_id, observed.revision);
-                                        }
-                                        Err(retire_error) => {
-                                            error!(
-                                                pane_id,
-                                                error = %retire_error,
-                                                "Durable but superseded successor remained draining"
-                                            );
-                                            capture_bindings.insert(pane_id, binding);
-                                        }
+                                    .await;
+                                    if retired {
+                                        retired_state_candidates.insert(pane_id);
                                     }
                                     continue;
                                 }
@@ -4491,29 +5273,21 @@ impl ObservationRuntime {
                                         error = %error,
                                         "Failed to activate native capture source"
                                     );
-                                    match retire_capture_binding(
-                                        &loop_cx,
+                                    let retired = retire_or_quarantine_capture_binding(
                                         &capture_authority,
-                                        &binding,
+                                        &capture_metadata,
+                                        &mut draining_bindings,
+                                        &mut draining_since,
+                                        binding,
+                                        "native source activation failed",
                                     )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            capture_metadata.write().await.remove(
-                                                &binding.identity.pane_incarnation(),
-                                            );
-                                        }
-                                        Err(retire_error) => {
-                                            error!(
-                                                pane_id,
-                                                error = %retire_error,
-                                                "Partially activated successor remained draining"
-                                            );
-                                            capture_bindings.insert(pane_id, binding);
-                                        }
+                                    .await;
+                                    if retired {
+                                        retired_state_candidates.insert(pane_id);
                                     }
                                     continue;
                                 }
+                                retired_state_candidates.remove(&pane_id);
                                 capture_bindings.insert(pane_id, binding);
                             }
                             Err(error) => {
@@ -4619,7 +5393,7 @@ impl ObservationRuntime {
                         }
 
                         if let Some(subscription_config) = vendored_subscription_config.clone() {
-                            for (&pane_id, observed_pane) in &observed_panes_cache {
+                            for (&pane_id, observed_pane) in observed_panes_cache.iter() {
                                 if streaming_tasks.contains_key(&pane_id) {
                                     continue;
                                 }
@@ -4892,6 +5666,19 @@ impl ObservationRuntime {
 
                     // Publish scheduler snapshot for health reporting.
                     *scheduler_snapshot.write().await = supervisor.scheduler_snapshot();
+
+                    // Prompt transition retries must not starve poll futures:
+                    // those futures own producer guards whose release is often
+                    // the condition for `draining_bindings` to make progress.
+                    // Polling once also registers wakeups for pending work;
+                    // draining ready completions is bounded per sync tick.
+                    let poll_reap_limit = poll_tasks.len().min(CAPTURE_POLL_REAP_BUDGET);
+                    for _ in 0..poll_reap_limit {
+                        let Some((pane_id, outcome)) = poll_tasks.try_join_next() else {
+                            break;
+                        };
+                        supervisor.handle_poll_result(pane_id, outcome);
+                    }
 
                     debug!(
                         discovery_publication_epoch = publication_epoch,
@@ -5240,7 +6027,10 @@ impl ObservationRuntime {
                         }
 
                         // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
-                        if capture_ring_tx.send_with_cx(&loop_cx, event).await.is_err() {
+                        if relay_capture_event_with_cx(&loop_cx, &capture_ring_tx, event)
+                            .await
+                            .is_err()
+                        {
                             metrics.record_capture_queue_depth(0);
                             debug!("Capture relay: persistence ring closed");
                             return;
@@ -5311,66 +6101,35 @@ impl ObservationRuntime {
             while let Some(mut event) = capture_rx.recv().await {
                 let mut durability_ack =
                     CaptureDurabilityAck::new(event.take_durability_ack());
+                let mut resync_decision = event.take_resync_decision();
                 let stamp = event.stamp();
-                let persistence_guard = match capture_authority
-                    .try_acquire_persistence(stamp, event.segment.pane_id)
+                let (persistence_guard, capture_pane_metadata) = match
+                    admit_capture_event_for_persistence(
+                        &capture_authority,
+                        &capture_metadata,
+                        &discovery_publication_rx,
+                        &event,
+                    )
+                    .await
                 {
-                    Ok(guard) => guard,
+                    Ok(admission) => admission,
                     Err(error) => {
                         metrics.capture_authority_rejections.increment();
                         debug!(
+                            pane_id = event.segment.pane_id,
+                            pane_incarnation = stamp.pane_incarnation().get(),
                             source_kind = ?stamp.source_kind(),
                             error = %error,
                             "Rejected stale capture event before semantic side effects"
                         );
+                        if let Some(decision) = resync_decision.as_mut() {
+                            decision.finish(Err(error.to_string()));
+                        }
                         durability_ack.finish(Err(error.to_string()));
                         continue;
                     }
                 };
                 let pane_incarnation = stamp.pane_incarnation();
-                let Some(capture_pane_metadata) = capture_metadata
-                    .read()
-                    .await
-                    .get(&pane_incarnation)
-                    .cloned()
-                else {
-                    metrics.capture_authority_rejections.increment();
-                    error!(
-                        pane_id = event.segment.pane_id,
-                        pane_incarnation = pane_incarnation.get(),
-                        "Capture authority admitted an event without immutable pane metadata"
-                    );
-                    durability_ack.finish(Err(
-                        "capture event has no immutable pane metadata".to_string(),
-                    ));
-                    continue;
-                };
-                let metadata_is_current = {
-                    let publication = discovery_publication_rx.borrow();
-                    publication
-                        .observed_panes
-                        .get(&event.segment.pane_id)
-                        .is_some_and(|pane| {
-                            pane.pane_uuid == capture_pane_metadata.pane_uuid
-                                && pane.generation
-                                    == capture_pane_metadata.discovery_generation
-                                && pane.revision
-                                    == capture_pane_metadata.discovery_revision
-                        })
-                };
-                if !metadata_is_current {
-                    metrics.capture_authority_rejections.increment();
-                    debug!(
-                        pane_id = event.segment.pane_id,
-                        pane_incarnation = pane_incarnation.get(),
-                        discovery_revision = capture_pane_metadata.discovery_revision.get(),
-                        "Rejected capture event after discovery published a different revision"
-                    );
-                    durability_ack.finish(Err(
-                        "capture discovery revision is no longer current".to_string(),
-                    ));
-                    continue;
-                }
                 metrics.record_capture_queue_depth(capture_rx.depth());
                 heartbeats.record_persistence();
                 // Check shutdown flag - if set, drain remaining events quickly
@@ -5431,7 +6190,7 @@ impl ObservationRuntime {
 
                 // Persist the segment
                 // ft-xbnl0.2.3 tick 254: cx-first segment persist.
-                mark_capture_checkpoint_uncertain(
+                let checkpoint_write = begin_capture_checkpoint_write(
                     &capture_checkpoints,
                     pane_id,
                     capture_pane_metadata.discovery_revision,
@@ -5450,18 +6209,10 @@ impl ObservationRuntime {
                         confirm_capture_checkpoint(
                             &capture_checkpoints,
                             pane_id,
-                            capture_pane_metadata.discovery_revision,
+                            &checkpoint_write,
                             persisted.segment.seq,
                             &bounded_segment.content,
                         );
-                        if let Some(ref adapter) = replay_capture {
-                            record_authorized_replay_egress(
-                                adapter,
-                                &bounded_segment,
-                                persisted.segment.seq,
-                                &persistence_guard,
-                            );
-                        }
                         // Check for sequence discontinuity and resync cursor if needed
                         if persisted.segment.seq != captured_seq {
                             warn!(
@@ -5471,9 +6222,49 @@ impl ObservationRuntime {
                                 "Sequence discontinuity detected, resyncing cursor"
                             );
                             let mut cursors_guard = cursors.write().await;
-                            if let Some(cursor) = cursors_guard.get_mut(&pane_id) {
-                                cursor.resync_seq(persisted.segment.seq);
-                            }
+                            let Some(cursor) = cursors_guard.get_mut(&pane_id) else {
+                                let error = runtime_backend_error(
+                                    "capture.persistence.cursor",
+                                    format!(
+                                        "pane {pane_id} has no cursor for mandatory sequence correction"
+                                    ),
+                                );
+                                error!(
+                                    pane_id,
+                                    error = %error,
+                                    "Durable capture cannot continue semantic fanout without cursor correction"
+                                );
+                                if let Some(decision) = resync_decision.as_mut() {
+                                    decision.finish(Err(error.to_string()));
+                                }
+                                durability_ack.finish(Err(error.to_string()));
+                                continue;
+                            };
+                            cursor.resync_seq(persisted.segment.seq);
+                        }
+
+                        // This acknowledgement is deliberately tied to the
+                        // durable segment commit and mandatory cursor sequence
+                        // reconciliation, not to the independent
+                        // recording/detection fanout below.  Acknowledging
+                        // before a storage-assigned sequence correction can
+                        // expose the successor with a stale next sequence;
+                        // delaying it through downstream fanout can instead
+                        // time out after the gap is durable and duplicate that
+                        // gap on retry.  The persistence guard remains alive
+                        // for the entire semantic chain, so revocation still
+                        // waits for every admitted predecessor side effect.
+                        if let Some(decision) = resync_decision.as_mut() {
+                            decision.finish(Ok(persisted.segment.seq));
+                        }
+                        durability_ack.finish(Ok(persisted.segment.seq));
+                        if let Some(ref adapter) = replay_capture {
+                            record_authorized_replay_egress(
+                                adapter,
+                                &bounded_segment,
+                                persisted.segment.seq,
+                                &persistence_guard,
+                            );
                         }
 
                         // Track metrics
@@ -5667,10 +6458,12 @@ impl ObservationRuntime {
                                 }
                             }
                         }
-                        durability_ack.finish(Ok(persisted.segment.seq));
                     }
                     Err(e) => {
                         error!(pane_id = pane_id, error = %e, "Failed to persist segment");
+                        if let Some(decision) = resync_decision.as_mut() {
+                            decision.finish(Err(e.to_string()));
+                        }
                         durability_ack.finish(Err(e.to_string()));
                     }
                 }
@@ -6419,6 +7212,7 @@ fn assemble_resume_anchor(segments: Vec<crate::storage::Segment>) -> String {
 ///   segments were captured and not yet flushed.
 ///
 /// Taking the maximum keeps `next_seq` monotonic against both.
+#[cfg(test)]
 fn resumed_capture_next_seq(max_persisted_seq: Option<u64>, resume_next_seq: u64) -> u64 {
     max_persisted_seq
         .map_or(0, |seq| seq.saturating_add(1))
@@ -6437,6 +7231,7 @@ fn resumed_capture_next_seq(max_persisted_seq: Option<u64>, resume_next_seq: u64
 ///
 /// Callers must hold the `cursors` guard before the `detection_contexts` guard
 /// (lock-order rank 1 first).
+#[cfg(test)]
 fn resume_runtime_pane_state(
     pane_id: u64,
     next_seq: u64,
@@ -7919,6 +8714,8 @@ mod tests {
         DiscoveryCapturePublication {
             epoch,
             observed_panes: Arc::new(HashMap::new()),
+            transitioning_pane_ids: Arc::new(HashSet::new()),
+            transitions: Arc::new(HashMap::new()),
         }
     }
 
@@ -7935,6 +8732,75 @@ mod tests {
         epoch = u64::MAX;
         assert_eq!(allocate_discovery_publication_epoch(&mut epoch), None);
         assert_eq!(epoch, u64::MAX);
+    }
+
+    #[test]
+    fn conservative_pre_storage_view_revokes_only_unproven_identities() {
+        let retained_pane = ObservedCapturePane {
+            info: make_pane(1, "retained"),
+            generation: 2,
+            pane_uuid: "retained-uuid".to_string(),
+            revision: DiscoveryRevision(10),
+            requires_storage_resync: false,
+        };
+        let closed_pane = ObservedCapturePane {
+            info: make_pane(2, "closed"),
+            generation: 3,
+            pane_uuid: "closed-uuid".to_string(),
+            revision: DiscoveryRevision(11),
+            requires_storage_resync: false,
+        };
+        let replaced_pane = ObservedCapturePane {
+            info: make_pane(3, "predecessor"),
+            generation: 4,
+            pane_uuid: "predecessor-uuid".to_string(),
+            revision: DiscoveryRevision(12),
+            requires_storage_resync: false,
+        };
+        let previous = HashMap::from([
+            (1, retained_pane.clone()),
+            (2, closed_pane),
+            (3, replaced_pane),
+        ]);
+        let panes = vec![
+            make_pane(1, "retained"),
+            make_pane(3, "successor"),
+            make_pane(4, "new"),
+        ];
+
+        let (view, transitioning) =
+            conservative_capture_view_before_storage(&previous, &panes);
+
+        assert_eq!(view.len(), 1);
+        let retained = view.get(&1).expect("unchanged pane remains admissible");
+        assert_eq!(retained.revision, retained_pane.revision);
+        assert!(!view.contains_key(&2), "closed predecessor is revoked");
+        assert!(!view.contains_key(&3), "changed predecessor is revoked");
+        assert_eq!(transitioning, Arc::new(HashSet::from([3, 4])));
+    }
+
+    #[test]
+    fn discovery_publication_channel_loss_fails_closed() {
+        let authority = CaptureAuthority::new();
+        let (tx, rx) = watch::channel(DiscoveryCapturePublication::default());
+        drop(rx);
+        let mut last_epoch = 0;
+        let mut last_view = Arc::new(HashMap::new());
+
+        let result = publish_discovery_capture_view(
+            &tx,
+            &authority,
+            &mut last_epoch,
+            &mut last_view,
+            Arc::new(HashMap::new()),
+            Arc::new(HashSet::new()),
+            Arc::new(HashMap::new()),
+            "test-closed-channel",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(last_epoch, 1, "failed epoch remains consumed, never reused");
+        assert!(last_view.is_empty());
     }
 
     #[test]
@@ -7966,28 +8832,567 @@ mod tests {
     fn durability_checkpoint_is_bounded_and_uncertainty_fails_closed() {
         let checkpoints = Arc::new(StdMutex::new(LruCache::new(2)));
         let revision = DiscoveryRevision(7);
-        mark_capture_checkpoint_uncertain(&checkpoints, 42, revision);
-        assert!(certain_capture_checkpoint(&checkpoints, 42, revision).is_none());
+
+        let unseeded = begin_capture_checkpoint_write(&checkpoints, 42, revision);
+        confirm_capture_checkpoint(&checkpoints, 42, &unseeded, 4, "unseeded");
+        assert!(
+            certain_capture_checkpoint(&checkpoints, 42, revision).is_none(),
+            "one later segment cannot certify missing durable history"
+        );
 
         let raw = "x".repeat(crate::ingest::RESUME_ANCHOR_BYTES * 2);
-        confirm_capture_checkpoint(&checkpoints, 42, revision, 4, &raw);
+        let _ = checkpoints.lock().expect("checkpoint cache").put(
+            42,
+            CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
+                revision,
+                next_seq: 4,
+                raw_tail: raw,
+            }),
+        );
+        let contiguous = begin_capture_checkpoint_write(&checkpoints, 42, revision);
+        confirm_capture_checkpoint(&checkpoints, 42, &contiguous, 4, "tail");
         let confirmed = certain_capture_checkpoint(&checkpoints, 42, revision)
-            .expect("confirmed checkpoint");
+            .expect("contiguous confirmed checkpoint");
         assert_eq!(confirmed.next_seq, 5);
         assert_eq!(confirmed.raw_tail.len(), crate::ingest::RESUME_ANCHOR_BYTES);
+        assert!(confirmed.raw_tail.ends_with("tail"));
 
-        mark_capture_checkpoint_uncertain(&checkpoints, 42, revision);
+        let ambiguous = begin_capture_checkpoint_write(&checkpoints, 42, revision);
+        drop(ambiguous);
         assert!(certain_capture_checkpoint(&checkpoints, 42, revision).is_none());
-        confirm_capture_checkpoint(&checkpoints, 42, revision, 5, "tail");
-        let reconfirmed = certain_capture_checkpoint(&checkpoints, 42, revision)
-            .expect("reconfirmed checkpoint");
-        assert_eq!(reconfirmed.next_seq, 6);
-        assert!(reconfirmed.raw_tail.ends_with("tail"));
+        let after_ambiguous = begin_capture_checkpoint_write(&checkpoints, 42, revision);
+        confirm_capture_checkpoint(&checkpoints, 42, &after_ambiguous, 5, "later");
+        assert!(
+            certain_capture_checkpoint(&checkpoints, 42, revision).is_none(),
+            "a later success cannot erase an ambiguous predecessor write"
+        );
+
+        let _ = checkpoints.lock().expect("checkpoint cache").put(
+            42,
+            CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
+                revision,
+                next_seq: 8,
+                raw_tail: "base".to_string(),
+            }),
+        );
+        let corrected = begin_capture_checkpoint_write(&checkpoints, 42, revision);
+        confirm_capture_checkpoint(&checkpoints, 42, &corrected, 9, "corrected");
+        assert!(
+            certain_capture_checkpoint(&checkpoints, 42, revision).is_none(),
+            "storage-assigned sequence correction requires authoritative reconciliation"
+        );
 
         assert!(
             certain_capture_checkpoint(&checkpoints, 42, DiscoveryRevision(8)).is_none(),
             "a same-ID successor cannot consume a predecessor revision without transition reset"
         );
+    }
+
+    #[test]
+    fn post_drain_capture_setup_bootstraps_checkpoint_without_overwrite() {
+        run_async_test(async {
+            let pane_id = 42;
+            let revision = DiscoveryRevision(7);
+            let cursors = Arc::new(RwLock::new(HashMap::<u64, PaneCursor>::new()));
+            let contexts = Arc::new(RwLock::new(HashMap::<u64, DetectionContext>::new()));
+            let activity = Arc::new(RwLock::new(HashMap::<u64, PaneActivityState>::new()));
+            let checkpoints = Arc::new(StdMutex::new(LruCache::new(2)));
+            let checkpoint = CaptureDurabilityCheckpoint {
+                revision,
+                next_seq: 5,
+                raw_tail: "durable tail".to_string(),
+            };
+
+            assert!(
+                initialize_capture_state_from_checkpoint(
+                    pane_id,
+                    &checkpoint,
+                    &cursors,
+                    &contexts,
+                    &activity,
+                    &checkpoints,
+                )
+                .await
+                .expect("initialize post-drain storage-proven capture state")
+            );
+            assert_eq!(
+                cursors
+                    .read()
+                    .await
+                    .get(&pane_id)
+                    .expect("initialized cursor")
+                    .next_seq,
+                5
+            );
+            assert!(contexts.read().await.contains_key(&pane_id));
+            let cached = certain_capture_checkpoint(&checkpoints, pane_id, revision)
+                .expect("post-drain storage-proven checkpoint is immediately certain");
+            assert_eq!(cached.next_seq, 5);
+            assert_eq!(cached.raw_tail, "durable tail");
+
+            let superseding_setup = CaptureDurabilityCheckpoint {
+                revision: DiscoveryRevision(8),
+                next_seq: 99,
+                raw_tail: "must not overwrite live state".to_string(),
+            };
+            assert!(
+                !initialize_capture_state_from_checkpoint(
+                    pane_id,
+                    &superseding_setup,
+                    &cursors,
+                    &contexts,
+                    &activity,
+                    &checkpoints,
+                )
+                .await
+                .expect("existing cursor is coordinator-owned")
+            );
+            assert_eq!(
+                cursors
+                    .read()
+                    .await
+                    .get(&pane_id)
+                    .expect("retained live cursor")
+                    .next_seq,
+                5
+            );
+            assert!(
+                certain_capture_checkpoint(
+                    &checkpoints,
+                    pane_id,
+                    superseding_setup.revision,
+                )
+                .is_none(),
+                "post-drain setup must not certify over an existing coordinator-owned cursor"
+            );
+        });
+    }
+
+    #[test]
+    fn checkpoint_eviction_cannot_be_recertified_from_one_later_segment() {
+        let checkpoints = Arc::new(StdMutex::new(LruCache::new(1)));
+        let revision = DiscoveryRevision(3);
+        let _ = checkpoints.lock().expect("checkpoint cache").put(
+            1,
+            CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
+                revision,
+                next_seq: 10,
+                raw_tail: "pane one history".to_string(),
+            }),
+        );
+        let _ = checkpoints.lock().expect("checkpoint cache").put(
+            2,
+            CachedCaptureCheckpoint::Certain(CaptureDurabilityCheckpoint {
+                revision,
+                next_seq: 20,
+                raw_tail: "pane two history".to_string(),
+            }),
+        );
+
+        let evicted = begin_capture_checkpoint_write(&checkpoints, 1, revision);
+        confirm_capture_checkpoint(&checkpoints, 1, &evicted, 10, "short prompt");
+
+        assert!(
+            certain_capture_checkpoint(&checkpoints, 1, revision).is_none(),
+            "eviction must force storage fallback instead of inventing a short anchor"
+        );
+    }
+
+    #[test]
+    fn pending_resync_overflow_never_becomes_direct_admission() {
+        let mut pending = PendingCaptureResyncs::new(1);
+        assert!(!pending.remember(1, DiscoveryRevision(10)));
+        assert!(pending.remember(2, DiscoveryRevision(20)));
+        assert_eq!(
+            pending.requirement(1, false),
+            Some(CaptureResyncRequirement::Exact(DiscoveryRevision(10)))
+        );
+        assert_eq!(
+            pending.requirement(2, false),
+            Some(CaptureResyncRequirement::StorageAudit),
+            "capacity-plus-one transition must fail over to storage, never disappear"
+        );
+
+        pending.acknowledge(1);
+        assert_eq!(
+            pending.requirement(1, false),
+            None,
+            "settled transitions must not poison unrelated future panes"
+        );
+        assert_eq!(
+            pending.requirement(2, false),
+            Some(CaptureResyncRequirement::StorageAudit),
+            "overflow fallback must not depend on discovery's earlier storage observation"
+        );
+        pending.acknowledge(2);
+        assert_eq!(pending.requirement(2, false), None);
+        assert!(capture_resync_has_proven_continuity(
+            CaptureResyncRequirement::Exact(DiscoveryRevision(30)),
+            DiscoveryRevision(30),
+        ));
+        assert!(!capture_resync_has_proven_continuity(
+            CaptureResyncRequirement::Exact(DiscoveryRevision(30)),
+            DiscoveryRevision(31),
+        ));
+        assert!(!capture_resync_has_proven_continuity(
+            CaptureResyncRequirement::StorageAudit,
+            DiscoveryRevision(31),
+        ));
+    }
+
+    #[test]
+    fn pending_resync_survives_pending_and_ready_transition_publications() {
+        let pane_id = 42;
+        let predecessor_revision = DiscoveryRevision(10);
+        let successor_revision = DiscoveryRevision(11);
+        let transition = CaptureTransitionDescriptor {
+            desired_revision: successor_revision,
+            predecessor_revision: Some(predecessor_revision),
+        };
+        let mut pending = PendingCaptureResyncs::new(1);
+        assert!(!pending.remember(pane_id, predecessor_revision));
+
+        let pending_publication = DiscoveryCapturePublication {
+            epoch: 1,
+            observed_panes: Arc::new(HashMap::new()),
+            transitioning_pane_ids: Arc::new(HashSet::from([pane_id])),
+            transitions: Arc::new(HashMap::from([(pane_id, transition)])),
+        };
+        pending.retain_authoritative(&pending_publication);
+        assert_eq!(
+            pending.requirement(pane_id, false),
+            Some(CaptureResyncRequirement::Exact(predecessor_revision))
+        );
+
+        let ready_publication = DiscoveryCapturePublication {
+            epoch: 2,
+            observed_panes: Arc::new(HashMap::from([(
+                pane_id,
+                ObservedCapturePane {
+                    info: make_pane(pane_id, "successor"),
+                    generation: 1,
+                    pane_uuid: "successor-uuid".to_string(),
+                    revision: successor_revision,
+                    requires_storage_resync: false,
+                },
+            )])),
+            transitioning_pane_ids: Arc::new(HashSet::new()),
+            transitions: Arc::new(HashMap::from([(pane_id, transition)])),
+        };
+        pending.retain_authoritative(&ready_publication);
+        assert_eq!(
+            pending.requirement(pane_id, false),
+            Some(CaptureResyncRequirement::Exact(predecessor_revision)),
+            "watch coalescing directly to ready must retain exact predecessor continuity"
+        );
+
+        pending.retain_authoritative(&DiscoveryCapturePublication::default());
+        assert_eq!(
+            pending.requirement(pane_id, false),
+            None,
+            "a confirmed terminal close releases the transition obligation"
+        );
+    }
+
+    #[test]
+    fn held_binding_is_quarantined_without_blocking_unrelated_retirement() {
+        run_async_test(async {
+            let authority = CaptureAuthority::new();
+            let first_identity = authority.activate_pane(1).expect("first pane");
+            let second_identity = authority.activate_pane(2).expect("second pane");
+            let first_lease = authority
+                .issue_source(first_identity, CaptureSourceKind::Polling)
+                .expect("first polling source");
+            let second_lease = authority
+                .issue_source(second_identity, CaptureSourceKind::Polling)
+                .expect("second polling source");
+            let held = first_lease
+                .try_acquire_persistence(first_lease.stamp(), 1)
+                .expect("held first persistence guard");
+            let revision = DiscoveryRevision(1);
+            let first_binding = ActiveCaptureBinding {
+                generation: 0,
+                pane_uuid: "first".to_string(),
+                revision,
+                identity: first_identity,
+                polling_lease: first_lease,
+                resync_receipt: None,
+                #[cfg(feature = "native-wezterm")]
+                native_lease: None,
+                #[cfg(all(feature = "vendored", unix))]
+                streaming_lease: None,
+            };
+            let second_binding = ActiveCaptureBinding {
+                generation: 0,
+                pane_uuid: "second".to_string(),
+                revision,
+                identity: second_identity,
+                polling_lease: second_lease,
+                resync_receipt: None,
+                #[cfg(feature = "native-wezterm")]
+                native_lease: None,
+                #[cfg(all(feature = "vendored", unix))]
+                streaming_lease: None,
+            };
+            let metadata = Arc::new(RwLock::new(HashMap::from([
+                (
+                    first_identity.pane_incarnation(),
+                    CapturePaneMetadata {
+                        pane_uuid: "first".to_string(),
+                        discovery_generation: 0,
+                        discovery_revision: revision,
+                    },
+                ),
+                (
+                    second_identity.pane_incarnation(),
+                    CapturePaneMetadata {
+                        pane_uuid: "second".to_string(),
+                        discovery_generation: 0,
+                        discovery_revision: revision,
+                    },
+                ),
+            ])));
+            let mut draining = HashMap::new();
+
+            retire_or_quarantine_capture_binding(
+                &authority,
+                &metadata,
+                &mut draining,
+                first_binding,
+                "test held predecessor",
+            )
+            .await;
+            assert!(draining.contains_key(&1));
+            assert!(
+                metadata
+                    .read()
+                    .await
+                    .contains_key(&first_identity.pane_incarnation()),
+                "quarantined binding retains immutable metadata until exact drain"
+            );
+
+            retire_or_quarantine_capture_binding(
+                &authority,
+                &metadata,
+                &mut draining,
+                second_binding,
+                "test unrelated predecessor",
+            )
+            .await;
+            assert!(!draining.contains_key(&2));
+            assert!(
+                !metadata
+                    .read()
+                    .await
+                    .contains_key(&second_identity.pane_incarnation()),
+                "unrelated drained binding retires immediately"
+            );
+
+            drop(held);
+            let first_binding = draining.remove(&1).expect("quarantined first binding");
+            retire_or_quarantine_capture_binding(
+                &authority,
+                &metadata,
+                &mut draining,
+                first_binding,
+                "test retry after drain",
+            )
+            .await;
+            assert!(draining.is_empty());
+            assert!(
+                !metadata
+                    .read()
+                    .await
+                    .contains_key(&first_identity.pane_incarnation())
+            );
+        });
+    }
+
+    #[test]
+    fn stale_mpsc_and_spsc_events_fail_full_persistence_preflight() {
+        run_async_test(async {
+            let pane_id = 77;
+            let predecessor_revision = DiscoveryRevision(10);
+            let successor_revision = DiscoveryRevision(11);
+            let authority = CaptureAuthority::new();
+            let predecessor = authority
+                .activate_pane(pane_id)
+                .expect("predecessor pane");
+            let predecessor_lease = authority
+                .issue_source(predecessor, CaptureSourceKind::Polling)
+                .expect("predecessor source");
+            let capture_metadata = Arc::new(RwLock::new(HashMap::from([(
+                predecessor.pane_incarnation(),
+                CapturePaneMetadata {
+                    pane_uuid: "predecessor-uuid".to_string(),
+                    discovery_generation: 0,
+                    discovery_revision: predecessor_revision,
+                },
+            )])));
+            let predecessor_observed = ObservedCapturePane {
+                info: make_pane(pane_id, "predecessor"),
+                generation: 0,
+                pane_uuid: "predecessor-uuid".to_string(),
+                revision: predecessor_revision,
+                requires_storage_resync: false,
+            };
+            let (publication_tx, publication_rx) = watch::channel(
+                DiscoveryCapturePublication {
+                    epoch: 1,
+                    observed_panes: Arc::new(HashMap::from([(
+                        pane_id,
+                        predecessor_observed,
+                    )])),
+                    transitioning_pane_ids: Arc::new(HashSet::new()),
+                    transitions: Arc::new(HashMap::new()),
+                },
+            );
+
+            let publication_only = test_capture_event_for_lease(
+                pane_id,
+                0,
+                &predecessor_lease,
+            );
+            let (mpsc_ack_tx, mpsc_ack_rx) = oneshot::channel();
+            let mpsc_event = test_capture_event_for_lease(
+                pane_id,
+                1,
+                &predecessor_lease,
+            )
+            .with_durability_ack(mpsc_ack_tx);
+            let (spsc_ack_tx, spsc_ack_rx) = oneshot::channel();
+            let spsc_event = test_capture_event_for_lease(
+                pane_id,
+                2,
+                &predecessor_lease,
+            )
+            .with_durability_ack(spsc_ack_tx);
+            let (ingress_tx, mut ingress_rx) = mpsc::channel(2);
+            let (ring_tx, ring_rx) = spsc_channel(3);
+            ingress_tx.try_send(mpsc_event).expect("queue old MPSC event");
+            ring_tx.try_send(spsc_event).expect("queue old SPSC event");
+
+            let successor_observed = ObservedCapturePane {
+                info: make_pane(pane_id, "successor"),
+                generation: 1,
+                pane_uuid: "successor-uuid".to_string(),
+                revision: successor_revision,
+                requires_storage_resync: true,
+            };
+            publication_tx
+                .send(DiscoveryCapturePublication {
+                    epoch: 2,
+                    observed_panes: Arc::new(HashMap::from([(
+                        pane_id,
+                        successor_observed,
+                    )])),
+                    transitioning_pane_ids: Arc::new(HashSet::new()),
+                    transitions: Arc::new(HashMap::new()),
+                })
+                .expect("publish successor before revocation");
+            assert!(
+                admit_capture_event_for_persistence(
+                    &authority,
+                    &capture_metadata,
+                    &publication_rx,
+                    &publication_only,
+                )
+                .await
+                .is_err(),
+                "publication supersession alone must close semantic admission"
+            );
+
+            assert!(
+                authority
+                    .retire_pane_if_drained(predecessor)
+                    .expect("retire predecessor")
+            );
+            let successor = authority.activate_pane(pane_id).expect("successor pane");
+            let successor_lease = authority
+                .issue_source(successor, CaptureSourceKind::Polling)
+                .expect("successor source");
+            capture_metadata.write().await.insert(
+                successor.pane_incarnation(),
+                CapturePaneMetadata {
+                    pane_uuid: "successor-uuid".to_string(),
+                    discovery_generation: 1,
+                    discovery_revision: successor_revision,
+                },
+            );
+
+            let loop_cx = runtime_loop_cx();
+            let relayed = recv_mpsc(&mut ingress_rx).await;
+            relay_capture_event_with_cx(&loop_cx, &ring_tx, relayed)
+                .await
+                .expect("relay old MPSC event into SPSC");
+
+            let mut semantic_side_effects = 0_u64;
+            let mut rejected = 0_u64;
+            let mut stale_spsc = ring_rx.try_recv().expect("old SPSC event");
+            let mut spsc_ack = CaptureDurabilityAck::new(stale_spsc.take_durability_ack());
+            match admit_capture_event_for_persistence(
+                &authority,
+                &capture_metadata,
+                &publication_rx,
+                &stale_spsc,
+            )
+            .await
+            {
+                Ok((_guard, _metadata)) => semantic_side_effects += 1,
+                Err(error) => {
+                    rejected += 1;
+                    spsc_ack.finish(Err(error.to_string()));
+                }
+            }
+            assert!(
+                crate::runtime_async::oneshot_recv_with_cx(&loop_cx, spsc_ack_rx)
+                    .await
+                    .expect("SPSC rejection acknowledgement")
+                    .is_err()
+            );
+
+            let mut stale_mpsc = ring_rx.try_recv().expect("relayed MPSC event");
+            let mut mpsc_ack = CaptureDurabilityAck::new(stale_mpsc.take_durability_ack());
+            match admit_capture_event_for_persistence(
+                &authority,
+                &capture_metadata,
+                &publication_rx,
+                &stale_mpsc,
+            )
+            .await
+            {
+                Ok((_guard, _metadata)) => semantic_side_effects += 1,
+                Err(error) => {
+                    rejected += 1;
+                    mpsc_ack.finish(Err(error.to_string()));
+                }
+            }
+            assert!(
+                crate::runtime_async::oneshot_recv_with_cx(&loop_cx, mpsc_ack_rx)
+                    .await
+                    .expect("MPSC rejection acknowledgement")
+                    .is_err()
+            );
+
+            let successor_event =
+                test_capture_event_for_lease(pane_id, 3, &successor_lease);
+            let successor_admission = admit_capture_event_for_persistence(
+                &authority,
+                &capture_metadata,
+                &publication_rx,
+                &successor_event,
+            )
+            .await
+            .expect("successor event admission");
+            semantic_side_effects += 1;
+            drop(successor_admission);
+
+            assert_eq!(rejected, 2);
+            assert_eq!(
+                semantic_side_effects, 1,
+                "only the exact successor may cross the semantic side-effect boundary"
+            );
+        });
     }
 
     #[test]
@@ -8395,12 +9800,20 @@ mod tests {
         let lease = authority
             .issue_source(pane, CaptureSourceKind::Polling)
             .expect("test polling authority");
+        test_capture_event_for_lease(1, seq, &lease)
+    }
+
+    fn test_capture_event_for_lease(
+        pane_id: u64,
+        seq: u64,
+        lease: &CaptureLease,
+    ) -> CaptureEvent {
         let guard = lease
-            .try_acquire_producer(lease.stamp(), 1)
+            .try_acquire_producer(lease.stamp(), pane_id)
             .expect("test producer authority");
         CaptureEvent::from_producer(
             CapturedSegment {
-                pane_id: 1,
+                pane_id,
                 seq,
                 content: "test".to_string(),
                 kind: crate::ingest::CapturedSegmentKind::Delta,

@@ -5,7 +5,7 @@
 //! belonging to a successor.  This module provides the non-reusable identity
 //! and drain protocol used to fence that ABA hazard.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -37,6 +37,56 @@ pub struct SourceEpoch(NonZeroU64);
 
 impl SourceEpoch {
     /// Return the checked monotonic value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Discovery-owned revision that authorizes one physical capture binding.
+///
+/// This is separate from [`PaneIncarnation`]: discovery publishes the desired
+/// revision before capture activation, while the authority allocates a fresh
+/// incarnation only after that exact revision is admitted.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CaptureRevision(NonZeroU64);
+
+impl CaptureRevision {
+    /// Construct a checked non-zero discovery revision.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the revision value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Runtime-monotonic epoch for one complete discovery authority view.
+///
+/// Pane revisions identify individual desired bindings.  This epoch orders
+/// whole-map installation so a delayed discovery publication cannot regress
+/// the authority back to an older set of pane revisions.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CaptureViewEpoch(NonZeroU64);
+
+impl CaptureViewEpoch {
+    /// Construct a checked non-zero view epoch.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the epoch value.
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0.get()
@@ -131,6 +181,20 @@ pub enum CaptureAuthorityError {
     /// The numeric pane ID already has an active incarnation.
     #[error("capture pane {global_pane_id} already has an active incarnation")]
     PaneAlreadyActive { global_pane_id: u64 },
+    /// Capture activation did not match discovery's currently desired revision.
+    #[error("capture pane {global_pane_id} discovery revision is not desired")]
+    RevisionNotDesired { global_pane_id: u64 },
+    /// Standalone activation was attempted after discovery enabled its gate.
+    #[error("capture pane {global_pane_id} requires a discovery revision")]
+    RevisionRequired { global_pane_id: u64 },
+    /// A delayed or duplicate whole-view installation attempted to regress authority.
+    #[error(
+        "capture desired view epoch {requested_epoch} is not newer than installed epoch {installed_epoch}"
+    )]
+    StaleDesiredView {
+        installed_epoch: u64,
+        requested_epoch: u64,
+    },
     /// No incarnation is active for the numeric pane ID.
     #[error("capture pane {global_pane_id} has no active incarnation")]
     PaneNotActive { global_pane_id: u64 },
@@ -565,6 +629,7 @@ where
 
 struct PaneAuthorityState {
     identity: ActivePaneIdentity,
+    discovery_revision: Option<CaptureRevision>,
     accepting_sources: bool,
     sources: BTreeMap<CaptureSourceKind, CaptureLease>,
 }
@@ -573,6 +638,8 @@ struct PaneAuthorityState {
 struct CaptureAuthorityState {
     last_incarnation: u64,
     last_source_epoch: u64,
+    desired_view_epoch: Option<CaptureViewEpoch>,
+    desired_revisions: HashMap<u64, CaptureRevision>,
     panes: HashMap<u64, PaneAuthorityState>,
 }
 
@@ -608,9 +675,36 @@ impl CaptureAuthority {
         &self,
         global_pane_id: u64,
     ) -> Result<ActivePaneIdentity, CaptureAuthorityError> {
+        self.activate_pane_inner(global_pane_id, None)
+    }
+
+    /// Install a fresh pane incarnation only if discovery still desires the
+    /// exact revision.  This closes the check-to-exposure race between a watch
+    /// publication changing and a provisional successor issuing its sources.
+    pub fn activate_pane_for_revision(
+        &self,
+        global_pane_id: u64,
+        revision: CaptureRevision,
+    ) -> Result<ActivePaneIdentity, CaptureAuthorityError> {
+        self.activate_pane_inner(global_pane_id, Some(revision))
+    }
+
+    fn activate_pane_inner(
+        &self,
+        global_pane_id: u64,
+        revision: Option<CaptureRevision>,
+    ) -> Result<ActivePaneIdentity, CaptureAuthorityError> {
         let mut state = self.lock_state()?;
         if state.panes.contains_key(&global_pane_id) {
             return Err(CaptureAuthorityError::PaneAlreadyActive { global_pane_id });
+        }
+        if revision.is_none() && state.desired_view_epoch.is_some() {
+            return Err(CaptureAuthorityError::RevisionRequired { global_pane_id });
+        }
+        if let Some(revision) = revision
+            && state.desired_revisions.get(&global_pane_id).copied() != Some(revision)
+        {
+            return Err(CaptureAuthorityError::RevisionNotDesired { global_pane_id });
         }
         let next = state
             .last_incarnation
@@ -628,11 +722,63 @@ impl CaptureAuthority {
             global_pane_id,
             PaneAuthorityState {
                 identity,
+                discovery_revision: revision,
                 accepting_sources: true,
                 sources: BTreeMap::new(),
             },
         );
         Ok(identity)
+    }
+
+    /// Atomically replace discovery's desired capture-revision view and close
+    /// admission for every active gated pane that no longer matches it.
+    ///
+    /// This method performs no await and revokes lease atomics while holding
+    /// the short authority-map mutex.  Therefore either a concurrent gated
+    /// activation observes the new desired revision and fails, or it installs
+    /// first and is revoked before this method returns.
+    pub(crate) fn install_desired_revisions(
+        &self,
+        epoch: CaptureViewEpoch,
+        desired: &HashMap<u64, CaptureRevision>,
+    ) -> Result<(), CaptureAuthorityError> {
+        let mut state = self.lock_state()?;
+        if let Some(installed_epoch) = state.desired_view_epoch
+            && epoch <= installed_epoch
+        {
+            return Err(CaptureAuthorityError::StaleDesiredView {
+                installed_epoch: installed_epoch.get(),
+                requested_epoch: epoch.get(),
+            });
+        }
+        for (pane_id, pane) in &mut state.panes {
+            if pane
+                .discovery_revision
+                .is_some_and(|active_revision| {
+                    desired.get(pane_id).copied() == Some(active_revision)
+                })
+            {
+                continue;
+            }
+            pane.accepting_sources = false;
+            for lease in pane.sources.values() {
+                lease.revoke_admission()?;
+            }
+        }
+        state.desired_view_epoch = Some(epoch);
+        state.desired_revisions.clone_from(desired);
+        Ok(())
+    }
+
+    /// Return every numeric pane ID whose exact incarnation still exists.
+    ///
+    /// Non-admitting/draining panes are intentionally included: registry
+    /// absence alone is not proof that their admitted producer or persistence
+    /// work has completed, so lifecycle GC must retain their cursor and
+    /// semantic state until exact retirement removes the authority entry.
+    pub(crate) fn retained_pane_ids(&self) -> Result<HashSet<u64>, CaptureAuthorityError> {
+        let state = self.lock_state()?;
+        Ok(state.panes.keys().copied().collect())
     }
 
     /// Issue one source epoch for an active pane incarnation.
@@ -975,6 +1121,214 @@ mod tests {
             .build()
             .expect("capture authority test runtime")
             .block_on(future);
+    }
+
+    #[test]
+    fn desired_revision_gate_closes_activation_and_source_exposure_races() {
+        let authority = CaptureAuthority::new();
+        let revision_one = CaptureRevision::new(1).expect("revision one");
+        let revision_two = CaptureRevision::new(2).expect("revision two");
+        let revision_three = CaptureRevision::new(3).expect("revision three");
+        let desired_one = HashMap::from([(7, revision_one), (8, revision_one)]);
+        authority
+            .install_desired_revisions(
+                CaptureViewEpoch::new(1).expect("view one"),
+                &desired_one,
+            )
+            .expect("install first desired view");
+        let predecessor_seven = authority
+            .activate_pane_for_revision(7, revision_one)
+            .expect("activate pane seven predecessor");
+        let predecessor_eight = authority
+            .activate_pane_for_revision(8, revision_one)
+            .expect("activate pane eight predecessor");
+        let lease_seven = authority
+            .issue_source(predecessor_seven, CaptureSourceKind::Polling)
+            .expect("pane seven predecessor source");
+        let lease_eight = authority
+            .issue_source(predecessor_eight, CaptureSourceKind::Polling)
+            .expect("pane eight predecessor source");
+
+        let desired_two = HashMap::from([(7, revision_two), (8, revision_one)]);
+        let producer_race = lease_seven.try_acquire_with_hook(
+            lease_seven.stamp(),
+            7,
+            CaptureGuardStage::Producer,
+            || {
+                authority
+                    .install_desired_revisions(
+                        CaptureViewEpoch::new(2).expect("view two"),
+                        &desired_two,
+                    )
+                    .expect("supersede after producer increment");
+            },
+        );
+        assert_eq!(
+            producer_race.unwrap_err(),
+            CaptureAuthorityError::LeaseNotAdmitting {
+                stage: CaptureGuardStage::Producer,
+            }
+        );
+        assert_eq!(lease_seven.inflight_counts(), (0, 0));
+
+        let desired_three = HashMap::from([(7, revision_two), (8, revision_two)]);
+        let persistence_race = lease_eight.try_acquire_with_hook(
+            lease_eight.stamp(),
+            8,
+            CaptureGuardStage::Persistence,
+            || {
+                authority
+                    .install_desired_revisions(
+                        CaptureViewEpoch::new(3).expect("view three"),
+                        &desired_three,
+                    )
+                    .expect("supersede after persistence increment");
+            },
+        );
+        assert_eq!(
+            persistence_race.unwrap_err(),
+            CaptureAuthorityError::LeaseNotAdmitting {
+                stage: CaptureGuardStage::Persistence,
+            }
+        );
+        assert_eq!(lease_eight.inflight_counts(), (0, 0));
+
+        assert!(
+            authority
+                .retire_pane_if_drained(predecessor_seven)
+                .expect("retire pane seven predecessor")
+        );
+        assert!(
+            authority
+                .retire_pane_if_drained(predecessor_eight)
+                .expect("retire pane eight predecessor")
+        );
+        assert_eq!(
+            authority
+                .activate_pane_for_revision(7, revision_one)
+                .unwrap_err(),
+            CaptureAuthorityError::RevisionNotDesired { global_pane_id: 7 }
+        );
+        let provisional_successor = authority
+            .activate_pane_for_revision(7, revision_two)
+            .expect("activate desired successor");
+
+        let desired_four = HashMap::from([(7, revision_three), (8, revision_two)]);
+        authority
+            .install_desired_revisions(
+                CaptureViewEpoch::new(4).expect("view four"),
+                &desired_four,
+            )
+            .expect("supersede between activation and source exposure");
+        assert_eq!(
+            authority
+                .issue_source(provisional_successor, CaptureSourceKind::Polling)
+                .unwrap_err(),
+            CaptureAuthorityError::TransitionInProgress
+        );
+        assert!(
+            authority
+                .retire_pane_if_drained(provisional_successor)
+                .expect("retire unexposed provisional successor")
+        );
+
+        let desired_five = HashMap::from([(9, revision_three)]);
+        authority
+            .install_desired_revisions(
+                CaptureViewEpoch::new(5).expect("view five"),
+                &desired_five,
+            )
+            .expect("install pane nine desired view");
+        let desired_six = HashMap::from([(9, revision_two)]);
+        authority
+            .install_desired_revisions(
+                CaptureViewEpoch::new(6).expect("view six"),
+                &desired_six,
+            )
+            .expect("supersede pane nine before activation");
+        assert_eq!(
+            authority
+                .activate_pane_for_revision(9, revision_three)
+                .unwrap_err(),
+            CaptureAuthorityError::RevisionNotDesired { global_pane_id: 9 }
+        );
+        assert_eq!(
+            authority
+                .install_desired_revisions(
+                    CaptureViewEpoch::new(5).expect("stale view five"),
+                    &desired_five,
+                )
+                .unwrap_err(),
+            CaptureAuthorityError::StaleDesiredView {
+                installed_epoch: 6,
+                requested_epoch: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn enabling_discovery_gate_revokes_legacy_authority_and_forbids_bypass() {
+        let authority = CaptureAuthority::new();
+        let legacy = authority.activate_pane(40).expect("legacy pane");
+        let legacy_lease = authority
+            .issue_source(legacy, CaptureSourceKind::Polling)
+            .expect("legacy source");
+        let held = legacy_lease
+            .try_acquire_persistence(legacy_lease.stamp(), 40)
+            .expect("admitted legacy persistence guard");
+        let revision = CaptureRevision::new(1).expect("capture revision");
+        let desired = HashMap::from([(41, revision)]);
+
+        authority
+            .install_desired_revisions(
+                CaptureViewEpoch::new(1).expect("first gated view"),
+                &desired,
+            )
+            .expect("enable discovery gate");
+        assert_eq!(
+            legacy_lease
+                .try_acquire_producer(legacy_lease.stamp(), 40)
+                .unwrap_err(),
+            CaptureAuthorityError::LeaseNotAdmitting {
+                stage: CaptureGuardStage::Producer,
+            }
+        );
+        assert!(
+            !authority
+                .retire_pane_if_drained(legacy)
+                .expect("held legacy guard keeps exact drain open")
+        );
+        drop(held);
+        assert!(
+            authority
+                .retire_pane_if_drained(legacy)
+                .expect("legacy pane drains after admitted work finishes")
+        );
+        assert_eq!(
+            authority.activate_pane(42).unwrap_err(),
+            CaptureAuthorityError::RevisionRequired { global_pane_id: 42 }
+        );
+
+        let gated = authority
+            .activate_pane_for_revision(41, revision)
+            .expect("desired gated pane");
+        let gated_lease = authority
+            .issue_source(gated, CaptureSourceKind::Polling)
+            .expect("desired gated source");
+        authority
+            .install_desired_revisions(
+                CaptureViewEpoch::new(2).expect("empty gated view"),
+                &HashMap::new(),
+            )
+            .expect("remove desired pane");
+        assert_eq!(
+            gated_lease
+                .try_acquire_persistence(gated_lease.stamp(), 41)
+                .unwrap_err(),
+            CaptureAuthorityError::LeaseNotAdmitting {
+                stage: CaptureGuardStage::Persistence,
+            }
+        );
     }
 
     #[test]
