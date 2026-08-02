@@ -283,7 +283,7 @@ mod tests {
 
         assert!(!bindings.clear_keyboard_if_matches(&1_u32));
         assert!(!bindings.clear_pointer_if_matches(&1_u32));
-        assert_eq!(bindings.clear_removed_seat(&2_u32).data_device, true);
+        assert!(bindings.clear_removed_seat(&2_u32).data_device);
     }
 
     #[test]
