@@ -5,7 +5,9 @@ use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux_commands::{
     DetachClient, ListAllPanes, ListAllWindows, ListCommands, SplitPane, TmuxCommand,
-    TmuxCommandClass,
+    TmuxCommandClass, TmuxCommandPreparation, TmuxConditionalCommit,
+    TmuxConditionalCommitIntent, TmuxConditionalCommitLease, TmuxConditionalCommitTarget,
+    TmuxPreparationPrerequisite,
 };
 use crate::tmux_pty::TmuxChildState;
 use crate::window::WindowId;
@@ -537,6 +539,17 @@ const CMD_QUEUE_INTENT_MAX_DEPTH: usize = 4_096;
 /// retained latest-intent resize/focus command is serviced after at most this
 /// many additional durable commands.
 const CMD_QUEUE_DURABLE_SERVICE_QUANTUM: usize = 32;
+
+/// Once a parked intent becomes ready, bound how many freshly admitted
+/// intents may overtake it. This is independent of durable-lane fairness:
+/// neither continuous key/control traffic nor a resize/focus storm can starve
+/// the exact target whose prerequisite was just published.
+const CMD_QUEUE_RETRY_INTENT_SERVICE_QUANTUM: usize = 32;
+
+/// Bound side-effect-free command preparation on the main thread. A mailbox
+/// can retain tens of thousands of entries; suppressed, stale, or temporarily
+/// blocked commands must yield instead of monopolizing an event-loop turn.
+const CMD_QUEUE_PREPARATION_QUANTUM: usize = 64;
 
 /// A domain can retain at most one command/detach start, one matching
 /// completion signal, and one terminal signal while its I/O supervisor is
@@ -1562,22 +1575,85 @@ pub(crate) struct TmuxNotificationIntentTelemetrySnapshot {
 pub(crate) struct TmuxCmdQueue {
     durable_entries: VecDeque<Box<dyn TmuxCommand>>,
     intent_entries: VecDeque<Box<dyn TmuxCommand>>,
+    retry_deferred_durable: VecDeque<DeferredTmuxCommand>,
+    retry_deferred_intent_head: Option<TmuxConditionalCommitTarget>,
+    retry_deferred_intent_tail: Option<TmuxConditionalCommitTarget>,
+    retry_deferred_intents:
+        HashMap<TmuxConditionalCommitTarget, DeferredTmuxCommand>,
+    ready_retry_deferred_intents: VecDeque<TmuxConditionalCommitTarget>,
     in_flight: Option<InFlightTmuxCommand>,
     preparing: Option<PreparingTmuxCommand>,
     retained_by_class: [usize; TmuxCommandClass::COUNT],
     durable_since_intent: usize,
+    intents_since_retry_deferred_durable: usize,
+    fresh_intents_since_retry_deferred_intent: usize,
     payload_bytes: usize,
     closed: bool,
     terminal_barrier: bool,
     terminal_command_dispatched: bool,
     rejected_commands: u64,
     merged_commands: u64,
+    next_conditional_commit_generation: u64,
+    latest_conditional_commits:
+        HashMap<TmuxConditionalCommitTarget, TmuxConditionalCommitLease>,
+    queued_conditional_commits:
+        HashMap<TmuxConditionalCommitTarget, VecDeque<TmuxConditionalCommitLease>>,
+    uncertain_remote_pane_sizes: HashSet<TmuxPaneId>,
 }
 
 #[derive(Debug)]
 struct PreparingTmuxCommand {
     class: TmuxCommandClass,
     payload_bytes: usize,
+    conditional_commit: Option<TmuxConditionalCommitLease>,
+    superseded: bool,
+}
+
+#[derive(Debug)]
+struct DeferredTmuxCommand {
+    command: Box<dyn TmuxCommand>,
+    conditional_commit: Option<TmuxConditionalCommitLease>,
+    retry_prerequisite: TmuxPreparationPrerequisite,
+    retry_ready: bool,
+    retry_intent_previous: Option<TmuxConditionalCommitTarget>,
+    retry_intent_next: Option<TmuxConditionalCommitTarget>,
+}
+
+/// Owns every allocation detached from a closed mailbox. The terminal path
+/// drops this value only after releasing the mailbox mutex, so command
+/// destructors, hash buckets, and high-water deque allocations cannot extend
+/// producer lock hold time.
+#[derive(Debug)]
+pub(crate) struct TmuxCmdQueueTeardown {
+    durable_entries: VecDeque<Box<dyn TmuxCommand>>,
+    intent_entries: VecDeque<Box<dyn TmuxCommand>>,
+    retry_deferred_durable: VecDeque<DeferredTmuxCommand>,
+    ready_retry_deferred_intents: VecDeque<TmuxConditionalCommitTarget>,
+    retry_deferred_intents: HashMap<TmuxConditionalCommitTarget, DeferredTmuxCommand>,
+    in_flight: Option<InFlightTmuxCommand>,
+    preparing: Option<PreparingTmuxCommand>,
+    latest_conditional_commits:
+        HashMap<TmuxConditionalCommitTarget, TmuxConditionalCommitLease>,
+    queued_conditional_commits:
+        HashMap<TmuxConditionalCommitTarget, VecDeque<TmuxConditionalCommitLease>>,
+    uncertain_remote_pane_sizes: HashSet<TmuxPaneId>,
+}
+
+impl Drop for TmuxCmdQueueTeardown {
+    fn drop(&mut self) {
+        // Explicitly release retained values before the collection allocations
+        // themselves. This method runs outside the queue critical section.
+        self.durable_entries.clear();
+        self.intent_entries.clear();
+        self.retry_deferred_durable.clear();
+        self.ready_retry_deferred_intents.clear();
+        self.retry_deferred_intents.clear();
+        drop(self.in_flight.take());
+        drop(self.preparing.take());
+        self.latest_conditional_commits.clear();
+        self.queued_conditional_commits.clear();
+        self.uncertain_remote_pane_sizes.clear();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1696,6 +1772,7 @@ pub(crate) struct InFlightTmuxCommand {
     generation: u64,
     remaining_responses: usize,
     first_error: Option<Guarded>,
+    conditional_commit: Option<TmuxConditionalCommit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1753,17 +1830,225 @@ impl TmuxCmdQueue {
         Self {
             durable_entries: VecDeque::new(),
             intent_entries: VecDeque::new(),
+            retry_deferred_durable: VecDeque::new(),
+            retry_deferred_intent_head: None,
+            retry_deferred_intent_tail: None,
+            retry_deferred_intents: HashMap::new(),
+            ready_retry_deferred_intents: VecDeque::new(),
             in_flight: None,
             preparing: None,
             retained_by_class: [0; TmuxCommandClass::COUNT],
             durable_since_intent: 0,
+            intents_since_retry_deferred_durable: 0,
+            fresh_intents_since_retry_deferred_intent: 0,
             payload_bytes: 0,
             closed: false,
             terminal_barrier: false,
             terminal_command_dispatched: false,
             rejected_commands: 0,
             merged_commands: 0,
+            next_conditional_commit_generation: 1,
+            latest_conditional_commits: HashMap::new(),
+            queued_conditional_commits: HashMap::new(),
+            uncertain_remote_pane_sizes: HashSet::new(),
         }
+    }
+
+    fn allocate_conditional_commit_lease(
+        &mut self,
+        intent: Option<TmuxConditionalCommitIntent>,
+        class: TmuxCommandClass,
+    ) -> Result<Option<TmuxConditionalCommitLease>, TmuxEnqueueError> {
+        let Some(intent) = intent else {
+            return Ok(None);
+        };
+        let generation = self.next_conditional_commit_generation;
+        let Some(next_generation) = generation.checked_add(1) else {
+            return self
+                .reject_full(class, "conditional commit generation exhausted")
+                .map(|()| None);
+        };
+        self.next_conditional_commit_generation = next_generation;
+        Ok(Some(TmuxConditionalCommitLease { generation, intent }))
+    }
+
+    pub(crate) fn advance_preparation_prerequisite(
+        &mut self,
+        prerequisite: TmuxPreparationPrerequisite,
+    ) {
+        for deferred in &mut self.retry_deferred_durable {
+            if deferred.retry_prerequisite == prerequisite {
+                deferred.retry_ready = true;
+            }
+        }
+
+        match prerequisite {
+            TmuxPreparationPrerequisite::Attach => {
+                // Attach is the sole domain-wide wake. Traverse the explicit
+                // dormant insertion order once so targets made ready together
+                // retain deterministic FIFO service.
+                let mut target = self.retry_deferred_intent_head;
+                while let Some(current_target) = target {
+                    let deferred = self
+                        .retry_deferred_intents
+                        .get_mut(&current_target)
+                        .expect("tmux deferred-intent order lost its indexed entry");
+                    target = deferred.retry_intent_next;
+                    if deferred.retry_prerequisite == prerequisite && !deferred.retry_ready {
+                        deferred.retry_ready = true;
+                        self.ready_retry_deferred_intents
+                            .push_back(current_target);
+                    }
+                }
+            }
+            TmuxPreparationPrerequisite::Pane(pane_id) => {
+                let target = TmuxConditionalCommitTarget::PaneSize(pane_id);
+                if let Some(deferred) = self
+                    .retry_deferred_intents
+                    .get_mut(&target)
+                {
+                    if deferred.retry_prerequisite == prerequisite && !deferred.retry_ready {
+                        deferred.retry_ready = true;
+                        self.ready_retry_deferred_intents.push_back(target);
+                    }
+                }
+            }
+        }
+    }
+
+    fn publish_conditional_commit_lease(
+        &mut self,
+        lease: Option<TmuxConditionalCommitLease>,
+    ) {
+        if let Some(lease) = lease {
+            self.latest_conditional_commits
+                .insert(lease.intent.target(), lease);
+        }
+    }
+
+    fn register_queued_conditional_commit(&mut self, lease: TmuxConditionalCommitLease) {
+        self.queued_conditional_commits
+            .entry(lease.intent.target())
+            .or_default()
+            .push_back(lease);
+    }
+
+    fn replace_last_queued_conditional_commit(
+        &mut self,
+        lease: TmuxConditionalCommitLease,
+    ) -> bool {
+        let Some(last) = self
+            .queued_conditional_commits
+            .get_mut(&lease.intent.target())
+            .and_then(|leases| leases.back_mut())
+        else {
+            return false;
+        };
+        *last = lease;
+        true
+    }
+
+    fn take_queued_conditional_commit(
+        &mut self,
+        target: TmuxConditionalCommitTarget,
+    ) -> Option<TmuxConditionalCommitLease> {
+        let (lease, empty) = {
+            let queue = self.queued_conditional_commits.get_mut(&target)?;
+            let lease = queue.pop_front();
+            (lease, queue.is_empty())
+        };
+        if empty {
+            self.queued_conditional_commits.remove(&target);
+        }
+        lease
+    }
+
+    pub(crate) fn conditional_commit_is_current(
+        &self,
+        lease: &TmuxConditionalCommitLease,
+    ) -> bool {
+        self.latest_conditional_commits
+            .get(&lease.intent.target())
+            == Some(lease)
+    }
+
+    fn retire_conditional_commit_if_current(
+        &mut self,
+        lease: &TmuxConditionalCommitLease,
+    ) -> bool {
+        if !self.conditional_commit_is_current(lease) {
+            return false;
+        }
+        self.latest_conditional_commits
+            .remove(&lease.intent.target());
+        true
+    }
+
+    /// Cached pane dimensions are suppression authority only while no resize
+    /// for this remote pane may have reached tmux without an exact matching
+    /// success being committed locally.
+    pub(crate) fn pane_size_suppression_is_trustworthy(
+        &self,
+        pane_id: TmuxPaneId,
+    ) -> bool {
+        !self.uncertain_remote_pane_sizes.contains(&pane_id)
+    }
+
+    /// Definitive pane retirement is the only non-success path allowed to
+    /// discard remote-size uncertainty. The pane identity no longer exists,
+    /// so no future request can suppress against its cached dimensions.
+    pub(crate) fn retire_pane_size_suppression_target(&mut self, pane_id: TmuxPaneId) {
+        self.uncertain_remote_pane_sizes.remove(&pane_id);
+    }
+
+    fn append_retry_deferred_intent(
+        &mut self,
+        target: TmuxConditionalCommitTarget,
+        mut deferred: DeferredTmuxCommand,
+    ) {
+        debug_assert!(!self.retry_deferred_intents.contains_key(&target));
+        let previous = self.retry_deferred_intent_tail;
+        deferred.retry_intent_previous = previous;
+        deferred.retry_intent_next = None;
+        let replaced = self.retry_deferred_intents.insert(target, deferred);
+        debug_assert!(replaced.is_none());
+
+        if let Some(previous) = previous {
+            self.retry_deferred_intents
+                .get_mut(&previous)
+                .expect("tmux deferred-intent tail lost its indexed entry")
+                .retry_intent_next = Some(target);
+        } else {
+            debug_assert!(self.retry_deferred_intent_head.is_none());
+            self.retry_deferred_intent_head = Some(target);
+        }
+        self.retry_deferred_intent_tail = Some(target);
+    }
+
+    fn remove_retry_deferred_intent(
+        &mut self,
+        target: TmuxConditionalCommitTarget,
+    ) -> Option<DeferredTmuxCommand> {
+        let deferred = self.retry_deferred_intents.remove(&target)?;
+        match deferred.retry_intent_previous {
+            Some(previous) => {
+                self.retry_deferred_intents
+                    .get_mut(&previous)
+                    .expect("tmux deferred-intent predecessor lost its indexed entry")
+                    .retry_intent_next = deferred.retry_intent_next;
+            }
+            None => self.retry_deferred_intent_head = deferred.retry_intent_next,
+        }
+        match deferred.retry_intent_next {
+            Some(next) => {
+                self.retry_deferred_intents
+                    .get_mut(&next)
+                    .expect("tmux deferred-intent successor lost its indexed entry")
+                    .retry_intent_previous = deferred.retry_intent_previous;
+            }
+            None => self.retry_deferred_intent_tail = deferred.retry_intent_previous,
+        }
+        Some(deferred)
     }
 
     /// Enqueues only while the owning tmux domain is live. Closing and pushing
@@ -1775,6 +2060,8 @@ impl TmuxCmdQueue {
         }
 
         let class = cmd.mailbox_class();
+        let conditional_commit = self
+            .allocate_conditional_commit_lease(cmd.conditional_commit_intent(), class)?;
         let incoming_payload_bytes = cmd.mailbox_payload_bytes();
         let Some(next_payload_bytes) = self.payload_bytes.checked_add(incoming_payload_bytes)
         else {
@@ -1783,8 +2070,45 @@ impl TmuxCmdQueue {
         if next_payload_bytes > CMD_QUEUE_MAX_PAYLOAD_BYTES {
             return self.reject_full(class, "payload byte cap");
         }
-
-        let merged = {
+        if class == TmuxCommandClass::CoalescibleIntent {
+            if let Some(lease) = conditional_commit.as_ref() {
+                let target = lease.intent.target();
+                if let Some(deferred) = self.retry_deferred_intents.get_mut(&target) {
+                    let old_payload_bytes = deferred.command.mailbox_payload_bytes();
+                    if !deferred.command.try_merge_newer(cmd.as_ref()) {
+                        // A conditional target is a complete latest-wins
+                        // identity. If a future intent type cannot merge in
+                        // place, replacing the dormant command is still safe
+                        // and prevents a stale generation from hiding behind a
+                        // different dormant target.
+                        deferred.command = cmd;
+                    }
+                    deferred.conditional_commit = Some(lease.clone());
+                    let merged_payload_bytes = deferred.command.mailbox_payload_bytes();
+                    self.payload_bytes = self
+                        .payload_bytes
+                        .checked_sub(old_payload_bytes)
+                        .and_then(|retained| retained.checked_add(merged_payload_bytes))
+                        .expect("tmux deferred-intent payload accounting invariant");
+                    debug_assert!(self.payload_bytes <= CMD_QUEUE_MAX_PAYLOAD_BYTES);
+                    self.publish_conditional_commit_lease(Some(lease.clone()));
+                    self.merged_commands = self.merged_commands.saturating_add(1);
+                    metrics::counter!(
+                        "mux.tmux.command_mailbox.admitted",
+                        "class" => class.label(),
+                        "disposition" => "merged_deferred",
+                    )
+                    .increment(1);
+                    return Ok(());
+                }
+            }
+        }
+        let can_merge_conditional = conditional_commit.as_ref().is_none_or(|lease| {
+            self.queued_conditional_commits
+                .get(&lease.intent.target())
+                .is_some_and(|leases| !leases.is_empty())
+        });
+        let merged = can_merge_conditional && {
             let lane = match class {
                 TmuxCommandClass::CoalescibleIntent => &mut self.intent_entries,
                 TmuxCommandClass::LosslessInput
@@ -1795,6 +2119,14 @@ impl TmuxCmdQueue {
                 .is_some_and(|last| last.try_merge_newer(cmd.as_ref()))
         };
         if merged {
+            if let Some(lease) = conditional_commit {
+                let replaced = self.replace_last_queued_conditional_commit(lease.clone());
+                debug_assert!(
+                    replaced,
+                    "merged tmux conditional command lost its queued generation"
+                );
+                self.publish_conditional_commit_lease(Some(lease));
+            }
             self.payload_bytes = next_payload_bytes;
             self.merged_commands = self.merged_commands.saturating_add(1);
             metrics::counter!(
@@ -1815,6 +2147,10 @@ impl TmuxCmdQueue {
             TmuxCommandClass::LosslessInput
             | TmuxCommandClass::RequiredControl
             | TmuxCommandClass::TerminalControl => self.durable_entries.push_back(cmd),
+        }
+        if let Some(lease) = conditional_commit {
+            self.register_queued_conditional_commit(lease.clone());
+            self.publish_conditional_commit_lease(Some(lease));
         }
         self.retained_by_class[class.index()] =
             self.retained_by_class[class.index()].saturating_add(1);
@@ -1882,7 +2218,6 @@ impl TmuxCmdQueue {
                 "detach command count cap",
             );
         }
-
         self.durable_entries.push_front(command);
         self.retained_by_class[TmuxCommandClass::TerminalControl.index()] = self.retained_by_class
             [TmuxCommandClass::TerminalControl.index()]
@@ -1954,11 +2289,22 @@ impl TmuxCmdQueue {
             );
         }
 
+        let mut conditional_commits = Vec::with_capacity(commands.len());
+        for command in &commands {
+            conditional_commits.push(self.allocate_conditional_commit_lease(
+                command.conditional_commit_intent(),
+                TmuxCommandClass::RequiredControl,
+            )?);
+        }
         let next_depth = self.len().saturating_add(commands.len());
         let crossed_warning_threshold =
             self.len() <= CMD_QUEUE_WARNING_DEPTH && next_depth > CMD_QUEUE_WARNING_DEPTH;
         let incoming_count = commands.len();
         self.durable_entries.extend(commands);
+        for lease in conditional_commits.into_iter().flatten() {
+            self.register_queued_conditional_commit(lease.clone());
+            self.publish_conditional_commit_lease(Some(lease));
+        }
         self.retained_by_class[TmuxCommandClass::RequiredControl.index()] = self.retained_by_class
             [TmuxCommandClass::RequiredControl.index()]
         .saturating_add(incoming_count);
@@ -2047,17 +2393,35 @@ impl TmuxCmdQueue {
         Err(TmuxEnqueueError::Full)
     }
 
-    pub(crate) fn close(
-        &mut self,
-    ) -> (VecDeque<Box<dyn TmuxCommand>>, Option<InFlightTmuxCommand>) {
+    pub(crate) fn close(&mut self) -> TmuxCmdQueueTeardown {
         self.closed = true;
-        self.preparing = None;
         self.retained_by_class = [0; TmuxCommandClass::COUNT];
         self.durable_since_intent = 0;
+        self.intents_since_retry_deferred_durable = 0;
+        self.fresh_intents_since_retry_deferred_intent = 0;
+        self.retry_deferred_intent_head = None;
+        self.retry_deferred_intent_tail = None;
         self.payload_bytes = 0;
-        let mut abandoned = std::mem::take(&mut self.durable_entries);
-        abandoned.extend(std::mem::take(&mut self.intent_entries));
-        (abandoned, self.in_flight.take())
+        TmuxCmdQueueTeardown {
+            durable_entries: std::mem::take(&mut self.durable_entries),
+            intent_entries: std::mem::take(&mut self.intent_entries),
+            retry_deferred_durable: std::mem::take(&mut self.retry_deferred_durable),
+            ready_retry_deferred_intents: std::mem::take(
+                &mut self.ready_retry_deferred_intents,
+            ),
+            retry_deferred_intents: std::mem::take(&mut self.retry_deferred_intents),
+            in_flight: self.in_flight.take(),
+            preparing: self.preparing.take(),
+            latest_conditional_commits: std::mem::take(
+                &mut self.latest_conditional_commits,
+            ),
+            queued_conditional_commits: std::mem::take(
+                &mut self.queued_conditional_commits,
+            ),
+            uncertain_remote_pane_sizes: std::mem::take(
+                &mut self.uncertain_remote_pane_sizes,
+            ),
+        }
     }
 
     #[cfg(test)]
@@ -2076,6 +2440,11 @@ impl TmuxCmdQueue {
     fn is_empty(&self) -> bool {
         self.durable_entries.is_empty()
             && self.intent_entries.is_empty()
+            && self.retry_deferred_durable.is_empty()
+            && self.retry_deferred_intent_head.is_none()
+            && self.retry_deferred_intent_tail.is_none()
+            && self.retry_deferred_intents.is_empty()
+            && self.ready_retry_deferred_intents.is_empty()
             && self.in_flight.is_none()
             && self.preparing.is_none()
     }
@@ -2092,14 +2461,46 @@ impl TmuxCmdQueue {
                     self.durable_entries.front().map(Box::as_ref)
                 }
             })
+            .or_else(|| {
+                self.retry_deferred_durable
+                    .front()
+                    .map(|deferred| deferred.command.as_ref())
+            })
+            .or_else(|| {
+                self.retry_deferred_intent_head
+                    .and_then(|target| self.retry_deferred_intents.get(&target))
+                    .map(|deferred| deferred.command.as_ref())
+            })
     }
 
+    #[cfg(test)]
     fn take_next_for_preparation(&mut self) -> Option<Box<dyn TmuxCommand>> {
+        self.take_next_for_preparation_with_policy(true)
+    }
+
+    fn take_next_for_preparation_with_policy(
+        &mut self,
+        allow_durable: bool,
+    ) -> Option<Box<dyn TmuxCommand>> {
         debug_assert!(self.preparing.is_none());
-        let service_intent = self.should_service_intent();
+        let service_intent = !allow_durable || self.should_service_intent();
         let command = if service_intent {
+            let retry_intent_ready = self.retry_deferred_intent_is_ready();
             self.durable_since_intent = 0;
-            self.intent_entries.pop_front()?
+            let command = self.intent_entries.pop_front()?;
+            if retry_intent_ready {
+                self.fresh_intents_since_retry_deferred_intent = self
+                    .fresh_intents_since_retry_deferred_intent
+                    .saturating_add(1);
+            } else {
+                self.fresh_intents_since_retry_deferred_intent = 0;
+            }
+            if !self.retry_deferred_durable.is_empty() {
+                self.intents_since_retry_deferred_durable = self
+                    .intents_since_retry_deferred_durable
+                    .saturating_add(1);
+            }
+            command
         } else {
             self.durable_since_intent = self.durable_since_intent.saturating_add(1);
             self.durable_entries.pop_front()?
@@ -2109,9 +2510,22 @@ impl TmuxCmdQueue {
             debug_assert!(!self.terminal_command_dispatched);
             self.terminal_command_dispatched = true;
         }
+        let conditional_intent = command.conditional_commit_intent();
+        let conditional_commit = conditional_intent
+            .as_ref()
+            .and_then(|intent| self.take_queued_conditional_commit(intent.target()));
+        let superseded = match (&conditional_intent, &conditional_commit) {
+            (Some(intent), Some(lease)) => {
+                lease.intent != *intent || !self.conditional_commit_is_current(lease)
+            }
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
         self.preparing = Some(PreparingTmuxCommand {
             class: command.mailbox_class(),
             payload_bytes: command.mailbox_payload_bytes(),
+            conditional_commit,
+            superseded,
         });
         metrics::counter!(
             "mux.tmux.command_mailbox.serviced",
@@ -2119,6 +2533,257 @@ impl TmuxCmdQueue {
         )
         .increment(1);
         Some(command)
+    }
+
+    fn prepared_conditional_commit(&self) -> Option<TmuxConditionalCommitLease> {
+        self.preparing
+            .as_ref()
+            .and_then(|preparing| preparing.conditional_commit.clone())
+    }
+
+    fn prepared_is_superseded(&self) -> bool {
+        self.preparing
+            .as_ref()
+            .is_some_and(|preparing| preparing.superseded)
+    }
+
+    /// Revalidates exact conditional authority at the prepare/install
+    /// linearization point. Preparation deliberately runs without the mailbox
+    /// lock; a newer same-target admission during that interval must prevent
+    /// the older bytes from ever reaching tmux.
+    fn prepared_install_authority_is_current(
+        &self,
+        generation: u64,
+        conditional_commit: Option<&TmuxConditionalCommit>,
+    ) -> bool {
+        let Some(preparing) = self.preparing.as_ref() else {
+            return false;
+        };
+        if preparing.superseded {
+            return false;
+        }
+        match (
+            preparing.conditional_commit.as_ref(),
+            conditional_commit,
+        ) {
+            (None, None) => true,
+            (Some(lease), Some(commit)) => {
+                commit.io_generation() == generation
+                    && commit.lease() == lease
+                    && self.conditional_commit_is_current(lease)
+            }
+            _ => false,
+        }
+    }
+
+    fn restore_prepared_for_retry(
+        &mut self,
+        command: Box<dyn TmuxCommand>,
+        prerequisite: TmuxPreparationPrerequisite,
+    ) -> bool {
+        let Some(preparing) = self.preparing.as_ref() else {
+            return false;
+        };
+        if preparing.class != command.mailbox_class()
+            || preparing.payload_bytes != command.mailbox_payload_bytes()
+            || (preparing.class == TmuxCommandClass::RequiredControl
+                && !self.retry_deferred_durable.is_empty())
+        {
+            return false;
+        }
+        let retry_intent_target = if preparing.class == TmuxCommandClass::CoalescibleIntent {
+            let Some(lease) = preparing.conditional_commit.as_ref() else {
+                // Retryable intents must have a stable coalescing identity;
+                // otherwise one dormant target could retain unbounded newer
+                // generations behind it.
+                return false;
+            };
+            let target = lease.intent.target();
+            if self.retry_deferred_intents.contains_key(&target) {
+                return false;
+            }
+            Some(target)
+        } else {
+            None
+        };
+        let preparing = self
+            .preparing
+            .take()
+            .expect("validated tmux preparation reservation disappeared");
+        let deferred = DeferredTmuxCommand {
+            command,
+            conditional_commit: preparing.conditional_commit,
+            retry_prerequisite: prerequisite,
+            retry_ready: false,
+            retry_intent_previous: None,
+            retry_intent_next: None,
+        };
+        match preparing.class {
+            TmuxCommandClass::CoalescibleIntent => {
+                let target = retry_intent_target
+                    .expect("validated retryable tmux intent lost its target identity");
+                self.append_retry_deferred_intent(target, deferred);
+            }
+            TmuxCommandClass::RequiredControl => {
+                // A blocked required command remains the durable FIFO head.
+                // Intents may still bypass it, but later durable input/control
+                // cannot overtake it. There can therefore be at most one such
+                // deferred durable reservation.
+                debug_assert!(self.retry_deferred_durable.is_empty());
+                self.intents_since_retry_deferred_durable = 0;
+                self.retry_deferred_durable.push_back(deferred);
+            }
+            TmuxCommandClass::LosslessInput | TmuxCommandClass::TerminalControl => return false,
+        }
+        true
+    }
+
+    fn retry_deferred_is_ready(&self, deferred: &DeferredTmuxCommand) -> bool {
+        deferred
+            .conditional_commit
+            .as_ref()
+            .is_some_and(|lease| !self.conditional_commit_is_current(lease))
+            || deferred.retry_ready
+    }
+
+    fn should_force_retry_deferred_durable(&self) -> bool {
+        self.intents_since_retry_deferred_durable >= CMD_QUEUE_DURABLE_SERVICE_QUANTUM
+            && self
+                .retry_deferred_durable
+                .front()
+                .is_some_and(|deferred| self.retry_deferred_is_ready(deferred))
+    }
+
+    fn retry_deferred_intent_is_ready(&self) -> bool {
+        // Same-target admission updates the target-indexed deferred command
+        // and its exact lease in place, so an intent cannot become stale while
+        // dormant. Explicit prerequisite publication is therefore the sole
+        // ready edge and remains O(1) on every producer scheduling check.
+        !self.ready_retry_deferred_intents.is_empty()
+    }
+
+    fn should_force_retry_deferred_intent(&self) -> bool {
+        self.retry_deferred_intent_is_ready()
+            && (self.intent_entries.is_empty()
+                || self.fresh_intents_since_retry_deferred_intent
+                    >= CMD_QUEUE_RETRY_INTENT_SERVICE_QUANTUM)
+            && (self.durable_entries.is_empty()
+                || !self.retry_deferred_durable.is_empty()
+                || self.durable_since_intent >= CMD_QUEUE_DURABLE_SERVICE_QUANTUM)
+    }
+
+    /// Apply the production mailbox policy for one preparation attempt.
+    ///
+    /// A parked required-control item remains the durable FIFO head. Intents
+    /// may bypass it while its prerequisite is unchanged, but once it is ready
+    /// no more than one bounded intent quantum may run before it is retried.
+    fn take_next_for_sender_preparation(
+        &mut self,
+    ) -> Option<Result<Box<dyn TmuxCommand>, Box<dyn TmuxCommand>>> {
+        debug_assert!(self.preparing.is_none());
+
+        if !self.terminal_barrier && self.should_force_retry_deferred_durable() {
+            return self.take_retry_deferred_for_preparation();
+        }
+
+        if !self.terminal_barrier && self.should_force_retry_deferred_intent() {
+            return self.take_retry_deferred_intent_for_preparation();
+        }
+
+        let allow_durable = self.terminal_barrier || self.retry_deferred_durable.is_empty();
+        if let Some(command) = self.take_next_for_preparation_with_policy(allow_durable) {
+            return Some(Ok(command));
+        }
+        if self.terminal_barrier {
+            None
+        } else {
+            self.take_retry_deferred_for_preparation()
+        }
+    }
+
+    /// Select at most one deferred command. A deferred durable entry is a FIFO
+    /// barrier for later durable work but not for latency-sensitive intents.
+    /// Stale conditional work is returned for destruction outside the mailbox
+    /// lock and still counts against the caller's preparation quantum.
+    fn take_retry_deferred_for_preparation(
+        &mut self,
+    ) -> Option<Result<Box<dyn TmuxCommand>, Box<dyn TmuxCommand>>> {
+        let intent_ready = self.retry_deferred_intent_is_ready();
+        let durable_ready = self
+            .retry_deferred_durable
+            .front()
+            .is_some_and(|deferred| self.retry_deferred_is_ready(deferred));
+        let take_durable = durable_ready
+            && (!intent_ready
+                || self.intents_since_retry_deferred_durable
+                    >= CMD_QUEUE_DURABLE_SERVICE_QUANTUM);
+        if !intent_ready && !take_durable {
+            return None;
+        }
+        if !take_durable {
+            return self.take_retry_deferred_intent_for_preparation();
+        }
+        let deferred = {
+            self.intents_since_retry_deferred_durable = 0;
+            self.retry_deferred_durable.pop_front()?
+        };
+        self.begin_retry_preparation(deferred)
+    }
+
+    fn take_retry_deferred_intent_for_preparation(
+        &mut self,
+    ) -> Option<Result<Box<dyn TmuxCommand>, Box<dyn TmuxCommand>>> {
+        let target = self.ready_retry_deferred_intents.pop_front()?;
+        if !self.retry_deferred_durable.is_empty() {
+            self.intents_since_retry_deferred_durable = self
+                .intents_since_retry_deferred_durable
+                .saturating_add(1);
+        }
+        self.fresh_intents_since_retry_deferred_intent = 0;
+        self.durable_since_intent = 0;
+        let deferred = self
+            .remove_retry_deferred_intent(target)
+            .expect("tmux ready retry FIFO lost its target-indexed entry");
+        debug_assert!(deferred.retry_ready);
+        self.begin_retry_preparation(deferred)
+    }
+
+    fn begin_retry_preparation(
+        &mut self,
+        deferred: DeferredTmuxCommand,
+    ) -> Option<Result<Box<dyn TmuxCommand>, Box<dyn TmuxCommand>>> {
+        let stale = deferred
+            .conditional_commit
+            .as_ref()
+            .is_some_and(|lease| !self.conditional_commit_is_current(lease));
+        if stale {
+            self.release_deferred_accounting(&deferred.command);
+            return Some(Err(deferred.command));
+        }
+
+        let command = deferred.command;
+        self.preparing = Some(PreparingTmuxCommand {
+            class: command.mailbox_class(),
+            payload_bytes: command.mailbox_payload_bytes(),
+            conditional_commit: deferred.conditional_commit,
+            superseded: false,
+        });
+        metrics::counter!(
+            "mux.tmux.command_mailbox.serviced",
+            "class" => command.mailbox_class().label(),
+            "source" => "retry",
+        )
+        .increment(1);
+        Some(Ok(command))
+    }
+
+    fn release_deferred_accounting(&mut self, command: &dyn TmuxCommand) {
+        let class = command.mailbox_class();
+        self.payload_bytes = self
+            .payload_bytes
+            .saturating_sub(command.mailbox_payload_bytes());
+        self.retained_by_class[class.index()] =
+            self.retained_by_class[class.index()].saturating_sub(1);
     }
 
     fn release_prepared(&mut self) {
@@ -2131,7 +2796,12 @@ impl TmuxCmdQueue {
         }
     }
 
-    fn install_in_flight(&mut self, cmd: Box<dyn TmuxCommand>, generation: u64) -> bool {
+    fn install_in_flight(
+        &mut self,
+        cmd: Box<dyn TmuxCommand>,
+        generation: u64,
+        conditional_commit: Option<TmuxConditionalCommit>,
+    ) -> bool {
         if self.closed || self.in_flight.is_some() {
             self.release_prepared();
             false
@@ -2143,6 +2813,30 @@ impl TmuxCmdQueue {
                 )),
                 Some((cmd.mailbox_class(), cmd.mailbox_payload_bytes()))
             );
+            debug_assert_eq!(
+                conditional_commit
+                    .as_ref()
+                    .map(TmuxConditionalCommit::lease),
+                self.preparing
+                    .as_ref()
+                    .and_then(|preparing| preparing.conditional_commit.as_ref())
+            );
+            debug_assert!(conditional_commit
+                .as_ref()
+                .is_none_or(|commit| commit.io_generation() == generation));
+            if let Some(TmuxConditionalCommit::PaneSize { lease, .. }) =
+                conditional_commit.as_ref()
+            {
+                if let TmuxConditionalCommitIntent::PaneSize { pane_id, .. } =
+                    &lease.intent
+                {
+                    // From this linearization point onward the command may
+                    // reach tmux. Cached dimensions cannot suppress another
+                    // resize until this exact current lease succeeds and its
+                    // cache update commits.
+                    self.uncertain_remote_pane_sizes.insert(*pane_id);
+                }
+            }
             self.preparing = None;
             let remaining_responses = cmd.expected_responses();
             debug_assert!(remaining_responses > 0);
@@ -2151,6 +2845,7 @@ impl TmuxCmdQueue {
                 generation,
                 remaining_responses,
                 first_error: None,
+                conditional_commit,
             });
             true
         }
@@ -2159,7 +2854,12 @@ impl TmuxCmdQueue {
     fn record_in_flight_response(
         &mut self,
         response: &Guarded,
-    ) -> Option<(Box<dyn TmuxCommand>, Guarded, u64)> {
+    ) -> Option<(
+        Box<dyn TmuxCommand>,
+        Guarded,
+        u64,
+        Option<TmuxConditionalCommit>,
+    )> {
         let in_flight = self.in_flight.as_mut()?;
         if response.error && in_flight.first_error.is_none() {
             in_flight.first_error = Some(response.clone());
@@ -2180,14 +2880,28 @@ impl TmuxCmdQueue {
             .first_error
             .take()
             .unwrap_or_else(|| response.clone());
-        Some((in_flight.command, response, in_flight.generation))
+        Some((
+            in_flight.command,
+            response,
+            in_flight.generation,
+            in_flight.conditional_commit,
+        ))
     }
 
     fn has_pending(&self) -> bool {
         if self.terminal_barrier && self.terminal_command_dispatched {
             return false;
         }
-        !self.durable_entries.is_empty() || !self.intent_entries.is_empty()
+        if self.terminal_barrier || !self.intent_entries.is_empty() {
+            return true;
+        }
+        if self.retry_deferred_intent_is_ready() {
+            return true;
+        }
+        if let Some(deferred) = self.retry_deferred_durable.front() {
+            return self.retry_deferred_is_ready(deferred);
+        }
+        !self.durable_entries.is_empty()
     }
 
     fn has_domain_detach_pending(&self) -> bool {
@@ -2253,7 +2967,7 @@ impl TmuxIoDeadlines {
 struct TmuxIoStart {
     generation: u64,
     kind: TmuxIoOperationKind,
-    command: Option<String>,
+    command: Option<Arc<[u8]>>,
     admitted_at: Instant,
     deadlines: TmuxIoDeadlines,
     _operation: OwnedActiveTmuxOperation,
@@ -2266,7 +2980,7 @@ impl fmt::Debug for TmuxIoStart {
             .field("kind", &self.kind)
             .field(
                 "command_bytes",
-                &self.command.as_ref().map_or(0, String::len),
+                &self.command.as_ref().map_or(0, |command| command.len()),
             )
             .field("admitted_at", &self.admitted_at)
             .field("deadlines", &self.deadlines)
@@ -2288,7 +3002,7 @@ enum TmuxIoControl {
 struct TmuxIoWriteJob {
     generation: u64,
     kind: TmuxIoOperationKind,
-    command: Option<String>,
+    command: Option<Arc<[u8]>>,
 }
 
 #[derive(Debug)]
@@ -2541,10 +3255,19 @@ fn execute_tmux_io_write(
     let result: anyhow::Result<()> = match job.kind {
         TmuxIoOperationKind::Command => pane
             .writer()
-            .write_all(command.as_bytes())
+            .write_all(command.as_ref())
             .map_err(anyhow::Error::from),
         TmuxIoOperationKind::Detach => {
             if let Some(local_pane) = pane.downcast_ref::<LocalPane>() {
+                let command = match std::str::from_utf8(command.as_ref()) {
+                    Ok(command) => command,
+                    Err(err) => {
+                        return TmuxIoWriteOutcome::Io {
+                            error_kind: std::io::ErrorKind::InvalidData,
+                            message: format!("tmux detach command was not UTF-8: {err}"),
+                        };
+                    }
+                };
                 match local_pane.write_tmux_command_if_same(&owner, command) {
                     Ok(true) => Ok(()),
                     Ok(false) => return TmuxIoWriteOutcome::LauncherBindingReplaced,
@@ -2555,7 +3278,7 @@ fn execute_tmux_io_write(
                     return TmuxIoWriteOutcome::RegistrationLost;
                 }
                 pane.writer()
-                    .write_all(command.as_bytes())
+                    .write_all(command.as_ref())
                     .map_err(anyhow::Error::from)
             }
         }
@@ -2957,6 +3680,12 @@ pub(crate) struct TmuxDomainState {
     pending_splits: Mutex<HashMap<u64, promise::Promise<TmuxPaneId>>>,
     next_split_request_id: AtomicU64,
     pub backlog: Mutex<TmuxBacklog>,
+    #[cfg(test)]
+    test_conditional_commits: AtomicUsize,
+    #[cfg(test)]
+    test_command_preparations: AtomicUsize,
+    #[cfg(test)]
+    test_send_runnables_scheduled: AtomicUsize,
     #[cfg(test)]
     test_io_deadlines: Mutex<Option<TmuxIoDeadlines>>,
 }
@@ -4023,15 +4752,20 @@ impl TmuxDomainState {
 
         let completed_response = self.process_protocol_events(events);
         drop(ingress);
-        if let Some((command, response)) = completed_response {
-            self.schedule_command_result(command, response);
+        if let Some((command, response, generation, conditional_commit)) = completed_response {
+            self.schedule_command_result(command, response, generation, conditional_commit);
         }
     }
 
     fn process_protocol_events(
         &self,
         events: Vec<Event>,
-    ) -> Option<(Box<dyn TmuxCommand>, Guarded)> {
+    ) -> Option<(
+        Box<dyn TmuxCommand>,
+        Guarded,
+        u64,
+        Option<TmuxConditionalCommit>,
+    )> {
         let mut events = events.into_iter();
         while let Some(event) = events.next() {
             if matches!(&event, Event::Exit { .. }) {
@@ -4070,7 +4804,7 @@ impl TmuxDomainState {
                     }
                     State::WaitingForResponse => {
                         let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                        if let Some((cmd, resp, generation)) =
+                        if let Some((cmd, resp, generation, conditional_commit)) =
                             cmd_queue.record_in_flight_response(response)
                         {
                             let io_kind = if cmd.awaits_clean_exit() {
@@ -4111,7 +4845,12 @@ impl TmuxDomainState {
                             let response_retained_bytes = std::mem::size_of_val(cmd.as_ref())
                                 .saturating_add(cmd.mailbox_payload_bytes())
                                 .saturating_add(std::mem::size_of::<Guarded>())
-                                .saturating_add(resp.output.capacity());
+                                .saturating_add(resp.output.capacity())
+                                .saturating_add(
+                                    conditional_commit
+                                        .as_ref()
+                                        .map_or(0, TmuxConditionalCommit::retained_bytes),
+                                );
                             let mut barrier = self.protocol_barrier.lock();
                             let admitted = barrier
                                 .activate(response_retained_bytes, trailing_events)
@@ -4126,7 +4865,7 @@ impl TmuxDomainState {
                                 self.transition_to_exit_and_schedule_detach();
                                 return None;
                             }
-                            return Some((cmd, resp));
+                            return Some((cmd, resp, generation, conditional_commit));
                         }
                     }
                     State::Idle | State::Sending | State::ProcessingResponse => {
@@ -4270,7 +5009,13 @@ impl TmuxDomainState {
         None
     }
 
-    fn schedule_command_result(&self, cmd: Box<dyn TmuxCommand>, resp: Guarded) {
+    fn schedule_command_result(
+        &self,
+        cmd: Box<dyn TmuxCommand>,
+        resp: Guarded,
+        generation: u64,
+        conditional_commit: Option<TmuxConditionalCommit>,
+    ) {
         let domain_id = self.domain_id;
         if !promise::spawn::is_scheduler_configured() {
             log::error!(
@@ -4320,20 +5065,244 @@ impl TmuxDomainState {
                 barrier_lease.completed = true;
                 return;
             }
-            expected_inner.complete_command_response(cmd, &resp);
+            expected_inner.complete_command_response(
+                cmd,
+                &resp,
+                generation,
+                conditional_commit,
+            );
             barrier_lease.completed = true;
         })
         .detach();
     }
 
-    fn apply_command_result(&self, cmd: Box<dyn TmuxCommand>, response: &Guarded) -> bool {
+    /// Validate conditional result authority before invoking a command result
+    /// callback. Identity locks are acquired before the mailbox, so a hot
+    /// keypress producer never waits behind topology-lock acquisition.
+    ///
+    /// Result callbacks run on the serialized mux main-thread path. The commit
+    /// below nevertheless revalidates after the callback; this first check
+    /// prevents an intent or replacement that was already stale at dispatch
+    /// time from performing any reconciliation side effect.
+    fn conditional_result_is_current(
+        &self,
+        generation: u64,
+        conditional_commit: &TmuxConditionalCommit,
+    ) -> bool {
+        if conditional_commit.io_generation() != generation {
+            return false;
+        }
+
+        match conditional_commit {
+            TmuxConditionalCommit::WindowLayout {
+                lease,
+                local_tab_id,
+                ..
+            } => {
+                let TmuxConditionalCommitIntent::WindowLayout { window_id, .. } = &lease.intent
+                else {
+                    return false;
+                };
+                let gui_tabs = self.gui_tabs.lock();
+                if !gui_tabs
+                    .get(window_id)
+                    .is_some_and(|local_tab| local_tab.tab_id == *local_tab_id)
+                {
+                    return false;
+                }
+                self.cmd_queue.lock().conditional_commit_is_current(lease)
+            }
+            TmuxConditionalCommit::PaneSize {
+                lease,
+                local_pane_id,
+                local_tab_id,
+                remote_window_id,
+                ..
+            } => {
+                let TmuxConditionalCommitIntent::PaneSize { pane_id, .. } = &lease.intent else {
+                    return false;
+                };
+                let _pane_registry = self.pane_registry.lock();
+                let gui_tabs = self.gui_tabs.lock();
+                if !gui_tabs
+                    .get(remote_window_id)
+                    .is_some_and(|local_tab| local_tab.tab_id == *local_tab_id)
+                {
+                    return false;
+                }
+                let remote_panes = self.remote_panes.lock();
+                let Some(remote_pane) = remote_panes.get(pane_id) else {
+                    return false;
+                };
+                let pane = remote_pane.lock();
+                if pane.local_pane_id != *local_pane_id
+                    || pane.window_id != *remote_window_id
+                    || pane.pane_id != *pane_id
+                {
+                    return false;
+                }
+                self.cmd_queue.lock().conditional_commit_is_current(lease)
+            }
+        }
+    }
+
+    /// Publish a suppression-cache update only while the exact I/O
+    /// generation, latest admitted intent, and local mirror identity captured
+    /// by pure preparation all still match. Topology identity locks are taken
+    /// first; the mailbox is acquired only for the final constant-time claim
+    /// and mutation, with no I/O or callback under any of these locks.
+    fn commit_conditional_success(
+        &self,
+        generation: u64,
+        conditional_commit: TmuxConditionalCommit,
+    ) -> bool {
+        if conditional_commit.io_generation() != generation {
+            metrics::counter!(
+                "mux.tmux.conditional_commit.skipped",
+                "reason" => "io_generation",
+            )
+            .increment(1);
+            return false;
+        }
+
+        let committed = match conditional_commit {
+            TmuxConditionalCommit::WindowLayout {
+                lease,
+                local_tab_id,
+                ..
+            } => {
+                let (window_id, layout_csum) = match &lease.intent {
+                    TmuxConditionalCommitIntent::WindowLayout {
+                        window_id,
+                        layout_csum,
+                        ..
+                    } => (*window_id, layout_csum.clone()),
+                    TmuxConditionalCommitIntent::PaneSize { .. } => return false,
+                };
+                let mut gui_tabs = self.gui_tabs.lock();
+                let Some(local_tab) = gui_tabs.get_mut(&window_id) else {
+                    return false;
+                };
+                if local_tab.tab_id != local_tab_id {
+                    false
+                } else {
+                    let mut cmd_queue = self.cmd_queue.lock();
+                    if !cmd_queue.retire_conditional_commit_if_current(&lease) {
+                        return false;
+                    }
+                    local_tab.layout_csum = layout_csum;
+                    true
+                }
+            }
+            TmuxConditionalCommit::PaneSize {
+                lease,
+                local_pane_id,
+                local_tab_id,
+                remote_window_id,
+                ..
+            } => {
+                let (pane_id, rows, cols) = match &lease.intent {
+                    TmuxConditionalCommitIntent::PaneSize {
+                        pane_id,
+                        rows,
+                        cols,
+                    } => (*pane_id, *rows, *cols),
+                    TmuxConditionalCommitIntent::WindowLayout { .. } => return false,
+                };
+                let _pane_registry = self.pane_registry.lock();
+                let gui_tabs = self.gui_tabs.lock();
+                let tab_matches = gui_tabs
+                    .get(&remote_window_id)
+                    .is_some_and(|local_tab| local_tab.tab_id == local_tab_id);
+                if !tab_matches {
+                    false
+                } else {
+                    let remote_panes = self.remote_panes.lock();
+                    let Some(remote_pane) = remote_panes.get(&pane_id) else {
+                        return false;
+                    };
+                    let mut pane = remote_pane.lock();
+                    if pane.local_pane_id != local_pane_id
+                        || pane.window_id != remote_window_id
+                        || pane.pane_id != pane_id
+                    {
+                        false
+                    } else {
+                        let mut cmd_queue = self.cmd_queue.lock();
+                        if !cmd_queue.conditional_commit_is_current(&lease) {
+                            return false;
+                        }
+                        pane.pane_width = u64::from(cols);
+                        pane.pane_height = u64::from(rows);
+                        let retired =
+                            cmd_queue.retire_conditional_commit_if_current(&lease);
+                        if !retired {
+                            return false;
+                        }
+                        cmd_queue
+                            .uncertain_remote_pane_sizes
+                            .remove(&pane_id);
+                        true
+                    }
+                }
+            }
+        };
+
+        metrics::counter!(
+            "mux.tmux.conditional_commit.completed",
+            "outcome" => if committed { "committed" } else { "identity_stale" },
+        )
+        .increment(1);
+        #[cfg(test)]
+        if committed {
+            self.test_conditional_commits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        committed
+    }
+
+    fn apply_command_result(
+        &self,
+        cmd: Box<dyn TmuxCommand>,
+        response: &Guarded,
+        generation: u64,
+        conditional_commit: Option<TmuxConditionalCommit>,
+    ) -> bool {
         let Some(_active_operation) = self.begin_active_operation() else {
             return false;
         };
+        let conditional_result_is_stale = conditional_commit
+            .as_ref()
+            .is_some_and(|conditional_commit| {
+                !self.conditional_result_is_current(generation, conditional_commit)
+            });
+        if conditional_result_is_stale && !response.error {
+            if let Some(conditional_commit) = conditional_commit.as_ref() {
+                if conditional_commit.io_generation() == generation {
+                    self.cmd_queue
+                        .lock()
+                        .retire_conditional_commit_if_current(conditional_commit.lease());
+                }
+            }
+            metrics::counter!(
+                "mux.tmux.conditional_commit.skipped",
+                "reason" => "stale_before_result",
+            )
+            .increment(1);
+            return true;
+        }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cmd.process_result(self.domain_id, response)
         })) {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) if !response.error => {}
+            Ok(Ok(())) => {
+                log::error!(
+                    "tmux command in domain {} accepted a guarded protocol error; detaching",
+                    self.domain_id
+                );
+                self.transition_to_exit_and_schedule_detach();
+                return false;
+            }
             Ok(Err(err)) => {
                 log::error!("Tmux processing command result error: {err}");
                 self.transition_to_exit_and_schedule_detach();
@@ -4349,11 +5318,20 @@ impl TmuxDomainState {
                 return false;
             }
         }
+        if let Some(conditional_commit) = conditional_commit {
+            self.commit_conditional_success(generation, conditional_commit);
+        }
         true
     }
 
-    fn complete_command_response(self: &Arc<Self>, cmd: Box<dyn TmuxCommand>, response: &Guarded) {
-        if self.apply_command_result(cmd, response) {
+    fn complete_command_response(
+        self: &Arc<Self>,
+        cmd: Box<dyn TmuxCommand>,
+        response: &Guarded,
+        generation: u64,
+        conditional_commit: Option<TmuxConditionalCommit>,
+    ) {
+        if self.apply_command_result(cmd, response, generation, conditional_commit) {
             self.protocol_barrier.lock().response_committed();
             self.drain_protocol_response_barrier();
         }
@@ -4473,7 +5451,7 @@ impl TmuxDomainState {
 
     #[cfg(test)]
     fn process_command_result(&self, cmd: Box<dyn TmuxCommand>, response: &Guarded) {
-        if !self.apply_command_result(cmd, response) {
+        if !self.apply_command_result(cmd, response, 0, None) {
             return;
         }
         if self.transition_state(State::ProcessingResponse, State::Idle) {
@@ -4501,64 +5479,149 @@ impl TmuxDomainState {
             return Ok(());
         }
 
-        let (command, prepared_command) = loop {
-            let prepared_command = {
-                let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                cmd_queue.take_next_for_preparation()
-            };
-            let Some(prepared_command) = prepared_command else {
-                // Keep the queue locked across the Sending -> Idle transition.
-                // A producer either enqueues before this transition and is
-                // observed here, or enqueues afterward and schedules the new
-                // Idle edge itself.
-                let cmd_queue = self.cmd_queue.as_ref().lock();
-                if cmd_queue.has_pending() {
-                    continue;
-                }
-                if !self.transition_state(State::Sending, State::Idle) {
-                    return Ok(());
-                }
+        // One main-thread turn inspects a fixed number of mailbox entries.
+        // Retryable work parks on one explicit fact, so it cannot be selected
+        // again until its exact lease is superseded or that fact is published.
+        let mut preparation_budget = CMD_QUEUE_PREPARATION_QUANTUM;
+
+        let (command, generation, io_kind) = loop {
+            if preparation_budget == 0 {
+                let _cmd_queue = self.cmd_queue.lock();
+                let _ = self.transition_state(State::Sending, State::Idle);
                 return Ok(());
+            }
+            let (prepared_command, conditional_commit_lease, superseded) = {
+                let mut cmd_queue = self.cmd_queue.as_ref().lock();
+                let prepared_command = match cmd_queue.take_next_for_sender_preparation() {
+                    Some(Ok(command)) => Some(command),
+                    Some(Err(stale)) => {
+                        drop(cmd_queue);
+                        drop(stale);
+                        preparation_budget -= 1;
+                        TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
+                        continue;
+                    }
+                    None => None,
+                };
+                let Some(prepared_command) = prepared_command else {
+                    // Close the empty-check/Idle transition race under the
+                    // mailbox lock. A later producer observes Idle and owns
+                    // the next scheduling edge.
+                    let _ = self.transition_state(State::Sending, State::Idle);
+                    return Ok(());
+                };
+                let conditional_commit_lease = cmd_queue.prepared_conditional_commit();
+                let superseded = cmd_queue.prepared_is_superseded();
+                (prepared_command, conditional_commit_lease, superseded)
             };
+            preparation_budget -= 1;
+
+            if superseded {
+                self.cmd_queue.lock().release_prepared();
+                TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
+                continue;
+            }
 
             // Command preparation can inspect mux/tab/pane state and may take
             // auxiliary locks. Do it outside the mailbox critical section so
             // keypress and resize producers never wait behind that work.
-            let command = prepared_command.get_command(self.domain_id);
-            if !command.is_empty() {
-                break (command, prepared_command);
+            let generation = self.alloc_io_generation()?;
+            let retry_lease = conditional_commit_lease.clone();
+            #[cfg(test)]
+            self.test_command_preparations
+                .fetch_add(1, Ordering::Relaxed);
+            let preparation = prepared_command.prepare(
+                self.domain_id,
+                generation,
+                conditional_commit_lease,
+            );
+            match preparation {
+                TmuxCommandPreparation::Ready {
+                    command,
+                    conditional_commit,
+                } => {
+                    let io_kind = if prepared_command.awaits_clean_exit() {
+                        TmuxIoOperationKind::Detach
+                    } else {
+                        TmuxIoOperationKind::Command
+                    };
+                    let mut cmd_queue = self.cmd_queue.as_ref().lock();
+                    if !cmd_queue.prepared_install_authority_is_current(
+                        generation,
+                        conditional_commit.as_ref(),
+                    ) {
+                        cmd_queue.release_prepared();
+                        drop(cmd_queue);
+                        drop(prepared_command);
+                        drop(command);
+                        metrics::counter!(
+                            "mux.tmux.conditional_commit.skipped",
+                            "reason" => "stale_before_install",
+                        )
+                        .increment(1);
+                        TmuxDomainState::wake_notification_intent_capacity(
+                            self.domain_id,
+                        );
+                        continue;
+                    }
+                    if !self.transition_state(State::Sending, State::WaitingForResponse) {
+                        cmd_queue.release_prepared();
+                        drop(cmd_queue);
+                        drop(prepared_command);
+                        drop(command);
+                        TmuxDomainState::wake_notification_intent_capacity(
+                            self.domain_id,
+                        );
+                        return Ok(());
+                    }
+                    if !cmd_queue.install_in_flight(
+                        prepared_command,
+                        generation,
+                        conditional_commit,
+                    ) {
+                        anyhow::bail!(
+                            "tmux command mailbox closed or already had an in-flight command during sender reservation"
+                        );
+                    }
+                    if !self.install_io_operation(io_kind, generation) {
+                        anyhow::bail!(
+                            "tmux domain {} could not install the unique I/O lease for generation \
+                             {generation}",
+                            self.domain_id,
+                        );
+                    }
+                    break (command, generation, io_kind);
+                }
+                TmuxCommandPreparation::Suppressed | TmuxCommandPreparation::Discarded => {
+                    let mut cmd_queue = self.cmd_queue.lock();
+                    if let Some(lease) = retry_lease.as_ref() {
+                        cmd_queue.retire_conditional_commit_if_current(lease);
+                    }
+                    cmd_queue.release_prepared();
+                    drop(cmd_queue);
+                    TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
+                }
+                TmuxCommandPreparation::Retryable { prerequisite } => {
+                    let mut cmd_queue = self.cmd_queue.lock();
+                    let retry_is_current = retry_lease.as_ref().is_none_or(|lease| {
+                        cmd_queue.conditional_commit_is_current(lease)
+                    });
+                    if retry_is_current {
+                        anyhow::ensure!(
+                            cmd_queue.restore_prepared_for_retry(
+                                prepared_command,
+                                prerequisite,
+                            ),
+                            "tmux retryable preparation lost its mailbox reservation"
+                        );
+                    } else {
+                        cmd_queue.release_prepared();
+                        drop(cmd_queue);
+                        TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
+                    }
+                }
             }
-            self.cmd_queue.lock().release_prepared();
-            TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
         };
-
-        let io_kind = if prepared_command.awaits_clean_exit() {
-            TmuxIoOperationKind::Detach
-        } else {
-            TmuxIoOperationKind::Command
-        };
-        let generation = self.alloc_io_generation()?;
-        {
-            let mut cmd_queue = self.cmd_queue.as_ref().lock();
-            if !self.transition_state(State::Sending, State::WaitingForResponse) {
-                cmd_queue.release_prepared();
-                drop(cmd_queue);
-                TmuxDomainState::wake_notification_intent_capacity(self.domain_id);
-                return Ok(());
-            }
-            if !cmd_queue.install_in_flight(prepared_command, generation) {
-                anyhow::bail!(
-                    "tmux command mailbox closed or already had an in-flight command during sender reservation"
-                );
-            }
-            if !self.install_io_operation(io_kind, generation) {
-                anyhow::bail!(
-                    "tmux domain {} could not install the unique I/O lease for generation \
-                     {generation}",
-                    self.domain_id,
-                );
-            }
-        }
 
         let command_bytes = command.len();
         let start = TmuxIoStart {
@@ -4636,9 +5699,16 @@ impl TmuxDomainState {
             return Err(TmuxScheduleError::ReplacedDomain);
         }
         let scheduled_inner = Arc::clone(&tmux_domain.inner);
+        if !scheduled_inner.should_schedule_send() {
+            return Ok(());
+        }
         if !scheduled_inner.try_claim_send_schedule() {
             return Ok(());
         }
+        #[cfg(test)]
+        scheduled_inner
+            .test_send_runnables_scheduled
+            .fetch_add(1, Ordering::Relaxed);
         let schedule_lease = SendScheduleLease {
             owner: Arc::clone(&scheduled_inner),
             completed: false,
@@ -4787,6 +5857,12 @@ impl TmuxDomain {
             pending_splits: Mutex::new(HashMap::default()),
             next_split_request_id: AtomicU64::new(1),
             backlog: Mutex::new(TmuxBacklog::default()),
+            #[cfg(test)]
+            test_conditional_commits: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_command_preparations: AtomicUsize::new(0),
+            #[cfg(test)]
+            test_send_runnables_scheduled: AtomicUsize::new(0),
             #[cfg(test)]
             test_io_deadlines: Mutex::new(None),
         });
@@ -5228,6 +6304,7 @@ mod tests {
         bytes: Vec<u8>,
         write_threads: Vec<std::thread::ThreadId>,
         write_gate: Option<WriteGate>,
+        write_limit_once: Option<usize>,
         write_error: Option<std::io::ErrorKind>,
     }
 
@@ -5258,6 +6335,79 @@ mod tests {
         sequence: usize,
     }
 
+    #[derive(Debug)]
+    struct RetryableRequiredTestCommand {
+        sequence: usize,
+    }
+
+    #[derive(Debug)]
+    struct DiscardedRequiredTestCommand;
+
+    struct BarrierConditionalTestCommand {
+        pane_id: TmuxPaneId,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl fmt::Debug for BarrierConditionalTestCommand {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BarrierConditionalTestCommand")
+                .field("pane_id", &self.pane_id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl TmuxCommand for BarrierConditionalTestCommand {
+        fn mailbox_class(&self) -> TmuxCommandClass {
+            TmuxCommandClass::CoalescibleIntent
+        }
+
+        fn get_command(&self, _domain_id: DomainId) -> String {
+            "barrier-conditional-test\n".to_string()
+        }
+
+        fn conditional_commit_intent(&self) -> Option<TmuxConditionalCommitIntent> {
+            Some(TmuxConditionalCommitIntent::PaneSize {
+                pane_id: self.pane_id,
+                rows: 40,
+                cols: 120,
+            })
+        }
+
+        fn prepare(
+            &self,
+            _domain_id: DomainId,
+            io_generation: u64,
+            lease: Option<TmuxConditionalCommitLease>,
+        ) -> TmuxCommandPreparation {
+            self.entered
+                .send(())
+                .expect("test preparation barrier receiver");
+            self.release
+                .recv()
+                .expect("test preparation barrier release");
+            let lease = lease.expect("conditional barrier command lease");
+            TmuxCommandPreparation::Ready {
+                command: Arc::<[u8]>::from(&b"barrier-conditional-test\n"[..]),
+                conditional_commit: Some(TmuxConditionalCommit::PaneSize {
+                    io_generation,
+                    lease,
+                    local_pane_id: 1,
+                    local_tab_id: 1,
+                    remote_window_id: 1,
+                }),
+            }
+        }
+
+        fn process_result(
+            &self,
+            _domain_id: DomainId,
+            _result: &Guarded,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     impl TmuxCommand for ClassedTestCommand {
         fn mailbox_class(&self) -> TmuxCommandClass {
             self.class
@@ -5276,11 +6426,67 @@ mod tests {
         }
     }
 
+    impl TmuxCommand for RetryableRequiredTestCommand {
+        fn mailbox_class(&self) -> TmuxCommandClass {
+            TmuxCommandClass::RequiredControl
+        }
+
+        fn get_command(&self, _domain_id: DomainId) -> String {
+            format!("retryable-test-{}\n", self.sequence)
+        }
+
+        fn prepare(
+            &self,
+            _domain_id: DomainId,
+            _io_generation: u64,
+            _lease: Option<TmuxConditionalCommitLease>,
+        ) -> TmuxCommandPreparation {
+            TmuxCommandPreparation::Retryable {
+                prerequisite: TmuxPreparationPrerequisite::Attach,
+            }
+        }
+
+        fn process_result(
+            &self,
+            _domain_id: DomainId,
+            _result: &Guarded,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl TmuxCommand for DiscardedRequiredTestCommand {
+        fn mailbox_class(&self) -> TmuxCommandClass {
+            TmuxCommandClass::RequiredControl
+        }
+
+        fn get_command(&self, _domain_id: DomainId) -> String {
+            String::new()
+        }
+
+        fn prepare(
+            &self,
+            _domain_id: DomainId,
+            _io_generation: u64,
+            _lease: Option<TmuxConditionalCommitLease>,
+        ) -> TmuxCommandPreparation {
+            TmuxCommandPreparation::Discarded
+        }
+
+        fn process_result(
+            &self,
+            _domain_id: DomainId,
+            _result: &Guarded,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     fn complete_next_mailbox_command(queue: &mut TmuxCmdQueue) -> Box<dyn TmuxCommand> {
         let command = queue
             .take_next_for_preparation()
             .expect("mailbox command should be ready");
-        assert!(queue.install_in_flight(command, 1));
+        assert!(queue.install_in_flight(command, 1, None));
         let response = Guarded {
             error: false,
             timestamp: 0,
@@ -5373,6 +6579,11 @@ mod tests {
                     )
                 })?;
             }
+            if let Some(limit) = self.write_limit_once.take() {
+                let written = limit.min(buf.len());
+                self.bytes.extend_from_slice(&buf[..written]);
+                return Ok(written);
+            }
             if let Some(kind) = self.write_error.take() {
                 return Err(std::io::Error::new(
                     kind,
@@ -5398,6 +6609,7 @@ mod tests {
                     bytes: Vec::new(),
                     write_threads: Vec::new(),
                     write_gate: None,
+                    write_limit_once: None,
                     write_error: None,
                 }),
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
@@ -5421,6 +6633,7 @@ mod tests {
                         entered: Some(entered_tx),
                         release: release_rx,
                     }),
+                    write_limit_once: None,
                     write_error: None,
                 }),
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
@@ -5437,6 +6650,27 @@ mod tests {
                     bytes: Vec::new(),
                     write_threads: Vec::new(),
                     write_gate: None,
+                    write_limit_once: None,
+                    write_error: Some(std::io::ErrorKind::BrokenPipe),
+                }),
+                mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
+            })
+        }
+
+        fn new_with_partial_then_failing_writer(
+            pane_id: PaneId,
+            domain_id: DomainId,
+            partial_bytes: usize,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                pane_id,
+                domain_id,
+                keys: Mutex::new(Vec::new()),
+                writes: Mutex::new(RecordingWriter {
+                    bytes: Vec::new(),
+                    write_threads: Vec::new(),
+                    write_gate: None,
+                    write_limit_once: Some(partial_bytes),
                     write_error: Some(std::io::ErrorKind::BrokenPipe),
                 }),
                 mux_registration: Arc::new(crate::PaneRegistrationSlot::default()),
@@ -5737,9 +6971,7 @@ mod tests {
                 Event::Exit { reason: None },
             ])
             .expect("detach Guarded must own its clean-exit protocol tail");
-        tmux_domain
-            .inner
-            .complete_command_response(completed.0, &completed.1);
+        complete_protocol_response(&tmux_domain.inner, completed);
         wait_until("serialized tmux detach clean exit", || {
             *tmux_domain.inner.state.lock() == State::Exit
         });
@@ -5794,9 +7026,7 @@ mod tests {
             .inner
             .process_protocol_events(vec![Event::Guarded(successful_guarded_response())])
             .expect("ordinary command response must retain exact ownership");
-        tmux_domain
-            .inner
-            .complete_command_response(completed.0, &completed.1);
+        complete_protocol_response(&tmux_domain.inner, completed);
         tmux_domain.inner.send_next_command();
         wait_until("detach write after prior response", || {
             launcher.recorded_writes() == b"count\ndetach\n"
@@ -5810,9 +7040,7 @@ mod tests {
                 Event::Exit { reason: None },
             ])
             .expect("detach response must fence its clean-exit tail");
-        tmux_domain
-            .inner
-            .complete_command_response(completed.0, &completed.1);
+        complete_protocol_response(&tmux_domain.inner, completed);
         wait_until("ordered tmux detach clean exit", || {
             *tmux_domain.inner.state.lock() == State::Exit
         });
@@ -6319,9 +7547,7 @@ mod tests {
             .inner
             .process_protocol_events(vec![Event::Guarded(successful_guarded_response())])
             .expect("detach Guarded must release only its response phase");
-        tmux_domain
-            .inner
-            .complete_command_response(completed.0, &completed.1);
+        complete_protocol_response(&tmux_domain.inner, completed);
         wait_until("tmux detach clean-exit deadline", || {
             *tmux_domain.inner.state.lock() == State::Exit
         });
@@ -6447,6 +7673,7 @@ mod tests {
             generation: 1,
             remaining_responses: 1,
             first_error: None,
+            conditional_commit: None,
         });
         queue.retained_by_class[TmuxCommandClass::RequiredControl.index()] = 1;
         drop(queue);
@@ -6462,6 +7689,24 @@ mod tests {
             flags: 0,
             output: String::new(),
         }
+    }
+
+    fn complete_protocol_response(
+        inner: &Arc<TmuxDomainState>,
+        completed: (
+            Box<dyn TmuxCommand>,
+            Guarded,
+            u64,
+            Option<TmuxConditionalCommit>,
+        ),
+    ) {
+        let (command, response, generation, conditional_commit) = completed;
+        inner.complete_command_response(
+            command,
+            &response,
+            generation,
+            conditional_commit,
+        );
     }
 
     #[test]
@@ -6491,9 +7736,7 @@ mod tests {
             1,
             "same-batch tail must wait behind the response callback"
         );
-        tmux_domain
-            .inner
-            .complete_command_response(completed.0, &completed.1);
+        complete_protocol_response(&tmux_domain.inner, completed);
 
         assert!(processed.load(Ordering::Acquire));
         assert_eq!(*tmux_domain.inner.tmux_session.lock(), Some(17));
@@ -6524,9 +7767,7 @@ mod tests {
 
         assert_eq!(*tmux_domain.inner.tmux_session.lock(), None);
         assert_eq!(tmux_domain.inner.protocol_barrier.lock().events.len(), 1);
-        tmux_domain
-            .inner
-            .complete_command_response(completed.0, &completed.1);
+        complete_protocol_response(&tmux_domain.inner, completed);
 
         assert!(processed.load(Ordering::Acquire));
         assert_eq!(*tmux_domain.inner.tmux_session.lock(), Some(23));
@@ -6551,6 +7792,7 @@ mod tests {
                 generation: 1,
                 remaining_responses: 1,
                 first_error: None,
+                conditional_commit: None,
             });
             queue.retained_by_class[TmuxCommandClass::RequiredControl.index()] = 1;
         }
@@ -6566,9 +7808,7 @@ mod tests {
                 Event::Guarded(successful_guarded_response()),
             ])
             .expect("the owned response must activate the protocol barrier");
-        tmux_domain
-            .inner
-            .complete_command_response(completed.0, &completed.1);
+        complete_protocol_response(&tmux_domain.inner, completed);
 
         assert_eq!(processed.load(Ordering::Relaxed), 1);
         assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
@@ -7415,6 +8655,61 @@ mod tests {
     }
 
     #[test]
+    fn close_moves_high_water_mailbox_storage_out_of_the_critical_section() {
+        let mut queue = TmuxCmdQueue::new();
+        for pane_id in 1..=128 {
+            queue
+                .push_back(Box::new(Resize {
+                    pane_id,
+                    size: portable_pty::PtySize {
+                        rows: 40,
+                        cols: 120,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                }))
+                .expect("high-water conditional intent admission");
+        }
+        for _ in 0..128 {
+            let command = queue
+                .take_next_for_preparation()
+                .expect("high-water intent enters preparation");
+            assert!(queue.restore_prepared_for_retry(
+                command,
+                TmuxPreparationPrerequisite::Attach,
+            ));
+        }
+        queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
+        queue.uncertain_remote_pane_sizes.extend(1..=128);
+        queue
+            .push_back(Box::new(ListCommands))
+            .expect("retain a durable allocation at close");
+        assert!(queue.ready_retry_deferred_intents.capacity() > 0);
+        assert!(queue.retry_deferred_intents.capacity() > 0);
+        assert!(queue.latest_conditional_commits.capacity() > 0);
+        assert!(queue.uncertain_remote_pane_sizes.capacity() > 0);
+
+        let teardown = queue.close();
+        assert_eq!(queue.durable_entries.capacity(), 0);
+        assert_eq!(queue.intent_entries.capacity(), 0);
+        assert_eq!(queue.retry_deferred_durable.capacity(), 0);
+        assert_eq!(queue.ready_retry_deferred_intents.capacity(), 0);
+        assert_eq!(queue.retry_deferred_intents.capacity(), 0);
+        assert_eq!(queue.latest_conditional_commits.capacity(), 0);
+        assert_eq!(queue.queued_conditional_commits.capacity(), 0);
+        assert_eq!(queue.uncertain_remote_pane_sizes.capacity(), 0);
+        assert!(queue.is_empty());
+
+        assert_eq!(teardown.retry_deferred_intents.len(), 128);
+        assert_eq!(teardown.ready_retry_deferred_intents.len(), 128);
+        assert!(teardown.ready_retry_deferred_intents.capacity() > 0);
+        assert!(teardown.retry_deferred_intents.capacity() > 0);
+        assert!(teardown.latest_conditional_commits.capacity() > 0);
+        assert!(teardown.uncertain_remote_pane_sizes.capacity() > 0);
+        drop(teardown);
+    }
+
+    #[test]
     fn required_admission_fails_closed_when_sender_cannot_be_registered() {
         let mux = Arc::new(Mux::new(None));
         let _guard = ScopedMux::install(mux);
@@ -7540,6 +8835,678 @@ mod tests {
     }
 
     #[test]
+    fn retryable_required_head_yields_to_intent_without_reordering_durable_fifo() {
+        let mut queue = TmuxCmdQueue::new();
+        queue
+            .push_back(Box::new(RetryableRequiredTestCommand { sequence: 1 }))
+            .expect("retryable durable head");
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::RequiredControl,
+                sequence: 2,
+            }))
+            .expect("later durable command");
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::CoalescibleIntent,
+                sequence: 3,
+            }))
+            .expect("ready intent");
+
+        let retryable = queue
+            .take_next_for_preparation()
+            .expect("durable head enters preparation first");
+        assert!(matches!(
+            retryable.prepare(0, 1, None),
+            TmuxCommandPreparation::Retryable { .. }
+        ));
+        assert!(queue.restore_prepared_for_retry(
+            retryable,
+            TmuxPreparationPrerequisite::Attach,
+        ));
+
+        let intent = queue
+            .take_next_for_preparation_with_policy(false)
+            .expect("ready intent bypasses the parked durable head");
+        assert_eq!(intent.get_command(0), "test-3\n");
+        queue.release_prepared();
+        drop(intent);
+        assert!(
+            queue
+                .take_next_for_preparation_with_policy(false)
+                .is_none(),
+            "later durable work must not overtake the parked FIFO head",
+        );
+        assert!(
+            !queue.has_pending(),
+            "a stable blocked head must remain dormant without hiding scheduled work",
+        );
+
+        queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
+        assert!(queue.has_pending());
+        let retried = queue
+            .take_retry_deferred_for_preparation()
+            .expect("progress makes the durable head retryable")
+            .expect("the exact durable generation remains current");
+        assert_eq!(retried.get_command(0), "retryable-test-1\n");
+        queue.release_prepared();
+    }
+
+    #[test]
+    fn ready_retryable_required_head_has_bounded_service_amid_continuous_intents() {
+        let mut queue = TmuxCmdQueue::new();
+        queue
+            .push_back(Box::new(RetryableRequiredTestCommand { sequence: 1 }))
+            .expect("retryable required head");
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::RequiredControl,
+                sequence: 2,
+            }))
+            .expect("later durable command");
+
+        let head = queue
+            .take_next_for_sender_preparation()
+            .expect("required head selection")
+            .expect("required head is not stale");
+        assert!(matches!(
+            head.prepare(0, 1, None),
+            TmuxCommandPreparation::Retryable { .. }
+        ));
+        assert!(queue.restore_prepared_for_retry(
+            head,
+            TmuxPreparationPrerequisite::Attach,
+        ));
+        queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
+
+        for sequence in 0..CMD_QUEUE_RETRY_INTENT_SERVICE_QUANTUM {
+            queue
+                .push_back(Box::new(ClassedTestCommand {
+                    class: TmuxCommandClass::CoalescibleIntent,
+                    sequence: 10_000 + sequence,
+                }))
+                .expect("continuous intent admission");
+            let intent = queue
+                .take_next_for_sender_preparation()
+                .expect("intent selection before bounded retry deadline")
+                .expect("ordinary intent is not stale");
+            assert_eq!(intent.mailbox_class(), TmuxCommandClass::CoalescibleIntent);
+            queue.release_prepared();
+        }
+
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::CoalescibleIntent,
+                sequence: 20_000,
+            }))
+            .expect("intent present at forced durable boundary");
+        let retried_head = queue
+            .take_next_for_sender_preparation()
+            .expect("ready durable retry must receive bounded service")
+            .expect("ready durable retry is not stale");
+        assert_eq!(retried_head.get_command(0), "retryable-test-1\n");
+        queue.release_prepared();
+
+        let next_durable = queue
+            .take_next_for_sender_preparation()
+            .expect("later durable command follows retried FIFO head")
+            .expect("later durable command is not stale");
+        assert_eq!(next_durable.get_command(0), "test-2\n");
+        queue.release_prepared();
+    }
+
+    #[test]
+    fn ready_retryable_intent_has_bounded_service_amid_continuous_fresh_intents() {
+        let mut queue = TmuxCmdQueue::new();
+        queue
+            .push_back(Box::new(Resize {
+                pane_id: 77,
+                size: portable_pty::PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }))
+            .expect("retryable resize admission");
+        let retryable = queue
+            .take_next_for_sender_preparation()
+            .expect("resize selection")
+            .expect("resize lease is current");
+        assert!(queue.restore_prepared_for_retry(
+            retryable,
+            TmuxPreparationPrerequisite::Attach,
+        ));
+        queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
+
+        for sequence in 0..CMD_QUEUE_DURABLE_SERVICE_QUANTUM {
+            queue
+                .push_back(Box::new(ClassedTestCommand {
+                    class: TmuxCommandClass::CoalescibleIntent,
+                    sequence,
+                }))
+                .expect("continuous fresh intent admission");
+            let fresh = queue
+                .take_next_for_sender_preparation()
+                .expect("fresh intent before bounded retry deadline")
+                .expect("fresh intent is not stale");
+            assert_eq!(fresh.get_command(0), format!("test-{sequence}\n"));
+            queue.release_prepared();
+        }
+
+        queue
+            .push_back(Box::new(ClassedTestCommand {
+                class: TmuxCommandClass::CoalescibleIntent,
+                sequence: usize::MAX,
+            }))
+            .expect("fresh intent at forced retry boundary");
+        let retried = queue
+            .take_next_for_sender_preparation()
+            .expect("ready retryable intent receives bounded service")
+            .expect("retryable intent lease remains current");
+        assert_eq!(
+            retried.as_resize().map(|(pane_id, _)| pane_id),
+            Some(77),
+        );
+        queue.release_prepared();
+
+        let fresh_after_retry = queue
+            .take_next_for_sender_preparation()
+            .expect("fresh intent remains queued after forced retry")
+            .expect("fresh intent is not stale");
+        assert_eq!(fresh_after_retry.get_command(0), format!("test-{}\n", usize::MAX));
+        queue.release_prepared();
+    }
+
+    #[test]
+    fn identical_conditional_admissions_keep_exact_distinct_generations() {
+        let mut queue = TmuxCmdQueue::new();
+        let resize = || {
+            Box::new(Resize {
+                pane_id: 19,
+                size: portable_pty::PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }) as Box<dyn TmuxCommand>
+        };
+        queue.push_back(resize()).expect("older resize admission");
+        let older = queue
+            .take_next_for_preparation()
+            .expect("older resize preparation");
+        let older_lease = queue
+            .prepared_conditional_commit()
+            .expect("older exact resize lease");
+
+        queue.push_back(resize()).expect("identical newer resize admission");
+        assert!(
+            !queue.conditional_commit_is_current(&older_lease),
+            "an identical later request must still supersede the older generation",
+        );
+        queue.release_prepared();
+        drop(older);
+
+        let newer = queue
+            .take_next_for_preparation()
+            .expect("newer resize preparation");
+        let newer_lease = queue
+            .prepared_conditional_commit()
+            .expect("newer exact resize lease");
+        assert!(newer_lease.generation > older_lease.generation);
+        assert!(queue.conditional_commit_is_current(&newer_lease));
+        queue.release_prepared();
+        drop(newer);
+    }
+
+    #[test]
+    fn merged_resize_dequeues_only_its_replacement_lease() {
+        let mut queue = TmuxCmdQueue::new();
+        let resize = |rows, cols| {
+            Box::new(Resize {
+                pane_id: 23,
+                size: portable_pty::PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }) as Box<dyn TmuxCommand>
+        };
+        queue.push_back(resize(30, 100)).expect("older resize");
+        let target = TmuxConditionalCommitTarget::PaneSize(23);
+        let older_lease = queue
+            .latest_conditional_commits
+            .get(&target)
+            .expect("older lease")
+            .clone();
+        queue.push_back(resize(40, 120)).expect("merged newer resize");
+        let replacement_lease = queue
+            .latest_conditional_commits
+            .get(&target)
+            .expect("replacement lease")
+            .clone();
+        assert!(replacement_lease.generation > older_lease.generation);
+        assert_eq!(queue.intent_entries.len(), 1);
+        assert_eq!(
+            queue
+                .queued_conditional_commits
+                .get(&target)
+                .expect("one queued replacement lease")
+                .len(),
+            1,
+        );
+
+        let merged = queue
+            .take_next_for_sender_preparation()
+            .expect("merged resize selection")
+            .expect("merged resize is not stale");
+        let dequeued_lease = queue
+            .prepared_conditional_commit()
+            .expect("exact merged lease");
+        assert_eq!(dequeued_lease, replacement_lease);
+        assert_eq!(
+            merged.as_resize(),
+            Some((
+                23,
+                portable_pty::PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            )),
+        );
+        assert!(!queue.conditional_commit_is_current(&older_lease));
+        assert!(queue.conditional_commit_is_current(&dequeued_lease));
+        assert!(!queue.queued_conditional_commits.contains_key(&target));
+        queue.release_prepared();
+    }
+
+    #[test]
+    fn newer_same_target_admission_fences_unlocked_preparation_before_install() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(408));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register prepare-install fence test domain");
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(BarrierConditionalTestCommand {
+                pane_id: 88,
+                entered: entered_tx,
+                release: release_rx,
+            }))
+            .expect("older conditional command admission");
+        *tmux_domain.inner.state.lock() = State::Idle;
+
+        let sender = Arc::clone(&tmux_domain.inner);
+        let sender_thread = std::thread::spawn(move || sender.send_next_command_inner());
+        entered_rx
+            .recv()
+            .expect("older preparation reached the unlocked barrier");
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(Resize {
+                pane_id: 88,
+                size: portable_pty::PtySize {
+                    rows: 50,
+                    cols: 140,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }))
+            .expect("newer same-target admission during preparation");
+        release_tx
+            .send(())
+            .expect("release older preparation barrier");
+        sender_thread
+            .join()
+            .expect("sender thread must not panic")
+            .expect("sender fence path must remain healthy");
+
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Idle);
+        assert!(tmux_domain.inner.lifecycle.lock().io_operation.is_none());
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        assert!(queue.in_flight.is_none());
+        assert!(queue.preparing.is_none());
+        assert_eq!(queue.retry_deferred_intents.len(), 1);
+        let deferred = queue
+            .retry_deferred_intents
+            .get(&TmuxConditionalCommitTarget::PaneSize(88))
+            .expect("newer resize remains parked for attach completion");
+        assert_eq!(
+            deferred.command.as_resize().map(|(_, size)| size),
+            Some(portable_pty::PtySize {
+                rows: 50,
+                cols: 140,
+                pixel_width: 0,
+                pixel_height: 0,
+            }),
+        );
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_command_preparations
+                .load(Ordering::Relaxed),
+            2,
+            "the stale preparation is rejected and only the newer intent prepares next",
+        );
+    }
+
+    #[test]
+    fn preparation_scan_yields_after_fixed_quantum() {
+        let tmux_domain = new_tmux_domain(405);
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            for _ in 0..=CMD_QUEUE_PREPARATION_QUANTUM {
+                queue
+                    .push_back(Box::new(DiscardedRequiredTestCommand))
+                    .expect("discarded preparation test command");
+            }
+        }
+        *tmux_domain.inner.state.lock() = State::Idle;
+
+        tmux_domain.inner.send_next_command();
+        {
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            assert_eq!(queue.len(), 1);
+            assert!(queue.has_pending());
+        }
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Idle);
+
+        tmux_domain.inner.send_next_command();
+        assert!(tmux_domain.inner.cmd_queue.lock().is_empty());
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Idle);
+    }
+
+    #[test]
+    fn targeted_pane_progress_reprepares_only_its_parked_resize() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(406));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register parked-resize test domain");
+        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+        const PARKED_TARGETS: usize = 8;
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            for pane_id in 1..=PARKED_TARGETS {
+                queue
+                    .push_back(Box::new(Resize {
+                        pane_id: TmuxPaneId::try_from(pane_id)
+                            .expect("small test pane id fits tmux identity"),
+                        size: portable_pty::PtySize {
+                            rows: 40,
+                            cols: 120,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        },
+                    }))
+                    .expect("parked resize admission");
+            }
+        }
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain.inner.send_next_command();
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_command_preparations
+                .load(Ordering::Relaxed),
+            PARKED_TARGETS,
+        );
+        {
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            assert_eq!(queue.retry_deferred_intents.len(), PARKED_TARGETS);
+            for pane_id in 1..=PARKED_TARGETS {
+                let target = TmuxConditionalCommitTarget::PaneSize(
+                    TmuxPaneId::try_from(pane_id).expect("small pane id"),
+                );
+                let deferred = queue
+                    .retry_deferred_intents
+                    .get(&target)
+                    .expect("one parked resize per target");
+                assert_eq!(
+                    deferred.retry_prerequisite,
+                    TmuxPreparationPrerequisite::Pane(
+                        TmuxPaneId::try_from(pane_id).expect("small pane id"),
+                    ),
+                );
+                assert!(!deferred.retry_ready);
+            }
+            assert!(!queue.has_pending());
+        }
+
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(5));
+        tmux_domain.inner.send_next_command();
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_command_preparations
+                .load(Ordering::Relaxed),
+            PARKED_TARGETS + 1,
+            "one pane publication must reprepare only its exact dependent target",
+        );
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        assert_eq!(queue.retry_deferred_intents.len(), PARKED_TARGETS);
+        assert!(queue
+            .retry_deferred_intents
+            .values()
+            .all(|deferred| !deferred.retry_ready));
+        assert!(!queue.has_pending());
+    }
+
+    #[test]
+    fn nonfront_retry_target_uses_exact_deduplicated_ready_fifo_token() {
+        let mut queue = TmuxCmdQueue::new();
+        for pane_id in [31, 32, 33] {
+            queue
+                .push_back(Box::new(Resize {
+                    pane_id,
+                    size: portable_pty::PtySize {
+                        rows: 40,
+                        cols: 120,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                }))
+                .expect("parked resize admission");
+            let command = queue
+                .take_next_for_preparation()
+                .expect("resize enters preparation");
+            assert!(queue.restore_prepared_for_retry(
+                command,
+                TmuxPreparationPrerequisite::Pane(pane_id),
+            ));
+        }
+        assert_eq!(
+            queue.retry_deferred_intent_head,
+            Some(TmuxConditionalCommitTarget::PaneSize(31)),
+        );
+        assert_eq!(
+            queue.retry_deferred_intent_tail,
+            Some(TmuxConditionalCommitTarget::PaneSize(33)),
+        );
+        assert!(queue.ready_retry_deferred_intents.is_empty());
+
+        let nonfront = TmuxPreparationPrerequisite::Pane(33);
+        queue.advance_preparation_prerequisite(nonfront);
+        queue.advance_preparation_prerequisite(nonfront);
+        assert_eq!(
+            queue.ready_retry_deferred_intents,
+            VecDeque::from([TmuxConditionalCommitTarget::PaneSize(33)]),
+            "repeated publication must not mint duplicate ready tokens",
+        );
+        assert_eq!(
+            queue
+                .retry_deferred_intents
+                .values()
+                .filter(|deferred| deferred.retry_ready)
+                .count(),
+            queue.ready_retry_deferred_intents.len(),
+            "every ready dormant target must own exactly one FIFO token",
+        );
+
+        let retried = queue
+            .take_retry_deferred_intent_for_preparation()
+            .expect("nonfront target has a ready token")
+            .expect("nonfront target lease remains current");
+        assert_eq!(retried.as_resize().map(|(pane_id, _)| pane_id), Some(33));
+        assert!(queue.ready_retry_deferred_intents.is_empty());
+        assert!(!queue
+            .retry_deferred_intents
+            .contains_key(&TmuxConditionalCommitTarget::PaneSize(33)));
+        assert_eq!(
+            queue.retry_deferred_intent_head,
+            Some(TmuxConditionalCommitTarget::PaneSize(31)),
+        );
+        assert_eq!(
+            queue.retry_deferred_intent_tail,
+            Some(TmuxConditionalCommitTarget::PaneSize(32)),
+        );
+        assert_eq!(
+            queue
+                .retry_deferred_intents
+                .get(&TmuxConditionalCommitTarget::PaneSize(32))
+                .and_then(|deferred| deferred.retry_intent_next),
+            None,
+            "unlinking a nonfront target must repair the dormant tail in O(1)",
+        );
+        queue.release_prepared();
+        drop(retried);
+    }
+
+    #[test]
+    fn same_target_resize_supersession_coalesces_behind_dormant_front() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(407));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register deferred-coalescing test domain");
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            for pane_id in [1, 2] {
+                queue
+                    .push_back(Box::new(Resize {
+                        pane_id,
+                        size: portable_pty::PtySize {
+                            rows: 30,
+                            cols: 100,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        },
+                    }))
+                    .expect("initial parked resize admission");
+            }
+        }
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain.inner.send_next_command();
+        let initial_b_lease = {
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            assert_eq!(
+                queue.retry_deferred_intent_head,
+                Some(TmuxConditionalCommitTarget::PaneSize(1)),
+            );
+            assert_eq!(queue.retry_deferred_intents.len(), 2);
+            queue
+                .retry_deferred_intents
+                .get(&TmuxConditionalCommitTarget::PaneSize(2))
+                .and_then(|deferred| deferred.conditional_commit.clone())
+                .expect("initial exact target-B lease")
+        };
+
+        for delta in 0_u16..128 {
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .push_back(Box::new(Resize {
+                    pane_id: 2,
+                    size: portable_pty::PtySize {
+                        rows: 40 + delta,
+                        cols: 120 + delta,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                }))
+                .expect("same-target deferred resize supersession");
+            tmux_domain
+                .inner
+                .schedule_send_next_command()
+                .expect("dormant merge scheduling check");
+        }
+
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_command_preparations
+                .load(Ordering::Relaxed),
+            2,
+            "neither dormant target may be re-prepared by same-target admission",
+        );
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_send_runnables_scheduled
+                .load(Ordering::Relaxed),
+            0,
+            "same-target dormant merges must not enqueue no-op main-thread senders",
+        );
+        let queue = tmux_domain.inner.cmd_queue.lock();
+        assert_eq!(queue.len(), 2, "supersession must not consume capacity");
+        assert_eq!(
+            queue.retry_deferred_intent_tail,
+            Some(TmuxConditionalCommitTarget::PaneSize(2)),
+        );
+        assert_eq!(queue.retry_deferred_intents.len(), 2);
+        assert!(queue
+            .retry_deferred_intents
+            .values()
+            .all(|deferred| !deferred.retry_ready));
+        assert!(!queue.conditional_commit_is_current(&initial_b_lease));
+        let current_b = queue
+            .retry_deferred_intents
+            .get(&TmuxConditionalCommitTarget::PaneSize(2))
+            .expect("one coalesced target-B retry");
+        let current_b_lease = current_b
+            .conditional_commit
+            .as_ref()
+            .expect("coalesced retry retains exact current lease");
+        assert!(current_b_lease.generation > initial_b_lease.generation);
+        assert!(queue.conditional_commit_is_current(current_b_lease));
+        assert_eq!(
+            current_b.command.as_resize(),
+            Some((
+                2,
+                portable_pty::PtySize {
+                    rows: 167,
+                    cols: 247,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            )),
+        );
+        assert!(!queue
+            .queued_conditional_commits
+            .contains_key(&TmuxConditionalCommitTarget::PaneSize(2)));
+        assert!(!queue.has_pending());
+    }
+
+    #[test]
     fn lossless_key_bytes_preserve_cross_pane_admission_order() {
         let mut queue = TmuxCmdQueue::new();
         for (pane, keys) in [(1, b"a".as_slice()), (2, b"b"), (1, b"c")] {
@@ -7563,6 +9530,1282 @@ mod tests {
         );
     }
 
+    fn take_conditional_command(
+        queue: &mut TmuxCmdQueue,
+        command: Box<dyn TmuxCommand>,
+    ) -> (Box<dyn TmuxCommand>, TmuxConditionalCommitLease) {
+        queue
+            .push_back(command)
+            .expect("conditional command should be admitted");
+        let command = queue
+            .take_next_for_preparation()
+            .expect("conditional command should enter preparation");
+        let lease = queue
+            .prepared_conditional_commit()
+            .expect("conditional command should own the latest intent lease");
+        assert!(!queue.prepared_is_superseded());
+        queue.release_prepared();
+        (command, lease)
+    }
+
+    fn install_conditional_test_tab(
+        mux: &Arc<Mux>,
+        inner: &TmuxDomainState,
+        remote_window_id: TmuxWindowId,
+        layout_csum: &str,
+    ) -> TabId {
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab)
+            .expect("register conditional-commit test tab");
+        let local_tab_id = tab.tab_id();
+        assert!(inner
+            .gui_tabs
+            .lock()
+            .insert(
+                remote_window_id,
+                TmuxTab {
+                    tab_id: local_tab_id,
+                    tmux_window_id: remote_window_id,
+                    layout_csum: layout_csum.to_string(),
+                    panes: HashSet::new(),
+                },
+            )
+            .is_none());
+        local_tab_id
+    }
+
+    fn install_conditional_test_pane(
+        inner: &TmuxDomainState,
+        remote_pane_id: TmuxPaneId,
+        local_pane_id: PaneId,
+        remote_window_id: TmuxWindowId,
+        cols: u64,
+        rows: u64,
+    ) {
+        let (_read, write) = filedescriptor::socketpair().expect("test pane socketpair");
+        assert!(inner
+            .remote_panes
+            .lock()
+            .insert(
+                remote_pane_id,
+                Arc::new(Mutex::new(TmuxRemotePane {
+                    local_pane_id,
+                    output_write: write,
+                    child_state: Arc::new(TmuxChildState::new()),
+                    session_id: 1,
+                    window_id: remote_window_id,
+                    pane_id: remote_pane_id,
+                    cursor_x: 0,
+                    cursor_y: 0,
+                    pane_width: cols,
+                    pane_height: rows,
+                    pane_left: 0,
+                    pane_top: 0,
+                    output_state: TmuxPaneOutputState::Ready,
+                    output_ingress: TmuxPaneOutputIngress::default(),
+                })),
+            )
+            .is_none());
+    }
+
+    fn install_conditional_layout_in_flight(
+        tmux_domain: &Arc<TmuxDomain>,
+        generation: u64,
+        remote_window_id: TmuxWindowId,
+        layout_csum: &str,
+    ) -> Arc<[u8]> {
+        let (command, lease) = {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            queue
+                .push_back(Box::new(ListAllPanes {
+                    window_id: remote_window_id,
+                    // Conditional authority belongs only to pruning layout
+                    // refreshes. The one success-path caller retains a
+                    // synthetic pane in its response so pruning does not
+                    // remove the fixture tab.
+                    prune: true,
+                    layout_csum: layout_csum.to_string(),
+                }))
+                .expect("conditional boundary command admission");
+            let command = queue
+                .take_next_for_preparation()
+                .expect("conditional boundary command preparation");
+            let lease = queue
+                .prepared_conditional_commit()
+                .expect("conditional boundary command lease");
+            (command, lease)
+        };
+        let TmuxCommandPreparation::Ready {
+            command: command_bytes,
+            conditional_commit: Some(conditional_commit),
+        } = command.prepare(tmux_domain.domain_id(), generation, Some(lease))
+        else {
+            panic!("conditional boundary command should prepare immutable bytes");
+        };
+        assert!(tmux_domain.inner.cmd_queue.lock().install_in_flight(
+            command,
+            generation,
+            Some(conditional_commit),
+        ));
+        *tmux_domain.inner.state.lock() = State::WaitingForResponse;
+        assert!(tmux_domain
+            .inner
+            .install_io_operation(TmuxIoOperationKind::Command, generation));
+        command_bytes
+    }
+
+    #[test]
+    fn list_panes_preparation_is_pure_and_matching_success_commits_checksum() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(240));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register conditional-commit test domain");
+        let local_tab_id = install_conditional_test_tab(&mux, &tmux_domain.inner, 71, "old0");
+
+        let (command, lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(ListAllPanes {
+                window_id: 71,
+                prune: true,
+                layout_csum: "new1".to_string(),
+            }),
+        );
+        let prepared = command.prepare(tmux_domain.domain_id(), 17, Some(lease.clone()));
+        let TmuxCommandPreparation::Ready {
+            command: command_bytes,
+            conditional_commit: Some(conditional_commit),
+        } = prepared
+        else {
+            panic!("changed layout should prepare immutable list-panes bytes");
+        };
+        assert!(command_bytes
+            .windows(b"list-panes".len())
+            .any(|window| window == b"list-panes"));
+        assert_eq!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get(&71)
+                .expect("test tab")
+                .layout_csum,
+            "old0",
+            "preparation must not publish the suppression checksum",
+        );
+
+        assert!(!tmux_domain
+            .inner
+            .commit_conditional_success(18, conditional_commit.clone()));
+        assert_eq!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get(&71)
+                .expect("test tab")
+                .layout_csum,
+            "old0",
+            "a mismatched I/O generation must leave the checksum retryable",
+        );
+        assert!(tmux_domain
+            .inner
+            .commit_conditional_success(17, conditional_commit));
+        let tab = tmux_domain.inner.gui_tabs.lock();
+        let tab = tab.get(&71).expect("test tab");
+        assert_eq!(tab.tab_id, local_tab_id);
+        assert_eq!(tab.layout_csum, "new1");
+    }
+
+    #[test]
+    fn mandatory_snapshot_survives_later_same_checksum_prune() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(410));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register mandatory-snapshot ordering domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 92, "same");
+        let mut queue = tmux_domain.inner.cmd_queue.lock();
+        queue
+            .push_back(Box::new(ListAllPanes {
+                window_id: 92,
+                prune: false,
+                layout_csum: "same".to_string(),
+            }))
+            .expect("mandatory non-pruning snapshot admission");
+        queue
+            .push_back(Box::new(ListAllPanes {
+                window_id: 92,
+                prune: true,
+                layout_csum: "same".to_string(),
+            }))
+            .expect("same-checksum pruning refresh admission");
+
+        let mandatory = queue
+            .take_next_for_sender_preparation()
+            .expect("mandatory snapshot selection")
+            .expect("mandatory snapshot is never stale");
+        assert!(!queue.prepared_is_superseded());
+        assert!(queue.prepared_conditional_commit().is_none());
+        assert!(matches!(
+            mandatory.prepare(tmux_domain.domain_id(), 91, None),
+            TmuxCommandPreparation::Ready {
+                conditional_commit: None,
+                ..
+            }
+        ));
+        queue.release_prepared();
+
+        let prune = queue
+            .take_next_for_sender_preparation()
+            .expect("pruning refresh selection")
+            .expect("pruning refresh lease is current");
+        let prune_lease = queue
+            .prepared_conditional_commit()
+            .expect("pruning refresh owns checksum authority");
+        assert!(!queue.prepared_is_superseded());
+        assert!(matches!(
+            prune.prepare(tmux_domain.domain_id(), 92, Some(prune_lease.clone())),
+            TmuxCommandPreparation::Suppressed,
+        ));
+        assert!(queue.retire_conditional_commit_if_current(&prune_lease));
+        queue.release_prepared();
+    }
+
+    #[test]
+    fn mandatory_snapshot_cannot_regress_earlier_changed_checksum_prune() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(411));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register reverse snapshot-ordering domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 93, "old0");
+        let mut queue = tmux_domain.inner.cmd_queue.lock();
+        queue
+            .push_back(Box::new(ListAllPanes {
+                window_id: 93,
+                prune: true,
+                layout_csum: "new1".to_string(),
+            }))
+            .expect("changed-checksum pruning refresh admission");
+        queue
+            .push_back(Box::new(ListAllPanes {
+                window_id: 93,
+                prune: false,
+                layout_csum: "old0".to_string(),
+            }))
+            .expect("later mandatory non-pruning snapshot admission");
+
+        let prune = queue
+            .take_next_for_sender_preparation()
+            .expect("pruning refresh selection")
+            .expect("mandatory snapshot must not stale pruning authority");
+        let prune_lease = queue
+            .prepared_conditional_commit()
+            .expect("pruning refresh owns checksum authority");
+        assert!(!queue.prepared_is_superseded());
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(prune_commit),
+            ..
+        } = prune.prepare(tmux_domain.domain_id(), 93, Some(prune_lease))
+        else {
+            panic!("changed checksum must prepare pruning reconciliation");
+        };
+        queue.release_prepared();
+        drop(queue);
+        assert!(tmux_domain
+            .inner
+            .commit_conditional_success(93, prune_commit));
+
+        let mut queue = tmux_domain.inner.cmd_queue.lock();
+        let mandatory = queue
+            .take_next_for_sender_preparation()
+            .expect("mandatory snapshot selection")
+            .expect("mandatory snapshot is never stale");
+        assert!(!queue.prepared_is_superseded());
+        assert!(queue.prepared_conditional_commit().is_none());
+        assert!(matches!(
+            mandatory.prepare(tmux_domain.domain_id(), 94, None),
+            TmuxCommandPreparation::Ready {
+                conditional_commit: None,
+                ..
+            }
+        ));
+        queue.release_prepared();
+        drop(queue);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get(&93)
+                .expect("test tab")
+                .layout_csum,
+            "new1",
+            "mandatory snapshot must not republish its older discovery checksum",
+        );
+    }
+
+    #[test]
+    fn guarded_success_commits_exact_in_flight_layout_authority_end_to_end() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(252));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register exact-success boundary domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 83, "old0");
+        let retained_pane_id = 983;
+        tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get_mut(&83)
+            .expect("conditional success test tab")
+            .panes
+            .insert(retained_pane_id);
+        let command = install_conditional_layout_in_flight(&tmux_domain, 86, 83, "new1");
+        assert!(!command.is_empty());
+
+        let mut success = successful_guarded_response();
+        success.output = format!(
+            "$1 @83 %{retained_pane_id} 0 0 0 80 24 0 0 1\n"
+        );
+
+        let (command, response, generation, conditional_commit) = tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .record_in_flight_response(&success)
+            .expect("guarded success completes the exact in-flight response");
+        assert!(tmux_domain
+            .inner
+            .claim_io_response(TmuxIoOperationKind::Command, 86));
+        assert!(tmux_domain.inner.apply_command_result(
+            command,
+            &response,
+            generation,
+            conditional_commit,
+        ));
+        assert_eq!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get(&83)
+                .expect("matching tab survives reconciliation")
+                .layout_csum,
+            "new1",
+        );
+        assert!(tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get_mut(&83)
+            .expect("matching tab survives reconciliation")
+            .panes
+            .remove(&retained_pane_id));
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_conditional_commits
+                .load(Ordering::Relaxed),
+            1,
+        );
+    }
+
+    #[test]
+    fn abandoned_prepared_authority_leaves_layout_retry_eligible() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(241));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register retry-boundary test domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 72, "old0");
+
+        let (command, lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(ListAllPanes {
+                window_id: 72,
+                prune: true,
+                layout_csum: "new1".to_string(),
+            }),
+        );
+        let prepared = command.prepare(tmux_domain.domain_id(), 31, Some(lease));
+        assert!(matches!(&prepared, TmuxCommandPreparation::Ready { .. }));
+        drop(prepared);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get(&72)
+                .expect("test tab")
+                .layout_csum,
+            "old0",
+            "abandoning prepared bytes and authority must not publish the checksum",
+        );
+
+        let (retry, retry_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(ListAllPanes {
+                window_id: 72,
+                prune: true,
+                layout_csum: "new1".to_string(),
+            }),
+        );
+        assert!(matches!(
+            retry.prepare(tmux_domain.domain_id(), 32, Some(retry_lease)),
+            TmuxCommandPreparation::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn launcher_acquisition_failure_cannot_commit_conditional_state() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(247));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register missing-launcher boundary domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 78, "old0");
+        let command = install_conditional_layout_in_flight(&tmux_domain, 81, 78, "new1");
+
+        let outcome = execute_tmux_io_write(
+            &Arc::downgrade(&tmux_domain.inner),
+            &TmuxIoWriteJob {
+                generation: 81,
+                kind: TmuxIoOperationKind::Command,
+                command: Some(command),
+            },
+        );
+        assert!(matches!(&outcome, TmuxIoWriteOutcome::LauncherPaneGone));
+        tmux_domain.inner.fail_tmux_io_operation(
+            TmuxIoOperationKind::Command,
+            81,
+            outcome.reason_label(),
+        );
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        assert!(tmux_domain.inner.cmd_queue.lock().is_closed());
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_conditional_commits
+                .load(Ordering::Relaxed),
+            0,
+        );
+    }
+
+    #[test]
+    fn partial_then_failed_write_cannot_commit_conditional_state() {
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("tmux-conditional-partial-write").expect("local domain"));
+        let mux = Arc::new(Mux::new(Some(Arc::clone(&default_domain))));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let launcher = RecordingPane::new_with_partial_then_failing_writer(
+            248,
+            default_domain.domain_id(),
+            3,
+        );
+        let launcher_dyn: Arc<dyn Pane> = launcher.clone();
+        mux.add_pane(&launcher_dyn).expect("add partial writer");
+        let tmux_domain = Arc::new(new_tmux_domain(248));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register partial-write boundary domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 79, "old0");
+        let command = install_conditional_layout_in_flight(&tmux_domain, 82, 79, "new1");
+
+        let outcome = execute_tmux_io_write(
+            &Arc::downgrade(&tmux_domain.inner),
+            &TmuxIoWriteJob {
+                generation: 82,
+                kind: TmuxIoOperationKind::Command,
+                command: Some(command),
+            },
+        );
+        assert!(matches!(
+            &outcome,
+            TmuxIoWriteOutcome::Io { error_kind, .. }
+                if *error_kind == std::io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(launcher.recorded_writes().len(), 3);
+        tmux_domain.inner.fail_tmux_io_operation(
+            TmuxIoOperationKind::Command,
+            82,
+            outcome.reason_label(),
+        );
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_conditional_commits
+                .load(Ordering::Relaxed),
+            0,
+        );
+    }
+
+    #[test]
+    fn cancellation_and_timeout_cannot_commit_conditional_state() {
+        {
+            let mux = Arc::new(Mux::new(None));
+            let _guard = ScopedMux::install(Arc::clone(&mux));
+            let tmux_domain = Arc::new(new_tmux_domain(249));
+            let registered: Arc<dyn Domain> = tmux_domain.clone();
+            mux.add_domain(&registered)
+                .expect("register cancellation boundary domain");
+            install_conditional_test_tab(&mux, &tmux_domain.inner, 80, "old0");
+            let command = install_conditional_layout_in_flight(&tmux_domain, 83, 80, "new1");
+            drop(command);
+
+            tmux_domain.inner.transition_to_exit_and_schedule_detach();
+            assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+            assert_eq!(
+                tmux_domain
+                    .inner
+                    .test_conditional_commits
+                    .load(Ordering::Relaxed),
+                0,
+            );
+        }
+
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(250));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register timeout boundary domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 81, "old0");
+        let command = install_conditional_layout_in_flight(&tmux_domain, 84, 81, "new1");
+        drop(command);
+
+        tmux_domain.inner.fail_tmux_io_operation(
+            TmuxIoOperationKind::Command,
+            84,
+            "response_timeout",
+        );
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_conditional_commits
+                .load(Ordering::Relaxed),
+            0,
+        );
+    }
+
+    #[test]
+    fn tmux_error_result_cannot_commit_conditional_state() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(251));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register tmux-error boundary domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 82, "old0");
+        let command = install_conditional_layout_in_flight(&tmux_domain, 85, 82, "new1");
+        drop(command);
+        let tmux_error = Guarded {
+            error: true,
+            timestamp: 0,
+            number: 0,
+            flags: 0,
+            output: "injected tmux error".to_string(),
+        };
+        let (command, response, generation, conditional_commit) = tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .record_in_flight_response(&tmux_error)
+            .expect("tmux error completes the owned response");
+        assert!(tmux_domain
+            .inner
+            .claim_io_response(TmuxIoOperationKind::Command, 85));
+
+        assert!(!tmux_domain.inner.apply_command_result(
+            command,
+            &response,
+            generation,
+            conditional_commit,
+        ));
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_conditional_commits
+                .load(Ordering::Relaxed),
+            0,
+        );
+    }
+
+    #[test]
+    fn stale_conditional_tmux_error_still_fails_closed() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(409));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register stale-error boundary domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 91, "old0");
+
+        let (older, older_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(ListAllPanes {
+                window_id: 91,
+                prune: true,
+                layout_csum: "old1".to_string(),
+            }),
+        );
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(older_commit),
+            ..
+        } = older.prepare(tmux_domain.domain_id(), 90, Some(older_lease))
+        else {
+            panic!("older layout command should prepare");
+        };
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(ListAllPanes {
+                window_id: 91,
+                prune: true,
+                layout_csum: "new2".to_string(),
+            }))
+            .expect("newer layout intent supersedes result authority");
+
+        let tmux_error = Guarded {
+            error: true,
+            timestamp: 0,
+            number: 0,
+            flags: 0,
+            output: "injected stale-lease tmux error".to_string(),
+        };
+        assert!(!tmux_domain.inner.apply_command_result(
+            older,
+            &tmux_error,
+            90,
+            Some(older_commit),
+        ));
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Exit);
+        assert!(tmux_domain.inner.cmd_queue.lock().is_closed());
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_conditional_commits
+                .load(Ordering::Relaxed),
+            0,
+        );
+    }
+
+    #[test]
+    fn newer_layout_intent_and_replacement_tab_fence_late_success() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(244));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register layout-overlap test domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 75, "old0");
+
+        let (older, older_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(ListAllPanes {
+                window_id: 75,
+                prune: true,
+                layout_csum: "old1".to_string(),
+            }),
+        );
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(older_commit),
+            ..
+        } = older.prepare(tmux_domain.domain_id(), 61, Some(older_lease))
+        else {
+            panic!("older layout reconciliation should prepare");
+        };
+
+        let (newer, newer_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(ListAllPanes {
+                window_id: 75,
+                prune: true,
+                layout_csum: "new2".to_string(),
+            }),
+        );
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(newer_commit),
+            ..
+        } = newer.prepare(tmux_domain.domain_id(), 62, Some(newer_lease))
+        else {
+            panic!("newer layout reconciliation should prepare");
+        };
+        assert!(!tmux_domain
+            .inner
+            .commit_conditional_success(61, older_commit));
+        assert_eq!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get(&75)
+                .expect("test tab")
+                .layout_csum,
+            "old0",
+        );
+
+        let replacement = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&replacement)
+            .expect("register replacement test tab");
+        let replacement_tab_id = replacement.tab_id();
+        tmux_domain.inner.gui_tabs.lock().insert(
+            75,
+            TmuxTab {
+                tab_id: replacement_tab_id,
+                tmux_window_id: 75,
+                layout_csum: "repl".to_string(),
+                panes: HashSet::new(),
+            },
+        );
+        assert!(tmux_domain.inner.apply_command_result(
+            newer,
+            &successful_guarded_response(),
+            62,
+            Some(newer_commit),
+        ));
+        let tabs = tmux_domain.inner.gui_tabs.lock();
+        let replacement = tabs.get(&75).expect("replacement tab");
+        assert_eq!(replacement.tab_id, replacement_tab_id);
+        assert_eq!(replacement.layout_csum, "repl");
+    }
+
+    #[test]
+    fn newer_layout_admission_fences_old_result_before_topology_reconciliation() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(245));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register pre-result-fence test domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 76, "old0");
+        let retained_pane_id = 986;
+        tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get_mut(&76)
+            .expect("test tab")
+            .panes
+            .insert(retained_pane_id);
+
+        let (older, older_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(ListAllPanes {
+                window_id: 76,
+                prune: true,
+                layout_csum: "old1".to_string(),
+            }),
+        );
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(older_commit),
+            ..
+        } = older.prepare(tmux_domain.domain_id(), 71, Some(older_lease))
+        else {
+            panic!("older layout reconciliation should prepare");
+        };
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(ListAllPanes {
+                window_id: 76,
+                prune: true,
+                layout_csum: "new2".to_string(),
+            }))
+            .expect("newer layout intent admission");
+
+        assert!(tmux_domain.inner.apply_command_result(
+            older,
+            &successful_guarded_response(),
+            71,
+            Some(older_commit),
+        ));
+        let tabs = tmux_domain.inner.gui_tabs.lock();
+        let tab = tabs.get(&76).expect("stale result must not remove the tab");
+        assert_eq!(tab.layout_csum, "old0");
+        assert!(tab.panes.contains(&retained_pane_id));
+        drop(tabs);
+        assert!(
+            !tmux_domain
+                .inner
+                .retired_panes
+                .lock()
+                .contains(&retained_pane_id),
+            "stale result must not begin pane reconciliation before it is fenced",
+        );
+    }
+
+    #[test]
+    fn empty_resize_preparation_is_retryable_and_side_effect_free() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(242));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register empty-preparation test domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 73, "same");
+        install_conditional_test_pane(&tmux_domain.inner, 83, 183, 73, 80, 24);
+
+        let resize = Resize {
+            pane_id: 83,
+            size: portable_pty::PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        };
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            queue
+                .push_back(Box::new(resize))
+                .expect("empty resize should be admitted");
+        }
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain.inner.send_next_command();
+        {
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            assert_eq!(queue.len(), 1, "retryable preparation must remain admitted");
+            assert!(queue.front().is_some_and(|command| command.as_resize().is_some()));
+            assert!(queue.preparing.is_none());
+            assert!(queue.intent_entries.is_empty());
+            assert_eq!(queue.retry_deferred_intents.len(), 1);
+            assert!(
+                !queue.has_pending(),
+                "blocked retry work must not self-schedule or wake on ordinary protocol ingress",
+            );
+        }
+        tmux_domain.inner.send_next_command();
+        assert_eq!(tmux_domain.inner.cmd_queue.lock().retry_deferred_intents.len(), 1);
+        assert_eq!(*tmux_domain.inner.state.lock(), State::Idle);
+        let pane = tmux_domain.inner.remote_panes.lock();
+        let pane = pane.get(&83).expect("test pane").lock();
+        assert_eq!((pane.pane_width, pane.pane_height), (80, 24));
+    }
+
+    #[test]
+    fn permanent_resize_preparation_failures_release_intent_capacity() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(246));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register permanent-resize test domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 77, "same");
+        install_conditional_test_pane(&tmux_domain.inner, 87, 187, 77, 80, 24);
+        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(Resize {
+                pane_id: 87,
+                size: portable_pty::PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }))
+            .expect("unsupported resize admission");
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain.inner.send_next_command();
+        assert!(
+            tmux_domain.inner.cmd_queue.lock().is_empty(),
+            "definitively unsupported resize capability must not poison the intent lane",
+        );
+
+        tmux_domain.inner.retired_panes.lock().insert(88);
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(Resize {
+                pane_id: 88,
+                size: portable_pty::PtySize {
+                    rows: 50,
+                    cols: 140,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }))
+            .expect("retired-pane resize admission");
+        tmux_domain.inner.send_next_command();
+        assert!(
+            tmux_domain.inner.cmd_queue.lock().is_empty(),
+            "retired pane resize must release bounded intent capacity",
+        );
+    }
+
+    #[test]
+    fn direct_window_close_wakes_resize_parked_before_pane_retirement() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(253));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register direct-retirement test domain");
+        let local_tab_id =
+            install_conditional_test_tab(&mux, &tmux_domain.inner, 90, "same");
+        tmux_domain
+            .inner
+            .mirror_index
+            .lock()
+            .register_window(local_tab_id, 90)
+            .expect("register test window mirror identity");
+        tmux_domain
+            .inner
+            .gui_tabs
+            .lock()
+            .get_mut(&90)
+            .expect("test window")
+            .panes
+            .insert(900);
+        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .push_back(Box::new(Resize {
+                pane_id: 900,
+                size: portable_pty::PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }))
+            .expect("racing resize admission");
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain.inner.send_next_command();
+        {
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            assert_eq!(queue.retry_deferred_intents.len(), 1);
+            assert!(!queue
+                .retry_deferred_intents
+                .values()
+                .next()
+                .expect("parked resize")
+                .retry_ready);
+            assert!(!queue.has_pending());
+        }
+
+        // Keep the production ingress path from scheduling an asynchronous
+        // sender so the retirement-to-retry boundary remains deterministic.
+        *tmux_domain.inner.state.lock() = State::ProcessingResponse;
+        assert!(tmux_domain
+            .inner
+            .process_protocol_events(vec![Event::WindowClose { window: 90 }])
+            .is_none());
+        assert!(tmux_domain.inner.retired_panes.lock().contains(&900));
+        {
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            assert!(queue
+                .retry_deferred_intents
+                .values()
+                .next()
+                .expect("retirement-woken resize")
+                .retry_ready);
+            assert!(queue.has_pending());
+        }
+
+        *tmux_domain.inner.state.lock() = State::Idle;
+        tmux_domain.inner.send_next_command();
+        assert!(
+            tmux_domain.inner.cmd_queue.lock().is_empty(),
+            "retirement progress must wake and discard the now-retired resize",
+        );
+        assert_eq!(
+            tmux_domain
+                .inner
+                .test_command_preparations
+                .load(Ordering::Relaxed),
+            2,
+        );
+    }
+
+    #[test]
+    fn newer_resize_intent_and_replacement_pane_fence_late_success() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(243));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register overlap test domain");
+        let local_tab_id = install_conditional_test_tab(&mux, &tmux_domain.inner, 74, "same");
+        install_conditional_test_pane(&tmux_domain.inner, 84, 184, 74, 80, 24);
+        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+        tmux_domain
+            .inner
+            .support_commands
+            .lock()
+            .insert("resize-window".to_string(), String::new());
+
+        let (older, older_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(Resize {
+                pane_id: 84,
+                size: portable_pty::PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }),
+        );
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(older_commit),
+            ..
+        } = older.prepare(tmux_domain.domain_id(), 51, Some(older_lease))
+        else {
+            panic!("older resize should prepare");
+        };
+
+        let (newer, newer_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(Resize {
+                pane_id: 84,
+                size: portable_pty::PtySize {
+                    rows: 50,
+                    cols: 140,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }),
+        );
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(newer_commit),
+            ..
+        } = newer.prepare(tmux_domain.domain_id(), 52, Some(newer_lease))
+        else {
+            panic!("newer resize should prepare");
+        };
+
+        assert!(!tmux_domain
+            .inner
+            .commit_conditional_success(51, older_commit));
+        {
+            let panes = tmux_domain.inner.remote_panes.lock();
+            let pane = panes.get(&84).expect("test pane").lock();
+            assert_eq!((pane.pane_width, pane.pane_height), (80, 24));
+        }
+        assert!(tmux_domain
+            .inner
+            .commit_conditional_success(52, newer_commit));
+        {
+            let panes = tmux_domain.inner.remote_panes.lock();
+            let pane = panes.get(&84).expect("test pane").lock();
+            assert_eq!((pane.pane_width, pane.pane_height), (140, 50));
+        }
+
+        let (replacement_fenced, replacement_lease) = take_conditional_command(
+            &mut tmux_domain.inner.cmd_queue.lock(),
+            Box::new(Resize {
+                pane_id: 84,
+                size: portable_pty::PtySize {
+                    rows: 60,
+                    cols: 160,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }),
+        );
+        let TmuxCommandPreparation::Ready {
+            conditional_commit: Some(replacement_commit),
+            ..
+        } = replacement_fenced.prepare(
+            tmux_domain.domain_id(),
+            53,
+            Some(replacement_lease),
+        )
+        else {
+            panic!("replacement-fenced resize should prepare");
+        };
+        let replaced = tmux_domain.inner.remote_panes.lock().remove(&84);
+        assert!(replaced.is_some(), "test must replace the prepared pane");
+        drop(replaced);
+        install_conditional_test_pane(&tmux_domain.inner, 84, 284, 74, 90, 30);
+        assert!(tmux_domain.inner.apply_command_result(
+            replacement_fenced,
+            &successful_guarded_response(),
+            53,
+            Some(replacement_commit),
+        ));
+        let panes = tmux_domain.inner.remote_panes.lock();
+        let replacement = panes.get(&84).expect("replacement pane").lock();
+        assert_eq!(replacement.local_pane_id, 284);
+        assert_eq!((replacement.pane_width, replacement.pane_height), (90, 30));
+        drop(replacement);
+        drop(panes);
+        assert_eq!(
+            tmux_domain
+                .inner
+                .gui_tabs
+                .lock()
+                .get(&74)
+                .expect("test tab")
+                .tab_id,
+            local_tab_id,
+        );
+    }
+
+    #[test]
+    fn stale_resize_success_forces_a_b_a_dispatch_and_exact_success_clears_uncertainty() {
+        let mux = Arc::new(Mux::new(None));
+        let _guard = ScopedMux::install(Arc::clone(&mux));
+        let tmux_domain = Arc::new(new_tmux_domain(411));
+        let registered: Arc<dyn Domain> = tmux_domain.clone();
+        mux.add_domain(&registered)
+            .expect("register resize uncertainty test domain");
+        install_conditional_test_tab(&mux, &tmux_domain.inner, 94, "same");
+        install_conditional_test_pane(&tmux_domain.inner, 804, 1804, 94, 80, 24);
+        *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+        tmux_domain
+            .inner
+            .support_commands
+            .lock()
+            .insert("resize-window".to_string(), String::new());
+
+        let resize = |rows, cols| {
+            Box::new(Resize {
+                pane_id: 804,
+                size: portable_pty::PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }) as Box<dyn TmuxCommand>
+        };
+
+        let (resize_b, resize_b_lease) = {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            queue.push_back(resize(40, 120)).expect("resize B admission");
+            let command = queue
+                .take_next_for_preparation()
+                .expect("resize B enters preparation");
+            let lease = queue
+                .prepared_conditional_commit()
+                .expect("resize B exact lease");
+            (command, lease)
+        };
+        let TmuxCommandPreparation::Ready {
+            command: resize_b_bytes,
+            conditional_commit: Some(resize_b_commit),
+        } = resize_b.prepare(tmux_domain.domain_id(), 71, Some(resize_b_lease))
+        else {
+            panic!("changed resize B must prepare immutable bytes");
+        };
+        assert!(!resize_b_bytes.is_empty());
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            assert!(queue.prepared_install_authority_is_current(
+                71,
+                Some(&resize_b_commit),
+            ));
+            assert!(queue.install_in_flight(resize_b, 71, Some(resize_b_commit)));
+            assert!(!queue.pane_size_suppression_is_trustworthy(804));
+            queue
+                .push_back(resize(24, 80))
+                .expect("newer resize A admission after B reached the I/O lane");
+        }
+
+        let successful = successful_guarded_response();
+        let stale_b_completion = {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            assert!(queue.record_in_flight_response(&successful).is_none());
+            queue
+                .record_in_flight_response(&successful)
+                .expect("resize B completes after both guarded responses")
+        };
+        let (resize_b, response_b, generation_b, commit_b) = stale_b_completion;
+        assert!(tmux_domain.inner.apply_command_result(
+            resize_b,
+            &response_b,
+            generation_b,
+            commit_b,
+        ));
+        {
+            let queue = tmux_domain.inner.cmd_queue.lock();
+            assert!(
+                !queue.pane_size_suppression_is_trustworthy(804),
+                "stale B success cannot make the cached A dimensions authoritative",
+            );
+        }
+        {
+            let panes = tmux_domain.inner.remote_panes.lock();
+            let pane = panes.get(&804).expect("test pane").lock();
+            assert_eq!((pane.pane_width, pane.pane_height), (80, 24));
+        }
+
+        let (resize_a, resize_a_lease) = {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            let command = queue
+                .take_next_for_preparation()
+                .expect("newest resize A enters preparation");
+            let lease = queue
+                .prepared_conditional_commit()
+                .expect("newest resize A exact lease");
+            (command, lease)
+        };
+        let TmuxCommandPreparation::Ready {
+            command: resize_a_bytes,
+            conditional_commit: Some(resize_a_commit),
+        } = resize_a.prepare(tmux_domain.domain_id(), 72, Some(resize_a_lease))
+        else {
+            panic!("uncertain cached A dimensions must force resize A dispatch");
+        };
+        let resize_a_text = String::from_utf8_lossy(resize_a_bytes.as_ref());
+        assert!(resize_a_text.contains("resize-pane -x 80 -y 24 -t %804"));
+        {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            assert!(queue.prepared_install_authority_is_current(
+                72,
+                Some(&resize_a_commit),
+            ));
+            assert!(queue.install_in_flight(resize_a, 72, Some(resize_a_commit)));
+            assert!(!queue.pane_size_suppression_is_trustworthy(804));
+        }
+
+        let exact_a_completion = {
+            let mut queue = tmux_domain.inner.cmd_queue.lock();
+            assert!(queue.record_in_flight_response(&successful).is_none());
+            queue
+                .record_in_flight_response(&successful)
+                .expect("exact resize A completes after both guarded responses")
+        };
+        let (resize_a, response_a, generation_a, commit_a) = exact_a_completion;
+        assert!(tmux_domain.inner.apply_command_result(
+            resize_a,
+            &response_a,
+            generation_a,
+            commit_a,
+        ));
+        assert!(
+            tmux_domain
+                .inner
+                .cmd_queue
+                .lock()
+                .pane_size_suppression_is_trustworthy(804),
+            "only the exact current matching A success clears remote uncertainty",
+        );
+    }
+
     #[test]
     fn resize_remains_in_flight_until_both_guarded_responses_arrive() {
         let mut queue = TmuxCmdQueue::new();
@@ -7580,7 +10823,16 @@ mod tests {
         let resize = queue
             .take_next_for_preparation()
             .expect("resize should enter preparation");
-        assert!(queue.install_in_flight(resize, 1));
+        let conditional_commit = TmuxConditionalCommit::PaneSize {
+            io_generation: 1,
+            lease: queue
+                .prepared_conditional_commit()
+                .expect("resize should retain conditional commit authority"),
+            local_pane_id: 0,
+            local_tab_id: 0,
+            remote_window_id: 0,
+        };
+        assert!(queue.install_in_flight(resize, 1, Some(conditional_commit)));
         queue
             .push_back(Box::new(ListCommands))
             .expect("following command should be admitted");
@@ -7610,10 +10862,11 @@ mod tests {
             flags: 0,
             output: String::new(),
         };
-        let (completed, retained_response, generation) = queue
+        let (completed, retained_response, generation, conditional_commit) = queue
             .record_in_flight_response(&second_success)
             .expect("the second response should complete the resize");
         assert_eq!(generation, 1);
+        assert!(conditional_commit.is_some());
         assert!(completed.as_resize().is_some());
         assert!(
             retained_response.error,
@@ -7668,7 +10921,7 @@ mod tests {
             let prepared = queue
                 .take_next_for_preparation()
                 .expect("the admitted sentinel must enter sender preparation");
-            assert!(queue.install_in_flight(prepared, 1));
+            assert!(queue.install_in_flight(prepared, 1, None));
             assert_eq!(queue.len(), 1);
         }
 

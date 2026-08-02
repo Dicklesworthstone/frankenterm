@@ -40,6 +40,131 @@ pub(crate) enum TmuxCommandClass {
     CoalescibleIntent,
 }
 
+/// The suppression-cache target owned by a prepared tmux command.
+///
+/// This key is deliberately narrower than the command text. It lets the
+/// mailbox publish a new intent generation at admission time, before command
+/// preparation or I/O can race with a newer request for the same remote
+/// object.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum TmuxConditionalCommitTarget {
+    WindowLayout(TmuxWindowId),
+    PaneSize(TmuxPaneId),
+}
+
+/// Exact fact whose publication can make a parked pure preparation useful.
+///
+/// Attach completion is a one-time domain-wide boundary. Pane publication is
+/// deliberately target-scoped: an unrelated window/layout response must not
+/// re-run every dormant resize in a large session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TmuxPreparationPrerequisite {
+    Attach,
+    Pane(TmuxPaneId),
+}
+
+/// The exact intent whose successful result may update a suppression cache.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TmuxConditionalCommitIntent {
+    WindowLayout {
+        window_id: TmuxWindowId,
+        prune: bool,
+        layout_csum: String,
+    },
+    PaneSize {
+        pane_id: TmuxPaneId,
+        rows: u16,
+        cols: u16,
+    },
+}
+
+impl TmuxConditionalCommitIntent {
+    pub(crate) const fn target(&self) -> TmuxConditionalCommitTarget {
+        match self {
+            Self::WindowLayout { window_id, .. } => {
+                TmuxConditionalCommitTarget::WindowLayout(*window_id)
+            }
+            Self::PaneSize { pane_id, .. } => TmuxConditionalCommitTarget::PaneSize(*pane_id),
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::WindowLayout { layout_csum, .. } => layout_csum.capacity(),
+            Self::PaneSize { .. } => 0,
+        }
+    }
+}
+
+/// Mailbox-issued authority for one admitted conditional cache update.
+///
+/// Generations never wrap. A later admitted intent for the same target
+/// replaces this lease in the mailbox even when the requested value happens
+/// to be identical.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TmuxConditionalCommitLease {
+    pub(crate) generation: u64,
+    pub(crate) intent: TmuxConditionalCommitIntent,
+}
+
+/// Identity-fenced cache mutation carried beside immutable command bytes.
+#[derive(Clone, Debug)]
+pub(crate) enum TmuxConditionalCommit {
+    WindowLayout {
+        io_generation: u64,
+        lease: TmuxConditionalCommitLease,
+        local_tab_id: TabId,
+    },
+    PaneSize {
+        io_generation: u64,
+        lease: TmuxConditionalCommitLease,
+        local_pane_id: PaneId,
+        local_tab_id: TabId,
+        remote_window_id: TmuxWindowId,
+    },
+}
+
+impl TmuxConditionalCommit {
+    pub(crate) const fn io_generation(&self) -> u64 {
+        match self {
+            Self::WindowLayout { io_generation, .. }
+            | Self::PaneSize { io_generation, .. } => *io_generation,
+        }
+    }
+
+    pub(crate) const fn lease(&self) -> &TmuxConditionalCommitLease {
+        match self {
+            Self::WindowLayout { lease, .. } | Self::PaneSize { lease, .. } => lease,
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of_val(self).saturating_add(self.lease().intent.retained_bytes())
+    }
+}
+
+/// Pure preparation result for one mailbox item.
+///
+/// `Ready` owns immutable command bytes and optional conditional commit
+/// authority. `Suppressed` means the authoritative cache already matches the
+/// request. `Retryable` means a known transient prerequisite is not ready yet;
+/// no suppression state was changed, so the same admitted request remains
+/// eligible after relevant progress. `Discarded` means the target or command
+/// capability is definitively gone and retaining the request would only poison
+/// bounded mailbox capacity.
+#[derive(Debug)]
+pub(crate) enum TmuxCommandPreparation {
+    Ready {
+        command: Arc<[u8]>,
+        conditional_commit: Option<TmuxConditionalCommit>,
+    },
+    Suppressed,
+    Retryable {
+        prerequisite: TmuxPreparationPrerequisite,
+    },
+    Discarded,
+}
+
 impl TmuxCommandClass {
     pub(crate) const COUNT: usize = 4;
 
@@ -66,6 +191,32 @@ pub(crate) trait TmuxCommand: Send + Debug {
     fn mailbox_class(&self) -> TmuxCommandClass;
     fn get_command(&self, domain_id: DomainId) -> String;
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
+
+    /// Intent whose cache update must be fenced against newer admissions.
+    fn conditional_commit_intent(&self) -> Option<TmuxConditionalCommitIntent> {
+        None
+    }
+
+    /// Prepare immutable command bytes. Commands with conditional suppression
+    /// state override this method with a side-effect-free inspection path.
+    /// The default preserves the historical behavior of dropping an empty
+    /// non-conditional command rather than reordering a lossless/control lane.
+    fn prepare(
+        &self,
+        domain_id: DomainId,
+        _io_generation: u64,
+        _lease: Option<TmuxConditionalCommitLease>,
+    ) -> TmuxCommandPreparation {
+        let command = self.get_command(domain_id);
+        if command.is_empty() {
+            TmuxCommandPreparation::Discarded
+        } else {
+            TmuxCommandPreparation::Ready {
+                command: Arc::from(command.into_bytes()),
+                conditional_commit: None,
+            }
+        }
+    }
 
     /// Whether a successful guarded response is only the first terminal
     /// boundary for this command.
@@ -410,6 +561,14 @@ impl TmuxDomainState {
             mux.remove_tab(tab_id);
         }
 
+        let mut cmd_queue = self.cmd_queue.lock();
+        for pane_id in &to_remove {
+            cmd_queue.retire_pane_size_suppression_target(*pane_id);
+            cmd_queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(
+                *pane_id,
+            ));
+        }
+
         Ok(())
     }
 
@@ -447,6 +606,14 @@ impl TmuxDomainState {
             mux.remove_pane(pane_id);
         }
         mux.remove_tab(tab.tab_id);
+
+        let mut cmd_queue = self.cmd_queue.lock();
+        for pane_id in detached_panes {
+            cmd_queue.retire_pane_size_suppression_target(pane_id);
+            cmd_queue.advance_preparation_prerequisite(TmuxPreparationPrerequisite::Pane(
+                pane_id,
+            ));
+        }
 
         Ok(())
     }
@@ -865,13 +1032,18 @@ impl TmuxDomainState {
             self.schedule_ready_pane_output(pane.pane_id, &remote_gate)?;
 
             if pane.pane_active {
-                let gui_tabs = self.gui_tabs.lock();
-
-                let Some(local_tab) = gui_tabs.get(&pane.window_id) else {
-                    anyhow::bail!("invalid tmux window id {}", pane.window_id);
+                let local_tab_id = {
+                    let gui_tabs = self.gui_tabs.lock();
+                    let Some(local_tab) = gui_tabs.get(&pane.window_id) else {
+                        anyhow::bail!("invalid tmux window id {}", pane.window_id);
+                    };
+                    local_tab.tab_id
                 };
 
-                if let Some(tab) = mux.get_tab(local_tab.tab_id) {
+                // Tab selection synchronously invokes pane focus hooks and mux
+                // subscribers. Never expose the gui-tab registry lock to that
+                // re-entrant callback graph.
+                if let Some(tab) = mux.get_tab(local_tab_id) {
                     let _ = tab.set_active_pane_for_mux(&local_pane, &mux);
                 }
             }
@@ -1708,44 +1880,119 @@ pub(crate) struct ListAllPanes {
     pub layout_csum: String,
 }
 
+enum ListAllPanesPreparation {
+    Ready { command: String, local_tab_id: TabId },
+    Suppressed,
+    Discarded,
+}
+
+impl ListAllPanes {
+    fn prepare_pure(&self, domain_id: DomainId) -> ListAllPanesPreparation {
+        let Some(mux) = Mux::try_get() else {
+            return ListAllPanesPreparation::Discarded;
+        };
+        let Some(domain) = mux.get_domain(domain_id) else {
+            return ListAllPanesPreparation::Discarded;
+        };
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            return ListAllPanesPreparation::Discarded;
+        };
+
+        let gui_tabs = tmux_domain.inner.gui_tabs.lock();
+        let Some(local_tab) = gui_tabs.get(&self.window_id) else {
+            // A later window-discovery result owns reconstruction. Retaining a
+            // list-panes request for a window with no local identity would let
+            // a permanently closed window occupy required-control capacity.
+            return ListAllPanesPreparation::Discarded;
+        };
+        if self.prune && local_tab.layout_csum == self.layout_csum {
+            return ListAllPanesPreparation::Suppressed;
+        }
+        let local_tab_id = local_tab.tab_id;
+        drop(gui_tabs);
+
+        ListAllPanesPreparation::Ready {
+            command: format!(
+                "list-panes -F '#{{session_id}} #{{window_id}} #{{pane_id}} \
+                #{{pane_index}} #{{cursor_x}} #{{cursor_y}} #{{pane_width}} #{{pane_height}} \
+                #{{pane_left}} #{{pane_top}} #{{pane_active}}' -t @{}\n",
+                self.window_id
+            ),
+            local_tab_id,
+        }
+    }
+}
+
 impl TmuxCommand for ListAllPanes {
     fn mailbox_class(&self) -> TmuxCommandClass {
         TmuxCommandClass::RequiredControl
     }
 
     fn get_command(&self, domain_id: DomainId) -> String {
-        let Some(mux) = Mux::try_get() else {
-            return "".to_string();
-        };
-        let domain = match mux.get_domain(domain_id) {
-            Some(d) => d,
-            None => return "".to_string(),
-        };
-        let tmux_domain = match domain.downcast_ref::<TmuxDomain>() {
-            Some(t) => t,
-            None => return "".to_string(),
-        };
-
-        let mut gui_tabs = tmux_domain.inner.gui_tabs.lock();
-
-        let Some(local_tab) = gui_tabs.get_mut(&self.window_id) else {
-            return "".to_string();
-        };
-
-        if local_tab.layout_csum.eq(&self.layout_csum) {
-            if self.prune {
-                return "".to_string();
+        match self.prepare_pure(domain_id) {
+            ListAllPanesPreparation::Ready { command, .. } => command,
+            ListAllPanesPreparation::Suppressed | ListAllPanesPreparation::Discarded => {
+                String::new()
             }
-        } else {
-            local_tab.layout_csum = self.layout_csum.clone();
         }
+    }
 
-        format!(
-            "list-panes -F '#{{session_id}} #{{window_id}} #{{pane_id}} \
-            #{{pane_index}} #{{cursor_x}} #{{cursor_y}} #{{pane_width}} #{{pane_height}} \
-            #{{pane_left}} #{{pane_top}} #{{pane_active}}' -t @{}\n",
-            self.window_id
-        )
+    fn conditional_commit_intent(&self) -> Option<TmuxConditionalCommitIntent> {
+        if !self.prune {
+            // Initial/non-pruning snapshots are mandatory synchronization,
+            // not checksum-coalescible layout refreshes. They must never be
+            // superseded by a racing LayoutChange, and they do not own cache
+            // publication because sync_window_state already installed the
+            // authoritative window checksum.
+            return None;
+        }
+        Some(TmuxConditionalCommitIntent::WindowLayout {
+            window_id: self.window_id,
+            prune: self.prune,
+            layout_csum: self.layout_csum.clone(),
+        })
+    }
+
+    fn prepare(
+        &self,
+        domain_id: DomainId,
+        io_generation: u64,
+        lease: Option<TmuxConditionalCommitLease>,
+    ) -> TmuxCommandPreparation {
+        let conditional_lease = if self.prune {
+            let Some(lease) = lease else {
+                return TmuxCommandPreparation::Discarded;
+            };
+            let Some(intent) = self.conditional_commit_intent() else {
+                return TmuxCommandPreparation::Discarded;
+            };
+            if lease.intent != intent {
+                return TmuxCommandPreparation::Discarded;
+            }
+            Some(lease)
+        } else {
+            if lease.is_some() {
+                return TmuxCommandPreparation::Discarded;
+            }
+            None
+        };
+        match self.prepare_pure(domain_id) {
+            ListAllPanesPreparation::Ready {
+                command,
+                local_tab_id,
+            } => TmuxCommandPreparation::Ready {
+                command: Arc::from(command.into_bytes()),
+                conditional_commit: conditional_lease.map(|lease| {
+                    TmuxConditionalCommit::WindowLayout {
+                        io_generation,
+                        lease,
+                        local_tab_id,
+                    }
+                }),
+            },
+            ListAllPanesPreparation::Suppressed => TmuxCommandPreparation::Suppressed,
+            ListAllPanesPreparation::Discarded => TmuxCommandPreparation::Discarded,
+        }
     }
 
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()> {
@@ -1769,13 +2016,23 @@ impl TmuxCommand for ListAllPanes {
         let mux = tmux_mux()?;
         if let Some(domain) = mux.get_domain(domain_id) {
             if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                if !self.prune {
-                    return tmux_domain.inner.sync_pane_state(&items);
-                } else {
-                    return tmux_domain
+                // Every list-panes response is an authoritative size/cursor
+                // snapshot for panes that still exist locally. Layout-change
+                // reconciliation additionally prunes identities absent from
+                // that snapshot; pruning alone would leave dimensions stale.
+                tmux_domain.inner.sync_pane_state(&items)?;
+                if self.prune {
+                    tmux_domain
                         .inner
-                        .remove_detached_pane(self.window_id, &pane_set);
+                        .remove_detached_pane(self.window_id, &pane_set)?;
                 }
+                let mut cmd_queue = tmux_domain.inner.cmd_queue.lock();
+                for pane_id in pane_set {
+                    cmd_queue.advance_preparation_prerequisite(
+                        TmuxPreparationPrerequisite::Pane(pane_id),
+                    );
+                }
+                return Ok(());
             }
         }
         anyhow::bail!("Tmux domain lost");
@@ -1854,82 +2111,190 @@ pub(crate) struct Resize {
     pub size: PtySize,
 }
 
+enum ResizePreparation {
+    Ready {
+        command: String,
+        local_pane_id: PaneId,
+        local_tab_id: TabId,
+        remote_window_id: TmuxWindowId,
+    },
+    Suppressed,
+    Retryable(TmuxPreparationPrerequisite),
+    Discarded,
+}
+
+impl Resize {
+    fn prepare_pure(&self, domain_id: DomainId) -> ResizePreparation {
+        let Some(mux) = Mux::try_get() else {
+            return ResizePreparation::Discarded;
+        };
+        let Some(domain) = mux.get_domain(domain_id) else {
+            return ResizePreparation::Discarded;
+        };
+        let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+            return ResizePreparation::Discarded;
+        };
+
+        // Tmux control mode cannot safely accept resize traffic during the
+        // initial synchronization phase. This is a retryable preparation
+        // boundary, not authority to update the cached size.
+        if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
+            return ResizePreparation::Retryable(TmuxPreparationPrerequisite::Attach);
+        }
+
+        // Once any resize for this pane may have reached tmux, cached
+        // dimensions are not suppression authority until the exact current
+        // matching success commits them. Snapshot the mailbox-owned fact
+        // before taking topology locks; no lock is nested across the two.
+        let pane_size_suppression_is_trustworthy = tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .pane_size_suppression_is_trustworthy(self.pane_id);
+
+        let remote_pane = {
+            let _registry = tmux_domain.inner.pane_registry.lock();
+            let remote_panes = tmux_domain.inner.remote_panes.lock();
+            match remote_panes.get(&self.pane_id).cloned() {
+                Some(remote_pane) => remote_pane,
+                None if tmux_domain.inner.retired_panes.lock().contains(&self.pane_id) => {
+                    return ResizePreparation::Discarded;
+                }
+                None => {
+                    return ResizePreparation::Retryable(
+                        TmuxPreparationPrerequisite::Pane(self.pane_id),
+                    );
+                }
+            }
+        };
+        let (local_pane_id, remote_window_id) = {
+            let pane = remote_pane.lock();
+            if pane_size_suppression_is_trustworthy
+                && pane.pane_width == u64::from(self.size.cols)
+                && pane.pane_height == u64::from(self.size.rows)
+            {
+                return ResizePreparation::Suppressed;
+            }
+            (pane.local_pane_id, pane.window_id)
+        };
+
+        let local_tab_id = {
+            let gui_tabs = tmux_domain.inner.gui_tabs.lock();
+            let Some(local_tab) = gui_tabs.get(&remote_window_id) else {
+                return ResizePreparation::Retryable(
+                    TmuxPreparationPrerequisite::Pane(self.pane_id),
+                );
+            };
+            local_tab.tab_id
+        };
+        let Some(local_tab) = mux.get_tab(local_tab_id) else {
+            return ResizePreparation::Retryable(
+                TmuxPreparationPrerequisite::Pane(self.pane_id),
+            );
+        };
+        let window_size = local_tab.get_size();
+
+        let support_commands = tmux_domain.inner.support_commands.lock();
+        let command = if support_commands.contains_key("resize-window") {
+            format!(
+                "resize-window -x {} -y {} -t @{}\nresize-pane -x {} -y {} -t %{}\n",
+                window_size.cols,
+                window_size.rows,
+                remote_window_id,
+                self.size.cols,
+                self.size.rows,
+                self.pane_id
+            )
+        } else if let Some(refresh_client) = support_commands.get("refresh-client") {
+            let separator = if refresh_client.contains("-C XxY") {
+                'x'
+            } else {
+                ','
+            };
+            format!(
+                "refresh-client -C {}{}{}\nresize-pane -x {} -y {} -t %{}\n",
+                window_size.cols,
+                separator,
+                window_size.rows,
+                self.size.cols,
+                self.size.rows,
+                self.pane_id
+            )
+        } else {
+            // Command discovery completes before AttachDone. At this point an
+            // absent resize-window/refresh-client capability is permanent for
+            // the connected tmux server and must not occupy the intent lane.
+            return ResizePreparation::Discarded;
+        };
+        drop(support_commands);
+
+        ResizePreparation::Ready {
+            command,
+            local_pane_id,
+            local_tab_id,
+            remote_window_id,
+        }
+    }
+}
+
 impl TmuxCommand for Resize {
     fn mailbox_class(&self) -> TmuxCommandClass {
         TmuxCommandClass::CoalescibleIntent
     }
 
     fn get_command(&self, domain_id: DomainId) -> String {
-        let Some(mux) = Mux::try_get() else {
-            return "".to_string();
-        };
-        let domain = match mux.get_domain(domain_id) {
-            Some(d) => d,
-            None => return "".to_string(),
-        };
-        let tmux_domain = match domain.downcast_ref::<TmuxDomain>() {
-            Some(t) => t,
-            None => return "".to_string(),
-        };
-
-        // Not in stable state for now, don't do resizing, otherwise it will cause tmux output
-        // unexpected content.
-        if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
-            return "".to_string();
+        match self.prepare_pure(domain_id) {
+            ResizePreparation::Ready { command, .. } => command,
+            ResizePreparation::Suppressed
+            | ResizePreparation::Retryable(_)
+            | ResizePreparation::Discarded => String::new(),
         }
+    }
 
-        let remote_pane = match tmux_domain
-            .inner
-            .remote_panes
-            .lock()
-            .get(&self.pane_id)
-            .cloned()
-        {
-            Some(remote_pane) => remote_pane,
-            None => return "".to_string(),
+    fn conditional_commit_intent(&self) -> Option<TmuxConditionalCommitIntent> {
+        Some(TmuxConditionalCommitIntent::PaneSize {
+            pane_id: self.pane_id,
+            rows: self.size.rows,
+            cols: self.size.cols,
+        })
+    }
+
+    fn prepare(
+        &self,
+        domain_id: DomainId,
+        io_generation: u64,
+        lease: Option<TmuxConditionalCommitLease>,
+    ) -> TmuxCommandPreparation {
+        let Some(lease) = lease else {
+            return TmuxCommandPreparation::Discarded;
         };
-        let tmux_window_id = {
-            let pane = remote_pane.lock();
-            if pane.pane_width == self.size.cols as u64 && pane.pane_height == self.size.rows as u64
-            {
-                return "".to_string();
+        let Some(intent) = self.conditional_commit_intent() else {
+            return TmuxCommandPreparation::Discarded;
+        };
+        if lease.intent != intent {
+            return TmuxCommandPreparation::Discarded;
+        }
+        match self.prepare_pure(domain_id) {
+            ResizePreparation::Ready {
+                command,
+                local_pane_id,
+                local_tab_id,
+                remote_window_id,
+            } => TmuxCommandPreparation::Ready {
+                command: Arc::from(command.into_bytes()),
+                conditional_commit: Some(TmuxConditionalCommit::PaneSize {
+                    io_generation,
+                    lease,
+                    local_pane_id,
+                    local_tab_id,
+                    remote_window_id,
+                }),
+            },
+            ResizePreparation::Suppressed => TmuxCommandPreparation::Suppressed,
+            ResizePreparation::Retryable(prerequisite) => {
+                TmuxCommandPreparation::Retryable { prerequisite }
             }
-            pane.window_id
-        };
-
-        let gui_tabs = tmux_domain.inner.gui_tabs.lock();
-        let local_tab = match gui_tabs.get(&tmux_window_id) {
-            Some(t) => t,
-            None => return "".to_string(),
-        };
-
-        let size = match mux.get_tab(local_tab.tab_id) {
-            Some(x) => x.get_size(),
-            None => return "".to_string(),
-        };
-
-        let support_commands = tmux_domain.inner.support_commands.lock();
-
-        if let Some(_x) = support_commands.get("resize-window") {
-            format!(
-                "resize-window -x {} -y {} -t @{}\nresize-pane -x {} -y {} -t %{}\n",
-                size.cols, size.rows, tmux_window_id, self.size.cols, self.size.rows, self.pane_id
-            )
-        } else if let Some(x) = support_commands.get("refresh-client") {
-            if x.contains("-C XxY") {
-                format!(
-                    "refresh-client -C {}x{}\nresize-pane -x {} -y {} -t %{}\n",
-                    size.cols, size.rows, self.size.cols, self.size.rows, self.pane_id
-                )
-            } else {
-                format!(
-                    "refresh-client -C {},{}\nresize-pane -x {} -y {} -t %{}\n",
-                    size.cols, size.rows, self.size.cols, self.size.rows, self.pane_id
-                )
-            }
-        } else {
-            log::info!("The tmux version is not supported");
-            return "".to_string();
+            ResizePreparation::Discarded => TmuxCommandPreparation::Discarded,
         }
     }
 
@@ -1940,24 +2305,10 @@ impl TmuxCommand for Resize {
             anyhow::bail!("{error}");
         }
 
-        let mux = tmux_mux()?;
-        let domain = mux
-            .get_domain(domain_id)
-            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
-        let tmux_domain = domain
-            .downcast_ref::<TmuxDomain>()
-            .ok_or_else(|| anyhow!("Tmux domain lost"))?;
-        let pane = tmux_domain
-            .inner
-            .remote_panes
-            .lock()
-            .get(&self.pane_id)
-            .cloned();
-        if let Some(pane) = pane {
-            let mut pane = pane.lock();
-            pane.pane_width = self.size.cols as u64;
-            pane.pane_height = self.size.rows as u64;
-        }
+        // Cache publication is deliberately separate from result validation.
+        // The I/O generation, mailbox intent generation, and pane/tab identity
+        // captured by `prepare` are committed by `TmuxDomainState` only after
+        // this matching guarded success.
         Ok(())
     }
 
@@ -2403,6 +2754,11 @@ impl TmuxCommand for AttachDone {
 
         // Do nothing, just change the state.
         *tmux_domain.inner.attach_state.lock() = AttachState::Done;
+        tmux_domain
+            .inner
+            .cmd_queue
+            .lock()
+            .advance_preparation_prerequisite(TmuxPreparationPrerequisite::Attach);
         Ok(())
     }
 }
@@ -2414,6 +2770,7 @@ mod tests {
     use filedescriptor::{poll, pollfd, AsRawSocketDescriptor, FileDescriptor, POLLIN};
     use promise::spawn::ScopedExecutor;
     use std::io::{Read as _, Write as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::MutexGuard as StdMutexGuard;
     use std::time::{Duration, Instant};
 
@@ -3612,6 +3969,80 @@ mod tests {
         assert_eq!(*tmux_domain.inner.attach_state.lock(), AttachState::Init);
         cmd.process_result(domain_id, &result)?;
         assert_eq!(*tmux_domain.inner.attach_state.lock(), AttachState::Done);
+        Ok(())
+    }
+
+    #[test]
+    fn active_pane_sync_releases_gui_tabs_before_reentrant_notification() -> anyhow::Result<()> {
+        let (_mux_guard, tmux_domain) = install_tmux_domain();
+        let mux = tmux_mux()?;
+        *tmux_domain.inner.tmux_session.lock() = Some(1);
+
+        let tab = Arc::new(Tab::new(&TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        }));
+        mux.add_tab_no_panes(&tab)?;
+        let local_tab_id = tab.tab_id();
+        tmux_domain
+            .inner
+            .mirror_index
+            .lock()
+            .register_window(local_tab_id, 2)?;
+        tmux_domain.inner.gui_tabs.lock().insert(
+            2,
+            TmuxTab {
+                tab_id: local_tab_id,
+                tmux_window_id: 2,
+                layout_csum: "test".to_string(),
+                panes: HashSet::from([3, 4]),
+            },
+        );
+
+        let pane_item = |pane_id, pane_active| PaneItem {
+            session_id: 1,
+            window_id: 2,
+            pane_id,
+            _pane_index: 0,
+            cursor_x: 0,
+            cursor_y: 0,
+            pane_width: 80,
+            pane_height: 24,
+            pane_left: 0,
+            pane_top: 0,
+            pane_active,
+        };
+        let first_item = pane_item(3, false);
+        let active_item = pane_item(4, true);
+        let first = tmux_domain.inner.create_pane(&first_item)?;
+        let active = tmux_domain.inner.create_pane(&active_item)?;
+        mux.add_pane(&first)?;
+        mux.add_pane(&active)?;
+        tab.assign_pane(&first);
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&active))?;
+        tab.set_active_idx(0);
+
+        let callback_observed_unlocked_registry = Arc::new(AtomicBool::new(false));
+        let callback_observed = Arc::clone(&callback_observed_unlocked_registry);
+        let owner = Arc::downgrade(&tmux_domain.inner);
+        let _subscription = mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::PaneFocused(_)) {
+                let available = owner
+                    .upgrade()
+                    .is_some_and(|owner| owner.gui_tabs.try_lock().is_some());
+                callback_observed.store(available, Ordering::Release);
+            }
+            true
+        })?;
+
+        tmux_domain.inner.sync_pane_state(&[active_item])?;
+        assert!(
+            callback_observed_unlocked_registry.load(Ordering::Acquire),
+            "synchronous focus notification must be able to re-enter gui_tabs",
+        );
         Ok(())
     }
 
