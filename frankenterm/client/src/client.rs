@@ -4462,6 +4462,10 @@ async fn client_thread_async(
         Readable(anyhow::Result<()>),
     }
 
+    // The decoded branch deliberately keeps the already-inline `Pdu` on the
+    // stack. Boxing it here would add one heap allocation to every live reply
+    // and unilateral frame just to shrink this loop-local branch carrier.
+    #[allow(clippy::large_enum_variant)]
     enum InboundPdu {
         Decoded {
             decoded: DecodedPdu,
