@@ -1057,11 +1057,12 @@ mod tests {
             let successor = authority
                 .issue_source(pane, CaptureSourceKind::Polling)
                 .expect("successor source");
+            let stale_error = match authority.begin_source_revocation(pane, stale_stamp) {
+                Ok(_) => panic!("stale revocation unexpectedly succeeded"),
+                Err(error) => error,
+            };
             assert_eq!(
-                authority
-                    .begin_source_revocation(pane, stale_stamp)
-                    .err()
-                    .expect("stale revocation must fail"),
+                stale_error,
                 CaptureAuthorityError::StaleSourceEpoch {
                     source_kind: CaptureSourceKind::Polling,
                 }
@@ -1294,7 +1295,7 @@ mod tests {
                 .begin_source_revocation(pane, stamp)
                 .expect("revocation");
             let expired = crate::cx::Cx::for_testing_with_budget(
-                asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
+                crate::cx::Budget::new().with_deadline(Default::default()),
             );
             assert_eq!(
                 revocation
@@ -1326,6 +1327,55 @@ mod tests {
             authority.activate_pane(24).unwrap_err(),
             CaptureAuthorityError::AuthorityPoisoned
         );
+    }
+
+    #[test]
+    fn inflight_counter_exhaustion_is_typed_and_does_not_wrap() {
+        let authority = CaptureAuthority::new();
+        let pane = authority.activate_pane(25).expect("pane");
+        let lease = authority
+            .issue_source(pane, CaptureSourceKind::Polling)
+            .expect("source");
+        let stamp = lease.stamp();
+
+        lease
+            .inner
+            .producer_inflight
+            .store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(
+            lease
+                .try_acquire_producer(stamp, stamp.global_pane_id())
+                .unwrap_err(),
+            CaptureAuthorityError::InflightCounterExhausted {
+                stage: CaptureGuardStage::Producer,
+            }
+        );
+        assert_eq!(
+            lease.inner.producer_inflight.load(Ordering::SeqCst),
+            usize::MAX
+        );
+        lease.inner.producer_inflight.store(0, Ordering::SeqCst);
+
+        lease
+            .inner
+            .persistence_inflight
+            .store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(
+            lease
+                .try_acquire_persistence(stamp, stamp.global_pane_id())
+                .unwrap_err(),
+            CaptureAuthorityError::InflightCounterExhausted {
+                stage: CaptureGuardStage::Persistence,
+            }
+        );
+        assert_eq!(
+            lease.inner.persistence_inflight.load(Ordering::SeqCst),
+            usize::MAX
+        );
+        lease
+            .inner
+            .persistence_inflight
+            .store(0, Ordering::SeqCst);
     }
 
     #[test]
