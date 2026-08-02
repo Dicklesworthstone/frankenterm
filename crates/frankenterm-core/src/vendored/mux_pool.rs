@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cx::{self, Cx};
 use crate::pool::{Pool, PoolAcquireGuard, PoolConfig, PoolError, PoolStats};
+use crate::protocol_recovery::ProtocolErrorKind;
 use crate::retry::RetryPolicy;
 // Retained across cfg gates: used by `execute_with_recovery_inner`
 // (non-asupersync fallback) and by test-mod eviction tests under both
@@ -36,8 +37,7 @@ use crate::retry::RetryPolicy;
 use crate::runtime_async::sleep;
 
 use super::mux_client::{
-    DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
-    validate_render_batch_panes,
+    DirectMuxClient, DirectMuxClientConfig, DirectMuxError, validate_render_batch_panes,
 };
 use codec::{
     GetLinesResponse, GetPaneRenderChangesResponse, GetSemanticZonesResponse, ListPanesResponse,

@@ -134,9 +134,60 @@ impl std::fmt::Display for ProtocolErrorKind {
 }
 
 /// Classify an error message string into a recovery category.
+///
+/// This is a compatibility heuristic for callers that no longer retain their
+/// typed error.  Typed mux callers must use `classify_mux_error`, whose
+/// exhaustive match is the canonical authority. Stable non-cancellation
+/// display forms emitted by `DirectMuxError` are kept aligned where the text
+/// retains the typed error kind. Explicit cancellation and arbitrary custom
+/// `io::Error` payloads cannot be reconstructed reliably from a string.
 #[must_use]
 pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     let lower = msg.to_lowercase();
+
+    // Match typed `DirectMuxError` display prefixes before inspecting their
+    // free-form payloads. A remote or codec message may itself contain words
+    // such as "incompatible" or "timeout" without changing the typed error's
+    // transport disposition.
+    if lower.starts_with("remote error:") {
+        return ProtocolErrorKind::Transient;
+    }
+    if lower.starts_with("unexpected response:") || lower.starts_with("codec error:") {
+        return ProtocolErrorKind::Recoverable;
+    }
+    if lower.starts_with("io error:") {
+        if lower.contains("broken pipe")
+            || lower.contains("connection reset")
+            || lower.contains("not connected")
+            || lower.contains("connection aborted")
+            || lower.contains("unexpected end of file")
+            || lower.contains("unexpected eof")
+        {
+            return ProtocolErrorKind::Recoverable;
+        }
+        if lower.contains("permission denied") || lower.contains("invalid input") {
+            return ProtocolErrorKind::Permanent;
+        }
+        if lower.contains("would block")
+            || lower.contains("interrupted")
+            || lower.contains("timed out")
+            || lower.contains("connection refused")
+            || lower.contains("address not available")
+        {
+            return ProtocolErrorKind::Transient;
+        }
+        return ProtocolErrorKind::Recoverable;
+    }
+
+    // These variants embed a caller-controlled path after a stable prefix.
+    // Classify the prefix first so path text such as "incompatible" cannot
+    // override the typed error's recovery disposition.
+    if lower.starts_with("mux socket not found at ") {
+        return ProtocolErrorKind::Transient;
+    }
+    if lower.starts_with("connect to mux socket timed out:") {
+        return ProtocolErrorKind::Transient;
+    }
 
     if lower.contains("codec version mismatch")
         || lower.contains("incompatible")
@@ -149,11 +200,25 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
         return ProtocolErrorKind::Permanent;
     }
 
+    if lower.contains("read from mux socket timed out")
+        || lower.contains("write to mux socket timed out")
+        || lower.contains("pipeline batch timed out")
+    {
+        return ProtocolErrorKind::Recoverable;
+    }
+
+    if lower.contains("connect to mux socket timed out") {
+        return ProtocolErrorKind::Transient;
+    }
+
+    if lower.contains("remote error") {
+        return ProtocolErrorKind::Transient;
+    }
+
     if lower.contains("unexpected response")
         || lower.contains("disconnected")
         || lower.contains("codec error")
         || lower.contains("frame exceeded max size")
-        || lower.contains("remote error")
         || lower.contains("request serial space exhausted")
     {
         return ProtocolErrorKind::Recoverable;
@@ -162,34 +227,28 @@ pub fn classify_error_message(msg: &str) -> ProtocolErrorKind {
     if lower.contains("timed out")
         || lower.contains("timeout")
         || lower.contains("connection refused")
+        || lower.contains("address not available")
     {
-        return ProtocolErrorKind::Transient;
-    }
-
-    if lower.contains("io error") {
-        if lower.contains("broken pipe")
-            || lower.contains("connection reset")
-            || lower.contains("not connected")
-        {
-            return ProtocolErrorKind::Recoverable;
-        }
-        if lower.contains("would block")
-            || lower.contains("interrupted")
-            || lower.contains("timed out")
-        {
-            return ProtocolErrorKind::Transient;
-        }
-        return ProtocolErrorKind::Recoverable;
-    }
-
-    if lower.contains("socket not found") {
         return ProtocolErrorKind::Transient;
     }
 
     ProtocolErrorKind::Recoverable
 }
 
-/// Classify a `DirectMuxError` directly when the `vendored` feature is active.
+/// Canonical, exhaustive recovery classification for
+/// [`crate::vendored::DirectMuxError`].
+///
+/// `Recoverable` means that the error variant itself establishes that the
+/// connection cannot be trusted and a caller may retry only after discarding
+/// it. `Transient` means that the variant alone does not establish protocol
+/// corruption; transport-side ambiguity may still require the owning client
+/// to poison the connection. `Permanent` means that replay cannot repair the
+/// failure. Explicit capability cancellation remains an orthogonal no-retry
+/// authority via `DirectMuxError::is_cancelled`.
+///
+/// This match intentionally has no wildcard. Adding a new `DirectMuxError`
+/// variant therefore fails compilation until its recovery disposition is
+/// chosen here.
 #[cfg(all(feature = "vendored", unix))]
 #[must_use]
 pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErrorKind {
@@ -206,32 +265,30 @@ pub fn classify_mux_error(err: &crate::vendored::DirectMuxError) -> ProtocolErro
         | DirectMuxError::UnexpectedResponse { .. }
         | DirectMuxError::Codec(_)
         | DirectMuxError::FrameTooLarge { .. }
-        | DirectMuxError::RemoteError(_)
+        | DirectMuxError::ReadTimeout
+        | DirectMuxError::WriteTimeout
+        | DirectMuxError::BatchTimeout { .. }
+        | DirectMuxError::SerialExhausted
         | DirectMuxError::RetentionLimitExceeded { .. }
         | DirectMuxError::ResponseSerialNotOutstanding { .. }
         | DirectMuxError::RetainedConnectionMismatch { .. }
         | DirectMuxError::RetainedStateAccounting { .. } => ProtocolErrorKind::Recoverable,
 
-        DirectMuxError::ConnectTimeout(_)
-        | DirectMuxError::ReadTimeout
-        | DirectMuxError::WriteTimeout
-        | DirectMuxError::BatchTimeout { .. } => ProtocolErrorKind::Transient,
-
-        DirectMuxError::SerialExhausted => ProtocolErrorKind::Recoverable,
-
-        DirectMuxError::SocketNotFound(_) => ProtocolErrorKind::Transient,
+        DirectMuxError::SocketNotFound(_)
+        | DirectMuxError::ConnectTimeout(_)
+        | DirectMuxError::RemoteError(_) => ProtocolErrorKind::Transient,
 
         DirectMuxError::Io(io_err) => match io_err.kind() {
             std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::NotConnected
-            | std::io::ErrorKind::ConnectionAborted => ProtocolErrorKind::Recoverable,
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::UnexpectedEof => ProtocolErrorKind::Recoverable,
             std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::TimedOut => ProtocolErrorKind::Transient,
-            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::AddrNotAvailable => {
-                ProtocolErrorKind::Transient
-            }
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::AddrNotAvailable => ProtocolErrorKind::Transient,
             std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput => {
                 ProtocolErrorKind::Permanent
             }
@@ -944,6 +1001,189 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn direct_mux_error_classification_has_one_exhaustive_authority() {
+        use crate::vendored::DirectMuxError;
+
+        let cases = [
+            (DirectMuxError::SocketPathMissing, ProtocolErrorKind::Permanent),
+            (
+                DirectMuxError::SocketNotFound(std::path::PathBuf::from(
+                    "/tmp/incompatible socket path not found.sock",
+                )),
+                ProtocolErrorKind::Transient,
+            ),
+            (DirectMuxError::ProxyUnsupported, ProtocolErrorKind::Permanent),
+            (
+                DirectMuxError::ConnectTimeout(std::path::PathBuf::from(
+                    "/tmp/incompatible socket path not found.sock",
+                )),
+                ProtocolErrorKind::Transient,
+            ),
+            (DirectMuxError::ReadTimeout, ProtocolErrorKind::Recoverable),
+            (DirectMuxError::WriteTimeout, ProtocolErrorKind::Recoverable),
+            (DirectMuxError::Disconnected, ProtocolErrorKind::Recoverable),
+            (
+                DirectMuxError::FrameTooLarge { max_bytes: 1024 },
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::ConnectionIdExhausted,
+                ProtocolErrorKind::Permanent,
+            ),
+            (DirectMuxError::SerialExhausted, ProtocolErrorKind::Recoverable),
+            (
+                DirectMuxError::InvalidLimit {
+                    field: "max_pending_responses",
+                },
+                ProtocolErrorKind::Permanent,
+            ),
+            (
+                DirectMuxError::RetentionLimitExceeded {
+                    resource: "pending mux responses",
+                    requested_count: 2,
+                    requested_bytes: 32,
+                    max_count: 1,
+                    max_bytes: 16,
+                },
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::ResponseSerialNotOutstanding {
+                    connection_id: 7,
+                    serial: 9,
+                },
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::RetainedConnectionMismatch {
+                    expected_connection_id: 8,
+                    got_connection_id: 7,
+                },
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::RetainedStateAccounting {
+                    resource: "pending mux responses",
+                },
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::Codec("codec version mismatch in payload".to_string()),
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::RemoteError("client is incompatible with pane".to_string()),
+                ProtocolErrorKind::Transient,
+            ),
+            (
+                DirectMuxError::BatchTimeout { timeout_ms: 25 },
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::DuplicateRenderBatchPane { pane_id: 7 },
+                ProtocolErrorKind::Permanent,
+            ),
+            (
+                DirectMuxError::UnexpectedResponse {
+                    expected: "ListPanesResponse".to_string(),
+                    got: "incompatible UnitResponse".to_string(),
+                },
+                ProtocolErrorKind::Recoverable,
+            ),
+            (
+                DirectMuxError::IncompatibleCodec {
+                    local: 4,
+                    remote: 3,
+                    remote_version: "old".to_string(),
+                },
+                ProtocolErrorKind::Permanent,
+            ),
+            (
+                DirectMuxError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                ProtocolErrorKind::Recoverable,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                classify_mux_error(&error),
+                expected,
+                "canonical typed classification for {error:?}"
+            );
+            assert_eq!(
+                error.protocol_error_kind(),
+                expected,
+                "DirectMuxError method must delegate for {error:?}"
+            );
+            assert_eq!(
+                classify_error_message(&error.to_string()),
+                expected,
+                "typed error display heuristic must agree for {error:?}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn direct_mux_io_classification_covers_recovery_kinds_and_cancellation_signal() {
+        use crate::vendored::DirectMuxError;
+
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = DirectMuxError::Io(std::io::Error::from(kind));
+            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Recoverable);
+            assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Recoverable);
+            assert_eq!(
+                classify_error_message(&error.to_string()),
+                ProtocolErrorKind::Recoverable
+            );
+        }
+
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            let error = DirectMuxError::Io(std::io::Error::from(kind));
+            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Transient);
+            assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Transient);
+            assert_eq!(
+                classify_error_message(&error.to_string()),
+                ProtocolErrorKind::Transient
+            );
+        }
+
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+        ] {
+            let error = DirectMuxError::Io(std::io::Error::from(kind));
+            assert_eq!(classify_mux_error(&error), ProtocolErrorKind::Permanent);
+            assert_eq!(error.protocol_error_kind(), ProtocolErrorKind::Permanent);
+            assert_eq!(
+                classify_error_message(&error.to_string()),
+                ProtocolErrorKind::Permanent
+            );
+        }
+
+        let cancelled = DirectMuxError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "mux request_write_wait cancelled: caller abandoned scope",
+        ));
+        assert!(cancelled.is_cancelled());
+        assert_eq!(classify_mux_error(&cancelled), ProtocolErrorKind::Transient);
+    }
+
     #[test]
     fn classify_unexpected_response() {
         assert_eq!(
@@ -990,7 +1230,7 @@ mod tests {
     fn classify_read_timeout() {
         assert_eq!(
             classify_error_message("read from mux socket timed out"),
-            ProtocolErrorKind::Transient
+            ProtocolErrorKind::Recoverable
         );
     }
 
@@ -1853,7 +2093,7 @@ mod tests {
     fn classify_remote_error() {
         assert_eq!(
             classify_error_message("remote error: domain not found"),
-            ProtocolErrorKind::Recoverable
+            ProtocolErrorKind::Transient
         );
     }
 

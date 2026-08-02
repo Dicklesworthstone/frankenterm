@@ -62,7 +62,6 @@ fn arb_recoverable_pattern() -> impl Strategy<Value = String> {
         Just("disconnected".to_string()),
         Just("codec error".to_string()),
         Just("frame exceeded max size".to_string()),
-        Just("remote error".to_string()),
     ]
 }
 
@@ -72,6 +71,7 @@ fn arb_transient_pattern() -> impl Strategy<Value = String> {
         Just("timed out".to_string()),
         Just("timeout".to_string()),
         Just("connection refused".to_string()),
+        Just("remote error".to_string()),
     ]
 }
 
@@ -163,7 +163,6 @@ proptest! {
         prop_assume!(!lower.contains("disconnected"));
         prop_assume!(!lower.contains("codec error"));
         prop_assume!(!lower.contains("frame exceeded max size"));
-        prop_assume!(!lower.contains("remote error"));
         let kind = classify_error_message(&msg);
         prop_assert_eq!(kind, ProtocolErrorKind::Transient,
             "expected Transient for message containing '{}', got {:?}", pattern, kind);
