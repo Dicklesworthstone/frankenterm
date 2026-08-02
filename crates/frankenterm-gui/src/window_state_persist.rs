@@ -5467,6 +5467,55 @@ mod tests {
         (state, changed_workspace)
     }
 
+    fn near_ceiling_state_with_overlay(
+        target_bytes: u64,
+    ) -> (
+        PersistedState,
+        String,
+        String,
+        MixedDomainLayoutOverlay,
+    ) {
+        let overlay = local_overlay(window_id(90_001), 1, 0x91);
+        let empty = PersistedState {
+            store_revision: 1,
+            ..PersistedState::default()
+        };
+        let empty_upper_bound = EncodedStateBudget::from_state(&empty, empty.store_revision)
+            .and_then(|budget| budget.upper_bound())
+            .expect("count empty near-ceiling state");
+        let mut overlay_only = empty.clone();
+        overlay_only.overlays.push(overlay.clone());
+        let overlay_upper_bound =
+            EncodedStateBudget::from_state(&overlay_only, overlay_only.store_revision)
+                .and_then(|budget| budget.upper_bound())
+                .expect("count near-ceiling overlay contribution");
+        let overlay_bytes = overlay_upper_bound
+            .checked_sub(empty_upper_bound)
+            .expect("overlay contribution cannot shrink an empty state");
+        let workspace_target = target_bytes
+            .checked_sub(overlay_bytes)
+            .expect("near-ceiling target leaves room for one overlay");
+        let (mut state, _) = workspace_state_at_encoded_upper_bound(workspace_target);
+        state.overlays.push(overlay.clone());
+        canonicalize_state(&mut state);
+        validate_published_state(&state).expect("near-ceiling mixed state is structurally valid");
+        let upper_bound = EncodedStateBudget::from_state(&state, state.store_revision)
+            .and_then(|budget| budget.upper_bound())
+            .expect("count near-ceiling mixed state");
+        assert_eq!(upper_bound, target_bytes);
+
+        let mut workspaces = state.window_states.keys().take(2).cloned();
+        let external_growth_workspace = workspaces.next().expect("first boundary workspace");
+        let stale_growth_workspace = workspaces.next().expect("second boundary workspace");
+        assert_ne!(external_growth_workspace, stale_growth_workspace);
+        (
+            state,
+            external_growth_workspace,
+            stale_growth_workspace,
+            overlay,
+        )
+    }
+
     fn maximum_width_index_bytes<const N: usize>(namespace: u8, mut index: usize) -> [u8; N] {
         assert!(N >= 3);
         assert!((100..=u8::MAX).contains(&namespace));
@@ -6862,6 +6911,12 @@ mod tests {
             MAX_STATE_FILE_BYTES
         );
         let encoded = encode_disk_slot(&state).expect("literal boundary state physically encodes");
+        eprintln!(
+            "window_state_persist boundary: admitted_upper_bound={} physical_encoded_bytes={} limit={}",
+            budget.upper_bound().expect("boundary upper bound evidence"),
+            encoded.len(),
+            MAX_STATE_FILE_BYTES
+        );
         assert!(
             u64::try_from(encoded.len()).expect("encoded boundary length fits u64")
                 <= MAX_STATE_FILE_BYTES
@@ -6894,6 +6949,277 @@ mod tests {
                 maximum: MAX_STATE_FILE_BYTES,
             }
         );
+    }
+
+    #[test]
+    fn controlled_worker_rebases_stale_mixed_batch_at_literal_byte_ceiling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("window-state.json");
+        let target_before_race = MAX_STATE_FILE_BYTES - 1;
+        let (
+            base,
+            external_growth_workspace,
+            stale_growth_workspace,
+            base_overlay,
+        ) = near_ceiling_state_with_overlay(target_before_race);
+        std::fs::write(
+            &path,
+            encode_disk_slot(&base).expect("encode near-ceiling mixed authority"),
+        )
+        .expect("write near-ceiling mixed authority");
+
+        let updated_overlay = local_overlay(base_overlay.window_id(), 2, 0x92);
+        let one_byte_wider_state = PersistedWindowState {
+            maximized: false,
+            fullscreen: true,
+        };
+        let mut stale_batch = PendingBatch::default();
+        stale_batch
+            .queue_window_state(stale_growth_workspace.clone(), one_byte_wider_state)
+            .expect("queue stale one-byte workspace growth");
+        stale_batch
+            .queue_overlay_live(Some(base_overlay.local_revision()), updated_overlay.clone())
+            .expect("queue stale same-width overlay update");
+        let local_preflight = preflight_batch(&base, &stale_batch, false)
+            .expect("stale mixed batch fits before the authority race");
+        assert!(
+            local_preflight
+                .accepted_workspaces
+                .contains(&stale_growth_workspace)
+        );
+        assert!(
+            local_preflight
+                .overlays
+                .apply_overlay_ids
+                .contains(&base_overlay.window_id())
+        );
+        assert_eq!(local_preflight.encoded_upper_bound, MAX_STATE_FILE_BYTES);
+
+        let worker = ControlledPersistenceWorker::open(path.clone());
+        worker.expect_waiting(1, false);
+        let flush = worker.admit_batch_with_flush(stale_batch.clone());
+        worker.continue_wake(1);
+        let frozen = worker.expect_commit(1, TestWorkerCommitPhase::Pending);
+        assert_eq!(
+            frozen.window_states.get(&stale_growth_workspace),
+            Some(&one_byte_wider_state)
+        );
+        assert!(frozen.overlay_mutations.contains_key(&base_overlay.window_id()));
+
+        // Interpose another process' one-byte authority growth after the
+        // worker freezes its queued batch but before it takes the file lock.
+        // The worker must reload and partition against that exact authority.
+        let mut external_batch = PendingBatch::default();
+        external_batch
+            .queue_window_state(
+                external_growth_workspace.clone(),
+                one_byte_wider_state,
+            )
+            .expect("queue external one-byte authority growth");
+        let external = commit_for_test(&path, &external_batch, WriteInterruption::None)
+            .expect("publish intervening authority growth");
+        assert_eq!(external.receipt.committed_updates, 1);
+        assert_eq!(external.receipt.rejected_updates, 0);
+
+        worker.release_commit(
+            1,
+            TestWorkerCommitAction::Run(WriteInterruption::None),
+        );
+        let receipt = match worker.expect_commit_finished(1, TestWorkerCommitPhase::Pending) {
+            TestWorkerCommitResult::Committed(receipt) => receipt,
+            TestWorkerCommitResult::Failed(code) => {
+                panic!("rebased near-ceiling worker commit failed: {code:?}")
+            }
+        };
+        assert!(receipt.wrote_new_generation);
+        assert_eq!(receipt.committed_updates, 1);
+        assert_eq!(receipt.rejected_updates, 1);
+        worker.continue_after_commit(1);
+        assert_eq!(
+            flush
+                .recv_timeout(CONTROLLED_WORKER_WATCHDOG)
+                .expect("rebased near-ceiling flush response")
+                .expect_err("byte-rejected lineage reaches its flush waiter")
+                .code(),
+            PersistenceFailureCode::Oversized
+        );
+        worker.expect_waiting(2, false);
+
+        let snapshot = load_snapshot_at(&path).expect("load rebased near-ceiling authority");
+        assert_eq!(
+            snapshot.window_states[&external_growth_workspace],
+            one_byte_wider_state
+        );
+        assert_eq!(
+            snapshot.window_states[&stale_growth_workspace],
+            PersistedWindowState {
+                maximized: true,
+                fullscreen: true,
+            }
+        );
+        assert_eq!(
+            snapshot
+                .overlay(base_overlay.window_id())
+                .expect("rebased overlay remains live"),
+            &updated_overlay
+        );
+        let restored = PersistedState {
+            schema_version: STORE_SCHEMA_VERSION,
+            store_revision: snapshot.store_revision,
+            window_states: snapshot.window_states.clone(),
+            domain_bindings: snapshot.domain_bindings.clone(),
+            overlays: snapshot.overlays.clone(),
+            tombstones: snapshot.tombstones.clone(),
+        };
+        let restored_budget = EncodedStateBudget::from_state(&restored, restored.store_revision)
+            .and_then(|budget| budget.upper_bound())
+            .expect("count rebased near-ceiling authority");
+        let restored_encoded =
+            encode_disk_slot(&restored).expect("encode rebased near-ceiling authority");
+        eprintln!(
+            "window_state_persist stale-rebase: admitted_upper_bound={} physical_encoded_bytes={} limit={} committed={} rejected={}",
+            restored_budget,
+            restored_encoded.len(),
+            MAX_STATE_FILE_BYTES,
+            receipt.committed_updates,
+            receipt.rejected_updates
+        );
+        assert_eq!(restored_budget, MAX_STATE_FILE_BYTES);
+        assert!(
+            u64::try_from(restored_encoded.len()).expect("restored length fits u64")
+                <= MAX_STATE_FILE_BYTES
+        );
+        let pending = lock_pending(&worker.writer().shared.pending);
+        assert!(pending.batch.window_states.is_empty());
+        assert!(pending.batch.overlay_mutations.is_empty());
+        assert!(pending.flush_waiters.is_empty());
+        assert!(pending.binding_waiters.is_empty());
+        assert_eq!(pending.waiter_count, 0);
+        drop(pending);
+
+        assert_eq!(
+            worker.stop_and_join(),
+            TestWorkerStopped {
+                waiting_epoch: 2,
+                commit_epoch: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn near_ceiling_mixed_batch_retry_is_bounded_across_every_crash_point() {
+        for interruption in [
+            WriteInterruption::AfterTruncate,
+            WriteInterruption::AfterPartialWrite,
+            WriteInterruption::AfterFullWrite,
+            WriteInterruption::AfterSync,
+            WriteInterruption::AfterDirectorySync,
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("window-state.json");
+            let (
+                base,
+                external_growth_workspace,
+                stale_growth_workspace,
+                base_overlay,
+            ) = near_ceiling_state_with_overlay(MAX_STATE_FILE_BYTES - 1);
+            std::fs::write(
+                &path,
+                encode_disk_slot(&base).expect("encode crash-matrix base authority"),
+            )
+            .expect("write crash-matrix base authority");
+
+            let one_byte_wider_state = PersistedWindowState {
+                maximized: false,
+                fullscreen: true,
+            };
+            let mut external_batch = PendingBatch::default();
+            external_batch
+                .queue_window_state(
+                    external_growth_workspace.clone(),
+                    one_byte_wider_state,
+                )
+                .expect("queue crash-matrix external growth");
+            commit_for_test(&path, &external_batch, WriteInterruption::None)
+                .expect("publish crash-matrix external growth");
+
+            let updated_overlay = local_overlay(base_overlay.window_id(), 2, 0x92);
+            let mut stale_batch = PendingBatch::default();
+            stale_batch
+                .queue_window_state(stale_growth_workspace.clone(), one_byte_wider_state)
+                .expect("queue crash-matrix stale growth");
+            stale_batch
+                .queue_overlay_live(Some(base_overlay.local_revision()), updated_overlay.clone())
+                .expect("queue crash-matrix overlay update");
+            assert_eq!(
+                commit_for_test(&path, &stale_batch, interruption)
+                    .expect_err("inject crash during partitioned mixed commit")
+                    .code(),
+                PersistenceFailureCode::Io
+            );
+
+            let replay = commit_for_test(&path, &stale_batch, WriteInterruption::None)
+                .expect("retry exact partitioned mixed batch");
+            assert_eq!(replay.receipt.committed_updates, 1);
+            assert_eq!(replay.receipt.rejected_updates, 1);
+            assert_eq!(
+                replay.rejected_workspaces[&stale_growth_workspace],
+                PersistenceFailure::EncodedQuota {
+                    projected_upper_bound: MAX_STATE_FILE_BYTES + 1,
+                    maximum: MAX_STATE_FILE_BYTES,
+                }
+            );
+            assert!(
+                replay
+                    .accepted_overlay_ids
+                    .contains(&base_overlay.window_id())
+            );
+
+            let snapshot = load_snapshot_at(&path).expect("load crash-matrix retry authority");
+            assert_eq!(
+                snapshot.window_states[&external_growth_workspace],
+                one_byte_wider_state
+            );
+            assert_eq!(
+                snapshot.window_states[&stale_growth_workspace],
+                PersistedWindowState {
+                    maximized: true,
+                    fullscreen: true,
+                }
+            );
+            assert_eq!(
+                snapshot
+                    .overlay(base_overlay.window_id())
+                    .expect("crash-matrix overlay remains live"),
+                &updated_overlay
+            );
+            let restored = PersistedState {
+                schema_version: STORE_SCHEMA_VERSION,
+                store_revision: snapshot.store_revision,
+                window_states: snapshot.window_states,
+                domain_bindings: snapshot.domain_bindings,
+                overlays: snapshot.overlays,
+                tombstones: snapshot.tombstones,
+            };
+            let restored_upper_bound =
+                EncodedStateBudget::from_state(&restored, restored.store_revision)
+                    .and_then(|budget| budget.upper_bound())
+                    .expect("count crash-matrix retry authority");
+            let restored_encoded =
+                encode_disk_slot(&restored).expect("encode crash-matrix retry authority");
+            eprintln!(
+                "window_state_persist crash-retry {interruption:?}: admitted_upper_bound={} physical_encoded_bytes={} limit={} wrote_new_generation={}",
+                restored_upper_bound,
+                restored_encoded.len(),
+                MAX_STATE_FILE_BYTES,
+                replay.receipt.wrote_new_generation
+            );
+            assert_eq!(restored_upper_bound, MAX_STATE_FILE_BYTES);
+            assert!(
+                u64::try_from(restored_encoded.len()).expect("retry length fits u64")
+                    <= MAX_STATE_FILE_BYTES
+            );
+        }
     }
 
     #[test]
@@ -7002,6 +7328,10 @@ mod tests {
         let PersistenceFailure::Oversized { actual, maximum } = failure else {
             panic!("all-maxima composite must fail with physical Oversized evidence");
         };
+        eprintln!(
+            "window_state_persist all-maxima: admitted_upper_bound={} physical_encoded_bytes={} limit={}",
+            projected_upper_bound, actual, maximum
+        );
         assert_eq!(maximum, MAX_STATE_FILE_BYTES);
         assert!(actual > MAX_STATE_FILE_BYTES);
         assert!(actual <= projected_upper_bound);
