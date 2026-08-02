@@ -2757,7 +2757,7 @@ impl TmuxCmdQueue {
             .as_ref()
             .is_some_and(|lease| !self.conditional_commit_is_current(lease));
         if stale {
-            self.release_deferred_accounting(&deferred.command);
+            self.release_deferred_accounting(deferred.command.as_ref());
             return Some(Err(deferred.command));
         }
 
