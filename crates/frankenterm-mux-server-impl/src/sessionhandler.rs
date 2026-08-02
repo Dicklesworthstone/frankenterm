@@ -35,17 +35,27 @@ use wezterm_term::terminal::Alert;
 
 #[derive(Clone)]
 pub struct PduSender {
-    func: Arc<dyn Fn(DecodedPdu) -> anyhow::Result<()> + Send + Sync>,
+    func: Arc<dyn Fn(DecodedPdu, PduDeliveryClass) -> anyhow::Result<()> + Send + Sync>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PduDeliveryClass {
+    Control,
+    Bulk,
 }
 
 impl PduSender {
-    pub fn send(&self, pdu: DecodedPdu) -> anyhow::Result<()> {
-        (self.func)(pdu)
+    pub fn send_control(&self, pdu: DecodedPdu) -> anyhow::Result<()> {
+        (self.func)(pdu, PduDeliveryClass::Control)
+    }
+
+    pub fn send_bulk(&self, pdu: DecodedPdu) -> anyhow::Result<()> {
+        (self.func)(pdu, PduDeliveryClass::Bulk)
     }
 
     pub fn new<T>(f: T) -> Self
     where
-        T: Fn(DecodedPdu) -> anyhow::Result<()> + Send + Sync + 'static,
+        T: Fn(DecodedPdu, PduDeliveryClass) -> anyhow::Result<()> + Send + Sync + 'static,
     {
         Self { func: Arc::new(f) }
     }
@@ -1202,7 +1212,7 @@ fn maybe_push_pane_changes(
         per_pane.compute_changes(pane, None)
     };
     if let Some(resp) = render_changes {
-        sender.send(DecodedPdu {
+        sender.send_bulk(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
         })?;
@@ -1233,7 +1243,7 @@ fn maybe_push_pane_changes(
     for alert in notifications {
         match alert {
             Alert::PaletteChanged => {
-                sender.send(DecodedPdu {
+                sender.send_bulk(DecodedPdu {
                     pdu: Pdu::SetPalette(SetPalette {
                         pane_id: pane.pane_id(),
                         palette: pane.palette(),
@@ -1242,7 +1252,7 @@ fn maybe_push_pane_changes(
                 })?;
             }
             alert => {
-                sender.send(DecodedPdu {
+                sender.send_bulk(DecodedPdu {
                     pdu: Pdu::NotifyAlert(NotifyAlert {
                         pane_id: pane.pane_id(),
                         alert,
@@ -1633,7 +1643,8 @@ impl SessionHandler {
                 }),
             };
             log::trace!("{} processing time {:?}", serial, start.elapsed());
-            let _ = response_authority.try_run(|| sender.send(DecodedPdu { pdu, serial }));
+            let _ = response_authority
+                .try_run(|| sender.send_control(DecodedPdu { pdu, serial }));
         };
 
         fn catch<F, SND>(f: F, send_response: SND)
@@ -2155,7 +2166,7 @@ impl SessionHandler {
                                     per_pane.compute_changes(pane, Some(input_serial))
                                 };
                                 if let Some(resp) = render_changes {
-                                    sender.send(DecodedPdu {
+                                    sender.send_control(DecodedPdu {
                                         pdu: Pdu::GetPaneRenderChangesResponse(resp),
                                         serial: 0,
                                     })?;
@@ -3314,7 +3325,7 @@ mod tests {
     fn capturing_sender() -> (PduSender, Arc<Mutex<Vec<DecodedPdu>>>) {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
-        let sender = PduSender::new(move |pdu| {
+        let sender = PduSender::new(move |pdu, _class| {
             captured_clone.lock().unwrap().push(pdu);
             Ok(())
         });
@@ -4473,12 +4484,36 @@ mod tests {
 
     #[test]
     fn pdu_sender_propagates_errors() {
-        let sender = PduSender::new(|_| anyhow::bail!("send failed"));
-        let result = sender.send(DecodedPdu {
+        let sender = PduSender::new(|_, _class| anyhow::bail!("send failed"));
+        let result = sender.send_control(DecodedPdu {
             serial: 0,
             pdu: Pdu::Pong(Pong {}),
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn ordinary_request_response_uses_control_delivery() {
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let sender = PduSender::new({
+            let deliveries = Arc::clone(&deliveries);
+            move |pdu, class| {
+                deliveries.lock().unwrap().push((pdu, class));
+                Ok(())
+            }
+        });
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 77,
+            pdu: Pdu::Ping(Ping {}),
+        });
+
+        let deliveries = deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0.serial, 77);
+        assert_eq!(deliveries[0].0.pdu, Pdu::Pong(Pong {}));
+        assert_eq!(deliveries[0].1, PduDeliveryClass::Control);
     }
 
     #[test]
@@ -6493,7 +6528,7 @@ mod tests {
                         reason: format!("{err:#}"),
                     }),
                 };
-                sender.send(DecodedPdu { pdu, serial }).ok();
+                sender.send_control(DecodedPdu { pdu, serial }).ok();
             }
         };
 
@@ -6524,7 +6559,7 @@ mod tests {
                         reason: format!("{err:#}"),
                     }),
                 };
-                sender.send(DecodedPdu { pdu, serial }).ok();
+                sender.send_control(DecodedPdu { pdu, serial }).ok();
             }
         };
 
@@ -6568,17 +6603,17 @@ mod tests {
         let pane: Arc<dyn Pane> = Arc::new(FakePane::new(None));
         let (_mux, registration) = register_test_pane(&pane);
         let per_pane = Arc::new(Mutex::new(PerPane::default()));
-        let send_count = Arc::new(AtomicUsize::new(0));
+        let delivery_classes = Arc::new(Mutex::new(Vec::new()));
 
         let sender = PduSender::new({
             let per_pane = Arc::clone(&per_pane);
-            let send_count = Arc::clone(&send_count);
-            move |_| {
+            let delivery_classes = Arc::clone(&delivery_classes);
+            move |_, class| {
                 assert!(
                     per_pane.try_lock().is_ok(),
                     "PduSender callback must not run while per-pane state is locked"
                 );
-                send_count.fetch_add(1, Ordering::Relaxed);
+                delivery_classes.lock().unwrap().push(class);
                 Ok(())
             }
         });
@@ -6588,9 +6623,16 @@ mod tests {
             .expect("test pane registration remains current")
             .expect("pane changes should send");
 
+        let delivery_classes = delivery_classes.lock().unwrap();
         assert!(
-            send_count.load(Ordering::Relaxed) >= 2,
+            delivery_classes.len() >= 2,
             "initial render and palette PDUs should both be sent"
+        );
+        assert!(
+            delivery_classes
+                .iter()
+                .all(|class| *class == PduDeliveryClass::Bulk),
+            "unsolicited render, palette, and alert pushes must use bulk admission"
         );
     }
 

@@ -1,6 +1,8 @@
 #![allow(clippy::future_not_send)]
 #![allow(clippy::type_repetition_in_bounds)]
-use crate::sessionhandler::{PduSender, SessionHandler, SessionOwner};
+use crate::sessionhandler::{
+    PduDeliveryClass, PduSender, SessionAuthority, SessionHandler, SessionOwner,
+};
 use anyhow::Context;
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -29,7 +31,7 @@ use std::io::{self, ErrorKind};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -253,7 +255,7 @@ impl Drop for OutboundReservation {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DispatchTerminal {
     tripped: Arc<AtomicBool>,
     admission: Arc<ParkingMutex<()>>,
@@ -324,25 +326,38 @@ fn reserve_outbound(
     let Some(admission) = terminal.admit() else {
         anyhow::bail!("mux dispatch connection is already terminal");
     };
-    let reservation = match budget.try_reserve(class, topology_bytes) {
-        Ok(reservation) => reservation,
+    match reserve_outbound_admitted(budget, class, topology_bytes) {
+        Ok(reservation) => Ok(reservation),
         Err(limit) => {
             admission.trip(OUTBOUND_BUDGET_OVERFLOW);
             drop(admission);
-            metrics::counter!(
-                "mux.dispatch.outbound_budget.rejected",
-                "class" => class.label(),
-                "limit" => limit.label(),
-            )
-            .increment(1);
-            anyhow::bail!(
-                "mux outbound {class:?} reservation exceeded the {} bound",
-                limit.label()
-            );
+            Err(outbound_budget_rejection(class, limit))
         }
-    };
-    drop(admission);
-    Ok(reservation)
+    }
+}
+
+fn reserve_outbound_admitted(
+    budget: &Arc<OutboundBudget>,
+    class: OutboundClass,
+    topology_bytes: usize,
+) -> Result<OutboundReservation, OutboundBudgetLimit> {
+    budget.try_reserve(class, topology_bytes)
+}
+
+fn outbound_budget_rejection(
+    class: OutboundClass,
+    limit: OutboundBudgetLimit,
+) -> anyhow::Error {
+    metrics::counter!(
+        "mux.dispatch.outbound_budget.rejected",
+        "class" => class.label(),
+        "limit" => limit.label(),
+    )
+    .increment(1);
+    anyhow::anyhow!(
+        "mux outbound {class:?} reservation exceeded the {} bound",
+        limit.label()
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -877,13 +892,18 @@ impl Drop for MuxSubscriptionGuard {
     }
 }
 
+#[cfg(test)]
 fn pdu_item(
     pdu: Pdu,
     serial: u64,
     reservation: OutboundReservation,
 ) -> Item {
+    decoded_pdu_item(Box::new(DecodedPdu { pdu, serial }), reservation)
+}
+
+fn decoded_pdu_item(decoded: Box<DecodedPdu>, reservation: OutboundReservation) -> Item {
     Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu {
-        decoded: Box::new(DecodedPdu { pdu, serial }),
+        decoded,
         reservation,
     }))
 }
@@ -920,6 +940,11 @@ fn test_notification_item(notification: MuxNotification) -> Item {
 }
 
 #[cfg(test)]
+fn test_terminal() -> DispatchTerminal {
+    DispatchTerminal::channel().0
+}
+
+#[cfg(test)]
 fn queue_pdu(item_tx: &Sender<Item>, pdu: Pdu, serial: u64) -> anyhow::Result<()> {
     let budget = Arc::new(OutboundBudget::default());
     let reservation = budget
@@ -940,6 +965,7 @@ fn queue_response_pdu(
     budget: &Arc<OutboundBudget>,
     pdu: Pdu,
     serial: u64,
+    delivery_class: PduDeliveryClass,
 ) -> anyhow::Result<()> {
     // Avoid even the outbound Box allocation on an already-dead connection;
     // `admit` below remains the authoritative race-closing check.
@@ -948,27 +974,44 @@ fn queue_response_pdu(
     }
     // Box the response before entering the connection's short admission
     // section. Large coherent snapshots must not extend this critical section
-    // with allocator work.
-    let reservation = reserve_outbound(terminal, budget, OutboundClass::Control, 0)?;
-    let item = pdu_item(pdu, serial, reservation);
+    // with allocator work. Admission, budget reservation, and FIFO publication
+    // form one linearization section so concurrent producers cannot consume
+    // headroom in one order and publish in another.
+    let class = match delivery_class {
+        PduDeliveryClass::Control => OutboundClass::Control,
+        PduDeliveryClass::Bulk => OutboundClass::Bulk,
+    };
+    let decoded = Box::new(DecodedPdu { pdu, serial });
     let Some(admission) = terminal.admit() else {
         anyhow::bail!("mux dispatch connection is already terminal");
     };
+    let reservation = match reserve_outbound_admitted(budget, class, 0) {
+        Ok(reservation) => reservation,
+        Err(limit) => {
+            admission.trip(OUTBOUND_BUDGET_OVERFLOW);
+            drop(admission);
+            return Err(outbound_budget_rejection(class, limit));
+        }
+    };
+    let item = decoded_pdu_item(decoded, reservation);
     match item_tx.try_send(item) {
         Ok(()) => Ok(()),
-        Err(error) => {
+        Err(TrySendError::Full(item)) => {
             admission.trip(RESPONSE_QUEUE_FAILURE);
             drop(admission);
+            drop(item);
             metrics::counter!("mux.dispatch.response_enqueue_failure").increment(1);
-            match error {
-                TrySendError::Full(_item) => Err(anyhow::anyhow!(
-                    "mux dispatch item queue is full (capacity \
-                     {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
-                )),
-                TrySendError::Closed(_item) => {
-                    Err(anyhow::anyhow!("mux dispatch item queue is closed"))
-                }
-            }
+            Err(anyhow::anyhow!(
+                "mux dispatch item queue is full (capacity \
+                 {DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY}); applying client backpressure"
+            ))
+        }
+        Err(TrySendError::Closed(item)) => {
+            admission.trip(RESPONSE_QUEUE_FAILURE);
+            drop(admission);
+            drop(item);
+            metrics::counter!("mux.dispatch.response_enqueue_failure").increment(1);
+            Err(anyhow::anyhow!("mux dispatch item queue is closed"))
         }
     }
 }
@@ -1054,10 +1097,48 @@ fn queue_notification(
     budget: &Arc<OutboundBudget>,
     notification: MuxNotification,
 ) -> bool {
-    let Ok(reservation) = reserve_outbound(terminal, budget, OutboundClass::Bulk, 0) else {
+    let Some(admission) = terminal.admit() else {
         return false;
     };
-    queue_reserved_notification(item_tx, terminal, notification, reservation)
+    let reservation = match reserve_outbound_admitted(budget, OutboundClass::Bulk, 0) {
+        Ok(reservation) => reservation,
+        Err(limit) => {
+            admission.trip(OUTBOUND_BUDGET_OVERFLOW);
+            drop(admission);
+            let _ = outbound_budget_rejection(OutboundClass::Bulk, limit);
+            return false;
+        }
+    };
+    let item = Item::Notif(ReservedNotification {
+        notification,
+        reservation,
+    });
+    match item_tx.try_send(item) {
+        Ok(()) => true,
+        Err(TrySendError::Full(item)) => {
+            admission.trip(NOTIFICATION_QUEUE_OVERFLOW);
+            drop(admission);
+            drop(item);
+            let dropped = DROPPED_NOTIFICATION_COUNT
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            metrics::counter!("mux.dispatch.notification_queue.full").increment(1);
+            if dropped.is_power_of_two() {
+                log::warn!(
+                    "mux dispatch notification queue is full (bulk capacity \
+                     {DISPATCH_ITEM_QUEUE_CAPACITY}); terminating the affected connection after \
+                     {dropped} overflow(s) since process start"
+                );
+            }
+            false
+        }
+        Err(TrySendError::Closed(item)) => {
+            admission.trip(NOTIFICATION_QUEUE_CLOSED);
+            drop(admission);
+            drop(item);
+            false
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1344,11 +1425,35 @@ impl TopologyStreamCoordinator {
         Ok(())
     }
 
-    fn queue_response(&self, decoded: DecodedPdu) -> anyhow::Result<()> {
-        self.with_live_result(|| self.queue_response_admitted(decoded))
+    fn queue_response(
+        &self,
+        decoded: DecodedPdu,
+        delivery_class: PduDeliveryClass,
+    ) -> anyhow::Result<()> {
+        self.with_live_result(|| self.queue_response_admitted(decoded, delivery_class))
     }
 
-    fn queue_response_admitted(&self, decoded: DecodedPdu) -> anyhow::Result<()> {
+    fn queue_response_admitted(
+        &self,
+        decoded: DecodedPdu,
+        delivery_class: PduDeliveryClass,
+    ) -> anyhow::Result<()> {
+        if delivery_class == PduDeliveryClass::Bulk {
+            let DecodedPdu { pdu, serial } = decoded;
+            if serial != 0 || matches!(&pdu, Pdu::ListPanesCoherentResponse(_)) {
+                self.terminal.trip(TOPOLOGY_PROTOCOL_FAILURE);
+                anyhow::bail!("non-unilateral mux response was classified as bulk");
+            }
+            return queue_response_pdu(
+                &self.item_tx,
+                &self.terminal,
+                &self.outbound_budget,
+                pdu,
+                serial,
+                delivery_class,
+            );
+        }
+
         let DecodedPdu { pdu, serial } = decoded;
         let mut state = self.state.lock();
         match pdu {
@@ -1369,6 +1474,7 @@ impl TopologyStreamCoordinator {
                                 &self.outbound_budget,
                                 other,
                                 serial,
+                                delivery_class,
                             )?;
                             state.phase = self.restore_prior(in_flight)?;
                         }
@@ -1380,6 +1486,7 @@ impl TopologyStreamCoordinator {
                                 &self.outbound_budget,
                                 other,
                                 serial,
+                                delivery_class,
                             )?;
                         }
                     }
@@ -1415,6 +1522,7 @@ impl TopologyStreamCoordinator {
                     &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
+                    PduDeliveryClass::Control,
                 );
             }
             state.phase = TopologyStreamPhase::Exhausted;
@@ -1482,6 +1590,7 @@ impl TopologyStreamCoordinator {
                     &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
+                    PduDeliveryClass::Control,
                 )?;
 
                 let mut established = EstablishedTopologyStream {
@@ -1515,6 +1624,7 @@ impl TopologyStreamCoordinator {
                     &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
+                    PduDeliveryClass::Control,
                 )?;
                 state.phase = self.restore_prior(in_flight)?;
             }
@@ -1525,6 +1635,7 @@ impl TopologyStreamCoordinator {
                     &self.outbound_budget,
                     Pdu::ListPanesCoherentResponse(response),
                     serial,
+                    PduDeliveryClass::Control,
                 )?;
                 state.phase = TopologyStreamPhase::Exhausted;
             }
@@ -2209,7 +2320,7 @@ where
 #[derive(Debug)]
 struct PendingOutboundBatch {
     bytes: Vec<u8>,
-    reservations: Vec<OutboundReservation>,
+    _reservations: Vec<OutboundReservation>,
     offset: usize,
     transient_retries: usize,
     phase: PendingOutboundPhase,
@@ -2279,34 +2390,39 @@ fn encode_write_payload(
 ) -> anyhow::Result<EncodedOutboundFrame> {
     match payload {
         WritePayload::Encoded(frame) => Ok(frame),
-        WritePayload::Typed(ReservedDecodedPdu {
-            decoded,
-            reservation,
-        }) => {
-            let bytes = decoded
+        WritePayload::Typed(mut typed) => {
+            let bytes = typed
+                .decoded
                 .pdu
-                .encode_frame_with_mode(decoded.serial, compression_mode)
+                .encode_frame_with_mode(typed.decoded.serial, compression_mode)
                 .context("encoding PDU frame")?;
-            let mut reservation = reservation;
             let encoded_capacity = bytes.capacity();
-            let grows_topology_charge =
-                reservation.is_topology && encoded_capacity > reservation.topology_bytes;
-            if grows_topology_charge {
+            if typed.reservation.is_topology {
+                let transition_bytes = typed
+                    .reservation
+                    .topology_bytes
+                    .checked_add(encoded_capacity)
+                    .context("counting typed-to-encoded topology allocation transition")?;
                 reweight_topology_batch(
                     terminal,
-                    std::slice::from_mut(&mut reservation),
-                    encoded_capacity,
+                    std::slice::from_mut(&mut typed.reservation),
+                    transition_bytes,
                 )?;
             }
+            let ReservedDecodedPdu {
+                decoded,
+                reservation,
+            } = typed;
             drop(decoded);
-            if !grows_topology_charge {
+            let mut frame = EncodedOutboundFrame { bytes, reservation };
+            if frame.reservation.is_topology {
                 reweight_topology_batch(
                     terminal,
-                    std::slice::from_mut(&mut reservation),
+                    std::slice::from_mut(&mut frame.reservation),
                     encoded_capacity,
                 )?;
             }
-            Ok(EncodedOutboundFrame { bytes, reservation })
+            Ok(frame)
         }
     }
 }
@@ -2319,11 +2435,11 @@ fn prepare_pending_outbound_batch(
     terminal: &DispatchTerminal,
 ) -> anyhow::Result<PendingOutboundBatch> {
     debug_assert!(deferred_item.is_none());
-    let EncodedOutboundFrame {
-        mut bytes,
-        reservation,
-    } = encode_write_payload(first, compression_mode, terminal)?;
-    let mut reservations = vec![reservation];
+    let first = encode_write_payload(first, compression_mode, terminal)?;
+    // Declare reservations before bytes so all error paths drop the retained
+    // allocation before releasing its accounting authority.
+    let mut reservations = vec![first.reservation];
+    let mut bytes = first.bytes;
     let mut frames = 1_usize;
 
     while frames < OUTBOUND_WRITE_QUANTUM_FRAMES
@@ -2347,9 +2463,35 @@ fn prepare_pending_outbound_batch(
             break;
         }
 
-        bytes.extend_from_slice(&frame.bytes);
-        reservations.push(frame.reservation);
-        reweight_topology_batch(terminal, &mut reservations, bytes.capacity())?;
+        let batch_is_topology = reservations
+            .first()
+            .is_some_and(|reservation| reservation.is_topology);
+        if frame.reservation.is_topology != batch_is_topology {
+            // A shared Vec allocation cannot be attributed exactly across the
+            // topology byte ceiling and uncharged control/bulk traffic. Keep
+            // each topology/non-topology transition as an encoded FIFO boundary
+            // so control capacity never consumes the topology byte budget.
+            *deferred_item = Some(Item::WritePdu(WritePayload::Encoded(frame)));
+            break;
+        }
+
+        let EncodedOutboundFrame {
+            bytes: frame_bytes,
+            reservation,
+        } = frame;
+        bytes.extend_from_slice(&frame_bytes);
+        reservations.push(reservation);
+        if batch_is_topology {
+            let transition_bytes = bytes
+                .capacity()
+                .checked_add(frame_bytes.capacity())
+                .context("counting topology batch allocation transition")?;
+            reweight_topology_batch(terminal, &mut reservations, transition_bytes)?;
+            drop(frame_bytes);
+            reweight_topology_batch(terminal, &mut reservations, bytes.capacity())?;
+        } else {
+            drop(frame_bytes);
+        }
         frames = frames.saturating_add(1);
     }
 
@@ -2362,7 +2504,7 @@ fn prepare_pending_outbound_batch(
 
     Ok(PendingOutboundBatch {
         bytes,
-        reservations,
+        _reservations: reservations,
         offset: 0,
         transient_retries: 0,
         phase: PendingOutboundPhase::Writing,
@@ -2442,6 +2584,10 @@ where
     {
         // Alternate when both directions remain continuously ready.
         pending.prefer_read = false;
+        let Some(admission) = terminal.admit() else {
+            return Ok(OutboundService::Terminal);
+        };
+        drop(admission);
         return Ok(OutboundService::Readable);
     }
 
@@ -2508,6 +2654,10 @@ where
             .await
             .context("waiting to retry a transport-bound outbound operation")?;
         pending.prefer_read = false;
+        let Some(admission) = terminal.admit() else {
+            return Ok(OutboundService::Terminal);
+        };
+        drop(admission);
         return Ok(OutboundService::Progress);
     }
 
@@ -2517,6 +2667,10 @@ where
     let ready_side = wait_for_dispatch_readable_or_writable(stream, io_uring_runtime)
         .await
         .context("waiting after a pending mux stream write or flush")?;
+    let Some(admission) = terminal.admit() else {
+        return Ok(OutboundService::Terminal);
+    };
+    drop(admission);
     if ready_side == DispatchReadySide::Readable {
         // Keep write preference false so the next service turn attempts
         // outbound progress before accepting another continuously-ready read.
@@ -2567,15 +2721,13 @@ where
     let mut current = Some(test_write_payload(first));
     while let Some(payload) = current.take() {
         let (frame, _reservation) = match payload {
-            WritePayload::Typed(ReservedDecodedPdu {
-                decoded,
-                reservation,
-            }) => (
-                decoded
+            WritePayload::Typed(typed) => (
+                typed
+                    .decoded
                     .pdu
-                    .encode_frame_with_mode(decoded.serial, compression_mode)
+                    .encode_frame_with_mode(typed.decoded.serial, compression_mode)
                     .context("encoding PDU frame")?,
-                reservation,
+                typed.reservation,
             ),
             WritePayload::Encoded(EncodedOutboundFrame { bytes, reservation }) => {
                 (bytes, reservation)
@@ -3351,6 +3503,101 @@ fn dispatch_client_request(
     Ok(())
 }
 
+enum ClientDecodeOutcome {
+    Decoded(anyhow::Result<DecodedPdu>),
+    Terminal(&'static str),
+    TerminalChannelClosed,
+}
+
+async fn decode_client_pdu_or_terminal<T>(
+    stream: &mut T,
+    terminal_rx: &Receiver<&'static str>,
+) -> ClientDecodeOutcome
+where
+    T: DispatchStream,
+{
+    let terminal_event = terminal_rx.recv();
+    let decode = Pdu::decode_async(stream, None);
+    pin_mut!(terminal_event);
+    pin_mut!(decode);
+    match select(terminal_event, decode).await {
+        Either::Left((Ok(reason), _)) => ClientDecodeOutcome::Terminal(reason),
+        Either::Left((Err(_), _)) => ClientDecodeOutcome::TerminalChannelClosed,
+        Either::Right((result, _)) => ClientDecodeOutcome::Decoded(result),
+    }
+}
+
+fn admit_request_dispatch(terminal: &DispatchTerminal) -> bool {
+    let Some(admission) = terminal.admit() else {
+        return false;
+    };
+    drop(admission);
+    true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestDispatchOutcome {
+    Dispatched,
+    Terminal,
+}
+
+fn pdu_sender_for_topology(topology: &Arc<TopologyStreamCoordinator>) -> PduSender {
+    let topology = Arc::downgrade(topology);
+    PduSender::new(move |pdu, delivery_class| {
+        let topology = topology
+            .upgrade()
+            .context("mux dispatch connection is retired")?;
+        topology.queue_response(pdu, delivery_class)
+    })
+}
+
+struct TopologyNotificationRoute {
+    authority: SessionAuthority,
+    mux: Weak<Mux>,
+    topology: Weak<TopologyStreamCoordinator>,
+}
+
+impl TopologyNotificationRoute {
+    fn new(
+        authority: SessionAuthority,
+        mux: &Arc<Mux>,
+        topology: &Arc<TopologyStreamCoordinator>,
+    ) -> Self {
+        Self {
+            authority,
+            mux: Arc::downgrade(mux),
+            topology: Arc::downgrade(topology),
+        }
+    }
+
+    fn deliver(&self, envelope: MuxNotificationEnvelope) -> bool {
+        self.authority
+            .try_run(|| {
+                let Some(topology) = self.topology.upgrade() else {
+                    return false;
+                };
+                let Some(mux) = self.mux.upgrade() else {
+                    return false;
+                };
+                topology.on_notification(&mux, envelope)
+            })
+            .unwrap_or(false)
+    }
+}
+
+fn dispatch_client_request_if_admitted(
+    handler: &mut SessionHandler,
+    topology: &TopologyStreamCoordinator,
+    terminal: &DispatchTerminal,
+    decoded: DecodedPdu,
+) -> anyhow::Result<RequestDispatchOutcome> {
+    if !admit_request_dispatch(terminal) {
+        return Ok(RequestDispatchOutcome::Terminal);
+    }
+    dispatch_client_request(handler, topology, decoded)?;
+    Ok(RequestDispatchOutcome::Dispatched)
+}
+
 async fn process_async_with_mux<T>(
     mut stream: T,
     config: DispatchRuntimeConfig,
@@ -3396,10 +3643,7 @@ where
         terminal.clone(),
         topology_stream_id,
     ));
-    let pdu_sender = PduSender::new({
-        let topology = Arc::clone(&topology);
-        move |pdu| topology.queue_response(pdu)
-    });
+    let pdu_sender = pdu_sender_for_topology(&topology);
     let mut handler = SessionHandler::new_for_session_with_topology_stream(
         pdu_sender,
         owner,
@@ -3407,17 +3651,11 @@ where
     );
 
     {
-        let notification_authority = authority.clone();
-        let notification_mux = Arc::clone(&mux);
-        let notification_topology = Arc::clone(&topology);
+        let notification_route =
+            TopologyNotificationRoute::new(authority.clone(), &mux, &topology);
         let (sub_id, session_incarnation, baseline_revision) = mux
             .subscribe_with_topology_fence(move |envelope| {
-                notification_authority
-                    .try_run(|| {
-                        notification_topology
-                            .on_notification(&notification_mux, envelope)
-                    })
-                    .unwrap_or(false)
+                notification_route.deliver(envelope)
             })
             .context("allocate fenced mux dispatch subscription")?;
         let _subscription_guard = MuxSubscriptionGuard::new(Arc::clone(&mux), sub_id)
@@ -3490,9 +3728,33 @@ where
 
             match next_item {
                 Ok(Item::Readable) => {
-                    let decoded = match Pdu::decode_async(&mut stream, None).await {
+                    let decoded = match decode_client_pdu_or_terminal(
+                        &mut stream,
+                        &terminal_rx,
+                    )
+                    .await
+                    {
+                        ClientDecodeOutcome::Terminal(reason) => {
+                            return Err(anyhow::anyhow!("mux dispatch terminated: {reason}"));
+                        }
+                        ClientDecodeOutcome::TerminalChannelClosed => {
+                            return Err(anyhow::anyhow!(
+                                "mux dispatch terminal channel closed unexpectedly"
+                            ));
+                        }
+                        ClientDecodeOutcome::Decoded(result) => result,
+                    };
+                    let decoded = match decoded {
                         Ok(data) => data,
                         Err(err) => {
+                            if !admit_request_dispatch(&terminal) {
+                                let reason = terminal_rx.try_recv().ok().unwrap_or(
+                                    "mux dispatch connection entered terminal state",
+                                );
+                                return Err(anyhow::anyhow!(
+                                    "mux dispatch terminated: {reason}"
+                                ));
+                            }
                             if is_clean_disconnect(&err) {
                                 // Client disconnected: no need to make a noise.
                                 return Ok(());
@@ -3500,7 +3762,23 @@ where
                             return Err(err).context("reading Pdu from client");
                         }
                     };
-                    dispatch_client_request(&mut handler, &topology, decoded)?;
+                    // This short admission is the request-dispatch
+                    // linearization point. The wrapper releases it before the
+                    // handler because synchronous response callbacks
+                    // legitimately re-enter the same terminal admission gate.
+                    if dispatch_client_request_if_admitted(
+                        &mut handler,
+                        &topology,
+                        &terminal,
+                        decoded,
+                    )? == RequestDispatchOutcome::Terminal
+                    {
+                        let reason = terminal_rx
+                            .try_recv()
+                            .ok()
+                            .unwrap_or("mux dispatch connection entered terminal state");
+                        return Err(anyhow::anyhow!("mux dispatch terminated: {reason}"));
+                    }
                 }
                 Ok(Item::WritePdu(decoded)) => {
                     match prepare_pending_outbound_batch(
@@ -3891,7 +4169,7 @@ mod tests {
     fn capturing_pdu_sender() -> (PduSender, Arc<ParkingMutex<Vec<DecodedPdu>>>) {
         let captured = Arc::new(ParkingMutex::new(Vec::new()));
         let captured_for_sender = Arc::clone(&captured);
-        let sender = PduSender::new(move |pdu| {
+        let sender = PduSender::new(move |pdu, _class| {
             captured_for_sender.lock().push(pdu);
             Ok(())
         });
@@ -4153,6 +4431,509 @@ mod tests {
         assert_eq!(title.as_ptr(), title_allocation);
     }
 
+    #[test]
+    fn topology_budget_survives_fence_restore_at_operating_queue_depths() {
+        for depth in [2_usize, 20, 200, DISPATCH_ITEM_QUEUE_CAPACITY] {
+            let (coordinator, item_rx, terminal_rx, _session_incarnation, stream_id) =
+                bound_topology_coordinator();
+            let mux = Mux::new(None);
+            let serial = 10_000_u64
+                .checked_add(u64::try_from(depth).expect("test depth fits u64"))
+                .expect("test serial stays in range");
+            coordinator
+                .begin_fence(serial, &fenced_snapshot_request())
+                .expect("begin queue-depth topology fence");
+
+            for revision in 1..=depth {
+                assert!(coordinator.on_notification(
+                    &mux,
+                    topology_envelope(
+                        u64::try_from(revision).expect("test revision fits u64"),
+                        MuxNotification::PaneAdded(revision),
+                    ),
+                ));
+            }
+
+            let retained = coordinator.outbound_budget.snapshot();
+            assert_eq!(retained.total_slots, depth);
+            assert_eq!(retained.bulk_slots, depth);
+            assert_eq!(
+                retained.topology_bytes,
+                RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
+                    .checked_mul(depth)
+                    .expect("test retained-byte total fits usize")
+            );
+            assert!(retained.topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        serial,
+                        pdu: Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                            negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                            stream_id,
+                            outcome: ListPanesCoherentOutcome::Contended {
+                                attempts: 1,
+                                first_revision: TopologyRevision::INITIAL,
+                                last_revision: TopologyRevision::new(
+                                    u64::try_from(depth).expect("test depth fits u64"),
+                                ),
+                            },
+                        }),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("control response must use reserved headroom at every bulk depth");
+
+            let queued = coordinator.outbound_budget.snapshot();
+            assert_eq!(queued.total_slots, depth + 1);
+            assert_eq!(queued.bulk_slots, depth);
+            assert_eq!(queued.topology_bytes, retained.topology_bytes);
+
+            let response = take_written_pdu(&item_rx);
+            assert_eq!(response.serial, serial);
+            assert!(matches!(
+                response.pdu,
+                Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                    outcome: ListPanesCoherentOutcome::Contended { .. },
+                    ..
+                })
+            ));
+            for expected_pane_id in 1..=depth {
+                assert!(matches!(
+                    item_rx.try_recv().expect("restored topology notification"),
+                    Item::Notif(ReservedNotification {
+                        notification: MuxNotification::PaneAdded(pane_id),
+                        ..
+                    }) if pane_id == expected_pane_id
+                ));
+            }
+            assert!(item_rx.is_empty());
+            assert!(terminal_rx.is_empty());
+            let released = coordinator.outbound_budget.snapshot();
+            assert_eq!(released.topology_bytes, 0);
+            assert_eq!(released.total_slots, 0);
+            assert_eq!(released.bulk_slots, 0);
+            assert!(released.peak_topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+        }
+    }
+
+    #[test]
+    fn established_topology_budget_survives_partial_write_and_flush_at_queue_depths() {
+        for depth in [2_usize, 20, 200, DISPATCH_ITEM_QUEUE_CAPACITY] {
+            let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+                bound_topology_coordinator();
+            let mux = Mux::new(None);
+            let serial = 20_000_u64
+                .checked_add(u64::try_from(depth).expect("test depth fits u64"))
+                .expect("test serial stays in range");
+            coordinator
+                .begin_fence(serial, &fenced_snapshot_request())
+                .expect("begin established queue-depth fence");
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        serial,
+                        pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                            stream_id,
+                            session_incarnation,
+                            TopologyRevision::INITIAL,
+                        )),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("establish queue-depth topology stream");
+            let snapshot = take_written_pdu(&item_rx);
+            assert_eq!(snapshot.serial, serial);
+
+            for revision in 1..=depth {
+                assert!(coordinator.on_notification(
+                    &mux,
+                    topology_envelope(
+                        u64::try_from(revision).expect("test revision fits u64"),
+                        MuxNotification::PaneAdded(revision),
+                    ),
+                ));
+            }
+            let queued = coordinator.outbound_budget.snapshot();
+            assert_eq!(queued.total_slots, depth);
+            assert_eq!(queued.bulk_slots, depth);
+            assert_eq!(
+                queued.topology_bytes,
+                RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES
+                    .checked_mul(depth)
+                    .expect("test retained-byte total fits usize")
+            );
+
+            let wire = drain_queued_write_pdus(&item_rx, &coordinator.terminal);
+            let mut cursor = Cursor::new(wire.as_slice());
+            for expected_revision in 1..=depth {
+                let decoded = Pdu::decode(&mut cursor).expect("decode stamped topology frame");
+                assert_eq!(decoded.serial, 0);
+                let Pdu::TopologyEvent(event) = decoded.pdu else {
+                    panic!("established topology wire frame must be stamped");
+                };
+                assert_eq!(
+                    event.revision,
+                    TopologyRevision::new(
+                        u64::try_from(expected_revision).expect("test revision fits u64")
+                    )
+                );
+            }
+            assert_eq!(cursor.position() as usize, wire.len());
+            assert!(item_rx.is_empty());
+            assert!(terminal_rx.is_empty());
+            let released = coordinator.outbound_budget.snapshot();
+            assert_eq!(released.topology_bytes, 0);
+            assert_eq!(released.total_slots, 0);
+            assert_eq!(released.bulk_slots, 0);
+            assert!(released.peak_topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+        }
+    }
+
+    #[test]
+    fn bulk_saturation_preserves_all_control_reserve_slots_and_wire_order() {
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        for _ in 0..DISPATCH_ITEM_QUEUE_CAPACITY {
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        pdu: Pdu::Pong(Pong {}),
+                        serial: 0,
+                    },
+                    PduDeliveryClass::Bulk,
+                )
+                .expect("bulk response should fill only the bulk partition");
+        }
+        let saturated = coordinator.outbound_budget.snapshot();
+        assert_eq!(saturated.bulk_slots, DISPATCH_ITEM_QUEUE_CAPACITY);
+        assert_eq!(saturated.total_slots, DISPATCH_ITEM_QUEUE_CAPACITY);
+
+        for serial in 1..=DISPATCH_ITEM_QUEUE_CONTROL_RESERVE {
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        pdu: Pdu::Pong(Pong {}),
+                        serial: u64::try_from(serial).expect("control serial fits u64"),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("every reserved control slot must remain available");
+        }
+        assert_eq!(
+            coordinator.outbound_budget.snapshot().total_slots,
+            DISPATCH_ITEM_QUEUE_TOTAL_CAPACITY
+        );
+
+        let wire = drain_queued_write_pdus(&item_rx, &coordinator.terminal);
+        let mut cursor = Cursor::new(wire.as_slice());
+        for _ in 0..DISPATCH_ITEM_QUEUE_CAPACITY {
+            let decoded = Pdu::decode(&mut cursor).expect("decode bulk wire predecessor");
+            assert_eq!(decoded.serial, 0);
+            assert_eq!(decoded.pdu, Pdu::Pong(Pong {}));
+        }
+        for expected_serial in 1..=DISPATCH_ITEM_QUEUE_CONTROL_RESERVE {
+            let decoded = Pdu::decode(&mut cursor).expect("decode reserved control response");
+            assert_eq!(
+                decoded.serial,
+                u64::try_from(expected_serial).expect("control serial fits u64")
+            );
+            assert_eq!(decoded.pdu, Pdu::Pong(Pong {}));
+        }
+        assert_eq!(cursor.position() as usize, wire.len());
+        assert!(item_rx.is_empty());
+        assert!(terminal_rx.is_empty());
+        let released = coordinator.outbound_budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn sixty_fifth_control_slot_is_the_first_terminal_overflow_and_releases_on_teardown() {
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        for _ in 0..DISPATCH_ITEM_QUEUE_CAPACITY {
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        pdu: Pdu::Pong(Pong {}),
+                        serial: 0,
+                    },
+                    PduDeliveryClass::Bulk,
+                )
+                .expect("fill bulk partition");
+        }
+        for serial in 1..=DISPATCH_ITEM_QUEUE_CONTROL_RESERVE {
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        pdu: Pdu::Pong(Pong {}),
+                        serial: u64::try_from(serial).expect("control serial fits u64"),
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .expect("fill reserved control partition");
+        }
+
+        let queued_before_overflow = item_rx.len();
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    pdu: Pdu::Pong(Pong {}),
+                    serial: 65,
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect_err("the first item beyond total capacity must fail closed");
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("first total-slot overflow must publish its reason"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+        assert!(terminal_rx.is_empty());
+        assert_eq!(item_rx.len(), queued_before_overflow);
+        assert!(
+            coordinator
+                .queue_response(
+                    DecodedPdu {
+                        pdu: Pdu::Pong(Pong {}),
+                        serial: 66,
+                    },
+                    PduDeliveryClass::Control,
+                )
+                .is_err(),
+            "no response may publish after the first terminal overflow"
+        );
+        assert_eq!(item_rx.len(), queued_before_overflow);
+
+        while item_rx.try_recv().is_ok() {}
+        let released = coordinator.outbound_budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn queue_teardown_and_reconnect_release_generation_local_budget() {
+        let (first, first_rx, first_terminal_rx, _, _) = bound_topology_coordinator();
+        let first_budget = Arc::clone(&first.outbound_budget);
+        let mux = Mux::new(None);
+        for revision in 1..=20 {
+            assert!(first.on_notification(
+                &mux,
+                topology_envelope(
+                    revision,
+                    MuxNotification::PaneAdded(
+                        usize::try_from(revision).expect("test revision fits usize"),
+                    ),
+                ),
+            ));
+        }
+        let first_queued = first.outbound_budget.snapshot();
+        assert_eq!(first_queued.total_slots, 20);
+        assert_eq!(first_queued.bulk_slots, 20);
+        assert!(first_queued.topology_bytes > 0);
+
+        drop(first_rx);
+        assert_eq!(
+            first.outbound_budget.snapshot(),
+            first_queued,
+            "closing the receiver must retain already-queued owners until channel teardown"
+        );
+        assert!(!first.on_notification(
+            &mux,
+            topology_envelope(21, MuxNotification::PaneAdded(21)),
+        ));
+        assert_eq!(
+            first_terminal_rx
+                .try_recv()
+                .expect("closed queue must terminate its connection generation"),
+            NOTIFICATION_QUEUE_CLOSED
+        );
+        let after_rejected = first.outbound_budget.snapshot();
+        assert_eq!(
+            after_rejected.topology_bytes, first_queued.topology_bytes,
+            "the rejected closed-channel item must release only its own retained bytes"
+        );
+        assert_eq!(
+            after_rejected.total_slots, first_queued.total_slots,
+            "the rejected closed-channel item must release only its own total slot"
+        );
+        assert_eq!(
+            after_rejected.bulk_slots, first_queued.bulk_slots,
+            "the rejected closed-channel topology item must not perturb bulk slots"
+        );
+        assert_eq!(
+            after_rejected.peak_topology_bytes,
+            first_queued
+                .peak_topology_bytes
+                .checked_add(RETAINED_TOPOLOGY_EVENT_ACCOUNTED_FIXED_BYTES)
+                .expect("test topology high-water fits usize"),
+            "the high-water mark must retain the transient rejected reservation"
+        );
+        drop(first);
+        let first_released = first_budget.snapshot();
+        assert_eq!(first_released.topology_bytes, 0);
+        assert_eq!(first_released.total_slots, 0);
+        assert_eq!(first_released.bulk_slots, 0);
+
+        let (second, second_rx, second_terminal_rx, _, _) = bound_topology_coordinator();
+        let second_budget = Arc::clone(&second.outbound_budget);
+        assert_eq!(second.outbound_budget.snapshot(), OutboundBudgetState::default());
+        assert!(second.on_notification(
+            &mux,
+            topology_envelope(1, MuxNotification::PaneAdded(1)),
+        ));
+        let second_queued = second.outbound_budget.snapshot();
+        assert_eq!(second_queued.total_slots, 1);
+        assert_eq!(second_queued.bulk_slots, 1);
+        assert!(second_queued.topology_bytes > 0);
+        drop(second_rx);
+        drop(second);
+        let second_released = second_budget.snapshot();
+        assert_eq!(second_released.topology_bytes, 0);
+        assert_eq!(second_released.total_slots, 0);
+        assert_eq!(second_released.bulk_slots, 0);
+        assert!(second_terminal_rx.is_empty());
+    }
+
+    #[test]
+    fn lingering_producer_callbacks_do_not_retain_dispatch_connection_or_budget() {
+        let (coordinator, item_rx, _terminal_rx, _, _) = bound_topology_coordinator();
+        let coordinator = Arc::new(coordinator);
+        let budget = Arc::clone(&coordinator.outbound_budget);
+        let weak_coordinator = Arc::downgrade(&coordinator);
+        let sender = pdu_sender_for_topology(&coordinator);
+
+        let mux = Arc::new(Mux::new(None));
+        let weak_mux = Arc::downgrade(&mux);
+        let owner = SessionOwner::new(Arc::clone(&mux));
+        let notification_route =
+            TopologyNotificationRoute::new(owner.authority(), &mux, &coordinator);
+
+        sender
+            .send_bulk(DecodedPdu {
+                pdu: Pdu::Pong(Pong {}),
+                serial: 0,
+            })
+            .expect("queue one response through the production weak sender");
+        let queued = budget.snapshot();
+        assert_eq!(queued.total_slots, 1);
+        assert_eq!(queued.bulk_slots, 1);
+
+        drop(item_rx);
+        assert_eq!(
+            budget.snapshot(),
+            queued,
+            "a live coordinator sender must retain its closed channel queue"
+        );
+        drop(coordinator);
+        assert!(weak_coordinator.upgrade().is_none());
+        assert_eq!(budget.snapshot(), OutboundBudgetState::default());
+
+        drop(owner);
+        drop(mux);
+        assert!(weak_mux.upgrade().is_none());
+        let error = sender
+            .send_control(DecodedPdu {
+                pdu: Pdu::Pong(Pong {}),
+                serial: 1,
+            })
+            .expect_err("a lingering response callback must fail after connection teardown");
+        assert!(format!("{error:#}").contains("mux dispatch connection is retired"));
+        assert!(!notification_route.deliver(topology_envelope(
+            1,
+            MuxNotification::PaneAdded(1),
+        )));
+    }
+
+    #[test]
+    fn stamped_topology_charge_reweights_to_pending_allocation_and_releases() {
+        let (coordinator, item_rx, _terminal_rx, _, _) = bound_topology_coordinator();
+        let mut title = String::with_capacity(16 * 1024);
+        title.push_str("short-title");
+        let retained = retain_topology_for_test(
+            &coordinator,
+            MuxNotification::WindowTitleChanged {
+                window_id: 31,
+                title,
+            },
+            TopologyRevision::new(7),
+        );
+        coordinator
+            .queue_stamped_event(retained)
+            .expect("queue stamped topology event");
+        let payload = match item_rx.try_recv().expect("queued stamped topology event") {
+            Item::WritePdu(payload) => payload,
+            other => panic!("expected queued topology PDU, got {other:?}"),
+        };
+        let mut deferred_item = None;
+        let pending = prepare_pending_outbound_batch(
+            payload,
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &coordinator.terminal,
+        )
+        .expect("encode retained topology event once");
+        assert!(deferred_item.is_none());
+        let encoded = coordinator.outbound_budget.snapshot();
+        assert_eq!(encoded.total_slots, 1);
+        assert_eq!(encoded.bulk_slots, 1);
+        assert_eq!(encoded.topology_bytes, pending.bytes.capacity());
+        assert!(encoded.topology_bytes <= TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+        drop(pending);
+        let released = coordinator.outbound_budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn typed_to_encoded_reweight_overflow_releases_failed_frame_before_authority() {
+        let budget = Arc::new(OutboundBudget::default());
+        let other = budget
+            .try_reserve(
+                OutboundClass::Topology,
+                TOPOLOGY_FENCE_MAX_RETAINED_BYTES - 2,
+            )
+            .expect("reserve near-ceiling unrelated topology bytes");
+        let reservation = budget
+            .try_reserve(OutboundClass::Topology, 1)
+            .expect("reserve one typed topology byte");
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+
+        let error = encode_write_payload(
+            WritePayload::Typed(ReservedDecodedPdu {
+                decoded: queued_ping(1),
+                reservation,
+            }),
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect_err("typed and encoded overlap must not exceed the topology ceiling");
+        assert!(format!("{error:#}").contains("topology_bytes"));
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("reweight overflow must terminate the connection"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+        let failed_released = budget.snapshot();
+        assert_eq!(
+            failed_released.topology_bytes,
+            TOPOLOGY_FENCE_MAX_RETAINED_BYTES - 2
+        );
+        assert_eq!(failed_released.total_slots, 1);
+        assert_eq!(failed_released.bulk_slots, 1);
+        drop(other);
+        let released = budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+    }
+
     fn take_written_pdu(item_rx: &Receiver<Item>) -> DecodedPdu {
         match item_rx.try_recv().expect("queued dispatch item") {
             Item::WritePdu(WritePayload::Typed(ReservedDecodedPdu { decoded, .. })) => *decoded,
@@ -4161,6 +4942,80 @@ mod tests {
             }
             other => panic!("expected queued PDU, got {other:?}"),
         }
+    }
+
+    fn drain_queued_write_pdus(
+        item_rx: &Receiver<Item>,
+        terminal: &DispatchTerminal,
+    ) -> Vec<u8> {
+        let mut deferred_item = None;
+        let mut stream = ChunkedDispatchStream {
+            max_write_size: Some(257),
+            ..ChunkedDispatchStream::default()
+        };
+        loop {
+            let next = if let Some(item) = deferred_item.take() {
+                item
+            } else {
+                match item_rx.try_recv() {
+                    Ok(item) => item,
+                    Err(TryRecvError::Empty | TryRecvError::Closed) => break,
+                }
+            };
+            let Item::WritePdu(payload) = next else {
+                panic!("wire-drain helper only accepts write PDUs, got {next:?}");
+            };
+            let mut pending = prepare_pending_outbound_batch(
+                payload,
+                item_rx,
+                &mut deferred_item,
+                CompressionMode::Auto,
+                terminal,
+            )
+            .expect("queued test PDU should prepare for outbound service");
+            loop {
+                match promise::spawn::block_on(service_pending_outbound(
+                    &mut stream,
+                    &mut pending,
+                    None,
+                    terminal,
+                ))
+                .expect("queued test PDU should make outbound progress")
+                {
+                    OutboundService::Progress => {}
+                    OutboundService::Complete => break,
+                    OutboundService::Readable => {
+                        panic!("non-readable test stream published inbound readiness")
+                    }
+                    OutboundService::Terminal => {
+                        panic!("live test connection became terminal during wire drain")
+                    }
+                }
+            }
+        }
+        stream.bytes
+    }
+
+    fn test_topology_pending(
+        budget: &Arc<OutboundBudget>,
+        terminal: &DispatchTerminal,
+    ) -> PendingOutboundBatch {
+        let reservation = budget
+            .try_reserve(OutboundClass::Topology, 1024)
+            .expect("reserve test topology frame");
+        let (_item_tx, item_rx) = unbounded();
+        let mut deferred_item = None;
+        prepare_pending_outbound_batch(
+            WritePayload::Typed(ReservedDecodedPdu {
+                decoded: queued_ping(1),
+                reservation,
+            }),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            terminal,
+        )
+        .expect("prepare test topology frame")
     }
 
     #[test]
@@ -4612,6 +5467,89 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cancels_partial_client_decode_without_repolling_stream() {
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let mut stream = PendingWriteThenReadableDispatchStream::default();
+        let read_polls = Arc::clone(&stream.read_polls);
+        let mut decode = Box::pin(decode_client_pdu_or_terminal(
+            &mut stream,
+            &terminal_rx,
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(decode.as_mut().poll(&mut cx), Poll::Pending));
+        let polls_before_terminal = read_polls.load(Ordering::Relaxed);
+        assert!(polls_before_terminal > 0);
+
+        terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
+        let Poll::Ready(ClientDecodeOutcome::Terminal(reason)) =
+            decode.as_mut().poll(&mut cx)
+        else {
+            panic!("terminal event must cancel a partial client frame decode");
+        };
+        assert_eq!(reason, OUTBOUND_BUDGET_OVERFLOW);
+        assert_eq!(
+            read_polls.load(Ordering::Relaxed),
+            polls_before_terminal,
+            "a ready terminal event must win without polling the partial decode again"
+        );
+    }
+
+    #[test]
+    fn request_dispatch_admission_rejects_terminal_and_releases_before_response_reentry() {
+        let rejected_mux = Arc::new(Mux::new(None));
+        let (rejected_sender, rejected_responses) = capturing_pdu_sender();
+        let mut rejected_handler =
+            SessionHandler::new_for_mux(rejected_sender, Arc::clone(&rejected_mux));
+        let rejected_topology = idle_topology_coordinator();
+        rejected_topology.terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
+        let rejected = dispatch_client_request_if_admitted(
+            &mut rejected_handler,
+            &rejected_topology,
+            &rejected_topology.terminal,
+            DecodedPdu {
+                serial: 90,
+                pdu: Pdu::SetClientId(codec::SetClientId {
+                    client_id: mux::client::ClientId::new(),
+                    is_proxy: false,
+                }),
+            },
+        )
+        .expect("terminal dispatch admission should be an explicit outcome");
+        assert_eq!(rejected, RequestDispatchOutcome::Terminal);
+        assert!(rejected_mux.iter_clients().is_empty());
+        assert!(rejected_responses.lock().is_empty());
+
+        let (coordinator, item_rx, _terminal_rx, _, _) = bound_topology_coordinator();
+        let coordinator = Arc::new(coordinator);
+        let sender = PduSender::new({
+            let coordinator = Arc::clone(&coordinator);
+            move |pdu, delivery_class| coordinator.queue_response(pdu, delivery_class)
+        });
+        let mux = Arc::new(Mux::new(None));
+        let mut handler = SessionHandler::new_for_mux(sender, mux);
+
+        let dispatched = dispatch_client_request_if_admitted(
+            &mut handler,
+            &coordinator,
+            &coordinator.terminal,
+            DecodedPdu {
+                serial: 91,
+                pdu: Pdu::Ping(Ping {}),
+            },
+        )
+        .expect("admitted Ping should synchronously enqueue its Pong response");
+        assert_eq!(dispatched, RequestDispatchOutcome::Dispatched);
+        assert!(
+            coordinator.terminal.admission.try_lock().is_some(),
+            "request admission must be released before response callbacks re-enter it"
+        );
+        let response = take_written_pdu(&item_rx);
+        assert_eq!(response.serial, 91);
+        assert_eq!(response.pdu, Pdu::Pong(Pong {}));
+    }
+
+    #[test]
     fn topology_fence_queues_snapshot_before_reordered_contiguous_events() {
         let (coordinator, item_rx, _terminal_rx, session_incarnation, stream_id) =
             bound_topology_coordinator();
@@ -4634,14 +5572,17 @@ mod tests {
         );
 
         coordinator
-            .queue_response(DecodedPdu {
-                serial: 41,
-                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
-                    stream_id,
-                    session_incarnation,
-                    TopologyRevision::INITIAL,
-                )),
-            })
+            .queue_response(
+                DecodedPdu {
+                    serial: 41,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
             .expect("complete coherent topology fence");
 
         let snapshot = take_written_pdu(&item_rx);
@@ -4671,14 +5612,17 @@ mod tests {
             .begin_fence(42, &fenced_snapshot_request())
             .expect("begin coherent topology fence");
         coordinator
-            .queue_response(DecodedPdu {
-                serial: 42,
-                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
-                    stream_id,
-                    session_incarnation,
-                    TopologyRevision::INITIAL,
-                )),
-            })
+            .queue_response(
+                DecodedPdu {
+                    serial: 42,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
             .expect("establish topology stream");
         let _snapshot = take_written_pdu(&item_rx);
 
@@ -4723,14 +5667,17 @@ mod tests {
         ));
 
         coordinator
-            .queue_response(DecodedPdu {
-                serial: 43,
-                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
-                    stream_id,
-                    session_incarnation,
-                    TopologyRevision::new(1),
-                )),
-            })
+            .queue_response(
+                DecodedPdu {
+                    serial: 43,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::new(1),
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
             .expect("complete coherent topology fence");
 
         let _snapshot = take_written_pdu(&item_rx);
@@ -4757,14 +5704,17 @@ mod tests {
             .expect("begin coherent topology fence");
 
         let error = coordinator
-            .queue_response(DecodedPdu {
-                serial: 44,
-                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
-                    stream_id,
-                    session_incarnation,
-                    TopologyRevision::new(4),
-                )),
-            })
+            .queue_response(
+                DecodedPdu {
+                    serial: 44,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::new(4),
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
             .expect_err("a snapshot older than subscription admission must fail closed");
 
         assert!(
@@ -4802,18 +5752,21 @@ mod tests {
         ));
 
         coordinator
-            .queue_response(DecodedPdu {
-                serial: 44,
-                pdu: Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
-                    negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
-                    stream_id,
-                    outcome: ListPanesCoherentOutcome::Contended {
-                        attempts: 3,
-                        first_revision: TopologyRevision::INITIAL,
-                        last_revision: TopologyRevision::new(2),
-                    },
-                }),
-            })
+            .queue_response(
+                DecodedPdu {
+                    serial: 44,
+                    pdu: Pdu::ListPanesCoherentResponse(ListPanesCoherentResponse {
+                        negotiated: TopologyCapabilities::FENCED_SNAPSHOT_V1,
+                        stream_id,
+                        outcome: ListPanesCoherentOutcome::Contended {
+                            attempts: 3,
+                            first_revision: TopologyRevision::INITIAL,
+                            last_revision: TopologyRevision::new(2),
+                        },
+                    }),
+                },
+                PduDeliveryClass::Control,
+            )
             .expect("return typed snapshot contention");
 
         let response = take_written_pdu(&item_rx);
@@ -4877,7 +5830,7 @@ mod tests {
         ));
         assert_eq!(
             terminal_rx.try_recv().expect("terminal overflow reason"),
-            TOPOLOGY_BUFFER_OVERFLOW
+            OUTBOUND_BUDGET_OVERFLOW
         );
         assert!(item_rx.is_empty());
         assert!(!coordinator.on_notification(
@@ -4902,10 +5855,13 @@ mod tests {
         );
         assert!(
             coordinator
-                .queue_response(DecodedPdu {
-                    serial: 99,
-                    pdu: Pdu::Pong(Pong {}),
-                })
+                .queue_response(
+                    DecodedPdu {
+                        serial: 99,
+                        pdu: Pdu::Pong(Pong {}),
+                    },
+                    PduDeliveryClass::Control,
+                )
                 .is_err(),
             "post-terminal response admission must fail"
         );
@@ -4916,14 +5872,17 @@ mod tests {
             .begin_fence(46, &fenced_snapshot_request())
             .expect("begin second coherent topology fence");
         coordinator
-            .queue_response(DecodedPdu {
-                serial: 46,
-                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
-                    stream_id,
-                    session_incarnation,
-                    TopologyRevision::INITIAL,
-                )),
-            })
+            .queue_response(
+                DecodedPdu {
+                    serial: 46,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
             .expect("establish second topology stream");
         let _snapshot = take_written_pdu(&item_rx);
         assert!(coordinator.on_notification(
@@ -4939,6 +5898,82 @@ mod tests {
             terminal_rx.try_recv().expect("terminal duplicate reason"),
             TOPOLOGY_PROTOCOL_FAILURE
         );
+    }
+
+    #[test]
+    fn subscribed_legacy_topology_rejects_one_oversized_owned_title() {
+        let (coordinator, item_rx, terminal_rx, _, _) = bound_topology_coordinator();
+        let mux = Mux::new(None);
+        let mut title = String::with_capacity(TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+        title.push('x');
+
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(
+                1,
+                MuxNotification::WindowTitleChanged {
+                    window_id: 1,
+                    title,
+                },
+            ),
+        ));
+        assert_eq!(
+            terminal_rx.try_recv().expect("oversized legacy title reason"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+        assert!(item_rx.is_empty());
+        let released = coordinator.outbound_budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn established_topology_rejects_one_oversized_owned_title() {
+        let (coordinator, item_rx, terminal_rx, session_incarnation, stream_id) =
+            bound_topology_coordinator();
+        let mux = Mux::new(None);
+        coordinator
+            .begin_fence(45, &fenced_snapshot_request())
+            .expect("begin oversized established-title fence");
+        coordinator
+            .queue_response(
+                DecodedPdu {
+                    serial: 45,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
+            .expect("establish topology stream");
+        let _snapshot = take_written_pdu(&item_rx);
+        let mut title = String::with_capacity(TOPOLOGY_FENCE_MAX_RETAINED_BYTES);
+        title.push('x');
+
+        assert!(!coordinator.on_notification(
+            &mux,
+            topology_envelope(
+                1,
+                MuxNotification::WindowTitleChanged {
+                    window_id: 1,
+                    title,
+                },
+            ),
+        ));
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("oversized established title reason"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+        assert!(item_rx.is_empty());
+        let released = coordinator.outbound_budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
     }
 
     #[test]
@@ -4977,7 +6012,7 @@ mod tests {
         ));
         assert_eq!(
             terminal_rx.try_recv().expect("prebind overflow reason"),
-            TOPOLOGY_BUFFER_OVERFLOW
+            OUTBOUND_BUDGET_OVERFLOW
         );
         assert!(item_rx.is_empty());
         {
@@ -5002,14 +6037,17 @@ mod tests {
             .begin_fence(47, &fenced_snapshot_request())
             .expect("begin established-gap setup fence");
         coordinator
-            .queue_response(DecodedPdu {
-                serial: 47,
-                pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
-                    stream_id,
-                    session_incarnation,
-                    TopologyRevision::INITIAL,
-                )),
-            })
+            .queue_response(
+                DecodedPdu {
+                    serial: 47,
+                    pdu: Pdu::ListPanesCoherentResponse(coherent_snapshot_response(
+                        stream_id,
+                        session_incarnation,
+                        TopologyRevision::INITIAL,
+                    )),
+                },
+                PduDeliveryClass::Control,
+            )
             .expect("establish topology stream");
         let _snapshot = take_written_pdu(&item_rx);
 
@@ -5043,7 +6081,7 @@ mod tests {
             terminal_rx
                 .try_recv()
                 .expect("established gap overflow reason"),
-            TOPOLOGY_BUFFER_OVERFLOW
+            OUTBOUND_BUDGET_OVERFLOW
         );
         assert!(item_rx.is_empty());
         let state = coordinator.state.lock();
@@ -5492,11 +6530,83 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct AdmissionBarrierDispatchStream {
+        admission: Arc<ParkingMutex<()>>,
+        poll_entered: std::sync::mpsc::Sender<()>,
+        release_poll: std::sync::mpsc::Receiver<()>,
+        write_polls: Arc<AtomicUsize>,
+        flush_polls: Arc<AtomicUsize>,
+        bytes_written: usize,
+    }
+
+    impl AdmissionBarrierDispatchStream {
+        fn enter_admitted_poll(&self) {
+            assert!(
+                self.admission.try_lock().is_none(),
+                "the terminal admission gate must remain held during an immediate I/O poll"
+            );
+            self.poll_entered
+                .send(())
+                .expect("test poll observer must remain connected");
+            self.release_poll
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("test must release an admitted I/O poll within five seconds");
+        }
+    }
+
+    impl DispatchStream for AdmissionBarrierDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for AdmissionBarrierDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for AdmissionBarrierDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.write_polls.fetch_add(1, Ordering::Relaxed);
+            this.enter_admitted_poll();
+            this.bytes_written = this.bytes_written.saturating_add(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flush_polls.fetch_add(1, Ordering::Relaxed);
+            this.enter_admitted_poll();
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[derive(Debug, Default)]
     struct ChunkedDispatchStream {
         readable: AtomicBool,
         bytes: Vec<u8>,
         write_sizes: Vec<usize>,
+        max_write_size: Option<usize>,
+        fail_flush: bool,
     }
 
     impl DispatchStream for ChunkedDispatchStream {
@@ -5523,9 +6633,16 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct PendingWriteThenReadableDispatchStream {
+        admission: Arc<ParkingMutex<()>>,
         readable: AtomicBool,
         combined_waits: AtomicUsize,
+        retry_waits: AtomicUsize,
+        read_polls: Arc<AtomicUsize>,
         write_polls: AtomicUsize,
+        requires_transport_retry: bool,
+        combined_wait_pending: bool,
+        ready_side: Option<DispatchReadySide>,
+        terminal_during_wait: Option<DispatchTerminal>,
     }
 
     impl DispatchStream for PendingWriteThenReadableDispatchStream {
@@ -5540,10 +6657,23 @@ mod tests {
         fn wait_for_readable_or_writable(
             &self,
         ) -> Pin<Box<dyn Future<Output = io::Result<DispatchReadySide>> + Send + '_>> {
+            if self.combined_wait_pending {
+                return Box::pin(std::future::pending());
+            }
             Box::pin(async move {
+                assert!(
+                    self.admission.try_lock().is_some(),
+                    "the terminal admission gate must be released before a readiness await"
+                );
                 self.combined_waits.fetch_add(1, Ordering::Relaxed);
-                self.readable.store(true, Ordering::Release);
-                Ok(DispatchReadySide::Readable)
+                if let Some(terminal) = &self.terminal_during_wait {
+                    terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
+                }
+                let ready_side = self.ready_side.unwrap_or(DispatchReadySide::Readable);
+                if ready_side == DispatchReadySide::Readable {
+                    self.readable.store(true, Ordering::Release);
+                }
+                Ok(ready_side)
             })
         }
 
@@ -5554,6 +6684,26 @@ mod tests {
                 DispatchReadinessHint::NotReady
             })
         }
+
+        fn pending_outbound_requires_retry(&self) -> bool {
+            self.requires_transport_retry
+        }
+
+        fn wait_for_pending_outbound_retry(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async move {
+                assert!(
+                    self.admission.try_lock().is_some(),
+                    "the terminal admission gate must be released before a transport retry await"
+                );
+                self.retry_waits.fetch_add(1, Ordering::Relaxed);
+                if let Some(terminal) = &self.terminal_during_wait {
+                    terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
+                }
+                Ok(())
+            })
+        }
     }
 
     impl AsyncRead for PendingWriteThenReadableDispatchStream {
@@ -5562,6 +6712,7 @@ mod tests {
             _cx: &mut Context<'_>,
             _buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
+            self.read_polls.fetch_add(1, Ordering::Relaxed);
             Poll::Pending
         }
     }
@@ -5572,6 +6723,10 @@ mod tests {
             _cx: &mut Context<'_>,
             _buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            assert!(
+                self.admission.try_lock().is_none(),
+                "the terminal admission gate must remain held during poll_write"
+            );
             self.write_polls.fetch_add(1, Ordering::Relaxed);
             Poll::Pending
         }
@@ -5648,13 +6803,20 @@ mod tests {
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            this.bytes.extend_from_slice(buf);
-            this.write_sizes.push(buf.len());
-            Poll::Ready(Ok(buf.len()))
+            let written = this
+                .max_write_size
+                .map_or(buf.len(), |limit| buf.len().min(limit.max(1)));
+            this.bytes.extend_from_slice(&buf[..written]);
+            this.write_sizes.push(written);
+            Poll::Ready(Ok(written))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            if self.fail_flush {
+                Poll::Ready(Err(io::Error::other("simulated outbound flush failure")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -7032,8 +8194,15 @@ mod tests {
             .try_send(Item::Readable)
             .expect("fill dispatch queue");
 
-        let err = queue_response_pdu(&item_tx, &terminal, &budget, Pdu::Pong(Pong {}), 41)
-            .expect_err("response enqueue into a full queue must fail");
+        let err = queue_response_pdu(
+            &item_tx,
+            &terminal,
+            &budget,
+            Pdu::Pong(Pong {}),
+            41,
+            PduDeliveryClass::Control,
+        )
+        .expect_err("response enqueue into a full queue must fail");
         assert!(
             format!("{err:#}").contains("mux dispatch item queue is full"),
             "response enqueue should retain the queue failure"
@@ -7095,6 +8264,571 @@ mod tests {
         assert!(
             deferred_item.is_none(),
             "the contiguous response should remain in the same ordered batch"
+        );
+    }
+
+    #[test]
+    fn pending_batch_moves_first_encoded_frame_and_retains_deferred_frame_identity() {
+        let budget = Arc::new(OutboundBudget::default());
+        let terminal = test_terminal();
+        let first_bytes = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![0x41; 56 * 1024],
+        })
+        .encode_frame_with_mode(1, CompressionMode::Never)
+        .expect("encode first test frame");
+        let second_bytes = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![0x42; 16 * 1024],
+        })
+        .encode_frame_with_mode(2, CompressionMode::Never)
+        .expect("encode deferred test frame");
+        assert!(first_bytes.len() < OUTBOUND_WRITE_QUANTUM_BYTES);
+        assert!(
+            first_bytes.len() + second_bytes.len() > OUTBOUND_WRITE_QUANTUM_BYTES,
+            "the second frame must cross the batch byte quantum"
+        );
+        let first_ptr = first_bytes.as_ptr();
+        let second_ptr = second_bytes.as_ptr();
+        let first_reservation = budget
+            .try_reserve(OutboundClass::Control, 0)
+            .expect("reserve first control frame");
+        let second_reservation = budget
+            .try_reserve(OutboundClass::Control, 0)
+            .expect("reserve second control frame");
+        let (item_tx, item_rx) = unbounded();
+        item_tx
+            .try_send(Item::WritePdu(WritePayload::Encoded(
+                EncodedOutboundFrame {
+                    bytes: second_bytes,
+                    reservation: second_reservation,
+                },
+            )))
+            .expect("queue already-encoded second frame");
+        let mut deferred_item = None;
+        let pending = prepare_pending_outbound_batch(
+            WritePayload::Encoded(EncodedOutboundFrame {
+                bytes: first_bytes,
+                reservation: first_reservation,
+            }),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("prepare encoded batch without copying its first frame");
+        assert_eq!(pending.bytes.as_ptr(), first_ptr);
+        let deferred = deferred_item
+            .take()
+            .expect("over-quantum encoded frame must be deferred");
+        let Item::WritePdu(WritePayload::Encoded(deferred)) = deferred else {
+            panic!("deferred outbound item must remain an encoded frame");
+        };
+        assert_eq!(deferred.bytes.as_ptr(), second_ptr);
+        assert_eq!(budget.snapshot().total_slots, 2);
+        drop(pending);
+        drop(deferred);
+        let released = budget.snapshot();
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+        assert_eq!(released.topology_bytes, 0);
+    }
+
+    #[test]
+    fn topology_and_control_frames_never_share_one_accounted_batch() {
+        for topology_first in [true, false] {
+            let budget = Arc::new(OutboundBudget::default());
+            let terminal = test_terminal();
+            let mut topology_bytes =
+                Vec::with_capacity(TOPOLOGY_FENCE_MAX_RETAINED_BYTES - (64 * 1024));
+            topology_bytes.push(0x54);
+            let topology_capacity = topology_bytes.capacity();
+            let control_bytes = vec![0x43];
+            let topology = EncodedOutboundFrame {
+                bytes: topology_bytes,
+                reservation: budget
+                    .try_reserve(OutboundClass::Topology, topology_capacity)
+                    .expect("near-ceiling topology frame must fit"),
+            };
+            let control = EncodedOutboundFrame {
+                bytes: control_bytes,
+                reservation: budget
+                    .try_reserve(OutboundClass::Control, 0)
+                    .expect("control frame must use reserved headroom"),
+            };
+            let (first, second) = if topology_first {
+                (topology, control)
+            } else {
+                (control, topology)
+            };
+            let expected_first_ptr = first.bytes.as_ptr();
+            let expected_deferred_ptr = second.bytes.as_ptr();
+            let (item_tx, item_rx) = unbounded();
+            item_tx
+                .try_send(Item::WritePdu(WritePayload::Encoded(second)))
+                .expect("queue cross-class successor");
+            let mut deferred_item = None;
+
+            let pending = prepare_pending_outbound_batch(
+                WritePayload::Encoded(first),
+                &item_rx,
+                &mut deferred_item,
+                CompressionMode::Never,
+                &terminal,
+            )
+            .expect("cross-class successor must be deferred without reserialization");
+            assert_eq!(pending.bytes.as_ptr(), expected_first_ptr);
+            let Item::WritePdu(WritePayload::Encoded(deferred)) = deferred_item
+                .take()
+                .expect("topology/control transition must form a batch boundary")
+            else {
+                panic!("cross-class successor must remain an encoded write frame");
+            };
+            assert_eq!(deferred.bytes.as_ptr(), expected_deferred_ptr);
+            assert_eq!(budget.snapshot().topology_bytes, topology_capacity);
+
+            drop(pending);
+            drop(deferred);
+            let released = budget.snapshot();
+            assert_eq!(released.topology_bytes, 0);
+            assert_eq!(released.total_slots, 0);
+            assert_eq!(released.bulk_slots, 0);
+        }
+    }
+
+    #[test]
+    fn deferred_topology_frame_keeps_identity_and_charge_until_its_own_flush() {
+        let budget = Arc::new(OutboundBudget::default());
+        let terminal = test_terminal();
+        let first_bytes = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![0x41; 56 * 1024],
+        })
+        .encode_frame_with_mode(1, CompressionMode::Never)
+        .expect("encode first topology frame");
+        let second_bytes = Pdu::WriteToPane(WriteToPane {
+            pane_id: 1,
+            data: vec![0x42; 16 * 1024],
+        })
+        .encode_frame_with_mode(2, CompressionMode::Never)
+        .expect("encode deferred topology frame");
+        let first_capacity = first_bytes.capacity();
+        let second_capacity = second_bytes.capacity();
+        let first_ptr = first_bytes.as_ptr();
+        let second_ptr = second_bytes.as_ptr();
+        let first = EncodedOutboundFrame {
+            bytes: first_bytes,
+            reservation: budget
+                .try_reserve(OutboundClass::Topology, first_capacity)
+                .expect("reserve first topology frame"),
+        };
+        let second = EncodedOutboundFrame {
+            bytes: second_bytes,
+            reservation: budget
+                .try_reserve(OutboundClass::Topology, second_capacity)
+                .expect("reserve second topology frame"),
+        };
+        let (item_tx, item_rx) = unbounded();
+        item_tx
+            .try_send(Item::WritePdu(WritePayload::Encoded(second)))
+            .expect("queue second topology frame");
+        let mut deferred_item = None;
+        let mut first_pending = prepare_pending_outbound_batch(
+            WritePayload::Encoded(first),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("prepare first topology frame");
+        assert_eq!(first_pending.bytes.as_ptr(), first_ptr);
+        let Item::WritePdu(WritePayload::Encoded(second)) = deferred_item
+            .take()
+            .expect("over-quantum topology successor must be deferred")
+        else {
+            panic!("deferred topology successor must remain encoded");
+        };
+        assert_eq!(second.bytes.as_ptr(), second_ptr);
+        assert_eq!(
+            budget.snapshot().topology_bytes,
+            first_capacity + second_capacity
+        );
+
+        let mut stream = ChunkedDispatchStream {
+            max_write_size: Some(257),
+            ..ChunkedDispatchStream::default()
+        };
+        loop {
+            match promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut first_pending,
+                None,
+                &terminal,
+            ))
+            .expect("first topology frame should make progress")
+            {
+                OutboundService::Progress => {}
+                OutboundService::Complete => break,
+                other => panic!("unexpected first-frame service outcome: {other:?}"),
+            }
+        }
+        drop(first_pending);
+        assert_eq!(budget.snapshot().topology_bytes, second_capacity);
+
+        let mut second_pending = prepare_pending_outbound_batch(
+            WritePayload::Encoded(second),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("prepare deferred topology frame once");
+        assert_eq!(second_pending.bytes.as_ptr(), second_ptr);
+        loop {
+            match promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut second_pending,
+                None,
+                &terminal,
+            ))
+            .expect("second topology frame should make progress")
+            {
+                OutboundService::Progress => {}
+                OutboundService::Complete => break,
+                other => panic!("unexpected second-frame service outcome: {other:?}"),
+            }
+        }
+        drop(second_pending);
+        let released = budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn terminal_before_outbound_service_performs_no_write_or_flush_poll() {
+        let (_item_tx, item_rx) = unbounded();
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let mut deferred_item = None;
+        let mut pending = prepare_pending_outbound_batch(
+            test_write_payload(queued_ping(1)),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("prepare test outbound frame");
+        let mut stream = CountingDispatchStream::default();
+        terminal.trip(OUTBOUND_BUDGET_OVERFLOW);
+
+        let writing = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("terminal service check should be explicit");
+        assert_eq!(writing, OutboundService::Terminal);
+        assert_eq!(pending.offset, 0);
+        assert_eq!(stream.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(stream.flush_calls.load(Ordering::Relaxed), 0);
+
+        pending.phase = PendingOutboundPhase::Flushing;
+        let flushing = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("terminal flush check should be explicit");
+        assert_eq!(flushing, OutboundService::Terminal);
+        assert_eq!(stream.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(stream.flush_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            terminal_rx.try_recv().expect("terminal reason must be published"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+    }
+
+    #[test]
+    fn topology_charge_releases_after_hard_write_and_flush_failures() {
+        let (terminal, _terminal_rx) = DispatchTerminal::channel();
+
+        let write_budget = Arc::new(OutboundBudget::default());
+        let mut write_pending = test_topology_pending(&write_budget, &terminal);
+        let mut write_stream = FailingWriteDispatchStream::new(NetworkWriteFailure::Other);
+        promise::spawn::block_on(service_pending_outbound(
+            &mut write_stream,
+            &mut write_pending,
+            None,
+            &terminal,
+        ))
+        .expect_err("hard write failure must stop outbound service");
+        assert!(write_budget.snapshot().topology_bytes > 0);
+        drop(write_pending);
+        let write_released = write_budget.snapshot();
+        assert_eq!(write_released.topology_bytes, 0);
+        assert_eq!(write_released.total_slots, 0);
+        assert_eq!(write_released.bulk_slots, 0);
+
+        let flush_budget = Arc::new(OutboundBudget::default());
+        let mut flush_pending = test_topology_pending(&flush_budget, &terminal);
+        let mut flush_stream = ChunkedDispatchStream {
+            fail_flush: true,
+            ..ChunkedDispatchStream::default()
+        };
+        assert_eq!(
+            promise::spawn::block_on(service_pending_outbound(
+                &mut flush_stream,
+                &mut flush_pending,
+                None,
+                &terminal,
+            ))
+            .expect("the write before a flush failure should succeed"),
+            OutboundService::Progress
+        );
+        promise::spawn::block_on(service_pending_outbound(
+            &mut flush_stream,
+            &mut flush_pending,
+            None,
+            &terminal,
+        ))
+        .expect_err("flush failure must stop outbound service");
+        assert!(flush_budget.snapshot().topology_bytes > 0);
+        drop(flush_pending);
+        let flush_released = flush_budget.snapshot();
+        assert_eq!(flush_released.topology_bytes, 0);
+        assert_eq!(flush_released.total_slots, 0);
+        assert_eq!(flush_released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn cancelling_pending_outbound_wait_retains_charge_until_batch_teardown() {
+        let budget = Arc::new(OutboundBudget::default());
+        let (terminal, _terminal_rx) = DispatchTerminal::channel();
+        let mut pending = test_topology_pending(&budget, &terminal);
+        let encoded_charge = budget.snapshot().topology_bytes;
+        assert!(encoded_charge > 0);
+        let mut stream = PendingWriteThenReadableDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            combined_wait_pending: true,
+            ..PendingWriteThenReadableDispatchStream::default()
+        };
+        let mut service = Box::pin(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(service.as_mut().poll(&mut cx), Poll::Pending));
+        drop(service);
+        assert_eq!(
+            budget.snapshot().topology_bytes,
+            encoded_charge,
+            "cancelling the service future must not release its caller-owned batch"
+        );
+        drop(pending);
+        let released = budget.snapshot();
+        assert_eq!(released.topology_bytes, 0);
+        assert_eq!(released.total_slots, 0);
+        assert_eq!(released.bulk_slots, 0);
+    }
+
+    #[test]
+    fn admitted_write_linearizes_before_terminal_and_no_later_poll_begins() {
+        let (_item_tx, item_rx) = unbounded();
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let mut deferred_item = None;
+        let pending = prepare_pending_outbound_batch(
+            test_write_payload(queued_ping(1)),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("prepare terminal-race frame");
+        let (poll_entered_tx, poll_entered_rx) = std::sync::mpsc::channel();
+        let (release_poll_tx, release_poll_rx) = std::sync::mpsc::channel();
+        let write_polls = Arc::new(AtomicUsize::new(0));
+        let flush_polls = Arc::new(AtomicUsize::new(0));
+        let stream = AdmissionBarrierDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            poll_entered: poll_entered_tx,
+            release_poll: release_poll_rx,
+            write_polls: Arc::clone(&write_polls),
+            flush_polls: Arc::clone(&flush_polls),
+            bytes_written: 0,
+        };
+        let terminal_for_service = terminal.clone();
+        let service = std::thread::spawn(move || {
+            let mut stream = stream;
+            let mut pending = pending;
+            let outcome = promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &terminal_for_service,
+            ));
+            (stream, pending, outcome)
+        });
+
+        poll_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("admitted write poll must begin within five seconds");
+        let (trip_started_tx, trip_started_rx) = std::sync::mpsc::channel();
+        let (trip_done_tx, trip_done_rx) = std::sync::mpsc::channel();
+        let terminal_for_trip = terminal.clone();
+        let tripper = std::thread::spawn(move || {
+            trip_started_tx
+                .send(())
+                .expect("terminal-race observer must remain connected");
+            terminal_for_trip.trip(OUTBOUND_BUDGET_OVERFLOW);
+            trip_done_tx
+                .send(())
+                .expect("terminal-race completion observer must remain connected");
+        });
+        trip_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("terminal trip must start within five seconds");
+        assert!(
+            matches!(
+                trip_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "terminal trip must not overtake an admitted write poll"
+        );
+        release_poll_tx
+            .send(())
+            .expect("admitted write poll must remain connected");
+
+        let (mut stream, mut pending, first_outcome) =
+            service.join().expect("admitted write service should join");
+        tripper.join().expect("terminal trip should join");
+        trip_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("terminal trip must finish after the admitted write poll");
+        assert_eq!(
+            first_outcome.expect("admitted write should complete its poll"),
+            OutboundService::Progress
+        );
+        assert_eq!(write_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(flush_polls.load(Ordering::Relaxed), 0);
+        assert!(stream.bytes_written > 0);
+        let bytes_after_admitted_poll = stream.bytes_written;
+
+        let second_outcome = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("post-terminal service should return an explicit terminal outcome");
+        assert_eq!(second_outcome, OutboundService::Terminal);
+        assert_eq!(write_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(flush_polls.load(Ordering::Relaxed), 0);
+        assert_eq!(stream.bytes_written, bytes_after_admitted_poll);
+        assert_eq!(
+            terminal_rx.try_recv().expect("terminal race reason must publish"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+    }
+
+    #[test]
+    fn admitted_flush_linearizes_before_terminal_and_no_later_poll_begins() {
+        let (_item_tx, item_rx) = unbounded();
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let mut deferred_item = None;
+        let mut pending = prepare_pending_outbound_batch(
+            test_write_payload(queued_ping(1)),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("prepare terminal-race flush frame");
+        pending.phase = PendingOutboundPhase::Flushing;
+        let (poll_entered_tx, poll_entered_rx) = std::sync::mpsc::channel();
+        let (release_poll_tx, release_poll_rx) = std::sync::mpsc::channel();
+        let write_polls = Arc::new(AtomicUsize::new(0));
+        let flush_polls = Arc::new(AtomicUsize::new(0));
+        let stream = AdmissionBarrierDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            poll_entered: poll_entered_tx,
+            release_poll: release_poll_rx,
+            write_polls: Arc::clone(&write_polls),
+            flush_polls: Arc::clone(&flush_polls),
+            bytes_written: 0,
+        };
+        let terminal_for_service = terminal.clone();
+        let service = std::thread::spawn(move || {
+            let mut stream = stream;
+            let mut pending = pending;
+            let outcome = promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &terminal_for_service,
+            ));
+            (stream, pending, outcome)
+        });
+
+        poll_entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("admitted flush poll must begin within five seconds");
+        let (trip_started_tx, trip_started_rx) = std::sync::mpsc::channel();
+        let (trip_done_tx, trip_done_rx) = std::sync::mpsc::channel();
+        let terminal_for_trip = terminal.clone();
+        let tripper = std::thread::spawn(move || {
+            trip_started_tx
+                .send(())
+                .expect("terminal-race observer must remain connected");
+            terminal_for_trip.trip(OUTBOUND_BUDGET_OVERFLOW);
+            trip_done_tx
+                .send(())
+                .expect("terminal-race completion observer must remain connected");
+        });
+        trip_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("terminal trip must start within five seconds");
+        assert!(
+            matches!(
+                trip_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "terminal trip must not overtake an admitted flush poll"
+        );
+        release_poll_tx
+            .send(())
+            .expect("admitted flush poll must remain connected");
+
+        let (mut stream, mut pending, first_outcome) =
+            service.join().expect("admitted flush service should join");
+        tripper.join().expect("terminal trip should join");
+        trip_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("terminal trip must finish after the admitted flush poll");
+        assert_eq!(
+            first_outcome.expect("admitted flush should complete its poll"),
+            OutboundService::Complete
+        );
+        assert_eq!(write_polls.load(Ordering::Relaxed), 0);
+        assert_eq!(flush_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.bytes_written, 0);
+
+        let second_outcome = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("post-terminal service should return an explicit terminal outcome");
+        assert_eq!(second_outcome, OutboundService::Terminal);
+        assert_eq!(write_polls.load(Ordering::Relaxed), 0);
+        assert_eq!(flush_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            terminal_rx.try_recv().expect("terminal race reason must publish"),
+            OUTBOUND_BUDGET_OVERFLOW
         );
     }
 
@@ -7232,11 +8966,13 @@ mod tests {
             serial: 1,
         });
         let mut deferred_item = None;
+        let terminal = test_terminal();
         let mut pending = prepare_pending_outbound_batch(
-            first,
+            test_write_payload(first),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
+            &terminal,
         )
         .expect("large frame should encode");
         drop(item_tx);
@@ -7246,18 +8982,26 @@ mod tests {
             "test frame must exceed one outbound service quantum",
         );
         let mut stream = ChunkedDispatchStream::default();
-        let first_turn =
-            promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
-                .expect("first write chunk should succeed");
+        let first_turn = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("first write chunk should succeed");
         assert_eq!(first_turn, OutboundService::Progress);
         assert_eq!(pending.offset, OUTBOUND_WRITE_QUANTUM_BYTES);
         assert_eq!(stream.write_sizes, vec![OUTBOUND_WRITE_QUANTUM_BYTES]);
 
         stream.readable.store(true, Ordering::Release);
         let offset_before_read = pending.offset;
-        let inbound_turn =
-            promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
-                .expect("readable input should preempt the next frame chunk");
+        let inbound_turn = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("readable input should preempt the next frame chunk");
         assert_eq!(inbound_turn, OutboundService::Readable);
         assert_eq!(
             pending.offset, offset_before_read,
@@ -7266,9 +9010,13 @@ mod tests {
 
         stream.readable.store(false, Ordering::Release);
         loop {
-            let outcome =
-                promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
-                    .expect("remaining chunks should succeed");
+            let outcome = promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &terminal,
+            ))
+            .expect("remaining chunks should succeed");
             assert!(matches!(
                 outcome,
                 OutboundService::Progress | OutboundService::Complete
@@ -7295,42 +9043,212 @@ mod tests {
             serial: 1,
         });
         let mut deferred_item = None;
+        let terminal = test_terminal();
         let mut pending = prepare_pending_outbound_batch(
-            first,
+            test_write_payload(first),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
+            &terminal,
         )
         .expect("ping frame should encode");
-        let mut stream = PendingWriteThenReadableDispatchStream::default();
+        let mut stream = PendingWriteThenReadableDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            ..PendingWriteThenReadableDispatchStream::default()
+        };
 
-        let outcome =
-            promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
-                .expect("newly readable input should preempt a pending write");
+        let outcome = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("newly readable input should preempt a pending write");
 
         assert_eq!(outcome, OutboundService::Readable);
         assert_eq!(pending.offset, 0, "a Pending write must not consume bytes");
         assert_eq!(stream.write_polls.load(Ordering::Relaxed), 1);
         assert_eq!(stream.combined_waits.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.retry_waits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pending_transport_retry_wait_releases_terminal_admission() {
+        let (_item_tx, item_rx) = unbounded();
+        let mut deferred_item = None;
+        let terminal = test_terminal();
+        let mut pending = prepare_pending_outbound_batch(
+            test_write_payload(queued_ping(1)),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("ping frame should encode");
+        let mut stream = PendingWriteThenReadableDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            requires_transport_retry: true,
+            ..PendingWriteThenReadableDispatchStream::default()
+        };
+
+        let outcome = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("transport retry wait should preserve outbound progress");
+
+        assert_eq!(outcome, OutboundService::Progress);
+        assert_eq!(pending.offset, 0);
+        assert_eq!(stream.write_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.retry_waits.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.combined_waits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn terminal_during_pending_readiness_wait_never_publishes_readable() {
+        let (_item_tx, item_rx) = unbounded();
+        let mut deferred_item = None;
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let mut pending = prepare_pending_outbound_batch(
+            test_write_payload(queued_ping(1)),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("ping frame should encode");
+        let mut stream = PendingWriteThenReadableDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            terminal_during_wait: Some(terminal.clone()),
+            ..PendingWriteThenReadableDispatchStream::default()
+        };
+
+        let outcome = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("terminal readiness race should return an explicit outcome");
+
+        assert_eq!(outcome, OutboundService::Terminal);
+        assert_eq!(pending.offset, 0);
+        assert_eq!(stream.write_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.combined_waits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("readiness race terminal reason must publish"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+    }
+
+    #[test]
+    fn terminal_during_pending_writable_wait_never_publishes_progress() {
+        let (_item_tx, item_rx) = unbounded();
+        let mut deferred_item = None;
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let mut pending = prepare_pending_outbound_batch(
+            test_write_payload(queued_ping(1)),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("ping frame should encode");
+        let mut stream = PendingWriteThenReadableDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            ready_side: Some(DispatchReadySide::Writable),
+            terminal_during_wait: Some(terminal.clone()),
+            ..PendingWriteThenReadableDispatchStream::default()
+        };
+
+        let outcome = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("terminal writable race should return an explicit outcome");
+
+        assert_eq!(outcome, OutboundService::Terminal);
+        assert_eq!(pending.offset, 0);
+        assert_eq!(stream.write_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.combined_waits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("writable race terminal reason must publish"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
+    }
+
+    #[test]
+    fn terminal_during_transport_retry_wait_never_publishes_progress() {
+        let (_item_tx, item_rx) = unbounded();
+        let mut deferred_item = None;
+        let (terminal, terminal_rx) = DispatchTerminal::channel();
+        let mut pending = prepare_pending_outbound_batch(
+            test_write_payload(queued_ping(1)),
+            &item_rx,
+            &mut deferred_item,
+            CompressionMode::Never,
+            &terminal,
+        )
+        .expect("ping frame should encode");
+        let mut stream = PendingWriteThenReadableDispatchStream {
+            admission: Arc::clone(&terminal.admission),
+            requires_transport_retry: true,
+            terminal_during_wait: Some(terminal.clone()),
+            ..PendingWriteThenReadableDispatchStream::default()
+        };
+
+        let outcome = promise::spawn::block_on(service_pending_outbound(
+            &mut stream,
+            &mut pending,
+            None,
+            &terminal,
+        ))
+        .expect("terminal retry race should return an explicit outcome");
+
+        assert_eq!(outcome, OutboundService::Terminal);
+        assert_eq!(pending.offset, 0);
+        assert_eq!(stream.write_polls.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.retry_waits.load(Ordering::Relaxed), 1);
+        assert_eq!(stream.combined_waits.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            terminal_rx
+                .try_recv()
+                .expect("retry race terminal reason must publish"),
+            OUTBOUND_BUDGET_OVERFLOW
+        );
     }
 
     #[test]
     fn unsupported_readiness_probe_classifies_combined_read_wake_without_spinning() {
         let (_item_tx, item_rx) = unbounded();
         let mut deferred_item = None;
+        let terminal = test_terminal();
         let mut pending = prepare_pending_outbound_batch(
-            queued_ping(1),
+            test_write_payload(queued_ping(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Never,
+            &terminal,
         )
         .expect("ping frame should encode");
         let mut stream = UnsupportedReadinessPendingWriteStream::default();
 
         for expected_polls in 1..=2 {
-            let outcome =
-                promise::spawn::block_on(service_pending_outbound(&mut stream, &mut pending, None))
-                    .expect("classified read wake should return to the dispatch loop");
+            let outcome = promise::spawn::block_on(service_pending_outbound(
+                &mut stream,
+                &mut pending,
+                None,
+                &terminal,
+            ))
+            .expect("classified read wake should return to the dispatch loop");
 
             assert_eq!(outcome, OutboundService::Readable);
             assert_eq!(
@@ -7371,11 +9289,13 @@ mod tests {
                 .expect("queue outbound ping");
         }
         let mut deferred_item = None;
+        let terminal = test_terminal();
         let pending = prepare_pending_outbound_batch(
-            queued_ping(1),
+            test_write_payload(queued_ping(1)),
             &item_rx,
             &mut deferred_item,
             CompressionMode::Auto,
+            &terminal,
         )
         .expect("bounded outbound batch should prepare");
 

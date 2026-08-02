@@ -9653,6 +9653,8 @@ mod tests {
 
         let transport_error = anyhow!("test transport terminated during flush");
         pending.fail_after_transport_error(&transport_error);
+        pending.fail_after_transport_error(&transport_error);
+        drop(pending);
 
         let live_error = live_rx
             .try_recv()
@@ -9682,6 +9684,10 @@ mod tests {
             RpcMetricProbe::counter(&probe.transport_cleared_abandoned),
             1
         );
+        assert!(matches!(
+            live_rx.try_recv(),
+            Err(async_channel::TryRecvError::Closed)
+        ));
         assert_eq!(probe.pending(), 0.0);
         probe.assert_balanced();
     }

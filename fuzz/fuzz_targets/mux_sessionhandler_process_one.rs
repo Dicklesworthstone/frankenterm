@@ -240,7 +240,7 @@ impl Drop for ScopedMux {
 fn capturing_sender() -> (PduSender, Arc<Mutex<Vec<DecodedPdu>>>) {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let captured_clone = Arc::clone(&captured);
-    let sender = PduSender::new(move |pdu| {
+    let sender = PduSender::new(move |pdu, _class| {
         captured_clone
             .lock()
             .unwrap_or_else(|err| err.into_inner())
