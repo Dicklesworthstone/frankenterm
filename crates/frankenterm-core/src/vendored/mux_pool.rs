@@ -256,7 +256,7 @@ impl RenderAttemptState {
 
 /// Preserve whether a render failure happened before or after invoking the
 /// operation. Only post-invocation transport failures are eligible for the
-/// pipelined-to-sequential compatibility fallback.
+/// pipelined-to-sequential fallback.
 #[derive(Debug)]
 enum RenderExecutionError {
     BeforeOperation(MuxPoolError),
@@ -312,15 +312,8 @@ impl MuxPool {
             && !decision.cancelled
     }
 
-    fn render_attempt_limit(&self, depth: usize) -> u32 {
-        let configured = self.max_recovery_attempts();
-        if depth > 1 {
-            // Preserve one sequential compatibility fallback even when mux
-            // recovery is disabled or configured for a single attempt.
-            configured.max(2)
-        } else {
-            configured
-        }
+    fn render_attempt_limit(&self) -> u32 {
+        self.max_recovery_attempts()
     }
 
     fn can_retry_render(
@@ -1048,7 +1041,7 @@ impl MuxPool {
         depth: usize,
         deadline: &Budget,
     ) -> Result<Vec<GetPaneRenderChangesResponse>, MuxPoolError> {
-        let mut attempts = RenderAttemptState::new(self.render_attempt_limit(depth));
+        let mut attempts = RenderAttemptState::new(self.render_attempt_limit());
         let pipeline_result = self
             .execute_render_batch_with_recovery_with_cx(
                 cx,
@@ -3622,7 +3615,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_batch_render_falls_back_to_sequential_after_pipeline_error() {
+    fn pool_batch_render_respects_single_attempt_when_recovery_is_disabled() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server_unexpected_batch_render_once(&temp_dir).await;
@@ -3649,27 +3642,23 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let result = pool
+            let error = pool
                 .get_pane_render_changes_batch(vec![10, 20, 30])
                 .await
-                .expect("batch fallback should succeed after pipeline error");
-
-            assert_eq!(result.len(), 3);
-            assert_eq!(result[0].pane_id, 10);
-            assert_eq!(result[1].pane_id, 20);
-            assert_eq!(result[2].pane_id, 30);
+                .expect_err("one configured attempt must not enter fallback");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+            ));
 
             let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
             assert_eq!(
-                stats.recovery_attempts, 1,
-                "sequential fallback begins shared logical attempt 2"
+                stats.connections_created, 1,
+                "one configured attempt creates only the failed pipeline connection"
             );
-            assert_eq!(stats.recovery_successes, 1);
-            assert_eq!(
-                stats.connections_created, 2,
-                "fallback should create one failed pipeline connection and one sequential replacement"
-            );
-            assert_eq!(stats.pool.total_acquired, 2);
+            assert_eq!(stats.pool.total_acquired, 1);
         });
     }
 
@@ -4451,7 +4440,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_batch_render_with_cx_falls_back_to_sequential_after_pipeline_error() {
+    fn pool_batch_render_with_cx_respects_single_attempt_when_recovery_is_disabled() {
         run_async_test(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
             let socket_path = spawn_mock_server_unexpected_batch_render_once(&temp_dir).await;
@@ -4479,27 +4468,23 @@ mod tests {
             };
             let pool = MuxPool::new(config);
 
-            let result = pool
+            let error = pool
                 .get_pane_render_changes_batch_with_cx(&cx, vec![10, 20, 30])
                 .await
-                .expect("batch fallback with cx should succeed after pipeline error");
-
-            assert_eq!(result.len(), 3);
-            assert_eq!(result[0].pane_id, 10);
-            assert_eq!(result[1].pane_id, 20);
-            assert_eq!(result[2].pane_id, 30);
+                .expect_err("one configured explicit-Cx attempt must not enter fallback");
+            assert!(matches!(
+                error,
+                MuxPoolError::Mux(DirectMuxError::UnexpectedResponse { .. })
+            ));
 
             let stats = pool.stats().await;
+            assert_eq!(stats.recovery_attempts, 0);
+            assert_eq!(stats.recovery_successes, 0);
             assert_eq!(
-                stats.recovery_attempts, 1,
-                "explicit-Cx fallback begins shared logical attempt 2"
+                stats.connections_created, 1,
+                "one configured explicit-Cx attempt creates only the failed pipeline connection"
             );
-            assert_eq!(stats.recovery_successes, 1);
-            assert_eq!(
-                stats.connections_created, 2,
-                "explicit-Cx fallback should create one failed pipeline connection and one sequential replacement"
-            );
-            assert_eq!(stats.pool.total_acquired, 2);
+            assert_eq!(stats.pool.total_acquired, 1);
         });
     }
 
