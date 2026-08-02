@@ -9202,10 +9202,12 @@ mod tests {
         let unknown_ident = 127_u64;
         assert_eq!(Pdu::pdu_name_for_ident(unknown_ident), None);
 
-        for (caller_is_closed, observed_ident) in [false, true]
-            .into_iter()
-            .flat_map(|closed| [known_wrong_ident, unknown_ident].map(|ident| (closed, ident)))
-        {
+        for &(caller_is_closed, observed_ident) in &[
+            (false, known_wrong_ident),
+            (false, unknown_ident),
+            (true, known_wrong_ident),
+            (true, unknown_ident),
+        ] {
             let (mut pending, probe) = pending_replies_for_test();
             let (completion_tx, completion_rx) = bounded(1);
             let serial = pending

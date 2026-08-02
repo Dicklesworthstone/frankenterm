@@ -5592,7 +5592,8 @@ mod test {
             .expect_err("oversize payload declaration must fail before selection");
             assert!(
                 error.to_string().contains("exceeds maximum"),
-                "unexpected oversize-header error: {error:#}"
+                "unexpected oversize-header error: {:#}",
+                error
             );
             assert!(
                 !selector_was_called,
@@ -5617,7 +5618,8 @@ mod test {
             .expect_err("truncated discarded body must fail closed");
             assert!(
                 error.to_string().contains("discarding an abandoned PDU body"),
-                "unexpected truncated-discard error: {error:#}"
+                "unexpected truncated-discard error: {:#}",
+                error
             );
         });
     }
@@ -5641,7 +5643,8 @@ mod test {
             .expect_err("compressed discard without zstd validation must fail closed");
             assert!(
                 error.to_string().contains("refusing to discard compressed PDU body"),
-                "unexpected compressed-discard error: {error:#}"
+                "unexpected compressed-discard error: {:#}",
+                error
             );
         });
     }
