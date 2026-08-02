@@ -6276,31 +6276,51 @@ mod tests {
         )
         .expect("queue first state");
         commit_for_test(&path, &first, WriteInterruption::None).expect("first");
+        commit_for_test(
+            &path,
+            &PendingBatch::default(),
+            WriteInterruption::None,
+        )
+        .expect("repair initial one-slot journal");
         let before = load_snapshot_at(&path).expect("before");
+        assert!(!before.degraded_recovery);
 
         let slot = local_slot(1);
+        let malformed_window = LayoutWindowId::from_bytes([0x91; 16]);
         let malformed = MixedDomainLayoutOverlay {
-            window_id: LayoutWindowId::from_bytes([0x91; 16]),
+            window_id: malformed_window,
             workspace: "default".to_string(),
             local_revision: 1,
             slots: vec![slot, slot],
             active: Some(slot),
         };
+        let malformed_mutation = PendingOverlayMutation {
+            base_revision: None,
+            desired: DesiredOverlayState::Live(malformed.clone()),
+            superseded_updates: 0,
+        };
         let mut batch = PendingBatch::default();
         batch.overlay_tab_count = malformed.slots.len();
         batch.overlay_mutations.insert(
-            malformed.window_id,
-            PendingOverlayMutation {
-                base_revision: None,
-                desired: DesiredOverlayState::Live(malformed),
-                superseded_updates: 0,
-            },
+            malformed_window,
+            malformed_mutation.clone(),
         );
+        let rejection = commit_for_test(&path, &batch, WriteInterruption::None)
+            .expect("malformed overlay lineage is partitioned");
+        assert!(!rejection.receipt.wrote_new_generation);
+        assert_eq!(rejection.receipt.store_revision, before.store_revision);
+        assert_eq!(rejection.receipt.committed_updates, 0);
+        assert_eq!(rejection.receipt.rejected_updates, 1);
+        assert!(rejection.accepted_overlay_ids.is_empty());
+        assert_eq!(rejection.rejected_overlay_mutations.len(), 1);
+        let rejected = &rejection.rejected_overlay_mutations[&malformed_window];
+        assert_eq!(rejected.mutation, malformed_mutation);
         assert_eq!(
-            commit_for_test(&path, &batch, WriteInterruption::None)
-                .expect_err("malformed must fail")
-                .code(),
-            PersistenceFailureCode::Invalid
+            rejected.failure,
+            PersistenceFailure::Invalid {
+                reason: "one stable tab identity would be owned by multiple layout windows"
+                    .to_string(),
+            }
         );
         assert_eq!(load_snapshot_at(&path).expect("after"), before);
     }
