@@ -4380,6 +4380,64 @@ mod tests {
         assert!(cursor.in_gap, "cursor must record that it is in a gap");
     }
 
+    #[test]
+    fn generation_resync_emits_one_gap_with_only_post_anchor_bytes() {
+        let mut cursor = PaneCursor::from_seq(3, 9).with_resume_anchor("durable tail\n");
+
+        let resync = cursor.capture_generation_resync(
+            "older output\ndurable tail\nvisible successor bytes\n",
+            "capture_generation_resync",
+        );
+
+        assert_eq!(resync.seq, 9);
+        assert_eq!(resync.content, "visible successor bytes\n");
+        assert!(matches!(
+            resync.kind,
+            CapturedSegmentKind::Gap { ref reason }
+                if reason == "capture_generation_resync"
+        ));
+        assert_eq!(cursor.next_seq, 10);
+        assert!(cursor.in_gap);
+
+        let next = cursor
+            .capture_snapshot(
+                "older output\ndurable tail\nvisible successor bytes\nnormal delta\n",
+                1024,
+                None,
+            )
+            .expect("post-resync output");
+        assert_eq!(next.seq, 10);
+        assert_eq!(next.content, "normal delta\n");
+        assert_eq!(next.kind, CapturedSegmentKind::Delta);
+    }
+
+    #[test]
+    fn generation_resync_is_honest_when_durable_anchor_is_unavailable() {
+        let mut missing = PaneCursor::from_seq(7, 4).with_resume_anchor("scrolled away\n");
+        let missing_gap = missing.capture_generation_resync(
+            "only visible successor scrollback\n",
+            "capture_generation_resync",
+        );
+        assert_eq!(missing_gap.content, "only visible successor scrollback\n");
+        assert!(matches!(
+            missing_gap.kind,
+            CapturedSegmentKind::Gap { ref reason }
+                if reason == "capture_generation_resync:resume_anchor_not_found"
+        ));
+
+        let mut absent = PaneCursor::from_seq(8, 0);
+        let absent_gap = absent.capture_generation_resync(
+            "first visible snapshot\n",
+            "capture_generation_resync",
+        );
+        assert_eq!(absent_gap.content, "first visible snapshot\n");
+        assert!(matches!(
+            absent_gap.kind,
+            CapturedSegmentKind::Gap { ref reason }
+                if reason == "capture_generation_resync:durable_anchor_unavailable"
+        ));
+    }
+
     /// ft-6lso5: a tail that repeats in the scrollback (a prompt line, a
     /// progress banner) must resume from its most recent occurrence, or the
     /// output in between is stored twice — the very duplication being fixed.
