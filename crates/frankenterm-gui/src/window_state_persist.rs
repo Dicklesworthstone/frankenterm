@@ -6631,7 +6631,9 @@ mod tests {
         assert!(preflight.accepted_workspaces.contains(&valid_workspace));
         assert_eq!(
             preflight.rejected_workspaces[&oversized_workspace].code(),
-            PersistenceFailureCode::Quota
+            // Cardinality remains below its cap; encoded bytes are the sole
+            // violated resource, whose public classification is Oversized.
+            PersistenceFailureCode::Oversized
         );
         assert!(preflight.accepted_bindings.contains(&valid_fingerprint));
         assert!(
@@ -6923,7 +6925,10 @@ mod tests {
         assert!(!preflight.accepted_workspaces.contains(&oversized_workspace));
         assert_eq!(
             preflight.rejected_workspaces[&oversized_workspace].code(),
-            PersistenceFailureCode::Oversized
+            // With the backfill accepted, restoring this candidate would
+            // exceed both byte and workspace caps. Count-quota precedence is
+            // intentional and leaves the one remaining slot to the backfill.
+            PersistenceFailureCode::Quota
         );
         assert_eq!(preflight.encoded_upper_bound, exact_backfill_limit);
     }
