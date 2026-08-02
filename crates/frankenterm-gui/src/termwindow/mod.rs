@@ -3696,7 +3696,9 @@ impl TermWindow {
         self.invalidate_modal();
         self.input_map = InputMap::new(&config);
         self.leader_is_down = None;
-        self.render_state.as_mut().map(|rs| rs.config_changed());
+        if let Some(render_state) = self.render_state.as_mut() {
+            render_state.config_changed(&config);
+        }
         let dimensions = self.dimensions;
 
         if let Err(err) = self.fonts.config_changed(&config) {

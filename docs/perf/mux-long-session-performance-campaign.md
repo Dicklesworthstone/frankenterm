@@ -155,9 +155,11 @@ The important implementation points are:
    local mux notification.
 9. Each TermWindow subscriber schedules a main-thread task before it knows
    whether the pane is visible in that window.
-10. macOS invalidation is paced by an integer-millisecond
-    `1000 / max_fps` delay. With the default `max_fps = 60`, event phase alone
-    can add nearly one 16.67ms refresh interval.
+10. macOS invalidation is paced by the canonical timer fallback:
+    `max_fps` is validated in `1..=1000`, then converted with ceiling division
+    to a strictly positive integer-millisecond interval. With the default
+    `max_fps = 60`, event phase alone can add nearly one 17ms timer interval;
+    this fallback is not presentation-phase aligned.
 
 This path has several serialized stages. A host with 128 logical CPUs cannot
 compensate for one congested connection writer, one server dispatch lane, one

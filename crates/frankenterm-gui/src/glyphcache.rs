@@ -4,7 +4,7 @@ use crate::renderstate::RenderContext;
 use crate::termwindow::render::paint::AllowImage;
 use ahash::AHashMap;
 use anyhow::Context;
-use config::{AllowSquareGlyphOverflow, TextStyle};
+use config::{AllowSquareGlyphOverflow, ConfigHandle, TextStyle};
 use euclid::num::Zero;
 use frankenterm_core::atlas_tier_doctor::{TierSwapDoctorReport, TierSwapDoctorRow};
 use frankenterm_core::atlas_tiered_swap::{MemoryBudget, TierSwapStats};
@@ -1214,9 +1214,12 @@ impl GlyphCache {
         Ok((glyph, false))
     }
 
-    pub fn config_changed(&mut self) {
-        let config = self.fonts.config();
-        let evicted = self.image_cache.update_config_capturing_evictions(&config);
+    pub fn config_changed(&mut self, config: &ConfigHandle) {
+        // The caller must pass the newly resolved handle explicitly. During a
+        // TermWindow reload, FontConfiguration is updated later and still
+        // exposes the prior handle at this point.
+        self.min_frame_duration = config::frame_interval_for_max_fps(config.max_fps);
+        let evicted = self.image_cache.update_config_capturing_evictions(config);
         self.apply_image_cache_evictions(evicted);
         self.enforce_image_cache_byte_budget();
         self.cursor_glyphs.clear();
@@ -2016,6 +2019,21 @@ mod tests {
         let cache = GlyphCache::new_in_memory(&fonts, size).unwrap();
 
         (cache, metrics)
+    }
+
+    #[test]
+    fn config_changed_refreshes_frame_interval_from_explicit_config() {
+        let (mut cache, _) = test_glyph_cache();
+        cache.min_frame_duration = Duration::ZERO;
+        let explicit_config = config::configuration();
+
+        cache.config_changed(&explicit_config);
+
+        assert_eq!(
+            cache.min_frame_duration,
+            config::frame_interval_for_max_fps(explicit_config.max_fps)
+        );
+        assert!(!cache.min_frame_duration.is_zero());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use ::window::glium::{
 };
 use ::window::*;
 use anyhow::Context;
+use config::ConfigHandle;
 use frankenterm_core::{atlas_tier_doctor::TierSwapDoctorReport, atlas_tiered_swap::MemoryBudget};
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::glyph_quad_staging::{
@@ -934,8 +935,8 @@ impl RenderState {
         )
     }
 
-    pub fn config_changed(&mut self) {
-        self.glyph_cache.borrow_mut().config_changed();
+    pub fn config_changed(&mut self, config: &ConfigHandle) {
+        self.glyph_cache.borrow_mut().config_changed(config);
     }
 
     pub fn tier_swap_doctor_report(&self) -> TierSwapDoctorReport {

@@ -3624,9 +3624,18 @@ mod tests {
     fn config_from_dynamic_rejects_zero_max_fps() {
         let mut obj = std::collections::BTreeMap::new();
         obj.insert(Value::String("max_fps".into()), Value::U64(0));
-        assert!(
+        let error =
             Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
-                .is_err()
+                .expect_err("zero max_fps must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("max_fps"), "unexpected error: {message}");
+        assert!(
+            message.contains("1..=1000"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("got 0"),
+            "unexpected error: {message}"
         );
     }
 
@@ -3637,9 +3646,22 @@ mod tests {
             Value::String("max_fps".into()),
             Value::U64(MAX_MAX_FPS + 1),
         );
-        assert!(
+        let invalid_value = MAX_MAX_FPS + 1;
+        let error =
             Config::from_dynamic(&Value::Object(obj.into()), FromDynamicOptions::default())
-                .is_err()
+                .expect_err("max_fps above timer resolution must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("max_fps"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("1..=1000"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&format!("got {invalid_value}")),
+            "unexpected error: {message}"
         );
     }
 
