@@ -1535,7 +1535,8 @@ impl RenderAttemptFailure {
         Self::new(RenderFailureStage::Paint, source)
     }
 
-    fn draw(source: anyhow::Error) -> Self {
+    fn draw(source: impl Into<anyhow::Error>) -> Self {
+        let source = source.into();
         let stage = source
             .downcast_ref::<DrawFailure>()
             .map_or(DrawFailureStage::RenderCommands, DrawFailure::stage);

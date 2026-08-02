@@ -1,6 +1,7 @@
 use crate::termwindow::frame_budget::{OpKind, OpPriority};
 use crate::termwindow::{DamageGeneration, RenderAttemptFailure};
 use ::window::bitmaps::atlas::{AtlasAllocationFailure, OutOfTextureSpace};
+use ::window::WindowOps;
 use anyhow::Context;
 use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
 use frankenterm_font::ClearShapeCache;
@@ -128,9 +129,10 @@ impl crate::TermWindow {
                             if let Err(err) = result {
                                 self.allow_images = match self.allow_images {
                                     AllowImage::Yes => AllowImage::Scale(2),
-                                    AllowImage::Scale(2) => AllowImage::Scale(4),
-                                    AllowImage::Scale(4) => AllowImage::Scale(8),
-                                    AllowImage::Scale(8) => AllowImage::No,
+                                    AllowImage::Scale(0..=1) => AllowImage::Scale(2),
+                                    AllowImage::Scale(2..=3) => AllowImage::Scale(4),
+                                    AllowImage::Scale(4..=7) => AllowImage::Scale(8),
+                                    AllowImage::Scale(_) => AllowImage::No,
                                     AllowImage::No => {
                                         break 'pass Err(err.context(if pass == 0 {
                                             "clear texture atlas"
